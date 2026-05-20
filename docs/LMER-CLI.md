@@ -93,7 +93,7 @@ GH_TOKEN=your-github-token
 
 The following environment variables control LMER behavior:
 
-- **`LMER_REGISTRY`** - Container registry to pull pre-built images from. Required when no local Containerfile is available for building.
+- **`LMER_REGISTRY`** - Container registry to pull pre-built images from. Optional; defaults to `ghcr.io/lmer2/lmer` (the project's GHCR registry). Override to point at a self-hosted or mirrored registry. Empty-string values are treated the same as unset and fall back to the default.
 
 - **`LMER_NO_AUTO_BUILD`** - Disable automatic container image building. Accepted truthy values: `1`, `true`, `yes` (case-insensitive). When enabled, LMER will error if the image is not found locally instead of building it.
 

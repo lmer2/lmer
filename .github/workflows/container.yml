@@ -8,7 +8,11 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/lmer
+  # Pinned to lmer2/lmer to match the hard-coded DEFAULT_REGISTRY in
+  # src/lmer_cli/build.py. Forks that want to publish their own images should
+  # change both sides together, otherwise pushed tags won't be what the CLI
+  # tries to pull.
+  IMAGE_NAME: lmer2/lmer
 
 jobs:
   build-and-push:

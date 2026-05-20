@@ -150,7 +150,8 @@ def ensure_image(
     1. If image already exists locally, return immediately.
     2. If auto-build is disabled, error and return False.
     3. If repo checkout has a Containerfile, build locally (developer mode).
-    4. Pull from registry (LMER_REGISTRY env var, required for pull).
+    4. Pull from registry: ``LMER_REGISTRY`` if set (and non-empty),
+       otherwise fall back to ``DEFAULT_REGISTRY``.
 
     Returns True if image is available, False if not.
     """
@@ -172,7 +173,9 @@ def ensure_image(
         return True
 
     # Pull from registry (defaults to the project's GHCR; LMER_REGISTRY overrides).
-    registry = os.environ.get("LMER_REGISTRY", DEFAULT_REGISTRY)
+    # Treat empty-string the same as unset so a stray `LMER_REGISTRY=` in a .env
+    # file doesn't bypass the default and produce a misleading downstream error.
+    registry = os.environ.get("LMER_REGISTRY") or DEFAULT_REGISTRY
     rc = pull_image(runtime, image, registry)
     if rc == 0:
         success("Image pulled successfully")
