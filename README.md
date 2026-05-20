@@ -57,6 +57,24 @@ lmer build --local /tmp/lmer-src
 
 Override the pull source with `LMER_REGISTRY=<host>/<path>` for self-hosted registries.
 
+### 3. Configure a work repo
+
+`lmer` requires a **work repo** — a git repository it uses to persist worklogs, gate-check results, and per-project notes across sessions. The `work` CLI inside the container actively `pull`s and `push`es to it, so a remote git repository is required (a bind-mounted local directory would have nothing to push to).
+
+Set up:
+
+1. Create an empty repository on a git host you can read/write (GitLab, GitHub, self-hosted). A personal/private repo is fine.
+2. Point `lmer` at it via `~/.lmer/.env`:
+
+   ```bash
+   mkdir -p ~/.lmer
+   echo 'LMER_WORK_REPO=git@github.com:<you>/lmer-work.git' >> ~/.lmer/.env
+   ```
+
+3. Make sure the credentials in the container can authenticate to that host — either an SSH key forwarded via the agent (see the "SSH not configured" hint lmer prints), or an HTTPS token (`GITLAB_TOKEN`, `GH_TOKEN`) in the same `.env` file.
+
+Subsequent `lmer chat <repo>` runs will clone the work repo into the container at `/work` and push updates back at the end of the session.
+
 ### Common options
 
 Targets can be a repo URL, a PR/MR/issue URL (lmer extracts the base repo), a local git path, or omitted to infer from the current directory's git remote:
