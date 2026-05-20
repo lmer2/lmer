@@ -50,3 +50,20 @@ def all_rule_files(rules_dir):
 def main_config(project_root):
     """Get the main AGENTS.md file."""
     return project_root / "AGENTS.md"
+
+
+@pytest.fixture
+def lmer_subprocess_env():
+    """Env dict for tests that shell out to the `lmer` CLI.
+
+    The CLI requires ``LMER_WORK_REPO`` early, before unrelated codepaths
+    (e.g. .env loading) run. Tests that exercise those unrelated paths need a
+    value present even when CI doesn't set one — this fixture supplies a dummy
+    if the real one isn't already in the environment.
+    """
+    return {
+        **os.environ,
+        "LMER_WORK_REPO": os.environ.get(
+            "LMER_WORK_REPO", "git@example.com:fixture/work-repo.git"
+        ),
+    }

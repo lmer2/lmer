@@ -256,11 +256,13 @@ class TestEnsureImage:
              patch.dict("os.environ", {"LMER_REGISTRY": "my.registry.com/repo"}):
             assert ensure_image("docker", "myimage:fips", None) is False
 
-    def test_returns_false_when_no_registry_and_no_containerfile(self):
-        """Without LMER_REGISTRY and no Containerfile, should fail."""
+    def test_pull_uses_default_registry_when_lmer_registry_unset(self):
+        """Without LMER_REGISTRY, fall back to the project's default GHCR registry."""
         with patch("lmer_cli.build.image_exists", return_value=False), \
+             patch("lmer_cli.build.pull_image", return_value=0) as mock_pull, \
              patch.dict("os.environ", {}, clear=True):
-            assert ensure_image("docker", "myimage:fips", None) is False
+            assert ensure_image("docker", "myimage:fips", None) is True
+            mock_pull.assert_called_once_with("docker", "myimage:fips", "ghcr.io/lmer2/lmer")
 
     def test_respects_skip_build_flag(self):
         with patch("lmer_cli.build.image_exists", return_value=False):

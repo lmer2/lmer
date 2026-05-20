@@ -52,20 +52,21 @@ DB_PASSWORD=secret123
 class TestLmerErrorHandling:
     """Test error handling in lmer script"""
 
-    def test_invalid_env_file(self):
+    def test_invalid_env_file(self, lmer_subprocess_env):
         """Test handling of malformed .env files"""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create an invalid .env file
             env_file = Path(tmpdir) / ".env"
             env_file.write_text("INVALID LINE WITHOUT EQUALS")
 
-            # lmer should still work even with invalid .env
+            # lmer should still work even with invalid .env.
             result = subprocess.run(
                 ["bash", "-c",
                  f"cd {tmpdir} && {Path(__file__).parent.parent}/lmer --no-task --exec 'echo test' 2>&1"],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                env=lmer_subprocess_env,
             )
 
             # Should detect .env but handle errors gracefully
@@ -74,20 +75,21 @@ class TestLmerErrorHandling:
                    result.returncode == 0, \
                 f"lmer failed with invalid .env. Output: {result.stdout}"
 
-    def test_empty_env_file(self):
+    def test_empty_env_file(self, lmer_subprocess_env):
         """Test handling of empty .env files"""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create an empty .env file
             env_file = Path(tmpdir) / ".env"
             env_file.touch()
 
-            # lmer should handle empty .env gracefully
+            # lmer should handle empty .env gracefully.
             result = subprocess.run(
                 ["bash", "-c",
                  f"cd {tmpdir} && {Path(__file__).parent.parent}/lmer --no-task --exec 'echo test'"],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                env=lmer_subprocess_env,
             )
 
             # Should detect .env even if empty

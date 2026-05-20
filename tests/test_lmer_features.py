@@ -17,7 +17,7 @@ from tests._lmer_runtime import requires_container, requires_lmer_venv
 class TestLmerEnvFeatures:
     """Test lmer environment and venv handling"""
 
-    def test_env_file_detection(self):
+    def test_env_file_detection(self, lmer_subprocess_env):
         """Test that lmer detects and loads .env files"""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create a .env file
@@ -32,12 +32,11 @@ echo "ANOTHER_VAR=$ANOTHER_VAR"
 """)
             test_script.chmod(0o755)
 
-            # Run lmer in exec mode to check if env vars are loaded
             result = subprocess.run(
                 ["bash", "-c", f"cd {tmpdir} && {Path(__file__).parent.parent}/lmer --no-task --exec 'echo TEST_VAR=$TEST_VAR'"],
                 capture_output=True,
                 text=True,
-                env={**os.environ, "PATH": os.environ.get("PATH", "")}
+                env=lmer_subprocess_env,
             )
 
             # Check that .env was detected
@@ -45,14 +44,14 @@ echo "ANOTHER_VAR=$ANOTHER_VAR"
             assert "Found .env file" in combined_output or "Loaded" in combined_output and "variables from .env" in combined_output, \
                 f"lmer did not detect .env file. Output: {result.stdout}\nError: {result.stderr}"
 
-    def test_env_file_not_loaded_when_absent(self):
+    def test_env_file_not_loaded_when_absent(self, lmer_subprocess_env):
         """Test that lmer doesn't error when no .env file exists"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Run lmer without .env file
             result = subprocess.run(
                 ["bash", "-c", f"cd {tmpdir} && {Path(__file__).parent.parent}/lmer --no-task --exec 'echo test'"],
                 capture_output=True,
-                text=True
+                text=True,
+                env=lmer_subprocess_env,
             )
 
             # Should not show .env loading message (but will show "not found" message)

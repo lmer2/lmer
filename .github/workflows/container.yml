@@ -1,0 +1,72 @@
+name: Container image
+
+on:
+  push:
+    branches: [main, prep-release]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  # Pinned to lmer2/lmer to match the hard-coded DEFAULT_REGISTRY in
+  # src/lmer_cli/build.py. Forks that want to publish their own images should
+  # change both sides together, otherwise pushed tags won't be what the CLI
+  # tries to pull.
+  IMAGE_NAME: lmer2/lmer
+
+jobs:
+  build-and-push:
+    name: build and push to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          image="${REGISTRY}/${IMAGE_NAME}"
+          tags="${image}:${short_sha}"
+
+          ref_type="${GITHUB_REF_TYPE:-}"
+          ref_name="${GITHUB_REF_NAME:-}"
+          if [ "${ref_type}" = "branch" ]; then
+            # Convenience moving tag for the branch tip
+            tags="${tags},${image}:${ref_name}"
+          elif [ "${ref_type}" = "tag" ]; then
+            # Release tags like v0.2.0 → also publish 0.2.0 to match
+            # resolve_image_tag() returning the PyPI-style version.
+            version="${ref_name#v}"
+            tags="${tags},${image}:${version}"
+          fi
+          echo "tags=${tags}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Containerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build with non-root UID/GID matching what lmer expects at run-time.
+          # (Local installs override via BUILD_UID/BUILD_GID — see Makefile.)
+          build-args: |
+            BUILD_UID=1000
+            BUILD_GID=1000
