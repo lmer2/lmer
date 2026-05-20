@@ -1,0 +1,35 @@
+# Mise configuration for LMER container
+# Tools can be installed on-demand with: mise use -g <tool>@latest
+
+[tools]
+# Default tools (installed at container build time)
+node = "lts"
+gh = "latest"
+glab = "latest"
+claude-powerline = "latest"
+
+# Cloud CLI tools (on-demand)
+# kubectl = "latest"
+# awscli = "latest"
+# gcloud = "latest"
+# azure-cli = "latest"
+# oci-cli = "latest"
+
+# Kubernetes tools
+# helm = "latest"
+# kubie = "latest"
+# k9s = "latest"
+# kubectx = "latest"
+
+# Infrastructure as Code
+# terraform = "latest"
+# terragrunt = "latest"
+# pulumi = "latest"
+
+# Development tools
+# python = "3.11"
+# go = "latest"
+# rust = "latest"
+
+[settings]
+experimental = true

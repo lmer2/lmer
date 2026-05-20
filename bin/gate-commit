@@ -1,0 +1,71 @@
+#!/Agents/global/.venv/bin/python3
+"""
+Gate Commit - Enforces all rules then commits if checks pass
+"""
+
+import sys
+import os
+import subprocess
+import argparse
+
+# Add src directory to path to use source files, not installed package
+src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+sys.path.insert(0, src_dir)
+
+from lmer_cli.gates import GateSystem, Colors
+from lmer_cli.util import get_bool_env
+
+
+def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
+    """Run gate checks and commit if passed"""
+
+    if bypass:
+        print(f"{Colors.YELLOW}{Colors.BOLD}⚠️  GATE COMMIT - Bypassing checks{Colors.NC}\n")
+    else:
+        print(f"{Colors.CYAN}{Colors.BOLD}🔒 GATE COMMIT - Running checks...{Colors.NC}\n")
+
+        # LMER_QUICK_GATE_COMMIT skips the slow test suite; gate-check and
+        # gate-push still run it, so coverage is preserved at push time.
+        # Accepts standard boolean strings (1/0, true/false, yes/no).
+        skip_tests = get_bool_env("LMER_QUICK_GATE_COMMIT")
+        if skip_tests:
+            print(f"{Colors.YELLOW}ℹ️  LMER_QUICK_GATE_COMMIT enabled — tests will be skipped{Colors.NC}")
+
+        # Run commit gate
+        gate = GateSystem(verbose=verbose)
+        if not gate.run_commit_gate(skip_tests=skip_tests):
+            print(f"\n{Colors.RED}❌ Commit aborted due to gate failures{Colors.NC}")
+            return 1
+
+    # Check for Claude attribution in commit message
+    claude_patterns = ["co-authored-by: claude", "co-authored-by: anthropic", "claude opus", "claude sonnet", "claude haiku", "noreply@anthropic.com"]
+    msg_lower = message.lower()
+    for pattern in claude_patterns:
+        if pattern in msg_lower:
+            print(f"\n{Colors.RED}❌ Commit message contains Claude attribution: '{pattern}'{Colors.NC}")
+            print(f"{Colors.RED}   Remove it and try again.{Colors.NC}")
+            return 1
+
+    # Commit with message
+    print(f"\n{Colors.GREEN}✅ Gate checks passed!{Colors.NC}")
+    print(f"{Colors.CYAN}Committing with message: {message}{Colors.NC}")
+
+    result = subprocess.run(["git", "commit", "-m", message], check=False)
+
+    if result.returncode == 0:
+        print(f"{Colors.GREEN}✅ Commit successful!{Colors.NC}")
+    else:
+        print(f"{Colors.RED}❌ Commit failed{Colors.NC}")
+
+    return result.returncode
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Gate commit - enforces all rules before commit")
+    parser.add_argument('-m', '--message', help='Commit message', required=True)
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('--bypass', action='store_true', help='Bypass gate checks')
+
+    args = parser.parse_args()
+
+    sys.exit(gate_commit(args.message, args.verbose, args.bypass))

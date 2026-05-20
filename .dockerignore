@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+LOCAL/
+*.log
+.claude/
+
+# Secrets
+.env
+.env.*
+
+# Build artifacts
+node_modules/
+dist/
+build/
+*.egg
+.eggs/
+
+# Docker
+Containerfile
+.dockerignore

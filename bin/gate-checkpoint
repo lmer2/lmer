@@ -1,0 +1,177 @@
+#!/Agents/global/.venv/bin/python3
+"""
+Checkpoint - Create development checkpoints with full validation
+"""
+
+import sys
+import os
+import subprocess
+import argparse
+import json
+from datetime import datetime
+from pathlib import Path
+
+# Add parent directory to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from lmer_cli.gates import GateSystem, Colors
+
+
+class Checkpoint:
+    """Manage development checkpoints"""
+
+    def __init__(self):
+        self.checkpoint_dir = Path.home() / '.claude' / 'checkpoints'
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_file = self.checkpoint_dir / 'checkpoints.json'
+
+    def load_checkpoints(self) -> list:
+        """Load existing checkpoints"""
+        if self.checkpoint_file.exists():
+            with open(self.checkpoint_file, 'r') as f:
+                return json.load(f)
+        return []
+
+    def save_checkpoints(self, checkpoints: list):
+        """Save checkpoints to file"""
+        with open(self.checkpoint_file, 'w') as f:
+            json.dump(checkpoints, f, indent=2)
+
+    def create(self, name: str, description: str = None, run_gate: bool = True):
+        """Create a new checkpoint"""
+
+        if run_gate:
+            print(f"{Colors.CYAN}🔍 Running gate checks...{Colors.NC}\n")
+            gate = GateSystem()
+            if not gate.run_commit_gate():
+                print(f"\n{Colors.RED}❌ Cannot create checkpoint - gate checks failed{Colors.NC}")
+                return False
+
+        # Get current git state
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True
+        ).stdout.strip()
+
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True
+        ).stdout.strip()
+
+        # Create checkpoint
+        checkpoint = {
+            'name': name,
+            'description': description or '',
+            'timestamp': datetime.now().isoformat(),
+            'branch': branch,
+            'commit': commit,
+            'tests_passed': True,
+            'gates_passed': run_gate
+        }
+
+        # Save checkpoint
+        checkpoints = self.load_checkpoints()
+        checkpoints.append(checkpoint)
+        self.save_checkpoints(checkpoints)
+
+        print(f"{Colors.GREEN}✅ Checkpoint '{name}' created successfully!{Colors.NC}")
+        print(f"   Branch: {branch}")
+        print(f"   Commit: {commit[:8]}")
+        print(f"   Time: {checkpoint['timestamp']}")
+
+        return True
+
+    def list(self):
+        """List all checkpoints"""
+        checkpoints = self.load_checkpoints()
+
+        if not checkpoints:
+            print(f"{Colors.YELLOW}No checkpoints found{Colors.NC}")
+            return
+
+        print(f"{Colors.CYAN}{Colors.BOLD}📍 Development Checkpoints{Colors.NC}\n")
+
+        for cp in checkpoints[-10:]:  # Show last 10
+            status = "✅" if cp.get('gates_passed', True) else "⚠️"
+            print(f"{status} {cp['name']}")
+            print(f"   Time: {cp['timestamp']}")
+            print(f"   Branch: {cp['branch']}")
+            print(f"   Commit: {cp['commit'][:8]}")
+            if cp.get('description'):
+                print(f"   Description: {cp['description']}")
+            print()
+
+    def restore(self, name: str):
+        """Restore to a checkpoint"""
+        checkpoints = self.load_checkpoints()
+
+        checkpoint = None
+        for cp in checkpoints:
+            if cp['name'] == name:
+                checkpoint = cp
+                break
+
+        if not checkpoint:
+            print(f"{Colors.RED}❌ Checkpoint '{name}' not found{Colors.NC}")
+            return False
+
+        print(f"{Colors.CYAN}📍 Restoring to checkpoint '{name}'...{Colors.NC}")
+        print(f"   Branch: {checkpoint['branch']}")
+        print(f"   Commit: {checkpoint['commit'][:8]}")
+
+        # Check for uncommitted changes
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True
+        ).stdout.strip()
+
+        if status:
+            print(f"{Colors.YELLOW}⚠️  You have uncommitted changes. Stash them first.{Colors.NC}")
+            return False
+
+        # Checkout branch and commit
+        subprocess.run(["git", "checkout", checkpoint['branch']], check=False)
+        subprocess.run(["git", "reset", "--hard", checkpoint['commit']], check=False)
+
+        print(f"{Colors.GREEN}✅ Restored to checkpoint '{name}'{Colors.NC}")
+        return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Development checkpoint system")
+    subparsers = parser.add_subparsers(dest='command', help='Commands')
+
+    # Create checkpoint
+    create_parser = subparsers.add_parser('create', help='Create a checkpoint')
+    create_parser.add_argument('name', help='Checkpoint name')
+    create_parser.add_argument('-d', '--description', help='Description')
+    create_parser.add_argument('--no-gate', action='store_true', help='Skip gate checks')
+
+    # List checkpoints
+    list_parser = subparsers.add_parser('list', help='List checkpoints')
+
+    # Restore checkpoint
+    restore_parser = subparsers.add_parser('restore', help='Restore to checkpoint')
+    restore_parser.add_argument('name', help='Checkpoint name')
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 1
+
+    cp = Checkpoint()
+
+    if args.command == 'create':
+        success = cp.create(args.name, args.description, not args.no_gate)
+        return 0 if success else 1
+    elif args.command == 'list':
+        cp.list()
+        return 0
+    elif args.command == 'restore':
+        success = cp.restore(args.name)
+        return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

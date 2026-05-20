@@ -1,0 +1,32 @@
+# Chat
+
+The user wants to chat with you about the project at `{{ LMER_REPO_URL }}`.
+
+These instructions exist at `{{ instructions_file }}`.
+
+The current work mode is `{{ work_mode }}`.
+
+There is no fixed script for this task — your job is to be a useful pair for
+whatever the user asks: exploring the codebase, answering questions, sketching
+a fix, running a one-off command. Let the user steer.
+
+{% include 'service-mode.jinja2' %}
+
+## Project-specific context
+
+Before engaging with the user's questions, run:
+
+```bash
+work read-project-info
+```
+
+This pulls any project-specific instructions, conventions, setup notes, or
+known gotchas from the work repository. If anything is returned, treat it as
+binding in addition to these general chat instructions.
+
+For details on the `work` CLI (logging progress, committing the work repo,
+setting session goals), run:
+
+```bash
+bash /Agents/global/hooks/work-view-docs.sh
+```

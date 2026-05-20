@@ -1,0 +1,263 @@
+#!/Agents/global/.venv/bin/python3
+"""
+Hook for start command.
+Prompts the task's instructions to Claude at the start of a task.
+Usage:
+  start [work_mode]  - Read instructions with optional work mode (default: "finish", valid: "finish", "phasic")
+  start               - Read instructions from current task context (LMER_TASK) with default work mode "finish"
+"""
+import sys
+import os
+import time
+from pathlib import Path
+import json
+from jinja2 import Environment, FileSystemLoader, Template
+
+
+def work_repo_taskdef_dirs():
+    """Return work-repo taskdef directories in precedence order.
+
+    Looks up:
+      1. {LMER_WORK_REPO_PATH}/{LMER_REPO_HOST}/{LMER_REPO_PROJECT}/taskdef/
+         (project-scoped — applies only to the current project)
+      2. {LMER_WORK_REPO_PATH}/taskdef/
+         (work-global — applies to all projects)
+
+    Only directories that exist on disk are returned. Returns an empty list
+    when LMER_WORK_REPO_PATH is unset or does not exist.
+    """
+    dirs = []
+    work_repo_path = os.environ.get("LMER_WORK_REPO_PATH")
+    if not work_repo_path:
+        return dirs
+    work_root = Path(work_repo_path)
+    if not work_root.is_dir():
+        return dirs
+
+    repo_host = os.environ.get("LMER_REPO_HOST")
+    repo_project = os.environ.get("LMER_REPO_PROJECT")
+    if repo_host and repo_project:
+        project_dir = work_root / repo_host / repo_project / "taskdef"
+        if project_dir.is_dir():
+            dirs.append(project_dir)
+
+    global_dir = work_root / "taskdef"
+    if global_dir.is_dir():
+        dirs.append(global_dir)
+
+    return dirs
+
+
+def taskdef_search_dirs():
+    """Return ordered list of directories to search for task definitions.
+
+    Precedence (first match wins):
+      1. Work-repo project taskdefs: {work_repo}/{host}/{project}/taskdef/
+      2. Work-repo global taskdefs: {work_repo}/taskdef/
+      3. LMER_TASKDEF_PATHS entries (colon-separated)
+      4. Built-in taskdef directory (under /home/developer/.lmer or
+         /Agents/global, depending on what is mounted)
+    """
+    lmer_global = Path("/home/developer/.lmer")
+    agents_global = Path("/Agents/global")
+
+    if lmer_global.exists():
+        base_path = lmer_global
+    elif agents_global.exists():
+        base_path = agents_global
+    else:
+        base_path = Path.cwd()
+
+    search_dirs = list(work_repo_taskdef_dirs())
+
+    extra_paths = os.environ.get("LMER_TASKDEF_PATHS", "")
+    if extra_paths:
+        for p in extra_paths.split(":"):
+            p = p.strip()
+            if p:
+                search_dirs.append(Path(p))
+
+    search_dirs.append(base_path / "taskdef")
+    return search_dirs
+
+
+def find_taskdef_file(filename, taskdef_name=None):
+    """Locate a file inside the active task definition directory.
+
+    Resolution order:
+      1. taskdef_search_dirs() — work-repo (project, then global), then
+         LMER_TASKDEF_PATHS, then the built-in taskdef directory. This is
+         the canonical precedence; work-repo overrides naturally win here.
+      2. LMER_TASKDEF_DIR env var — fallback fast path the CLI sets when it
+         pre-resolves the taskdef directory. In practice this points into
+         one of the search_dirs entries already, but is retained for cases
+         where the CLI sets it to a path not covered by the search list.
+      3. LMER_TASK_INSTRUCTIONS env var parent — older fallback equivalent
+         to LMER_TASKDEF_DIR (the CLI sets both to the same directory).
+
+    Returns a Path if found, else None. This function is silent; callers are
+    responsible for any user-facing error reporting.
+    """
+    if not taskdef_name:
+        taskdef_name = os.environ.get('LMER_TASK') or os.environ.get('LMER_TASKDEF')
+
+    if taskdef_name:
+        for search_dir in taskdef_search_dirs():
+            candidate = search_dir / taskdef_name / filename
+            if candidate.exists():
+                return candidate
+
+    taskdef_dir_env = os.environ.get('LMER_TASKDEF_DIR')
+    if taskdef_dir_env:
+        candidate = Path(taskdef_dir_env) / filename
+        if candidate.exists():
+            return candidate
+
+    pre_resolved = os.environ.get('LMER_TASK_INSTRUCTIONS')
+    if pre_resolved:
+        candidate = Path(pre_resolved).parent / filename
+        if candidate.exists():
+            return candidate
+
+    return None
+
+
+def find_taskdef_instructions(taskdef_name=None):
+    """Find and read task definition instructions."""
+    resolved_name = taskdef_name or os.environ.get('LMER_TASK') or os.environ.get('LMER_TASKDEF')
+    instructions_file = find_taskdef_file("instructions.txt", resolved_name)
+    if instructions_file:
+        return instructions_file
+
+    if not resolved_name:
+        print("❌ ERROR: No task definition specified and LMER_TASK not set")
+        print("💡 Usage: start [work_mode]")
+        return None
+
+    search_dirs = taskdef_search_dirs()
+    print(f"❌ ERROR: Instructions file not found for task '{resolved_name}'")
+    print(f"💡 Searched in: {', '.join(str(d) for d in search_dirs)}")
+    available = []
+    for search_dir in search_dirs:
+        if search_dir.exists():
+            available.extend(d.name for d in search_dir.iterdir() if d.is_dir())
+    if available:
+        print(f"📁 Available task definitions: {', '.join(sorted(set(available)))}")
+    return None
+
+
+def render_taskdef_template(template_file, extra_context=None):
+    """Render a task-definition template file with LMER_* env vars as context.
+
+    Sets up a Jinja2 environment that can resolve `{% include %}` references
+    against the current taskdef's parent directory, any LMER_TASKDEF_PATHS
+    entries, and the built-in taskdef root. Returns the rendered string.
+    """
+    taskdef_dir = template_file.parent.parent
+    search_paths = [str(taskdef_dir)]
+    for work_dir in work_repo_taskdef_dirs():
+        if str(work_dir) not in search_paths:
+            search_paths.append(str(work_dir))
+    extra_paths = os.environ.get("LMER_TASKDEF_PATHS", "")
+    if extra_paths:
+        for p in extra_paths.split(":"):
+            p = p.strip()
+            if p and p not in search_paths:
+                search_paths.append(p)
+    builtin_taskdef = Path(os.environ.get("LMER_TASKDEF_ROOT", ""))
+    if builtin_taskdef.is_dir() and str(builtin_taskdef) not in search_paths:
+        search_paths.append(str(builtin_taskdef))
+    env = Environment(loader=FileSystemLoader(search_paths))
+
+    template_name = template_file.relative_to(taskdef_dir)
+    template = env.get_template(str(template_name))
+
+    context = {k: v for k, v in os.environ.items() if k.startswith('LMER_')}
+    context['taskdef_name'] = template_file.parent.name
+    context['taskdef_file'] = str(template_file)
+    if extra_context:
+        context.update(extra_context)
+
+    return template.render(**context)
+
+
+def read_and_display_instructions(instructions_file, work_mode="finish"):
+    """Read and display the task instructions, rendering with Jinja2."""
+    print(f"📋 Task Instructions: {instructions_file.parent.name}")
+    print(f"📍 Location: {instructions_file}")
+    print("\n" + "="*60)
+
+    rendered_content = render_taskdef_template(
+        instructions_file,
+        extra_context={
+            'instructions_file': str(instructions_file),
+            'work_mode': work_mode,
+        },
+    )
+    print(rendered_content)
+
+    print("="*60 + "\n")
+
+    timestamp_file = Path.home() / ".claude/last_start_timestamp"
+    timestamp_file.parent.mkdir(exist_ok=True)
+
+    with open(timestamp_file, 'w') as f:
+        json.dump({
+            "timestamp": time.time(),
+            "file": str(instructions_file),
+            "taskdef": instructions_file.parent.name
+        }, f)
+
+    return True
+
+
+def check_task_context():
+    """Display current task context from environment variables."""
+    repo_url = os.environ.get('LMER_REPO_URL')
+    task_target = os.environ.get('LMER_TASK_TARGET')
+    task = os.environ.get('LMER_TASK') or os.environ.get('LMER_TASKDEF')
+
+    if any([repo_url, task_target, task]):
+        print("\n📊 Task Context:")
+        if task:
+            print(f"  • Task: {task}")
+        if repo_url:
+            print(f"  • Repository: {repo_url}")
+        if task_target:
+            print(f"  • Target: {task_target}")
+        print()
+
+
+def main():
+    """Main hook execution."""
+    # Parse work mode parameter (default: "finish")
+    work_mode = "finish"
+    if len(sys.argv) > 1:
+        work_mode = sys.argv[1]
+        # Validate work mode
+        valid_modes = ["finish", "phasic"]
+        if work_mode not in valid_modes:
+            print(f"⚠️  WARNING: Invalid work mode '{work_mode}'. Valid modes: {', '.join(valid_modes)}")
+            print(f"   Using default mode: 'finish'\n")
+            work_mode = "finish"
+
+    print(f"🚀 Starting task (work mode: {work_mode})...\n")
+
+    # Find instructions file (no longer accepts taskdef override)
+    instructions_file = find_taskdef_instructions(None)
+    if not instructions_file:
+        sys.exit(1)
+
+    # Display current task context
+    check_task_context()
+
+    # Read and display instructions
+    if not read_and_display_instructions(instructions_file, work_mode):
+        sys.exit(1)
+
+    print("✅ Task instructions loaded")
+    print("📋 Next: Begin working on the task following the instructions\n")
+
+
+if __name__ == "__main__":
+    main()

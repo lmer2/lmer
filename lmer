@@ -1,0 +1,40 @@
+#!/bin/bash
+# LMER wrapper - activates uv environment and calls lmer Python CLI
+
+# Prefer Python 3.12 for uv (matches container and pyproject.toml requires-python)
+export UV_PYTHON=python3.12
+
+# Find the script directory and repo root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Try to find repo root by looking for pyproject.toml or .venv
+# If script is in bin/, go up one level
+if [ -f "$SCRIPT_DIR/../pyproject.toml" ]; then
+    REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+elif [ -f "$SCRIPT_DIR/pyproject.toml" ]; then
+    REPO_ROOT="$SCRIPT_DIR"
+else
+    # If we're in the repo root, use current directory
+    if [ -f "./pyproject.toml" ]; then
+        REPO_ROOT="$(pwd)"
+    else
+        # Fallback to global installation
+        REPO_ROOT="$HOME/.lmer"
+    fi
+fi
+
+# Determine the venv path to use
+VENV_PATH=""
+if [ -d "$REPO_ROOT/.venv" ]; then
+    VENV_PATH="$REPO_ROOT/.venv"
+elif [ -d "$HOME/.lmer/.venv" ]; then
+    VENV_PATH="$HOME/.lmer/.venv"
+fi
+
+if [ -z "$VENV_PATH" ]; then
+    echo "Error: No virtual environment found" >&2
+    exit 1
+fi
+
+# Call lmer directly from the venv bin (avoid recursive wrapper call)
+exec "$VENV_PATH/bin/lmer" "$@"

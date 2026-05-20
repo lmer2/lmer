@@ -1,0 +1,340 @@
+"""
+Container volume mount configuration.
+
+This module handles building Docker/Podman volume mount arguments for various
+components including workspaces, global configurations, repositories, and user
+home directory files. It handles differences between Docker and Podman, including
+SELinux labeling requirements for Podman.
+"""
+
+import os
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+from lmer_cli.runtime import _is_selinux_enforcing
+
+EXTERNAL_TASKDEF_MOUNT_BASE = "/Agents/taskdefs"
+
+
+def selinux_opt(runtime: str) -> str:
+    """
+    Return SELinux volume label suffix when needed.
+
+    Both Docker and Podman require ,z suffix for SELinux private labeling
+    to allow container access to mounted volumes on SELinux-enabled systems.
+
+    Args:
+        runtime: Container runtime name ('docker' or 'podman')
+
+    Returns:
+        ',z' if SELinux is enforcing, empty string otherwise
+    """
+    return ",z" if _is_selinux_enforcing() else ""
+
+
+def build_workspace_mount(
+    runtime: str,
+    workspace_volume: Optional[str],
+    workspace_bind: Optional[Path],
+) -> List[str]:
+    """
+    Build volume mount arguments for /workspace directory.
+
+    Creates mount for the container's working directory. Prioritizes bind mount
+    over named volume, falls back to tmpfs for ephemeral workspaces.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        workspace_volume: Optional named volume name
+        workspace_bind: Optional host path to bind mount
+
+    Returns:
+        List of Docker/Podman arguments for workspace mount
+    """
+    args: List[str] = []
+    se = selinux_opt(runtime)
+    if workspace_bind:
+        args += ["-v", f"{workspace_bind}:/workspace:rw{se}"]
+    elif workspace_volume:
+        args += ["-v", f"{workspace_volume}:/workspace:rw{se}"]
+    else:
+        if runtime == "docker":
+            args += ["--mount", "type=tmpfs,destination=/workspace"]
+        else:
+            args += ["--tmpfs", "/workspace"]
+    return args
+
+
+def build_global_mount(runtime: str, repo_root: Path) -> List[str]:
+    """
+    Build volume mounts for the global rules repository.
+
+    Mounts specific directories from the lmer repository into the container
+    at /Agents/global. Excludes .venv to allow container to use its own
+    Python environment built during image creation.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        repo_root: Path to the lmer repository root
+
+    Returns:
+        List of Docker/Podman arguments for global mounts
+    """
+    se = selinux_opt(runtime)
+    args: List[str] = []
+
+    # Directories needed by the container (excludes .venv, cache, build artifacts)
+    # Read-write directories
+    rw_dirs = ["bin", "src", "hooks", "Ctl", "libexec"]
+    # Read-only directories
+    ro_dirs = [".claude", "agent-files", "rules", "taskdef"]
+    # Individual files
+    ro_files = ["AGENTS.md"]
+    rw_files = [".env"]
+
+    for dir_name in rw_dirs:
+        dir_path = repo_root / dir_name
+        if dir_path.exists():
+            args += ["-v", f"{dir_path}:/Agents/global/{dir_name}:rw{se}"]
+
+    for dir_name in ro_dirs:
+        dir_path = repo_root / dir_name
+        if dir_path.exists():
+            args += ["-v", f"{dir_path}:/Agents/global/{dir_name}:ro{se}"]
+
+    for file_name in ro_files:
+        file_path = repo_root / file_name
+        if file_path.exists():
+            args += ["-v", f"{file_path}:/Agents/global/{file_name}:ro{se}"]
+
+    for file_name in rw_files:
+        file_path = repo_root / file_name
+        if file_path.exists():
+            args += ["-v", f"{file_path}:/Agents/global/{file_name}:rw{se}"]
+
+    return args
+
+
+def build_lmer_docs_mount(runtime: str, repo_root: Path) -> List[str]:
+    """
+    Build volume mount for lmer-docs directory.
+
+    Mounts the lmer-docs directory into the container at /Agents/global/lmer-docs.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        repo_root: Path to the lmer repository root
+
+    Returns:
+        List of Docker/Podman arguments for lmer-docs mount
+    """
+    se = selinux_opt(runtime)
+    lmer_docs = repo_root / "lmer-docs"
+    if lmer_docs.exists():
+        return ["-v", f"{lmer_docs}:/Agents/global/lmer-docs:ro{se}"]
+    return []
+
+
+def build_host_repo_ro_mount(runtime: str, host_repo_path: Path) -> List[str]:
+    """
+    Build read-only mount for local repository on host.
+
+    When the target is a local git repository, mounts it read-only into
+    the container for reference during cloning.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        host_repo_path: Path to local repository on host
+
+    Returns:
+        List of Docker/Podman arguments for host repo mount
+    """
+    se = selinux_opt(runtime)
+    return ["-v", f"{host_repo_path}:/host-repo:ro{se}"]
+
+
+def build_container_home_mounts(runtime: str, container_home: Path) -> List[str]:
+    """
+    Build mounts for persistent container-home directory.
+
+    Mounts persistent directories from container-home for SSH keys, configs,
+    shell history, and app data that should persist across container sessions.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        container_home: Path to container-home directory on host
+
+    Returns:
+        List of Docker/Podman arguments for container-home mounts
+    """
+    args: List[str] = []
+    se = selinux_opt(runtime)
+
+    # Mount SSH directory for git/ssh operations
+    ssh_dir = container_home / ".ssh"
+    if ssh_dir.exists():
+        args += ["-v", f"{ssh_dir}:/home/developer/.ssh:rw{se}"]
+
+    # Mount config directory for various app configs
+    config_dir = container_home / ".config"
+    if config_dir.exists():
+        args += ["-v", f"{config_dir}:/home/developer/.config:rw{se}"]
+
+    # Mount bash history for persistence
+    bash_history = container_home / ".bash_history"
+    if bash_history.exists():
+        args += ["-v", f"{bash_history}:/home/developer/.bash_history:rw{se}"]
+
+    # Mount gitconfig if it exists (read-write so git can add safe.directory)
+    gitconfig = container_home / ".gitconfig"
+    if gitconfig.exists():
+        args += ["-v", f"{gitconfig}:/home/developer/.gitconfig:rw{se}"]
+
+    # Mount only specific .local subdirectories to preserve image-installed
+    # binaries in .local/bin/ and .local/share/claude/ (claude CLI)
+    for subdir in ["share/mise", "state"]:
+        local_sub = container_home / ".local" / subdir
+        if local_sub.exists():
+            args += ["-v", f"{local_sub}:/home/developer/.local/{subdir}:rw{se}"]
+
+    return args
+
+
+def build_user_mounts(runtime: str) -> Tuple[List[str], bool]:
+    """
+    Build mounts for user configuration files and SSH agent.
+
+    Mounts only Claude credentials file (not entire .claude directory) and SSH
+    authentication socket from the host user's home directory into the container.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+
+    Returns:
+        Tuple of (mount arguments, ssh_agent_enabled flag)
+    """
+    args: List[str] = []
+    se = selinux_opt(runtime)
+    home = Path.home()
+    ssh_agent_enabled = False
+
+    # Only mount credentials file, not entire .claude directory
+    # This avoids ownership issues with other .claude subdirectories
+    credentials_file = home / ".claude" / ".credentials.json"
+    if credentials_file.exists():
+        # Ensure .claude directory exists in container first
+        args += ["-v", f"{credentials_file}:/home/developer/.claude/.credentials.json:rw{se}"]
+
+    # .claude.json
+    if (home / ".claude.json").exists():
+        args += ["-v", f"{home}/.claude.json:/home/developer/.claude.json:rw{se}"]
+    # SSH agent
+    ssh_sock = os.environ.get("SSH_AUTH_SOCK")
+    if ssh_sock:
+        args += ["-v", f"{ssh_sock}:/ssh-agent:ro{se}", "-e", "SSH_AUTH_SOCK=/ssh-agent"]
+        ssh_agent_enabled = True
+    return args, ssh_agent_enabled
+
+
+def _find_container_socket(runtime: str) -> Optional[Path]:
+    """Find the container runtime socket path."""
+    candidates: List[str] = []
+    if runtime == "podman":
+        # Podman: rootless first, then rootful
+        uid = os.getuid()
+        candidates = [
+            f"/run/user/{uid}/podman/podman.sock",
+            "/var/run/podman/podman.sock",
+            "/run/podman/podman.sock",
+        ]
+    else:
+        candidates = ["/var/run/docker.sock"]
+
+    for path_str in candidates:
+        p = Path(path_str)
+        if p.exists():
+            return p
+    return None
+
+
+def build_external_taskdef_mounts(
+    runtime: str,
+    taskdef_paths: List[Path],
+) -> Tuple[List[str], List[str]]:
+    """
+    Build volume mounts for external taskdef directories.
+
+    Each host path in *taskdef_paths* is mounted read-only into the container
+    under /Agents/taskdefs/<index>.  The function returns both the mount args
+    and the corresponding container-side paths so callers can build
+    LMER_TASKDEF_PATHS for the container environment.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        taskdef_paths: Host-side paths from LMER_TASKDEF_PATHS
+
+    Returns:
+        (mount_args, container_paths) – Docker/Podman args and the
+        container-side directories in the same order as *taskdef_paths*.
+    """
+    se = selinux_opt(runtime)
+    args: List[str] = []
+    container_paths: List[str] = []
+    for idx, host_path in enumerate(taskdef_paths):
+        if not host_path.exists() or not host_path.is_dir():
+            continue
+        container_dir = f"{EXTERNAL_TASKDEF_MOUNT_BASE}/{idx}"
+        args += ["-v", f"{host_path}:{container_dir}:ro{se}"]
+        container_paths.append(container_dir)
+    return args, container_paths
+
+
+def build_checkout_mount(runtime: str, checkout_path: Path) -> List[str]:
+    """
+    Build volume mount for a local checkout as /workspace.
+
+    Used when --checkout is specified without --service (no Docker socket needed).
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        checkout_path: Absolute path to local source checkout on host
+
+    Returns:
+        List of Docker/Podman arguments for the workspace mount
+    """
+    se = selinux_opt(runtime)
+    return ["-v", f"{checkout_path}:/workspace:rw{se}"]
+
+
+def build_service_mode_mounts(runtime: str, checkout_path: Path) -> List[str]:
+    """
+    Build volume mounts for service mode.
+
+    Mounts the local checkout as /workspace and the container runtime socket
+    for exec access to the target service container.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        checkout_path: Absolute path to local source checkout on host
+
+    Returns:
+        List of Docker/Podman arguments for service mode mounts
+    """
+    args = build_checkout_mount(runtime, checkout_path)
+
+    # Mount container runtime socket for exec access
+    sock = _find_container_socket(runtime)
+    if sock is not None:
+        # Always mount to /var/run/docker.sock inside the container so that
+        # docker-cli (installed in the image) can find it regardless of which
+        # runtime is on the host.
+        container_sock = "/var/run/docker.sock"
+        args += ["-v", f"{sock}:{container_sock}:rw"]
+        # Add the socket's group so the container user can access it
+        try:
+            sock_gid = sock.stat().st_gid
+            args += ["--group-add", str(sock_gid)]
+        except OSError:
+            pass
+
+    return args

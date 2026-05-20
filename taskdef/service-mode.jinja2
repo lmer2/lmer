@@ -1,0 +1,64 @@
+{% if LMER_SERVICE_MODE is defined and LMER_SERVICE_MODE == '1' %}
+## Service Mode
+
+A development environment is running with service `{{ LMER_SERVICE_NAME }}`.
+Your workspace at `/workspace` contains the project source code from the
+developer's local checkout on the host.
+
+### How the shared volume works
+
+Both your `/workspace` and the service container mount from the **same host
+directory**. However, the service container may mount only specific
+subdirectories (not the entire repo). To find out what's shared:
+
+```bash
+# See how the service container mounts the source
+docker inspect {{ LMER_SERVICE_CONTAINER }} --format '{% raw %}{{json .Mounts}}{% endraw %}' | python3 -m json.tool
+
+# Check the service container's working directory
+target-exec pwd
+```
+
+Edits to files under shared mount points are immediately visible in both
+directions. Files outside the service container's mounts are only in `/workspace`.
+
+### Running commands in the project environment
+
+Use `target-exec` to run commands inside the service container (which has the
+project's runtime, database connections, installed packages, etc.):
+
+```bash
+# Run tests
+target-exec pytest tests/ -x
+
+# Django management commands
+target-exec python manage.py migrate
+target-exec python manage.py shell
+
+# Check installed packages
+target-exec pip list
+
+# Run arbitrary commands
+target-exec <command> [args...]
+```
+
+### Viewing service logs
+
+```bash
+# Target service logs (follow mode)
+target-logs
+
+# Another container's logs
+target-logs <container-name>
+
+# Last N lines of a container
+target-logs <container-name> 100
+```
+
+### Important notes
+
+- **Edit files locally** in `/workspace` using normal tools (vim, sed, etc.)
+- **Run project commands** via `target-exec` (pytest, manage.py, pip, etc.)
+- **Git operations** run directly in `/workspace` (not via target-exec)
+- The service container may only mount **specific subdirectories** — check mounts before assuming file visibility
+{% endif %}

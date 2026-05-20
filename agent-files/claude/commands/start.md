@@ -1,0 +1,17 @@
+---
+description: Start task by reading instructions (supports work modes: finish, phasic)
+allowed-tools: Bash(/Agents/global/hooks/start.sh), Bash(/Agents/global/hooks/start.sh:*), Bash(bash /Agents/global/hooks/start.sh), Bash(bash /Agents/global/hooks/start.sh:*), Bash(/Agents/global/hooks/gitlab-review-docs.sh), Bash(/Agents/global/hooks/gitlab-review-docs.sh:*), Bash(bash /Agents/global/hooks/gitlab-review-docs.sh), Bash(bash /Agents/global/hooks/gitlab-review-docs.sh:*), Bash(/Agents/global/hooks/gitlab-review-post-review.sh), Bash(/Agents/global/hooks/gitlab-review-post-review.sh:*), Bash(bash /Agents/global/hooks/gitlab-review-post-review.sh), Bash(bash /Agents/global/hooks/gitlab-review-post-review.sh:*), Bash(/Agents/global/hooks/work-view-docs.sh), Bash(/Agents/global/hooks/work-view-docs.sh:*), Bash(bash /Agents/global/hooks/work-view-docs.sh), Bash(bash /Agents/global/hooks/work-view-docs.sh:*), Bash(/Agents/global/hooks/rgr.sh), Bash(/Agents/global/hooks/rgr.sh:*), Bash(bash /Agents/global/hooks/rgr.sh), Bash(bash /Agents/global/hooks/rgr.sh:*), Bash(gitlab-review:*), Bash(work:*), Bash(git add:*), Bash(git branch:*), Bash(git branch), Bash(git checkout:*), Bash(git config:*), Bash(git diff:*), Bash(git fetch:*), Bash(git grep:*), Bash(git log:*), Bash(git ls-files:*), Bash(git ls-tree:*), Bash(git merge-base:*), Bash(git mv:*), Bash(git pull:*), Bash(git remote:*), Bash(git reset:*), Bash(git rev-parse:*), Bash(git rm:*), Bash(git show:*), Bash(git stash:*), Bash(git status:*), Bash(git status), Bash(gh issue view:*), Bash(python3:*), Bash(python:*), Bash(python -m pytest:*), Bash(basename:*), Bash(cat:*), Bash(chmod:*), Bash(cp:*), Bash(cut:*), Bash(date:*), Bash(diff:*), Bash(dirname:*), Bash(echo:*), Bash(env), Bash(env:*), Bash(find:*), Bash(grep:*), Bash(head:*), Bash(jq:*), Bash(ls:*), Bash(ls), Bash(make:*), Bash(mkdir:*), Bash(mv:*), Bash(pip:*), Bash(pwd), Bash(readlink:*), Bash(realpath:*), Bash(rm:*), Bash(sed:*), Bash(sort:*), Bash(source:*), Bash(tail:*), Bash(tee:*), Bash(test:*), Bash(touch:*), Bash(tr:*), Bash(true), Bash(wc:*), Bash(which:*), Bash(xargs:*), Bash(export:*), Bash(awk:*), Bash(pre-commit:*), Bash(pre-commit run:*), Bash(uv run:*), Bash(uv sync:*), Bash(bin/doctor), Bash(bin/doctor:*), Bash(bin/gate-check), Bash(bin/gate-check:*), Bash(bin/gate-commit:*), Bash(bin/gate-push:*), Bash(/Agents/global/bin/gate-check:*), Bash(/Agents/global/bin/gate-commit:*), Bash(/Agents/global/bin/gate-push:*), Bash(work read-project-info), Bash(work log:*), Bash(work commit:*), Bash(work goal:*), Bash(work report:*), Bash(work report --file:*), Edit(/tmp/**), Edit(/workspace/**), Edit(review.json), Edit(report.md), Write(/tmp/**), Write(/workspace/**), Write(review.json), Write(report.md), WebSearch, WebFetch(domain:github.com), WebFetch(domain:docs.github.com), WebFetch(domain:raw.githubusercontent.com), WebFetch(domain:api.github.com)
+---
+
+Load and display the task's instructions:
+
+**Usage:**
+- `/start` or `/start finish` - Default mode: complete task in one session
+- `/start phasic` - Phasic mode: work in phases with stopping points
+
+**Phasic mode** is useful for complex tasks where you want to review progress at checkpoints. Claude will:
+- Set goals using `work goal` for each phase
+- File reports at phase completion
+- Stop after each phase for your review
+
+!bash /Agents/global/hooks/start.sh

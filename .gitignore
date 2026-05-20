@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+.env
+*.egg-info/
+*.egg-info
+
+# IDE
+.vscode/
+.idea/
+
+.*.sw*
+.sw*
+
+*.log
+
+# Claude
+.claude/settings.local.json
+.claude/*.swp
+.claude/*.swo
+.claude/*.tmp
+.credentials.json
+
+# Temporary files
+*.tmp
+*.bak
+old.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# uv
+.python-version
+
+# Container persistent home
+container-home/
+
+implement/
+
+# custom
+.plan/
+build/
+third-party-docs/

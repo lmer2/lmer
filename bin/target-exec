@@ -1,0 +1,27 @@
+#!/bin/bash
+# Run a command inside the target service container.
+# Requires LMER_SERVICE_CONTAINER and LMER_SERVICE_WORKDIR environment variables.
+#
+# Usage:
+#   target-exec <command> [args...]
+#   target-exec pytest tests/ -x
+#   target-exec python manage.py migrate
+
+set -e
+
+if [ -z "$LMER_SERVICE_CONTAINER" ]; then
+    echo "❌ target-exec: not in service mode (LMER_SERVICE_CONTAINER not set)" >&2
+    echo "   Use --service <name> when launching lmer" >&2
+    exit 1
+fi
+
+if [ $# -eq 0 ]; then
+    echo "Usage: target-exec <command> [args...]" >&2
+    echo "  Runs a command inside the target service container" >&2
+    echo "  Container: $LMER_SERVICE_CONTAINER" >&2
+    echo "  Workdir:   ${LMER_SERVICE_WORKDIR:-/}" >&2
+    exit 1
+fi
+
+WORKDIR="${LMER_SERVICE_WORKDIR:-/}"
+exec docker exec -w "$WORKDIR" "$LMER_SERVICE_CONTAINER" "$@"

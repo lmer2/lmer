@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+# bin/doctor — Container health check command
+# Verifies that the container environment is fully operational.
+# Exit codes: 0 = healthy (warnings OK), 1 = errors found, 2 = doctor itself failed
+
+set -euo pipefail
+
+# --- Path detection ---
+# Check /Agents/global first, then $LMER_GLOBAL_DIR, then script's own parent dir
+if [[ -d "/Agents/global" ]]; then
+    GLOBAL_DIR="/Agents/global"
+elif [[ -n "${LMER_GLOBAL_DIR:-}" && -d "$LMER_GLOBAL_DIR" ]]; then
+    GLOBAL_DIR="$LMER_GLOBAL_DIR"
+else
+    GLOBAL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+fi
+
+# --- Flags ---
+QUIET=false
+VERBOSE=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -q|--quiet)  QUIET=true; shift ;;
+        -v|--verbose) VERBOSE=true; shift ;;
+        -h|--help)
+            echo "Usage: bin/doctor [-q|--quiet] [-v|--verbose]"
+            echo "  -q  Quiet mode: show errors only"
+            echo "  -v  Verbose mode: show details for all checks"
+            exit 0
+            ;;
+        *) echo "Unknown option: $1"; exit 2 ;;
+    esac
+done
+
+# --- Counters ---
+ERRORS=0
+WARNINGS=0
+PASSES=0
+
+# --- Output helpers ---
+pass() {
+    PASSES=$((PASSES + 1))
+    if ! $QUIET; then
+        echo "  ✓ $1"
+    fi
+}
+
+warn() {
+    WARNINGS=$((WARNINGS + 1))
+    if ! $QUIET; then
+        echo "  ⚠️  $1"
+    fi
+}
+
+error() {
+    ERRORS=$((ERRORS + 1))
+    echo "  ✗ $1"
+}
+
+detail() {
+    if $VERBOSE; then
+        echo "    → $1"
+    fi
+}
+
+section() {
+    if ! $QUIET; then
+        echo ""
+        echo "$1"
+    fi
+}
+
+# --- Header ---
+if ! $QUIET; then
+    echo "============================================================"
+    echo "🩺 DOCTOR — Container Health Check"
+    echo "============================================================"
+    detail "Global dir: $GLOBAL_DIR"
+fi
+
+# =============================================================================
+# 1. Slash Commands
+# =============================================================================
+section "📁 Slash Commands"
+
+CLAUDE_COMMANDS="$HOME/.claude/commands"
+if [[ -e "$CLAUDE_COMMANDS" ]]; then
+    pass "~/.claude/commands exists"
+    if [[ -L "$CLAUDE_COMMANDS" ]]; then
+        LINK_TARGET="$(readlink "$CLAUDE_COMMANDS")"
+        if [[ "$LINK_TARGET" == *"agent-files/claude/commands"* ]]; then
+            pass "Symlink target correct: $LINK_TARGET"
+        else
+            error "Symlink points to unexpected target: $LINK_TARGET"
+        fi
+    else
+        detail "~/.claude/commands is a directory (not a symlink)"
+    fi
+    MD_COUNT=$(find "$CLAUDE_COMMANDS" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
+    if [[ "$MD_COUNT" -gt 0 ]]; then
+        pass "Found $MD_COUNT slash command(s)"
+    else
+        error "No .md files in ~/.claude/commands"
+    fi
+else
+    error "~/.claude/commands does not exist"
+fi
+
+# =============================================================================
+# 2. Settings & Credentials
+# =============================================================================
+section "⚙️  Settings & Credentials"
+
+SETTINGS_FILE="$HOME/.claude/settings.json"
+if [[ -e "$SETTINGS_FILE" ]]; then
+    pass "settings.json exists"
+    if [[ -L "$SETTINGS_FILE" ]]; then
+        detail "Symlink target: $(readlink "$SETTINGS_FILE")"
+    fi
+else
+    error "settings.json missing at $SETTINGS_FILE"
+fi
+
+CREDS_FILE="$HOME/.claude/.credentials.json"
+if [[ -e "$CREDS_FILE" ]]; then
+    pass ".credentials.json exists"
+else
+    error ".credentials.json missing — authentication will fail"
+fi
+
+MCP_FILE="$HOME/.mcp.json"
+if [[ -e "$MCP_FILE" ]]; then
+    pass ".mcp.json exists"
+else
+    warn ".mcp.json missing — MCP tools unavailable"
+fi
+
+# =============================================================================
+# 3. Global Rules
+# =============================================================================
+section "📜 Global Rules"
+
+if [[ -f "$GLOBAL_DIR/AGENTS.md" ]]; then
+    pass "AGENTS.md accessible"
+else
+    error "AGENTS.md not found at $GLOBAL_DIR/AGENTS.md"
+fi
+
+if [[ -d "$GLOBAL_DIR/rules" ]]; then
+    RULE_COUNT=$(find "$GLOBAL_DIR/rules" -maxdepth 1 -name '*.md' 2>/dev/null | wc -l)
+    pass "rules/ directory exists ($RULE_COUNT rule files)"
+else
+    error "rules/ directory missing"
+fi
+
+if [[ -d "$GLOBAL_DIR/agent-files" ]]; then
+    pass "agent-files/ directory exists"
+else
+    error "agent-files/ directory missing"
+fi
+
+# =============================================================================
+# 4. Required Tools
+# =============================================================================
+section "🔧 Required Tools"
+
+for tool in git python3 claude node; do
+    if command -v "$tool" &>/dev/null; then
+        if $VERBOSE; then
+            tool_path="$(command -v "$tool")"
+            pass "$tool available ($tool_path)"
+        else
+            pass "$tool available"
+        fi
+    else
+        error "$tool not found on PATH"
+    fi
+done
+
+# =============================================================================
+# 5. Gate Commands
+# =============================================================================
+section "🔒 Gate Commands"
+
+for gate in bin/gate-check bin/gate-commit bin/gate-push; do
+    GATE_PATH="$GLOBAL_DIR/$gate"
+    if [[ -x "$GATE_PATH" ]]; then
+        pass "$gate executable"
+    elif [[ -f "$GATE_PATH" ]]; then
+        error "$gate exists but is not executable"
+    else
+        error "$gate not found"
+    fi
+done
+
+# =============================================================================
+# 6. Environment
+# =============================================================================
+section "🌍 Environment"
+
+if [[ "$HOME" == "/home/developer" ]]; then
+    pass "HOME=/home/developer"
+else
+    warn "HOME=$HOME (expected /home/developer in container)"
+fi
+
+if [[ ":$PATH:" == *":/Agents/global/bin:"* ]] || [[ ":$PATH:" == *":$GLOBAL_DIR/bin:"* ]]; then
+    pass "PATH includes global bin directory"
+else
+    warn "PATH does not include $GLOBAL_DIR/bin"
+    detail "PATH=$PATH"
+fi
+
+# =============================================================================
+# 7. Workspace
+# =============================================================================
+section "📂 Workspace"
+
+if [[ -d "/workspace" ]]; then
+    pass "/workspace exists"
+    if touch /workspace/.doctor-write-test 2>/dev/null; then
+        rm -f /workspace/.doctor-write-test
+        pass "/workspace is writable"
+    else
+        warn "/workspace is not writable"
+    fi
+else
+    warn "/workspace does not exist"
+fi
+
+# =============================================================================
+# 8. SSH Agent
+# =============================================================================
+section "🔑 SSH Agent"
+
+if [[ -n "${SSH_AUTH_SOCK:-}" ]]; then
+    pass "SSH_AUTH_SOCK is set"
+    if [[ -S "$SSH_AUTH_SOCK" ]]; then
+        pass "SSH socket is accessible"
+    else
+        warn "SSH_AUTH_SOCK set but socket not accessible: $SSH_AUTH_SOCK"
+    fi
+else
+    warn "SSH_AUTH_SOCK not set — git push over SSH will fail"
+fi
+
+# =============================================================================
+# 9. Python Environment
+# =============================================================================
+section "🐍 Python Environment"
+
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    pass "Virtual environment active: $VIRTUAL_ENV"
+else
+    warn "No virtual environment active"
+fi
+
+if "${LMER_PYTHON:-python3}" -c "import lmer_cli" &>/dev/null 2>&1; then
+    pass "lmer_cli importable"
+else
+    warn "lmer_cli not importable"
+fi
+
+# =============================================================================
+# Summary
+# =============================================================================
+echo ""
+echo "============================================================"
+echo "🎯 Summary"
+echo "============================================================"
+TOTAL=$((PASSES + WARNINGS + ERRORS))
+echo "  ✓ Passed:   $PASSES"
+echo "  ⚠️  Warnings: $WARNINGS"
+echo "  ✗ Errors:   $ERRORS"
+echo "  Total:      $TOTAL checks"
+echo ""
+
+if [[ "$ERRORS" -gt 0 ]]; then
+    echo "❌ $ERRORS error(s) found — environment is NOT healthy"
+    exit 1
+elif [[ "$WARNINGS" -gt 0 ]]; then
+    echo "✅ Healthy (with $WARNINGS warning(s))"
+    exit 0
+else
+    echo "✅ All checks passed — environment is fully operational"
+    exit 0
+fi

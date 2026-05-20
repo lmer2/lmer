@@ -1,0 +1,17 @@
+#!/bin/bash
+# Wrapper script for work CLI
+# Sets up PYTHONPATH for both host and container compatibility
+
+# Detect script location and set paths accordingly
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Add src directory to PYTHONPATH to find the work_repo module
+if [ -d "/Agents/global/src" ]; then
+    # Container environment - src is mounted from host
+    export PYTHONPATH="/Agents/global/src:$PYTHONPATH"
+else
+    # Host environment
+    export PYTHONPATH="${SCRIPT_DIR}/src:$PYTHONPATH"
+fi
+
+exec "${LMER_PYTHON:-python3}" -c "from work_repo.cli import main; main()" "$@"

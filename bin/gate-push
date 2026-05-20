@@ -1,0 +1,56 @@
+#!/Agents/global/.venv/bin/python3
+"""
+Gate Push - Enforces all rules before push
+"""
+
+import sys
+import os
+import subprocess
+import argparse
+
+# Add src directory to path for container compatibility
+src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+sys.path.insert(0, src_dir)
+
+from lmer_cli.gates import push_gate, Colors
+
+
+def gate_push(verbose: bool = False):
+    """Run gate checks and push if passed"""
+
+    result = push_gate(verbose=verbose)
+    if result != 0:
+        return result
+
+    # Get current branch
+    branch_result = subprocess.run(
+        ["git", "branch", "--show-current"],
+        capture_output=True, text=True, check=False
+    )
+    branch = branch_result.stdout.strip()
+
+    if not branch:
+        print(f"{Colors.RED}❌ Could not determine current branch{Colors.NC}")
+        return 1
+
+    print(f"{Colors.CYAN}Pushing branch: {branch}{Colors.NC}")
+    result = subprocess.run(
+        ["git", "push", "-u", "origin", branch],
+        check=False
+    )
+
+    if result.returncode == 0:
+        print(f"{Colors.GREEN}✅ Push successful!{Colors.NC}")
+    else:
+        print(f"{Colors.RED}❌ Push failed{Colors.NC}")
+
+    return result.returncode
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Gate push - enforces all rules before push")
+    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+
+    args = parser.parse_args()
+
+    sys.exit(gate_push(args.verbose))

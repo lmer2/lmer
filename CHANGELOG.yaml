@@ -1,0 +1,77 @@
+# lmer change log
+#
+# Entries under `unreleased` accumulate between releases. Issue numbers
+# referenced in older entries (e.g. `#19`–`#36`) are from the project's
+# pre-open-source GitLab tracker and are kept here for historical context;
+# new entries should reference GitHub issues at
+# https://github.com/lmer2/lmer/issues.
+
+unreleased:
+  added:
+    - "Apache-2.0 `LICENSE` at the repo root"
+    - "GitHub Actions workflow (`.github/workflows/ci.yml`) running pre-commit and pytest on push/PR for `main` and `prep-release`"
+    - "`lmer build --update-claude` flag to force re-install of Claude Code CLI during image build (busts Docker cache for the install layer)"
+    - "`/followup` slash command that loads per-task-type follow-up instructions from a `followup.txt` file alongside `instructions.txt` in the active task definition directory (#20)"
+    - "gitlab-review: issue discussion support — post comments (`--issue-comment-file`), read discussions (`--issue-comments`, `--all-issue-comments`), and reply to threads (`--reply-issue-thread`)"
+    - Documentation provisioning — AGENTS.md and rules/ files are automatically provided from lmer defaults or work repo when the target repository doesn't have them
+    - Layered override hierarchy for documentation (lmer defaults < work repo project info < project repo)
+    - Gate-check warns when provisioned lmer defaults are in use instead of project-native documentation
+    - Changelog gate check warns when no changelog file exists or hasn't been updated
+    - Jinja2 template (changelog.jinja2) with changelog maintenance instructions for task definitions
+    - "`--show-env` CLI flag to display LMER environment variable configuration on startup with source tracking"
+    - "`LMER_REASONING_EFFORT` environment variable to override Claude's reasoning effort (`low`/`medium`/`high`/`max`/`auto`); translates to claude's `--effort` flag (#27)"
+    - "`LMER_HUMAN_IDENTITY` environment variable communicates the human user's identity (free-form string) into the session; auto-derived from the host's `git config --global user.name`/`user.email` when unset, and injected into Claude's system prompt so the model can recognize the user in PR/MR/issue artifacts without asking them to confirm (#28)"
+    - Auto-allow Skill() calls for start, rgr, test, and doctor so agents no longer prompt for permission when these slash commands are user-invoked
+    - WebFetch permission for GitHub domains (github.com, docs.github.com, raw.githubusercontent.com, api.github.com)
+    - AGENTS.md section on efficient command usage — guidance to avoid compound commands, use dedicated tools, and keep gate-commit messages simple
+    - "gate-check: projects can now ship a `gate-check-run-tests.sh` script in their work-repo `info/` (or `{task}/info/`) directory to override the default pytest invocation; useful for `--service` mode and projects with non-trivial test environments (#30)"
+    - "gate-check: pre-commit invocation now falls back to `uv run pre-commit` (uv.lock + `uv` on PATH) or `poetry run pre-commit` (poetry.lock + `poetry` on PATH) when `.venv/bin/pre-commit` is missing, before falling through to a bare `pre-commit`. The venv-binary check also verifies the script's shebang interpreter exists, so a bind-mounted host venv whose interpreter path doesn't resolve in the current filesystem (e.g., host `.venv` mounted into a container) correctly falls through to the manager fallbacks instead of producing a misleading ENOENT on the script itself"
+    - "Claude is now wrapped by an `lmer-supervisor` PTY process so a controlling Python process can read/write its stdin/stdout (#31)"
+    - "`--fastapi` CLI flag exposes a FastAPI endpoint inside the container with `POST /input` and `GET /output` for programmatic interaction; the endpoint is bearer-token protected and the chosen port is published to `127.0.0.1` on the host"
+    - "`--fastapi-port-range`, `--fastapi-host`, and `--fastapi-token` flags configure the FastAPI bind. The host CLI picks one free port from the range (default 8700-8799) before container start and publishes only that single port, letting multiple parallel `lmer ... --fastapi` sessions coexist with default flags. The bearer token (auto-generated when `--fastapi-token` is omitted) is exported to the in-container environment as `LMER_FASTAPI_TOKEN`"
+    - "`/start` is now auto-injected into Claude on launch so a task begins immediately; disable with `--manual-start` or `LMER_MANUAL_START=1`"
+    - "`lmer-pipe` helper CLI for talking to the supervisor's FastAPI endpoint without curl pipelines. Subcommands `send`, `read`, `follow`, `health` read `LMER_FASTAPI_PORT`/`LMER_FASTAPI_TOKEN` from the environment by default and turn common interactions into one-liners (`lmer-pipe send '/start'`, `lmer-pipe follow --from-end`, etc.)"
+    - "`--no-supervisor` CLI flag (and `LMER_DISABLE_SUPERVISOR=1` env var) bypasses `lmer-supervisor` and execs `claude` directly. Debug aid for bisecting rendering issues attributable to the PTY wrapper"
+    - "gate-check secrets ignore list — optional `gate-check.yaml` in the work-repo project info directory (`{host}/{project}/info/`) lets a project allowlist files that produce false positives in the secret scan. Whole-file globs under `secrets.ignore`; missing/malformed config is silently ignored (#33)"
+    - "Work-repo taskdef loading — task definitions can now be loaded from the work repo in addition to the baked-in global taskdefs. Project-scoped taskdefs live at `{work_repo}/{host}/{project}/taskdef/<task>/` and apply only when working on that project; work-global taskdefs at `{work_repo}/taskdef/<task>/` apply to all projects. Precedence (first match wins): project > work-global > `LMER_TASKDEF_PATHS` > built-in, so a project can ship a customised `develop` taskdef that shadows the built-in one (#42)"
+    - "Built-in `chat` taskdef — ships in `taskdef/chat/` so `lmer chat <repo>` works out of the box without an external taskdef path (#44)"
+    - "`docs/TASKDEFS.md` — authoring guide for taskdefs: format, Jinja2 context, shared partials, recurring patterns (#44)"
+    - "`LMER_QUICK_GATE_COMMIT=1` env var skips the slow test suite during `gate-commit` (other checks still run; tests are still enforced by `gate-check` and `gate-push`) (#43)"
+  changed:
+    - "Packaging metadata updated for open-source release: `pyproject.toml` now declares `license = \"Apache-2.0\"`, an `authors` block (`20C, LLC`), `Development Status :: 3 - Alpha`, and full `Homepage`/`Repository`/`Documentation`/`Issues` URLs pointing at https://github.com/lmer2/lmer; the project ships with an Apache-2.0 `LICENSE` file"
+    - "Dependency `dotenv>=0.9.9` corrected to `python-dotenv>=1.0.0` (the `dotenv` PyPI package was an unrelated/abandoned shim)"
+    - "Work repository is now cloned to `/work` instead of `/workspace/work`, so it no longer lives inside the target project repo (#21)"
+    - Renamed container image from claude-global-rules:fips to lmer
+    - Version-tagged container images derived from install method (git SHA, PEP 610 commit, or package version)
+    - Default to registry pull instead of clone-and-build fallback
+    - Improved Containerfile layer caching (dependency files first, source last)
+    - Image tag resolution failure is now a hard error — set LMER_IMAGE env var as override if needed
+    - Renamed `lmer rebuild` to `lmer build`; now passes --pull to docker build by default
+    - Run `lmer build --force` required to delete existing image before building (previously always deleted)"
+    - Renamed CLAUDE.md to AGENTS.md; content is now injected via --append-system-prompt-file instead of Claude Code auto-discovery
+    - User-specific additions can be placed in ~/.lmer/AGENTS.md (appended after workspace config)
+    - "Quick start docs (README, docs/LMER-CLI.md, docs/AUTHENTICATION.md) now reflect the typical org workflow: install from `prep-release` (latest features) or `main` (stable), and authenticate Claude via subscription credentials (host `~/.claude/.credentials.json`) with API key as the alternative (#32)"
+  fixed:
+    - "CI: `build-container` and `publish-container` jobs no longer fail at `docker login` on Kubernetes GitLab runners. The dind service container does not share its `/certs/client` volume with the build container on the Kubernetes executor, so TLS was disabled in favor of plaintext communication over `tcp://localhost:2375` inside the pod (#45)"
+    - "service mode: `--service NAME` now resolves containers via exact match on the Docker Compose service label (`com.docker.compose.service=NAME`), with fallback to exact container name. Docker's `--filter name=` is a substring match, which previously caused `--service myapp` to pick `myappdev-database-1` instead of `myappdev-myapp-1`; substring matches are now rejected with a clear error rather than silently selected"
+    - "gate-check pre-commit: dropped the `uv run pre-commit` / `poetry run pre-commit` fallbacks from `_resolve_precommit_command`. Both `uv run` and `poetry run` sync the project's full dependency set before executing the command, so for any project whose runtime deps require system libraries the gate environment can't build (e.g. `mysqlclient` without MySQL dev headers), the sync failed before pre-commit was ever invoked and gate-check reported a misleading 'Pre-commit Hooks' failure that had nothing to do with hooks. New chain: `.venv/bin/pre-commit` if launchable, else bare `pre-commit` from PATH. Hook versions are still pinned by `.pre-commit-config.yaml` (#36)"
+    - "gate-check pre-commit: on failure, the captured stdout/stderr tail is surfaced as `details` instead of running a fragile parse-for-lines-containing-'Failed' filter. Previously, when something *impersonated* pre-commit (e.g. `uv run pre-commit` printing a `uv` build error before pre-commit ran), the parser silently discarded the actual failure and the user saw only 'Some hooks failed'. Now the raw output is visible (last 15 non-empty lines) when running `gate-check -v`"
+    - "Container-runtime test guard now verifies the daemon is actually reachable (via `docker info` / `podman info`), not just that the binary exists, so `test_lmer_features.py` and `test_lmer_integration.py` skip cleanly when there is no docker socket (e.g. self-dev runs) instead of failing the gate check (#26)"
+    - Expanded permissions allow list to reduce unnecessary permission prompts for common shell utilities, git subcommands, and gate command path variants
+    - Fixed typo in permissions (Bask -> Bash for awk)
+    - Credential stripping in URL parsing (netloc -> hostname) to prevent token leakage
+    - Podman --cache-from compatibility (flag only passed for Docker)
+    - Tag extraction no longer confuses registry port numbers with image tags
+    - "Agent instructions now use bare `gate-check`/`gate-commit`/`gate-push` instead of `bin/gate-*`, which only works in self-development mode and caused confusion in normal task runs (#19)"
+    - "Agent instructions now require a minimum 5-minute (300000 ms) Bash timeout for gate commands to prevent premature termination of tests and pre-commit hooks (#19)"
+    - "gitlab-review: follow pagination on list endpoints (`--comments`, `--all-comments`, `--issue-comments`, `--all-issue-comments`, `--list`, `--list-templates`, `--info` participants) instead of silently returning only the first page; adds `--page-size` and `--max-pages` flags and a stderr warning when the page cap is reached (#29)"
+    - "lmer-pipe `follow` no longer retries forever on HTTP errors. The retry catch is now narrowed to `ConnectionError`/`Timeout`; HTTPError (401/403/404/5xx) propagates so the user sees a real exit code instead of a silent loop"
+    - "lmer-pipe `read --wait` now auto-extends the client HTTP timeout to outlast the server-side long-poll budget, so `--wait > --timeout` returns data instead of raising `ReadTimeout`"
+    - "gate-check `check_tests` now prepends the project's `src/` tree to the pytest subprocess `PYTHONPATH` so the test run imports the working copy. Previously, in self-dev mode an inherited `PYTHONPATH` from the operational install shadowed the project source and caused new tests to fail with `ImportError`/`AttributeError` (#33)"
+  deprecated: []
+  removed:
+    - "`docker-compose`-dependent Makefile targets (`make up`, `down`, `restart`, `shell`, `test-container`, `test-fips`, `pre-commit`, `logs`, `status`, `clean`, `clean-all`, `install-hooks`, `exec`, `root-shell`, `quicktest`, `commit-check`) and the `claude-safe` wrapper. The repo no longer ships a `docker-compose.yml`; use `make build` plus `make lmer`/`make lmer-shell` (or `./lmer` directly) instead"
+    - install-global.sh (replaced by uv tool install)
+    - loading `.env` from the host-side runtime install directory (was previously sourced from `~/Agents/global/.env`); use `~/.lmer/.env` or the project repo's `.env` instead
+    - GITLAB_API_KEY_* environment variable support (use GITLAB_TOKEN_* instead)
+  security: []

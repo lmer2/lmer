@@ -1,0 +1,350 @@
+#!/bin/bash
+# Internal script to run Claude with proper setup
+
+export PATH="/home/developer/.npm-global/bin:$PATH"
+export HOME="/home/developer"
+
+# Check if we have credentials
+if [ -f "$HOME/.claude/.credentials.json" ]; then
+    echo "✅ Credentials found in .claude/"
+else
+    echo "❌ No credentials found at $HOME/.claude/.credentials.json"
+fi
+
+# Check for .claude.json
+if [ -f "$HOME/.claude.json" ]; then
+    echo "✅ Claude config found at ~/.claude.json"
+else
+    echo "⚠️  No .claude.json found"
+fi
+
+# Check statsig directory
+if [ -d "$HOME/.claude/statsig" ]; then
+    echo "✅ Statsig cache found"
+else
+    echo "⚠️  No statsig cache directory"
+fi
+
+# ── Self-development mode detection ──
+# When /workspace IS the lmer repository itself, skip --add-dir to avoid
+# Claude seeing two copies of the same codebase (one at /workspace, one at
+# /Agents/global). Claude will only see /workspace/AGENTS.md.
+LMER_SELF_DEV=0
+if [ -f "/workspace/pyproject.toml" ]; then
+    if "${LMER_PYTHON:-python3}" -c "
+import tomllib
+with open('/workspace/pyproject.toml', 'rb') as f:
+    data = tomllib.load(f)
+exit(0 if data.get('project', {}).get('name') in ('lmer', 'lmer-cli') else 1)
+" 2>/dev/null; then
+        LMER_SELF_DEV=1
+        export LMER_SELF_DEV
+        echo "🔧 Self-development mode: /workspace is the lmer repository"
+        echo "   Skipping --add-dir to avoid duplicate project directories"
+        echo "   All development work should happen in /workspace/"
+        echo "   /Agents/global/ is the operational runtime — do not modify"
+
+        # Still create symlinks for commands and settings from the best available source
+        # These are independent of --add-dir and needed for Claude Code functionality
+        SYMLINK_SOURCE=""
+        if [ -d "/home/developer/.lmer" ]; then
+            SYMLINK_SOURCE="/home/developer/.lmer"
+        elif [ -d "/Agents/global" ]; then
+            SYMLINK_SOURCE="/Agents/global"
+        fi
+
+        if [ -n "$SYMLINK_SOURCE" ]; then
+            if [ -d "$SYMLINK_SOURCE/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
+                ln -sf "$SYMLINK_SOURCE/agent-files/claude/commands" /home/developer/.claude/commands
+                echo "✅ Global slash commands linked from $SYMLINK_SOURCE"
+            fi
+            if [ -f "$SYMLINK_SOURCE/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
+                ln -sf "$SYMLINK_SOURCE/agent-files/claude/settings.json" /home/developer/.claude/settings.json
+                echo "✅ Global settings.json linked from $SYMLINK_SOURCE"
+            fi
+        fi
+
+        # Point the venv's editable install at /workspace/src first, with
+        # /Agents/global/src as a fallback. The whole runtime (entry-point
+        # scripts AND pytest) now resolves lmer_cli/work_repo/etc. from
+        # the dev checkout — and top-level packages absent from /workspace
+        # (e.g. integrations/, which lives only on certain refs) still
+        # resolve via /Agents/global/src instead of vanishing from sys.path.
+        # The earlier approach prepended /workspace/src to PYTHONPATH only,
+        # leaving entry points and pytest with different views of lmer_cli
+        # when the two trees diverged.
+        for pth in /Agents/global/.venv/lib/python*/site-packages/__editable__.lmer*.pth; do
+            [ -f "$pth" ] && printf '/workspace/src\n/Agents/global/src\n' > "$pth"
+        done
+        echo "✅ Editable install redirected to /workspace/src (with /Agents/global/src fallback)"
+
+        # No --add-dir: Claude only sees /workspace (the development checkout)
+        EXTRA_ARGS=""
+    fi
+fi
+
+# Check for global LMER installation first
+LMER_GLOBAL_DIR="${LMER_GLOBAL_DIR:-/home/developer/.lmer}"
+if [ "$LMER_SELF_DEV" = "1" ]; then
+    # Self-dev path already handled above; skip the normal --add-dir chain
+    true
+elif [ -d "$LMER_GLOBAL_DIR" ]; then
+    echo "✅ Global LMER installation found at $LMER_GLOBAL_DIR"
+    EXTRA_ARGS="--add-dir $LMER_GLOBAL_DIR"
+
+    # Make global slash commands available by symlinking to Claude home directory
+    if [ -d "$LMER_GLOBAL_DIR/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
+        ln -sf "$LMER_GLOBAL_DIR/agent-files/claude/commands" /home/developer/.claude/commands
+        echo "✅ Global slash commands linked to Claude home"
+    fi
+    # Symlink settings.json for permissions
+    if [ -f "$LMER_GLOBAL_DIR/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
+        ln -sf "$LMER_GLOBAL_DIR/agent-files/claude/settings.json" /home/developer/.claude/settings.json
+        echo "✅ Global settings.json linked to Claude home"
+    fi
+elif [ -d "/Agents/global" ]; then
+    echo "✅ Global rules mounted at /Agents/global"
+    # Add --add-dir for global rules so Claude can access them
+    EXTRA_ARGS="--add-dir /Agents/global"
+
+    # Make global slash commands available by symlinking to Claude home directory
+    if [ -d "/Agents/global/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
+        ln -sf /Agents/global/agent-files/claude/commands /home/developer/.claude/commands
+        echo "✅ Global slash commands linked to Claude home"
+    fi
+    # Symlink settings.json for permissions
+    if [ -f "/Agents/global/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
+        ln -sf /Agents/global/agent-files/claude/settings.json /home/developer/.claude/settings.json
+        echo "✅ Global settings.json linked to Claude home"
+    fi
+elif [ -d "/workspace" ] && [ -f "/workspace/AGENTS.md" ]; then
+    echo "✅ Global rules found at /workspace"
+    EXTRA_ARGS="--add-dir /workspace"
+
+    if [ -d "/Agents/global" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --add-dir /Agents/global"
+
+        # Make global slash commands available by symlinking to Claude home directory
+        if [ -d "/Agents/global/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
+            ln -sf /Agents/global/agent-files/claude/commands /home/developer/.claude/commands
+            echo "✅ Global slash commands linked to Claude home"
+        fi
+        # Symlink settings.json for permissions
+        if [ -f "/Agents/global/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
+            ln -sf /Agents/global/agent-files/claude/settings.json /home/developer/.claude/settings.json
+            echo "✅ Global settings.json linked to Claude home"
+        fi
+    fi
+
+    # If no arguments provided (interactive mode), remind about rules
+    if [ $# -eq 0 ]; then
+        echo ""
+        echo "🚨 Global rules loaded at /Agents/global/AGENTS.md"
+        echo ""
+        echo "📖 Quick commands:"
+        echo "  📋 rgr        - Read all global rules"
+        echo "  🔀 rgr-git    - Read git rules only"
+        echo "  🧪 rgr-test   - Read testing rules only"
+        echo "  ✨ rgr-code   - Read code quality rules only"
+        echo ""
+        echo "💡 Start with: rgr"
+        echo ""
+    fi
+else
+    echo "⚠️  Global rules not mounted, but ensuring access to /Agents/global if available"
+    if [ -d "/Agents/global" ]; then
+        EXTRA_ARGS="--add-dir /Agents/global"
+
+        # Make global slash commands available by symlinking to Claude home directory
+        if [ -d "/Agents/global/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
+            ln -sf /Agents/global/agent-files/claude/commands /home/developer/.claude/commands
+            echo "✅ Global slash commands linked to Claude home"
+        fi
+        # Symlink settings.json for permissions
+        if [ -f "/Agents/global/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
+            ln -sf /Agents/global/agent-files/claude/settings.json /home/developer/.claude/settings.json
+            echo "✅ Global settings.json linked to Claude home"
+        fi
+    else
+        EXTRA_ARGS=""
+    fi
+fi
+
+# Merge personal MCP configuration if .mcp.local.json exists
+# This allows users to add personal MCPs without modifying the base .mcp.json
+# Place your file at ~/.lmer/.mcp.local.json or /home/developer/.mcp.local.json
+MCP_FILE="/home/developer/.mcp.json"
+MCP_LOCAL="/home/developer/.mcp.local.json"
+if [ -f "$MCP_LOCAL" ] && [ -f "$MCP_FILE" ] && command -v jq >/dev/null 2>&1; then
+    echo "🔧 Merging personal MCP servers from .mcp.local.json"
+    MERGED=$(jq -s '.[0] * .[1] | .mcpServers = ((.[0].mcpServers // {}) * (.[1].mcpServers // {}))' "$MCP_FILE" "$MCP_LOCAL" 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$MERGED" ]; then
+        echo "$MERGED" > "$MCP_FILE"
+        echo "✅ Merged personal MCP servers into .mcp.json"
+    else
+        echo "⚠️  Failed to merge .mcp.local.json, using base MCP config"
+    fi
+elif [ -f "$MCP_LOCAL" ] && ! command -v jq >/dev/null 2>&1; then
+    echo "⚠️  Found .mcp.local.json but jq not available for merging"
+fi
+
+# Merge personal permissions if settings.local.json exists
+# This allows users to add personal permissions without modifying the base settings.json
+# Place your file at ~/.lmer/.claude/settings.local.json
+SETTINGS_FILE="/home/developer/.claude/settings.json"
+SETTINGS_LOCAL="/home/developer/.claude/settings.local.json"
+if [ -f "$SETTINGS_LOCAL" ] && [ -f "$SETTINGS_FILE" ] && command -v jq >/dev/null 2>&1; then
+    echo "🔧 Merging personal permissions from settings.local.json"
+    MERGED=$(jq -s '
+      .[0] * .[1] |
+      .permissions.allow = (((.[0].permissions.allow // []) + (.[1].permissions.allow // [])) | unique) |
+      .permissions.deny = (((.[0].permissions.deny // []) + (.[1].permissions.deny // [])) | unique)
+    ' "$SETTINGS_FILE" "$SETTINGS_LOCAL" 2>/dev/null)
+    if [ $? -eq 0 ] && [ -n "$MERGED" ]; then
+        # Settings may be a symlink to a read-only mount — replace with regular file
+        [ -L "$SETTINGS_FILE" ] && rm "$SETTINGS_FILE"
+        echo "$MERGED" > "$SETTINGS_FILE"
+        echo "✅ Merged personal permissions into settings.json"
+    else
+        echo "⚠️  Failed to merge settings.local.json, using base settings"
+    fi
+elif [ -f "$SETTINGS_LOCAL" ] && ! command -v jq >/dev/null 2>&1; then
+    echo "⚠️  Found settings.local.json but jq not available for merging"
+fi
+
+# Check for Danger Zone mode (skip permissions)
+if [ "$LMER_DANGER_ZONE" = "1" ]; then
+    echo "⚠️  DANGER ZONE: Skipping all permissions checks!"
+    EXTRA_ARGS="$EXTRA_ARGS --allow-dangerously-skip-permissions"
+fi
+
+# Translate LMER_REASONING_EFFORT into claude's --effort flag.
+# Valid claude values: low, medium, high, max. Treat "auto" or unset as
+# "let claude decide" — pass no flag. Invalid values get a warning + skip.
+# Normalize to lowercase so HIGH/High/high all work.
+if [ -n "$LMER_REASONING_EFFORT" ]; then
+    effort_lower="${LMER_REASONING_EFFORT,,}"
+    if [ "$effort_lower" != "auto" ]; then
+        case "$effort_lower" in
+            low|medium|high|max)
+                EXTRA_ARGS="$EXTRA_ARGS --effort $effort_lower"
+                echo "✅ Reasoning effort: $effort_lower"
+                ;;
+            *)
+                echo "⚠️  Ignoring LMER_REASONING_EFFORT='$LMER_REASONING_EFFORT' (expected: low|medium|high|max|auto)"
+                ;;
+        esac
+    fi
+fi
+
+# ── AGENTS.md system prompt injection ──
+# Since AGENTS.md is not auto-discovered by Claude Code (unlike CLAUDE.md),
+# we inject it via --append-system-prompt-file. The chain is:
+#   1. Workspace AGENTS.md (project or provisioned global config)
+#   2. ~/.lmer/AGENTS.md (optional user-specific additions)
+AGENTS_PROMPT_ARGS=""
+AGENTS_COMBINED=""
+rm -f /tmp/agents-prompt.*.md 2>/dev/null
+
+# Find workspace AGENTS.md
+WORKSPACE_AGENTS=""
+if [ -f "/workspace/AGENTS.md" ]; then
+    WORKSPACE_AGENTS="/workspace/AGENTS.md"
+fi
+
+# Find user AGENTS.md
+USER_AGENTS=""
+LMER_HOME="${LMER_GLOBAL_DIR:-/home/developer/.lmer}"
+if [ -f "$LMER_HOME/AGENTS.md" ]; then
+    USER_AGENTS="$LMER_HOME/AGENTS.md"
+fi
+
+if [ -n "$WORKSPACE_AGENTS" ] && [ -n "$USER_AGENTS" ]; then
+    # Concatenate both into a temp file
+    AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+    cat "$WORKSPACE_AGENTS" "$USER_AGENTS" > "$AGENTS_COMBINED"
+    AGENTS_PROMPT_ARGS="--append-system-prompt-file $AGENTS_COMBINED"
+    echo "✅ AGENTS.md system prompt: workspace + user (~/.lmer/AGENTS.md)"
+elif [ -n "$WORKSPACE_AGENTS" ]; then
+    AGENTS_PROMPT_ARGS="--append-system-prompt-file $WORKSPACE_AGENTS"
+    echo "✅ AGENTS.md system prompt: workspace"
+elif [ -n "$USER_AGENTS" ]; then
+    AGENTS_PROMPT_ARGS="--append-system-prompt-file $USER_AGENTS"
+    echo "✅ AGENTS.md system prompt: user (~/.lmer/AGENTS.md)"
+fi
+
+# ── Human user identity injection ──
+# When LMER_HUMAN_IDENTITY is set (explicitly via env or auto-derived from the
+# host's git config by the lmer CLI), render the human-identity prompt
+# fragment template and append it to the system prompt so the model can
+# attribute matching usernames/emails in PRs, MRs, issues, and comments to the
+# human user it is collaborating with. The fragment text lives in
+# prompts/human-identity.md.jinja2 — not in this script — so it can be edited
+# without touching shell code.
+if [ -n "$(printf '%s' "$LMER_HUMAN_IDENTITY" | tr -d '[:space:]')" ]; then
+    IDENTITY_TEMPLATE=""
+    for candidate in \
+        "$(dirname "$0")/../prompts/human-identity.md.jinja2" \
+        "/workspace/prompts/human-identity.md.jinja2" \
+        "$LMER_HOME/prompts/human-identity.md.jinja2" \
+        "/Agents/global/prompts/human-identity.md.jinja2"; do
+        if [ -f "$candidate" ]; then
+            IDENTITY_TEMPLATE="$candidate"
+            break
+        fi
+    done
+
+    RENDERER=""
+    for candidate in \
+        "$(dirname "$0")/render-prompt-fragment.py" \
+        "/workspace/libexec/render-prompt-fragment.py" \
+        "$LMER_HOME/libexec/render-prompt-fragment.py" \
+        "/Agents/global/libexec/render-prompt-fragment.py"; do
+        if [ -f "$candidate" ]; then
+            RENDERER="$candidate"
+            break
+        fi
+    done
+
+    if [ -n "$IDENTITY_TEMPLATE" ] && [ -n "$RENDERER" ]; then
+        if [ -z "$AGENTS_COMBINED" ]; then
+            AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+            if [ -n "$WORKSPACE_AGENTS" ]; then
+                cat "$WORKSPACE_AGENTS" > "$AGENTS_COMBINED"
+            elif [ -n "$USER_AGENTS" ]; then
+                cat "$USER_AGENTS" > "$AGENTS_COMBINED"
+            fi
+        fi
+        printf '\n\n' >> "$AGENTS_COMBINED"
+        if "${LMER_PYTHON:-python3}" "$RENDERER" "$IDENTITY_TEMPLATE" >> "$AGENTS_COMBINED"; then
+            AGENTS_PROMPT_ARGS="--append-system-prompt-file $AGENTS_COMBINED"
+            echo "✅ Human identity injected into system prompt"
+        else
+            echo "⚠️  Failed to render human identity template at $IDENTITY_TEMPLATE"
+        fi
+    else
+        if [ -z "$IDENTITY_TEMPLATE" ]; then
+            echo "⚠️  LMER_HUMAN_IDENTITY set but human-identity.md.jinja2 not found"
+        fi
+        if [ -z "$RENDERER" ]; then
+            echo "⚠️  LMER_HUMAN_IDENTITY set but render-prompt-fragment.py not found"
+        fi
+    fi
+fi
+
+# Run Claude through the lmer supervisor when available.
+#
+# The supervisor wraps claude under a PTY so a controlling Python process
+# sits between the user and the model. It enables:
+#   - LMER_FASTAPI=1   -> a FastAPI endpoint to read/write the process
+#   - auto-injecting `/start` so a task begins immediately (disable with
+#     LMER_MANUAL_START=1)
+#
+# Falls back to direct `exec claude` if `lmer-supervisor` is not on PATH
+# (e.g. older containers built before this feature shipped) or if the
+# user opts out with LMER_DISABLE_SUPERVISOR=1 (escape hatch for
+# bisecting rendering issues attributable to the PTY wrapper).
+if [ "${LMER_DISABLE_SUPERVISOR:-0}" != "1" ] && command -v lmer-supervisor >/dev/null 2>&1; then
+    exec lmer-supervisor -- claude $EXTRA_ARGS $AGENTS_PROMPT_ARGS "$@"
+fi
+exec claude $EXTRA_ARGS $AGENTS_PROMPT_ARGS "$@"

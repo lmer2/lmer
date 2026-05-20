@@ -1,0 +1,132 @@
+#!/bin/bash
+# LMER Reset Script
+# Cleans up all LMER installation state for testing fresh installs
+
+set -e
+
+echo "🧹 LMER Reset Script"
+echo "===================="
+echo ""
+echo "This will remove:"
+echo "  • ~/.lmer/ directory (runtime state)"
+echo "  • uv tool installed 'lmer' package"
+echo "  • lmer container image"
+echo "  • Any containers using that image"
+echo ""
+
+# Check what exists
+LMER_DIR_EXISTS=false
+UV_TOOL_EXISTS=false
+IMAGE_EXISTS=false
+CONTAINERS_EXIST=false
+
+if [ -d "$HOME/.lmer" ]; then
+    LMER_DIR_EXISTS=true
+    echo "Found: ~/.lmer/ directory"
+fi
+
+if uv tool list 2>/dev/null | grep -q "^lmer "; then
+    UV_TOOL_EXISTS=true
+    echo "Found: uv tool 'lmer'"
+fi
+
+if command -v docker >/dev/null 2>&1; then
+    if docker image inspect lmer >/dev/null 2>&1; then
+        IMAGE_EXISTS=true
+        echo "Found: lmer image"
+    fi
+
+    CONTAINER_IDS=$(docker ps -aq --filter ancestor=lmer 2>/dev/null || true)
+    if [ -n "$CONTAINER_IDS" ]; then
+        CONTAINERS_EXIST=true
+        echo "Found: containers using the image"
+    fi
+elif command -v podman >/dev/null 2>&1; then
+    if podman image inspect lmer >/dev/null 2>&1; then
+        IMAGE_EXISTS=true
+        echo "Found: lmer image"
+    fi
+
+    CONTAINER_IDS=$(podman ps -aq --filter ancestor=lmer 2>/dev/null || true)
+    if [ -n "$CONTAINER_IDS" ]; then
+        CONTAINERS_EXIST=true
+        echo "Found: containers using the image"
+    fi
+fi
+
+if ! $LMER_DIR_EXISTS && ! $UV_TOOL_EXISTS && ! $IMAGE_EXISTS && ! $CONTAINERS_EXIST; then
+    echo ""
+    echo "✅ Nothing to clean up - already in fresh state"
+    exit 0
+fi
+
+echo ""
+read -p "Proceed with cleanup? [y/N] " -n 1 -r
+echo ""
+
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 1
+fi
+
+echo ""
+
+# Remove ~/.lmer directory
+if $LMER_DIR_EXISTS; then
+    echo "🗑️  Removing ~/.lmer/ ..."
+    # Some files may be owned by container UID, try normal rm first, then sudo if needed
+    if ! rm -rf "$HOME/.lmer" 2>/dev/null; then
+        echo "   Some files need elevated permissions, using sudo..."
+        sudo rm -rf "$HOME/.lmer"
+    fi
+    echo "   Done"
+fi
+
+# Remove uv tool
+if $UV_TOOL_EXISTS; then
+    echo "🗑️  Uninstalling uv tool 'lmer' ..."
+    uv tool uninstall lmer
+    echo "   Done"
+fi
+
+# Detect container runtime
+RUNTIME=""
+if command -v docker >/dev/null 2>&1; then
+    RUNTIME="docker"
+elif command -v podman >/dev/null 2>&1; then
+    RUNTIME="podman"
+fi
+
+if [ -n "$RUNTIME" ]; then
+    # Remove containers first
+    if $CONTAINERS_EXIST; then
+        echo "🗑️  Removing containers ..."
+        $RUNTIME ps -aq --filter ancestor=lmer | xargs -r $RUNTIME rm -f
+        echo "   Done"
+    fi
+
+    # Remove image
+    if $IMAGE_EXISTS; then
+        echo "🗑️  Removing lmer image ..."
+        $RUNTIME rmi lmer
+        echo "   Done"
+    fi
+fi
+
+echo ""
+echo "✅ Reset complete!"
+echo ""
+echo "To test fresh install:"
+echo ""
+echo "  # From local path:"
+echo "  uv tool install lmer --from /path/to/lmer"
+echo ""
+echo "  # From git URL:"
+echo "  uv tool install lmer --from git+https://github.com/lmer2/lmer.git"
+echo ""
+echo "  # With branch/tag/ref:"
+echo "  uv tool install lmer --from git+https://github.com/lmer2/lmer.git@main"
+echo "  uv tool install lmer --from git+https://github.com/lmer2/lmer.git@prep-release"
+echo ""
+echo "Then test:"
+echo "  cd /tmp && lmer review"

@@ -1,0 +1,60 @@
+## Changelog Maintenance
+
+This project tracks changes in a changelog file. You must update it as part of your work.
+
+### Locating the Changelog
+
+Look for an existing changelog file in the project root. Common names include:
+- `CHANGELOG.yaml`, `CHANGELOG.md`, `CHANGELOG.rst`, `CHANGELOG.txt`
+- `CHANGES.md`, `CHANGES.rst`, `CHANGES.txt`
+- `HISTORY.md`, `NEWS.md`, `RELEASES.md`
+
+If no changelog file exists, create `CHANGELOG.yaml` using the format below.
+
+### CHANGELOG.yaml Format
+
+```yaml
+unreleased:
+  added: []
+  fixed: []
+  changed: []
+  deprecated: []
+  removed: []
+  security: []
+```
+
+**Categories:**
+- **added** — New features or capabilities
+- **fixed** — Bug fixes
+- **changed** — Changes to existing functionality
+- **deprecated** — Features marked for future removal
+- **removed** — Features that have been removed
+- **security** — Security-related fixes or improvements
+
+### What to Include
+
+The changelog communicates changes **to users of the project**. Write entries from the perspective of someone consuming the project (a user, operator, or downstream developer).
+
+**Good entries:**
+- "Added dark mode support"
+- "Fixed login timeout when using SSO"
+- "Removed deprecated `/v1/users` endpoint"
+- "Changed default cache TTL from 60s to 300s"
+
+**Do NOT include:**
+- Internal refactoring that doesn't affect behavior
+- Test-only changes
+- CI/CD pipeline adjustments
+- Code style or linting fixes
+- Mid-development steps or work-in-progress notes
+
+### When to Update
+
+- Update the changelog when your changes include user-facing additions, fixes, removals, or behavior changes.
+- Place entries under the `unreleased:` section.
+- Do NOT update the changelog for purely internal changes (refactors, test improvements, CI config).
+- If the project uses a different changelog format than YAML, follow the existing format and conventions.
+
+### Adapting to Existing Formats
+
+If the project already has a changelog in a different format (e.g., Markdown with `## [Unreleased]`, RST, or plain text), follow that format instead of creating a new YAML file. The important thing is that user-facing changes are recorded, not which specific format is used.

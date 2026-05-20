@@ -1,0 +1,20 @@
+#!/bin/bash
+# Claude Code status line wrapper
+# Runs claude-powerline (all defaults) then appends container indicators
+
+# Ensure mise shims are on PATH for claude-powerline
+export PATH="${HOME}/.local/share/mise/shims:${PATH}"
+
+# Claude Code pipes JSON status data via stdin — capture it so we can
+# forward it to claude-powerline inside a command substitution.
+input=$(cat)
+output=$(echo "$input" | claude-powerline 2>/dev/null)
+
+# Right-side indicators
+indicators=""
+[ "$CLAUDE_CONTAINER" = "true" ] && indicators="📦"
+[ "$LMER_DANGER_ZONE" = "1" ] && indicators="${indicators}⚡"
+
+[ -n "$indicators" ] && output="$output $indicators"
+
+echo "$output"

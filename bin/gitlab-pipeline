@@ -1,0 +1,90 @@
+#!/Agents/global/.venv/bin/python3
+"""
+GitLab Pipeline Monitor - Watch and debug CI/CD pipelines.
+
+Usage:
+    gitlab-pipeline <project> <pipeline_id|mr_id> [--mr] [--watch] [--trace JOB_ID]
+
+Examples:
+    # Watch a pipeline
+    gitlab-pipeline group/project 229 --watch
+
+    # Watch pipeline for MR
+    gitlab-pipeline group/project 9 --mr --watch
+
+    # Get trace for a specific job
+    gitlab-pipeline group/project 921 --trace
+
+Environment:
+    GITLAB_HOST: GitLab instance hostname (e.g. gitlab.example.com)
+    GITLAB_TOKEN_<sanitized_host>: API token for a specific host (host name with
+        dots/hyphens replaced by underscores, e.g. GITLAB_TOKEN_gitlab_example_com)
+    GITLAB_TOKEN: Fallback API token
+"""
+
+import argparse
+import os
+import sys
+
+# Add src directory to path for container compatibility
+src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+sys.path.insert(0, src_dir)
+
+from lmer_cli.gitlab_pipeline import (
+    DEFAULT_HOST,
+    GitLabPipelineClient,
+    GitLabPipelineError,
+    ProjectNotFoundError,
+    get_token,
+    resolve_pipeline_id,
+    show_status,
+    show_trace,
+    watch_pipeline,
+)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GitLab Pipeline Monitor",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    parser.add_argument("project", help="Project path (e.g., agents/global)")
+    parser.add_argument("id", type=int, help="Pipeline ID, MR ID, or Job ID")
+    parser.add_argument("--mr", action="store_true", help="ID is a merge request ID")
+    parser.add_argument("--watch", "-w", action="store_true", help="Watch until complete")
+    parser.add_argument("--trace", "-t", action="store_true", help="Get job trace (ID is job ID)")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="GitLab host")
+
+    args = parser.parse_args()
+
+    try:
+        token = get_token(args.host)
+        client = GitLabPipelineClient(args.host, token)
+
+        # Get project ID
+        project_id = client.get_project_id(args.project)
+        if not project_id:
+            raise ProjectNotFoundError(args.project)
+
+        # Handle trace mode
+        if args.trace:
+            show_trace(client, project_id, args.id)
+            return
+
+        # Resolve pipeline ID (handles MR lookup)
+        pipeline_id = resolve_pipeline_id(client, project_id, args.id, is_mr=args.mr)
+
+        # Watch or show status
+        if args.watch:
+            watch_pipeline(client, project_id, pipeline_id)
+        else:
+            show_status(client, project_id, pipeline_id)
+
+    except GitLabPipelineError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

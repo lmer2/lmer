@@ -1,0 +1,21 @@
+#!/bin/bash
+# Tail logs from the target service container or another named container.
+# Requires LMER_SERVICE_CONTAINER environment variable.
+#
+# Usage:
+#   target-logs                    # target service, last 50 lines
+#   target-logs <container>        # specific container
+#   target-logs <container> <N>    # specific container, last N lines
+
+set -e
+
+if [ -z "$LMER_SERVICE_CONTAINER" ]; then
+    echo "❌ target-logs: not in service mode (LMER_SERVICE_CONTAINER not set)" >&2
+    echo "   Use --service <name> when launching lmer" >&2
+    exit 1
+fi
+
+CONTAINER="${1:-$LMER_SERVICE_CONTAINER}"
+LINES="${2:-50}"
+
+exec docker logs --tail "$LINES" -f "$CONTAINER"
