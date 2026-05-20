@@ -308,7 +308,9 @@ Set via the host environment, `~/.lmer/.env`, or a project-local `.env` file:
 - `PYTHONHASHSEED=0` - Deterministic hashing
 - `CLAUDE_CONTAINER=true` - Container detection flag
 - `CONTAINER_LIMITS=CPU:1core Memory:2GB Processes:512` - Resource limit info
-- `GITLAB_TOKEN_*` - GitLab tokens (if needed)
+- `LMER_WORK_REPO_TOKEN` - Provider-agnostic dedicated work-repo token (highest priority for work-repo lookups)
+- `GITLAB_TOKEN_*`, `GITLAB_TOKEN` - GitLab tokens (host-specific via sanitized hostname suffix, plus generic fallback)
+- `GH_TOKEN`, `GITHUB_TOKEN` - GitHub tokens (consulted for `github.com`, `*.github.com`, `*.ghe.com` hosts)
 - `CLAUDE_API_KEY` - Claude API key (if needed)
 
 ## Building for Production

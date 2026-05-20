@@ -37,6 +37,8 @@ unreleased:
     - "Built-in `chat` taskdef — ships in `taskdef/chat/` so `lmer chat <repo>` works out of the box without an external taskdef path (#44)"
     - "`docs/TASKDEFS.md` — authoring guide for taskdefs: format, Jinja2 context, shared partials, recurring patterns (#44)"
     - "`LMER_QUICK_GATE_COMMIT=1` env var skips the slow test suite during `gate-commit` (other checks still run; tests are still enforced by `gate-check` and `gate-push`) (#43)"
+    - "Provider-agnostic work-repo token: new `LMER_WORK_REPO_TOKEN` env var is the canonical dedicated work-repo token, supersedes the GitLab-only `GITLAB_TOKEN_worklog` (kept as a deprecated fallback) and works for GitLab, GitHub, and self-hosted hosts"
+    - "GitHub token fallbacks: `GH_TOKEN` (preferred) and `GITHUB_TOKEN` are now consulted for `github.com`, `*.github.com`, and `*.ghe.com` (GitHub Enterprise Cloud) hosts, after host-specific `GITLAB_TOKEN_<host>` and before the generic `GITLAB_TOKEN`"
   changed:
     - "Packaging metadata updated for open-source release: `pyproject.toml` now declares `license = \"Apache-2.0\"`, an `authors` block (`20C, LLC`), `Development Status :: 3 - Alpha`, and full `Homepage`/`Repository`/`Documentation`/`Issues` URLs pointing at https://github.com/lmer2/lmer; the project ships with an Apache-2.0 `LICENSE` file"
     - "Dependency `dotenv>=0.9.9` corrected to `python-dotenv>=1.0.0` (the `dotenv` PyPI package was an unrelated/abandoned shim)"

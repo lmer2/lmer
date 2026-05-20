@@ -63,15 +63,25 @@ Override the pull source with `LMER_REGISTRY=<host>/<path>` for self-hosted regi
 
 Set up:
 
-1. Create an empty repository on a git host you can read/write (GitLab, GitHub, self-hosted). A personal/private repo is fine.
-2. Point `lmer` at it via `~/.lmer/.env`:
+1. Create an empty repository on a git host you can read/write — GitLab (cloud or self-hosted) or GitHub both work. A personal/private repo is fine.
+2. Point `lmer` at it and supply a token the container will use for clone/pull/push, via `~/.lmer/.env`:
 
    ```bash
    mkdir -p ~/.lmer
-   echo 'LMER_WORK_REPO=git@github.com:<you>/lmer-work.git' >> ~/.lmer/.env
+   cat >> ~/.lmer/.env <<'EOF'
+   LMER_WORK_REPO=git@github.com:<you>/lmer-work.git
+
+   # Dedicated work-repo token. Provider-agnostic — works for GitLab,
+   # GitHub, or self-hosted. Highest-priority lookup for the work repo,
+   # so it stays isolated from any per-host tokens used to clone the
+   # target repos you point `lmer chat` at.
+   LMER_WORK_REPO_TOKEN=<your-pat>
+   EOF
    ```
 
-3. Make sure the credentials in the container can authenticate to that host — either an SSH key forwarded via the agent (see the "SSH not configured" hint lmer prints), or an HTTPS token (`GITLAB_TOKEN`, `GH_TOKEN`) in the same `.env` file.
+   The token needs read + write on the work repo. lmer will rewrite the SSH URL to HTTPS-with-token automatically when a token is present.
+
+   SSH instead of HTTPS works too — keep the `git@…` URL, drop the token line, and forward an SSH agent into the container (lmer prints the exact commands when no key is configured).
 
 Subsequent `lmer chat <repo>` runs will clone the work repo into the container at `/work` and push updates back at the end of the session.
 
