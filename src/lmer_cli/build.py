@@ -14,6 +14,7 @@ from pathlib import Path
 from .log import error, success
 
 DEFAULT_IMAGE = "lmer"
+DEFAULT_REGISTRY = "ghcr.io/lmer2/lmer"
 
 
 def image_exists(runtime: str, image: str) -> bool:
@@ -170,17 +171,18 @@ def ensure_image(
         success("Image built successfully")
         return True
 
-    # Pull from registry (LMER_REGISTRY required).
-    registry = os.environ.get("LMER_REGISTRY")
-    if not registry:
-        error("❌ Image not found locally and no Containerfile available. Set LMER_REGISTRY to pull from a registry.")
-        return False
+    # Pull from registry (defaults to the project's GHCR; LMER_REGISTRY overrides).
+    registry = os.environ.get("LMER_REGISTRY", DEFAULT_REGISTRY)
     rc = pull_image(runtime, image, registry)
     if rc == 0:
         success("Image pulled successfully")
         return True
 
-    error(f"Pull from {registry} failed")
+    error(f"Pull from {registry} failed (expected tag: {image}).")
+    error("If the registry is unreachable or the tag is missing, build locally instead:")
+    error("    git clone https://github.com/lmer2/lmer /tmp/lmer-src")
+    error("    lmer build --local /tmp/lmer-src")
+    error("Or override the registry with LMER_REGISTRY=<host>/<path>.")
     return False
 
 

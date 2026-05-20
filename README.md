@@ -48,6 +48,15 @@ uv tool install -e lmer --from .
 
 To upgrade later: `uv tool upgrade lmer`.
 
+The container image is pulled automatically on first run from `ghcr.io/lmer2/lmer` — no manual build step is needed. If you can't reach GHCR, or want to develop on the container itself, build it locally from a clone:
+
+```bash
+git clone https://github.com/lmer2/lmer /tmp/lmer-src
+lmer build --local /tmp/lmer-src
+```
+
+Override the pull source with `LMER_REGISTRY=<host>/<path>` for self-hosted registries.
+
 ### Common options
 
 Targets can be a repo URL, a PR/MR/issue URL (lmer extracts the base repo), a local git path, or omitted to infer from the current directory's git remote:

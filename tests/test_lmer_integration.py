@@ -59,13 +59,15 @@ class TestLmerErrorHandling:
             env_file = Path(tmpdir) / ".env"
             env_file.write_text("INVALID LINE WITHOUT EQUALS")
 
-            # lmer should still work even with invalid .env
+            # lmer should still work even with invalid .env. LMER_WORK_REPO is
+            # required by an early check unrelated to this test; supply a dummy.
             result = subprocess.run(
                 ["bash", "-c",
                  f"cd {tmpdir} && {Path(__file__).parent.parent}/lmer --no-task --exec 'echo test' 2>&1"],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                env={**os.environ, "LMER_WORK_REPO": os.environ.get("LMER_WORK_REPO", "git@example.com:fixture/work-repo.git")}
             )
 
             # Should detect .env but handle errors gracefully
@@ -81,13 +83,15 @@ class TestLmerErrorHandling:
             env_file = Path(tmpdir) / ".env"
             env_file.touch()
 
-            # lmer should handle empty .env gracefully
+            # lmer should handle empty .env gracefully. LMER_WORK_REPO is
+            # required by an early check unrelated to this test; supply a dummy.
             result = subprocess.run(
                 ["bash", "-c",
                  f"cd {tmpdir} && {Path(__file__).parent.parent}/lmer --no-task --exec 'echo test'"],
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=30,
+                env={**os.environ, "LMER_WORK_REPO": os.environ.get("LMER_WORK_REPO", "git@example.com:fixture/work-repo.git")}
             )
 
             # Should detect .env even if empty
