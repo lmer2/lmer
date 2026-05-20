@@ -23,39 +23,59 @@ def _sanitize_hostname(host: str) -> str:
     return re.sub(r"[.\-]", "_", host.lower())
 
 
+def _is_github_host(host: str) -> bool:
+    """Return True for hosts that should consult GitHub-style token env vars.
+
+    Covers public GitHub plus GitHub Enterprise Cloud subdomains. GitHub
+    Enterprise Server can sit on any custom hostname and is not auto-detected;
+    those users should set a per-host ``GITLAB_TOKEN_<sanitized_host>`` (the
+    name is provider-agnostic in practice — see _get_gitlab_token).
+    """
+    if not host:
+        return False
+    h = host.lower()
+    return h == "github.com" or h.endswith(".github.com") or h.endswith(".ghe.com")
+
+
 def _get_gitlab_token(host: str, *, for_work_repo: bool = False) -> str | None:
     """
-    Get GitLab API token for a given host from environment variables.
+    Look up an API token for ``host`` from environment variables.
 
-    Checks for host-specific tokens first (using sanitized hostname),
-    then falls back to generic GITLAB_TOKEN.
+    Despite the historical name, this function supports both GitLab and
+    GitHub hosts. Lookup order:
 
-    Token lookup uses sanitized hostname as suffix:
-    - GITLAB_TOKEN_{sanitized_host} (e.g., GITLAB_TOKEN_git_example_com)
+    For work-repo lookups (``for_work_repo=True``), check first:
+      1. ``LMER_WORK_REPO_TOKEN`` — provider-agnostic dedicated work-repo token
+      2. ``GITLAB_TOKEN_worklog`` — deprecated; kept as fallback
 
-    For work repo clones, checks _worklog suffix first (highest priority):
-    - GITLAB_TOKEN_worklog
+    Then, for any lookup:
+      3. ``GITLAB_TOKEN_{sanitized_host}`` — host-specific token (provider
+         doesn't matter; the name is historical)
+      4. For github.com / *.github.com / *.ghe.com: ``GH_TOKEN``, then
+         ``GITHUB_TOKEN``
+      5. ``GITLAB_TOKEN`` — generic fallback
 
-    Args:
-        host: GitLab host (e.g., 'git.example.com', 'gitlab.example.com')
-        for_work_repo: If True, check _worklog suffix first (for persistent work repo)
-
-    Returns:
-        API token if found, None otherwise
+    Returns the token string, or ``None`` if nothing matches.
     """
-    # For work repo, check _worklog suffix first (highest priority)
     if for_work_repo:
+        token = os.environ.get("LMER_WORK_REPO_TOKEN")
+        if token:
+            return token
         token = os.environ.get("GITLAB_TOKEN_worklog")
         if token:
             return token
 
-    # Try host-specific keys using sanitized hostname
     suffix = _sanitize_hostname(host)
     token = os.environ.get(f"GITLAB_TOKEN_{suffix}")
     if token:
         return token
 
-    # Fall back to generic token
+    if _is_github_host(host):
+        for var in ("GH_TOKEN", "GITHUB_TOKEN"):
+            token = os.environ.get(var)
+            if token:
+                return token
+
     return os.environ.get("GITLAB_TOKEN")
 
 

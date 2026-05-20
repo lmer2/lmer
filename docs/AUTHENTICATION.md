@@ -10,7 +10,7 @@ This document describes how authentication works in containerized environments, 
 
 1. [Container-Home Directory](#container-home-directory)
 2. [SSH Authentication](#ssh-authentication)
-3. [GitLab Token Authentication](#gitlab-token-authentication)
+3. [Git Token Authentication](#git-token-authentication)
 4. [Claude API Authentication](#claude-api-authentication)
 5. [Security Considerations](#security-considerations)
 6. [Troubleshooting](#troubleshooting)
@@ -178,43 +178,55 @@ lmer --no-task --exec -- bash
 
 ---
 
-## GitLab Token Authentication
+## Git Token Authentication
 
-LMER uses GitLab tokens to authenticate HTTPS git operations. This is an alternative to SSH authentication and is particularly useful in environments where SSH agent forwarding is not available.
+LMER can authenticate HTTPS git operations against GitLab **and GitHub** hosts using personal-access tokens. This is an alternative to SSH authentication and is particularly useful in environments where SSH agent forwarding is not available.
+
+The environment-variable names in this section retain their historical `GITLAB_TOKEN_…` prefix (the lookup logic predates GitHub support), but the per-host variant is provider-agnostic — `GITLAB_TOKEN_github_com` is a valid name for a GitHub PAT.
 
 ### Token Environment Variables
 
-GitLab tokens are resolved in the following priority order:
+Tokens are resolved in the following priority order.
 
-#### For Work Repository (highest to lowest priority)
+#### For the Work Repository (highest to lowest)
 
-1. `GITLAB_TOKEN_worklog` - Dedicated token for the persistent work repo
-2. Host-specific tokens (see below)
-3. `GITLAB_TOKEN` - Generic fallback
+1. **`LMER_WORK_REPO_TOKEN`** — provider-agnostic dedicated work-repo token. Recommended.
+2. **`GITLAB_TOKEN_worklog`** — deprecated; honored as a fallback for existing setups.
+3. Host-specific tokens (see below).
+4. For GitHub hosts only: `GH_TOKEN`, then `GITHUB_TOKEN`.
+5. **`GITLAB_TOKEN`** — generic fallback.
 
-#### For All Other Repositories (highest to lowest priority)
+#### For All Other Repositories (highest to lowest)
 
-1. `GITLAB_TOKEN_{suffix}` - Host-specific token
-2. `GITLAB_TOKEN` - Generic fallback
+1. **`GITLAB_TOKEN_{suffix}`** — host-specific token (see suffix resolution below).
+2. For GitHub hosts only: `GH_TOKEN`, then `GITHUB_TOKEN`.
+3. **`GITLAB_TOKEN`** — generic fallback.
+
+GitHub-host detection covers `github.com`, `*.github.com`, and `*.ghe.com` (GitHub Enterprise Cloud). GitHub Enterprise Server on a custom domain is not auto-detected — set a per-host `GITLAB_TOKEN_<suffix>` for those.
 
 ### Host Suffix Resolution
 
 The `{suffix}` is the sanitized hostname: lowercase with dots and hyphens replaced by underscores.
 
-| GitLab Host | Suffix | Environment Variables |
-|-------------|--------|----------------------|
+| Host | Suffix | Environment Variable |
+|---|---|---|
 | `git.example.com` | `git_example_com` | `GITLAB_TOKEN_git_example_com` |
 | `gitlab.myorg.com` | `gitlab_myorg_com` | `GITLAB_TOKEN_gitlab_myorg_com` |
+| `github.com` | `github_com` | `GITLAB_TOKEN_github_com` |
 
 ### Example .env Configuration
 
 ```bash
-# Dedicated token for work repository (highest priority for work repo)
-GITLAB_TOKEN_worklog=glpat-xxxxxxxxxxxxxxxxxxxx
+# Provider-agnostic dedicated work-repo token (recommended; works for
+# GitLab, GitHub, and self-hosted). Highest-priority lookup for the work repo.
+LMER_WORK_REPO_TOKEN=<your-pat>
 
-# Host-specific tokens (using sanitized hostname as suffix)
+# GitHub fallback tokens (used for github.com / *.github.com / *.ghe.com)
+GH_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Host-specific tokens (lookup uses the sanitized hostname as suffix)
 GITLAB_TOKEN_git_example_com=glpat-yyyyyyyyyyyyyyyyyyyy      # For git.example.com
-GITLAB_TOKEN_gitlab_myorg_com=glpat-zzzzzzzzzzzzzzzzzzzz       # For gitlab.myorg.com
+GITLAB_TOKEN_gitlab_myorg_com=glpat-zzzzzzzzzzzzzzzzzzzz     # For gitlab.myorg.com
 
 # Generic fallback (lowest priority)
 GITLAB_TOKEN=glpat-aaaaaaaaaaaaaaaaaaaaaa
@@ -222,22 +234,24 @@ GITLAB_TOKEN=glpat-aaaaaaaaaaaaaaaaaaaaaa
 
 ### URL Conversion Behavior
 
-When a token is available, LMER automatically converts SSH URLs to HTTPS:
+When a token is available, LMER automatically rewrites SSH URLs to HTTPS-with-token:
 
 ```
 # Original (SSH)
-git@gitlab.example.com:agents/work.git
+git@github.com:owner/work.git
 
 # Converted (HTTPS with token)
-https://oauth2:glpat-xxx@gitlab.example.com/agents/work.git
+https://oauth2:<token>@github.com/owner/work.git
 ```
+
+The `oauth2:` username works for both GitLab and GitHub — GitHub ignores the basic-auth username when the password is a valid PAT.
 
 ### Fallback to SSH
 
 If no token is found for a host:
-- The original SSH URL is preserved
-- SSH agent forwarding is used (if available)
-- No automatic retry with SSH if HTTPS auth fails
+- The original SSH URL is preserved.
+- SSH agent forwarding is used (if available).
+- No automatic retry with SSH if HTTPS auth fails.
 
 ### Prefer SSH Over Tokens
 
@@ -247,52 +261,59 @@ To force SSH authentication even when tokens are available, set:
 REPO_AUTH_PREFER_SSH=1
 ```
 
-Accepted values: `1`, `true`, `yes` (case insensitive)
+Accepted values: `1`, `true`, `yes` (case insensitive).
 
 When set, LMER will:
-- Skip all token lookups for URL conversion
-- Preserve original SSH URLs
-- Rely on SSH agent forwarding for authentication
+- Skip all token lookups for URL conversion.
+- Preserve original SSH URLs.
+- Rely on SSH agent forwarding for authentication.
 
 This is useful when:
-- Your SSH setup is more reliable than token auth
-- You want consistent authentication across all repos
-- You're debugging token-related issues
+- Your SSH setup is more reliable than token auth.
+- You want consistent authentication across all repos.
+- You're debugging token-related issues.
 
 ### Token Precedence Summary
 
 ```
 Work Repo Clone:
-  1. GITLAB_TOKEN_worklog
-  2. GITLAB_TOKEN_{host-suffix}
-  3. GITLAB_TOKEN
-  4. (No token) → Use SSH
+  1. LMER_WORK_REPO_TOKEN
+  2. GITLAB_TOKEN_worklog          (deprecated)
+  3. GITLAB_TOKEN_{host-suffix}
+  4. GH_TOKEN, then GITHUB_TOKEN   (github.com / *.github.com / *.ghe.com only)
+  5. GITLAB_TOKEN
+  6. (No token) → Use SSH
 
 Target Repo Clone:
   1. GITLAB_TOKEN_{host-suffix}
-  2. GITLAB_TOKEN
-  3. (No token) → Use SSH
+  2. GH_TOKEN, then GITHUB_TOKEN   (github.com / *.github.com / *.ghe.com only)
+  3. GITLAB_TOKEN
+  4. (No token) → Use SSH
 ```
 
 ### Troubleshooting
 
-#### 404 Errors from GitLab
+#### 404 Errors from the Git Host
 
 A 404 error often indicates an authentication issue rather than a missing resource:
 
 ```bash
 # Check which tokens are set
-env | grep -E 'GITLAB_TOKEN'
+env | grep -E 'GITLAB_TOKEN|GH_TOKEN|GITHUB_TOKEN|LMER_WORK_REPO_TOKEN'
 
-# Verify the token works (replace with your host and variable)
+# Verify a GitLab token works (replace with your host and variable)
 curl -H "PRIVATE-TOKEN: $GITLAB_TOKEN_git_example_com" https://git.example.com/api/v4/user
+
+# Verify a GitHub token works
+curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user
 ```
 
 #### Wrong Token Used
 
 If the wrong token is being used, check:
-1. The sanitized hostname suffix (dots/hyphens become underscores)
-2. Whether a generic `GITLAB_TOKEN` is overriding host-specific tokens
+1. The sanitized hostname suffix (dots/hyphens become underscores).
+2. Whether a generic `GITLAB_TOKEN` is overriding host-specific tokens.
+3. Whether you intended a work-repo lookup but the work-repo token vars aren't set.
 
 #### Token Not Found
 

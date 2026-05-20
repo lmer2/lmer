@@ -60,19 +60,31 @@ class TestGetGitlabToken:
 class TestGetGitlabTokenWorkRepo:
     """Tests for _get_gitlab_token with for_work_repo=True."""
 
-    def test_worklog_token_takes_highest_priority(self):
-        """GITLAB_TOKEN_worklog should take priority over host-specific tokens."""
+    def test_lmer_work_repo_token_takes_highest_priority(self):
+        """LMER_WORK_REPO_TOKEN is the canonical work-repo token; wins over everything."""
         env = {
-            "GITLAB_TOKEN_worklog": "worklog-token",
+            "LMER_WORK_REPO_TOKEN": "canonical-token",
+            "GITLAB_TOKEN_worklog": "deprecated-token",
             "GITLAB_TOKEN_git_example_com": "host-token",
             "GITLAB_TOKEN": "generic-token",
         }
         with patch.dict(os.environ, env, clear=True):
             token = _get_gitlab_token("git.example.com", for_work_repo=True)
-            assert token == "worklog-token"
+            assert token == "canonical-token"
 
-    def test_falls_back_to_host_specific_if_no_worklog(self):
-        """Should fall back to host-specific token if no worklog token."""
+    def test_falls_back_to_deprecated_worklog_token(self):
+        """GITLAB_TOKEN_worklog is honored as a backwards-compat fallback."""
+        env = {
+            "GITLAB_TOKEN_worklog": "deprecated-token",
+            "GITLAB_TOKEN_git_example_com": "host-token",
+            "GITLAB_TOKEN": "generic-token",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            token = _get_gitlab_token("git.example.com", for_work_repo=True)
+            assert token == "deprecated-token"
+
+    def test_falls_back_to_host_specific_if_no_dedicated_work_repo_token(self):
+        """Should fall back to host-specific token if no dedicated work-repo token."""
         env = {
             "GITLAB_TOKEN_git_example_com": "host-token",
         }
@@ -80,15 +92,67 @@ class TestGetGitlabTokenWorkRepo:
             token = _get_gitlab_token("git.example.com", for_work_repo=True)
             assert token == "host-token"
 
-    def test_worklog_not_used_when_for_work_repo_false(self):
-        """Should not use worklog token when for_work_repo=False."""
+    def test_dedicated_work_repo_token_not_used_when_for_work_repo_false(self):
+        """Should not use the dedicated work-repo tokens when for_work_repo=False."""
         env = {
-            "GITLAB_TOKEN_worklog": "worklog-token",
+            "LMER_WORK_REPO_TOKEN": "canonical-token",
+            "GITLAB_TOKEN_worklog": "deprecated-token",
             "GITLAB_TOKEN_git_example_com": "host-token",
         }
         with patch.dict(os.environ, env, clear=True):
             token = _get_gitlab_token("git.example.com", for_work_repo=False)
             assert token == "host-token"
+
+
+class TestGetGitlabTokenGitHub:
+    """Tests for _get_gitlab_token GitHub-host fallbacks."""
+
+    def test_github_com_uses_gh_token(self):
+        """GH_TOKEN should be used when host is github.com and no host-specific entry exists."""
+        with patch.dict(os.environ, {"GH_TOKEN": "gh-pat"}, clear=True):
+            assert _get_gitlab_token("github.com") == "gh-pat"
+
+    def test_github_com_falls_through_to_github_token(self):
+        """GITHUB_TOKEN is honored when GH_TOKEN is absent."""
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "github-actions-token"}, clear=True):
+            assert _get_gitlab_token("github.com") == "github-actions-token"
+
+    def test_gh_token_wins_over_github_token(self):
+        """GH_TOKEN takes priority over GITHUB_TOKEN for github.com."""
+        env = {"GH_TOKEN": "gh-pat", "GITHUB_TOKEN": "github-actions-token"}
+        with patch.dict(os.environ, env, clear=True):
+            assert _get_gitlab_token("github.com") == "gh-pat"
+
+    def test_host_specific_wins_over_gh_token(self):
+        """Per-host GITLAB_TOKEN_<host> beats the GitHub fallbacks (explicit > implicit)."""
+        env = {
+            "GITLAB_TOKEN_github_com": "host-specific",
+            "GH_TOKEN": "gh-pat",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            assert _get_gitlab_token("github.com") == "host-specific"
+
+    def test_ghe_cloud_subdomain_uses_gh_token(self):
+        """GitHub Enterprise Cloud (*.ghe.com) is treated as a GitHub host."""
+        with patch.dict(os.environ, {"GH_TOKEN": "gh-pat"}, clear=True):
+            assert _get_gitlab_token("acme.ghe.com") == "gh-pat"
+
+    def test_github_subdomain_uses_gh_token(self):
+        """*.github.com (e.g. raw.github.com) is treated as a GitHub host."""
+        with patch.dict(os.environ, {"GH_TOKEN": "gh-pat"}, clear=True):
+            assert _get_gitlab_token("raw.github.com") == "gh-pat"
+
+    def test_gh_token_not_used_for_non_github_host(self):
+        """Random GitLab host should NOT pick up GH_TOKEN."""
+        env = {"GH_TOKEN": "gh-pat"}
+        with patch.dict(os.environ, env, clear=True):
+            assert _get_gitlab_token("gitlab.example.com") is None
+
+    def test_work_repo_lookup_can_use_gh_token(self):
+        """Work-repo lookup with no dedicated token but on a GitHub host should still find GH_TOKEN."""
+        env = {"GH_TOKEN": "gh-pat"}
+        with patch.dict(os.environ, env, clear=True):
+            assert _get_gitlab_token("github.com", for_work_repo=True) == "gh-pat"
 
 
 class TestPreferSsh:

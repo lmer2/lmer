@@ -164,19 +164,34 @@ def sanitize_task_target(task_target: str) -> str:
 
 def _get_gitlab_token(host: str) -> str | None:
     """
-    Get GitLab API token for a given host from environment variables.
+    Look up an API token for ``host`` from environment variables.
 
-    Uses sanitized hostname (lowercase, dots/hyphens → underscores) as env var suffix.
-    Checks host-specific tokens first, then falls back to generic GITLAB_TOKEN.
+    Despite the name, supports both GitLab and GitHub hosts. Lookup:
+      1. ``GITLAB_TOKEN_{sanitized_host}`` — host-specific (provider-agnostic
+         in practice; the prefix is historical)
+      2. For github.com / *.github.com / *.ghe.com: ``GH_TOKEN``, then
+         ``GITHUB_TOKEN``
+      3. ``GITLAB_TOKEN`` — generic fallback
 
-    NOTE: This is a standalone copy of the logic in lmer_cli.tokens._get_gitlab_token.
-    This module runs inside the container as a standalone script and cannot import
-    from the lmer_cli package. Keep in sync with tokens.py when modifying.
+    NOTE: standalone copy of lmer_cli.tokens._get_gitlab_token (this module
+    runs inside the container without the lmer_cli import path). The work-repo
+    branch (``LMER_WORK_REPO_TOKEN``/``GITLAB_TOKEN_worklog``) is intentionally
+    omitted — the host CLI has already injected the work-repo token into
+    ``LMER_WORK_REPO`` before the container starts. Keep this in sync with
+    tokens.py for the host-shared behavior.
     """
     suffix = re.sub(r"[.\-]", "_", host.lower())
     token = os.environ.get(f"GITLAB_TOKEN_{suffix}")
     if token:
         return token
+
+    h = host.lower()
+    if h == "github.com" or h.endswith(".github.com") or h.endswith(".ghe.com"):
+        for var in ("GH_TOKEN", "GITHUB_TOKEN"):
+            token = os.environ.get(var)
+            if token:
+                return token
+
     return os.environ.get("GITLAB_TOKEN")
 
 

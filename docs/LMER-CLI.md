@@ -95,7 +95,13 @@ The following environment variables control LMER behavior:
 
 - **`LMER_WORK_REPO`** - **Required.** Git URL of the work repo where lmer persists worklogs, gate-check results, and per-project notes across sessions. Must be a remote URL (SSH or HTTPS) the container can clone, pull from, and push to — a local-filesystem path won't work because the in-container `work` CLI actively syncs via `git fetch`/`pull`/`push`. Typically a small private repo on whatever git host you're already using.
 
+- **`LMER_WORK_REPO_TOKEN`** - Provider-agnostic token used to authenticate against the work repo. Highest-priority lookup for work-repo clones, so it isolates the work-repo credential from per-host target-repo tokens. Works for GitLab, GitHub, and self-hosted hosts. When set, lmer rewrites an `LMER_WORK_REPO=git@host:…` URL into `https://oauth2:<token>@host/…` for cloning. The legacy `GITLAB_TOKEN_worklog` is still honored as a fallback for existing setups.
+
 - **`LMER_WORK_REPO_PATH`** - In-container clone location of the work repo. Defaults to `/work`; rarely needs overriding.
+
+- **`GITLAB_TOKEN`** / **`GITLAB_TOKEN_<sanitized_host>`** - Per-host or generic API token used to authenticate against GitLab hosts (also used by the legacy URL-token-injection path for target repos). Hostname suffix is lowercased with dots/hyphens replaced by underscores — e.g. `git.example.com` → `GITLAB_TOKEN_git_example_com`.
+
+- **`GH_TOKEN`** / **`GITHUB_TOKEN`** - Tokens used for GitHub hosts (`github.com`, `*.github.com`, `*.ghe.com`). `GH_TOKEN` takes priority over `GITHUB_TOKEN`. Either is consulted only after a more-specific per-host `GITLAB_TOKEN_<host>` is checked.
 
 - **`LMER_REGISTRY`** - Container registry to pull pre-built images from. Optional; defaults to `ghcr.io/lmer2/lmer` (the project's GHCR registry). Override to point at a self-hosted or mirrored registry. Empty-string values are treated the same as unset and fall back to the default.
 
