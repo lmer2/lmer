@@ -42,8 +42,8 @@ jobs:
         run: uv sync --frozen
 
       - name: Run pytest
-        # `slow` tests build/run containers; hosted GitHub runners don't have
-        # Docker-in-Docker configured the way .gitlab-ci.yml does, so we
-        # deselect them here. Container tests are still covered by the GitLab
-        # pipeline.
+        # `slow` tests build/run containers (see pyproject.toml [tool.pytest.ini_options]
+        # markers); hosted GitHub runners don't have Docker-in-Docker configured the way
+        # .gitlab-ci.yml does, so we deselect them here. Container tests are still covered
+        # by the GitLab pipeline.
         run: uv run pytest tests/ -v --cov=src --cov-report=term-missing -m "not slow"
