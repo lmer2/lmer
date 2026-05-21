@@ -52,4 +52,5 @@ implement/
 # custom
 .plan/
 build/
+dist/
 third-party-docs/
