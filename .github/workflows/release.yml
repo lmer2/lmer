@@ -1,0 +1,33 @@
+name: Release to PyPI
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  verify-version:
+    name: Verify tag matches pyproject version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compare tag against pyproject.toml
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pyver=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "${tag}" != "${pyver}" ]; then
+            echo "::error::Tag version '${tag}' does not match pyproject.toml version '${pyver}'"
+            exit 1
+          fi
+          echo "Tag and pyproject version match: ${tag}"
+
+  checks:
+    name: Run CI checks
+    needs: verify-version
+    uses: ./.github/workflows/checks.yml
