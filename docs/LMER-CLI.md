@@ -7,6 +7,7 @@ Python-first CLI for running LMER with a repository target, cloning inside the c
 - [Prerequisites](#prerequisites)
 - [Install Globally](#install-globally)
 - [Environment Variables](#environment-variables)
+- [Work-Repo Claude Assets](#work-repo-claude-assets)
 - [Tasks](#tasks)
 - [Basic Usage](#basic-usage)
   - [Starting Your Task](#starting-your-task)
@@ -114,6 +115,30 @@ The following environment variables control LMER behavior:
 - **`LMER_HUMAN_IDENTITY`** - Free-form string identifying the human user the session is collaborating with (e.g. `"Jane Doe <jdoe on example.com, jane@example.com>"`). When set, it is forwarded into the container and injected into Claude's system prompt so the model can attribute matching usernames, emails, or handles in PRs, MRs, issues, comments, and commit history to the user. When unset, LMER falls back to the host's `git config user.name` and `user.email` (respecting system, global, and local config). If neither is available, no identity is injected. The injected text is rendered from the Jinja2 template at `prompts/human-identity.md.jinja2` — edit that file to change the wording.
 
 - **`LMER_QUICK_GATE_COMMIT`** - When set to a truthy value (`1`, `true`, `yes`, case-insensitive), `gate-commit` skips the test suite (the slowest check) but still runs pre-commit hooks, secret scans, and every other check. Tests are still enforced by standalone `gate-check` and by `gate-push`, so coverage is preserved before code leaves the local repo. Only `gate-commit` reads this variable; `gate-check` and `gate-push` ignore it. Falsy values (`0`, `false`, `no`) and unset both leave tests running, so this can be a transient export that you turn off without `unset`. Useful for iterative commits on a feature branch where you'll run `gate-push` (which runs the suite) before code leaves the repo.
+
+### Work-Repo Claude Assets
+
+The work repository can contribute Claude Code slash commands, skills, and a limited slice of `settings.json` to every session that uses it. This is the supported way to ship project-specific automation, runbooks, or pre-authorized tool patterns across all developers who share the work repo.
+
+Layout (relative to the work-repo root, i.e. `/work/agent-files/claude/` inside the container):
+
+```
+agent-files/claude/
+├── commands/
+│   └── deploy.md            # Available as /deploy in the session
+├── skills/
+│   └── runbook-xyz/
+│       └── SKILL.md         # Auto-discovered Claude Code skill
+└── settings.json            # Only permissions.allow is merged
+```
+
+At container start, `claude-runner.sh` does the following:
+
+- Symlinks every entry under `agent-files/claude/commands/` into `~/.claude/commands/` so the files are visible to Claude Code's slash-command loader.
+- Symlinks every skill directory under `agent-files/claude/skills/` into `~/.claude/skills/` so Claude Code's skill discovery picks them up.
+- If `agent-files/claude/settings.json` exists, merges its `permissions.allow` array into `~/.claude/settings.json` (deduplicated). No other keys are honored — work-repo `settings.json` cannot, for example, add a `deny` entry or change the status-line command, so a misconfigured work repo cannot weaken protections that live in the global settings.
+
+Both sources (lmer global tree at `/Agents/global/agent-files/claude/`, plus the work repo) are overlaid, with work-repo entries overriding global ones on name collision. Per Claude Code's skill loader, changes to skills under `~/.claude/skills/` take effect immediately within the running session — adding a new file in the work repo and re-syncing does not require a container restart.
 
 ### Tasks
 

@@ -34,6 +34,11 @@ pytest:
   stage: test
   image: python:3.12  # Full image includes git
   before_script:
+    # jq is required at runtime by libexec/claude-agent-files.sh to merge
+    # the work-repo permissions.allow into ~/.claude/settings.json. The
+    # python:3.12 image does not ship it, so the merge tests fail without
+    # this install. The runtime container (Containerfile) installs jq too.
+    - apt-get update && apt-get install -y --no-install-recommends jq
     - pip install uv && uv sync --frozen
   script:
     - uv run pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml
