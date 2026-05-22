@@ -25,6 +25,16 @@ else
     echo "⚠️  No statsig cache directory"
 fi
 
+# Source the agent-files helpers (claude_link_agent_files,
+# claude_merge_work_settings). Tests source the helpers file directly.
+# shellcheck source=./claude-agent-files.sh
+source "$(dirname "$0")/claude-agent-files.sh"
+
+# Path to the global lmer agent-files/claude tree, set by whichever
+# discovery branch below succeeds. Consumed by the finalizer block that
+# calls the helpers above.
+CLAUDE_GLOBAL_AGENT_FILES=""
+
 # ── Self-development mode detection ──
 # When /workspace IS the lmer repository itself, skip --add-dir to avoid
 # Claude seeing two copies of the same codebase (one at /workspace, one at
@@ -54,14 +64,8 @@ exit(0 if data.get('project', {}).get('name') in ('lmer', 'lmer-cli') else 1)
         fi
 
         if [ -n "$SYMLINK_SOURCE" ]; then
-            if [ -d "$SYMLINK_SOURCE/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
-                ln -sf "$SYMLINK_SOURCE/agent-files/claude/commands" /home/developer/.claude/commands
-                echo "✅ Global slash commands linked from $SYMLINK_SOURCE"
-            fi
-            if [ -f "$SYMLINK_SOURCE/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
-                ln -sf "$SYMLINK_SOURCE/agent-files/claude/settings.json" /home/developer/.claude/settings.json
-                echo "✅ Global settings.json linked from $SYMLINK_SOURCE"
-            fi
+            CLAUDE_GLOBAL_AGENT_FILES="$SYMLINK_SOURCE/agent-files/claude"
+            echo "✅ Global agent-files source: $SYMLINK_SOURCE"
         fi
 
         # Point the venv's editable install at /workspace/src first, with
@@ -91,49 +95,19 @@ if [ "$LMER_SELF_DEV" = "1" ]; then
 elif [ -d "$LMER_GLOBAL_DIR" ]; then
     echo "✅ Global LMER installation found at $LMER_GLOBAL_DIR"
     EXTRA_ARGS="--add-dir $LMER_GLOBAL_DIR"
-
-    # Make global slash commands available by symlinking to Claude home directory
-    if [ -d "$LMER_GLOBAL_DIR/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
-        ln -sf "$LMER_GLOBAL_DIR/agent-files/claude/commands" /home/developer/.claude/commands
-        echo "✅ Global slash commands linked to Claude home"
-    fi
-    # Symlink settings.json for permissions
-    if [ -f "$LMER_GLOBAL_DIR/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
-        ln -sf "$LMER_GLOBAL_DIR/agent-files/claude/settings.json" /home/developer/.claude/settings.json
-        echo "✅ Global settings.json linked to Claude home"
-    fi
+    CLAUDE_GLOBAL_AGENT_FILES="$LMER_GLOBAL_DIR/agent-files/claude"
 elif [ -d "/Agents/global" ]; then
     echo "✅ Global rules mounted at /Agents/global"
     # Add --add-dir for global rules so Claude can access them
     EXTRA_ARGS="--add-dir /Agents/global"
-
-    # Make global slash commands available by symlinking to Claude home directory
-    if [ -d "/Agents/global/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
-        ln -sf /Agents/global/agent-files/claude/commands /home/developer/.claude/commands
-        echo "✅ Global slash commands linked to Claude home"
-    fi
-    # Symlink settings.json for permissions
-    if [ -f "/Agents/global/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
-        ln -sf /Agents/global/agent-files/claude/settings.json /home/developer/.claude/settings.json
-        echo "✅ Global settings.json linked to Claude home"
-    fi
+    CLAUDE_GLOBAL_AGENT_FILES="/Agents/global/agent-files/claude"
 elif [ -d "/workspace" ] && [ -f "/workspace/AGENTS.md" ]; then
     echo "✅ Global rules found at /workspace"
     EXTRA_ARGS="--add-dir /workspace"
 
     if [ -d "/Agents/global" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --add-dir /Agents/global"
-
-        # Make global slash commands available by symlinking to Claude home directory
-        if [ -d "/Agents/global/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
-            ln -sf /Agents/global/agent-files/claude/commands /home/developer/.claude/commands
-            echo "✅ Global slash commands linked to Claude home"
-        fi
-        # Symlink settings.json for permissions
-        if [ -f "/Agents/global/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
-            ln -sf /Agents/global/agent-files/claude/settings.json /home/developer/.claude/settings.json
-            echo "✅ Global settings.json linked to Claude home"
-        fi
+        CLAUDE_GLOBAL_AGENT_FILES="/Agents/global/agent-files/claude"
     fi
 
     # If no arguments provided (interactive mode), remind about rules
@@ -154,20 +128,31 @@ else
     echo "⚠️  Global rules not mounted, but ensuring access to /Agents/global if available"
     if [ -d "/Agents/global" ]; then
         EXTRA_ARGS="--add-dir /Agents/global"
-
-        # Make global slash commands available by symlinking to Claude home directory
-        if [ -d "/Agents/global/agent-files/claude/commands" ] && [ ! -e "/home/developer/.claude/commands" ]; then
-            ln -sf /Agents/global/agent-files/claude/commands /home/developer/.claude/commands
-            echo "✅ Global slash commands linked to Claude home"
-        fi
-        # Symlink settings.json for permissions
-        if [ -f "/Agents/global/agent-files/claude/settings.json" ] && [ ! -e "/home/developer/.claude/settings.json" ]; then
-            ln -sf /Agents/global/agent-files/claude/settings.json /home/developer/.claude/settings.json
-            echo "✅ Global settings.json linked to Claude home"
-        fi
+        CLAUDE_GLOBAL_AGENT_FILES="/Agents/global/agent-files/claude"
     else
         EXTRA_ARGS=""
     fi
+fi
+
+# ── Lay out commands, skills, and settings under ~/.claude ──
+# Symlink settings.json from the global tree first (if discovered above),
+# then merge in the work-repo's permissions.allow. Then populate
+# ~/.claude/commands/ and ~/.claude/skills/ with per-entry symlinks from
+# the global tree and the work repo (work overrides on name collision).
+WORK_AGENT_FILES="/work/agent-files/claude"
+[ -d "$WORK_AGENT_FILES" ] || WORK_AGENT_FILES=""
+
+if [ -n "$CLAUDE_GLOBAL_AGENT_FILES" ] \
+   && [ -f "$CLAUDE_GLOBAL_AGENT_FILES/settings.json" ] \
+   && [ ! -e "/home/developer/.claude/settings.json" ]; then
+    ln -sf "$CLAUDE_GLOBAL_AGENT_FILES/settings.json" /home/developer/.claude/settings.json
+    echo "✅ Global settings.json linked to Claude home"
+fi
+
+claude_link_agent_files "/home/developer/.claude" "$CLAUDE_GLOBAL_AGENT_FILES" "$WORK_AGENT_FILES"
+
+if [ -n "$WORK_AGENT_FILES" ]; then
+    claude_merge_work_settings "/home/developer/.claude" "$WORK_AGENT_FILES"
 fi
 
 # Merge personal MCP configuration if .mcp.local.json exists
