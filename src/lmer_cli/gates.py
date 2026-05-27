@@ -19,6 +19,8 @@ import time
 
 import yaml
 
+from work_repo.utils import project_info_dir, task_info_dir
+
 
 class CheckStatus(Enum):
     """Status of a check"""
@@ -223,18 +225,15 @@ class GateSystem:
         The script must exist and be executable. Returns the resolved
         path, or None if no script is configured.
         """
-        repo_host = os.environ.get("LMER_REPO_HOST")
-        repo_project = os.environ.get("LMER_REPO_PROJECT")
-        if not repo_host or not repo_project:
+        tsk_info_dir = task_info_dir()
+        proj_info_dir = project_info_dir()
+        if tsk_info_dir is None or proj_info_dir is None:
             return None
 
-        work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
-        task_type = os.environ.get("LMER_TASK", "default")
-
-        base = work_repo_path / repo_host / repo_project
+        # Discovery order: task-specific info wins over global project info.
         candidates = [
-            base / task_type / "info" / "gate-check-run-tests.sh",
-            base / "info" / "gate-check-run-tests.sh",
+            tsk_info_dir / "gate-check-run-tests.sh",
+            proj_info_dir / "gate-check-run-tests.sh",
         ]
 
         for candidate in candidates:
@@ -466,14 +465,10 @@ class GateSystem:
         and returns the `secrets.ignore` list. Returns an empty list if the
         file is absent or the env vars are not set — the config is optional.
         """
-        work_repo_path = os.environ.get("LMER_WORK_REPO_PATH", "/work")
-        repo_host = os.environ.get("LMER_REPO_HOST")
-        repo_project = os.environ.get("LMER_REPO_PROJECT")
-
-        if not repo_host or not repo_project:
+        info_dir = project_info_dir()
+        if info_dir is None:
             return []
 
-        info_dir = Path(work_repo_path) / repo_host / repo_project / "info"
         config_path = None
         for candidate in ("gate-check.yaml", "gate-check.yml"):
             candidate_path = info_dir / candidate

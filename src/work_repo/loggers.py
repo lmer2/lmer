@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 import yaml
 
-from .utils import sanitize_task_target, redact_secrets, _collect_secret_values
+from .utils import redact_secrets, _collect_secret_values, task_target_dir
 
 
 class Logger(ABC):
@@ -97,22 +97,15 @@ def get_logger(log_file: Optional[Path] = None) -> Logger:
     """
     if log_file is None:
         # Determine log file path from environment variables
-        work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
-        repo_host = os.environ.get("LMER_REPO_HOST")
-        repo_project = os.environ.get("LMER_REPO_PROJECT")
-        task_type = os.environ.get("LMER_TASK", "default")
-        task_target = os.environ.get("LMER_TASK_TARGET", "default")
+        tgt_dir = task_target_dir()
 
-        if not repo_host or not repo_project:
+        if tgt_dir is None:
             raise ValueError(
                 "LMER_REPO_HOST and LMER_REPO_PROJECT must be set to determine log file path"
             )
 
-        # Sanitize task_target to match directory structure
-        safe_task_target = sanitize_task_target(task_target) if task_target else "default"
-
         # Build path: {host}/{project}/{task_type}/{task_target}/log.yaml
-        log_file = work_repo_path / repo_host / repo_project / task_type / safe_task_target / "log.yaml"
+        log_file = tgt_dir / "log.yaml"
 
     # Check for logger type from environment
     logger_type = os.environ.get("WORK_LOGGER_TYPE", "yaml").lower()
