@@ -22,6 +22,7 @@ unreleased:
     - "`LMER_REASONING_EFFORT` environment variable to override Claude's reasoning effort (`low`/`medium`/`high`/`max`/`auto`); translates to claude's `--effort` flag (#27)"
     - "`LMER_HUMAN_IDENTITY` environment variable communicates the human user's identity (free-form string) into the session; auto-derived from the host's `git config --global user.name`/`user.email` when unset, and injected into Claude's system prompt so the model can recognize the user in PR/MR/issue artifacts without asking them to confirm (#28)"
     - Auto-allow Skill() calls for start, rgr, test, and doctor so agents no longer prompt for permission when these slash commands are user-invoked
+    - "Auto-allow the service-mode `target-exec` and `target-logs` wrapper scripts so agents no longer prompt for permission when running commands or tailing logs in the target service container (#6)"
     - WebFetch permission for GitHub domains (github.com, docs.github.com, raw.githubusercontent.com, api.github.com)
     - AGENTS.md section on efficient command usage — guidance to avoid compound commands, use dedicated tools, and keep gate-commit messages simple
     - "gate-check: projects can now ship a `gate-check-run-tests.sh` script in their work-repo `info/` (or `{task}/info/`) directory to override the default pytest invocation; useful for `--service` mode and projects with non-trivial test environments (#30)"
