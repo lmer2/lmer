@@ -15,7 +15,12 @@ the user's terminal and claude. The supervisor:
   shortly after startup so an lmer task begins automatically. Disabled by
   ``--manual-start`` (or ``LMER_MANUAL_START=1``). CR (``\\r``) is what an
   Enter keypress produces in raw-mode TUIs like Claude Code; ``\\n`` would
-  insert a literal newline into the input field without submitting.
+  insert a literal newline into the input field without submitting. To make
+  that injection robust the PTY's line-discipline echo and CR→LF translation
+  are pre-cleared before fork (see ``_preconfigure_pty_for_injection``) and
+  injection is deferred until Claude's input prompt has actually rendered
+  (see ``_wait_for_ready_marker``) so a startup-timing race or transient
+  modal/dialog can't swallow the submit CR.
 
 The supervisor is meant to be invoked at the end of the claude-runner shell
 script in place of ``exec claude``. See ``libexec/claude-runner.sh``.
@@ -54,6 +59,20 @@ DEFAULT_FASTAPI_HOST = "127.0.0.1"
 # register, the input box is empty and a bare CR is a harmless no-op.
 DEFAULT_AUTO_START_NUDGE_DELAY = 0.5
 AUTO_START_NUDGE_COUNT = 3
+
+# Wait for Claude's input prompt to actually render before injecting ``/start``.
+# Claude Code v2.1.119 changed Enter routing so a CR fires the topmost
+# modal/dialog (permission prompt, theme picker, IDE detect, etc.) rather than
+# also submitting input-box text; if any such dialog is open when our injection
+# lands, the ``\r`` is consumed by the dialog and ``/start`` stays typed but
+# unsubmitted. Waiting for the input-prompt glyph (``❯``, U+276F) gives Claude
+# time to finish its startup chain before we send Enter.
+DEFAULT_AUTO_START_READY_MARKER = b"\xe2\x9d\xaf"  # "❯" — Claude's prompt char
+DEFAULT_AUTO_START_READY_TIMEOUT = 15.0
+# Small extra pause after the marker is observed: the prompt often renders
+# during a multi-screen-redraw sequence, and a short settle helps the input
+# box reach its steady, focused state before we type into it.
+DEFAULT_AUTO_START_SETTLE_DELAY = 0.25
 OUTPUT_BUFFER_LIMIT = 1024 * 1024  # 1 MiB rolling buffer of child output
 
 # When the host terminal (especially VSCode's integrated terminal) hasn't
@@ -171,6 +190,41 @@ def _set_winsize(fd: int, rows: int, cols: int) -> None:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     except OSError:
         pass
+
+
+def _preconfigure_pty_for_injection(fd: int) -> None:
+    """Pre-clear line-discipline flags so injected ``/start\\r`` survives intact.
+
+    A freshly-allocated PTY starts in cooked mode (``ICRNL``, ``ECHO``,
+    ``ICANON`` all on). Until the child (claude) calls ``tcsetattr`` to switch
+    to raw mode, anything we write to the master is processed by the kernel:
+
+    - ``ICRNL`` translates the trailing CR of ``/start\\r`` into LF — claude
+      then reads ``/start\\n`` in raw mode, where ``\\n`` is a literal newline
+      in the input box, not Enter. The slash command sits typed-but-unsubmitted.
+    - ``ECHO`` echoes the injection back through the master, where our
+      forwarding loop renders it onto the host TTY as a visible blank line
+      pushing the claude banner upward (the "Enters outside the input" the
+      issue reporter saw).
+
+    Clearing these flags pre-fork narrows that race so the injection lands as
+    raw CR with no host-side echo. Claude is free to call ``tcsetattr`` itself
+    afterward — its own raw-mode setup overrides ours and life goes on. The
+    helper clears the flags unconditionally — there is no per-flag gating
+    inside — but the call site skips it under ``--manual-start`` since
+    nothing is injected then.
+    """
+    with contextlib.suppress(termios.error, OSError):
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)
+        attrs[3] &= ~(
+            termios.ECHO
+            | termios.ECHOE
+            | termios.ECHOK
+            | termios.ECHONL
+            | termios.ICANON
+        )
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
 def _get_winsize(fd: int) -> Optional[tuple[int, int]]:
@@ -345,6 +399,29 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         float(nudge_raw) if nudge_raw is not None else DEFAULT_AUTO_START_NUDGE_DELAY
     )
 
+    ready_timeout_raw = args.auto_start_ready_timeout
+    if ready_timeout_raw is None:
+        ready_timeout_raw = os.environ.get("LMER_AUTO_START_READY_TIMEOUT")
+    auto_start_ready_timeout = (
+        float(ready_timeout_raw)
+        if ready_timeout_raw is not None
+        else DEFAULT_AUTO_START_READY_TIMEOUT
+    )
+
+    settle_raw = os.environ.get("LMER_AUTO_START_SETTLE_DELAY")
+    auto_start_settle_delay = (
+        float(settle_raw) if settle_raw is not None else DEFAULT_AUTO_START_SETTLE_DELAY
+    )
+
+    # Marker bytes are read as UTF-8 from env so a future claude UI change can
+    # be patched without a release. Setting it to the empty string disables
+    # marker gating (waits only on the initial + timeout-bounded delays).
+    marker_raw = os.environ.get("LMER_AUTO_START_READY_MARKER")
+    auto_start_ready_marker = (
+        marker_raw.encode("utf-8") if marker_raw is not None
+        else DEFAULT_AUTO_START_READY_MARKER
+    )
+
     recheck_raw = os.environ.get("LMER_WINSIZE_RECHECK_DELAY")
     winsize_recheck_delay = (
         float(recheck_raw) if recheck_raw is not None else DEFAULT_WINSIZE_RECHECK_DELAY
@@ -358,6 +435,9 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         "token": token,
         "auto_start_delay": auto_start_delay,
         "auto_start_nudge_delay": auto_start_nudge_delay,
+        "auto_start_ready_marker": auto_start_ready_marker,
+        "auto_start_ready_timeout": auto_start_ready_timeout,
+        "auto_start_settle_delay": auto_start_settle_delay,
         "winsize_recheck_delay": winsize_recheck_delay,
     }
 
@@ -378,6 +458,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         help="Seconds between follow-up CR nudges that re-trigger /start submission (default 0.5)",
     )
+    parser.add_argument(
+        "--auto-start-ready-timeout",
+        type=float,
+        help=(
+            "Max seconds to wait for claude's input prompt to render before "
+            "injecting /start; 0 disables marker waiting (default 15)"
+        ),
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to run (typically: -- claude ...)")
     return parser
 
@@ -391,6 +479,98 @@ def _split_command(remainder: list[str]) -> list[str]:
             "lmer-supervisor: missing command. Usage: lmer-supervisor [options] -- claude [args...]"
         )
     return remainder
+
+
+def _wait_for_ready_marker(
+    output: OutputBuffer,
+    marker: bytes,
+    timeout: float,
+    cancel: Optional[threading.Event] = None,
+) -> bool:
+    """Block until ``marker`` appears in ``output``, up to ``timeout`` seconds.
+
+    Returns ``True`` if the marker was observed in the byte stream, ``False`` if
+    the timeout expired or ``cancel`` fired before that. ``timeout <= 0`` or an
+    empty ``marker`` skips the wait entirely (returns ``True``) so callers can
+    disable marker-gating by configuration. A small tail of the previously-seen
+    bytes is retained between reads so a marker straddling two reads is still
+    detected.
+
+    Per-call read timeout is bounded (200 ms) so the loop wakes regularly to
+    re-check the cancel event — without this, a shutdown raised during the wait
+    would only be observed after the full ``timeout`` elapsed (the parent
+    blocks in ``OutputBuffer.read_since`` and the cancel signal would be
+    ignored for that whole window).
+    """
+    if not marker or timeout <= 0:
+        return True
+    deadline = time.monotonic() + timeout
+    cursor = 0
+    tail = b""
+    keep = len(marker) - 1
+    poll = 0.2  # short enough to make cancel feel snappy, long enough not to spin
+    while True:
+        if cancel is not None and cancel.is_set():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        data, cursor, _ = output.read_since(cursor, timeout=min(remaining, poll))
+        if not data:
+            continue
+        haystack = tail + data
+        if marker in haystack:
+            return True
+        if keep > 0:
+            tail = haystack[-keep:]
+
+
+def _start_auto_start_thread(
+    output: OutputBuffer,
+    write: Callable[[bytes], int],
+    options: dict,
+    cancel: threading.Event,
+) -> threading.Thread:
+    """Spawn the auto-/start daemon thread and return it.
+
+    Sequencing inside the thread:
+
+    1. Initial fixed delay — covers the very-early-startup window where claude
+       has not produced any output yet (so the marker scan would just spin) and
+       where any typing would be discarded.
+    2. Marker wait — block until claude has rendered its input prompt glyph
+       (see :func:`_wait_for_ready_marker`). Falls through on timeout so a
+       marker change in claude doesn't deadlock the auto-start path; the
+       cooked-mode pre-clear + CR nudges still give best-effort delivery.
+    3. Settle delay — small extra pause to let the input box reach steady
+       state if the prompt rendered mid-redraw.
+    4. Inject ``/start\\r`` plus follow-up CR nudges.
+
+    The ``cancel`` event short-circuits each stage so a shutdown raised during
+    the wait is honored promptly (the marker wait re-checks the event on a
+    bounded poll cadence internally).
+    """
+    nudge_delay = max(0.0, options["auto_start_nudge_delay"])
+    initial_delay = max(0.0, options["auto_start_delay"])
+    ready_marker = options["auto_start_ready_marker"]
+    ready_timeout = max(0.0, options["auto_start_ready_timeout"])
+    settle_delay = max(0.0, options["auto_start_settle_delay"])
+
+    def _run() -> None:
+        if initial_delay > 0 and cancel.wait(initial_delay):
+            return
+        _wait_for_ready_marker(output, ready_marker, ready_timeout, cancel=cancel)
+        if cancel.is_set():
+            return
+        if settle_delay > 0 and cancel.wait(settle_delay):
+            return
+        _inject_auto_start(write, AUTO_START_NUDGE_COUNT, nudge_delay)
+
+    thread = threading.Thread(
+        target=_run, name="lmer-supervisor-auto-start", daemon=True
+    )
+    thread.start()
+    return thread
 
 
 def _inject_auto_start(
@@ -459,6 +639,12 @@ def run_supervisor(
 
     master_fd, slave_fd = os.openpty()
 
+    # Pre-clear ICRNL/ECHO/ICANON before fork so the auto-/start injection that
+    # fires shortly after spawn isn't mangled by the PTY's default cooked-mode
+    # line discipline. Skipped under --manual-start since nothing is injected.
+    if not options["manual_start"]:
+        _preconfigure_pty_for_injection(slave_fd)
+
     initial_winsize = _get_winsize(stdin_fd) if os.isatty(stdin_fd) else None
     if initial_winsize:
         _set_winsize(master_fd, *initial_winsize)
@@ -502,17 +688,12 @@ def run_supervisor(
         )
         sys.stderr.flush()
 
-    auto_start_timer: Optional[threading.Timer] = None
+    auto_start_thread: Optional[threading.Thread] = None
+    auto_start_cancel = threading.Event()
     if not options["manual_start"]:
-        nudge_delay = max(0.0, options["auto_start_nudge_delay"])
-
-        def _inject_start() -> None:
-            # Runs in this daemon timer thread, so the inter-nudge sleeps never
-            # block the forwarding loop or hold up process exit.
-            _inject_auto_start(write_to_child, AUTO_START_NUDGE_COUNT, nudge_delay)
-        auto_start_timer = threading.Timer(options["auto_start_delay"], _inject_start)
-        auto_start_timer.daemon = True
-        auto_start_timer.start()
+        auto_start_thread = _start_auto_start_thread(
+            output, write_to_child, options, auto_start_cancel
+        )
 
     def _apply_host_winsize_to_master() -> None:
         size = _get_winsize(stdin_fd)
@@ -589,8 +770,8 @@ def run_supervisor(
                 with contextlib.suppress(OSError):
                     write_to_child(chunk)
     finally:
-        if auto_start_timer is not None:
-            auto_start_timer.cancel()
+        if auto_start_thread is not None:
+            auto_start_cancel.set()
         if winsize_recheck_timer is not None:
             winsize_recheck_timer.cancel()
         if previous_winch is not None and hasattr(signal, "SIGWINCH"):
