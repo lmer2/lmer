@@ -12,7 +12,7 @@ import yaml
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import commit_work_changes
-from .utils import sanitize_task_target, redact_secrets
+from .utils import redact_secrets, task_target_dir
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -243,17 +243,13 @@ def cmd_report(file_path: str) -> int:
         Exit code
     """
     try:
-        # Read environment variables
-        work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
-        repo_host = os.environ.get("LMER_REPO_HOST")
-        repo_project = os.environ.get("LMER_REPO_PROJECT")
-        task_type = os.environ.get("LMER_TASK", "default")
-        task_target = os.environ.get("LMER_TASK_TARGET", "default")
-
-        if not repo_host or not repo_project:
+        # Build target directory path: {host}/{project}/{task_type}/{task_target}
+        target_dir = task_target_dir()
+        if target_dir is None:
             print("❌ LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
             return 1
 
+        work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
         if not work_repo_path.exists():
             print(f"❌ Work repository not found at {work_repo_path}", file=sys.stderr)
             return 1
@@ -264,11 +260,6 @@ def cmd_report(file_path: str) -> int:
             print(f"❌ Report file not found: {file_path}", file=sys.stderr)
             return 1
 
-        # Sanitize task_target to match directory structure
-        safe_task_target = sanitize_task_target(task_target) if task_target else "default"
-
-        # Build target directory path: {host}/{project}/{task_type}/{task_target}
-        target_dir = work_repo_path / repo_host / repo_project / task_type / safe_task_target
         target_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate timestamp filename: YYMMDD-HH-MM-SS.md
