@@ -37,7 +37,7 @@ import threading
 import time
 import tty
 from collections import deque
-from typing import Iterable, Mapping, Optional
+from typing import Callable, Iterable, Mapping, Optional
 
 from pydantic import BaseModel
 
@@ -45,6 +45,15 @@ from pydantic import BaseModel
 DEFAULT_PORT_RANGE = (8700, 8799)
 DEFAULT_AUTO_START_DELAY = 1.5
 DEFAULT_FASTAPI_HOST = "127.0.0.1"
+
+# After the initial ``/start\r`` injection, claude's TUI occasionally shows
+# the typed ``/start`` but never registers the trailing CR — the submit gets
+# swallowed during a startup re-render, so the task never begins. To make
+# auto-start robust we follow up with a few bare CR "nudges": each one
+# re-triggers submission of the already-typed ``/start``. If the first CR did
+# register, the input box is empty and a bare CR is a harmless no-op.
+DEFAULT_AUTO_START_NUDGE_DELAY = 0.5
+AUTO_START_NUDGE_COUNT = 3
 OUTPUT_BUFFER_LIMIT = 1024 * 1024  # 1 MiB rolling buffer of child output
 
 # When the host terminal (especially VSCode's integrated terminal) hasn't
@@ -329,6 +338,13 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         delay_raw = os.environ.get("LMER_AUTO_START_DELAY")
     auto_start_delay = float(delay_raw) if delay_raw is not None else DEFAULT_AUTO_START_DELAY
 
+    nudge_raw = args.auto_start_nudge_delay
+    if nudge_raw is None:
+        nudge_raw = os.environ.get("LMER_AUTO_START_NUDGE_DELAY")
+    auto_start_nudge_delay = (
+        float(nudge_raw) if nudge_raw is not None else DEFAULT_AUTO_START_NUDGE_DELAY
+    )
+
     recheck_raw = os.environ.get("LMER_WINSIZE_RECHECK_DELAY")
     winsize_recheck_delay = (
         float(recheck_raw) if recheck_raw is not None else DEFAULT_WINSIZE_RECHECK_DELAY
@@ -341,6 +357,7 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         "host": host,
         "token": token,
         "auto_start_delay": auto_start_delay,
+        "auto_start_nudge_delay": auto_start_nudge_delay,
         "winsize_recheck_delay": winsize_recheck_delay,
     }
 
@@ -356,6 +373,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fastapi-host", help="Host to bind FastAPI (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", help="Bearer token (auto-generated if not provided)")
     parser.add_argument("--auto-start-delay", type=float, help="Seconds before /start is injected (default 1.5)")
+    parser.add_argument(
+        "--auto-start-nudge-delay",
+        type=float,
+        help="Seconds between follow-up CR nudges that re-trigger /start submission (default 0.5)",
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to run (typically: -- claude ...)")
     return parser
 
@@ -369,6 +391,33 @@ def _split_command(remainder: list[str]) -> list[str]:
             "lmer-supervisor: missing command. Usage: lmer-supervisor [options] -- claude [args...]"
         )
     return remainder
+
+
+def _inject_auto_start(
+    write: Callable[[bytes], int],
+    nudge_count: int,
+    nudge_delay: float,
+) -> None:
+    """Type ``/start`` and submit it, then send a few bare-CR nudges.
+
+    CR (``\\r``), not LF (``\\n``): claude's TUI runs in raw mode where Enter
+    arrives as ``\\r``; ``\\n`` would be inserted as a literal newline in the
+    input box and never trigger submission.
+
+    The initial CR is sometimes swallowed during a startup re-render, leaving
+    ``/start`` typed but unsubmitted — the bug behind this nudge logic. Each
+    follow-up bare CR re-submits the already-typed ``/start``; once it has gone
+    through, the prompt is empty and a bare CR is a harmless no-op. ``OSError``
+    is suppressed so a closed PTY (child already exited) doesn't crash the
+    timer thread this runs on.
+    """
+    with contextlib.suppress(OSError):
+        write(b"/start\r")
+    for _ in range(nudge_count):
+        if nudge_delay > 0:
+            time.sleep(nudge_delay)
+        with contextlib.suppress(OSError):
+            write(b"\r")
 
 
 def run_supervisor(
@@ -455,12 +504,12 @@ def run_supervisor(
 
     auto_start_timer: Optional[threading.Timer] = None
     if not options["manual_start"]:
+        nudge_delay = max(0.0, options["auto_start_nudge_delay"])
+
         def _inject_start() -> None:
-            # CR (\r), not LF (\n): claude's TUI runs in raw mode where Enter
-            # arrives as \r. \n would be inserted as a literal newline in the
-            # input box and never trigger submission.
-            with contextlib.suppress(OSError):
-                write_to_child(b"/start\r")
+            # Runs in this daemon timer thread, so the inter-nudge sleeps never
+            # block the forwarding loop or hold up process exit.
+            _inject_auto_start(write_to_child, AUTO_START_NUDGE_COUNT, nudge_delay)
         auto_start_timer = threading.Timer(options["auto_start_delay"], _inject_start)
         auto_start_timer.daemon = True
         auto_start_timer.start()
