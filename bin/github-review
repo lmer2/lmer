@@ -1,0 +1,17 @@
+#!/bin/bash
+# Wrapper script for github-review CLI
+# Sets up PYTHONPATH for both host and container compatibility
+
+# Detect script location and set paths accordingly
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Add src directory to PYTHONPATH to find the github_reviewer module
+if [ -d "/Agents/global/src" ]; then
+    # Container environment - src is mounted from host
+    export PYTHONPATH="/Agents/global/src:$PYTHONPATH"
+else
+    # Host environment
+    export PYTHONPATH="${SCRIPT_DIR}/src:$PYTHONPATH"
+fi
+
+exec "${LMER_PYTHON:-python3}" -c "from github_reviewer.cli import main; main()" "$@"

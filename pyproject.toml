@@ -53,6 +53,7 @@ lmer = "lmer_cli.cli:main"
 lmer-supervisor = "lmer_cli.supervisor:main"
 lmer-pipe = "lmer_cli.pipe:main"
 gitlab-review = "gitlab_reviewer.cli:main"
+github-review = "github_reviewer.cli:main"
 work = "work_repo.cli:main"
 
 [project.urls]
