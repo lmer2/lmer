@@ -886,6 +886,12 @@ def main(argv: list[str] | None = None) -> int:
         # Forward the auto-/start CR-nudge delay so a host-set value reaches
         # the supervisor running inside the container.
         "LMER_AUTO_START_NUDGE_DELAY": os.environ.get("LMER_AUTO_START_NUDGE_DELAY"),
+        # Forward the prompt-ready marker wait timeout (default 15s in-container).
+        "LMER_AUTO_START_READY_TIMEOUT": os.environ.get("LMER_AUTO_START_READY_TIMEOUT"),
+        # Forward the prompt-ready marker bytes (UTF-8) so the in-container
+        # supervisor can be re-tuned without a release if claude changes the
+        # input-prompt glyph.
+        "LMER_AUTO_START_READY_MARKER": os.environ.get("LMER_AUTO_START_READY_MARKER"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
         # only works if the container-side bind is 0.0.0.0. The host CLI

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import socket
+import termios
 import threading
 import time
 
@@ -142,6 +143,7 @@ class TestResolveOptions:
             fastapi_token=None,
             auto_start_delay=None,
             auto_start_nudge_delay=None,
+            auto_start_ready_timeout=None,
         )
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -150,7 +152,9 @@ class TestResolveOptions:
         for k in (
             "LMER_FASTAPI", "LMER_MANUAL_START", "LMER_FASTAPI_PORT_RANGE",
             "LMER_FASTAPI_HOST", "LMER_FASTAPI_TOKEN", "LMER_AUTO_START_DELAY",
-            "LMER_AUTO_START_NUDGE_DELAY", "LMER_WINSIZE_RECHECK_DELAY",
+            "LMER_AUTO_START_NUDGE_DELAY", "LMER_AUTO_START_READY_TIMEOUT",
+            "LMER_AUTO_START_SETTLE_DELAY", "LMER_AUTO_START_READY_MARKER",
+            "LMER_WINSIZE_RECHECK_DELAY",
         ):
             monkeypatch.delenv(k, raising=False)
         opts = supervisor._resolve_options(self._ns())
@@ -161,6 +165,9 @@ class TestResolveOptions:
         assert opts["token"] == ""
         assert opts["auto_start_delay"] == supervisor.DEFAULT_AUTO_START_DELAY
         assert opts["auto_start_nudge_delay"] == supervisor.DEFAULT_AUTO_START_NUDGE_DELAY
+        assert opts["auto_start_ready_timeout"] == supervisor.DEFAULT_AUTO_START_READY_TIMEOUT
+        assert opts["auto_start_ready_marker"] == supervisor.DEFAULT_AUTO_START_READY_MARKER
+        assert opts["auto_start_settle_delay"] == supervisor.DEFAULT_AUTO_START_SETTLE_DELAY
 
     def test_nudge_delay_from_env(self, monkeypatch):
         monkeypatch.delenv("LMER_AUTO_START_NUDGE_DELAY", raising=False)
@@ -172,6 +179,34 @@ class TestResolveOptions:
         monkeypatch.setenv("LMER_AUTO_START_NUDGE_DELAY", "0.25")
         opts = supervisor._resolve_options(self._ns(auto_start_nudge_delay=0.75))
         assert opts["auto_start_nudge_delay"] == 0.75
+
+    def test_ready_timeout_from_env(self, monkeypatch):
+        monkeypatch.setenv("LMER_AUTO_START_READY_TIMEOUT", "7.5")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["auto_start_ready_timeout"] == 7.5
+
+    def test_ready_timeout_cli_overrides_env(self, monkeypatch):
+        monkeypatch.setenv("LMER_AUTO_START_READY_TIMEOUT", "3")
+        opts = supervisor._resolve_options(self._ns(auto_start_ready_timeout=12.0))
+        assert opts["auto_start_ready_timeout"] == 12.0
+
+    def test_settle_delay_from_env(self, monkeypatch):
+        monkeypatch.setenv("LMER_AUTO_START_SETTLE_DELAY", "0.1")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["auto_start_settle_delay"] == 0.1
+
+    def test_ready_marker_from_env(self, monkeypatch):
+        # Override with a unicode string so we verify UTF-8 encoding too.
+        monkeypatch.setenv("LMER_AUTO_START_READY_MARKER", "READY→")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["auto_start_ready_marker"] == "READY→".encode("utf-8")
+
+    def test_ready_marker_empty_env_disables_gating(self, monkeypatch):
+        # Empty string is a sentinel for "no marker" — _wait_for_ready_marker
+        # short-circuits on falsy marker.
+        monkeypatch.setenv("LMER_AUTO_START_READY_MARKER", "")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["auto_start_ready_marker"] == b""
 
     def test_env_enables_fastapi(self, monkeypatch):
         monkeypatch.setenv("LMER_FASTAPI", "1")
@@ -208,6 +243,192 @@ class TestContainerEnvPassthrough:
         )
         assert pattern.search(source), \
             "LMER_AUTO_START_NUDGE_DELAY entry missing from cli.py container env dict"
+
+    def test_cli_env_dict_declares_auto_start_ready_timeout(self):
+        """Guard: LMER_AUTO_START_READY_TIMEOUT must be in cli.py's container env dict."""
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_AUTO_START_READY_TIMEOUT["']\s*:\s*os\.environ\.get\(\s*["']LMER_AUTO_START_READY_TIMEOUT["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_AUTO_START_READY_TIMEOUT entry missing from cli.py container env dict"
+
+    def test_cli_env_dict_declares_auto_start_ready_marker(self):
+        """Guard: LMER_AUTO_START_READY_MARKER must be in cli.py's container env dict."""
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_AUTO_START_READY_MARKER["']\s*:\s*os\.environ\.get\(\s*["']LMER_AUTO_START_READY_MARKER["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_AUTO_START_READY_MARKER entry missing from cli.py container env dict"
+
+
+class TestPreconfigurePtyForInjection:
+    """Cover the cooked-mode race fix: ICRNL/ECHO/ICANON cleared pre-fork."""
+
+    def _new_pty(self) -> tuple[int, int]:
+        master, slave = os.openpty()
+        # Sanity: a fresh PTY starts with the flags we intend to clear ON.
+        attrs = termios.tcgetattr(slave)
+        assert attrs[0] & termios.ICRNL
+        assert attrs[3] & termios.ECHO
+        assert attrs[3] & termios.ICANON
+        return master, slave
+
+    def test_clears_input_and_local_flags(self):
+        master, slave = self._new_pty()
+        try:
+            supervisor._preconfigure_pty_for_injection(slave)
+            attrs = termios.tcgetattr(slave)
+            # Input flags: CR↔NL translation off so injected \r survives.
+            assert not (attrs[0] & termios.ICRNL)
+            assert not (attrs[0] & termios.INLCR)
+            assert not (attrs[0] & termios.IGNCR)
+            # Local flags: echo off so injection doesn't render on the host TTY;
+            # ICANON off so the kernel doesn't line-buffer the injection.
+            assert not (attrs[3] & termios.ECHO)
+            assert not (attrs[3] & termios.ICANON)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_cr_survives_after_preconfigure(self):
+        """End-to-end: a CR written to master reaches slave as CR (not LF)."""
+        master, slave = self._new_pty()
+        try:
+            supervisor._preconfigure_pty_for_injection(slave)
+            os.write(master, b"/start\r")
+            data = os.read(slave, 64)
+            # Without the pre-config, ICRNL would have turned this into b"/start\n".
+            assert data == b"/start\r"
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_no_master_side_echo_after_preconfigure(self):
+        """Bytes written to master must not echo back through master."""
+        import select
+
+        master, slave = self._new_pty()
+        try:
+            supervisor._preconfigure_pty_for_injection(slave)
+            os.write(master, b"/start\r")
+            # Drain the slave-bound delivery so any echo would be the only thing
+            # left for master to read.
+            os.read(slave, 64)
+            rlist, _, _ = select.select([master], [], [], 0.05)
+            assert master not in rlist, \
+                "ECHO leaked: master saw a readable echo of the injection"
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_swallows_termios_error_on_non_tty(self, tmp_path):
+        """Helper must not crash if fd is not a TTY (e.g., a regular file)."""
+        regular = tmp_path / "not-a-tty"
+        regular.write_bytes(b"")
+        fd = os.open(str(regular), os.O_RDWR)
+        try:
+            # Should not raise even though fd is not a terminal.
+            supervisor._preconfigure_pty_for_injection(fd)
+        finally:
+            os.close(fd)
+
+
+class TestWaitForReadyMarker:
+    """Cover the prompt-ready gating that defers /start until claude is ready.
+
+    Claude Code v2.1.119 changed Enter routing so an open modal/dialog (theme
+    picker, IDE detect, permission prompt, etc.) consumes the submit CR rather
+    than also submitting input-box text. Until claude finishes its startup
+    chain and renders the input prompt glyph, our `/start\\r` injection sits
+    typed but unsubmitted. The helper waits for that glyph before we inject.
+    """
+
+    def test_returns_true_when_marker_present(self):
+        buf = supervisor.OutputBuffer(limit=1024)
+        buf.append(b"banner\n\xe2\x9d\xaf ")  # "❯ " — the prompt glyph
+        assert supervisor._wait_for_ready_marker(buf, b"\xe2\x9d\xaf", 1.0) is True
+
+    def test_returns_true_when_marker_arrives_late(self):
+        buf = supervisor.OutputBuffer(limit=1024)
+
+        def producer():
+            time.sleep(0.05)
+            buf.append(b"some startup output ")
+            time.sleep(0.05)
+            buf.append(b"\xe2\x9d\xaf ")
+
+        threading.Thread(target=producer, daemon=True).start()
+        start = time.monotonic()
+        ok = supervisor._wait_for_ready_marker(buf, b"\xe2\x9d\xaf", 2.0)
+        elapsed = time.monotonic() - start
+        assert ok is True
+        assert elapsed < 1.0
+
+    def test_returns_false_on_timeout(self):
+        buf = supervisor.OutputBuffer(limit=1024)
+        buf.append(b"no marker here at all")
+        start = time.monotonic()
+        ok = supervisor._wait_for_ready_marker(buf, b"\xe2\x9d\xaf", 0.15)
+        elapsed = time.monotonic() - start
+        assert ok is False
+        assert elapsed >= 0.15
+
+    def test_detects_marker_spanning_chunk_boundary(self):
+        """Marker straddling two chunks must still match — the wait helper
+        keeps a small tail of previously-seen bytes specifically for this."""
+        buf = supervisor.OutputBuffer(limit=1024)
+
+        def producer():
+            # ``❯`` is three bytes (0xE2, 0x9D, 0xAF). Split the marker across
+            # two appends so the first read returns only its prefix.
+            buf.append(b"prefix\xe2\x9d")
+            time.sleep(0.05)
+            buf.append(b"\xaf rest")
+
+        threading.Thread(target=producer, daemon=True).start()
+        ok = supervisor._wait_for_ready_marker(buf, b"\xe2\x9d\xaf", 2.0)
+        assert ok is True
+
+    def test_zero_timeout_skips_wait(self):
+        """timeout<=0 disables marker gating — return immediately as True so
+        callers can opt out of marker-based readiness by configuration."""
+        buf = supervisor.OutputBuffer(limit=1024)
+        assert supervisor._wait_for_ready_marker(buf, b"\xe2\x9d\xaf", 0) is True
+        assert supervisor._wait_for_ready_marker(buf, b"\xe2\x9d\xaf", -1.0) is True
+
+    def test_empty_marker_skips_wait(self):
+        buf = supervisor.OutputBuffer(limit=1024)
+        assert supervisor._wait_for_ready_marker(buf, b"", 1.0) is True
+
+    def test_cancel_event_breaks_out_promptly(self):
+        """Cancel during a long marker wait must return False quickly, not
+        block for the full timeout. The helper polls on a bounded cadence
+        specifically so shutdown propagates within ~poll seconds."""
+        buf = supervisor.OutputBuffer(limit=1024)
+        cancel = threading.Event()
+
+        def trip():
+            time.sleep(0.05)
+            cancel.set()
+
+        threading.Thread(target=trip, daemon=True).start()
+        start = time.monotonic()
+        ok = supervisor._wait_for_ready_marker(
+            buf, b"\xe2\x9d\xaf", 5.0, cancel=cancel
+        )
+        elapsed = time.monotonic() - start
+        assert ok is False
+        # Generous upper bound: poll interval is 0.2s, trip fires at +0.05s,
+        # so worst case we wake on the next poll boundary around +0.25s.
+        assert elapsed < 1.0
 
 
 class TestInjectAutoStart:
@@ -315,6 +536,7 @@ class TestCli:
             "--fastapi-token", "tok",
             "--auto-start-delay", "0.5",
             "--auto-start-nudge-delay", "0.2",
+            "--auto-start-ready-timeout", "8.0",
             "--", "claude", "--foo",
         ])
         assert ns.fastapi is True
@@ -324,6 +546,7 @@ class TestCli:
         assert ns.fastapi_token == "tok"
         assert ns.auto_start_delay == 0.5
         assert ns.auto_start_nudge_delay == 0.2
+        assert ns.auto_start_ready_timeout == 8.0
         assert ns.command == ["--", "claude", "--foo"]
 
 
@@ -456,6 +679,9 @@ class TestSupervisorIntegration:
             "token": "",
             "auto_start_delay": 0.1,
             "auto_start_nudge_delay": 0.05,
+            "auto_start_ready_marker": supervisor.DEFAULT_AUTO_START_READY_MARKER,
+            "auto_start_ready_timeout": 0,  # skip marker wait for non-claude wrapped procs
+            "auto_start_settle_delay": 0,
             "winsize_recheck_delay": 0,
         }
         if options:
@@ -487,18 +713,13 @@ class TestSupervisorIntegration:
         assert b"hello supervisor" in output
 
     def test_auto_start_injects_when_enabled(self):
-        # Use cat which echoes whatever we send (including the auto /start).
-        # Don't close stdin immediately — give the timer time to fire.
+        # Use ``head -c N`` instead of ``cat``: the auto-/start path pre-configures
+        # the PTY out of cooked mode, so a ^D-on-stdin-close trick can't terminate
+        # the child anymore. ``head -c`` exits on its own once it has echoed N
+        # bytes, regardless of line discipline. N=10 covers ``/start\r`` plus the
+        # three CR nudges.
         stdin_r, stdin_w = os.pipe()
         stdout_r, stdout_w = os.pipe()
-
-        def feeder():
-            time.sleep(0.4)
-            try:
-                os.close(stdin_w)
-            except OSError:
-                pass
-        threading.Thread(target=feeder, daemon=True).start()
 
         opts = {
             "fastapi": False,
@@ -508,11 +729,17 @@ class TestSupervisorIntegration:
             "token": "",
             "auto_start_delay": 0.1,
             "auto_start_nudge_delay": 0.05,
+            # head doesn't emit claude's prompt glyph; skip marker gating so
+            # the injection fires immediately after the initial delay.
+            "auto_start_ready_marker": supervisor.DEFAULT_AUTO_START_READY_MARKER,
+            "auto_start_ready_timeout": 0,
+            "auto_start_settle_delay": 0,
             "winsize_recheck_delay": 0,
         }
         rc = supervisor.run_supervisor(
-            ["cat"], opts, stdin_fd=stdin_r, stdout_fd=stdout_w,
+            ["head", "-c", "10"], opts, stdin_fd=stdin_r, stdout_fd=stdout_w,
         )
+        os.close(stdin_w)
         os.close(stdout_w)
         chunks = []
         while True:
