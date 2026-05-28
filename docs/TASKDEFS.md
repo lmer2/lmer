@@ -42,6 +42,13 @@ fires, the template is rendered with:
 - `{{ instructions_file }}` — the absolute path of the file being rendered
 - `{{ taskdef_name }}` — the directory name of the active taskdef
 - `{{ taskdef_file }}` — alias for the path of the rendered file
+- `{{ is_github }}` / `{{ is_gitlab }}` — booleans for the main task
+  target's provider, so a template can branch on the review interface (e.g.
+  use `github-review` vs `gitlab-review`). The host is taken from
+  `LMER_REPO_HOST` (falling back to the host parsed from `LMER_TASK_TARGET` /
+  `LMER_REPO_URL`); github.com and GitHub Enterprise hosts set `is_github`,
+  any other non-empty host sets `is_gitlab`, and both are `False` when no host
+  can be determined.
 
 To emit a literal `{{ VAR }}` in the rendered output (e.g. when documenting
 the template format itself), wrap it in a Jinja string: `{{ '{{ VAR }}' }}`.
