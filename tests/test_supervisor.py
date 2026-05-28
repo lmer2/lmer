@@ -141,6 +141,7 @@ class TestResolveOptions:
             fastapi_host=None,
             fastapi_token=None,
             auto_start_delay=None,
+            auto_start_nudge_delay=None,
         )
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -149,7 +150,7 @@ class TestResolveOptions:
         for k in (
             "LMER_FASTAPI", "LMER_MANUAL_START", "LMER_FASTAPI_PORT_RANGE",
             "LMER_FASTAPI_HOST", "LMER_FASTAPI_TOKEN", "LMER_AUTO_START_DELAY",
-            "LMER_WINSIZE_RECHECK_DELAY",
+            "LMER_AUTO_START_NUDGE_DELAY", "LMER_WINSIZE_RECHECK_DELAY",
         ):
             monkeypatch.delenv(k, raising=False)
         opts = supervisor._resolve_options(self._ns())
@@ -159,6 +160,18 @@ class TestResolveOptions:
         assert opts["host"] == supervisor.DEFAULT_FASTAPI_HOST
         assert opts["token"] == ""
         assert opts["auto_start_delay"] == supervisor.DEFAULT_AUTO_START_DELAY
+        assert opts["auto_start_nudge_delay"] == supervisor.DEFAULT_AUTO_START_NUDGE_DELAY
+
+    def test_nudge_delay_from_env(self, monkeypatch):
+        monkeypatch.delenv("LMER_AUTO_START_NUDGE_DELAY", raising=False)
+        monkeypatch.setenv("LMER_AUTO_START_NUDGE_DELAY", "0.25")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["auto_start_nudge_delay"] == 0.25
+
+    def test_nudge_delay_cli_overrides_env(self, monkeypatch):
+        monkeypatch.setenv("LMER_AUTO_START_NUDGE_DELAY", "0.25")
+        opts = supervisor._resolve_options(self._ns(auto_start_nudge_delay=0.75))
+        assert opts["auto_start_nudge_delay"] == 0.75
 
     def test_env_enables_fastapi(self, monkeypatch):
         monkeypatch.setenv("LMER_FASTAPI", "1")
@@ -177,6 +190,67 @@ class TestResolveOptions:
         monkeypatch.setenv("LMER_FASTAPI_HOST", "0.0.0.0")
         opts = supervisor._resolve_options(self._ns(fastapi_host="1.2.3.4"))
         assert opts["host"] == "1.2.3.4"
+
+
+class TestContainerEnvPassthrough:
+    def test_cli_env_dict_declares_auto_start_nudge_delay(self):
+        """Guard: LMER_AUTO_START_NUDGE_DELAY must be in cli.py's container env dict.
+
+        The supervisor reads this var inside the container, so a host-set value
+        only takes effect if cli.py forwards it explicitly.
+        """
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_AUTO_START_NUDGE_DELAY["']\s*:\s*os\.environ\.get\(\s*["']LMER_AUTO_START_NUDGE_DELAY["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_AUTO_START_NUDGE_DELAY entry missing from cli.py container env dict"
+
+
+class TestInjectAutoStart:
+    def test_sends_start_then_nudges(self):
+        sink: list[bytes] = []
+        supervisor._inject_auto_start(
+            lambda data: (sink.append(data), len(data))[1],
+            nudge_count=3,
+            nudge_delay=0,
+        )
+        # /start\r once, followed by exactly one bare \r per nudge.
+        assert sink == [b"/start\r", b"\r", b"\r", b"\r"]
+
+    def test_no_nudges_when_count_zero(self):
+        sink: list[bytes] = []
+        supervisor._inject_auto_start(
+            lambda data: (sink.append(data), len(data))[1],
+            nudge_count=0,
+            nudge_delay=0,
+        )
+        assert sink == [b"/start\r"]
+
+    def test_oserror_from_write_is_suppressed(self):
+        def boom(_data: bytes) -> int:
+            raise OSError("PTY closed")
+
+        # A closed PTY mid-injection must not propagate out of the timer thread.
+        supervisor._inject_auto_start(boom, nudge_count=2, nudge_delay=0)
+
+    def test_negative_nudge_delay_never_sleeps(self, monkeypatch):
+        # Documented contract: a negative delay is clamped — time.sleep must
+        # never be called with a negative value (which would raise ValueError),
+        # while all nudges are still sent.
+        slept: list[float] = []
+        monkeypatch.setattr(supervisor.time, "sleep", lambda s: slept.append(s))
+        sink: list[bytes] = []
+        supervisor._inject_auto_start(
+            lambda data: (sink.append(data), len(data))[1],
+            nudge_count=3,
+            nudge_delay=-1.0,
+        )
+        assert slept == []
+        assert sink == [b"/start\r", b"\r", b"\r", b"\r"]
 
 
 class TestResolveFastApiPort:
@@ -240,6 +314,7 @@ class TestCli:
             "--fastapi-host", "0.0.0.0",
             "--fastapi-token", "tok",
             "--auto-start-delay", "0.5",
+            "--auto-start-nudge-delay", "0.2",
             "--", "claude", "--foo",
         ])
         assert ns.fastapi is True
@@ -248,6 +323,7 @@ class TestCli:
         assert ns.fastapi_host == "0.0.0.0"
         assert ns.fastapi_token == "tok"
         assert ns.auto_start_delay == 0.5
+        assert ns.auto_start_nudge_delay == 0.2
         assert ns.command == ["--", "claude", "--foo"]
 
 
@@ -379,6 +455,7 @@ class TestSupervisorIntegration:
             "host": "127.0.0.1",
             "token": "",
             "auto_start_delay": 0.1,
+            "auto_start_nudge_delay": 0.05,
             "winsize_recheck_delay": 0,
         }
         if options:
@@ -430,6 +507,7 @@ class TestSupervisorIntegration:
             "host": "127.0.0.1",
             "token": "",
             "auto_start_delay": 0.1,
+            "auto_start_nudge_delay": 0.05,
             "winsize_recheck_delay": 0,
         }
         rc = supervisor.run_supervisor(

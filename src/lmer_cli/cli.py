@@ -883,6 +883,9 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_FASTAPI": "1" if ns.fastapi else None,
         "LMER_MANUAL_START": "1" if ns.manual_start else None,
         "LMER_DISABLE_SUPERVISOR": "1" if ns.no_supervisor else None,
+        # Forward the auto-/start CR-nudge delay so a host-set value reaches
+        # the supervisor running inside the container.
+        "LMER_AUTO_START_NUDGE_DELAY": os.environ.get("LMER_AUTO_START_NUDGE_DELAY"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
         # only works if the container-side bind is 0.0.0.0. The host CLI
