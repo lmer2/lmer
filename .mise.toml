@@ -7,6 +7,7 @@ node = "lts"
 gh = "latest"
 glab = "latest"
 claude-powerline = "latest"
+actionlint = "1.7.7"
 
 # Cloud CLI tools (on-demand)
 # kubectl = "latest"
