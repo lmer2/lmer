@@ -38,6 +38,17 @@ class CheckResult:
     message: str = ""
     details: List[str] = None
     is_critical: bool = True
+    # Complete captured output for checks that shell out (tests, pre-commit).
+    # `details` only holds a short tail for the terminal; `full_output` is the
+    # untruncated stdout+stderr, persisted to the gate-check log so failures can
+    # be investigated without re-running the slow checks.
+    full_output: Optional[str] = None
+
+
+# Fixed, predictable location for the full gate-check log. Overwritten on every
+# run so it always reflects the latest invocation. Lives under /tmp so it is
+# never committed and needs no per-project configuration.
+GATE_CHECK_LOG_PATH = Path("/tmp/gate-check.log")
 
 
 class Colors:
@@ -263,6 +274,7 @@ class GateSystem:
                 status=CheckStatus.PASSED,
                 message=f"Custom test runner passed ({script.name})",
                 details=details,
+                full_output=combined_output,
             )
 
         details = non_empty[-5:] if non_empty else ["Custom test runner failed - no output"]
@@ -271,6 +283,7 @@ class GateSystem:
             status=CheckStatus.FAILED,
             message=f"Custom test runner failed ({script.name})",
             details=details,
+            full_output=combined_output,
         )
 
     def check_tests(self) -> CheckResult:
@@ -331,7 +344,8 @@ class GateSystem:
             return CheckResult(
                 name="Python Tests",
                 status=CheckStatus.PASSED,
-                message=f"All {test_count} passed"
+                message=f"All {test_count} passed",
+                full_output=combined_output,
             )
         else:
             # Look for failure patterns in output
@@ -360,7 +374,8 @@ class GateSystem:
                 name="Python Tests",
                 status=CheckStatus.FAILED,
                 message="Tests failed",
-                details=failures[:5]  # Show first 5 failures
+                details=failures[:5],  # Show first 5 failures
+                full_output=combined_output,
             )
 
     @staticmethod
@@ -430,12 +445,14 @@ class GateSystem:
         code = result.returncode
         stdout = result.stdout
         stderr = result.stderr
+        combined_output = stdout + stderr
 
         if code == 0:
             return CheckResult(
                 name="Pre-commit Hooks",
                 status=CheckStatus.PASSED,
-                message="All hooks passed"
+                message="All hooks passed",
+                full_output=combined_output,
             )
 
         # On failure: surface the tail of combined stdout+stderr. Earlier
@@ -456,6 +473,7 @@ class GateSystem:
             status=CheckStatus.FAILED,
             message=f"pre-commit exited {code}",
             details=details,
+            full_output=combined_output,
         )
 
     def _load_secrets_ignore_patterns(self) -> List[str]:
@@ -744,14 +762,28 @@ class GateSystem:
             message="Permissions correct"
         )
 
+    def _tally(self) -> Tuple[int, int]:
+        """Count critical failures and warnings across all check results.
+
+        Shared by print_results and write_log_file so the two summary counts
+        can't drift apart. Non-critical failures are not counted as failures.
+        """
+        failures = 0
+        warnings = 0
+        for result in self.results:
+            if result.status == CheckStatus.FAILED and result.is_critical:
+                failures += 1
+            elif result.status == CheckStatus.WARNING:
+                warnings += 1
+        return failures, warnings
+
     def print_results(self):
         """Print all check results"""
         print(f"\n{Colors.BLUE}{'═' * 60}{Colors.NC}")
         print(f"{Colors.BLUE}{Colors.BOLD}                    GATE CHECK RESULTS{Colors.NC}")
         print(f"{Colors.BLUE}{'═' * 60}{Colors.NC}\n")
 
-        failures = 0
-        warnings = 0
+        failures, warnings = self._tally()
 
         for result in self.results:
             # Choose color based on status
@@ -759,11 +791,8 @@ class GateSystem:
                 color = Colors.GREEN
             elif result.status == CheckStatus.FAILED:
                 color = Colors.RED
-                if result.is_critical:
-                    failures += 1
             elif result.status == CheckStatus.WARNING:
                 color = Colors.YELLOW
-                warnings += 1
             else:
                 color = Colors.CYAN
 
@@ -794,6 +823,69 @@ class GateSystem:
             if warnings > 0:
                 print(f"{Colors.YELLOW}⚠️  Also found {warnings} warning(s){Colors.NC}")
             return False
+
+    def write_log_file(self, path: Optional[Path] = None) -> Optional[Path]:
+        """Persist the full results of this run to a plain-text log file.
+
+        The terminal output only shows a short tail of each check's details
+        (and only when --verbose). This writes every check's status, message,
+        all details, and the complete captured subprocess output (for tests
+        and pre-commit) so a failure can be investigated by reading the file
+        instead of re-running the slow checks.
+
+        Returns the path written, or None if writing failed (writing the log
+        must never break gate-check itself).
+        """
+        # Resolve the default at call time (not as a default arg) so the module
+        # constant can be monkeypatched and so the latest value is always used.
+        if path is None:
+            path = GATE_CHECK_LOG_PATH
+
+        lines: List[str] = []
+        sep = "=" * 78
+        lines.append(sep)
+        lines.append("GATE CHECK LOG")
+        lines.append(f"Generated:         {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(self.timestamp))}")
+        lines.append(f"Working directory: {self.project_root}")
+        lines.append(sep)
+        lines.append("")
+
+        failures, warnings = self._tally()
+        for result in self.results:
+            # Strip the emoji/whitespace decoration from the status value so the
+            # log greps cleanly (e.g. "PASSED", "FAILED").
+            status_label = result.status.name
+            lines.append(f"[{status_label}] {result.name}")
+            if result.message:
+                lines.append(f"  Message: {result.message}")
+            if not result.is_critical and result.status == CheckStatus.FAILED:
+                lines.append("  (non-critical)")
+            if result.details:
+                lines.append("  Details:")
+                for detail in result.details:
+                    lines.append(f"    - {detail}")
+            if result.full_output is not None:
+                trimmed = result.full_output.strip("\n")
+                lines.append("  Full output:")
+                lines.append("  " + ("-" * 76))
+                if trimmed:
+                    lines.extend(trimmed.splitlines())
+                else:
+                    lines.append("(no output)")
+                lines.append("  " + ("-" * 76))
+            lines.append("")
+
+        lines.append(sep)
+        lines.append(f"SUMMARY: {failures} critical failure(s), {warnings} warning(s)")
+        lines.append(sep)
+        lines.append("")
+
+        try:
+            path.write_text("\n".join(lines), encoding="utf-8")
+        except OSError as e:
+            print(f"{Colors.YELLOW}⚠️  Could not write gate-check log to {path}: {e}{Colors.NC}")
+            return None
+        return path
 
     def run_commit_gate(self, skip_tests: bool = False) -> bool:
         """Run all checks for commit gate.
@@ -827,7 +919,15 @@ class GateSystem:
             result = check()
             self.results.append(result)
 
-        return self.print_results()
+        passed = self.print_results()
+
+        # Always persist the full results so failures can be investigated by
+        # reading the log instead of re-running the (often slow) checks.
+        log_path = self.write_log_file()
+        if log_path is not None:
+            print(f"\n{Colors.CYAN}📝 Full check log written to: {log_path}{Colors.NC}")
+
+        return passed
 
     def _get_push_allow_list(self) -> list[str]:
         """Get the push allow list from LMER_PUSH_ALLOW_LIST env var.
