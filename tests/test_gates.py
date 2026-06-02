@@ -145,6 +145,9 @@ class TestGateSystem:
         result = self.gate.check_tests()
         assert result.status == CheckStatus.PASSED
         assert "5 tests" in result.message
+        # Full output is captured for the log even on success.
+        assert result.full_output is not None
+        assert "5 passed in 0.5s" in result.full_output
 
     @patch('subprocess.run')
     def test_check_tests_fail(self, mock_run):
@@ -158,6 +161,10 @@ class TestGateSystem:
         result = self.gate.check_tests()
         assert result.status == CheckStatus.FAILED
         assert "Tests failed" in result.message
+        # Full pytest output is preserved so the failure can be investigated
+        # from the log without re-running the suite.
+        assert result.full_output is not None
+        assert "FAILED tests/test_main.py::test_function" in result.full_output
 
     @patch('subprocess.run')
     def test_check_precommit_pass(self, mock_run):
@@ -167,6 +174,8 @@ class TestGateSystem:
         result = self.gate.check_precommit()
         assert result.status == CheckStatus.PASSED
         assert "All hooks passed" in result.message
+        assert result.full_output is not None
+        assert "All checks passed" in result.full_output
 
     @patch('subprocess.run')
     def test_check_precommit_fail(self, mock_run):
@@ -184,6 +193,10 @@ class TestGateSystem:
         assert result.details is not None
         assert "black.....................................Failed" in result.details
         assert "Fix it." in result.details
+        # Complete output is preserved for the log file.
+        assert result.full_output is not None
+        assert "black.....................................Failed" in result.full_output
+        assert "Fix it." in result.full_output
 
     @patch('subprocess.run')
     def test_check_precommit_fail_surfaces_non_precommit_output(self, mock_run):
@@ -439,8 +452,10 @@ class TestGateSystem:
         # This test has issues with mocking - skipping for now
         pass
 
-    def test_run_commit_gate_skip_tests_omits_check_tests(self, capsys):
+    def test_run_commit_gate_skip_tests_omits_check_tests(self, capsys, tmp_path, monkeypatch):
         """skip_tests=True must not invoke check_tests, but still runs other checks."""
+        # Redirect the log so the test doesn't clobber the real /tmp/gate-check.log.
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH", tmp_path / "gate-check.log")
         passed = CheckResult(name="x", status=CheckStatus.PASSED, message="ok")
         for attr in (
             "check_git_status", "check_staged_files", "check_branch",
@@ -460,8 +475,10 @@ class TestGateSystem:
         # Library message stays neutral — env-var hint belongs to gate-commit.
         assert "LMER_QUICK_GATE_COMMIT" not in out
 
-    def test_run_commit_gate_default_runs_tests(self):
+    def test_run_commit_gate_default_runs_tests(self, tmp_path, monkeypatch):
         """Without skip_tests, check_tests still runs (regression guard)."""
+        # Redirect the log so the test doesn't clobber the real /tmp/gate-check.log.
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH", tmp_path / "gate-check.log")
         passed = CheckResult(name="x", status=CheckStatus.PASSED, message="ok")
         for attr in (
             "check_git_status", "check_staged_files", "check_branch",
@@ -474,6 +491,138 @@ class TestGateSystem:
         self.gate.run_commit_gate()
 
         self.gate.check_tests.assert_called_once()
+
+
+class TestWriteLogFile:
+    """Test the gate-check log file written for post-failure investigation."""
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=False)
+
+    def test_writes_status_message_and_details(self, tmp_path):
+        """Every check's status, message, and details land in the log."""
+        self.gate.results = [
+            CheckResult(
+                name="Python Tests",
+                status=CheckStatus.FAILED,
+                message="Tests failed",
+                details=["FAILED tests/test_x.py::test_y"],
+            ),
+        ]
+        log_path = tmp_path / "gate-check.log"
+        returned = self.gate.write_log_file(path=log_path)
+
+        assert returned == log_path
+        content = log_path.read_text()
+        assert "[FAILED] Python Tests" in content
+        assert "Message: Tests failed" in content
+        assert "FAILED tests/test_x.py::test_y" in content
+
+    def test_includes_full_output(self, tmp_path):
+        """The untruncated full_output is what makes re-running unnecessary."""
+        long_output = "\n".join(f"line {i}" for i in range(100))
+        self.gate.results = [
+            CheckResult(
+                name="Python Tests",
+                status=CheckStatus.FAILED,
+                message="Tests failed",
+                details=["line 99"],  # terminal only saw the tail
+                full_output=long_output,
+            ),
+        ]
+        log_path = tmp_path / "gate-check.log"
+        self.gate.write_log_file(path=log_path)
+
+        content = log_path.read_text()
+        # The full body is present, not just the tail that reached the terminal.
+        assert "line 0" in content
+        assert "line 50" in content
+        assert "line 99" in content
+        assert "Full output:" in content
+
+    def test_summary_counts_failures_and_warnings(self, tmp_path):
+        """The summary line reflects critical failures vs. warnings."""
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.FAILED, message="boom"),
+            CheckResult(name="B", status=CheckStatus.WARNING, message="meh"),
+            CheckResult(
+                name="C", status=CheckStatus.FAILED, message="non-crit",
+                is_critical=False,
+            ),
+            CheckResult(name="D", status=CheckStatus.PASSED, message="ok"),
+        ]
+        log_path = tmp_path / "gate-check.log"
+        self.gate.write_log_file(path=log_path)
+
+        content = log_path.read_text()
+        # Only the critical FAILED counts as a failure; non-critical is excluded.
+        assert "SUMMARY: 1 critical failure(s), 1 warning(s)" in content
+        assert "(non-critical)" in content
+
+    def test_empty_full_output_renders_no_output_placeholder(self, tmp_path):
+        """A check that ran but produced no output gets a "(no output)" marker."""
+        self.gate.results = [
+            CheckResult(
+                name="Python Tests",
+                status=CheckStatus.PASSED,
+                message="ok",
+                full_output="",
+            ),
+        ]
+        log_path = tmp_path / "gate-check.log"
+        self.gate.write_log_file(path=log_path)
+
+        content = log_path.read_text()
+        # full_output is non-None (the check shelled out) but empty -> placeholder.
+        assert "Full output:" in content
+        assert "(no output)" in content
+
+    def test_none_full_output_omits_section(self, tmp_path):
+        """A check with no captured output (full_output=None) has no output section."""
+        self.gate.results = [
+            CheckResult(
+                name="Git Status",
+                status=CheckStatus.PASSED,
+                message="clean",
+            ),
+        ]
+        log_path = tmp_path / "gate-check.log"
+        self.gate.write_log_file(path=log_path)
+
+        content = log_path.read_text()
+        # Checks that never shell out (full_output stays None) get no output block.
+        assert "Full output:" not in content
+
+    def test_returns_none_on_write_error(self, tmp_path):
+        """A log-write failure must never break gate-check itself."""
+        self.gate.results = [
+            CheckResult(name="A", status=CheckStatus.PASSED, message="ok"),
+        ]
+        # Point at a path whose parent does not exist and cannot be created.
+        bad_path = tmp_path / "nope" / "gate-check.log"
+        result = self.gate.write_log_file(path=bad_path)
+        assert result is None
+
+    def test_run_commit_gate_writes_log_and_prints_path(self, tmp_path, capsys, monkeypatch):
+        """run_commit_gate persists the log and announces its path."""
+        log_path = tmp_path / "gate-check.log"
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH", log_path)
+
+        passed = CheckResult(name="x", status=CheckStatus.PASSED, message="ok")
+        for attr in (
+            "check_git_status", "check_staged_files", "check_branch",
+            "check_tests", "check_precommit", "check_secrets",
+            "check_code_quality", "check_documentation", "check_changelog",
+            "check_permissions",
+        ):
+            setattr(self.gate, attr, MagicMock(__name__=attr, return_value=passed))
+
+        self.gate.run_commit_gate()
+
+        assert log_path.exists()
+        out = capsys.readouterr().out
+        assert str(log_path) in out
+        assert "Full check log written to" in out
 
 
 class TestCheckChangelog:
