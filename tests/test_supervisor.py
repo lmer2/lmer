@@ -228,6 +228,22 @@ class TestResolveOptions:
 
 
 class TestContainerEnvPassthrough:
+    def test_cli_env_dict_declares_auto_start_delay(self):
+        """Guard: LMER_AUTO_START_DELAY must be in cli.py's container env dict.
+
+        The supervisor reads this var inside the container, so a host-set value
+        only takes effect if cli.py forwards it explicitly.
+        """
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_AUTO_START_DELAY["']\s*:\s*os\.environ\.get\(\s*["']LMER_AUTO_START_DELAY["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_AUTO_START_DELAY entry missing from cli.py container env dict"
+
     def test_cli_env_dict_declares_auto_start_nudge_delay(self):
         """Guard: LMER_AUTO_START_NUDGE_DELAY must be in cli.py's container env dict.
 
