@@ -122,6 +122,8 @@ The following environment variables control LMER behavior:
 
 - **`LMER_AUTO_START_READY_MARKER`** - UTF-8 string the supervisor scans for in Claude's output to decide that the input prompt has rendered (default `❯` — U+276F). The marker is a heuristic: `❯` is also used as a row-selection indicator in some TUI pickers, so a future Claude UI change could shift the right marker. Override here lets you patch in a more specific string (e.g. a unique-to-input-box sequence) without an lmer release. Set to the empty string to disable marker gating entirely (equivalent to `LMER_AUTO_START_READY_TIMEOUT=0`). Has no effect under `--manual-start`/`LMER_MANUAL_START`. Forwarded into the container by the host CLI.
 
+- **`LMER_START_PROMPT`** - Follow-up prompt the supervisor types and submits immediately after auto-injecting `/start`, so an automated run can hand Claude an extra instruction without manual typing (e.g. `"make sure to research X online first"`). Claude queues input typed while it is still working on `/start`, so the prompt becomes the next conversation turn. Its submit Enter gets the same bare-CR nudge re-submission as `/start` (governed by `LMER_AUTO_START_NUDGE_DELAY`) in case the initial CR is swallowed. Set on the host via the `--prompt` CLI flag (which populates this var); an empty or unset value means no follow-up. Tied to auto-start, so it is a **no-op under `--manual-start`/`LMER_MANUAL_START`** (nothing is auto-injected then). Forwarded into the container by the host CLI.
+
 ### Work-Repo Claude Assets
 
 The work repository can contribute Claude Code slash commands, skills, and a limited slice of `settings.json` to every session that uses it. This is the supported way to ship project-specific automation, runbooks, or pre-authorized tool patterns across all developers who share the work repo.
@@ -316,6 +318,7 @@ lmer build --local /path/to/agents/global
 - `--remote <name>` - Git remote name to use (required when local repo has multiple remotes)
 - `--verbose` - Enable verbose output
 - `--manual-start` - Do not auto-inject `/start` into Claude on launch. By default the supervisor sends `/start` shortly after Claude is ready so the configured task begins immediately
+- `--prompt <text>` - Follow-up prompt injected immediately after the auto-`/start`, so an automated run can hand Claude an extra instruction without manual typing (e.g. `lmer chat <issue-url> --prompt="research X online first"`). Claude queues input typed while it is still working on `/start`, so the prompt becomes the next conversation turn. Forwarded to the container as `LMER_START_PROMPT`. Ignored under `--manual-start` (nothing is auto-injected then)
 - `--fastapi` - Expose a FastAPI endpoint inside the container that lets a controlling process drive Claude's stdin/stdout (`POST /input`, `GET /output`). The chosen port is published to `127.0.0.1` on the host. See [Supervisor and FastAPI Endpoint](#supervisor-and-fastapi-endpoint)
 - `--fastapi-port-range LOW-HIGH` - Port range to pick a free FastAPI port from (default `8700-8799`). The host CLI picks one free port from this range before container start and publishes only that port
 - `--fastapi-host <host>` - Inside-container bind host for the FastAPI endpoint (default `0.0.0.0` when `--fastapi` is set so the published port works)
@@ -328,6 +331,8 @@ lmer build --local /path/to/agents/global
 Claude is launched through `lmer-supervisor`, a Python process that sits between your terminal and the Claude CLI. It allocates a PTY and forwards keystrokes/output transparently. The supervisor can also expose a FastAPI control plane.
 
 **Auto `/start`** — by default `/start` is typed into Claude after a short delay so an lmer task begins without manual intervention. Because the trailing Enter is occasionally swallowed during Claude's startup re-render (leaving `/start` typed but unsubmitted), the supervisor (1) pre-clears cooked-mode PTY flags before fork so the CR isn't translated to LF, (2) defers injection until Claude has actually rendered the input prompt glyph (`❯`) so any startup modal/dialog has had a chance to clear, and (3) follows the initial `/start\r` with a few bare carriage-return nudges to re-trigger submission; each nudge is a no-op once `/start` has gone through. Tune the gap between nudges with `--auto-start-nudge-delay` (or `LMER_AUTO_START_NUDGE_DELAY`) and the maximum prompt-ready wait with `--auto-start-ready-timeout` (or `LMER_AUTO_START_READY_TIMEOUT`). Disable auto-start entirely with `--manual-start` (or `LMER_MANUAL_START=1`) when you want to drive Claude yourself.
+
+**Follow-up prompt** — pass `--prompt "<text>"` (or set `LMER_START_PROMPT`) to have the supervisor type and submit an extra instruction right after the `/start` injection. Claude queues input typed while it is still working on `/start`, so the prompt lands as the next conversation turn — handy for automating `lmer chat <issue-url> --prompt="research X online first"`. It is part of the auto-start flow, so it is ignored under `--manual-start` (where nothing is auto-injected).
 
 **FastAPI endpoint** — pass `--fastapi` to expose two endpoints (bearer-token protected):
 

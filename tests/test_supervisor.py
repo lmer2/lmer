@@ -154,7 +154,7 @@ class TestResolveOptions:
             "LMER_FASTAPI_HOST", "LMER_FASTAPI_TOKEN", "LMER_AUTO_START_DELAY",
             "LMER_AUTO_START_NUDGE_DELAY", "LMER_AUTO_START_READY_TIMEOUT",
             "LMER_AUTO_START_SETTLE_DELAY", "LMER_AUTO_START_READY_MARKER",
-            "LMER_WINSIZE_RECHECK_DELAY",
+            "LMER_WINSIZE_RECHECK_DELAY", "LMER_START_PROMPT",
         ):
             monkeypatch.delenv(k, raising=False)
         opts = supervisor._resolve_options(self._ns())
@@ -168,6 +168,18 @@ class TestResolveOptions:
         assert opts["auto_start_ready_timeout"] == supervisor.DEFAULT_AUTO_START_READY_TIMEOUT
         assert opts["auto_start_ready_marker"] == supervisor.DEFAULT_AUTO_START_READY_MARKER
         assert opts["auto_start_settle_delay"] == supervisor.DEFAULT_AUTO_START_SETTLE_DELAY
+        assert opts["start_prompt"] == ""
+
+    def test_start_prompt_from_env(self, monkeypatch):
+        monkeypatch.setenv("LMER_START_PROMPT", "research X online first")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["start_prompt"] == "research X online first"
+
+    def test_start_prompt_blank_env_is_empty(self, monkeypatch):
+        # Explicit empty string is treated the same as unset: no follow-up.
+        monkeypatch.setenv("LMER_START_PROMPT", "")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["start_prompt"] == ""
 
     def test_nudge_delay_from_env(self, monkeypatch):
         monkeypatch.delenv("LMER_AUTO_START_NUDGE_DELAY", raising=False)
@@ -267,6 +279,22 @@ class TestContainerEnvPassthrough:
         )
         assert pattern.search(source), \
             "LMER_AUTO_START_READY_MARKER entry missing from cli.py container env dict"
+
+    def test_cli_env_dict_declares_start_prompt(self):
+        """Guard: LMER_START_PROMPT must be in cli.py's container env dict.
+
+        Unlike the other supervisor vars it is sourced from the --prompt CLI
+        arg (ns.prompt), not os.environ — so the guard matches that pattern.
+        """
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_START_PROMPT["']\s*:\s*ns\.prompt"""
+        )
+        assert pattern.search(source), \
+            "LMER_START_PROMPT entry missing from cli.py container env dict"
 
 
 class TestPreconfigurePtyForInjection:
@@ -472,6 +500,117 @@ class TestInjectAutoStart:
         )
         assert slept == []
         assert sink == [b"/start\r", b"\r", b"\r", b"\r"]
+
+
+class TestInjectStartPrompt:
+    def test_sends_prompt_with_trailing_cr(self):
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "research X online first",
+        )
+        # Single payload: text + CR (Enter in claude's raw-mode TUI).
+        assert sink == ["research X online first\r".encode("utf-8")]
+
+    def test_does_not_double_terminate_cr(self):
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "do the thing\r",
+        )
+        assert sink == [b"do the thing\r"]
+
+    def test_does_not_double_terminate_lf(self):
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "do the thing\n",
+        )
+        assert sink == [b"do the thing\n"]
+
+    def test_empty_prompt_is_noop(self):
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "",
+        )
+        assert sink == []
+
+    def test_encodes_unicode_as_utf8(self):
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "café ☕",
+        )
+        assert sink == ["café ☕\r".encode("utf-8")]
+
+    def test_sends_prompt_then_nudges(self):
+        # Mirrors _inject_auto_start: the prompt's submit CR can be swallowed
+        # during a startup re-render, so bare-CR nudges re-submit it.
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "hello",
+            nudge_count=3,
+            nudge_delay=0,
+        )
+        assert sink == [b"hello\r", b"\r", b"\r", b"\r"]
+
+    def test_no_nudges_when_count_zero(self):
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "hello",
+            nudge_count=0,
+            nudge_delay=0,
+        )
+        assert sink == [b"hello\r"]
+
+    def test_negative_nudge_delay_never_sleeps(self, monkeypatch):
+        # A negative delay must be clamped — time.sleep is never called with a
+        # negative value (which would raise ValueError) while nudges still send.
+        slept: list[float] = []
+        monkeypatch.setattr(supervisor.time, "sleep", lambda s: slept.append(s))
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "hello",
+            nudge_count=2,
+            nudge_delay=-1.0,
+        )
+        assert slept == []
+        assert sink == [b"hello\r", b"\r", b"\r"]
+
+    def test_empty_prompt_is_noop_even_with_nudges(self):
+        sink: list[bytes] = []
+        supervisor._inject_start_prompt(
+            lambda data: (sink.append(data), len(data))[1],
+            "",
+            nudge_count=3,
+            nudge_delay=0,
+        )
+        assert sink == []
+
+    def test_oserror_from_write_is_suppressed(self):
+        def boom(_data: bytes) -> int:
+            raise OSError("PTY closed")
+
+        # A closed PTY mid-injection must not propagate out of the timer thread.
+        supervisor._inject_start_prompt(boom, "anything", nudge_count=2)
+
+
+class TestEnsureSubmitCr:
+    def test_appends_cr_when_missing(self):
+        assert supervisor._ensure_submit_cr("hello") == "hello\r"
+
+    def test_does_not_double_cr(self):
+        assert supervisor._ensure_submit_cr("hello\r") == "hello\r"
+
+    def test_does_not_double_lf(self):
+        assert supervisor._ensure_submit_cr("hello\n") == "hello\n"
+
+    def test_empty_string_gets_cr(self):
+        assert supervisor._ensure_submit_cr("") == "\r"
 
 
 class TestResolveFastApiPort:
@@ -735,6 +874,8 @@ class TestSupervisorIntegration:
             "auto_start_ready_timeout": 0,
             "auto_start_settle_delay": 0,
             "winsize_recheck_delay": 0,
+            # No follow-up prompt: only /start + nudges are injected (10 bytes).
+            "start_prompt": "",
         }
         rc = supervisor.run_supervisor(
             ["head", "-c", "10"], opts, stdin_fd=stdin_r, stdout_fd=stdout_w,
@@ -754,6 +895,49 @@ class TestSupervisorIntegration:
         os.close(stdin_r)
         assert rc == 0
         assert b"/start" in b"".join(chunks)
+
+    def test_start_prompt_injected_after_start(self):
+        # Inject /start (7 bytes: ``/start\r``) + 3 CR nudges (3 bytes) +
+        # the follow-up prompt ``hello\r`` (6 bytes) + 3 CR nudges for the
+        # prompt (3 bytes) = 19 bytes total. ``head -c 19`` echoes exactly
+        # those and exits, so the supervisor returns.
+        stdin_r, stdin_w = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+
+        opts = {
+            "fastapi": False,
+            "manual_start": False,
+            "port_range": (8700, 8799),
+            "host": "127.0.0.1",
+            "token": "",
+            "auto_start_delay": 0.1,
+            "auto_start_nudge_delay": 0.05,
+            "auto_start_ready_marker": supervisor.DEFAULT_AUTO_START_READY_MARKER,
+            "auto_start_ready_timeout": 0,
+            "auto_start_settle_delay": 0,
+            "winsize_recheck_delay": 0,
+            "start_prompt": "hello",
+        }
+        rc = supervisor.run_supervisor(
+            ["head", "-c", "19"], opts, stdin_fd=stdin_r, stdout_fd=stdout_w,
+        )
+        os.close(stdin_w)
+        os.close(stdout_w)
+        chunks = []
+        while True:
+            try:
+                chunk = os.read(stdout_r, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        os.close(stdout_r)
+        os.close(stdin_r)
+        out = b"".join(chunks)
+        assert rc == 0
+        assert b"/start" in out
+        assert b"hello" in out
 
     def test_exit_code_propagated(self):
         rc, _ = self._run(["sh", "-c", "exit 42"], b"")
