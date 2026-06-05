@@ -21,6 +21,10 @@ the user's terminal and claude. The supervisor:
   injection is deferred until Claude's input prompt has actually rendered
   (see ``_wait_for_ready_marker``) so a startup-timing race or transient
   modal/dialog can't swallow the submit CR.
+- Optionally injects a follow-up prompt (host CLI ``--prompt`` →
+  ``LMER_START_PROMPT``) immediately after the ``/start`` injection so an
+  automated run can hand claude an extra instruction without manual typing.
+  Tied to auto-start, so it is a no-op under ``--manual-start``.
 
 The supervisor is meant to be invoked at the end of the claude-runner shell
 script in place of ``exec claude``. See ``libexec/claude-runner.sh``.
@@ -318,8 +322,8 @@ def _build_fastapi_app(
         # newline in the input box and never submit. The field is named
         # ``append_newline`` for backwards-compatible API shape but the
         # behavior is "press Enter after the text".
-        if body.append_newline and not payload.endswith(("\r", "\n")):
-            payload = payload + "\r"
+        if body.append_newline:
+            payload = _ensure_submit_cr(payload)
         n = write_input(payload.encode("utf-8"))
         return {"bytes_written": n}
 
@@ -427,6 +431,11 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         float(recheck_raw) if recheck_raw is not None else DEFAULT_WINSIZE_RECHECK_DELAY
     )
 
+    # Follow-up prompt injected right after the auto-/start (host CLI --prompt).
+    # Env-only: the host CLI forwards it as LMER_START_PROMPT. Empty/unset means
+    # no follow-up. Tied to auto-start, so it is a no-op under --manual-start.
+    start_prompt = os.environ.get("LMER_START_PROMPT") or ""
+
     return {
         "fastapi": fastapi_enabled,
         "manual_start": manual_start,
@@ -439,6 +448,7 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         "auto_start_ready_timeout": auto_start_ready_timeout,
         "auto_start_settle_delay": auto_start_settle_delay,
         "winsize_recheck_delay": winsize_recheck_delay,
+        "start_prompt": start_prompt,
     }
 
 
@@ -545,6 +555,10 @@ def _start_auto_start_thread(
     3. Settle delay — small extra pause to let the input box reach steady
        state if the prompt rendered mid-redraw.
     4. Inject ``/start\\r`` plus follow-up CR nudges.
+    5. If a follow-up prompt is configured (host CLI ``--prompt`` →
+       ``LMER_START_PROMPT``), type and submit it after a short pause. Claude
+       queues input typed while it is still working on ``/start``, so the
+       prompt lands as the next turn. Skipped when no prompt is set.
 
     The ``cancel`` event short-circuits each stage so a shutdown raised during
     the wait is honored promptly (the marker wait re-checks the event on a
@@ -555,6 +569,7 @@ def _start_auto_start_thread(
     ready_marker = options["auto_start_ready_marker"]
     ready_timeout = max(0.0, options["auto_start_ready_timeout"])
     settle_delay = max(0.0, options["auto_start_settle_delay"])
+    start_prompt = options["start_prompt"]
 
     def _run() -> None:
         if initial_delay > 0 and cancel.wait(initial_delay):
@@ -565,12 +580,33 @@ def _start_auto_start_thread(
         if settle_delay > 0 and cancel.wait(settle_delay):
             return
         _inject_auto_start(write, AUTO_START_NUDGE_COUNT, nudge_delay)
+        if start_prompt:
+            # Pause so the follow-up doesn't interleave with the trailing CR
+            # nudges (which would submit it prematurely or into a non-empty box).
+            if nudge_delay > 0 and cancel.wait(nudge_delay):
+                return
+            _inject_start_prompt(
+                write, start_prompt, AUTO_START_NUDGE_COUNT, nudge_delay
+            )
 
     thread = threading.Thread(
         target=_run, name="lmer-supervisor-auto-start", daemon=True
     )
     thread.start()
     return thread
+
+
+def _ensure_submit_cr(payload: str) -> str:
+    """Append a submit CR (``\\r``) unless ``payload`` already ends with CR/LF.
+
+    CR (not LF) is "press Enter" in claude's raw-mode TUI; an already-present
+    trailing CR/LF is left intact so the caller never double-submits. Shared by
+    the FastAPI ``/input`` handler and ``_inject_start_prompt`` so the submit
+    convention lives in one place.
+    """
+    if payload.endswith(("\r", "\n")):
+        return payload
+    return payload + "\r"
 
 
 def _inject_auto_start(
@@ -593,6 +629,42 @@ def _inject_auto_start(
     """
     with contextlib.suppress(OSError):
         write(b"/start\r")
+    for _ in range(nudge_count):
+        if nudge_delay > 0:
+            time.sleep(nudge_delay)
+        with contextlib.suppress(OSError):
+            write(b"\r")
+
+
+def _inject_start_prompt(
+    write: Callable[[bytes], int],
+    prompt: str,
+    nudge_count: int = 0,
+    nudge_delay: float = 0.0,
+) -> None:
+    """Type a follow-up prompt and submit it after ``/start`` was injected.
+
+    Sends the prompt text followed by a submit CR (``\\r``) — Enter in claude's
+    raw-mode TUI (via :func:`_ensure_submit_cr`, so a trailing CR/LF already
+    present on ``prompt`` is not doubled). Then sends ``nudge_count`` bare-CR
+    nudges, mirroring :func:`_inject_auto_start`: the prompt's submit CR can be
+    swallowed during a startup re-render just like ``/start``'s, leaving the
+    text typed-but-unsubmitted with nothing to re-trigger it. Each follow-up
+    bare CR re-submits it; once it has gone through, the box is empty and a bare
+    CR is a harmless no-op. An empty prompt is a no-op. ``OSError`` is suppressed
+    so a closed PTY (child already exited) doesn't crash the daemon thread this
+    runs on.
+
+    The prompt is written as a single payload under the supervisor's write lock,
+    so it never interleaves with concurrent writers (FastAPI ``/input``, the
+    main forwarding loop). Claude queues input typed while it is still working
+    on ``/start``, so the submitted prompt becomes the next conversation turn.
+    """
+    if not prompt:
+        return
+    payload = _ensure_submit_cr(prompt)
+    with contextlib.suppress(OSError):
+        write(payload.encode("utf-8"))
     for _ in range(nudge_count):
         if nudge_delay > 0:
             time.sleep(nudge_delay)

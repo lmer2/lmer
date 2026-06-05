@@ -92,6 +92,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     # Supervisor / FastAPI controls (consumed inside the container by lmer-supervisor)
     parser.add_argument("--fastapi", dest="fastapi", action="store_true", help="Expose a FastAPI endpoint to read/write the claude process (POST /input, GET /output)")
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
+    parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec claude directly (debug aid for rendering issues)")
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
     parser.add_argument("--fastapi-host", dest="fastapi_host", help="Host for the FastAPI endpoint to bind (default 127.0.0.1)")
@@ -882,6 +883,10 @@ def main(argv: list[str] | None = None) -> int:
         # Supervisor / FastAPI controls (consumed inside the container by lmer-supervisor)
         "LMER_FASTAPI": "1" if ns.fastapi else None,
         "LMER_MANUAL_START": "1" if ns.manual_start else None,
+        # Follow-up prompt the in-container supervisor injects immediately
+        # after the auto-/start. Sourced from --prompt; no-op under
+        # --manual-start (the supervisor only injects it as part of auto-start).
+        "LMER_START_PROMPT": ns.prompt if ns.prompt else None,
         "LMER_DISABLE_SUPERVISOR": "1" if ns.no_supervisor else None,
         # Forward the initial auto-/start delay so a host-set value reaches
         # the supervisor running inside the container.
