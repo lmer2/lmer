@@ -16,9 +16,11 @@ from pathlib import Path
 import pytest
 
 from lmer_cli.cli import (
+    DEFAULT_PORT_BIND,
     DEFAULT_PORT_POOL,
     _apply_port_passthrough,
-    _publish_loopback_ports,
+    _publish_host_ports,
+    _resolve_port_bind,
     _resolve_requested_ports,
 )
 
@@ -72,10 +74,32 @@ class TestResolveRequestedPorts:
             _resolve_requested_ports(-1, None, {})
 
 
-class TestPublishLoopbackPorts:
+class TestResolvePortBind:
+    def test_default_bind_constant(self):
+        # Loopback by default so published ports are not network-exposed.
+        assert DEFAULT_PORT_BIND == "127.0.0.1"
+
+    def test_default_when_nothing_set(self):
+        assert _resolve_port_bind(None, {}) == DEFAULT_PORT_BIND
+
+    def test_cli_wins_over_env(self):
+        assert (
+            _resolve_port_bind("0.0.0.0", {"LMER_PORT_BIND": "10.0.0.1"})
+            == "0.0.0.0"
+        )
+
+    def test_env_fallback(self):
+        assert _resolve_port_bind(None, {"LMER_PORT_BIND": "0.0.0.0"}) == "0.0.0.0"
+
+    def test_blank_env_falls_through_to_default(self):
+        # An exported but empty LMER_PORT_BIND should not bind to "".
+        assert _resolve_port_bind(None, {"LMER_PORT_BIND": "   "}) == DEFAULT_PORT_BIND
+
+
+class TestPublishHostPorts:
     def test_appends_publish_args_for_each_port(self):
         run: list[str] = []
-        _publish_loopback_ports(run, [8842, 8857])
+        _publish_host_ports(run, [8842, 8857])
         assert run == [
             "-p", "127.0.0.1:8842:8842",
             "-p", "127.0.0.1:8857:8857",
@@ -83,14 +107,19 @@ class TestPublishLoopbackPorts:
 
     def test_empty_list_is_noop(self):
         run = ["existing"]
-        _publish_loopback_ports(run, [])
+        _publish_host_ports(run, [])
         assert run == ["existing"]
+
+    def test_custom_bind_used_in_publish_args(self):
+        run: list[str] = []
+        _publish_host_ports(run, [8842], bind="0.0.0.0")
+        assert run == ["-p", "0.0.0.0:8842:8842"]
 
 
 class TestApplyPortPassthrough:
     @staticmethod
-    def _ns(ports=None, port_pool=None):
-        return argparse.Namespace(ports=ports, port_pool=port_pool)
+    def _ns(ports=None, port_pool=None, port_bind=None):
+        return argparse.Namespace(ports=ports, port_pool=port_pool, port_bind=port_bind)
 
     def test_noop_when_no_ports_requested(self, monkeypatch):
         monkeypatch.delenv("LMER_PORT_COUNT", raising=False)
@@ -103,6 +132,7 @@ class TestApplyPortPassthrough:
     def test_allocates_publishes_and_exports(self, monkeypatch):
         monkeypatch.delenv("LMER_PORT_COUNT", raising=False)
         monkeypatch.delenv("LMER_PORT_POOL", raising=False)
+        monkeypatch.delenv("LMER_PORT_BIND", raising=False)
         env: dict = {}
         run: list[str] = []
         rc = _apply_port_passthrough(self._ns(ports=2, port_pool="9000-9100"), env, run)
@@ -110,7 +140,7 @@ class TestApplyPortPassthrough:
         ports = [int(p) for p in env["LMER_PORTS"].split(",")]
         assert len(ports) == 2
         assert all(9000 <= p <= 9100 for p in ports)
-        # run holds a "-p 127.0.0.1:P:P" pair per allocated port.
+        # run holds a "-p 127.0.0.1:P:P" pair per allocated port (default bind).
         assert run.count("-p") == 2
         for p in ports:
             assert f"127.0.0.1:{p}:{p}" in run
@@ -136,6 +166,7 @@ class TestApplyPortPassthrough:
     def test_env_var_fallback_when_no_cli_flags(self, monkeypatch):
         monkeypatch.setenv("LMER_PORT_COUNT", "1")
         monkeypatch.setenv("LMER_PORT_POOL", "9300-9400")
+        monkeypatch.delenv("LMER_PORT_BIND", raising=False)
         env: dict = {}
         run: list[str] = []
         rc = _apply_port_passthrough(self._ns(), env, run)
@@ -143,12 +174,69 @@ class TestApplyPortPassthrough:
         (port,) = env["LMER_PORTS"].split(",")
         assert 9300 <= int(port) <= 9400
 
+    def test_cli_port_bind_publishes_on_that_address(self, monkeypatch):
+        monkeypatch.delenv("LMER_PORT_COUNT", raising=False)
+        monkeypatch.delenv("LMER_PORT_POOL", raising=False)
+        monkeypatch.delenv("LMER_PORT_BIND", raising=False)
+        env: dict = {}
+        run: list[str] = []
+        rc = _apply_port_passthrough(
+            self._ns(ports=1, port_pool="9500-9600", port_bind="0.0.0.0"), env, run
+        )
+        assert rc is None
+        (port,) = env["LMER_PORTS"].split(",")
+        assert f"0.0.0.0:{port}:{port}" in run
+        # No 127.0.0.1 mapping should leak when an override is in effect.
+        assert not any(s.startswith("127.0.0.1:") for s in run)
+
+    def test_env_port_bind_used_when_cli_not_set(self, monkeypatch):
+        monkeypatch.delenv("LMER_PORT_COUNT", raising=False)
+        monkeypatch.delenv("LMER_PORT_POOL", raising=False)
+        monkeypatch.setenv("LMER_PORT_BIND", "0.0.0.0")
+        env: dict = {}
+        run: list[str] = []
+        rc = _apply_port_passthrough(self._ns(ports=1, port_pool="9700-9800"), env, run)
+        assert rc is None
+        (port,) = env["LMER_PORTS"].split(",")
+        assert f"0.0.0.0:{port}:{port}" in run
+
+    def test_cli_port_bind_wins_over_env(self, monkeypatch):
+        monkeypatch.delenv("LMER_PORT_COUNT", raising=False)
+        monkeypatch.delenv("LMER_PORT_POOL", raising=False)
+        monkeypatch.setenv("LMER_PORT_BIND", "10.255.255.255")  # unroutable on purpose
+        env: dict = {}
+        run: list[str] = []
+        rc = _apply_port_passthrough(
+            self._ns(ports=1, port_pool="9810-9820", port_bind="127.0.0.1"), env, run
+        )
+        assert rc is None
+        (port,) = env["LMER_PORTS"].split(",")
+        assert f"127.0.0.1:{port}:{port}" in run
+
+    def test_invalid_bind_returns_error_code(self, monkeypatch):
+        # An address the host can't bind (here a label under .invalid — RFC
+        # 6761 guarantees DNS resolution fails) makes every per-port bind in
+        # _pick_ports raise gaierror; the inner loop swallows it as "port
+        # busy" and after the pool is exhausted _pick_ports raises
+        # RuntimeError, which we catch and surface as exit code 2.
+        monkeypatch.delenv("LMER_PORT_COUNT", raising=False)
+        monkeypatch.delenv("LMER_PORT_POOL", raising=False)
+        env: dict = {}
+        run: list[str] = []
+        rc = _apply_port_passthrough(
+            self._ns(ports=1, port_pool="9900-9910", port_bind="not.a.real.host.invalid"),
+            env, run,
+        )
+        assert rc == 2
+        assert "LMER_PORTS" not in env
+
 
 def test_cli_declares_port_passthrough_flags():
-    """Guard against accidental removal of the --ports / --port-pool flags."""
+    """Guard against accidental removal of the --ports / --port-pool / --port-bind flags."""
     source = CLI_PY.read_text()
     assert re.search(r'add_argument\(\s*["\']--ports["\']', source), "--ports flag missing"
     assert re.search(r'add_argument\(\s*["\']--port-pool["\']', source), "--port-pool flag missing"
+    assert re.search(r'add_argument\(\s*["\']--port-bind["\']', source), "--port-bind flag missing"
 
 
 def test_cli_exports_allocated_ports_via_lmer_ports():
