@@ -317,6 +317,23 @@ if [ -n "$(printf '%s' "$LMER_HUMAN_IDENTITY" | tr -d '[:space:]')" ]; then
     fi
 fi
 
+# ── Agent memory restore ──
+# When LMER_PERSIST_AGENT_MEMORY is enabled, restore previously-saved
+# per-project agent memory from the work repo into Claude's memory directory
+# before claude starts, so the saved memory is on disk by the time the session
+# loads. Persisting memory back to the work repo is the agent's responsibility
+# via `work memory persist` (see AGENTS.md) — we only automate the restore here.
+# `work memory restore` self-guards on LMER_PERSIST_AGENT_MEMORY, but we gate the
+# call in the shell too so disabled sessions stay quiet and skip it when the
+# `work` CLI isn't on PATH (e.g. the claude-runner unit tests).
+case "${LMER_PERSIST_AGENT_MEMORY,,}" in
+    1|true|yes)
+        if command -v work >/dev/null 2>&1; then
+            work memory restore || echo "⚠️  Agent memory restore failed (continuing)"
+        fi
+        ;;
+esac
+
 # Run Claude through the lmer supervisor when available.
 #
 # The supervisor wraps claude under a PTY so a controlling Python process

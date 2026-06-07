@@ -7,6 +7,7 @@ import pytest
 
 from work_repo.utils import (
     project_info_dir,
+    project_memory_dir,
     sanitize_task_target,
     task_info_dir,
     task_target_dir,
@@ -155,7 +156,7 @@ class TestInfoDirHelpers:
     """Test project_info_dir / task_info_dir / task_target_dir helpers."""
 
     @pytest.mark.parametrize(
-        "helper", [project_info_dir, task_info_dir, task_target_dir]
+        "helper", [project_info_dir, project_memory_dir, task_info_dir, task_target_dir]
     )
     def test_returns_none_when_host_and_project_unset(self, clean_info_env, helper):
         """All helpers return None when host/project env vars are absent."""
@@ -183,6 +184,13 @@ class TestInfoDirHelpers:
         clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
         clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
         assert project_info_dir() == Path("/wr/git.example.com/group/proj/info")
+
+    def test_project_memory_dir_path(self, clean_info_env):
+        """project_memory_dir assembles {work}/{host}/{project}/memory."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        assert project_memory_dir() == Path("/wr/git.example.com/group/proj/memory")
 
     def test_task_info_dir_path(self, clean_info_env):
         """task_info_dir assembles {work}/{host}/{project}/{task}/info."""

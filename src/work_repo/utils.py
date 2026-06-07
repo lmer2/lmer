@@ -186,6 +186,20 @@ def project_info_dir() -> Optional[Path]:
     return base / "info"
 
 
+def project_memory_dir() -> Optional[Path]:
+    """
+    Return ``{LMER_WORK_REPO_PATH}/{host}/{project}/memory``.
+
+    This is the per-project directory where persisted agent memory is stored,
+    shared across all task types and targets for the project. Returns ``None``
+    if ``LMER_REPO_HOST`` or ``LMER_REPO_PROJECT`` is unset.
+    """
+    base = _work_repo_base()
+    if base is None:
+        return None
+    return base / "memory"
+
+
 def task_info_dir() -> Optional[Path]:
     """
     Return ``{LMER_WORK_REPO_PATH}/{host}/{project}/{task}/info``.
