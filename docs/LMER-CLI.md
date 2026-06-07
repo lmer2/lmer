@@ -13,6 +13,7 @@ Python-first CLI for running LMER with a repository target, cloning inside the c
   - [Starting Your Task](#starting-your-task)
 - [Building the Container Image](#building-the-container-image)
 - [Command-Line Options](#command-line-options)
+- [Troubleshooting](#troubleshooting)
 
 ### Prerequisites
 - Docker or Podman installed
@@ -115,6 +116,8 @@ The following environment variables control LMER behavior:
 - **`LMER_HUMAN_IDENTITY`** - Free-form string identifying the human user the session is collaborating with (e.g. `"Jane Doe <jdoe on example.com, jane@example.com>"`). When set, it is forwarded into the container and injected into Claude's system prompt so the model can attribute matching usernames, emails, or handles in PRs, MRs, issues, comments, and commit history to the user. When unset, LMER falls back to the host's `git config user.name` and `user.email` (respecting system, global, and local config). If neither is available, no identity is injected. The injected text is rendered from the Jinja2 template at `prompts/human-identity.md.jinja2` — edit that file to change the wording.
 
 - **`LMER_QUICK_GATE_COMMIT`** - When set to a truthy value (`1`, `true`, `yes`, case-insensitive), `gate-commit` skips the test suite (the slowest check) but still runs pre-commit hooks, secret scans, and every other check. Tests are still enforced by standalone `gate-check` and by `gate-push`, so coverage is preserved before code leaves the local repo. Only `gate-commit` reads this variable; `gate-check` and `gate-push` ignore it. Falsy values (`0`, `false`, `no`) and unset both leave tests running, so this can be a transient export that you turn off without `unset`. Useful for iterative commits on a feature branch where you'll run `gate-push` (which runs the suite) before code leaves the repo.
+
+- **`LMER_PIDS_LIMIT`** - Overrides the container PID cap that LMER passes as `--pids-limit` to `docker`/`podman run` (default `512`). Accepts any **positive integer**, or **`-1`** for "unlimited" (Docker/Podman semantics). Any other value — `0`, other negatives, or non-numeric — is rejected with a warning and falls back to `512`, so a misconfiguration can never silently weaken the fork-bomb safety bound. This is a **host-side** variable read by the launching CLI; it does not need to reach inside the container. Raise it (or set `-1`) on hosts affected by the cgroup-v1 pids-controller counter leak, where phantom fork entries accumulate over a long session and prematurely exhaust the cap — see [Troubleshooting: containers hit the PID cap](#troubleshooting-containers-hit-the-pid-cap-cgroup-v1-pids-leak).
 
 - **`LMER_AUTO_START_DELAY`** - Seconds the supervisor waits before injecting the initial `/start` into Claude (the marker-based prompt-ready wait, see `LMER_AUTO_START_READY_TIMEOUT`, may extend this). Accepts a float (default `1.5`); negative values are clamped to `0`. Also settable per-invocation with `--auto-start-delay`. Has no effect under `--manual-start`/`LMER_MANUAL_START`. Parsed by `lmer-supervisor` and forwarded into the container by the host CLI.
 
@@ -467,3 +470,45 @@ curl -sS -H "Authorization: Bearer $LMER_FASTAPI_TOKEN" \
 - **Auth is required on every request.** Including `/healthz`. Wrong tokens come back as `lmer-pipe: HTTP 401`.
 - **The endpoint binds to `127.0.0.1` on the host.** Other machines on your network cannot reach it. If you need remote access, tunnel via SSH (`ssh -L 8780:127.0.0.1:8780 …`) rather than rebinding to `0.0.0.0`.
 - **Restoring a follower.** Pass `--since N` to `lmer-pipe read`/`follow` to resume from a known cursor; anything older than `cursor - 1 MiB` will be reported as `dropped_bytes` in the response.
+
+### Troubleshooting
+
+#### Troubleshooting: containers hit the PID cap (cgroup-v1 pids leak)
+
+**Symptom.** During a long-running session the in-container shell suddenly can't fork: every shell-out fails with `Resource temporarily unavailable` (`EAGAIN`) at `fork()`. `bash`/`echo`/`pwd` return exit code 1 with no output, thread-spawning programs panic, and the failure is silent until it happens — actual process activity inside the container is normal.
+
+**Cause.** A kernel-level counter-accounting bug in the **cgroup v1 pids controller** on older kernels (notably the RHEL 8 / `4.18.0-*.el8` line). Every `fork()` charges the cgroup's pids counter; the counter is supposed to decrement when the task exits, but on these kernels a fraction of short-lived child exits are never refunded. LMER sessions fork-exec heavily (every `gate-check`/`gate-commit` runs pytest and pre-commit, plus per-task `git`/`gh`/`jq`/`uv`/`ruff` shell-outs), so phantom entries accumulate. When phantom + real reaches the container's `--pids-limit`, the kernel rejects every further `fork()` even though the real process count is tiny.
+
+You can confirm it from inside or outside the container:
+
+```bash
+cat /sys/fs/cgroup/pids/pids.current   # e.g. 511
+cat /sys/fs/cgroup/pids/pids.max       # e.g. 512  -> at the cap
+docker top <container-id> -ef          # but only a handful of real processes
+```
+
+A large gap between `pids.current` and the real process count is phantom accumulation.
+
+**This is a host-kernel issue, not a container-image one.** Containers share the host's kernel — the image LMER builds has no kernel of its own — so both the buggy accounting and the `--pids-limit` enforcement live in the **host** kernel's cgroup controller. That is why the permanent fix (below) is a host action, and why LMER's lever is the launch-time cap.
+
+**Immediate recovery (no restart, preserves in-flight work).** Bump the live container's cap; the very next `fork()` succeeds and the session resumes:
+
+```bash
+CID=<container-id>
+sudo sh -c "echo 4096 > /sys/fs/cgroup/pids/docker/$CID/pids.max"
+```
+
+**Mitigation (LMER-side, out of the box).** Raise the cap LMER launches with via `LMER_PIDS_LIMIT` so new sessions start with more headroom — for example in your `.env`:
+
+```bash
+LMER_PIDS_LIMIT=4096   # or -1 for unlimited on badly-leaking hosts
+```
+
+This raises the bound but does not fix the leak itself — a high-enough fork rate over a long-enough session can still reach any finite cap. `-1` removes the cap entirely (at the cost of losing the fork-bomb safety bound).
+
+**Permanent remedy (host-side).** The cgroup-v1 pids-controller leak is fixed in newer kernels, and the controller is rewritten in **cgroup v2**, where the bug does not occur. Either eliminates the need for the workaround:
+
+- **Upgrade the host kernel** to a patchlevel where the leak is fixed.
+- **Switch the host to cgroup v2** (RHEL 8 supports it but defaults to v1): boot with `systemd.unified_cgroup_hierarchy=1` and reboot. Coordinate this — it affects every container on the host.
+
+Both are host-infrastructure changes (they require a reboot and validation against other workloads on the box) and cannot be shipped by LMER itself. Until one is in place, `LMER_PIDS_LIMIT` plus the live-bump recovery above keep sessions working regardless of host kernel.
