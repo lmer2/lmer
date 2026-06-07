@@ -117,7 +117,7 @@ The following environment variables control LMER behavior:
 
 - **`LMER_QUICK_GATE_COMMIT`** - When set to a truthy value (`1`, `true`, `yes`, case-insensitive), `gate-commit` skips the test suite (the slowest check) but still runs pre-commit hooks, secret scans, and every other check. Tests are still enforced by standalone `gate-check` and by `gate-push`, so coverage is preserved before code leaves the local repo. Only `gate-commit` reads this variable; `gate-check` and `gate-push` ignore it. Falsy values (`0`, `false`, `no`) and unset both leave tests running, so this can be a transient export that you turn off without `unset`. Useful for iterative commits on a feature branch where you'll run `gate-push` (which runs the suite) before code leaves the repo.
 
-- **`LMER_PIDS_LIMIT`** - Sets the container PID cap that LMER passes as `--pids-limit` to `docker`/`podman run`. Accepts any **positive integer**, or **`-1`** for "unlimited" (Docker/Podman semantics). **When unset (the default), LMER omits `--pids-limit` entirely** and defers to the container runtime — which uses the daemon's `default-pids-limit` (`/etc/docker/daemon.json`) if an admin configured one, otherwise unlimited (bounded only by the host's `kernel.pid_max`). Any invalid value — `0`, other negatives, or non-numeric — is rejected with a warning and also defers to the runtime. This is a **host-side** variable read by the launching CLI; it does not need to reach inside the container. Set it (e.g. `4096`, or `-1`) on hosts affected by the cgroup-v1 pids-controller counter leak, where phantom fork entries accumulate over a long session and prematurely exhaust a finite cap — see [Troubleshooting: containers hit the PID cap](#troubleshooting-containers-hit-the-pid-cap-cgroup-v1-pids-leak).
+- **`LMER_PIDS_LIMIT`** - Overrides the container PID cap that LMER passes as `--pids-limit` to `docker`/`podman run` (default `512`). Accepts any **positive integer**, or **`-1`** for "unlimited" (Docker/Podman semantics). Any other value — `0`, other negatives, or non-numeric — is rejected with a warning and falls back to `512`, so a misconfiguration can never silently weaken the fork-bomb safety bound. This is a **host-side** variable read by the launching CLI; it does not need to reach inside the container. Raise it (or set `-1`) on hosts affected by the cgroup-v1 pids-controller counter leak, where phantom fork entries accumulate over a long session and prematurely exhaust the cap — see [Troubleshooting: containers hit the PID cap](#troubleshooting-containers-hit-the-pid-cap-cgroup-v1-pids-leak).
 
 - **`LMER_AUTO_START_DELAY`** - Seconds the supervisor waits before injecting the initial `/start` into Claude (the marker-based prompt-ready wait, see `LMER_AUTO_START_READY_TIMEOUT`, may extend this). Accepts a float (default `1.5`); negative values are clamped to `0`. Also settable per-invocation with `--auto-start-delay`. Has no effect under `--manual-start`/`LMER_MANUAL_START`. Parsed by `lmer-supervisor` and forwarded into the container by the host CLI.
 
@@ -491,8 +491,6 @@ A large gap between `pids.current` and the real process count is phantom accumul
 
 **This is a host-kernel issue, not a container-image one.** Containers share the host's kernel — the image LMER builds has no kernel of its own — so both the buggy accounting and the `--pids-limit` enforcement live in the **host** kernel's cgroup controller. That is why the permanent fix (below) is a host action, and why LMER's lever is the launch-time cap.
 
-**Where the cap comes from.** LMER does not impose a PID cap by default — it omits `--pids-limit` unless `LMER_PIDS_LIMIT` is set, deferring to the container runtime. So a finite cap is in play only when (a) the docker daemon sets `default-pids-limit` in `/etc/docker/daemon.json`, or (b) you set `LMER_PIDS_LIMIT` yourself. If neither applies, there is no finite cap for the leak to exhaust (runaway forking is still bounded by the `--memory 2g` limit). A low daemon default on a leaky kernel is the case that reintroduces this symptom.
-
 **Immediate recovery (no restart, preserves in-flight work).** Bump the live container's cap; the very next `fork()` succeeds and the session resumes:
 
 ```bash
@@ -500,13 +498,13 @@ CID=<container-id>
 sudo sh -c "echo 4096 > /sys/fs/cgroup/pids/docker/$CID/pids.max"
 ```
 
-**Mitigation (LMER-side).** If a low cap is in effect, raise the value LMER launches with via `LMER_PIDS_LIMIT` so new sessions start with more headroom — for example in your `.env`:
+**Mitigation (LMER-side, out of the box).** Raise the cap LMER launches with via `LMER_PIDS_LIMIT` so new sessions start with more headroom — for example in your `.env`:
 
 ```bash
 LMER_PIDS_LIMIT=4096   # or -1 for unlimited on badly-leaking hosts
 ```
 
-A finite override raises the bound but does not fix the leak itself — a high-enough fork rate over a long-enough session can still reach any finite cap. `-1` removes the cap entirely (at the cost of losing the fork-bomb safety bound; `--memory 2g` still applies). Alternatively, leave `LMER_PIDS_LIMIT` unset and instead raise the daemon's `default-pids-limit`, which then applies to every container on the host.
+This raises the bound but does not fix the leak itself — a high-enough fork rate over a long-enough session can still reach any finite cap. `-1` removes the cap entirely (at the cost of losing the fork-bomb safety bound).
 
 **Permanent remedy (host-side).** The cgroup-v1 pids-controller leak is fixed in newer kernels, and the controller is rewritten in **cgroup v2**, where the bug does not occur. Either eliminates the need for the workaround:
 

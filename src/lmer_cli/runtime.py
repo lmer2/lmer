@@ -36,6 +36,14 @@ class RuntimeErrorDetect(Exception):
 
 _LMER_STATE_DIR = Path.home() / ".lmer"
 
+# Default container PID limit. Caps the number of processes a session's
+# container may spawn (a fork-bomb / runaway safety bound). Overridable via
+# LMER_PIDS_LIMIT — see _resolve_pids_limit() and docs/LMER-CLI.md. Raising
+# this is the host-kernel-agnostic mitigation for the cgroup-v1 pids-controller
+# counter leak on older kernels (e.g. RHEL 8 / 4.18), where phantom fork
+# entries accumulate and prematurely exhaust the cap.
+DEFAULT_PIDS_LIMIT = "512"
+
 
 @lru_cache(maxsize=1)
 def _is_selinux_enforcing() -> bool:
@@ -153,44 +161,41 @@ def lmer_state_dir() -> Path:
     return _LMER_STATE_DIR
 
 
-def _resolve_pids_limit() -> str | None:
+def _resolve_pids_limit() -> str:
     """Resolve the container ``--pids-limit`` value from ``LMER_PIDS_LIMIT``.
 
-    Returns the value to hand to ``docker``/``podman`` ``--pids-limit``, or
-    ``None`` to omit the flag entirely and defer to the container runtime.
-    When omitted, the cap falls back to the daemon's ``default-pids-limit``
-    (``/etc/docker/daemon.json``) if configured, else the runtime default
-    (unlimited, bounded only by the host's ``kernel.pid_max``).
+    Returns the value to hand to ``docker``/``podman`` ``--pids-limit``.
 
     Rules:
-    - Unset/empty → ``None`` (defer to docker/daemon — see above).
+    - Unset/empty → :data:`DEFAULT_PIDS_LIMIT`.
     - Any positive integer → that value (raise the cap on hosts affected by
       the cgroup-v1 pids-controller leak).
-    - ``-1`` → ``"-1"`` (Docker/Podman "unlimited"; an explicit escape hatch
-      for badly leaking hosts where any finite cap eventually fills with
-      phantom entries).
+    - ``-1`` → ``"-1"`` (Docker/Podman "unlimited"; an escape hatch for badly
+      leaking hosts where any finite cap eventually fills with phantom
+      entries).
     - Anything else — ``0``, other negatives, non-numeric — is rejected with a
-      warning and also defers to docker/daemon (``None``).
+      warning and falls back to the default. A misconfigured value must never
+      silently weaken or disable the safety bound.
     """
     raw = os.environ.get("LMER_PIDS_LIMIT", "").strip()
     if not raw:
-        return None
+        return DEFAULT_PIDS_LIMIT
     try:
         value = int(raw)
     except ValueError:
         warning(
             f"⚠️  Ignoring invalid LMER_PIDS_LIMIT={raw!r} (not an integer); "
-            f"deferring to docker/daemon default"
+            f"using default {DEFAULT_PIDS_LIMIT}"
         )
-        return None
+        return DEFAULT_PIDS_LIMIT
     if value > 0 or value == -1:
         return str(value)
     warning(
         f"⚠️  Ignoring out-of-range LMER_PIDS_LIMIT={raw!r} "
         f"(must be a positive integer, or -1 for unlimited); "
-        f"deferring to docker/daemon default"
+        f"using default {DEFAULT_PIDS_LIMIT}"
     )
-    return None
+    return DEFAULT_PIDS_LIMIT
 
 
 def base_run_args(runtime: str, exec_mode: bool, user: str) -> List[str]:
@@ -215,13 +220,7 @@ def base_run_args(runtime: str, exec_mode: bool, user: str) -> List[str]:
     args: List[str] = [runtime, "run", "--rm"]
     args += tty_flags()
     # Resource limits and security
-    args += ["--cpus", "1", "--memory", "2g"]
-    # PID cap: only set when LMER_PIDS_LIMIT requests it; otherwise omit the
-    # flag and defer to the container runtime / daemon default.
-    pids_limit = _resolve_pids_limit()
-    if pids_limit is not None:
-        args += ["--pids-limit", pids_limit]
-    args += ["--security-opt", "no-new-privileges"]
+    args += ["--cpus", "1", "--memory", "2g", "--pids-limit", _resolve_pids_limit(), "--security-opt", "no-new-privileges"]
     # Disable SELinux labeling to allow SSH agent socket access
     # Container processes (container_t) cannot connect to user sockets (unconfined_t) by default
     if _is_selinux_enforcing():
