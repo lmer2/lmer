@@ -19,6 +19,8 @@ from lmer_cli.runtime import (
     lmer_state_dir,
     base_run_args,
     env_args,
+    _resolve_pids_limit,
+    DEFAULT_PIDS_LIMIT,
 )
 
 
@@ -176,7 +178,8 @@ class TestBaseRunArgs:
         assert "--memory" in args
         assert "2g" in args
         assert "--pids-limit" in args
-        assert "512" in args
+        # Default cap is 512 and must directly follow the flag.
+        assert args[args.index("--pids-limit") + 1] == "512"
         assert "--security-opt" in args
         assert "no-new-privileges" in args
         assert "--user" in args
@@ -215,6 +218,68 @@ class TestBaseRunArgs:
         with patch.object(sys.stdin, "isatty", return_value=False):
             args = base_run_args("docker", False, "developer")
             assert "-it" not in args
+
+    def test_base_args_honors_pids_limit_override(self):
+        """LMER_PIDS_LIMIT overrides the --pids-limit value in base args."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "4096"}):
+            args = base_run_args("docker", False, "developer")
+            assert args[args.index("--pids-limit") + 1] == "4096"
+
+    def test_base_args_invalid_pids_limit_falls_back_to_default(self):
+        """An invalid LMER_PIDS_LIMIT leaves the default cap in place."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "0"}):
+            args = base_run_args("docker", False, "developer")
+            assert args[args.index("--pids-limit") + 1] == DEFAULT_PIDS_LIMIT
+
+
+class TestResolvePidsLimit:
+    """Test LMER_PIDS_LIMIT parsing for the container --pids-limit value."""
+
+    def test_unset_returns_default(self):
+        """Unset LMER_PIDS_LIMIT yields the default cap."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LMER_PIDS_LIMIT", None)
+            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+
+    def test_empty_returns_default(self):
+        """Empty/whitespace LMER_PIDS_LIMIT yields the default cap."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "   "}):
+            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+
+    def test_positive_integer_accepted(self):
+        """A positive integer is passed through verbatim."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "4096"}):
+            assert _resolve_pids_limit() == "4096"
+
+    def test_whitespace_is_stripped(self):
+        """Surrounding whitespace is stripped before parsing."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "  2048  "}):
+            assert _resolve_pids_limit() == "2048"
+
+    def test_minus_one_means_unlimited(self):
+        """-1 is accepted (Docker/Podman 'unlimited')."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "-1"}):
+            assert _resolve_pids_limit() == "-1"
+
+    def test_zero_rejected_falls_back(self):
+        """0 is out of range and falls back to the default."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "0"}):
+            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+
+    def test_other_negative_rejected_falls_back(self):
+        """Negatives other than -1 fall back to the default."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "-5"}):
+            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+
+    def test_non_numeric_rejected_falls_back(self):
+        """A non-numeric value falls back to the default."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "lots"}):
+            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
+
+    def test_float_rejected_falls_back(self):
+        """A float string is not an integer and falls back to the default."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "1024.5"}):
+            assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
 
 
 class TestEnvArgs:
