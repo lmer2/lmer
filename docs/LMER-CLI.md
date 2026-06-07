@@ -118,6 +118,12 @@ The following environment variables control LMER behavior:
 
 - **`LMER_QUICK_GATE_COMMIT`** - When set to a truthy value (`1`, `true`, `yes`, case-insensitive), `gate-commit` skips the test suite (the slowest check) but still runs pre-commit hooks, secret scans, and every other check. Tests are still enforced by standalone `gate-check` and by `gate-push`, so coverage is preserved before code leaves the local repo. Only `gate-commit` reads this variable; `gate-check` and `gate-push` ignore it. Falsy values (`0`, `false`, `no`) and unset both leave tests running, so this can be a transient export that you turn off without `unset`. Useful for iterative commits on a feature branch where you'll run `gate-push` (which runs the suite) before code leaves the repo.
 
+- **`LMER_PORT_COUNT`** - Number of host ports to allocate from the pool (see `LMER_PORT_POOL`) and publish into the container, so a service Claude starts inside (e.g. a dev web server) is reachable from the host. Equivalent to the `--ports` flag, which takes precedence when both are set. Must be a non-negative integer; `0` (or unset) disables port passthrough. A non-numeric value aborts startup with an error. The allocated ports are exported to the container as `LMER_PORTS`. Read by the host CLI only.
+
+- **`LMER_PORT_POOL`** - Inclusive port range `LOW-HIGH` the `--ports`/`LMER_PORT_COUNT` ports are picked from (default `8800-8899`, kept distinct from the FastAPI range `8700-8799` so both features can be used together). Equivalent to the `--port-pool` flag, which takes precedence. The host CLI picks the requested number of currently-free ports from this pool before the container starts, so multiple `lmer` instances on the same host get disjoint ports without manual coordination. If fewer than the requested number of free ports are available, startup aborts with an error. Read by the host CLI only.
+
+- **`LMER_PORTS`** - Set **by lmer inside the container** (not a host input): a comma-separated list of the ports allocated via `--ports`/`LMER_PORT_COUNT` (e.g. `8842,8857`). Each is published to `127.0.0.1` on the host with the same port number inside and out. Services Claude starts should bind to `0.0.0.0` on one of these ports to be reachable from the host. Empty/unset when no ports were requested.
+
 - **`LMER_AUTO_START_DELAY`** - Seconds the supervisor waits before injecting the initial `/start` into Claude (the marker-based prompt-ready wait, see `LMER_AUTO_START_READY_TIMEOUT`, may extend this). Accepts a float (default `1.5`); negative values are clamped to `0`. Also settable per-invocation with `--auto-start-delay`. Has no effect under `--manual-start`/`LMER_MANUAL_START`. Parsed by `lmer-supervisor` and forwarded into the container by the host CLI.
 
 - **`LMER_AUTO_START_NUDGE_DELAY`** - Seconds between the follow-up carriage-return "nudges" that the supervisor sends after auto-injecting `/start`. The initial Enter is occasionally swallowed during Claude's startup re-render, leaving `/start` typed but unsubmitted; the supervisor sends a few bare CRs afterward to re-trigger submission (each is a harmless no-op once `/start` has gone through). Accepts a float (default `0.5`); negative values are clamped to `0`. Has no effect under `--manual-start`/`LMER_MANUAL_START`. Parsed by `lmer-supervisor` and forwarded into the container by the host CLI.
@@ -327,6 +333,8 @@ lmer build --local /path/to/agents/global
 - `--fastapi-port-range LOW-HIGH` - Port range to pick a free FastAPI port from (default `8700-8799`). The host CLI picks one free port from this range before container start and publishes only that port
 - `--fastapi-host <host>` - Inside-container bind host for the FastAPI endpoint (default `0.0.0.0` when `--fastapi` is set so the published port works)
 - `--fastapi-token <token>` - Bearer token to require on FastAPI requests. If omitted a random token is generated and printed to stderr on startup
+- `--ports <N>` - Allocate `N` free host ports and publish them into the container so a service Claude starts inside (e.g. a dev web server) is reachable from the host. The host CLI picks `N` currently-free ports from `--port-pool` before the container starts, publishes each to `127.0.0.1` with the same port number inside and out, and exports the list to the container as `LMER_PORTS`. Startup aborts if `N` free ports can't be found. Also settable via `LMER_PORT_COUNT` (the flag wins). Bind services to `0.0.0.0` inside the container so the published mapping works. See [Port Passthrough](#port-passthrough)
+- `--port-pool LOW-HIGH` - Inclusive port pool the `--ports` ports are picked from (default `8800-8899`, distinct from the FastAPI range so both features coexist). Also settable via `LMER_PORT_POOL` (the flag wins)
 
 **Note**: `--workspace-volume` and `--workspace-bind` options are currently not functional. The workspace uses the `/workspace` directory from the container image instead.
 
@@ -469,3 +477,28 @@ curl -sS -H "Authorization: Bearer $LMER_FASTAPI_TOKEN" \
 - **Auth is required on every request.** Including `/healthz`. Wrong tokens come back as `lmer-pipe: HTTP 401`.
 - **The endpoint binds to `127.0.0.1` on the host.** Other machines on your network cannot reach it. If you need remote access, tunnel via SSH (`ssh -L 8780:127.0.0.1:8780 …`) rather than rebinding to `0.0.0.0`.
 - **Restoring a follower.** Pass `--since N` to `lmer-pipe read`/`follow` to resume from a known cursor; anything older than `cursor - 1 MiB` will be reported as `dropped_bytes` in the response.
+
+### Port Passthrough
+
+When Claude runs a service inside the container that you want to test from your host browser — a dev web server, an API, a preview build — that service's port needs to be published out of the container. `--ports` automates this without making you hand-pick port numbers, which matters when several `lmer` sessions run at once.
+
+```bash
+# Allocate 2 free ports and publish them to the host.
+lmer chat <repo> --ports 2
+
+# Pick from a custom pool instead of the default 8800-8899.
+lmer chat <repo> --ports 3 --port-pool 9000-9099
+
+# Same thing via environment variables (the CLI flags take precedence).
+LMER_PORT_COUNT=2 LMER_PORT_POOL=9000-9099 lmer chat <repo>
+```
+
+How it works:
+
+- The host CLI picks `--ports` (or `LMER_PORT_COUNT`) currently-free ports from the pool (`--port-pool` / `LMER_PORT_POOL`, default `8800-8899`) **before** the container starts, and publishes each with `-p 127.0.0.1:PORT:PORT` — the same port number inside and out.
+- The chosen ports are exported into the container as `LMER_PORTS`, a comma-separated list (e.g. `LMER_PORTS=8842,8857`). Claude (or anything it spawns) reads that variable to learn which ports it may use.
+- Because allocation happens on the host before start, running multiple `lmer ... --ports N` sessions in parallel works out of the box — each picks a disjoint set of free ports from the pool.
+- The ports publish to `127.0.0.1` only, so the service is reachable from your local machine but not network-exposed. Services Claude starts must bind to `0.0.0.0` inside the container (not `127.0.0.1`) for the published mapping to reach them.
+- If the pool doesn't have enough free ports to satisfy the request, startup aborts with a clear error rather than starting with fewer ports than asked for.
+
+The default pool (`8800-8899`) is deliberately distinct from the FastAPI range (`8700-8799`), so `--ports` and `--fastapi` can be combined in one session without colliding.

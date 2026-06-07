@@ -241,10 +241,15 @@ def _get_winsize(fd: int) -> Optional[tuple[int, int]]:
     return rows, cols
 
 
-def _pick_port(port_range: tuple[int, int], host: str) -> int:
-    """Try ports in random order from the inclusive range until one binds.
+def _pick_ports(port_range: tuple[int, int], host: str, count: int) -> list[int]:
+    """Pick ``count`` distinct free ports from the inclusive range.
 
-    Raises :class:`RuntimeError` if no port in the range is free.
+    Ports are probed in random order; each candidate is bound (then released)
+    to confirm it is currently free. Returns the chosen ports in the order they
+    were found.
+
+    Raises :class:`ValueError` for an inverted range or non-positive ``count``,
+    and :class:`RuntimeError` if fewer than ``count`` free ports are available.
     """
     import random
     import socket
@@ -252,16 +257,36 @@ def _pick_port(port_range: tuple[int, int], host: str) -> int:
     low, high = port_range
     if low > high:
         raise ValueError(f"invalid port range {low}-{high}")
+    if count <= 0:
+        raise ValueError(f"count must be positive, got {count}")
     candidates = list(range(low, high + 1))
     random.shuffle(candidates)
+    chosen: list[int] = []
     for port in candidates:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind((host, port))
             except OSError:
                 continue
-            return port
-    raise RuntimeError(f"no free port in range {low}-{high} on {host}")
+            chosen.append(port)
+            if len(chosen) == count:
+                return chosen
+    raise RuntimeError(
+        f"could not allocate {count} free port(s) in range {low}-{high} on {host} "
+        f"(found {len(chosen)})"
+    )
+
+
+def _pick_port(port_range: tuple[int, int], host: str) -> int:
+    """Try ports in random order from the inclusive range until one binds.
+
+    Raises :class:`RuntimeError` if no port in the range is free.
+    """
+    try:
+        return _pick_ports(port_range, host, 1)[0]
+    except RuntimeError:
+        low, high = port_range
+        raise RuntimeError(f"no free port in range {low}-{high} on {host}")
 
 
 def _parse_port_range(spec: str) -> tuple[int, int]:
