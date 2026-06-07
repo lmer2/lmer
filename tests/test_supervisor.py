@@ -126,6 +126,25 @@ class TestPortRange:
                     return
             pytest.fail("never returned a port other than the busy one")
 
+    def test_pick_ports_returns_distinct_ports_in_range(self):
+        ports = supervisor._pick_ports((9000, 9100), "127.0.0.1", 5)
+        assert len(ports) == 5
+        assert len(set(ports)) == 5
+        assert all(9000 <= p <= 9100 for p in ports)
+
+    def test_pick_ports_rejects_non_positive_count(self):
+        with pytest.raises(ValueError):
+            supervisor._pick_ports((9000, 9100), "127.0.0.1", 0)
+
+    def test_pick_ports_raises_when_pool_too_small(self):
+        # Single-port pool cannot satisfy a request for two ports.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            held.bind(("127.0.0.1", 0))
+            free_port = held.getsockname()[1]
+        # free_port is released; a request for 2 from a 1-wide pool must raise.
+        with pytest.raises(RuntimeError):
+            supervisor._pick_ports((free_port, free_port), "127.0.0.1", 2)
+
 
 # ---------------------------------------------------------------------------
 # Options resolution
