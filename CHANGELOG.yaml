@@ -8,6 +8,7 @@
 
 unreleased:
   added:
+    - "`LMER_PERSIST_AGENT_MEMORY` environment variable to persist Claude Code agent memory to the work repo on a per-project basis (stored under `{host}/{project}/memory/`). Memory is restored automatically at session start; the agent persists it back via the new `work memory persist` command. Restore and persist use mirror semantics, so memory the agent deletes does not get resurrected on the next restore (#56)"
     - "Apache-2.0 `LICENSE` at the repo root"
     - "GitHub Actions workflow (`.github/workflows/ci.yml`) running pre-commit and pytest on push/PR for `main` and `prep-release`"
     - "`lmer build --update-claude` flag to force re-install of Claude Code CLI during image build (busts Docker cache for the install layer)"

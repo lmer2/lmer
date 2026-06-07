@@ -12,6 +12,7 @@ import yaml
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import commit_work_changes
+from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
 
 
@@ -105,6 +106,28 @@ Examples:
         "description",
         nargs="?",
         help="Description of current goal (optional - if omitted, displays current goal)",
+    )
+
+    # memory command
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help="Restore or persist per-project agent memory (LMER_PERSIST_AGENT_MEMORY)",
+    )
+    memory_subparsers = memory_parser.add_subparsers(
+        dest="memory_action", help="Memory action to perform"
+    )
+    memory_subparsers.add_parser(
+        "restore",
+        help="Restore saved agent memory from the work repo into Claude's memory dir",
+    )
+    memory_persist_parser = memory_subparsers.add_parser(
+        "persist",
+        help="Copy Claude's agent memory into the work repo, then commit and push",
+    )
+    memory_persist_parser.add_argument(
+        "--message",
+        "-m",
+        help="Commit message (defaults to auto-generated)",
     )
 
     return parser
@@ -318,6 +341,27 @@ def cmd_goal(description: str | None) -> int:
         return 1
 
 
+def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser) -> int:
+    """
+    Execute memory command.
+
+    Args:
+        action: ``"restore"`` or ``"persist"`` (None prints help)
+        message: Optional commit message (persist only)
+        parser: The top-level parser, used to print help when no action is given
+
+    Returns:
+        Exit code
+    """
+    if action == "restore":
+        return restore_memory()
+    elif action == "persist":
+        return persist_memory(message)
+    else:
+        parser.print_help()
+        return 1
+
+
 def main() -> int:
     """Main entry point for work CLI."""
     parser = create_parser()
@@ -337,6 +381,8 @@ def main() -> int:
         return cmd_report(args.file)
     elif args.command == "goal":
         return cmd_goal(args.description)
+    elif args.command == "memory":
+        return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
     else:
         print(f"❌ Unknown command: {args.command}", file=sys.stderr)
         return 1

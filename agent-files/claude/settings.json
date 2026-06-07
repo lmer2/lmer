@@ -111,6 +111,7 @@
       "Bash(work commit:*)",
       "Bash(work goal:*)",
       "Bash(work log:*)",
+      "Bash(work memory:*)",
       "Bash(work read-project-info)",
       "Bash(work report:*)",
       "Bash(work report --file:*)",

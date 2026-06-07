@@ -946,6 +946,7 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_DANGER_ZONE": os.environ.get("LMER_DANGER_ZONE"),
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
+        "LMER_PERSIST_AGENT_MEMORY": os.environ.get("LMER_PERSIST_AGENT_MEMORY"),
         "LMER_HUMAN_IDENTITY": resolve_human_identity(),
         # Optional git identity overrides for commits made inside the container.
         # When set, entrypoint.sh exports them as GIT_AUTHOR_*/GIT_COMMITTER_*
