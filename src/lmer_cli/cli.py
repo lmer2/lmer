@@ -850,6 +850,12 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         "LMER_HUMAN_IDENTITY": resolve_human_identity(),
+        # Optional git identity overrides for commits made inside the container.
+        # When set, entrypoint.sh exports them as GIT_AUTHOR_*/GIT_COMMITTER_*
+        # (session-scoped; the mounted ~/.gitconfig is left untouched). Either
+        # may be set independently; the unset half falls back to gitconfig.
+        "LMER_GIT_USER_NAME": os.environ.get("LMER_GIT_USER_NAME"),
+        "LMER_GIT_USER_EMAIL": os.environ.get("LMER_GIT_USER_EMAIL"),
         "LMER_REPO_URL": repo_url,
         "LMER_WORK_REPO": work_repo_url,
         "LMER_WORK_REPO_PATH": os.environ.get("LMER_WORK_REPO_PATH", "/work"),

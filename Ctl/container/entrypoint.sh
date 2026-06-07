@@ -106,6 +106,26 @@ except Exception as e:
     print(f'❌ Crypto test failed: {e}')
 "
 
+# ── Git identity overrides ──
+# When LMER_GIT_USER_NAME / LMER_GIT_USER_EMAIL are set, export git's native
+# author/committer env vars so commits made this session use the override.
+# This deliberately does NOT run `git config --global`: the container's
+# ~/.gitconfig is a persistent, read-write bind mount (container-home/.gitconfig),
+# so writing to it would leak the override into future sessions even after the
+# env var is unset. Git's GIT_AUTHOR_*/GIT_COMMITTER_* vars are session-scoped,
+# touch no file, and apply across every repo (workspace and the work repo).
+# Either var may be set independently; the unset half falls back to gitconfig.
+if [ -n "$LMER_GIT_USER_NAME" ]; then
+    export GIT_AUTHOR_NAME="$LMER_GIT_USER_NAME"
+    export GIT_COMMITTER_NAME="$LMER_GIT_USER_NAME"
+    echo "✅ Git author/committer name overridden via LMER_GIT_USER_NAME"
+fi
+if [ -n "$LMER_GIT_USER_EMAIL" ]; then
+    export GIT_AUTHOR_EMAIL="$LMER_GIT_USER_EMAIL"
+    export GIT_COMMITTER_EMAIL="$LMER_GIT_USER_EMAIL"
+    echo "✅ Git author/committer email overridden via LMER_GIT_USER_EMAIL"
+fi
+
 # Check if we're in a git repository
 if [ -d .git ]; then
     echo ""
