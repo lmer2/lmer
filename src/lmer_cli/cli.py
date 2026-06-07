@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 import re
+from typing import Mapping
 from dotenv import dotenv_values
 
 from . import resolve
@@ -46,6 +47,98 @@ from .tokens import (
     _inject_gitlab_token_if_available,
 )
 from .util import resolve_human_identity
+
+# Default pool for general port passthrough (--ports / --port-pool). Kept
+# distinct from the FastAPI range (8700-8799) so both features can be used in
+# the same session without colliding on default flags.
+DEFAULT_PORT_POOL = "8800-8899"
+
+
+def _resolve_requested_ports(
+    cli_count: int | None,
+    cli_pool: str | None,
+    env: Mapping[str, str],
+) -> tuple[int, str]:
+    """Resolve the requested port count and pool from CLI args + env vars.
+
+    CLI values take precedence over the ``LMER_PORT_COUNT`` / ``LMER_PORT_POOL``
+    environment variables. Returns ``(count, pool_spec)`` where ``count`` is 0
+    when port passthrough is off. Raises :class:`ValueError` if the count is
+    non-numeric or negative.
+    """
+    if cli_count is not None:
+        count = cli_count
+    else:
+        raw = (env.get("LMER_PORT_COUNT") or "").strip()
+        if not raw:
+            count = 0
+        else:
+            try:
+                count = int(raw)
+            except ValueError:
+                raise ValueError(f"LMER_PORT_COUNT must be an integer, got {raw!r}")
+    if count < 0:
+        raise ValueError(f"port count must be >= 0, got {count}")
+    pool = cli_pool or env.get("LMER_PORT_POOL") or DEFAULT_PORT_POOL
+    return count, pool
+
+
+def _publish_loopback_ports(run: list[str], ports: list[int]) -> None:
+    """Append container ``-p`` args publishing each port on 127.0.0.1.
+
+    The same port number is used inside and outside the container, and the
+    bind is loopback-only so the mapping is reachable from the host but not
+    network-exposed. Shared by the FastAPI endpoint and the general
+    port-passthrough publishing sites.
+    """
+    for port in ports:
+        run += ["-p", f"127.0.0.1:{port}:{port}"]
+
+
+def _apply_port_passthrough(
+    ns: argparse.Namespace, env: dict, run: list[str]
+) -> int | None:
+    """Resolve, allocate, and publish general port-passthrough ports.
+
+    Allocates the requested number of free ports from the pool on the host
+    (before container start, so parallel sessions get disjoint ports),
+    publishes each to 127.0.0.1, and exports the list to the container via
+    ``LMER_PORTS`` so Claude can bind services to ports reachable from the host.
+    CLI flags win over the ``LMER_PORT_COUNT``/``LMER_PORT_POOL`` env vars.
+
+    Mutates ``env`` and ``run`` in place. Returns ``None`` on success
+    (including when no ports are requested) or a process exit code on a fatal
+    error, so the caller can ``return`` it directly.
+    """
+    try:
+        port_count, port_pool_spec = _resolve_requested_ports(
+            ns.ports, ns.port_pool, os.environ
+        )
+    except ValueError as exc:
+        error(f"❌ {exc}")
+        return 2
+    if port_count <= 0:
+        return None
+
+    from .supervisor import _parse_port_range, _pick_ports
+
+    try:
+        port_pool = _parse_port_range(port_pool_spec)
+    except ValueError as exc:
+        error(f"❌ Invalid port pool {port_pool_spec!r}: {exc}")
+        return 2
+    try:
+        picked_ports = _pick_ports(port_pool, "127.0.0.1", port_count)
+    except RuntimeError as exc:
+        error(f"❌ {exc}")
+        return 2
+
+    env["LMER_PORTS"] = ",".join(str(p) for p in picked_ports)
+    _publish_loopback_ports(run, picked_ports)
+    published = ", ".join(str(p) for p in picked_ports)
+    info(f"🔌 Publishing {len(picked_ports)} port(s) on 127.0.0.1: {published}")
+    info("   (exposed inside the container via LMER_PORTS; bind services to 0.0.0.0)")
+    return None
 
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -97,6 +190,10 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
     parser.add_argument("--fastapi-host", dest="fastapi_host", help="Host for the FastAPI endpoint to bind (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", dest="fastapi_token", help="Bearer token for the FastAPI endpoint (auto-generated if omitted)")
+    # General port passthrough: allocate N free ports from a pool and publish
+    # them so a service Claude runs inside the container is reachable on the host.
+    parser.add_argument("--ports", dest="ports", type=int, help="Number of host ports to allocate from --port-pool and publish to the container (env: LMER_PORT_COUNT)")
+    parser.add_argument("--port-pool", dest="port_pool", help=f"Port pool LOW-HIGH to allocate --ports from (default {DEFAULT_PORT_POOL}; env: LMER_PORT_POOL)")
 
     ns, extra = parser.parse_known_args(argv)
     # Combine any extra unknown args with the -- separated rest
@@ -850,6 +947,12 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         "LMER_HUMAN_IDENTITY": resolve_human_identity(),
+        # Optional git identity overrides for commits made inside the container.
+        # When set, entrypoint.sh exports them as GIT_AUTHOR_*/GIT_COMMITTER_*
+        # (session-scoped; the mounted ~/.gitconfig is left untouched). Either
+        # may be set independently; the unset half falls back to gitconfig.
+        "LMER_GIT_USER_NAME": os.environ.get("LMER_GIT_USER_NAME"),
+        "LMER_GIT_USER_EMAIL": os.environ.get("LMER_GIT_USER_EMAIL"),
         "LMER_REPO_URL": repo_url,
         "LMER_WORK_REPO": work_repo_url,
         "LMER_WORK_REPO_PATH": os.environ.get("LMER_WORK_REPO_PATH", "/work"),
@@ -965,8 +1068,14 @@ def main(argv: list[str] | None = None) -> int:
         port_range = _parse_port_range(port_range_spec)
         host_port = _pick_port(port_range, "127.0.0.1")
         env["LMER_FASTAPI_PORT"] = str(host_port)
-        run += ["-p", f"127.0.0.1:{host_port}:{host_port}"]
+        _publish_loopback_ports(run, [host_port])
         info(f"🛰  FastAPI endpoint will be published on http://127.0.0.1:{host_port}")
+
+    # General port passthrough (--ports / --port-pool): allocate N free ports
+    # and publish them so a service Claude runs inside is reachable on the host.
+    port_rc = _apply_port_passthrough(ns, env, run)
+    if port_rc is not None:
+        return port_rc
 
     run += env_args(env)
 
