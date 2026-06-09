@@ -32,10 +32,12 @@ from .mounts import (
     build_external_taskdef_mounts,
     build_global_mount,
     build_host_repo_ro_mount,
+    build_host_uv_cache_mount,
     build_lmer_docs_mount,
     build_user_mounts,
     build_workspace_mount,
     build_service_mode_mounts,
+    resolve_host_uv_cache_dir,
 )
 from .build import DEFAULT_IMAGE, ensure_image, build_image, resolve_image_tag
 from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
@@ -46,7 +48,7 @@ from .tokens import (
     _convert_ssh_to_https_if_token_available,
     _inject_gitlab_token_if_available,
 )
-from .util import resolve_human_identity
+from .util import get_bool_env, resolve_human_identity
 
 # Default pool for general port passthrough (--ports / --port-pool). Kept
 # distinct from the FastAPI range (8700-8799) so both features can be used in
@@ -860,6 +862,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # Check SSH setup and warn if not configured
     _check_ssh_setup(container_home, ssh_agent_enabled)
+
+    # Optional: mount the host's uv cache so target-repo `uv sync` reuses
+    # already-downloaded packages instead of re-fetching them each session.
+    # Off by default; opt-in via LMER_MOUNT_UV_CACHE.
+    if get_bool_env("LMER_MOUNT_UV_CACHE"):
+        host_uv_cache = resolve_host_uv_cache_dir()
+        if host_uv_cache.exists() and host_uv_cache.is_dir():
+            run += build_host_uv_cache_mount(runtime, host_uv_cache)
+            success(f"✅ Mounting host uv cache: {host_uv_cache} → /home/developer/.cache/uv")
+        else:
+            info(f"⚠️  Host uv cache not found at {host_uv_cache}, skipping mount")
 
     # Workspace mount removed - using /workspace directory from image instead
     # This avoids root:root ownership issues with Docker/Podman mounts

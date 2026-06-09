@@ -14,9 +14,12 @@ from lmer_cli.mounts import (
     build_global_mount,
     build_lmer_docs_mount,
     build_host_repo_ro_mount,
+    build_host_uv_cache_mount,
     build_user_mounts,
     build_checkout_mount,
     build_service_mode_mounts,
+    resolve_host_uv_cache_dir,
+    CONTAINER_UV_CACHE_DIR,
 )
 
 
@@ -380,3 +383,54 @@ class TestBuildServiceModeMounts:
                 args = build_service_mode_mounts("docker", Path("/home/user/myproject"))
         assert "/home/user/myproject:/workspace:rw" in args
         assert not any("docker.sock" in str(a) for a in args)
+
+
+class TestResolveHostUvCacheDir:
+    """Resolution order for the host's uv cache directory."""
+
+    def test_explicit_uv_cache_dir_wins(self, monkeypatch, tmp_path):
+        explicit = tmp_path / "custom-uv"
+        monkeypatch.setenv("UV_CACHE_DIR", str(explicit))
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+        assert resolve_host_uv_cache_dir() == explicit
+
+    def test_xdg_cache_home_when_no_explicit(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+        xdg = tmp_path / "xdg"
+        monkeypatch.setenv("XDG_CACHE_HOME", str(xdg))
+        assert resolve_host_uv_cache_dir() == xdg / "uv"
+
+    def test_linux_default(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setattr("lmer_cli.mounts.Path.home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr("lmer_cli.mounts.sys.platform", "linux")
+        assert resolve_host_uv_cache_dir() == tmp_path / ".cache" / "uv"
+
+    def test_macos_default(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("UV_CACHE_DIR", raising=False)
+        monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+        monkeypatch.setattr("lmer_cli.mounts.Path.home", classmethod(lambda cls: tmp_path))
+        monkeypatch.setattr("lmer_cli.mounts.sys.platform", "darwin")
+        assert resolve_host_uv_cache_dir() == tmp_path / "Library" / "Caches" / "uv"
+
+    def test_expanduser_on_explicit_path(self, monkeypatch):
+        monkeypatch.setenv("UV_CACHE_DIR", "~/my-uv-cache")
+        resolved = resolve_host_uv_cache_dir()
+        assert not str(resolved).startswith("~"), "tilde should have been expanded"
+
+
+class TestBuildHostUvCacheMount:
+    """Mount-arg construction for the host uv cache."""
+
+    def test_mount_to_container_default_path(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args = build_host_uv_cache_mount("docker", Path("/home/user/.cache/uv"))
+        assert args == ["-v", f"/home/user/.cache/uv:{CONTAINER_UV_CACHE_DIR}:rw"]
+
+    def test_selinux_label_on_podman(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=True):
+            _is_selinux_enforcing.cache_clear()
+            args = build_host_uv_cache_mount("podman", Path("/home/user/.cache/uv"))
+        assert args[-1].endswith(":rw,z")
