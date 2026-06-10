@@ -168,7 +168,12 @@ class TestBaseRunArgs:
 
     def test_base_args_docker(self):
         """Test base args for Docker"""
-        args = base_run_args("docker", False, "developer")
+        # Isolate LMER_PIDS_LIMIT from the ambient environment (it may be
+        # exported from a developer's .env / host into the dev container) so
+        # the default-cap assertion below is deterministic. See issue #63.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LMER_PIDS_LIMIT", None)
+            args = base_run_args("docker", False, "developer")
 
         assert "docker" in args
         assert "run" in args
