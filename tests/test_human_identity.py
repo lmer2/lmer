@@ -15,31 +15,19 @@ Covers four layers:
 """
 import os
 import re
-import stat
 import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from lmer_cli.util import _git_config, resolve_human_identity
+from tests._claude_runner_harness import run_claude_runner, skip_if_npm_claude_present
 
 
 REPO_ROOT = Path(__file__).parent.parent
-CLAUDE_RUNNER = REPO_ROOT / "libexec" / "claude-runner.sh"
 CLI_PY = REPO_ROOT / "src" / "lmer_cli" / "cli.py"
 RENDERER = REPO_ROOT / "libexec" / "render-prompt-fragment.py"
 IDENTITY_TEMPLATE = REPO_ROOT / "prompts" / "human-identity.md.jinja2"
-
-NPM_GLOBAL_CLAUDE = Path("/home/developer/.npm-global/bin/claude")
-skip_if_npm_claude_present = pytest.mark.skipif(
-    NPM_GLOBAL_CLAUDE.exists(),
-    reason=(
-        "Real claude at /home/developer/.npm-global/bin/claude would shadow "
-        "the test stub because claude-runner.sh prepends that directory to PATH"
-    ),
-)
 
 
 class TestResolveHumanIdentity:
@@ -247,65 +235,9 @@ class TestPackagedIdentityTemplate:
 
 
 def _run_claude_runner(tmp_path, env_value=None):
-    """Run claude-runner.sh with a stubbed claude binary.
-
-    The stub writes its argv to a file so we can inspect what flags
-    claude-runner.sh actually passes.
-
-    A symlink to ``sys.executable`` is exposed as ``python3`` in the fake
-    bin so the renderer subprocess finds a Python with ``jinja2`` available
-    (the bare ``/usr/bin/python3`` in test environments may not have it).
-
-    Returns: (combined stdout+stderr, captured argv list, contents of any
-    --append-system-prompt-file the runner constructed).
-    """
-    argv_file = tmp_path / "claude_argv.txt"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-
-    fake_claude = fake_bin / "claude"
-    fake_claude.write_text(
-        "#!/bin/bash\n"
-        f'printf "%s\\n" "$@" > "{argv_file}"\n'
-        "exit 0\n"
-    )
-    fake_claude.chmod(fake_claude.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-    # Expose the test's Python interpreter as `python3` so the renderer can
-    # import jinja2 from the active venv. Using a wrapper instead of a symlink
-    # preserves PEP 405 venv detection (which inspects argv[0]'s location to
-    # find pyvenv.cfg).
-    python_wrapper = fake_bin / "python3"
-    python_wrapper.write_text(f'#!/bin/bash\nexec {sys.executable} "$@"\n')
-    python_wrapper.chmod(python_wrapper.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-
-    env = {
-        "PATH": f"{fake_bin}:/usr/bin:/bin",
-        "HOME": str(tmp_path),
-    }
-    if env_value is not None:
-        env["LMER_HUMAN_IDENTITY"] = env_value
-
-    result = subprocess.run(
-        ["bash", str(CLAUDE_RUNNER)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-
-    captured_argv = []
-    if argv_file.exists():
-        captured_argv = [line for line in argv_file.read_text().splitlines() if line]
-
-    prompt_file_contents = None
-    if "--append-system-prompt-file" in captured_argv:
-        idx = captured_argv.index("--append-system-prompt-file")
-        prompt_path = Path(captured_argv[idx + 1])
-        if prompt_path.exists():
-            prompt_file_contents = prompt_path.read_text()
-
-    return result.stdout + result.stderr, captured_argv, prompt_file_contents
+    env = {} if env_value is None else {"LMER_HUMAN_IDENTITY": env_value}
+    result = run_claude_runner(tmp_path, env, expose_python3=True)
+    return result.output, result.argv, result.prompt
 
 
 @skip_if_npm_claude_present

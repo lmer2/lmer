@@ -222,6 +222,16 @@ if [ -n "$LMER_REASONING_EFFORT" ]; then
     fi
 fi
 
+# Translate LMER_LLM_NAME into claude's --model flag.
+# The value is passed through verbatim (alias like "sonnet"/"opus" or a full
+# model ID) — claude itself rejects unknown models, and hardcoding a list here
+# would go stale as models change. Unset or empty means no flag: claude uses
+# its own default model.
+if [ -n "$LMER_LLM_NAME" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --model $LMER_LLM_NAME"
+    echo "✅ Claude model: $LMER_LLM_NAME"
+fi
+
 # ── AGENTS.md system prompt injection ──
 # Since AGENTS.md is not auto-discovered by Claude Code (unlike CLAUDE.md),
 # we inject it via --append-system-prompt-file. The chain is:

@@ -8,6 +8,7 @@
 
 unreleased:
   added:
+    - "`LMER_LLM_NAME` environment variable to start Claude with a specific model (e.g. `sonnet`, `opus`, or a full model ID); the value is passed verbatim to claude's `--model` flag. When unset, Claude Code's default model is used (#64)"
     - "`LMER_MOUNT_UV_CACHE` environment variable to bind-mount the host's `uv` cache directory into the container at `/home/developer/.cache/uv` so target-repo `uv sync`/`uv pip install` reuse already-downloaded wheels across sessions. Off by default; host path resolved via `$UV_CACHE_DIR` → `$XDG_CACHE_HOME/uv` → platform default (`~/.cache/uv` on Linux, `~/Library/Caches/uv` on macOS); missing host cache logs an info message and is skipped (#62)"
     - "`LMER_PERSIST_AGENT_MEMORY` environment variable to persist Claude Code agent memory to the work repo on a per-project basis (stored under `{host}/{project}/memory/`). Memory is restored automatically at session start; the agent persists it back via the new `work memory persist` command. Restore and persist use mirror semantics, so memory the agent deletes does not get resurrected on the next restore (#56)"
     - "Apache-2.0 `LICENSE` at the repo root"
