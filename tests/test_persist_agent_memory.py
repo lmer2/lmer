@@ -12,27 +12,16 @@ Covers three layers:
 
 import os
 import re
-import stat
-import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from work_repo import memory
+from tests._claude_runner_harness import run_claude_runner, skip_if_npm_claude_present
 
 
-CLAUDE_RUNNER = Path(__file__).parent.parent / "libexec" / "claude-runner.sh"
 CLI_PY = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
-
-NPM_GLOBAL_CLAUDE = Path("/home/developer/.npm-global/bin/claude")
-skip_if_npm_claude_present = pytest.mark.skipif(
-    NPM_GLOBAL_CLAUDE.exists(),
-    reason=(
-        "Real claude at /home/developer/.npm-global/bin/claude would shadow "
-        "the test stub because claude-runner.sh prepends that directory to PATH"
-    ),
-)
 
 
 # ── Layer 1: cli.py env-dict guard ──────────────────────────────────────────
@@ -219,51 +208,9 @@ def test_persist_missing_env_returns_error(memory_env, monkeypatch):
 
 
 def _run_claude_runner_with_work(tmp_path, persist_value=None):
-    """Run claude-runner.sh with stubbed `claude` and `work` binaries.
-
-    The `work` stub appends its argv to a file so we can assert whether (and
-    with what arguments) claude-runner.sh invoked it. Returns
-    (combined_output, work_argv_lines).
-    """
-    work_calls = tmp_path / "work_calls.txt"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-
-    fake_claude = fake_bin / "claude"
-    fake_claude.write_text("#!/bin/bash\nexit 0\n")
-    fake_claude.chmod(
-        fake_claude.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
-    )
-
-    fake_work = fake_bin / "work"
-    fake_work.write_text(
-        "#!/bin/bash\n"
-        f'printf "%s\\n" "$*" >> "{work_calls}"\n'
-        "exit 0\n"
-    )
-    fake_work.chmod(
-        fake_work.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH
-    )
-
-    env = {
-        "PATH": f"{fake_bin}:/usr/bin:/bin",
-        "HOME": str(tmp_path),
-    }
-    if persist_value is not None:
-        env["LMER_PERSIST_AGENT_MEMORY"] = persist_value
-
-    result = subprocess.run(
-        ["bash", str(CLAUDE_RUNNER)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-
-    calls = []
-    if work_calls.exists():
-        calls = [line for line in work_calls.read_text().splitlines() if line]
-    return result.stdout + result.stderr, calls
+    env = {} if persist_value is None else {"LMER_PERSIST_AGENT_MEMORY": persist_value}
+    result = run_claude_runner(tmp_path, env, stub_work=True)
+    return result.output, result.work_calls
 
 
 @skip_if_npm_claude_present
