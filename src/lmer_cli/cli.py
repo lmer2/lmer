@@ -1044,6 +1044,11 @@ def main(argv: list[str] | None = None) -> int:
         # supervisor can be re-tuned without a release if claude changes the
         # input-prompt glyph.
         "LMER_AUTO_START_READY_MARKER": os.environ.get("LMER_AUTO_START_READY_MARKER"),
+        # Forward the gap between the auto-/start and the follow-up prompt so a
+        # host-set value reaches the supervisor running inside the container.
+        # Without this delay /start can fail to register before the prompt is
+        # typed on slow systems, landing both on one input line (issue #65).
+        "LMER_START_PROMPT_DELAY": os.environ.get("LMER_START_PROMPT_DELAY"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
         # only works if the container-side bind is 0.0.0.0. The host CLI
