@@ -22,9 +22,12 @@ the user's terminal and claude. The supervisor:
   (see ``_wait_for_ready_marker``) so a startup-timing race or transient
   modal/dialog can't swallow the submit CR.
 - Optionally injects a follow-up prompt (host CLI ``--prompt`` →
-  ``LMER_START_PROMPT``) immediately after the ``/start`` injection so an
-  automated run can hand claude an extra instruction without manual typing.
-  Tied to auto-start, so it is a no-op under ``--manual-start``.
+  ``LMER_START_PROMPT``) a configurable delay after the ``/start`` injection so
+  an automated run can hand claude an extra instruction without manual typing.
+  The gap (``--start-prompt-delay`` / ``LMER_START_PROMPT_DELAY``) lets the
+  ``/start`` slash command register before the prompt is typed, so on slow
+  systems the prompt does not land on the same input line as ``/start``. Tied
+  to auto-start, so it is a no-op under ``--manual-start``.
 
 The supervisor is meant to be invoked at the end of the claude-runner shell
 script in place of ``exec claude``. See ``libexec/claude-runner.sh``.
@@ -77,6 +80,15 @@ DEFAULT_AUTO_START_READY_TIMEOUT = 15.0
 # during a multi-screen-redraw sequence, and a short settle helps the input
 # box reach its steady, focused state before we type into it.
 DEFAULT_AUTO_START_SETTLE_DELAY = 0.25
+
+# Gap between the auto-``/start`` submission and the follow-up prompt
+# (``LMER_START_PROMPT``) injection. On slow systems ``/start`` has not yet
+# been recognized as a slash command by the time the prompt text arrives, so
+# the prompt lands on the same input line (``/start <prompt text>``) instead of
+# as the next conversation turn. A generous default gives the slash command
+# time to register before we type; fast systems simply wait this once at
+# startup. Tunable via ``--start-prompt-delay`` / ``LMER_START_PROMPT_DELAY``.
+DEFAULT_START_PROMPT_DELAY = 2.0
 OUTPUT_BUFFER_LIMIT = 1024 * 1024  # 1 MiB rolling buffer of child output
 
 # When the host terminal (especially VSCode's integrated terminal) hasn't
@@ -461,6 +473,17 @@ def _resolve_options(args: argparse.Namespace) -> dict:
     # no follow-up. Tied to auto-start, so it is a no-op under --manual-start.
     start_prompt = os.environ.get("LMER_START_PROMPT") or ""
 
+    # Gap before the follow-up prompt is injected (see DEFAULT_START_PROMPT_DELAY).
+    # CLI flag wins over the env var, which wins over the default.
+    prompt_delay_raw = args.start_prompt_delay
+    if prompt_delay_raw is None:
+        prompt_delay_raw = os.environ.get("LMER_START_PROMPT_DELAY")
+    start_prompt_delay = (
+        float(prompt_delay_raw)
+        if prompt_delay_raw is not None
+        else DEFAULT_START_PROMPT_DELAY
+    )
+
     return {
         "fastapi": fastapi_enabled,
         "manual_start": manual_start,
@@ -474,6 +497,7 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         "auto_start_settle_delay": auto_start_settle_delay,
         "winsize_recheck_delay": winsize_recheck_delay,
         "start_prompt": start_prompt,
+        "start_prompt_delay": start_prompt_delay,
     }
 
 
@@ -499,6 +523,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Max seconds to wait for claude's input prompt to render before "
             "injecting /start; 0 disables marker waiting (default 15)"
+        ),
+    )
+    parser.add_argument(
+        "--start-prompt-delay",
+        type=float,
+        help=(
+            "Seconds to wait after the auto-/start submission before injecting "
+            "the follow-up --prompt/LMER_START_PROMPT, so /start registers as a "
+            "slash command first on slow systems (default 2.0)"
         ),
     )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to run (typically: -- claude ...)")
@@ -581,9 +614,13 @@ def _start_auto_start_thread(
        state if the prompt rendered mid-redraw.
     4. Inject ``/start\\r`` plus follow-up CR nudges.
     5. If a follow-up prompt is configured (host CLI ``--prompt`` →
-       ``LMER_START_PROMPT``), type and submit it after a short pause. Claude
-       queues input typed while it is still working on ``/start``, so the
-       prompt lands as the next turn. Skipped when no prompt is set.
+       ``LMER_START_PROMPT``), wait ``start_prompt_delay`` seconds
+       (``--start-prompt-delay`` / ``LMER_START_PROMPT_DELAY``) so ``/start``
+       has registered as a slash command — otherwise on a slow system the
+       prompt text lands on the same input line as ``/start`` — then type and
+       submit it. Claude queues input typed while it is still working on
+       ``/start``, so the prompt lands as the next turn. Skipped when no prompt
+       is set.
 
     The ``cancel`` event short-circuits each stage so a shutdown raised during
     the wait is honored promptly (the marker wait re-checks the event on a
@@ -595,6 +632,7 @@ def _start_auto_start_thread(
     ready_timeout = max(0.0, options["auto_start_ready_timeout"])
     settle_delay = max(0.0, options["auto_start_settle_delay"])
     start_prompt = options["start_prompt"]
+    start_prompt_delay = max(0.0, options["start_prompt_delay"])
 
     def _run() -> None:
         if initial_delay > 0 and cancel.wait(initial_delay):
@@ -607,8 +645,11 @@ def _start_auto_start_thread(
         _inject_auto_start(write, AUTO_START_NUDGE_COUNT, nudge_delay)
         if start_prompt:
             # Pause so the follow-up doesn't interleave with the trailing CR
-            # nudges (which would submit it prematurely or into a non-empty box).
-            if nudge_delay > 0 and cancel.wait(nudge_delay):
+            # nudges (which would submit it prematurely or into a non-empty box)
+            # and, more importantly, so /start has time to register as a slash
+            # command before the prompt text is typed — otherwise on a slow
+            # system the prompt lands on the same input line as /start (#65).
+            if start_prompt_delay > 0 and cancel.wait(start_prompt_delay):
                 return
             _inject_start_prompt(
                 write, start_prompt, AUTO_START_NUDGE_COUNT, nudge_delay

@@ -163,6 +163,7 @@ class TestResolveOptions:
             auto_start_delay=None,
             auto_start_nudge_delay=None,
             auto_start_ready_timeout=None,
+            start_prompt_delay=None,
         )
         defaults.update(overrides)
         return argparse.Namespace(**defaults)
@@ -174,6 +175,7 @@ class TestResolveOptions:
             "LMER_AUTO_START_NUDGE_DELAY", "LMER_AUTO_START_READY_TIMEOUT",
             "LMER_AUTO_START_SETTLE_DELAY", "LMER_AUTO_START_READY_MARKER",
             "LMER_WINSIZE_RECHECK_DELAY", "LMER_START_PROMPT",
+            "LMER_START_PROMPT_DELAY",
         ):
             monkeypatch.delenv(k, raising=False)
         opts = supervisor._resolve_options(self._ns())
@@ -188,6 +190,7 @@ class TestResolveOptions:
         assert opts["auto_start_ready_marker"] == supervisor.DEFAULT_AUTO_START_READY_MARKER
         assert opts["auto_start_settle_delay"] == supervisor.DEFAULT_AUTO_START_SETTLE_DELAY
         assert opts["start_prompt"] == ""
+        assert opts["start_prompt_delay"] == supervisor.DEFAULT_START_PROMPT_DELAY
 
     def test_start_prompt_from_env(self, monkeypatch):
         monkeypatch.setenv("LMER_START_PROMPT", "research X online first")
@@ -225,6 +228,23 @@ class TestResolveOptions:
         monkeypatch.setenv("LMER_AUTO_START_SETTLE_DELAY", "0.1")
         opts = supervisor._resolve_options(self._ns())
         assert opts["auto_start_settle_delay"] == 0.1
+
+    def test_start_prompt_delay_from_env(self, monkeypatch):
+        monkeypatch.setenv("LMER_START_PROMPT_DELAY", "3.5")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["start_prompt_delay"] == 3.5
+
+    def test_start_prompt_delay_cli_overrides_env(self, monkeypatch):
+        monkeypatch.setenv("LMER_START_PROMPT_DELAY", "3.5")
+        opts = supervisor._resolve_options(self._ns(start_prompt_delay=0.75))
+        assert opts["start_prompt_delay"] == 0.75
+
+    def test_start_prompt_delay_zero_from_env(self, monkeypatch):
+        # Explicit 0 must be honored (restores the old near-immediate behavior),
+        # not treated as unset/falling back to the default.
+        monkeypatch.setenv("LMER_START_PROMPT_DELAY", "0")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["start_prompt_delay"] == 0.0
 
     def test_ready_marker_from_env(self, monkeypatch):
         # Override with a unicode string so we verify UTF-8 encoding too.
@@ -330,6 +350,22 @@ class TestContainerEnvPassthrough:
         )
         assert pattern.search(source), \
             "LMER_START_PROMPT entry missing from cli.py container env dict"
+
+    def test_cli_env_dict_declares_start_prompt_delay(self):
+        """Guard: LMER_START_PROMPT_DELAY must be in cli.py's container env dict.
+
+        The supervisor reads this var inside the container, so a host-set value
+        only takes effect if cli.py forwards it explicitly.
+        """
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_START_PROMPT_DELAY["']\s*:\s*os\.environ\.get\(\s*["']LMER_START_PROMPT_DELAY["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_START_PROMPT_DELAY entry missing from cli.py container env dict"
 
 
 class TestPreconfigurePtyForInjection:
@@ -634,6 +670,83 @@ class TestInjectStartPrompt:
         supervisor._inject_start_prompt(boom, "anything", nudge_count=2)
 
 
+class TestStartAutoStartThread:
+    """Cover the auto-start daemon's sequencing, especially the configurable
+    gap before the follow-up prompt (issue #65)."""
+
+    class _FakeCancel:
+        """Stand-in for the cancel Event: records wait() durations, never set."""
+
+        def __init__(self):
+            self.waits: list[float] = []
+
+        def wait(self, timeout):
+            self.waits.append(timeout)
+            return False
+
+        def is_set(self):
+            return False
+
+    def _options(self, **overrides):
+        opts = dict(
+            auto_start_delay=0.0,
+            auto_start_nudge_delay=0.0,
+            auto_start_ready_marker=b"",  # empty → marker wait short-circuits
+            auto_start_ready_timeout=0.0,
+            auto_start_settle_delay=0.0,
+            start_prompt="hello",
+            start_prompt_delay=0.0,
+        )
+        opts.update(overrides)
+        return opts
+
+    def test_injects_start_then_prompt_in_order(self):
+        sink: list[bytes] = []
+        write = lambda data: (sink.append(bytes(data)), len(data))[1]
+        cancel = self._FakeCancel()
+        thread = supervisor._start_auto_start_thread(
+            output=None, write=write, options=self._options(), cancel=cancel
+        )
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        # /start submitted first, then the follow-up prompt.
+        assert sink[0] == b"/start\r"
+        assert b"hello\r" in sink
+        assert sink.index(b"/start\r") < sink.index(b"hello\r")
+
+    def test_waits_start_prompt_delay_before_prompt(self):
+        # The gap before the prompt must come from start_prompt_delay, not the
+        # nudge delay — a distinctive value proves which knob gates it.
+        sink: list[bytes] = []
+        write = lambda data: (sink.append(bytes(data)), len(data))[1]
+        cancel = self._FakeCancel()
+        thread = supervisor._start_auto_start_thread(
+            output=None,
+            write=write,
+            options=self._options(start_prompt_delay=0.123),
+            cancel=cancel,
+        )
+        thread.join(timeout=2)
+        assert 0.123 in cancel.waits
+        assert b"hello\r" in sink
+
+    def test_no_prompt_injection_when_unset(self):
+        sink: list[bytes] = []
+        write = lambda data: (sink.append(bytes(data)), len(data))[1]
+        cancel = self._FakeCancel()
+        thread = supervisor._start_auto_start_thread(
+            output=None,
+            write=write,
+            options=self._options(start_prompt="", start_prompt_delay=5.0),
+            cancel=cancel,
+        )
+        thread.join(timeout=2)
+        # /start still injected, but no prompt and no prompt-delay wait.
+        assert sink[0] == b"/start\r"
+        assert all(b"hello" not in chunk for chunk in sink)
+        assert 5.0 not in cancel.waits
+
+
 class TestEnsureSubmitCr:
     def test_appends_cr_when_missing(self):
         assert supervisor._ensure_submit_cr("hello") == "hello\r"
@@ -711,6 +824,7 @@ class TestCli:
             "--auto-start-delay", "0.5",
             "--auto-start-nudge-delay", "0.2",
             "--auto-start-ready-timeout", "8.0",
+            "--start-prompt-delay", "2.5",
             "--", "claude", "--foo",
         ])
         assert ns.fastapi is True
@@ -721,6 +835,7 @@ class TestCli:
         assert ns.auto_start_delay == 0.5
         assert ns.auto_start_nudge_delay == 0.2
         assert ns.auto_start_ready_timeout == 8.0
+        assert ns.start_prompt_delay == 2.5
         assert ns.command == ["--", "claude", "--foo"]
 
 
@@ -857,6 +972,8 @@ class TestSupervisorIntegration:
             "auto_start_ready_timeout": 0,  # skip marker wait for non-claude wrapped procs
             "auto_start_settle_delay": 0,
             "winsize_recheck_delay": 0,
+            "start_prompt": "",
+            "start_prompt_delay": 0,
         }
         if options:
             opts.update(options)
@@ -911,6 +1028,7 @@ class TestSupervisorIntegration:
             "winsize_recheck_delay": 0,
             # No follow-up prompt: only /start + nudges are injected (10 bytes).
             "start_prompt": "",
+            "start_prompt_delay": 0,
         }
         rc = supervisor.run_supervisor(
             ["head", "-c", "10"], opts, stdin_fd=stdin_r, stdout_fd=stdout_w,
@@ -952,6 +1070,7 @@ class TestSupervisorIntegration:
             "auto_start_settle_delay": 0,
             "winsize_recheck_delay": 0,
             "start_prompt": "hello",
+            "start_prompt_delay": 0.05,
         }
         rc = supervisor.run_supervisor(
             ["head", "-c", "19"], opts, stdin_fd=stdin_r, stdout_fd=stdout_w,
