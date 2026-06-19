@@ -64,6 +64,7 @@
       "Bash(git status)",
       "Bash(gitlab-review)",
       "Bash(gitlab-review:*)",
+      "Bash(lmer-slack:*)",
       "Bash(grep:*)",
       "Bash(head:*)",
       "Bash(hooks/rgr.py)",
@@ -165,6 +166,18 @@
     "deny": [
       "Bash(git commit:*)",
       "Bash(git push:*)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Agents/global/hooks/slack_reply_guard.py"
+          }
+        ]
+      }
     ]
   }
 }

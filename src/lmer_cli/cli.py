@@ -49,6 +49,7 @@ from .tokens import (
     _inject_gitlab_token_if_available,
 )
 from .util import get_bool_env, resolve_human_identity
+from .targets import partition_targets, special_target_env
 
 # Default pool for general port passthrough (--ports / --port-pool). Kept
 # distinct from the FastAPI range (8700-8799) so both features can be used in
@@ -739,11 +740,25 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     task_id = ns.task if not ns.no_task else None
-    # Handle multiple targets: first is primary, rest are secondary
-    # ns.target is always a list with nargs="*" (possibly empty)
-    targets: list[str] = ns.target if ns.target else []
+    # Handle multiple targets: first is primary, rest are secondary.
+    # ns.target is always a list with nargs="*" (possibly empty).
+    # Partition special target types (e.g. Slack thread URLs) out before
+    # primary/secondary selection so the clone path (~repo resolution)
+    # never sees them. Each claimed type is represented by a handler that
+    # owns its type-specific behavior (see lmer_cli.targets).
+    _raw_targets: list[str] = ns.target if ns.target else []
+    targets, special_targets = partition_targets(_raw_targets)
     primary_target: str | None = targets[0] if targets else None
     secondary_targets: list[str] = targets[1:] if len(targets) > 1 else []
+
+    # Credential gate: each special target type validates its own required
+    # credentials (e.g. Slack needs SLACK_BOT_TOKEN); fail fast before any
+    # container work.
+    for handler in special_targets:
+        env_error = handler.validate_environment()
+        if env_error:
+            error(f"❌ {env_error}")
+            return 1
 
     # Resolve taskdef directory for the selected task
     resolved_taskdef_dir: Path | None = None
@@ -793,6 +808,10 @@ def main(argv: list[str] | None = None) -> int:
     skip_repo_resolve = bool(ns.no_clone or ns.no_task)
     repo_url: str | None = None
     host_repo_path = None
+    # Session without a repository (set when the only targets are special
+    # targets whose handler allows repo-less mode for the selected task,
+    # and no git origin can be inferred from cwd).
+    no_repo_session = False
     if not skip_repo_resolve:
         cwd = Path.cwd()
 
@@ -819,6 +838,28 @@ def main(argv: list[str] | None = None) -> int:
             if checkout_path:
                 # With --checkout, repo URL resolution failure is non-fatal
                 warning(f"⚠️  Could not resolve repo URL: {e}")
+            elif special_targets and not targets:
+                # Special targets (e.g. a Slack thread) are the only targets
+                # and cwd is not a git repo: a repo-less session is allowed
+                # only when every claimed handler supports it for this task
+                # (conservative when multiple types are mixed). If allowed,
+                # the container is told to skip the workspace clone via
+                # LMER_NO_REPO; otherwise fail fast with the refusing
+                # handler's reason.
+                refusing = next(
+                    (
+                        h
+                        for h in special_targets
+                        if not h.supports_repoless_session(task_id)
+                    ),
+                    None,
+                )
+                if refusing is None:
+                    info(special_targets[0].repoless_start_message())
+                    no_repo_session = True
+                else:
+                    error(f"❌ {e}. {refusing.repoless_unsupported_reason(task_id)}")
+                    return 2
             else:
                 error(f"❌ {e}")
                 return 2
@@ -1055,6 +1096,14 @@ def main(argv: list[str] | None = None) -> int:
         # publishes to 127.0.0.1 on the host, so it is not network-exposed.
         "LMER_FASTAPI_HOST": ns.fastapi_host or ("0.0.0.0" if ns.fastapi else None),
         "LMER_FASTAPI_TOKEN": ns.fastapi_token,
+        # Env contributed by special target types (Slack tokens + parsed
+        # thread context today). Keys of types with no matching target are
+        # seeded with None so the .env merge below cannot forward them.
+        **special_target_env(special_targets),
+        # Repo-less session (special targets were the only targets and no
+        # git origin could be inferred): tells clone_and_exec to skip the
+        # workspace clone instead of failing on the missing LMER_REPO_URL.
+        "LMER_NO_REPO": "1" if no_repo_session else None,
     }
 
     # Merge all variables from .env file into container env dict

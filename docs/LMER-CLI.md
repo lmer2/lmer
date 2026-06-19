@@ -147,6 +147,30 @@ The following environment variables control LMER behavior:
 
 - **`LMER_START_PROMPT_DELAY`** - Seconds the supervisor waits between submitting the auto-`/start` and injecting the follow-up `LMER_START_PROMPT`. The delay lets `/start` register as a slash command first; without it, on a slow system the prompt text is typed before `/start` has been recognized and both land on the same input line (`/start <prompt text>`) instead of as separate turns. Accepts a float (default `2.0`); negative values are clamped to `0`. Has no effect when no follow-up prompt is set, and (like the prompt itself) is a no-op under `--manual-start`/`LMER_MANUAL_START`. Also settable per-invocation on the supervisor with `--start-prompt-delay`. Parsed by `lmer-supervisor` and forwarded into the container by the host CLI.
 
+- **`SLACK_BOT_TOKEN`** - Slack Bot User OAuth Token (`xoxb-...`) used by the Slack-thread chat integration. **Required** whenever a Slack thread permalink is passed as a target to `lmer chat` — lmer fails fast at startup if it is missing. Typically set in your `.env` file. Forwarded into the container, where the `lmer-slack` CLI uses it (Bearer auth) for all Slack Web API calls. See [Slack Thread Chat](#slack-thread-chat) for how to create the Slack app and obtain the token.
+
+- **`SLACK_APP_TOKEN`** - Slack App-Level Token (`xapp-...`, scope `connections:write`). **Required by `lmer-slack-listener`** — the host-side listener uses it to open the socket-mode connection. It is also forwarded into the container when set alongside a Slack target, but is not consumed by the in-container thread-chat flow itself (only `SLACK_BOT_TOKEN` is needed there). See [Spawning sessions automatically (`lmer-slack-listener`)](#spawning-sessions-automatically-lmer-slack-listener).
+
+- **`LMER_SLACK_CHAT_IDLE_TIMEOUT_MINUTES`** - Read **host-side by `lmer-slack-listener`**: minutes of total thread silence (no human or agent messages) before a spawned session is disconnected and a reconnect hint is posted (default `300`, i.e. 5 hours). Invalid values fall back to the default.
+
+- **`LMER_SLACK_CHAT_MAX_SESSIONS`** - Read **host-side by `lmer-slack-listener`**: maximum number of concurrently running `lmer chat` sessions (default `5`). When the limit is reached the listener replies that all session slots are busy instead of spawning another.
+
+- **`LMER_SLACK_CHAT_BIN`** - Read **host-side by `lmer-slack-listener`**: the executable used to spawn sessions (default `lmer`). Set this to an absolute path when `lmer` is not on the listener process's `PATH`.
+
+- **`LMER_SLACK_CHAT_CWD`** - Read **host-side by `lmer-slack-listener`**: working directory for spawned `lmer chat` processes (default `/tmp/lmer-slack-chat-sessions`). Must **not** be a git checkout — lmer would infer a repo target from it, but chat sessions start repo-less so the agent can resolve and clone a workspace from the conversation.
+
+- **`LMER_SLACK_CHAT_LOG_DIR`** - Read **host-side by `lmer-slack-listener`**: directory for per-session PTY transcripts, one file per `(channel, thread_ts)` (default `/tmp/lmer-slack-chat-sessions/logs`).
+
+- **`LMER_SLACK_DM_ALLOWED_USERS`** - Read **host-side by `lmer-slack-listener`**: comma-separated Slack user IDs allowed to hold conversational DM sessions. Unset (the default) means DMs are open to everyone; when set, a DM from anyone not on the list is silently ignored. Channel mentions are never gated by this list.
+
+- **`LMER_SLACK_LOG_LEVEL`** - Read **host-side by `lmer-slack-listener`**: Python logging level for the listener (default `INFO`). Overridden by the `--log-level` flag.
+
+- **`LMER_SLACK_CHANNEL`** / **`LMER_SLACK_THREAD_TS`** - Set **by lmer inside the container** (not host inputs): the channel ID and thread timestamp parsed from the first Slack thread permalink target given to `lmer chat`. Their presence switches the `chat` taskdef into Slack conversation mode and supplies the default channel/thread for `lmer-slack` invocations (overridable per-invocation with `--permalink`). Empty/unset when no Slack target was given.
+
+- **`LMER_SLACK_PERMALINK`** - Also set **by lmer inside the container**: the original Slack thread permalink URL the channel/thread values were derived from, kept for reference and diagnostics.
+
+- **`LMER_NO_REPO`** - Set **by lmer inside the container** (not a host input) to `1` when the session deliberately has no repository — currently only when a Slack thread permalink is the sole `lmer chat` target and no git origin could be inferred from the current directory. The container's clone step is skipped (`/workspace` stays empty) and the chat taskdef drops its repository-specific instructions. Unset for all repository-backed sessions.
+
 ### Work-Repo Claude Assets
 
 The work repository can contribute Claude Code slash commands, skills, and a limited slice of `settings.json` to every session that uses it. This is the supported way to ship project-specific automation, runbooks, or pre-authorized tool patterns across all developers who share the work repo.
@@ -300,6 +324,114 @@ lmer chat https://github.com/org/repo.git --ref v1.2.3
 # Enable verbose output
 lmer chat https://github.com/org/repo.git --verbose
 ```
+
+### Slack Thread Chat
+
+`lmer chat` can conduct the conversation over a Slack thread instead of the interactive terminal. Pass a Slack thread permalink as an additional target:
+
+```bash
+lmer chat https://github.com/org/repo.git "https://myworkspace.slack.com/archives/C0123456789/p1700000000123456"
+```
+
+The repository target is optional — a Slack thread permalink can be the only target:
+
+```bash
+lmer chat "https://myworkspace.slack.com/archives/C0123456789/p1700000000123456"
+```
+
+When no repository target is given, lmer first tries to infer a repo from the current directory's git origin (as usual); if the current directory is not a git repository, the session starts without a repository — the container skips the workspace clone (signalled via `LMER_NO_REPO=1`) and the chat task is the Slack conversation itself. This repo-less fallback is supported for the `chat` task only; every other task assumes code in `/workspace` and fails fast with an error if a Slack thread is its sole target outside a git checkout.
+
+To get the permalink, hover the thread's first message in Slack and choose **"Copy link"**.
+
+lmer parses the permalink into a channel ID and thread timestamp, injects them into the container as `LMER_SLACK_CHANNEL` / `LMER_SLACK_THREAD_TS` / `LMER_SLACK_PERMALINK` (along with `SLACK_BOT_TOKEN`), and the chat task instructions switch Claude into a Slack conversation driven by the `lmer-slack` CLI:
+
+- `lmer-slack history` — fetch and print the thread messages, advancing a cursor so already-seen messages are not re-printed
+- `lmer-slack post` — post a reply into the thread. Prefer `--message-file PATH` or `--stdin` over a positional `lmer-slack post "<text>"` for any free-form text: a command-line argument is processed by the shell first, so backticks (common in Slack inline code), `$`, and quotes get expanded/mangled before they reach Slack, with no error. `--message-file`/`--stdin` post the body verbatim. (`-` is an alias for `--stdin`.)
+- `lmer-slack watch [--out FILE]` — continuously long-poll the thread and stream each new human message as a single JSON line (`{"ts", "user", "text"}`) to stdout, optionally appending the same line to `FILE`. Bot/self/parent messages are filtered out, and a persisted cursor means a restarted watcher resumes instead of replaying. This is the recommended way to wait for replies: point Claude Code's `/monitor` at `lmer-slack watch` so each new message arrives as an event — including mid-task — rather than blocking the agent in a poll loop.
+- `lmer-slack poll` — block until a new human message arrives (exit 0) or the timeout elapses (exit 2; exit 1 means a real error). A simple blocking alternative to `watch` when a stream monitor is not available.
+
+In a Slack-bridged session the terminal is a separate channel from the Slack thread: replies the agent composes as ordinary assistant text land in the (normally unattended) terminal, not in Slack, so the human sees nothing. To backstop this, a Claude Code `Stop` hook (`hooks/slack_reply_guard.py`, wired in `agent-files/claude/settings.json`) fires at the end of each turn when `LMER_SLACK_CHANNEL` is set: if the turn produced a substantive reply but made no `lmer-slack post` call, it re-prompts the agent to post it. The check is scoped to text emitted since the last post, so acknowledge-then-work and periodic progress notes do not trip it; it nudges at most once per turn and is a no-op (and fails open) outside Slack mode.
+
+#### Creating the Slack app and obtaining tokens
+
+1. Go to **https://api.slack.com/apps** → **"Create New App"** → **"From scratch"**. Enter a name (e.g. "lmer") and select your workspace.
+2. In the left sidebar, go to **"OAuth & Permissions"** → **"Scopes" → "Bot Token Scopes"** and add:
+   - `chat:write` — send messages
+   - `channels:history` — read public channel messages
+   - `groups:history` — read private channel messages (if you want to chat in private channels)
+   - `im:history` / `mpim:history` — read DM / group-DM messages (only if you want to use threads there)
+   - `app_mentions:read` — receive @bot mentions (**required for `lmer-slack-listener`**; not needed for the direct `lmer chat <permalink>` flow)
+3. Go back to **"OAuth & Permissions"**, click **"Install to Workspace"**, and approve. Copy the **"Bot User OAuth Token"** (starts with `xoxb-`) and set it in your `.env` file:
+
+   ```bash
+   SLACK_BOT_TOKEN=xoxb-...
+   ```
+
+4. *(Optional, required only for `lmer-slack-listener`)* `SLACK_APP_TOKEN` (starts with `xapp-`): under **"Socket Mode"**, enable Socket Mode and generate an App-Level Token with the `connections:write` scope, then set `SLACK_APP_TOKEN=xapp-...` in your `.env`. The direct `lmer chat <permalink>` thread-chat flow does **not** need it; the host-side listener (next section) does.
+5. Invite the bot to the channel containing the thread (`/invite @lmer` in the channel). Without membership, Slack API calls fail with `not_in_channel`.
+
+#### Spawning sessions automatically (`lmer-slack-listener`)
+
+The flow above attaches a session to one thread you already have a permalink for. `lmer-slack-listener` automates that: it is a long-lived **host** process that listens for Slack events and spawns an `lmer chat <thread-permalink>` session whenever the bot is mentioned or DMed. The spawned agent joins the thread and does all conversation I/O itself via the in-container `lmer-slack` CLI — the listener never relays conversation content, it only spawns and tracks sessions.
+
+##### Quickstart
+
+Prerequisite: a host where plain `lmer chat <repo>` already works (lmer CLI on `PATH`, a container runtime, model + git auth) and a Slack app with Socket Mode and the scopes/events listed under [Slack app setup](#slack-app-setup-for-the-listener) below.
+
+1. **Install the command on the host** (it runs on the host, so the package must be installed there, not just in the image):
+
+   ```bash
+   uv tool install lmer --from git+https://github.com/lmer2/lmer@prep-release
+   # or, from a local checkout: uv tool install -e lmer --from .
+   lmer-slack-listener --help   # confirm it's on PATH
+   ```
+
+2. **Provide the tokens.** The listener reads `.env` the same way the main `lmer` CLI does — the current directory's `.env`, then `~/.lmer/.env`, with already-exported environment variables winning. Put both tokens in whichever you prefer:
+
+   ```bash
+   # ~/.lmer/.env  (shared with the rest of lmer) — or a .env in your run dir
+   SLACK_BOT_TOKEN=xoxb-...
+   SLACK_APP_TOKEN=xapp-...
+   ```
+
+   Everything `lmer` itself needs (model auth, `LMER_IMAGE`, `GITLAB_TOKEN`/`GITLAB_TOKEN_<host>`, …) must be visible the same way — spawned sessions inherit the listener's full environment.
+
+3. **Run it** (foreground; `Ctrl-C` stops it and shuts down live sessions gracefully):
+
+   ```bash
+   lmer-slack-listener --log-level DEBUG
+   ```
+
+4. **Drive it from Slack.** Invite the bot to a channel (`/invite @your-bot`), then `@`-mention it (or DM it). You should see `lmer_session_spawned` in the logs and a *"Connecting a session to this thread… ⏳"* reply; the **first reply takes ~a minute** (container boot). Reply in the thread to continue.
+
+5. **Watch a session** (each gets a PTY transcript):
+
+   ```bash
+   tail -f /tmp/lmer-slack-chat-sessions/logs/<channel>-<thread_ts>.log
+   ```
+
+While testing, `LMER_SLACK_CHAT_MAX_SESSIONS=2` and a shorter `LMER_SLACK_CHAT_IDLE_TIMEOUT_MINUTES` make limits and idle-disconnect easy to observe.
+
+Behavior:
+
+- **Mention outside a thread** — the mention message becomes a new thread's parent and a session is attached to it. **Mention inside a thread** — a session is attached only if none is already running (a live session sees the message through its own polling). **DMs** — a non-bot DM connects a session the same way; one session runs per DM conversation (a new top-level DM while one is live is pointed back at the active thread).
+- Every message in a connected thread — yours or the agent's own posts — resets that session's idle timer. After `LMER_SLACK_CHAT_IDLE_TIMEOUT_MINUTES` of silence the session is disconnected and a reconnect hint is posted; mentioning the bot again spawns a fresh session that reads the thread history. A crashed session posts the same hint; a clean sign-off leaves quietly.
+- At most `LMER_SLACK_CHAT_MAX_SESSIONS` sessions run at once. DM access can be restricted with `LMER_SLACK_DM_ALLOWED_USERS`. See [Environment Variables](#environment-variables) for the full `LMER_SLACK_CHAT_*` / `LMER_SLACK_DM_ALLOWED_USERS` set.
+
+It must run **on a host** (not inside a container): lmer launches a container per session, so the listener has to sit alongside those containers, not within one. Spawned sessions inherit the listener's full environment, so any lmer configuration (`LMER_IMAGE`, git tokens, model API keys, `SLACK_BOT_TOKEN`, ...) in the listener's `.env` reaches the sessions automatically.
+
+##### Slack app setup for the listener
+
+The listener needs more Slack setup than the direct thread-chat flow. In addition to the steps above:
+
+- **Socket Mode** enabled with an `SLACK_APP_TOKEN` (App-Level Token, scope `connections:write`).
+- **Bot Token Scopes** (under **"OAuth & Permissions"**): `app_mentions:read` (receive mentions), `chat:write` (post acks and reconnect notices), `channels:history` / `groups:history` (read public / private thread messages), and `im:history` (DM conversations). Re-install the app after adding scopes.
+- **Event Subscriptions** (under **"Event Subscriptions" → "Subscribe to bot events"**):
+  - `app_mention` — bot mentions that start or reconnect a session
+  - `message.im` — DM conversations
+  - `message.channels` / `message.groups` — thread activity in public / private channels, which resets the idle timer for connected sessions
+
+The same `SLACK_BOT_TOKEN` is forwarded into each spawned session, so its history scopes also cover the in-container `lmer-slack` reads. The bot must be a member of any channel it is used in (`/invite @your-bot`), or Slack calls fail with `not_in_channel`.
 
 ### Building the Container Image
 

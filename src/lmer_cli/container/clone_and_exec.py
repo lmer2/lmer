@@ -593,9 +593,12 @@ def main(argv: list[str] | None = None) -> int:
         cmd_tokens = ["claude-runner"]
 
     service_mode = os.environ.get("LMER_SERVICE_MODE") == "1"
+    # Repo-less session (e.g. Slack-only chat): the host CLI sets LMER_NO_REPO
+    # when there is deliberately no repository to clone.
+    no_repo_mode = os.environ.get("LMER_NO_REPO") == "1"
 
     repo_url = os.environ.get("LMER_REPO_URL")
-    if not repo_url and not service_mode:
+    if not repo_url and not service_mode and not no_repo_mode:
         print("❌ LMER_REPO_URL is not set in environment", file=sys.stderr)
         return 2
 
@@ -631,6 +634,10 @@ def main(argv: list[str] | None = None) -> int:
                 rc = run(["git", "-C", str(ws), "checkout", branch])
                 if rc != 0:
                     print(f"⚠️  Failed to checkout branch {branch}", file=sys.stderr)
+    elif no_repo_mode and not repo_url:
+        # Repo-less session: leave /workspace as-is (empty image dir) and
+        # continue with work-repo setup and dispatch.
+        print("📦 No repository for this session (LMER_NO_REPO=1); skipping workspace clone", file=sys.stderr)
     else:
         # Normal mode: clone the repository
         if not repo_url:
