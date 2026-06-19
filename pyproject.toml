@@ -34,6 +34,9 @@ dependencies = [
     "jinja2>=3.1.6",
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
+    "slack-bolt>=1.18.0",
+    "aiohttp>=3.9.0",
+    "certifi>=2023.7.22",
 ]
 
 [tool.setuptools.packages.find]
@@ -43,6 +46,7 @@ where = ["src"]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
     "flake8>=3.8.0",
     "black>=21.0.0",
     "mypy>=0.800",
@@ -53,6 +57,8 @@ lmer = "lmer_cli.cli:main"
 lmer-supervisor = "lmer_cli.supervisor:main"
 lmer-pipe = "lmer_cli.pipe:main"
 gitlab-review = "gitlab_reviewer.cli:main"
+lmer-slack = "slack_chat.cli:main"
+lmer-slack-listener = "slack_chat.listener:main"
 github-review = "github_reviewer.cli:main"
 work = "work_repo.cli:main"
 
@@ -64,11 +70,17 @@ Issues = "https://github.com/lmer2/lmer/issues"
 
 [tool.uv]
 package = true
+# Lock out package releases newer than one week to reduce supply-chain risk
+# (a freshly published malicious/compromised version is not resolved until it
+# has been public for at least a week). Relative-duration syntax requires uv
+# from Dec 2025 or later.
+exclude-newer = "1 week"
 
 [dependency-groups]
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.23.0",
     "httpx>=0.27.0",
 ]
 
@@ -78,6 +90,7 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --strict-markers"
+asyncio_mode = "auto"
 markers = [
     "slow: marks tests that build/run containers (deselect with '-m \"not slow\"')",
 ]
