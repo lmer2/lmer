@@ -521,6 +521,21 @@ class GateSystem:
 
         ignore_patterns = self._load_secrets_ignore_patterns()
 
+        # Only scan files tracked by git. Untracked and git-ignored files will
+        # never be committed, so scanning them for to-be-committed secrets just
+        # produces false positives (e.g. vendored, git-ignored dependencies).
+        # If this is not a git repo, fall back to scanning everything.
+        #
+        # Use `-z` (NUL-separated, no quoting) so paths with non-ASCII bytes,
+        # special characters, or embedded newlines match the raw paths produced
+        # by os.walk below. Plain `git ls-files` would quote such paths (e.g.
+        # "caf\303\251.py") and split on newlines, causing those tracked files
+        # to be treated as untracked and silently skipped by the scan.
+        tracked_files = None
+        code, stdout, _ = self.run_command(["git", "ls-files", "-z"], check=False)
+        if code == 0:
+            tracked_files = set(p for p in stdout.split("\0") if p)
+
         findings = []
 
         for root, dirs, files in os.walk(self.project_root):
@@ -541,6 +556,9 @@ class GateSystem:
                 filepath = Path(root) / file
                 relative_path = filepath.relative_to(self.project_root)
                 relative_str = relative_path.as_posix()
+
+                if tracked_files is not None and relative_str not in tracked_files:
+                    continue
 
                 if any(fnmatch.fnmatch(relative_str, pat) for pat in ignore_patterns):
                     continue

@@ -334,6 +334,76 @@ class TestGateSystem:
         result = self.gate.check_secrets()
         assert result.status == CheckStatus.FAILED
 
+    @staticmethod
+    def _git(tmp_path, *args):
+        """Run a git command in tmp_path, raising on failure."""
+        subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_check_secrets_tracked_file_flagged(self, tmp_path):
+        """In a git repo, a secret in a git-tracked file is flagged."""
+        self._git(tmp_path, "init")
+        secret_file = tmp_path / "config.py"
+        secret_file.write_text("API_KEY = 'secret123456'")
+        self._git(tmp_path, "add", "config.py")
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_secrets()
+        assert result.status == CheckStatus.FAILED
+        assert any("config.py" in line for line in result.details or [])
+
+    def test_check_secrets_untracked_file_skipped(self, tmp_path):
+        """In a git repo, a secret in an untracked file is NOT scanned.
+
+        Untracked files cannot be committed without first being added (at which
+        point they would be scanned), so the secret scan deliberately ignores
+        them to avoid false positives from vendored / scratch files.
+        """
+        self._git(tmp_path, "init")
+        # An untracked, never-added file containing a secret.
+        (tmp_path / "scratch.py").write_text("API_KEY = 'secret123456'")
+        # A tracked, clean file so git ls-files succeeds and returns >0 entries.
+        clean = tmp_path / "main.py"
+        clean.write_text("print('hello')\n")
+        self._git(tmp_path, "add", "main.py")
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_secrets()
+        assert result.status == CheckStatus.PASSED
+
+    def test_check_secrets_gitignored_file_skipped(self, tmp_path):
+        """In a git repo, a secret in a git-ignored file is NOT scanned."""
+        self._git(tmp_path, "init")
+        (tmp_path / ".gitignore").write_text("ignored.py\n")
+        (tmp_path / "ignored.py").write_text("API_KEY = 'secret123456'")
+        self._git(tmp_path, "add", ".gitignore")
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_secrets()
+        assert result.status == CheckStatus.PASSED
+
+    def test_check_secrets_tracked_non_ascii_filename_flagged(self, tmp_path):
+        """A secret in a tracked file with a non-ASCII name is still flagged.
+
+        Regression guard for the `git ls-files -z` fix: plain `git ls-files`
+        quotes such paths (e.g. "caf\\303\\251.py"), which would not match the
+        raw path from os.walk and would cause the file to be silently skipped.
+        """
+        self._git(tmp_path, "init")
+        secret_file = tmp_path / "café.py"
+        secret_file.write_text("API_KEY = 'secret123456'")
+        self._git(tmp_path, "-c", "core.quotepath=true", "add", "café.py")
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_secrets()
+        assert result.status == CheckStatus.FAILED
+        assert any("café.py" in line for line in result.details or [])
+
     def test_check_code_quality_clean(self, tmp_path):
         """Test checking code quality when clean"""
         # Create temporary test file
