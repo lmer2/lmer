@@ -135,6 +135,14 @@ def sanitize_task_target(task_target: str) -> str:
             if len(parts) > 1:
                 issue_id = parts[-1].split("/")[0].split("?")[0]
                 return f"issue-{issue_id}"
+        # GitLab work item format (newer GitLab UI): .../-/work_items/70
+        # Work items are issues; normalize to the same issue-{id} form so a
+        # work_items URL and its equivalent /-/issues/ URL share a target.
+        if "/-/work_items/" in task_target.lower():
+            parts = task_target.split("/-/work_items/")
+            if len(parts) > 1:
+                issue_id = parts[-1].split("/")[0].split("?")[0]
+                return f"issue-{issue_id}"
         # GitHub PR format: .../pull/123
         if "/pull/" in task_target.lower():
             parts = task_target.split("/pull/")
@@ -207,6 +215,7 @@ def _derive_repo_url_from_task_target(target: str) -> str | None:
     - GitHub: https://github.com/owner/repo/pull/123 -> git@github.com:owner/repo
     - GitLab: https://gitlab.com/group/project/-/merge_requests/123 -> https://oauth2:TOKEN@gitlab.com/group/project.git (if token available)
     - GitLab: https://gitlab.example.com/group/subgroup/project/-/issues/456 -> git@gitlab.example.com:group/subgroup/project (if no token)
+    - GitLab: https://gitlab.com/group/project/-/work_items/70 (newer issue URL form) -> same as /-/issues/
     """
     try:
         parsed = urlparse(target)
@@ -224,10 +233,13 @@ def _derive_repo_url_from_task_target(target: str) -> str | None:
     if len(path_parts) < 2:
         return None
 
-    # Heuristics: only attempt derive when a known resource path is present
+    # Heuristics: only attempt derive when a known resource path is present.
+    # 'work_items/' is GitLab's newer URL form for issues (.../-/work_items/70);
+    # it is treated like 'issues/'. The trailing slash keeps it a path-segment
+    # match so a repo merely named 'work_items' isn't misread as a resource link.
     lowered = '/'.join(path_parts).lower()
     indicators = (
-        'pull/', 'pulls/', 'merge_requests', 'issues/', 'compare/', 'commits/', 'commit/'
+        'pull/', 'pulls/', 'merge_requests', 'issues/', 'work_items/', 'compare/', 'commits/', 'commit/'
     )
     if not any(tok in lowered for tok in indicators):
         return None

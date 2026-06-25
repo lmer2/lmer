@@ -97,6 +97,8 @@ lmer chat https://gitlab.com/group/project.git
 lmer chat https://github.com/org/repo/pull/123
 lmer chat https://gitlab.com/group/project/-/merge_requests/456
 lmer chat https://gitlab.com/group/project/-/issues/31
+# Newer GitLab serves issues at /-/work_items/<id> — also supported (treated as the issue)
+lmer chat https://gitlab.com/group/project/-/work_items/70
 
 # Local checkout (extracts remote URL)
 lmer chat /path/to/repo

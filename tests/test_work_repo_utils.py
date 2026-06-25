@@ -58,6 +58,18 @@ class TestSanitizeTaskTarget:
     @pytest.mark.parametrize(
         "url,expected",
         [
+            ("https://gitlab.com/group/project/-/work_items/70", "issue-70"),
+            ("https://git.20c.com/agents/global/-/work_items/72", "issue-72"),
+            ("https://gitlab.com/group/project/-/work_items/789?work_item_iid=789", "issue-789"),
+        ],
+    )
+    def test_gitlab_work_item_urls(self, url, expected):
+        """GitLab work_items URLs (newer issue form) normalize like issues (#72)"""
+        assert sanitize_task_target(url) == expected
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
             ("https://github.com/owner/repo/pull/123", "pr-123"),
             ("https://github.com/owner/repo/pull/456?tab=files", "pr-456"),
         ],
