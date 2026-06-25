@@ -120,6 +120,14 @@ def sanitize_task_target(task_target: str) -> str:
             if len(parts) > 1:
                 issue_id = parts[-1].split("/")[0].split("?")[0]
                 return f"issue-{issue_id}"
+        # GitLab work item format (newer GitLab UI): .../-/work_items/70
+        # Work items are issues; normalize to the same issue-{id} form so a
+        # work_items URL and its equivalent /-/issues/ URL share a target.
+        if "/-/work_items/" in task_target.lower():
+            parts = task_target.split("/-/work_items/")
+            if len(parts) > 1:
+                issue_id = parts[-1].split("/")[0].split("?")[0]
+                return f"issue-{issue_id}"
         # GitHub PR format: .../pull/123
         if "/pull/" in task_target.lower():
             parts = task_target.split("/pull/")

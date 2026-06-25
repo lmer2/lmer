@@ -230,7 +230,7 @@ Set `LMER_TASKDEF_PATHS=/path/to/my-tasks` to make your tasks available.
   - **Additional targets (secondary)**: Cloned into subdirectories (e.g., `/workspace/mr-123`) but do not override environment variables
 - If no target is provided, the CLI will try to infer from the current directory's git remote.
 - When providing a local git path, lmer extracts the remote URL instead of using `file://` protocol.
-- PR/MR/issue URLs (e.g., `https://github.com/org/repo/pull/123`) are automatically converted to their base repository URLs.
+- PR/MR/issue URLs (e.g., `https://github.com/org/repo/pull/123`) are automatically converted to their base repository URLs. Newer GitLab installs that serve issues under `/-/work_items/<id>` are also recognized and treated the same as the older `/-/issues/<id>` form.
 
 **Default behavior**: Without `--exec`, lmer runs `claude-runner` which starts an interactive Claude Code session.
 

@@ -1,7 +1,14 @@
 """Tests for repository URL parsing functions."""
 
-from lmer_cli.cli import _parse_repo_url
-from lmer_cli.container.clone_and_exec import _parse_gitlab_mr_url
+import pytest
+
+from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
+from lmer_cli.container.clone_and_exec import (
+    _derive_repo_url_from_task_target as _derive_repo_url_container,
+    _parse_gitlab_mr_url,
+    sanitize_task_target as _container_sanitize_task_target,
+)
+from work_repo.utils import sanitize_task_target as _utils_sanitize_task_target
 
 
 class TestParseRepoUrl:
@@ -152,3 +159,68 @@ class TestParseGitlabMrUrl:
         """Should return None tuple for empty URL."""
         result = _parse_gitlab_mr_url("")
         assert result == (None, None, None)
+
+
+# Both copies of the URL-derivation helper (host-side cli.py and the
+# container clone_and_exec.py) must treat the newer GitLab "work_items"
+# issue URL form identically to "/-/issues/" (issue #72).
+@pytest.mark.parametrize(
+    "derive",
+    [
+        pytest.param(_derive_repo_url_from_task_target, id="cli"),
+        pytest.param(_derive_repo_url_container, id="container"),
+    ],
+)
+class TestDeriveRepoUrlFromWorkItems:
+    """work_items URLs derive a base repo URL just like /-/issues/ URLs."""
+
+    def test_work_items_url_is_derivable(self, derive):
+        # Before #72 the 'work_items' indicator was missing, so this returned
+        # None and the raw work_items URL was wrongly used as a clone URL.
+        url = "https://gitlab.example.com/group/project/-/work_items/70"
+        assert derive(url) is not None
+
+    def test_work_items_matches_issues(self, derive):
+        """A work_items URL derives the same repo URL as the issues URL."""
+        base = "https://gitlab.example.com/group/project"
+        assert derive(f"{base}/-/work_items/70") == derive(f"{base}/-/issues/70")
+
+    def test_nested_group_work_items(self, derive):
+        """The full project path before /-/ is preserved for nested groups."""
+        url = "https://gitlab.example.com/group/subgroup/project/-/work_items/12"
+        derived = derive(url)
+        assert derived is not None
+        assert "group/subgroup/project" in derived
+
+    def test_repo_named_work_items_is_not_derivable(self, derive):
+        """A bare repo whose name merely contains 'work_items' is not a target.
+
+        The 'work_items/' indicator carries a trailing slash so it only matches
+        a real .../-/work_items/<id> resource path, mirroring the 'issues/'
+        convention. A bare repo URL like .../group/work_items (or
+        .../work_items_tracker) must derive None, not be misread as a resource
+        link. Bare 'work_items' would have matched these via substring.
+        """
+        assert derive("https://gitlab.example.com/group/work_items") is None
+        assert derive("https://gitlab.example.com/group/work_items_tracker") is None
+
+
+# Both copies of sanitize_task_target (work_repo.utils and the container
+# clone_and_exec) must normalize work_items URLs to the issue-<id> form.
+@pytest.mark.parametrize(
+    "sanitize",
+    [
+        pytest.param(_utils_sanitize_task_target, id="work_repo.utils"),
+        pytest.param(_container_sanitize_task_target, id="container"),
+    ],
+)
+class TestSanitizeWorkItemsParity:
+    """work_items URLs normalize to issue-<id> in both sanitize copies."""
+
+    def test_work_items_url(self, sanitize):
+        url = "https://gitlab.example.com/group/project/-/work_items/70"
+        assert sanitize(url) == "issue-70"
+
+    def test_work_items_matches_issues(self, sanitize):
+        base = "https://gitlab.example.com/group/project"
+        assert sanitize(f"{base}/-/work_items/70") == sanitize(f"{base}/-/issues/70")
