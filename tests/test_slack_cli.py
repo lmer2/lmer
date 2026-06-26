@@ -349,7 +349,7 @@ class TestPostInputModes:
     metacharacters (backticks, $, quotes) are not mangled."""
 
     # A body that the shell would corrupt if it went through the command line.
-    SHELLY = "run `pdb_rir_status --reset` first, cost $5, say \"hi\""
+    SHELLY = "run `some-tool --reset` first, cost $5, say \"hi\""
 
     def test_post_message_file_posts_verbatim(self, tmp_path):
         _require_impl()

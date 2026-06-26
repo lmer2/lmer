@@ -155,7 +155,7 @@ class TestRedactSecrets:
     def test_redacts_glpat_prefix_without_env_var(self):
         """glpat- tokens are redacted by prefix even without a matching env var."""
         with patch.dict(os.environ, {}, clear=True):
-            token = "glpat-FbDkAZmWrHWWGn62MK8a5G86MQp1OjZnCA"
+            token = "glpat-abc123def456ghi789jkl0"
             text = f"Token: {token} was used"
             result = redact_secrets(text)
             assert token not in result
