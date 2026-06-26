@@ -232,7 +232,7 @@ class TestTargetProviderFlags:
             ("GitHub.com", True),
             ("api.github.com", True),
             ("acme.ghe.com", True),
-            ("git.20c.com", False),
+            ("gitlab.example.com", False),
             ("gitlab.com", False),
             ("", False),
             (None, False),
@@ -248,7 +248,7 @@ class TestTargetProviderFlags:
 
     def test_repo_host_gitlab(self, monkeypatch):
         self._clear_host_env(monkeypatch)
-        monkeypatch.setenv("LMER_REPO_HOST", "git.20c.com")
+        monkeypatch.setenv("LMER_REPO_HOST", "gitlab.example.com")
         assert _target_provider_flags() == (False, True)
 
     def test_falls_back_to_task_target_url(self, monkeypatch):
@@ -263,7 +263,7 @@ class TestTargetProviderFlags:
         self._clear_host_env(monkeypatch)
         monkeypatch.setenv(
             "LMER_REPO_URL",
-            "https://oauth2:tok@git.20c.com/agents/global.git",
+            "https://oauth2:tok@gitlab.example.com/group/project.git",
         )
         assert _target_provider_flags() == (False, True)
 

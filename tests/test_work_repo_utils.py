@@ -59,7 +59,7 @@ class TestSanitizeTaskTarget:
         "url,expected",
         [
             ("https://gitlab.com/group/project/-/work_items/70", "issue-70"),
-            ("https://git.20c.com/agents/global/-/work_items/72", "issue-72"),
+            ("https://gitlab.example.com/group/project/-/work_items/72", "issue-72"),
             ("https://gitlab.com/group/project/-/work_items/789?work_item_iid=789", "issue-789"),
         ],
     )
