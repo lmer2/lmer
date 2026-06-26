@@ -175,6 +175,37 @@ claude --append-system-prompt-file ~/Agents/global/AGENTS.md
 
 User-specific additions: create `~/.lmer/AGENTS.md` — the runner appends it after the workspace config automatically.
 
+## Releasing
+
+Releases to [PyPI](https://pypi.org/project/lmer/) are driven by git tags on `lmer2/lmer`. The full pipeline lives in `.github/workflows/release.yml`.
+
+To cut a release:
+
+1. Bump `version` in `pyproject.toml` (e.g. `0.1.0` → `0.1.1`).
+2. Update `CHANGELOG.yaml` with the release notes.
+3. Commit and merge to `main` through the normal PR flow.
+4. Tag the merge commit and push the tag:
+
+   ```bash
+   git switch main && git pull --ff-only
+   git tag v0.1.1
+   git push origin v0.1.1
+   ```
+
+5. Watch the `Release to PyPI` workflow in the Actions tab. It will:
+   - Verify the tag version matches `pyproject.toml`.
+   - Re-run `pre-commit` and `pytest`.
+   - Build the wheel and sdist with `uv build`.
+   - Publish to PyPI using Trusted Publishing (no stored secrets).
+   - Create a GitHub Release with the artifacts attached.
+
+### Prerequisites (one-time)
+
+- A PyPI **Trusted Publisher** binding must exist for project `lmer` pointing at workflow `release.yml` on `lmer2/lmer`, environment `pypi`. Configure at https://pypi.org/manage/project/lmer/settings/publishing/.
+- A GitHub **environment** named `pypi` must exist on `lmer2/lmer` (Settings → Environments).
+
+Both are set up by the maintainer; they don't need to be touched per release.
+
 ## Documentation
 
 See [docs/INDEX.md](docs/INDEX.md) for the full documentation index. Common starting points: [LMER-CLI.md](docs/LMER-CLI.md), [CONTAINER.md](docs/CONTAINER.md), [AUTHENTICATION.md](docs/AUTHENTICATION.md), [TASKDEFS.md](docs/TASKDEFS.md).
