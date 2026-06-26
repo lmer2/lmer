@@ -2,14 +2,18 @@
 
 Subcommands
 -----------
-history   Fetch the thread, print messages, advance cursor to latest ts.
-post      Post a message, print the returned ts.
-poll      Block-poll the thread until a new non-bot message arrives or
-          --timeout seconds elapse.
-watch     Long-poll continuously, emitting every new non-bot message as a
-          JSON line to stdout (and optionally appending it to a file).
-          Designed to be driven by a file/stream monitor instead of the
-          agent blocking in poll itself.
+history      Fetch the thread, print messages, advance cursor to latest ts.
+post         Post a message, print the returned ts.
+poll         Block-poll the thread until a new non-bot message arrives or
+             --timeout seconds elapse.
+watch        Long-poll continuously, emitting every new non-bot message as a
+             JSON line to stdout (and optionally appending it to a file).
+             Designed to be driven by a file/stream monitor instead of the
+             agent blocking in poll itself.
+end-session  End this lmer chat session: optionally post a goodbye, then ask
+             the in-container supervisor (LMER_SUPERVISOR_PID) to quit claude
+             cleanly so the host orchestrator frees the session slot
+             immediately instead of waiting for the idle timeout.
 
 Channel and thread_ts resolution order (first wins):
   1. --permalink <url>  (parsed via parse_slack_permalink)
@@ -33,6 +37,7 @@ import os
 import sys
 import json
 import time
+import signal
 import argparse
 from pathlib import Path
 from typing import List, Optional
@@ -54,6 +59,18 @@ POLL_TIMEOUT_EXIT_CODE: int = 2
 #: Upper bound (seconds) for watch's exponential backoff after transient
 #: Slack errors, so a sustained outage doesn't hammer the API every interval.
 WATCH_ERROR_BACKOFF_MAX: float = 60.0
+
+#: Environment variable through which the in-container ``lmer-supervisor``
+#: publishes its own PID. ``end-session`` sends this PID ``SIGUSR1`` to ask the
+#: supervisor for a graceful self-shutdown. Kept in sync with
+#: ``lmer_cli.supervisor.SUPERVISOR_PID_ENV``.
+SUPERVISOR_PID_ENV: str = "LMER_SUPERVISOR_PID"
+
+#: Exit code for ``end-session`` when it cannot find a supervisor to signal
+#: (no/invalid LMER_SUPERVISOR_PID, or the process is gone). Distinct from 1
+#: (generic Slack/runtime error) so callers can tell "nothing to shut down"
+#: apart from "the shutdown attempt errored".
+END_SESSION_NO_SUPERVISOR_EXIT_CODE: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +301,36 @@ def create_parser() -> argparse.ArgumentParser:
         help="Start cursor at this timestamp (overrides cursor file).",
     )
 
+    # --- end-session ---
+    end_p = sub.add_parser(
+        "end-session",
+        help=(
+            "End this chat session: optionally post a goodbye, then ask the "
+            "supervisor to quit cleanly so the orchestrator frees the slot."
+        ),
+    )
+    end_p.add_argument(
+        "text",
+        nargs="?",
+        help=(
+            "Optional goodbye message posted to the thread before shutting "
+            "down. Like 'post', prefer --message-file or --stdin for free-form "
+            "text (backticks, $, quotes); '-' is an alias for --stdin. Omit it "
+            "to leave without posting anything."
+        ),
+    )
+    end_src = end_p.add_mutually_exclusive_group()
+    end_src.add_argument(
+        "--message-file",
+        metavar="PATH",
+        help="Read the goodbye body verbatim from PATH (no shell expansion).",
+    )
+    end_src.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read the goodbye body verbatim from stdin (no shell expansion).",
+    )
+
     return parser
 
 
@@ -291,22 +338,49 @@ def create_parser() -> argparse.ArgumentParser:
 # Channel / thread_ts resolution
 # ---------------------------------------------------------------------------
 
-def _resolve_channel_thread(args: argparse.Namespace):
-    """Return (channel, thread_ts) from --permalink or env vars.
+def _try_resolve_channel_thread(args: argparse.Namespace):
+    """Resolve (channel, thread_ts) without exiting; (None, None) on failure.
 
-    Raises SystemExit(1) if neither source provides both values.
+    Same source order as :func:`_resolve_channel_thread` — a ``--permalink`` URL,
+    then the ``LMER_SLACK_CHANNEL`` / ``LMER_SLACK_THREAD_TS`` env vars — but it
+    never raises or prints: a malformed permalink or missing/empty env vars yield
+    ``(None, None)``. ``end-session`` uses this for its best-effort goodbye so a
+    thread it cannot address is skipped rather than aborting the shutdown;
+    callers that require a channel use :func:`_resolve_channel_thread`.
     """
     if args.permalink:
         try:
-            channel, thread_ts = parse_slack_permalink(args.permalink)
-            return channel, thread_ts
+            return parse_slack_permalink(args.permalink)
+        except ValueError:
+            return None, None
+
+    channel = os.environ.get("LMER_SLACK_CHANNEL", "").strip()
+    thread_ts = os.environ.get("LMER_SLACK_THREAD_TS", "").strip()
+    if not channel or not thread_ts:
+        return None, None
+
+    return channel, thread_ts
+
+
+def _resolve_channel_thread(args: argparse.Namespace):
+    """Return (channel, thread_ts) from --permalink or env vars.
+
+    Raises SystemExit(1) if neither source provides both values. A malformed
+    ``--permalink`` is reported with its specific parse error rather than the
+    generic env-var message — unlike :func:`_try_resolve_channel_thread`, which
+    silently collapses a bad permalink to ``(None, None)`` for best-effort use.
+    """
+    # Handle --permalink here (not via _try_resolve_channel_thread) so a bad URL
+    # surfaces the actual parse reason and we don't tell the user to "use
+    # --permalink" when they already did. The env-var path is shared.
+    if args.permalink:
+        try:
+            return parse_slack_permalink(args.permalink)
         except ValueError as exc:
             print(f"Error parsing permalink: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    channel = os.environ.get("LMER_SLACK_CHANNEL", "").strip()
-    thread_ts = os.environ.get("LMER_SLACK_THREAD_TS", "").strip()
-
+    channel, thread_ts = _try_resolve_channel_thread(args)
     if not channel or not thread_ts:
         print(
             "Error: channel and thread_ts are required.  "
@@ -394,6 +468,25 @@ def _resolve_post_text(args: argparse.Namespace) -> str:
         return sys.stdin.read().rstrip("\n")
 
     return args.text
+
+
+def _resolve_optional_post_text(args: argparse.Namespace) -> Optional[str]:
+    """Like :func:`_resolve_post_text` but the message is optional.
+
+    Returns ``None`` when no source (positional ``text``, ``--message-file``, or
+    ``--stdin``/``-``) is given; otherwise delegates to :func:`_resolve_post_text`
+    to read the body from the single source — so the verbatim ``--message-file`` /
+    stdin read and trailing-newline handling live in exactly one place. Raises
+    ``SystemExit(1)`` if more than one source is supplied or the ``--message-file``
+    cannot be read. Used by ``end-session``, where posting a goodbye is optional.
+    """
+    use_stdin = bool(getattr(args, "stdin", False)) or args.text == "-"
+    msg_file = getattr(args, "message_file", None)
+    positional = args.text is not None and args.text != "-"
+
+    if sum([positional, msg_file is not None, use_stdin]) == 0:
+        return None
+    return _resolve_post_text(args)
 
 
 def _cmd_post(args: argparse.Namespace, client: SlackClient) -> int:
@@ -565,6 +658,87 @@ def _cmd_watch(args: argparse.Namespace, client: SlackClient) -> int:
             return 0
 
 
+def _read_supervisor_pid() -> Optional[int]:
+    """Return the supervisor PID from the environment, or None if unusable.
+
+    The value comes from ``LMER_SUPERVISOR_PID``, exported by
+    ``lmer_cli.supervisor`` before it forks claude. Returns None when the var is
+    unset, empty, or not a positive integer.
+    """
+    raw = os.environ.get(SUPERVISOR_PID_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _cmd_end_session(args: argparse.Namespace, client: SlackClient) -> int:
+    """Handle the 'end-session' subcommand.
+
+    Optionally posts a goodbye message to the thread, then signals the
+    in-container supervisor (``LMER_SUPERVISOR_PID``) with ``SIGUSR1`` to quit
+    claude cleanly. The supervisor's clean exit makes the ``lmer chat`` process
+    exit 0, which the host orchestrator's reaper treats as a deliberate sign-off
+    and frees the session slot immediately — instead of waiting out the idle
+    timeout.
+
+    The goodbye post is best-effort: a Slack failure is reported to stderr but
+    does NOT abort the shutdown (freeing the slot is the point). Returns
+    ``END_SESSION_NO_SUPERVISOR_EXIT_CODE`` when there is no supervisor to signal
+    (e.g. the supervisor is disabled), so the caller can distinguish that from a
+    generic error.
+    """
+    goodbye = _resolve_optional_post_text(args)
+    if goodbye:
+        # The goodbye is best-effort and must never abort the shutdown (freeing
+        # the slot is the point). Resolve the thread non-fatally: an
+        # unresolvable channel is treated like a failed post — warn and skip,
+        # don't sys.exit — so the supervisor still gets signaled below.
+        channel, thread_ts = _try_resolve_channel_thread(args)
+        if channel and thread_ts:
+            try:
+                client.post_message(channel, thread_ts, goodbye)
+            except SlackError as exc:
+                print(
+                    f"Warning: could not post goodbye message: {exc}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                "Warning: could not resolve the Slack channel/thread; "
+                "skipping the goodbye message and continuing shutdown.",
+                file=sys.stderr,
+            )
+
+    pid = _read_supervisor_pid()
+    if pid is None:
+        print(
+            "Error: no supervisor to signal "
+            f"({SUPERVISOR_PID_ENV} is unset or invalid). This session cannot "
+            "shut itself down — it will end on the idle timeout instead.",
+            file=sys.stderr,
+        )
+        return END_SESSION_NO_SUPERVISOR_EXIT_CODE
+
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except ProcessLookupError:
+        print(
+            f"Error: supervisor process {pid} is gone; nothing to shut down.",
+            file=sys.stderr,
+        )
+        return END_SESSION_NO_SUPERVISOR_EXIT_CODE
+    except OSError as exc:
+        print(f"Error: could not signal supervisor {pid}: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Shutdown requested (signaled supervisor pid {pid}).")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -583,7 +757,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # Reject unknown subcommands (argparse already handles this, but belt-and-
     # suspenders for subparsers that might not exit).
-    known = {"history", "post", "poll", "watch"}
+    known = {"history", "post", "poll", "watch", "end-session"}
     if args.subcommand not in known:
         print(f"Unknown subcommand: {args.subcommand!r}", file=sys.stderr)
         return 1
@@ -603,6 +777,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _cmd_poll(args, client)
         elif args.subcommand == "watch":
             return _cmd_watch(args, client)
+        elif args.subcommand == "end-session":
+            return _cmd_end_session(args, client)
     except SlackError as exc:
         print(f"Slack error: {exc}", file=sys.stderr)
         return 1

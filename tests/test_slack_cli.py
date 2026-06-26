@@ -24,6 +24,7 @@ Cursor dir uses a tmp_path-based override, NOT the real /tmp/lmer-slack.
 import os
 import sys
 import json
+import signal
 import contextlib
 import importlib
 from io import StringIO
@@ -609,6 +610,35 @@ class TestEnvAndSince:
             args, kwargs = mock_client.get_replies.call_args
             assert CHANNEL in args or kwargs.get("channel") == CHANNEL
 
+    def test_malformed_permalink_reports_specific_parse_error(self, tmp_path):
+        """A bad --permalink must report the parse reason, not the generic msg.
+
+        Strict commands (history/post/poll/watch) resolve via
+        _resolve_channel_thread; a malformed permalink must surface the specific
+        "parsing permalink" error rather than the generic "channel and thread_ts
+        are required … or use --permalink" message — the latter loses the parse
+        reason and nonsensically tells the user to use --permalink when they did.
+        Regression guard for the _try_resolve_channel_thread refactor.
+        """
+        _require_impl()
+        bad_permalink = "https://ws.slack.com/archives/"  # no channel/ts segment
+        with patch("slack_chat.cli.SlackClient") as MockClient:
+            MockClient.return_value = _make_client_mock()
+            # --permalink is a global flag; it precedes the subcommand.
+            code, _out, err = _run_cli(
+                ["--permalink", bad_permalink, "history"],
+                env_overrides={
+                    "LMER_SLACK_CHANNEL": "",
+                    "LMER_SLACK_THREAD_TS": "",
+                },
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 1
+        # The specific parse error — not the generic env-var fallback (which also
+        # mentions "--permalink", so match the distinguishing "parsing" phrase).
+        assert "parsing permalink" in err.lower()
+        assert "channel and thread_ts are required" not in err.lower()
+
 
 # ---------------------------------------------------------------------------
 # 6. Bot-message filtering in poll
@@ -1145,3 +1175,244 @@ class TestWatch:
         # The transient error was surfaced on stderr, not swallowed silently.
         assert "transient" in err.lower()
         assert mock_client.get_replies.call_count >= 2
+
+
+# ---------------------------------------------------------------------------
+# end-session: post optional goodbye, then signal the supervisor
+# ---------------------------------------------------------------------------
+
+FAKE_SUPERVISOR_PID = 13579
+
+
+def test_supervisor_pid_env_constant_matches_supervisor_module():
+    """slack_chat.cli and lmer_cli.supervisor must agree on LMER_SUPERVISOR_PID.
+
+    The supervisor exports this env var (publishing its own PID) and
+    ``end-session`` reads it to know whom to SIGUSR1 — they form a cross-module
+    contract. Pin the two constants equal so a rename on one side can't silently
+    break self-shutdown in production while every other test stays green (the
+    supervisor tests reference the constant; the slack tests use the literal).
+    """
+    _require_impl()
+    from lmer_cli import supervisor
+
+    assert (
+        _slack_cli_mod.SUPERVISOR_PID_ENV == supervisor.SUPERVISOR_PID_ENV
+    ), "SUPERVISOR_PID_ENV diverged between slack_chat.cli and lmer_cli.supervisor"
+    assert _slack_cli_mod.SUPERVISOR_PID_ENV == "LMER_SUPERVISOR_PID"
+
+
+class TestEndSession:
+    """end-session optionally posts a goodbye, then SIGUSR1s the supervisor."""
+
+    def test_end_session_subcommand_is_recognised(self, tmp_path):
+        """'end-session' must route to its handler, not error as unknown."""
+        _require_impl()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as _mock_kill:
+            MockClient.return_value = _make_client_mock()
+            code, _out, _err = _run_cli(
+                ["end-session"],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 0
+
+    def test_signals_supervisor_with_sigusr1(self, tmp_path):
+        """With a valid PID it sends exactly SIGUSR1 to that PID and exits 0."""
+        _require_impl()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as mock_kill:
+            MockClient.return_value = _make_client_mock()
+            code, out, _err = _run_cli(
+                ["end-session"],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 0
+        mock_kill.assert_called_once_with(FAKE_SUPERVISOR_PID, signal.SIGUSR1)
+        assert str(FAKE_SUPERVISOR_PID) in out
+
+    def test_no_message_does_not_post(self, tmp_path):
+        """Without a goodbye body, nothing is posted to the thread."""
+        _require_impl()
+        client = _make_client_mock()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill"):
+            MockClient.return_value = client
+            code, _out, _err = _run_cli(
+                ["end-session"],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 0
+        client.post_message.assert_not_called()
+
+    def test_posts_goodbye_then_signals(self, tmp_path):
+        """A positional goodbye is posted before the supervisor is signaled."""
+        _require_impl()
+        client = _make_client_mock()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as mock_kill:
+            MockClient.return_value = client
+            code, _out, _err = _run_cli(
+                ["end-session", "thanks, signing off!"],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 0
+        client.post_message.assert_called_once_with(
+            CHANNEL, THREAD_TS, "thanks, signing off!"
+        )
+        mock_kill.assert_called_once_with(FAKE_SUPERVISOR_PID, signal.SIGUSR1)
+
+    def test_posts_goodbye_from_message_file_verbatim(self, tmp_path):
+        """--message-file body is posted verbatim (no shell expansion)."""
+        _require_impl()
+        body = "bye! ran `make test` — all green. $HOME stays literal."
+        msg_file = tmp_path / "bye.md"
+        msg_file.write_text(body + "\n")
+        client = _make_client_mock()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as mock_kill:
+            MockClient.return_value = client
+            code, _out, _err = _run_cli(
+                ["end-session", "--message-file", str(msg_file)],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 0
+        client.post_message.assert_called_once_with(CHANNEL, THREAD_TS, body)
+        mock_kill.assert_called_once()
+
+    def test_goodbye_failure_still_signals(self, tmp_path):
+        """A failed goodbye post must NOT block the shutdown — the slot frees."""
+        _require_impl()
+        from slack_chat.cli import SlackError as _SlackError
+
+        client = _make_client_mock()
+        client.post_message.side_effect = _SlackError("slack down")
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as mock_kill:
+            MockClient.return_value = client
+            code, _out, err = _run_cli(
+                ["end-session", "see ya"],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 0
+        mock_kill.assert_called_once_with(FAKE_SUPERVISOR_PID, signal.SIGUSR1)
+        assert "could not post" in err.lower()
+
+    def test_no_supervisor_pid_returns_distinct_code(self, tmp_path):
+        """No LMER_SUPERVISOR_PID -> a code distinct from 0 and the generic 1."""
+        _require_impl()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as mock_kill:
+            MockClient.return_value = _make_client_mock()
+            code, _out, err = _run_cli(
+                ["end-session"],
+                env_overrides={"LMER_SUPERVISOR_PID": ""},
+                tmp_cursor_dir=tmp_path,
+            )
+        expected = _slack_cli_mod.END_SESSION_NO_SUPERVISOR_EXIT_CODE
+        assert code == expected
+        assert expected not in (0, 1)
+        mock_kill.assert_not_called()
+        assert err.strip()
+
+    def test_invalid_supervisor_pid_returns_no_supervisor_code(self, tmp_path):
+        """A non-integer PID is treated as 'no supervisor', not a crash."""
+        _require_impl()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as mock_kill:
+            MockClient.return_value = _make_client_mock()
+            code, _out, _err = _run_cli(
+                ["end-session"],
+                env_overrides={"LMER_SUPERVISOR_PID": "not-a-pid"},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == _slack_cli_mod.END_SESSION_NO_SUPERVISOR_EXIT_CODE
+        mock_kill.assert_not_called()
+
+    def test_supervisor_already_gone_returns_no_supervisor_code(self, tmp_path):
+        """If the supervisor PID is gone, report the no-supervisor code."""
+        _require_impl()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill", side_effect=ProcessLookupError()):
+            MockClient.return_value = _make_client_mock()
+            code, _out, err = _run_cli(
+                ["end-session"],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == _slack_cli_mod.END_SESSION_NO_SUPERVISOR_EXIT_CODE
+        assert err.strip()
+
+    def test_generic_signal_error_returns_generic_code(self, tmp_path):
+        """A non-ProcessLookup OSError from os.kill maps to the generic code 1.
+
+        Distinct from the ProcessLookupError path (no-supervisor code): an EPERM
+        / other OSError means the signal attempt itself errored, which is a
+        generic failure, not "nothing to shut down".
+        """
+        _require_impl()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill", side_effect=OSError("operation not permitted")):
+            MockClient.return_value = _make_client_mock()
+            code, _out, err = _run_cli(
+                ["end-session"],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 1
+        assert code != _slack_cli_mod.END_SESSION_NO_SUPERVISOR_EXIT_CODE
+        assert err.strip()
+
+    def test_more_than_one_goodbye_source_errors(self, tmp_path):
+        """Two goodbye sources (positional + --message-file) is rejected (exit 1).
+
+        The positional text is not in the --message-file/--stdin mutually
+        exclusive group, so argparse allows the combination; the >1-source guard
+        in _resolve_post_text must reject it before any supervisor is signaled.
+        """
+        _require_impl()
+        msg_file = tmp_path / "bye.md"
+        msg_file.write_text("from file\n")
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as mock_kill:
+            MockClient.return_value = _make_client_mock()
+            code, _out, err = _run_cli(
+                ["end-session", "positional bye", "--message-file", str(msg_file)],
+                env_overrides={"LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID)},
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 1
+        mock_kill.assert_not_called()
+        assert err.strip()
+
+    def test_unresolvable_channel_skips_goodbye_but_still_signals(self, tmp_path):
+        """An unresolvable thread must not abort shutdown: skip goodbye, signal.
+
+        The goodbye is best-effort. If neither --permalink nor the channel/thread
+        env vars resolve, end-session warns and skips the post but STILL signals
+        the supervisor — the slot must be freed regardless.
+        """
+        _require_impl()
+        client = _make_client_mock()
+        with patch("slack_chat.cli.SlackClient") as MockClient, \
+             patch("os.kill") as mock_kill:
+            MockClient.return_value = client
+            code, _out, err = _run_cli(
+                ["end-session", "bye all"],
+                env_overrides={
+                    "LMER_SUPERVISOR_PID": str(FAKE_SUPERVISOR_PID),
+                    "LMER_SLACK_CHANNEL": "",
+                    "LMER_SLACK_THREAD_TS": "",
+                },
+                tmp_cursor_dir=tmp_path,
+            )
+        assert code == 0
+        client.post_message.assert_not_called()
+        mock_kill.assert_called_once_with(FAKE_SUPERVISOR_PID, signal.SIGUSR1)
+        assert "could not resolve" in err.lower()
