@@ -787,7 +787,7 @@ class TestSlackTokenRedaction:
 
 # ---------------------------------------------------------------------------
 # (e) Slack-only target without an inferrable repo -> repo-less session
-#     (MR 86 follow-up: "providing just a slack thread as a target should work")
+#     ("providing just a slack thread as a target should work")
 # ---------------------------------------------------------------------------
 
 

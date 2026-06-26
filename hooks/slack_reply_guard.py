@@ -11,7 +11,7 @@ ordinary assistant text lands in the terminal and reaches *no one*. The human
 sees silence on a question they asked, and there is nobody at the terminal to
 notice and nudge.
 
-Field reports on MR !86 showed this happening repeatedly, and recurring even
+Field reports showed this happening repeatedly, and recurring even
 after the model acknowledged the miss — model self-correction was not enough.
 This hook is the programmatic backstop.
 

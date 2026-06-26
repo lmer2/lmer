@@ -143,9 +143,9 @@ class TestRenderPromptFragment:
     def test_renders_lmer_env_var(self, tmp_path):
         template = tmp_path / "frag.md.jinja2"
         template.write_text("Hello {{ LMER_HUMAN_IDENTITY }}.\n")
-        result = self._run_renderer(template, env={"LMER_HUMAN_IDENTITY": "Vegu"})
+        result = self._run_renderer(template, env={"LMER_HUMAN_IDENTITY": "Alice"})
         assert result.returncode == 0, result.stderr
-        assert result.stdout == "Hello Vegu.\n"
+        assert result.stdout == "Hello Alice.\n"
 
     def test_non_lmer_vars_not_in_context(self, tmp_path):
         template = tmp_path / "frag.md.jinja2"

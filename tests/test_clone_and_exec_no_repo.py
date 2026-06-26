@@ -1,6 +1,6 @@
 """Tests for repo-less sessions (LMER_NO_REPO=1) in clone_and_exec.
 
-MR 86 follow-up: a Slack thread permalink as the sole `lmer chat` target
+A Slack thread permalink as the sole `lmer chat` target
 starts a session without a repository. The host CLI signals this to the
 container via LMER_NO_REPO=1; clone_and_exec must skip the workspace clone
 instead of failing on the missing LMER_REPO_URL.
