@@ -99,6 +99,26 @@ OUTPUT_BUFFER_LIMIT = 1024 * 1024  # 1 MiB rolling buffer of child output
 # receives a SIGWINCH and re-renders with the correct dimensions.
 DEFAULT_WINSIZE_RECHECK_DELAY = 0.5
 
+# Self-shutdown: the wrapped agent can ask the supervisor to quit the session
+# (e.g. an in-container ``lmer-slack end-session`` so a Slack chat session frees
+# its orchestrator slot instead of lingering until the idle timeout) by sending
+# the supervisor process ``SIGUSR1``. The supervisor injects claude's quit chord
+# — Ctrl-C twice, the same chord the host-side session reaper uses — and, if that
+# does not make claude exit within the grace period, escalates to SIGTERM then
+# SIGKILL on the child so the session always ends. The supervisor's own PID is
+# published to the wrapped process (and its subprocesses) via the
+# ``LMER_SUPERVISOR_PID`` environment variable so the in-container CLI knows whom
+# to signal.
+SUPERVISOR_PID_ENV = "LMER_SUPERVISOR_PID"
+# Gap between the two Ctrl-C presses of the quit chord (mirrors the host-side
+# reaper's terminate() pacing in slack_chat.sessions).
+DEFAULT_SHUTDOWN_CHORD_GAP = 0.5
+# How long to wait for claude to unwind after each shutdown step before
+# escalating (quit chord -> SIGTERM -> SIGKILL).
+DEFAULT_SHUTDOWN_ESCALATE_GRACE = 10.0
+# Poll cadence while waiting for the child to exit between escalation steps.
+SHUTDOWN_POLL_INTERVAL = 0.2
+
 
 class OutputBuffer:
     """Thread-safe rolling buffer keyed by cumulative byte offset.
@@ -738,6 +758,91 @@ def _inject_start_prompt(
             write(b"\r")
 
 
+def _inject_shutdown_chord(write: Callable[[bytes], int], gap: float) -> None:
+    """Send claude's quit chord — Ctrl-C (``\\x03``) twice with a short gap.
+
+    This is the same chord the host-side session reaper writes in
+    ``slack_chat.sessions.SessionManager.terminate`` to unwind the whole
+    claude/container stack gracefully. The gap gives claude time to render its
+    "Press Ctrl-C again to exit" state so the second press is interpreted as the
+    confirmation rather than coalesced into one. ``OSError`` is suppressed so a
+    PTY that has already closed (child exited under us) doesn't crash the daemon
+    thread this runs on. A non-positive ``gap`` never sleeps (so a negative value
+    can't raise ``ValueError`` out of ``time.sleep``).
+    """
+    with contextlib.suppress(OSError):
+        write(b"\x03")
+    if gap > 0:
+        time.sleep(gap)
+    with contextlib.suppress(OSError):
+        write(b"\x03")
+
+
+def _child_alive(pid: int) -> bool:
+    """Return whether ``pid`` is still a signalable process.
+
+    Uses ``kill(pid, 0)`` (the POSIX existence probe) rather than ``waitpid`` so
+    it never competes with ``run_supervisor``'s own reaping ``waitpid`` for the
+    child — two reapers would race and one would get ``ECHILD``. A still-unreaped
+    zombie reports alive here; that's fine, the escalation grace covers the brief
+    window before the main loop reaps it.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but not signalable by us — treat as alive (we shouldn't see
+        # this for our own child, but fail safe rather than escalate blindly).
+        return True
+    return True
+
+
+def _wait_child_exit(pid: int, timeout: float) -> bool:
+    """Poll until ``pid`` is gone or ``timeout`` seconds elapse.
+
+    Returns ``True`` if the child exited within the window, ``False`` otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    while _child_alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(SHUTDOWN_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
+    return True
+
+
+def _self_shutdown(
+    write: Callable[[bytes], int],
+    child_pid: int,
+    *,
+    chord_gap: float = DEFAULT_SHUTDOWN_CHORD_GAP,
+    escalate_grace: float = DEFAULT_SHUTDOWN_ESCALATE_GRACE,
+) -> None:
+    """Quit the wrapped child on request, escalating until it actually exits.
+
+    Ladder (mirrors the host-side reaper's ``terminate``):
+
+    1. Inject claude's quit chord (Ctrl-C twice). This lets claude — and the
+       docker/podman/claude stack under it — unwind normally and exit 0.
+    2. If the child is still alive after ``escalate_grace``, send it SIGTERM.
+    3. If it is *still* alive after another ``escalate_grace``, send SIGKILL.
+
+    Runs on a daemon thread spawned from the SIGUSR1 handler so the timed gaps
+    don't execute in async-signal context. Signals are sent to the child PID
+    only (not its group): the child is its own session/group leader (the fork
+    path calls ``setsid``), and ``run_supervisor`` reaps it via ``waitpid``.
+    """
+    _inject_shutdown_chord(write, chord_gap)
+    if _wait_child_exit(child_pid, escalate_grace):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.kill(child_pid, signal.SIGTERM)
+    if _wait_child_exit(child_pid, escalate_grace):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.kill(child_pid, signal.SIGKILL)
+
+
 def run_supervisor(
     cmd: list[str],
     options: dict,
@@ -774,6 +879,13 @@ def run_supervisor(
         fastapi_port = _resolve_fastapi_port(options, os.environ)
         os.environ["LMER_FASTAPI_PORT"] = str(fastapi_port)
         os.environ["LMER_FASTAPI_TOKEN"] = fastapi_token
+
+    # Publish the supervisor's own PID to the wrapped process (and everything it
+    # spawns) BEFORE fork, so the child inherits it through its initial
+    # environment. An in-container CLI (``lmer-slack end-session``) sends this PID
+    # SIGUSR1 to ask for a graceful self-shutdown. Set after fork it would not
+    # reach the already-frozen child env.
+    os.environ[SUPERVISOR_PID_ENV] = str(os.getpid())
 
     master_fd, slave_fd = os.openpty()
 
@@ -861,9 +973,32 @@ def run_supervisor(
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, sig)
 
+    # SIGUSR1 = "agent asked to leave": quit claude gracefully and report a clean
+    # exit. The actual chord injection + escalation runs on a daemon thread so
+    # the timed gaps never execute in async-signal context; the handler just
+    # flips the flag (idempotent — repeated signals don't spawn racing threads)
+    # and kicks the thread off.
+    shutdown_requested = threading.Event()
+
+    def request_shutdown(*_args) -> None:
+        if shutdown_requested.is_set():
+            return
+        shutdown_requested.set()
+        threading.Thread(
+            target=_self_shutdown,
+            args=(write_to_child, pid),
+            name="lmer-supervisor-self-shutdown",
+            daemon=True,
+        ).start()
+
     previous_winch = signal.signal(signal.SIGWINCH, forward_winsize) if hasattr(signal, "SIGWINCH") else None
     previous_int = signal.signal(signal.SIGINT, forward_signal)
     previous_term = signal.signal(signal.SIGTERM, forward_signal)
+    previous_usr1 = (
+        signal.signal(signal.SIGUSR1, request_shutdown)
+        if hasattr(signal, "SIGUSR1")
+        else None
+    )
 
     stdin_open = True
     try:
@@ -916,6 +1051,8 @@ def run_supervisor(
             signal.signal(signal.SIGWINCH, previous_winch)
         signal.signal(signal.SIGINT, previous_int)
         signal.signal(signal.SIGTERM, previous_term)
+        if previous_usr1 is not None and hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, previous_usr1)
         if old_attrs is not None:
             with contextlib.suppress(termios.error):
                 termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
@@ -925,6 +1062,12 @@ def run_supervisor(
             server_thread.join(timeout=2.0)
 
     _, status = os.waitpid(pid, 0)
+    # A requested self-shutdown is a deliberate, clean sign-off: report exit 0 so
+    # the orchestrator (e.g. the Slack session reaper) frees the slot quietly and
+    # does NOT post a crash notice — even if the quit chord had to be escalated to
+    # a signal, which would otherwise surface as a non-zero (128+sig) status.
+    if shutdown_requested.is_set():
+        return 0
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status)
     if os.WIFSIGNALED(status):

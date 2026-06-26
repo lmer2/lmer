@@ -670,6 +670,146 @@ class TestInjectStartPrompt:
         supervisor._inject_start_prompt(boom, "anything", nudge_count=2)
 
 
+class TestInjectShutdownChord:
+    """The self-shutdown quit chord: Ctrl-C (\\x03) twice with a gap."""
+
+    def test_sends_ctrl_c_twice(self):
+        sink: list[bytes] = []
+        supervisor._inject_shutdown_chord(
+            lambda data: (sink.append(data), len(data))[1], gap=0
+        )
+        assert sink == [b"\x03", b"\x03"]
+
+    def test_sleeps_the_gap_between_presses(self, monkeypatch):
+        slept: list[float] = []
+        monkeypatch.setattr(supervisor.time, "sleep", lambda s: slept.append(s))
+        sink: list[bytes] = []
+        supervisor._inject_shutdown_chord(
+            lambda data: (sink.append(data), len(data))[1], gap=0.5
+        )
+        assert slept == [0.5]
+        assert sink == [b"\x03", b"\x03"]
+
+    def test_non_positive_gap_never_sleeps(self, monkeypatch):
+        # A negative/zero gap must not call time.sleep (negative would raise).
+        slept: list[float] = []
+        monkeypatch.setattr(supervisor.time, "sleep", lambda s: slept.append(s))
+        sink: list[bytes] = []
+        supervisor._inject_shutdown_chord(
+            lambda data: (sink.append(data), len(data))[1], gap=-1.0
+        )
+        assert slept == []
+        assert sink == [b"\x03", b"\x03"]
+
+    def test_oserror_from_write_is_suppressed(self):
+        def boom(_data: bytes) -> int:
+            raise OSError("PTY closed")
+
+        # A closed PTY mid-chord must not propagate out of the daemon thread.
+        supervisor._inject_shutdown_chord(boom, gap=0)
+
+
+class TestChildAlive:
+    """_child_alive probes via kill(pid, 0) and never reaps."""
+
+    def test_true_for_self(self):
+        assert supervisor._child_alive(os.getpid()) is True
+
+    def test_false_when_process_lookup_error(self, monkeypatch):
+        def _no_such(_pid, _sig):
+            raise ProcessLookupError
+
+        monkeypatch.setattr(supervisor.os, "kill", _no_such)
+        assert supervisor._child_alive(424242) is False
+
+    def test_true_when_permission_error(self, monkeypatch):
+        def _eperm(_pid, _sig):
+            raise PermissionError
+
+        monkeypatch.setattr(supervisor.os, "kill", _eperm)
+        # Exists but unsignalable — fail safe to "alive" rather than escalate.
+        assert supervisor._child_alive(1) is True
+
+
+class TestWaitChildExit:
+    def test_returns_true_when_already_gone(self, monkeypatch):
+        monkeypatch.setattr(supervisor, "_child_alive", lambda _pid: False)
+        assert supervisor._wait_child_exit(123, timeout=5.0) is True
+
+    def test_returns_false_on_timeout(self, monkeypatch):
+        clock = {"now": 0.0}
+        monkeypatch.setattr(supervisor.time, "monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            supervisor.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s)
+        )
+        monkeypatch.setattr(supervisor, "_child_alive", lambda _pid: True)
+        assert supervisor._wait_child_exit(123, timeout=1.0) is False
+
+    def test_returns_true_when_child_exits_partway(self, monkeypatch):
+        clock = {"now": 0.0}
+        calls = {"n": 0}
+        monkeypatch.setattr(supervisor.time, "monotonic", lambda: clock["now"])
+        monkeypatch.setattr(
+            supervisor.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s)
+        )
+
+        def _alive(_pid):
+            calls["n"] += 1
+            return calls["n"] < 3  # alive for two probes, then gone
+
+        monkeypatch.setattr(supervisor, "_child_alive", _alive)
+        assert supervisor._wait_child_exit(123, timeout=10.0) is True
+
+
+class TestSelfShutdown:
+    """_self_shutdown escalates quit-chord -> SIGTERM -> SIGKILL until exit."""
+
+    def test_chord_only_when_child_exits_promptly(self, monkeypatch):
+        chords: list[bool] = []
+        monkeypatch.setattr(
+            supervisor, "_inject_shutdown_chord", lambda w, g: chords.append(True)
+        )
+        monkeypatch.setattr(supervisor, "_wait_child_exit", lambda pid, t: True)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            supervisor.os, "kill", lambda pid, sig: killed.append((pid, sig))
+        )
+
+        supervisor._self_shutdown(lambda d: len(d), 4321)
+
+        assert chords == [True]
+        assert killed == []  # chord worked; no escalation
+
+    def test_escalates_to_sigterm_then_sigkill(self, monkeypatch):
+        monkeypatch.setattr(supervisor, "_inject_shutdown_chord", lambda w, g: None)
+        # Child never exits on its own -> both waits time out.
+        monkeypatch.setattr(supervisor, "_wait_child_exit", lambda pid, t: False)
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            supervisor.os, "kill", lambda pid, sig: killed.append((pid, sig))
+        )
+
+        supervisor._self_shutdown(lambda d: len(d), 4321)
+
+        assert killed == [
+            (4321, supervisor.signal.SIGTERM),
+            (4321, supervisor.signal.SIGKILL),
+        ]
+
+    def test_escalates_to_sigterm_only_when_that_works(self, monkeypatch):
+        monkeypatch.setattr(supervisor, "_inject_shutdown_chord", lambda w, g: None)
+        waits = iter([False, True])  # chord fails, child dies after SIGTERM
+        monkeypatch.setattr(supervisor, "_wait_child_exit", lambda pid, t: next(waits))
+        killed: list[tuple[int, int]] = []
+        monkeypatch.setattr(
+            supervisor.os, "kill", lambda pid, sig: killed.append((pid, sig))
+        )
+
+        supervisor._self_shutdown(lambda d: len(d), 4321)
+
+        assert killed == [(4321, supervisor.signal.SIGTERM)]
+
+
 class TestStartAutoStartThread:
     """Cover the auto-start daemon's sequencing, especially the configurable
     gap before the follow-up prompt (issue #65)."""
@@ -1096,3 +1236,78 @@ class TestSupervisorIntegration:
     def test_exit_code_propagated(self):
         rc, _ = self._run(["sh", "-c", "exit 42"], b"")
         assert rc == 42
+
+    def test_supervisor_pid_exported_to_child(self):
+        # The supervisor publishes its own PID via LMER_SUPERVISOR_PID before
+        # fork, so the wrapped process (and its subprocesses) inherit it. Here
+        # the supervisor runs in this very process, so the child should see
+        # this process's PID.
+        os.environ.pop("LMER_SUPERVISOR_PID", None)
+        try:
+            rc, output = self._run(
+                ["sh", "-c", "echo PID=$LMER_SUPERVISOR_PID"], b""
+            )
+            assert rc == 0
+            assert f"PID={os.getpid()}".encode() in output
+        finally:
+            os.environ.pop("LMER_SUPERVISOR_PID", None)
+
+    def test_sigusr1_triggers_clean_shutdown(self):
+        # SIGUSR1 to the supervisor must quit the wrapped child and report a
+        # clean exit (0). The supervisor runs in this process, so we signal
+        # ourselves from a background thread once it's underway. We wrap `cat`
+        # (stays alive on stdin) with manual_start=True, leaving the PTY in
+        # cooked mode: the injected ^C (\x03) then reaches cat's line discipline
+        # as VINTR -> SIGINT, killing it. (In production claude runs in raw mode
+        # and handles the ^C chord itself; either way the supervisor reports 0.)
+        import signal as _signal
+
+        stdin_r, stdin_w = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+        opts = {
+            "fastapi": False,
+            "manual_start": True,
+            "port_range": (8700, 8799),
+            "host": "127.0.0.1",
+            "token": "",
+            "auto_start_delay": 0,
+            "auto_start_nudge_delay": 0,
+            "auto_start_ready_marker": b"",
+            "auto_start_ready_timeout": 0,
+            "auto_start_settle_delay": 0,
+            "winsize_recheck_delay": 0,
+            "start_prompt": "",
+            "start_prompt_delay": 0,
+        }
+
+        main_pid = os.getpid()
+
+        def _signal_after_startup():
+            time.sleep(0.3)
+            os.kill(main_pid, _signal.SIGUSR1)
+
+        signaller = threading.Thread(target=_signal_after_startup, daemon=True)
+        signaller.start()
+
+        try:
+            rc = supervisor.run_supervisor(
+                ["cat"], opts, stdin_fd=stdin_r, stdout_fd=stdout_w
+            )
+        finally:
+            os.close(stdin_w)
+            os.close(stdout_w)
+            signaller.join(timeout=2.0)
+            # Drain and close so no fd/pipe leaks regardless of outcome.
+            while True:
+                try:
+                    if not os.read(stdout_r, 4096):
+                        break
+                except OSError:
+                    break
+            os.close(stdout_r)
+            os.close(stdin_r)
+            os.environ.pop("LMER_SUPERVISOR_PID", None)
+
+        # Clean exit reported even though the child was killed by SIGINT —
+        # a requested self-shutdown always looks deliberate to the orchestrator.
+        assert rc == 0

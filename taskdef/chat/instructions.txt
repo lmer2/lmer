@@ -157,6 +157,31 @@ waiting until the human explicitly signals they are done (they say so or ask
 you to stop). Do not rely on any out-of-band channel for human input while
 `LMER_SLACK_CHANNEL` is set.
 
+### Ending the session
+
+This session occupies one of a limited number of concurrent session slots on
+the host. When the human **explicitly signals the conversation is over** — they
+say goodbye, tell you to stop, or otherwise wrap up — don't just go silent: end
+the session so the slot is freed for someone else right away. A session left
+sitting idle holds its slot until a long inactivity timeout expires, which can
+block others from starting one.
+
+To end the session, post a short goodbye and then shut down:
+
+```bash
+lmer-slack end-session --message-file /tmp/bye.md
+```
+
+`end-session` posts the goodbye (same `--message-file` / `--stdin` / positional
+rules as `post`; omit it to leave without a message) and then asks the host to
+shut this session down cleanly. Stop the `/monitor` watcher first if one is
+running. Treat `end-session` as the last thing you do — once you run it the
+session is on its way out, so don't expect to handle further messages.
+
+Only end the session on a clear human signal. A quiet thread, a finished task,
+or a `poll` timeout is **not** a reason to end it — the human may still have
+follow-ups. When in doubt, keep waiting.
+
 ### Acknowledge before working
 
 When a human message kicks off any non-trivial work (anything beyond an
