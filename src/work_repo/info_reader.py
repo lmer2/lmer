@@ -1,10 +1,8 @@
 """Read and concatenate project info files."""
 
-import os
-from pathlib import Path
 from typing import List
 
-from .utils import sanitize_task_target
+from .utils import project_info_dir, task_info_dir, task_target_dir
 
 
 def read_project_info() -> str:
@@ -22,23 +20,17 @@ def read_project_info() -> str:
     Returns:
         Concatenated content of all .md files, plus log and report file information
     """
-    work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
-    repo_host = os.environ.get("LMER_REPO_HOST")
-    repo_project = os.environ.get("LMER_REPO_PROJECT")
-    task_type = os.environ.get("LMER_TASK", "default")
+    proj_info_dir = project_info_dir()
+    tsk_info_dir = task_info_dir()
 
-    if not repo_host or not repo_project:
+    if proj_info_dir is None or tsk_info_dir is None:
         return "Error: LMER_REPO_HOST and LMER_REPO_PROJECT must be set"
-
-    # Build paths
-    project_info_dir = work_repo_path / repo_host / repo_project / "info"
-    task_info_dir = work_repo_path / repo_host / repo_project / task_type / "info"
 
     content_parts: List[str] = []
 
     # Read project info files
-    if project_info_dir.exists() and project_info_dir.is_dir():
-        md_files = sorted(project_info_dir.glob("*.md"))
+    if proj_info_dir.exists() and proj_info_dir.is_dir():
+        md_files = sorted(proj_info_dir.glob("*.md"))
         for md_file in md_files:
             try:
                 with open(md_file, "r", encoding="utf-8") as f:
@@ -49,8 +41,8 @@ def read_project_info() -> str:
                 content_parts.append(f"Error reading {md_file}: {e}\n")
 
     # Read task-specific info files
-    if task_info_dir.exists() and task_info_dir.is_dir():
-        md_files = sorted(task_info_dir.glob("*.md"))
+    if tsk_info_dir.exists() and tsk_info_dir.is_dir():
+        md_files = sorted(tsk_info_dir.glob("*.md"))
         for md_file in md_files:
             try:
                 with open(md_file, "r", encoding="utf-8") as f:
@@ -61,9 +53,7 @@ def read_project_info() -> str:
                 content_parts.append(f"Error reading {md_file}: {e}\n")
 
     # Check for log.yaml and report files in task target directory
-    task_target = os.environ.get("LMER_TASK_TARGET", "default")
-    safe_task_target = sanitize_task_target(task_target) if task_target else "default"
-    task_target_dir = work_repo_path / repo_host / repo_project / task_type / safe_task_target
+    tgt_dir = task_target_dir()
 
     info_sections: List[str] = []
 
@@ -74,15 +64,15 @@ def read_project_info() -> str:
         info_sections.append("No info files found in project or task-specific info directories.")
 
     # Check for log.yaml
-    log_file = task_target_dir / "log.yaml"
+    log_file = tgt_dir / "log.yaml"
     if log_file.exists():
         info_sections.append(f"\n---\n\n## Task Related Work Log File\n\nLog file exists: {log_file.resolve()}")
 
     # Check for report files (.md files in task target directory)
-    if task_target_dir.exists() and task_target_dir.is_dir():
+    if tgt_dir.exists() and tgt_dir.is_dir():
         # Get all .md files, excluding hidden files
         report_files = [
-            f for f in task_target_dir.glob("*.md")
+            f for f in tgt_dir.glob("*.md")
             if f.is_file() and not f.name.startswith(".")
         ]
 

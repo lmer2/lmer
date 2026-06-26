@@ -10,8 +10,46 @@ import sys
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 import json
 from jinja2 import Environment, FileSystemLoader, Template
+
+
+def _is_github_host(host):
+    """Return True for GitHub / GitHub Enterprise hosts.
+
+    Local mirror of ``lmer_cli.tokens._is_github_host`` so this hook stays
+    self-contained (it runs under the global venv and does not import the
+    lmer_cli package). Keep the two in sync — a source-level guard test in
+    ``tests/test_start_hook.py`` asserts the bodies match.
+    """
+    if not host:
+        return False
+    h = host.lower()
+    return h == "github.com" or h.endswith(".github.com") or h.endswith(".ghe.com")
+
+
+def _target_provider_flags():
+    """Compute ``(is_github, is_gitlab)`` booleans for the main task target.
+
+    The host is taken from ``LMER_REPO_HOST`` when set, otherwise parsed from
+    ``LMER_TASK_TARGET`` / ``LMER_REPO_URL``. github.com and GitHub Enterprise
+    hosts are GitHub; any other non-empty host is treated as GitLab — the same
+    binary github-or-gitlab model used by ``lmer_cli.tokens``. When no host can
+    be determined both flags are ``False``.
+    """
+    host = os.environ.get("LMER_REPO_HOST", "").strip()
+    if not host:
+        for var in ("LMER_TASK_TARGET", "LMER_REPO_URL"):
+            value = os.environ.get(var, "")
+            if "://" in value:
+                parsed = urlparse(value)
+                if parsed.hostname:
+                    host = parsed.hostname
+                    break
+    is_github = _is_github_host(host)
+    is_gitlab = bool(host) and not is_github
+    return is_github, is_gitlab
 
 
 def work_repo_taskdef_dirs():
@@ -175,6 +213,9 @@ def render_taskdef_template(template_file, extra_context=None):
     context = {k: v for k, v in os.environ.items() if k.startswith('LMER_')}
     context['taskdef_name'] = template_file.parent.name
     context['taskdef_file'] = str(template_file)
+    is_github, is_gitlab = _target_provider_flags()
+    context['is_github'] = is_github
+    context['is_gitlab'] = is_gitlab
     if extra_context:
         context.update(extra_context)
 

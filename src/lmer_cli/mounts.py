@@ -8,12 +8,17 @@ SELinux labeling requirements for Podman.
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 from lmer_cli.runtime import _is_selinux_enforcing
 
 EXTERNAL_TASKDEF_MOUNT_BASE = "/Agents/taskdefs"
+
+# Path inside the container where uv looks for its cache by default
+# (HOME=/home/developer + XDG default of $HOME/.cache/uv).
+CONTAINER_UV_CACHE_DIR = "/home/developer/.cache/uv"
 
 
 def selinux_opt(runtime: str) -> str:
@@ -304,6 +309,52 @@ def build_checkout_mount(runtime: str, checkout_path: Path) -> List[str]:
     """
     se = selinux_opt(runtime)
     return ["-v", f"{checkout_path}:/workspace:rw{se}"]
+
+
+def resolve_host_uv_cache_dir() -> Path:
+    """
+    Resolve the host's uv cache directory using uv's own resolution rules.
+
+    Honors `$UV_CACHE_DIR` first, then `$XDG_CACHE_HOME/uv`, falling back to the
+    platform-appropriate default (`~/.cache/uv` on Linux, `~/Library/Caches/uv`
+    on macOS). The returned path may not exist on disk — callers should check.
+
+    Returns:
+        Path to the host uv cache directory (existence not guaranteed)
+    """
+    explicit = os.environ.get("UV_CACHE_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return Path(xdg).expanduser() / "uv"
+
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Caches" / "uv"
+    return home / ".cache" / "uv"
+
+
+def build_host_uv_cache_mount(runtime: str, host_cache_dir: Path) -> List[str]:
+    """
+    Build read-write mount for the host's uv cache directory.
+
+    Mounts the host's uv cache at the container's default uv cache location so
+    `uv` operations inside the container (e.g. installing project dependencies
+    in the target repo) reuse already-downloaded packages instead of fetching
+    them from PyPI. Mounted read-write so newly installed packages populate the
+    shared cache and benefit subsequent sessions on either side.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        host_cache_dir: Path to the uv cache directory on the host
+
+    Returns:
+        List of Docker/Podman arguments for the uv cache mount
+    """
+    se = selinux_opt(runtime)
+    return ["-v", f"{host_cache_dir}:{CONTAINER_UV_CACHE_DIR}:rw{se}"]
 
 
 def build_service_mode_mounts(runtime: str, checkout_path: Path) -> List[str]:

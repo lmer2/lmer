@@ -12,7 +12,8 @@ import yaml
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import commit_work_changes
-from .utils import sanitize_task_target, redact_secrets
+from .memory import persist_memory, restore_memory
+from .utils import redact_secrets, task_target_dir
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -105,6 +106,28 @@ Examples:
         "description",
         nargs="?",
         help="Description of current goal (optional - if omitted, displays current goal)",
+    )
+
+    # memory command
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help="Restore or persist per-project agent memory (LMER_PERSIST_AGENT_MEMORY)",
+    )
+    memory_subparsers = memory_parser.add_subparsers(
+        dest="memory_action", help="Memory action to perform"
+    )
+    memory_subparsers.add_parser(
+        "restore",
+        help="Restore saved agent memory from the work repo into Claude's memory dir",
+    )
+    memory_persist_parser = memory_subparsers.add_parser(
+        "persist",
+        help="Copy Claude's agent memory into the work repo, then commit and push",
+    )
+    memory_persist_parser.add_argument(
+        "--message",
+        "-m",
+        help="Commit message (defaults to auto-generated)",
     )
 
     return parser
@@ -243,17 +266,13 @@ def cmd_report(file_path: str) -> int:
         Exit code
     """
     try:
-        # Read environment variables
-        work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
-        repo_host = os.environ.get("LMER_REPO_HOST")
-        repo_project = os.environ.get("LMER_REPO_PROJECT")
-        task_type = os.environ.get("LMER_TASK", "default")
-        task_target = os.environ.get("LMER_TASK_TARGET", "default")
-
-        if not repo_host or not repo_project:
+        # Build target directory path: {host}/{project}/{task_type}/{task_target}
+        target_dir = task_target_dir()
+        if target_dir is None:
             print("❌ LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
             return 1
 
+        work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
         if not work_repo_path.exists():
             print(f"❌ Work repository not found at {work_repo_path}", file=sys.stderr)
             return 1
@@ -264,11 +283,6 @@ def cmd_report(file_path: str) -> int:
             print(f"❌ Report file not found: {file_path}", file=sys.stderr)
             return 1
 
-        # Sanitize task_target to match directory structure
-        safe_task_target = sanitize_task_target(task_target) if task_target else "default"
-
-        # Build target directory path: {host}/{project}/{task_type}/{task_target}
-        target_dir = work_repo_path / repo_host / repo_project / task_type / safe_task_target
         target_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate timestamp filename: YYMMDD-HH-MM-SS.md
@@ -327,6 +341,27 @@ def cmd_goal(description: str | None) -> int:
         return 1
 
 
+def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser) -> int:
+    """
+    Execute memory command.
+
+    Args:
+        action: ``"restore"`` or ``"persist"`` (None prints help)
+        message: Optional commit message (persist only)
+        parser: The top-level parser, used to print help when no action is given
+
+    Returns:
+        Exit code
+    """
+    if action == "restore":
+        return restore_memory()
+    elif action == "persist":
+        return persist_memory(message)
+    else:
+        parser.print_help()
+        return 1
+
+
 def main() -> int:
     """Main entry point for work CLI."""
     parser = create_parser()
@@ -346,6 +381,8 @@ def main() -> int:
         return cmd_report(args.file)
     elif args.command == "goal":
         return cmd_goal(args.description)
+    elif args.command == "memory":
+        return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
     else:
         print(f"❌ Unknown command: {args.command}", file=sys.stderr)
         return 1

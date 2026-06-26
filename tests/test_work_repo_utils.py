@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
 """Tests for work_repo.utils module"""
 
+from pathlib import Path
+
 import pytest
 
-from work_repo.utils import sanitize_task_target
+from work_repo.utils import (
+    project_info_dir,
+    project_memory_dir,
+    sanitize_task_target,
+    task_info_dir,
+    task_target_dir,
+)
+
+# Env vars the info-dir helpers read; cleared before each helper test so the
+# host environment can't leak real LMER_* values into assertions.
+_INFO_DIR_ENV_VARS = (
+    "LMER_WORK_REPO_PATH",
+    "LMER_REPO_HOST",
+    "LMER_REPO_PROJECT",
+    "LMER_TASK",
+    "LMER_TASK_TARGET",
+)
 
 
 class TestSanitizeTaskTarget:
@@ -35,6 +53,18 @@ class TestSanitizeTaskTarget:
     )
     def test_gitlab_issue_urls(self, url, expected):
         """Test GitLab issue URLs"""
+        assert sanitize_task_target(url) == expected
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("https://gitlab.com/group/project/-/work_items/70", "issue-70"),
+            ("https://gitlab.example.com/group/project/-/work_items/72", "issue-72"),
+            ("https://gitlab.com/group/project/-/work_items/789?work_item_iid=789", "issue-789"),
+        ],
+    )
+    def test_gitlab_work_item_urls(self, url, expected):
+        """GitLab work_items URLs (newer issue form) normalize like issues (#72)"""
         assert sanitize_task_target(url) == expected
 
     @pytest.mark.parametrize(
@@ -124,3 +154,103 @@ class TestSanitizeTaskTarget:
     def test_url_fallback(self, url, expected):
         """Test URL fallback behavior for unrecognized URLs"""
         assert sanitize_task_target(url) == expected
+
+
+@pytest.fixture
+def clean_info_env(monkeypatch):
+    """Clear all LMER_* env vars the info-dir helpers consult."""
+    for name in _INFO_DIR_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+class TestInfoDirHelpers:
+    """Test project_info_dir / task_info_dir / task_target_dir helpers."""
+
+    @pytest.mark.parametrize(
+        "helper", [project_info_dir, project_memory_dir, task_info_dir, task_target_dir]
+    )
+    def test_returns_none_when_host_and_project_unset(self, clean_info_env, helper):
+        """All helpers return None when host/project env vars are absent."""
+        assert helper() is None
+
+    @pytest.mark.parametrize(
+        "helper", [project_info_dir, task_info_dir, task_target_dir]
+    )
+    def test_returns_none_when_only_host_set(self, clean_info_env, helper):
+        """Host without project is insufficient -> None."""
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        assert helper() is None
+
+    @pytest.mark.parametrize(
+        "helper", [project_info_dir, task_info_dir, task_target_dir]
+    )
+    def test_returns_none_when_only_project_set(self, clean_info_env, helper):
+        """Project without host is insufficient -> None."""
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        assert helper() is None
+
+    def test_project_info_dir_path(self, clean_info_env):
+        """project_info_dir assembles {work}/{host}/{project}/info."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        assert project_info_dir() == Path("/wr/git.example.com/group/proj/info")
+
+    def test_project_memory_dir_path(self, clean_info_env):
+        """project_memory_dir assembles {work}/{host}/{project}/memory."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        assert project_memory_dir() == Path("/wr/git.example.com/group/proj/memory")
+
+    def test_task_info_dir_path(self, clean_info_env):
+        """task_info_dir assembles {work}/{host}/{project}/{task}/info."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        clean_info_env.setenv("LMER_TASK", "develop")
+        assert task_info_dir() == Path("/wr/git.example.com/group/proj/develop/info")
+
+    def test_task_target_dir_path(self, clean_info_env):
+        """task_target_dir assembles {work}/{host}/{project}/{task}/{target}."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        clean_info_env.setenv("LMER_TASK", "develop")
+        clean_info_env.setenv("LMER_TASK_TARGET", "my-branch")
+        assert task_target_dir() == Path(
+            "/wr/git.example.com/group/proj/develop/my-branch"
+        )
+
+    def test_work_repo_path_defaults_to_work(self, clean_info_env):
+        """LMER_WORK_REPO_PATH defaults to /work when unset."""
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        assert project_info_dir() == Path("/work/git.example.com/group/proj/info")
+
+    def test_task_and_target_default_to_default(self, clean_info_env):
+        """LMER_TASK and LMER_TASK_TARGET default to 'default' when unset."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        assert task_info_dir() == Path(
+            "/wr/git.example.com/group/proj/default/info"
+        )
+        assert task_target_dir() == Path(
+            "/wr/git.example.com/group/proj/default/default"
+        )
+
+    def test_task_target_dir_sanitizes_target(self, clean_info_env):
+        """task_target_dir passes LMER_TASK_TARGET through sanitize_task_target."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        clean_info_env.setenv("LMER_TASK", "review")
+        clean_info_env.setenv(
+            "LMER_TASK_TARGET",
+            "https://git.example.com/group/proj/-/merge_requests/756",
+        )
+        assert task_target_dir() == Path(
+            "/wr/git.example.com/group/proj/review/mr-756"
+        )

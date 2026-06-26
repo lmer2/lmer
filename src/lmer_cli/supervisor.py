@@ -15,7 +15,19 @@ the user's terminal and claude. The supervisor:
   shortly after startup so an lmer task begins automatically. Disabled by
   ``--manual-start`` (or ``LMER_MANUAL_START=1``). CR (``\\r``) is what an
   Enter keypress produces in raw-mode TUIs like Claude Code; ``\\n`` would
-  insert a literal newline into the input field without submitting.
+  insert a literal newline into the input field without submitting. To make
+  that injection robust the PTY's line-discipline echo and CR→LF translation
+  are pre-cleared before fork (see ``_preconfigure_pty_for_injection``) and
+  injection is deferred until Claude's input prompt has actually rendered
+  (see ``_wait_for_ready_marker``) so a startup-timing race or transient
+  modal/dialog can't swallow the submit CR.
+- Optionally injects a follow-up prompt (host CLI ``--prompt`` →
+  ``LMER_START_PROMPT``) a configurable delay after the ``/start`` injection so
+  an automated run can hand claude an extra instruction without manual typing.
+  The gap (``--start-prompt-delay`` / ``LMER_START_PROMPT_DELAY``) lets the
+  ``/start`` slash command register before the prompt is typed, so on slow
+  systems the prompt does not land on the same input line as ``/start``. Tied
+  to auto-start, so it is a no-op under ``--manual-start``.
 
 The supervisor is meant to be invoked at the end of the claude-runner shell
 script in place of ``exec claude``. See ``libexec/claude-runner.sh``.
@@ -37,7 +49,7 @@ import threading
 import time
 import tty
 from collections import deque
-from typing import Iterable, Mapping, Optional
+from typing import Callable, Iterable, Mapping, Optional
 
 from pydantic import BaseModel
 
@@ -45,6 +57,38 @@ from pydantic import BaseModel
 DEFAULT_PORT_RANGE = (8700, 8799)
 DEFAULT_AUTO_START_DELAY = 1.5
 DEFAULT_FASTAPI_HOST = "127.0.0.1"
+
+# After the initial ``/start\r`` injection, claude's TUI occasionally shows
+# the typed ``/start`` but never registers the trailing CR — the submit gets
+# swallowed during a startup re-render, so the task never begins. To make
+# auto-start robust we follow up with a few bare CR "nudges": each one
+# re-triggers submission of the already-typed ``/start``. If the first CR did
+# register, the input box is empty and a bare CR is a harmless no-op.
+DEFAULT_AUTO_START_NUDGE_DELAY = 0.5
+AUTO_START_NUDGE_COUNT = 3
+
+# Wait for Claude's input prompt to actually render before injecting ``/start``.
+# Claude Code v2.1.119 changed Enter routing so a CR fires the topmost
+# modal/dialog (permission prompt, theme picker, IDE detect, etc.) rather than
+# also submitting input-box text; if any such dialog is open when our injection
+# lands, the ``\r`` is consumed by the dialog and ``/start`` stays typed but
+# unsubmitted. Waiting for the input-prompt glyph (``❯``, U+276F) gives Claude
+# time to finish its startup chain before we send Enter.
+DEFAULT_AUTO_START_READY_MARKER = b"\xe2\x9d\xaf"  # "❯" — Claude's prompt char
+DEFAULT_AUTO_START_READY_TIMEOUT = 15.0
+# Small extra pause after the marker is observed: the prompt often renders
+# during a multi-screen-redraw sequence, and a short settle helps the input
+# box reach its steady, focused state before we type into it.
+DEFAULT_AUTO_START_SETTLE_DELAY = 0.25
+
+# Gap between the auto-``/start`` submission and the follow-up prompt
+# (``LMER_START_PROMPT``) injection. On slow systems ``/start`` has not yet
+# been recognized as a slash command by the time the prompt text arrives, so
+# the prompt lands on the same input line (``/start <prompt text>``) instead of
+# as the next conversation turn. A generous default gives the slash command
+# time to register before we type; fast systems simply wait this once at
+# startup. Tunable via ``--start-prompt-delay`` / ``LMER_START_PROMPT_DELAY``.
+DEFAULT_START_PROMPT_DELAY = 2.0
 OUTPUT_BUFFER_LIMIT = 1024 * 1024  # 1 MiB rolling buffer of child output
 
 # When the host terminal (especially VSCode's integrated terminal) hasn't
@@ -54,6 +98,26 @@ OUTPUT_BUFFER_LIMIT = 1024 * 1024  # 1 MiB rolling buffer of child output
 # short delay after launch and re-apply to the master PTY so claude
 # receives a SIGWINCH and re-renders with the correct dimensions.
 DEFAULT_WINSIZE_RECHECK_DELAY = 0.5
+
+# Self-shutdown: the wrapped agent can ask the supervisor to quit the session
+# (e.g. an in-container ``lmer-slack end-session`` so a Slack chat session frees
+# its orchestrator slot instead of lingering until the idle timeout) by sending
+# the supervisor process ``SIGUSR1``. The supervisor injects claude's quit chord
+# — Ctrl-C twice, the same chord the host-side session reaper uses — and, if that
+# does not make claude exit within the grace period, escalates to SIGTERM then
+# SIGKILL on the child so the session always ends. The supervisor's own PID is
+# published to the wrapped process (and its subprocesses) via the
+# ``LMER_SUPERVISOR_PID`` environment variable so the in-container CLI knows whom
+# to signal.
+SUPERVISOR_PID_ENV = "LMER_SUPERVISOR_PID"
+# Gap between the two Ctrl-C presses of the quit chord (mirrors the host-side
+# reaper's terminate() pacing in slack_chat.sessions).
+DEFAULT_SHUTDOWN_CHORD_GAP = 0.5
+# How long to wait for claude to unwind after each shutdown step before
+# escalating (quit chord -> SIGTERM -> SIGKILL).
+DEFAULT_SHUTDOWN_ESCALATE_GRACE = 10.0
+# Poll cadence while waiting for the child to exit between escalation steps.
+SHUTDOWN_POLL_INTERVAL = 0.2
 
 
 class OutputBuffer:
@@ -164,6 +228,41 @@ def _set_winsize(fd: int, rows: int, cols: int) -> None:
         pass
 
 
+def _preconfigure_pty_for_injection(fd: int) -> None:
+    """Pre-clear line-discipline flags so injected ``/start\\r`` survives intact.
+
+    A freshly-allocated PTY starts in cooked mode (``ICRNL``, ``ECHO``,
+    ``ICANON`` all on). Until the child (claude) calls ``tcsetattr`` to switch
+    to raw mode, anything we write to the master is processed by the kernel:
+
+    - ``ICRNL`` translates the trailing CR of ``/start\\r`` into LF — claude
+      then reads ``/start\\n`` in raw mode, where ``\\n`` is a literal newline
+      in the input box, not Enter. The slash command sits typed-but-unsubmitted.
+    - ``ECHO`` echoes the injection back through the master, where our
+      forwarding loop renders it onto the host TTY as a visible blank line
+      pushing the claude banner upward (the "Enters outside the input" the
+      issue reporter saw).
+
+    Clearing these flags pre-fork narrows that race so the injection lands as
+    raw CR with no host-side echo. Claude is free to call ``tcsetattr`` itself
+    afterward — its own raw-mode setup overrides ours and life goes on. The
+    helper clears the flags unconditionally — there is no per-flag gating
+    inside — but the call site skips it under ``--manual-start`` since
+    nothing is injected then.
+    """
+    with contextlib.suppress(termios.error, OSError):
+        attrs = termios.tcgetattr(fd)
+        attrs[0] &= ~(termios.ICRNL | termios.INLCR | termios.IGNCR)
+        attrs[3] &= ~(
+            termios.ECHO
+            | termios.ECHOE
+            | termios.ECHOK
+            | termios.ECHONL
+            | termios.ICANON
+        )
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+
 def _get_winsize(fd: int) -> Optional[tuple[int, int]]:
     """Return ``(rows, cols)`` for ``fd`` or ``None`` if unavailable."""
     try:
@@ -174,10 +273,15 @@ def _get_winsize(fd: int) -> Optional[tuple[int, int]]:
     return rows, cols
 
 
-def _pick_port(port_range: tuple[int, int], host: str) -> int:
-    """Try ports in random order from the inclusive range until one binds.
+def _pick_ports(port_range: tuple[int, int], host: str, count: int) -> list[int]:
+    """Pick ``count`` distinct free ports from the inclusive range.
 
-    Raises :class:`RuntimeError` if no port in the range is free.
+    Ports are probed in random order; each candidate is bound (then released)
+    to confirm it is currently free. Returns the chosen ports in the order they
+    were found.
+
+    Raises :class:`ValueError` for an inverted range or non-positive ``count``,
+    and :class:`RuntimeError` if fewer than ``count`` free ports are available.
     """
     import random
     import socket
@@ -185,16 +289,36 @@ def _pick_port(port_range: tuple[int, int], host: str) -> int:
     low, high = port_range
     if low > high:
         raise ValueError(f"invalid port range {low}-{high}")
+    if count <= 0:
+        raise ValueError(f"count must be positive, got {count}")
     candidates = list(range(low, high + 1))
     random.shuffle(candidates)
+    chosen: list[int] = []
     for port in candidates:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind((host, port))
             except OSError:
                 continue
-            return port
-    raise RuntimeError(f"no free port in range {low}-{high} on {host}")
+            chosen.append(port)
+            if len(chosen) == count:
+                return chosen
+    raise RuntimeError(
+        f"could not allocate {count} free port(s) in range {low}-{high} on {host} "
+        f"(found {len(chosen)})"
+    )
+
+
+def _pick_port(port_range: tuple[int, int], host: str) -> int:
+    """Try ports in random order from the inclusive range until one binds.
+
+    Raises :class:`RuntimeError` if no port in the range is free.
+    """
+    try:
+        return _pick_ports(port_range, host, 1)[0]
+    except RuntimeError:
+        low, high = port_range
+        raise RuntimeError(f"no free port in range {low}-{high} on {host}")
 
 
 def _parse_port_range(spec: str) -> tuple[int, int]:
@@ -255,8 +379,8 @@ def _build_fastapi_app(
         # newline in the input box and never submit. The field is named
         # ``append_newline`` for backwards-compatible API shape but the
         # behavior is "press Enter after the text".
-        if body.append_newline and not payload.endswith(("\r", "\n")):
-            payload = payload + "\r"
+        if body.append_newline:
+            payload = _ensure_submit_cr(payload)
         n = write_input(payload.encode("utf-8"))
         return {"bytes_written": n}
 
@@ -329,9 +453,55 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         delay_raw = os.environ.get("LMER_AUTO_START_DELAY")
     auto_start_delay = float(delay_raw) if delay_raw is not None else DEFAULT_AUTO_START_DELAY
 
+    nudge_raw = args.auto_start_nudge_delay
+    if nudge_raw is None:
+        nudge_raw = os.environ.get("LMER_AUTO_START_NUDGE_DELAY")
+    auto_start_nudge_delay = (
+        float(nudge_raw) if nudge_raw is not None else DEFAULT_AUTO_START_NUDGE_DELAY
+    )
+
+    ready_timeout_raw = args.auto_start_ready_timeout
+    if ready_timeout_raw is None:
+        ready_timeout_raw = os.environ.get("LMER_AUTO_START_READY_TIMEOUT")
+    auto_start_ready_timeout = (
+        float(ready_timeout_raw)
+        if ready_timeout_raw is not None
+        else DEFAULT_AUTO_START_READY_TIMEOUT
+    )
+
+    settle_raw = os.environ.get("LMER_AUTO_START_SETTLE_DELAY")
+    auto_start_settle_delay = (
+        float(settle_raw) if settle_raw is not None else DEFAULT_AUTO_START_SETTLE_DELAY
+    )
+
+    # Marker bytes are read as UTF-8 from env so a future claude UI change can
+    # be patched without a release. Setting it to the empty string disables
+    # marker gating (waits only on the initial + timeout-bounded delays).
+    marker_raw = os.environ.get("LMER_AUTO_START_READY_MARKER")
+    auto_start_ready_marker = (
+        marker_raw.encode("utf-8") if marker_raw is not None
+        else DEFAULT_AUTO_START_READY_MARKER
+    )
+
     recheck_raw = os.environ.get("LMER_WINSIZE_RECHECK_DELAY")
     winsize_recheck_delay = (
         float(recheck_raw) if recheck_raw is not None else DEFAULT_WINSIZE_RECHECK_DELAY
+    )
+
+    # Follow-up prompt injected right after the auto-/start (host CLI --prompt).
+    # Env-only: the host CLI forwards it as LMER_START_PROMPT. Empty/unset means
+    # no follow-up. Tied to auto-start, so it is a no-op under --manual-start.
+    start_prompt = os.environ.get("LMER_START_PROMPT") or ""
+
+    # Gap before the follow-up prompt is injected (see DEFAULT_START_PROMPT_DELAY).
+    # CLI flag wins over the env var, which wins over the default.
+    prompt_delay_raw = args.start_prompt_delay
+    if prompt_delay_raw is None:
+        prompt_delay_raw = os.environ.get("LMER_START_PROMPT_DELAY")
+    start_prompt_delay = (
+        float(prompt_delay_raw)
+        if prompt_delay_raw is not None
+        else DEFAULT_START_PROMPT_DELAY
     )
 
     return {
@@ -341,7 +511,13 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         "host": host,
         "token": token,
         "auto_start_delay": auto_start_delay,
+        "auto_start_nudge_delay": auto_start_nudge_delay,
+        "auto_start_ready_marker": auto_start_ready_marker,
+        "auto_start_ready_timeout": auto_start_ready_timeout,
+        "auto_start_settle_delay": auto_start_settle_delay,
         "winsize_recheck_delay": winsize_recheck_delay,
+        "start_prompt": start_prompt,
+        "start_prompt_delay": start_prompt_delay,
     }
 
 
@@ -356,6 +532,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fastapi-host", help="Host to bind FastAPI (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", help="Bearer token (auto-generated if not provided)")
     parser.add_argument("--auto-start-delay", type=float, help="Seconds before /start is injected (default 1.5)")
+    parser.add_argument(
+        "--auto-start-nudge-delay",
+        type=float,
+        help="Seconds between follow-up CR nudges that re-trigger /start submission (default 0.5)",
+    )
+    parser.add_argument(
+        "--auto-start-ready-timeout",
+        type=float,
+        help=(
+            "Max seconds to wait for claude's input prompt to render before "
+            "injecting /start; 0 disables marker waiting (default 15)"
+        ),
+    )
+    parser.add_argument(
+        "--start-prompt-delay",
+        type=float,
+        help=(
+            "Seconds to wait after the auto-/start submission before injecting "
+            "the follow-up --prompt/LMER_START_PROMPT, so /start registers as a "
+            "slash command first on slow systems (default 2.0)"
+        ),
+    )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to run (typically: -- claude ...)")
     return parser
 
@@ -369,6 +567,280 @@ def _split_command(remainder: list[str]) -> list[str]:
             "lmer-supervisor: missing command. Usage: lmer-supervisor [options] -- claude [args...]"
         )
     return remainder
+
+
+def _wait_for_ready_marker(
+    output: OutputBuffer,
+    marker: bytes,
+    timeout: float,
+    cancel: Optional[threading.Event] = None,
+) -> bool:
+    """Block until ``marker`` appears in ``output``, up to ``timeout`` seconds.
+
+    Returns ``True`` if the marker was observed in the byte stream, ``False`` if
+    the timeout expired or ``cancel`` fired before that. ``timeout <= 0`` or an
+    empty ``marker`` skips the wait entirely (returns ``True``) so callers can
+    disable marker-gating by configuration. A small tail of the previously-seen
+    bytes is retained between reads so a marker straddling two reads is still
+    detected.
+
+    Per-call read timeout is bounded (200 ms) so the loop wakes regularly to
+    re-check the cancel event — without this, a shutdown raised during the wait
+    would only be observed after the full ``timeout`` elapsed (the parent
+    blocks in ``OutputBuffer.read_since`` and the cancel signal would be
+    ignored for that whole window).
+    """
+    if not marker or timeout <= 0:
+        return True
+    deadline = time.monotonic() + timeout
+    cursor = 0
+    tail = b""
+    keep = len(marker) - 1
+    poll = 0.2  # short enough to make cancel feel snappy, long enough not to spin
+    while True:
+        if cancel is not None and cancel.is_set():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        data, cursor, _ = output.read_since(cursor, timeout=min(remaining, poll))
+        if not data:
+            continue
+        haystack = tail + data
+        if marker in haystack:
+            return True
+        if keep > 0:
+            tail = haystack[-keep:]
+
+
+def _start_auto_start_thread(
+    output: OutputBuffer,
+    write: Callable[[bytes], int],
+    options: dict,
+    cancel: threading.Event,
+) -> threading.Thread:
+    """Spawn the auto-/start daemon thread and return it.
+
+    Sequencing inside the thread:
+
+    1. Initial fixed delay — covers the very-early-startup window where claude
+       has not produced any output yet (so the marker scan would just spin) and
+       where any typing would be discarded.
+    2. Marker wait — block until claude has rendered its input prompt glyph
+       (see :func:`_wait_for_ready_marker`). Falls through on timeout so a
+       marker change in claude doesn't deadlock the auto-start path; the
+       cooked-mode pre-clear + CR nudges still give best-effort delivery.
+    3. Settle delay — small extra pause to let the input box reach steady
+       state if the prompt rendered mid-redraw.
+    4. Inject ``/start\\r`` plus follow-up CR nudges.
+    5. If a follow-up prompt is configured (host CLI ``--prompt`` →
+       ``LMER_START_PROMPT``), wait ``start_prompt_delay`` seconds
+       (``--start-prompt-delay`` / ``LMER_START_PROMPT_DELAY``) so ``/start``
+       has registered as a slash command — otherwise on a slow system the
+       prompt text lands on the same input line as ``/start`` — then type and
+       submit it. Claude queues input typed while it is still working on
+       ``/start``, so the prompt lands as the next turn. Skipped when no prompt
+       is set.
+
+    The ``cancel`` event short-circuits each stage so a shutdown raised during
+    the wait is honored promptly (the marker wait re-checks the event on a
+    bounded poll cadence internally).
+    """
+    nudge_delay = max(0.0, options["auto_start_nudge_delay"])
+    initial_delay = max(0.0, options["auto_start_delay"])
+    ready_marker = options["auto_start_ready_marker"]
+    ready_timeout = max(0.0, options["auto_start_ready_timeout"])
+    settle_delay = max(0.0, options["auto_start_settle_delay"])
+    start_prompt = options["start_prompt"]
+    start_prompt_delay = max(0.0, options["start_prompt_delay"])
+
+    def _run() -> None:
+        if initial_delay > 0 and cancel.wait(initial_delay):
+            return
+        _wait_for_ready_marker(output, ready_marker, ready_timeout, cancel=cancel)
+        if cancel.is_set():
+            return
+        if settle_delay > 0 and cancel.wait(settle_delay):
+            return
+        _inject_auto_start(write, AUTO_START_NUDGE_COUNT, nudge_delay)
+        if start_prompt:
+            # Pause so the follow-up doesn't interleave with the trailing CR
+            # nudges (which would submit it prematurely or into a non-empty box)
+            # and, more importantly, so /start has time to register as a slash
+            # command before the prompt text is typed — otherwise on a slow
+            # system the prompt lands on the same input line as /start (#65).
+            if start_prompt_delay > 0 and cancel.wait(start_prompt_delay):
+                return
+            _inject_start_prompt(
+                write, start_prompt, AUTO_START_NUDGE_COUNT, nudge_delay
+            )
+
+    thread = threading.Thread(
+        target=_run, name="lmer-supervisor-auto-start", daemon=True
+    )
+    thread.start()
+    return thread
+
+
+def _ensure_submit_cr(payload: str) -> str:
+    """Append a submit CR (``\\r``) unless ``payload`` already ends with CR/LF.
+
+    CR (not LF) is "press Enter" in claude's raw-mode TUI; an already-present
+    trailing CR/LF is left intact so the caller never double-submits. Shared by
+    the FastAPI ``/input`` handler and ``_inject_start_prompt`` so the submit
+    convention lives in one place.
+    """
+    if payload.endswith(("\r", "\n")):
+        return payload
+    return payload + "\r"
+
+
+def _inject_auto_start(
+    write: Callable[[bytes], int],
+    nudge_count: int,
+    nudge_delay: float,
+) -> None:
+    """Type ``/start`` and submit it, then send a few bare-CR nudges.
+
+    CR (``\\r``), not LF (``\\n``): claude's TUI runs in raw mode where Enter
+    arrives as ``\\r``; ``\\n`` would be inserted as a literal newline in the
+    input box and never trigger submission.
+
+    The initial CR is sometimes swallowed during a startup re-render, leaving
+    ``/start`` typed but unsubmitted — the bug behind this nudge logic. Each
+    follow-up bare CR re-submits the already-typed ``/start``; once it has gone
+    through, the prompt is empty and a bare CR is a harmless no-op. ``OSError``
+    is suppressed so a closed PTY (child already exited) doesn't crash the
+    timer thread this runs on.
+    """
+    with contextlib.suppress(OSError):
+        write(b"/start\r")
+    for _ in range(nudge_count):
+        if nudge_delay > 0:
+            time.sleep(nudge_delay)
+        with contextlib.suppress(OSError):
+            write(b"\r")
+
+
+def _inject_start_prompt(
+    write: Callable[[bytes], int],
+    prompt: str,
+    nudge_count: int = 0,
+    nudge_delay: float = 0.0,
+) -> None:
+    """Type a follow-up prompt and submit it after ``/start`` was injected.
+
+    Sends the prompt text followed by a submit CR (``\\r``) — Enter in claude's
+    raw-mode TUI (via :func:`_ensure_submit_cr`, so a trailing CR/LF already
+    present on ``prompt`` is not doubled). Then sends ``nudge_count`` bare-CR
+    nudges, mirroring :func:`_inject_auto_start`: the prompt's submit CR can be
+    swallowed during a startup re-render just like ``/start``'s, leaving the
+    text typed-but-unsubmitted with nothing to re-trigger it. Each follow-up
+    bare CR re-submits it; once it has gone through, the box is empty and a bare
+    CR is a harmless no-op. An empty prompt is a no-op. ``OSError`` is suppressed
+    so a closed PTY (child already exited) doesn't crash the daemon thread this
+    runs on.
+
+    The prompt is written as a single payload under the supervisor's write lock,
+    so it never interleaves with concurrent writers (FastAPI ``/input``, the
+    main forwarding loop). Claude queues input typed while it is still working
+    on ``/start``, so the submitted prompt becomes the next conversation turn.
+    """
+    if not prompt:
+        return
+    payload = _ensure_submit_cr(prompt)
+    with contextlib.suppress(OSError):
+        write(payload.encode("utf-8"))
+    for _ in range(nudge_count):
+        if nudge_delay > 0:
+            time.sleep(nudge_delay)
+        with contextlib.suppress(OSError):
+            write(b"\r")
+
+
+def _inject_shutdown_chord(write: Callable[[bytes], int], gap: float) -> None:
+    """Send claude's quit chord — Ctrl-C (``\\x03``) twice with a short gap.
+
+    This is the same chord the host-side session reaper writes in
+    ``slack_chat.sessions.SessionManager.terminate`` to unwind the whole
+    claude/container stack gracefully. The gap gives claude time to render its
+    "Press Ctrl-C again to exit" state so the second press is interpreted as the
+    confirmation rather than coalesced into one. ``OSError`` is suppressed so a
+    PTY that has already closed (child exited under us) doesn't crash the daemon
+    thread this runs on. A non-positive ``gap`` never sleeps (so a negative value
+    can't raise ``ValueError`` out of ``time.sleep``).
+    """
+    with contextlib.suppress(OSError):
+        write(b"\x03")
+    if gap > 0:
+        time.sleep(gap)
+    with contextlib.suppress(OSError):
+        write(b"\x03")
+
+
+def _child_alive(pid: int) -> bool:
+    """Return whether ``pid`` is still a signalable process.
+
+    Uses ``kill(pid, 0)`` (the POSIX existence probe) rather than ``waitpid`` so
+    it never competes with ``run_supervisor``'s own reaping ``waitpid`` for the
+    child — two reapers would race and one would get ``ECHILD``. A still-unreaped
+    zombie reports alive here; that's fine, the escalation grace covers the brief
+    window before the main loop reaps it.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but not signalable by us — treat as alive (we shouldn't see
+        # this for our own child, but fail safe rather than escalate blindly).
+        return True
+    return True
+
+
+def _wait_child_exit(pid: int, timeout: float) -> bool:
+    """Poll until ``pid`` is gone or ``timeout`` seconds elapse.
+
+    Returns ``True`` if the child exited within the window, ``False`` otherwise.
+    """
+    deadline = time.monotonic() + timeout
+    while _child_alive(pid):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(SHUTDOWN_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
+    return True
+
+
+def _self_shutdown(
+    write: Callable[[bytes], int],
+    child_pid: int,
+    *,
+    chord_gap: float = DEFAULT_SHUTDOWN_CHORD_GAP,
+    escalate_grace: float = DEFAULT_SHUTDOWN_ESCALATE_GRACE,
+) -> None:
+    """Quit the wrapped child on request, escalating until it actually exits.
+
+    Ladder (mirrors the host-side reaper's ``terminate``):
+
+    1. Inject claude's quit chord (Ctrl-C twice). This lets claude — and the
+       docker/podman/claude stack under it — unwind normally and exit 0.
+    2. If the child is still alive after ``escalate_grace``, send it SIGTERM.
+    3. If it is *still* alive after another ``escalate_grace``, send SIGKILL.
+
+    Runs on a daemon thread spawned from the SIGUSR1 handler so the timed gaps
+    don't execute in async-signal context. Signals are sent to the child PID
+    only (not its group): the child is its own session/group leader (the fork
+    path calls ``setsid``), and ``run_supervisor`` reaps it via ``waitpid``.
+    """
+    _inject_shutdown_chord(write, chord_gap)
+    if _wait_child_exit(child_pid, escalate_grace):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.kill(child_pid, signal.SIGTERM)
+    if _wait_child_exit(child_pid, escalate_grace):
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.kill(child_pid, signal.SIGKILL)
 
 
 def run_supervisor(
@@ -408,7 +880,20 @@ def run_supervisor(
         os.environ["LMER_FASTAPI_PORT"] = str(fastapi_port)
         os.environ["LMER_FASTAPI_TOKEN"] = fastapi_token
 
+    # Publish the supervisor's own PID to the wrapped process (and everything it
+    # spawns) BEFORE fork, so the child inherits it through its initial
+    # environment. An in-container CLI (``lmer-slack end-session``) sends this PID
+    # SIGUSR1 to ask for a graceful self-shutdown. Set after fork it would not
+    # reach the already-frozen child env.
+    os.environ[SUPERVISOR_PID_ENV] = str(os.getpid())
+
     master_fd, slave_fd = os.openpty()
+
+    # Pre-clear ICRNL/ECHO/ICANON before fork so the auto-/start injection that
+    # fires shortly after spawn isn't mangled by the PTY's default cooked-mode
+    # line discipline. Skipped under --manual-start since nothing is injected.
+    if not options["manual_start"]:
+        _preconfigure_pty_for_injection(slave_fd)
 
     initial_winsize = _get_winsize(stdin_fd) if os.isatty(stdin_fd) else None
     if initial_winsize:
@@ -453,17 +938,12 @@ def run_supervisor(
         )
         sys.stderr.flush()
 
-    auto_start_timer: Optional[threading.Timer] = None
+    auto_start_thread: Optional[threading.Thread] = None
+    auto_start_cancel = threading.Event()
     if not options["manual_start"]:
-        def _inject_start() -> None:
-            # CR (\r), not LF (\n): claude's TUI runs in raw mode where Enter
-            # arrives as \r. \n would be inserted as a literal newline in the
-            # input box and never trigger submission.
-            with contextlib.suppress(OSError):
-                write_to_child(b"/start\r")
-        auto_start_timer = threading.Timer(options["auto_start_delay"], _inject_start)
-        auto_start_timer.daemon = True
-        auto_start_timer.start()
+        auto_start_thread = _start_auto_start_thread(
+            output, write_to_child, options, auto_start_cancel
+        )
 
     def _apply_host_winsize_to_master() -> None:
         size = _get_winsize(stdin_fd)
@@ -493,9 +973,32 @@ def run_supervisor(
         with contextlib.suppress(ProcessLookupError):
             os.kill(pid, sig)
 
+    # SIGUSR1 = "agent asked to leave": quit claude gracefully and report a clean
+    # exit. The actual chord injection + escalation runs on a daemon thread so
+    # the timed gaps never execute in async-signal context; the handler just
+    # flips the flag (idempotent — repeated signals don't spawn racing threads)
+    # and kicks the thread off.
+    shutdown_requested = threading.Event()
+
+    def request_shutdown(*_args) -> None:
+        if shutdown_requested.is_set():
+            return
+        shutdown_requested.set()
+        threading.Thread(
+            target=_self_shutdown,
+            args=(write_to_child, pid),
+            name="lmer-supervisor-self-shutdown",
+            daemon=True,
+        ).start()
+
     previous_winch = signal.signal(signal.SIGWINCH, forward_winsize) if hasattr(signal, "SIGWINCH") else None
     previous_int = signal.signal(signal.SIGINT, forward_signal)
     previous_term = signal.signal(signal.SIGTERM, forward_signal)
+    previous_usr1 = (
+        signal.signal(signal.SIGUSR1, request_shutdown)
+        if hasattr(signal, "SIGUSR1")
+        else None
+    )
 
     stdin_open = True
     try:
@@ -540,14 +1043,16 @@ def run_supervisor(
                 with contextlib.suppress(OSError):
                     write_to_child(chunk)
     finally:
-        if auto_start_timer is not None:
-            auto_start_timer.cancel()
+        if auto_start_thread is not None:
+            auto_start_cancel.set()
         if winsize_recheck_timer is not None:
             winsize_recheck_timer.cancel()
         if previous_winch is not None and hasattr(signal, "SIGWINCH"):
             signal.signal(signal.SIGWINCH, previous_winch)
         signal.signal(signal.SIGINT, previous_int)
         signal.signal(signal.SIGTERM, previous_term)
+        if previous_usr1 is not None and hasattr(signal, "SIGUSR1"):
+            signal.signal(signal.SIGUSR1, previous_usr1)
         if old_attrs is not None:
             with contextlib.suppress(termios.error):
                 termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
@@ -557,6 +1062,12 @@ def run_supervisor(
             server_thread.join(timeout=2.0)
 
     _, status = os.waitpid(pid, 0)
+    # A requested self-shutdown is a deliberate, clean sign-off: report exit 0 so
+    # the orchestrator (e.g. the Slack session reaper) frees the slot quietly and
+    # does NOT post a crash notice — even if the quit chord had to be escalated to
+    # a signal, which would otherwise surface as a non-zero (128+sig) status.
+    if shutdown_requested.is_set():
+        return 0
     if os.WIFEXITED(status):
         return os.WEXITSTATUS(status)
     if os.WIFSIGNALED(status):

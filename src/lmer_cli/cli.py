@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 import re
+from typing import Mapping
 from dotenv import dotenv_values
 
 from . import resolve
@@ -31,10 +32,12 @@ from .mounts import (
     build_external_taskdef_mounts,
     build_global_mount,
     build_host_repo_ro_mount,
+    build_host_uv_cache_mount,
     build_lmer_docs_mount,
     build_user_mounts,
     build_workspace_mount,
     build_service_mode_mounts,
+    resolve_host_uv_cache_dir,
 )
 from .build import DEFAULT_IMAGE, ensure_image, build_image, resolve_image_tag
 from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
@@ -45,7 +48,125 @@ from .tokens import (
     _convert_ssh_to_https_if_token_available,
     _inject_gitlab_token_if_available,
 )
-from .util import resolve_human_identity
+from .util import get_bool_env, resolve_human_identity
+from .targets import partition_targets, special_target_env
+
+# Default pool for general port passthrough (--ports / --port-pool). Kept
+# distinct from the FastAPI range (8700-8799) so both features can be used in
+# the same session without colliding on default flags.
+DEFAULT_PORT_POOL = "8800-8899"
+
+# Default host bind address for --ports passthrough. Loopback-only so the
+# published mapping is reachable from the host but not network-exposed.
+# Override with --port-bind / LMER_PORT_BIND (e.g. "0.0.0.0" for LAN access).
+DEFAULT_PORT_BIND = "127.0.0.1"
+
+
+def _resolve_requested_ports(
+    cli_count: int | None,
+    cli_pool: str | None,
+    env: Mapping[str, str],
+) -> tuple[int, str]:
+    """Resolve the requested port count and pool from CLI args + env vars.
+
+    CLI values take precedence over the ``LMER_PORT_COUNT`` / ``LMER_PORT_POOL``
+    environment variables. Returns ``(count, pool_spec)`` where ``count`` is 0
+    when port passthrough is off. Raises :class:`ValueError` if the count is
+    non-numeric or negative.
+    """
+    if cli_count is not None:
+        count = cli_count
+    else:
+        raw = (env.get("LMER_PORT_COUNT") or "").strip()
+        if not raw:
+            count = 0
+        else:
+            try:
+                count = int(raw)
+            except ValueError:
+                raise ValueError(f"LMER_PORT_COUNT must be an integer, got {raw!r}")
+    if count < 0:
+        raise ValueError(f"port count must be >= 0, got {count}")
+    pool = cli_pool or env.get("LMER_PORT_POOL") or DEFAULT_PORT_POOL
+    return count, pool
+
+
+def _resolve_port_bind(cli_bind: str | None, env: Mapping[str, str]) -> str:
+    """Resolve the host bind address for --ports passthrough.
+
+    Precedence: ``--port-bind`` > ``LMER_PORT_BIND`` env > ``DEFAULT_PORT_BIND``.
+    Empty strings (from blank env values) are treated as unset and fall through
+    to the next source.
+    """
+    if cli_bind:
+        return cli_bind
+    env_bind = (env.get("LMER_PORT_BIND") or "").strip()
+    return env_bind or DEFAULT_PORT_BIND
+
+
+def _publish_host_ports(
+    run: list[str], ports: list[int], bind: str = DEFAULT_PORT_BIND
+) -> None:
+    """Append container ``-p`` args publishing each port on ``bind``.
+
+    The same port number is used inside and outside the container. By default
+    ``bind`` is loopback (``127.0.0.1``) so the mapping is reachable from the
+    host but not network-exposed; pass a different address (e.g. ``0.0.0.0``)
+    to expose the ports more widely. Shared by the FastAPI endpoint (always
+    bound to loopback by its caller) and the general port-passthrough
+    publishing site.
+    """
+    for port in ports:
+        run += ["-p", f"{bind}:{port}:{port}"]
+
+
+def _apply_port_passthrough(
+    ns: argparse.Namespace, env: dict, run: list[str]
+) -> int | None:
+    """Resolve, allocate, and publish general port-passthrough ports.
+
+    Allocates the requested number of free ports from the pool on the host
+    (before container start, so parallel sessions get disjoint ports),
+    publishes each on the resolved bind address (loopback by default), and
+    exports the list to the container via ``LMER_PORTS`` so Claude can bind
+    services to ports reachable from the host. CLI flags win over the
+    ``LMER_PORT_COUNT`` / ``LMER_PORT_POOL`` / ``LMER_PORT_BIND`` env vars.
+
+    Mutates ``env`` and ``run`` in place. Returns ``None`` on success
+    (including when no ports are requested) or a process exit code on a fatal
+    error, so the caller can ``return`` it directly.
+    """
+    try:
+        port_count, port_pool_spec = _resolve_requested_ports(
+            ns.ports, ns.port_pool, os.environ
+        )
+    except ValueError as exc:
+        error(f"❌ {exc}")
+        return 2
+    if port_count <= 0:
+        return None
+
+    port_bind = _resolve_port_bind(getattr(ns, "port_bind", None), os.environ)
+
+    from .supervisor import _parse_port_range, _pick_ports
+
+    try:
+        port_pool = _parse_port_range(port_pool_spec)
+    except ValueError as exc:
+        error(f"❌ Invalid port pool {port_pool_spec!r}: {exc}")
+        return 2
+    try:
+        picked_ports = _pick_ports(port_pool, port_bind, port_count)
+    except RuntimeError as exc:
+        error(f"❌ {exc}")
+        return 2
+
+    env["LMER_PORTS"] = ",".join(str(p) for p in picked_ports)
+    _publish_host_ports(run, picked_ports, bind=port_bind)
+    published = ", ".join(str(p) for p in picked_ports)
+    info(f"🔌 Publishing {len(picked_ports)} port(s) on {port_bind}: {published}")
+    info("   (exposed inside the container via LMER_PORTS; bind services to 0.0.0.0)")
+    return None
 
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -92,10 +213,16 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     # Supervisor / FastAPI controls (consumed inside the container by lmer-supervisor)
     parser.add_argument("--fastapi", dest="fastapi", action="store_true", help="Expose a FastAPI endpoint to read/write the claude process (POST /input, GET /output)")
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
+    parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec claude directly (debug aid for rendering issues)")
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
     parser.add_argument("--fastapi-host", dest="fastapi_host", help="Host for the FastAPI endpoint to bind (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", dest="fastapi_token", help="Bearer token for the FastAPI endpoint (auto-generated if omitted)")
+    # General port passthrough: allocate N free ports from a pool and publish
+    # them so a service Claude runs inside the container is reachable on the host.
+    parser.add_argument("--ports", dest="ports", type=int, help="Number of host ports to allocate from --port-pool and publish to the container (env: LMER_PORT_COUNT)")
+    parser.add_argument("--port-pool", dest="port_pool", help=f"Port pool LOW-HIGH to allocate --ports from (default {DEFAULT_PORT_POOL}; env: LMER_PORT_POOL)")
+    parser.add_argument("--port-bind", dest="port_bind", help=f"Host bind address for --ports publishing (default {DEFAULT_PORT_BIND}; pass 0.0.0.0 to expose ports beyond loopback; env: LMER_PORT_BIND)")
 
     ns, extra = parser.parse_known_args(argv)
     # Combine any extra unknown args with the -- separated rest
@@ -215,6 +342,7 @@ def _derive_repo_url_from_task_target(target: str) -> str | None:
     - GitHub: https://github.com/owner/repo/pull/123 -> git@github.com:owner/repo
     - GitLab: https://gitlab.com/group/project/-/merge_requests/123 -> https://oauth2:TOKEN@gitlab.com/group/project (if token available)
     - GitLab: https://gitlab.example.com/group/subgroup/project/-/issues/456 -> git@gitlab.example.com:group/subgroup/project (if no token)
+    - GitLab: https://gitlab.com/group/project/-/work_items/70 (newer issue URL form) -> same as /-/issues/
     """
     try:
         parsed = urlparse(target)
@@ -232,10 +360,13 @@ def _derive_repo_url_from_task_target(target: str) -> str | None:
     if len(path_parts) < 2:
         return None
 
-    # Heuristics: only attempt derive when a known resource path is present
+    # Heuristics: only attempt derive when a known resource path is present.
+    # 'work_items/' is GitLab's newer URL form for issues (.../-/work_items/70);
+    # it is treated like 'issues/'. The trailing slash keeps it a path-segment
+    # match so a repo merely named 'work_items' isn't misread as a resource link.
     lowered = '/'.join(path_parts).lower()
     indicators = (
-        'pull/', 'pulls/', 'merge_requests', 'issues/', 'compare/', 'commits/', 'commit/'
+        'pull/', 'pulls/', 'merge_requests', 'issues/', 'work_items/', 'compare/', 'commits/', 'commit/'
     )
     if not any(tok in lowered for tok in indicators):
         return None
@@ -613,11 +744,25 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     task_id = ns.task if not ns.no_task else None
-    # Handle multiple targets: first is primary, rest are secondary
-    # ns.target is always a list with nargs="*" (possibly empty)
-    targets: list[str] = ns.target if ns.target else []
+    # Handle multiple targets: first is primary, rest are secondary.
+    # ns.target is always a list with nargs="*" (possibly empty).
+    # Partition special target types (e.g. Slack thread URLs) out before
+    # primary/secondary selection so the clone path (~repo resolution)
+    # never sees them. Each claimed type is represented by a handler that
+    # owns its type-specific behavior (see lmer_cli.targets).
+    _raw_targets: list[str] = ns.target if ns.target else []
+    targets, special_targets = partition_targets(_raw_targets)
     primary_target: str | None = targets[0] if targets else None
     secondary_targets: list[str] = targets[1:] if len(targets) > 1 else []
+
+    # Credential gate: each special target type validates its own required
+    # credentials (e.g. Slack needs SLACK_BOT_TOKEN); fail fast before any
+    # container work.
+    for handler in special_targets:
+        env_error = handler.validate_environment()
+        if env_error:
+            error(f"❌ {env_error}")
+            return 1
 
     # Resolve taskdef directory for the selected task
     resolved_taskdef_dir: Path | None = None
@@ -667,6 +812,10 @@ def main(argv: list[str] | None = None) -> int:
     skip_repo_resolve = bool(ns.no_clone or ns.no_task)
     repo_url: str | None = None
     host_repo_path = None
+    # Session without a repository (set when the only targets are special
+    # targets whose handler allows repo-less mode for the selected task,
+    # and no git origin can be inferred from cwd).
+    no_repo_session = False
     if not skip_repo_resolve:
         cwd = Path.cwd()
 
@@ -693,6 +842,28 @@ def main(argv: list[str] | None = None) -> int:
             if checkout_path:
                 # With --checkout, repo URL resolution failure is non-fatal
                 warning(f"⚠️  Could not resolve repo URL: {e}")
+            elif special_targets and not targets:
+                # Special targets (e.g. a Slack thread) are the only targets
+                # and cwd is not a git repo: a repo-less session is allowed
+                # only when every claimed handler supports it for this task
+                # (conservative when multiple types are mixed). If allowed,
+                # the container is told to skip the workspace clone via
+                # LMER_NO_REPO; otherwise fail fast with the refusing
+                # handler's reason.
+                refusing = next(
+                    (
+                        h
+                        for h in special_targets
+                        if not h.supports_repoless_session(task_id)
+                    ),
+                    None,
+                )
+                if refusing is None:
+                    info(special_targets[0].repoless_start_message())
+                    no_repo_session = True
+                else:
+                    error(f"❌ {e}. {refusing.repoless_unsupported_reason(task_id)}")
+                    return 2
             else:
                 error(f"❌ {e}")
                 return 2
@@ -736,6 +907,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # Check SSH setup and warn if not configured
     _check_ssh_setup(container_home, ssh_agent_enabled)
+
+    # Optional: mount the host's uv cache so target-repo `uv sync` reuses
+    # already-downloaded packages instead of re-fetching them each session.
+    # Off by default; opt-in via LMER_MOUNT_UV_CACHE.
+    if get_bool_env("LMER_MOUNT_UV_CACHE"):
+        host_uv_cache = resolve_host_uv_cache_dir()
+        if host_uv_cache.exists() and host_uv_cache.is_dir():
+            run += build_host_uv_cache_mount(runtime, host_uv_cache)
+            success(f"✅ Mounting host uv cache: {host_uv_cache} → /home/developer/.cache/uv")
+        else:
+            info(f"⚠️  Host uv cache not found at {host_uv_cache}, skipping mount")
 
     # Workspace mount removed - using /workspace directory from image instead
     # This avoids root:root ownership issues with Docker/Podman mounts
@@ -847,8 +1029,16 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_GLOBAL_DIR": os.environ.get("LMER_GLOBAL_DIR", "/home/developer/.lmer"),
         "LMER_DANGER_ZONE": os.environ.get("LMER_DANGER_ZONE"),
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
+        "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
+        "LMER_PERSIST_AGENT_MEMORY": os.environ.get("LMER_PERSIST_AGENT_MEMORY"),
         "LMER_HUMAN_IDENTITY": resolve_human_identity(),
+        # Optional git identity overrides for commits made inside the container.
+        # When set, entrypoint.sh exports them as GIT_AUTHOR_*/GIT_COMMITTER_*
+        # (session-scoped; the mounted ~/.gitconfig is left untouched). Either
+        # may be set independently; the unset half falls back to gitconfig.
+        "LMER_GIT_USER_NAME": os.environ.get("LMER_GIT_USER_NAME"),
+        "LMER_GIT_USER_EMAIL": os.environ.get("LMER_GIT_USER_EMAIL"),
         "LMER_REPO_URL": repo_url,
         "LMER_WORK_REPO": work_repo_url,
         "LMER_WORK_REPO_PATH": os.environ.get("LMER_WORK_REPO_PATH", "/work"),
@@ -882,13 +1072,42 @@ def main(argv: list[str] | None = None) -> int:
         # Supervisor / FastAPI controls (consumed inside the container by lmer-supervisor)
         "LMER_FASTAPI": "1" if ns.fastapi else None,
         "LMER_MANUAL_START": "1" if ns.manual_start else None,
+        # Follow-up prompt the in-container supervisor injects immediately
+        # after the auto-/start. Sourced from --prompt; no-op under
+        # --manual-start (the supervisor only injects it as part of auto-start).
+        "LMER_START_PROMPT": ns.prompt if ns.prompt else None,
         "LMER_DISABLE_SUPERVISOR": "1" if ns.no_supervisor else None,
+        # Forward the initial auto-/start delay so a host-set value reaches
+        # the supervisor running inside the container.
+        "LMER_AUTO_START_DELAY": os.environ.get("LMER_AUTO_START_DELAY"),
+        # Forward the auto-/start CR-nudge delay so a host-set value reaches
+        # the supervisor running inside the container.
+        "LMER_AUTO_START_NUDGE_DELAY": os.environ.get("LMER_AUTO_START_NUDGE_DELAY"),
+        # Forward the prompt-ready marker wait timeout (default 15s in-container).
+        "LMER_AUTO_START_READY_TIMEOUT": os.environ.get("LMER_AUTO_START_READY_TIMEOUT"),
+        # Forward the prompt-ready marker bytes (UTF-8) so the in-container
+        # supervisor can be re-tuned without a release if claude changes the
+        # input-prompt glyph.
+        "LMER_AUTO_START_READY_MARKER": os.environ.get("LMER_AUTO_START_READY_MARKER"),
+        # Forward the gap between the auto-/start and the follow-up prompt so a
+        # host-set value reaches the supervisor running inside the container.
+        # Without this delay /start can fail to register before the prompt is
+        # typed on slow systems, landing both on one input line (issue #65).
+        "LMER_START_PROMPT_DELAY": os.environ.get("LMER_START_PROMPT_DELAY"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
         # only works if the container-side bind is 0.0.0.0. The host CLI
         # publishes to 127.0.0.1 on the host, so it is not network-exposed.
         "LMER_FASTAPI_HOST": ns.fastapi_host or ("0.0.0.0" if ns.fastapi else None),
         "LMER_FASTAPI_TOKEN": ns.fastapi_token,
+        # Env contributed by special target types (Slack tokens + parsed
+        # thread context today). Keys of types with no matching target are
+        # seeded with None so the .env merge below cannot forward them.
+        **special_target_env(special_targets),
+        # Repo-less session (special targets were the only targets and no
+        # git origin could be inferred): tells clone_and_exec to skip the
+        # workspace clone instead of failing on the missing LMER_REPO_URL.
+        "LMER_NO_REPO": "1" if no_repo_session else None,
     }
 
     # Merge all variables from .env file into container env dict
@@ -948,8 +1167,14 @@ def main(argv: list[str] | None = None) -> int:
         port_range = _parse_port_range(port_range_spec)
         host_port = _pick_port(port_range, "127.0.0.1")
         env["LMER_FASTAPI_PORT"] = str(host_port)
-        run += ["-p", f"127.0.0.1:{host_port}:{host_port}"]
+        _publish_host_ports(run, [host_port])
         info(f"🛰  FastAPI endpoint will be published on http://127.0.0.1:{host_port}")
+
+    # General port passthrough (--ports / --port-pool): allocate N free ports
+    # and publish them so a service Claude runs inside is reachable on the host.
+    port_rc = _apply_port_passthrough(ns, env, run)
+    if port_rc is not None:
+        return port_rc
 
     run += env_args(env)
 

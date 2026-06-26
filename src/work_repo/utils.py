@@ -3,6 +3,7 @@
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Optional
 
 # Minimum length for an env var value to be considered a secret worth redacting.
@@ -119,6 +120,14 @@ def sanitize_task_target(task_target: str) -> str:
             if len(parts) > 1:
                 issue_id = parts[-1].split("/")[0].split("?")[0]
                 return f"issue-{issue_id}"
+        # GitLab work item format (newer GitLab UI): .../-/work_items/70
+        # Work items are issues; normalize to the same issue-{id} form so a
+        # work_items URL and its equivalent /-/issues/ URL share a target.
+        if "/-/work_items/" in task_target.lower():
+            parts = task_target.split("/-/work_items/")
+            if len(parts) > 1:
+                issue_id = parts[-1].split("/")[0].split("?")[0]
+                return f"issue-{issue_id}"
         # GitHub PR format: .../pull/123
         if "/pull/" in task_target.lower():
             parts = task_target.split("/pull/")
@@ -148,3 +157,86 @@ def sanitize_task_target(task_target: str) -> str:
     sanitized = sanitized.strip("-")
 
     return sanitized if sanitized else "default"
+
+
+def _work_repo_base() -> Optional[Path]:
+    """
+    Return the {LMER_WORK_REPO_PATH}/{host}/{project} base path.
+
+    Reads the env-var trio that every work-repo path is built from:
+    ``LMER_WORK_REPO_PATH`` (defaults to ``/work``), ``LMER_REPO_HOST``, and
+    ``LMER_REPO_PROJECT``. Returns ``None`` if either the host or project is
+    unset, since no meaningful path can be assembled without them. Callers
+    keep ownership of their own "missing env var" error UX.
+
+    Returns:
+        The base ``Path``, or ``None`` if host/project are not configured.
+    """
+    repo_host = os.environ.get("LMER_REPO_HOST")
+    repo_project = os.environ.get("LMER_REPO_PROJECT")
+    if not repo_host or not repo_project:
+        return None
+
+    work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
+    return work_repo_path / repo_host / repo_project
+
+
+def project_info_dir() -> Optional[Path]:
+    """
+    Return ``{LMER_WORK_REPO_PATH}/{host}/{project}/info``.
+
+    This is the global, project-wide info directory. Returns ``None`` if
+    ``LMER_REPO_HOST`` or ``LMER_REPO_PROJECT`` is unset.
+    """
+    base = _work_repo_base()
+    if base is None:
+        return None
+    return base / "info"
+
+
+def project_memory_dir() -> Optional[Path]:
+    """
+    Return ``{LMER_WORK_REPO_PATH}/{host}/{project}/memory``.
+
+    This is the per-project directory where persisted agent memory is stored,
+    shared across all task types and targets for the project. Returns ``None``
+    if ``LMER_REPO_HOST`` or ``LMER_REPO_PROJECT`` is unset.
+    """
+    base = _work_repo_base()
+    if base is None:
+        return None
+    return base / "memory"
+
+
+def task_info_dir() -> Optional[Path]:
+    """
+    Return ``{LMER_WORK_REPO_PATH}/{host}/{project}/{task}/info``.
+
+    This is the task-specific info directory. ``LMER_TASK`` defaults to
+    ``"default"`` when unset. Returns ``None`` if ``LMER_REPO_HOST`` or
+    ``LMER_REPO_PROJECT`` is unset.
+    """
+    base = _work_repo_base()
+    if base is None:
+        return None
+    task_type = os.environ.get("LMER_TASK", "default")
+    return base / task_type / "info"
+
+
+def task_target_dir() -> Optional[Path]:
+    """
+    Return ``{LMER_WORK_REPO_PATH}/{host}/{project}/{task}/{task_target}``.
+
+    The task target directory holds the log file and report files for the
+    current run. ``LMER_TASK`` and ``LMER_TASK_TARGET`` default to
+    ``"default"`` when unset; the task target is passed through
+    :func:`sanitize_task_target` to match the on-disk directory naming.
+    Returns ``None`` if ``LMER_REPO_HOST`` or ``LMER_REPO_PROJECT`` is unset.
+    """
+    base = _work_repo_base()
+    if base is None:
+        return None
+    task_type = os.environ.get("LMER_TASK", "default")
+    task_target = os.environ.get("LMER_TASK_TARGET", "default")
+    safe_task_target = sanitize_task_target(task_target) if task_target else "default"
+    return base / task_type / safe_task_target

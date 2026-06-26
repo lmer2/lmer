@@ -227,6 +227,31 @@ work goal
 
 The goal is stored temporarily and persists across CLI invocations but is not permanently saved. Useful for tracking the current objective during a work session.
 
+#### Persist Agent Memory
+
+When `LMER_PERSIST_AGENT_MEMORY` is enabled, your agent memory is persisted to
+the work repo on a **per-project** basis (stored under
+`{host}/{project}/memory/`) so it survives across sessions.
+
+- **Restore is automatic.** At session start, any previously-saved memory for
+  this project is copied back into your memory directory before you begin — you
+  do not need to do anything to load it.
+- **Persisting is your responsibility.** Memory you write during a session lives
+  only in the ephemeral container until you save it. Before you finish a task,
+  run:
+
+  ```bash
+  work memory persist
+  ```
+
+  This copies your current memory into the work repo and commits and pushes it.
+  Run it whenever you've recorded memory worth keeping (and again at the end of
+  the task). It is a no-op when `LMER_PERSIST_AGENT_MEMORY` is disabled, so it is
+  always safe to call.
+
+Only persist durable, project-level facts to memory — never credentials,
+secrets, or customer data, since the work repo is shared.
+
 ## Efficient Command Usage
 
 ### Avoid Compound Commands

@@ -64,6 +64,7 @@
       "Bash(git status)",
       "Bash(gitlab-review)",
       "Bash(gitlab-review:*)",
+      "Bash(lmer-slack:*)",
       "Bash(grep:*)",
       "Bash(head:*)",
       "Bash(hooks/rgr.py)",
@@ -93,6 +94,9 @@
       "Bash(ssh-add:*)",
       "Bash(strace:*)",
       "Bash(tail:*)",
+      "Bash(target-exec:*)",
+      "Bash(target-logs)",
+      "Bash(target-logs:*)",
       "Bash(tee:*)",
       "Bash(test:*)",
       "Bash(touch:*)",
@@ -108,6 +112,7 @@
       "Bash(work commit:*)",
       "Bash(work goal:*)",
       "Bash(work log:*)",
+      "Bash(work memory:*)",
       "Bash(work read-project-info)",
       "Bash(work report:*)",
       "Bash(work report --file:*)",
@@ -161,6 +166,18 @@
     "deny": [
       "Bash(git commit:*)",
       "Bash(git push:*)"
+    ]
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /Agents/global/hooks/slack_reply_guard.py"
+          }
+        ]
+      }
     ]
   }
 }
