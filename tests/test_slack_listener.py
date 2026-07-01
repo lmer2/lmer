@@ -664,3 +664,35 @@ class TestEnsureCaBundle:
         listener._ensure_ca_bundle()
 
         assert os.environ["SSL_CERT_FILE"] == "/custom/corporate-ca.pem"
+
+
+class TestMainLmerEnvFile:
+    """main() wires --lmer-env-file through to the SessionManager (issue #75)."""
+
+    def _patch_main(self, monkeypatch, captured):
+        class FakeManager:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr(listener, "SessionManager", FakeManager)
+        monkeypatch.setattr(listener, "_load_env_files", lambda: None)
+        monkeypatch.setattr(listener, "_ensure_ca_bundle", lambda: None)
+        # Don't actually run the event loop; close the coroutine so calling
+        # the real _run() (to build the coroutine) raises no "never awaited".
+        monkeypatch.setattr(listener.asyncio, "run", lambda coro: coro.close())
+        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+        monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
+
+    def test_flag_passed_to_session_manager(self, monkeypatch):
+        captured: dict = {}
+        self._patch_main(monkeypatch, captured)
+        rc = listener.main(["--lmer-env-file", "/x/y.env"])
+        assert rc == 0
+        assert captured.get("lmer_env_file") == "/x/y.env"
+
+    def test_defaults_to_none_when_flag_absent(self, monkeypatch):
+        captured: dict = {}
+        self._patch_main(monkeypatch, captured)
+        rc = listener.main([])
+        assert rc == 0
+        assert captured.get("lmer_env_file") is None

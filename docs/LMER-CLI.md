@@ -161,6 +161,8 @@ The following environment variables control LMER behavior:
 
 - **`LMER_SLACK_CHAT_LOG_DIR`** - Read **host-side by `lmer-slack-listener`**: directory for per-session PTY transcripts, one file per `(channel, thread_ts)` (default `/tmp/lmer-slack-chat-sessions/logs`).
 
+- **`LMER_SLACK_CHAT_ENV_FILE`** - Read **host-side by `lmer-slack-listener`**: path to a `.env` file forwarded to each spawned `lmer chat` as `lmer --env-file <path>`. The listener spawns sessions from a scratch working directory with no `.env` of its own, so variables that live only in its deployment `.env` (git tokens like `GITLAB_TOKEN_<host>`, `LMER_*` settings, ...) would otherwise be dropped at the container boundary (issue #75); pointing this at that `.env` carries them into the chat container. Overridden by the `--lmer-env-file` flag; unset (and no flag) means no `--env-file` is passed and spawning is unchanged.
+
 - **`LMER_SLACK_DM_ALLOWED_USERS`** - Read **host-side by `lmer-slack-listener`**: comma-separated Slack user IDs allowed to hold conversational DM sessions. Unset (the default) means DMs are open to everyone; when set, a DM from anyone not on the list is silently ignored. Channel mentions are never gated by this list.
 
 - **`LMER_SLACK_LOG_LEVEL`** - Read **host-side by `lmer-slack-listener`**: Python logging level for the listener (default `INFO`). Overridden by the `--log-level` flag.
@@ -397,7 +399,7 @@ Prerequisite: a host where plain `lmer chat <repo>` already works (lmer CLI on `
    SLACK_APP_TOKEN=xapp-...
    ```
 
-   Everything `lmer` itself needs (model auth, `LMER_IMAGE`, `GITLAB_TOKEN`/`GITLAB_TOKEN_<host>`, …) must be visible the same way — spawned sessions inherit the listener's full environment.
+   Everything `lmer` itself needs (model auth, `LMER_IMAGE`, `GITLAB_TOKEN`/`GITLAB_TOKEN_<host>`, …) must be visible to the listener — spawned sessions inherit its full environment. Note, though, that inheriting a variable only gets it into the spawned `lmer` **process**; for it to reach **inside the chat container** lmer must forward it, which it does for variables it loads from a `.env` file. The listener spawns from a scratch working directory with no `.env`, so put deployment variables (git tokens, `LMER_*` settings, …) in `~/.lmer/.env` (always loaded) **or** point `--lmer-env-file` / `LMER_SLACK_CHAT_ENV_FILE` at the `.env` that holds them so they are forwarded into each session (issue #75).
 
 3. **Run it** (foreground; `Ctrl-C` stops it and shuts down live sessions gracefully):
 
@@ -474,6 +476,7 @@ lmer build --local /path/to/agents/global
 - `--branch <branch>` - Checkout a specific branch (applies to primary target only)
 - `--ref <ref>` - Checkout a specific ref (tag or commit) (applies to primary target only)
 - `--remote <name>` - Git remote name to use (required when local repo has multiple remotes)
+- `--env-file <path>` - Load an additional `.env` file as the **highest-priority** `.env` source (above the working-directory `.env` and `~/.lmer/.env`, which still load; below variables already exported in the environment). Its variables are forwarded into the container like any other `.env`-sourced var. Useful when `lmer` is launched from a directory without the relevant `.env` — e.g. `lmer-slack-listener` spawns `lmer chat` from a scratch cwd and forwards its deployment `.env` this way (see `--lmer-env-file` / `LMER_SLACK_CHAT_ENV_FILE`). A path that does not exist is warned and skipped (non-fatal)
 - `--verbose` - Enable verbose output
 - `--manual-start` - Do not auto-inject `/start` into Claude on launch. By default the supervisor sends `/start` shortly after Claude is ready so the configured task begins immediately
 - `--prompt <text>` - Follow-up prompt injected immediately after the auto-`/start`, so an automated run can hand Claude an extra instruction without manual typing (e.g. `lmer chat <issue-url> --prompt="research X online first"`). Claude queues input typed while it is still working on `/start`, so the prompt becomes the next conversation turn. Forwarded to the container as `LMER_START_PROMPT`. Ignored under `--manual-start` (nothing is auto-injected then)

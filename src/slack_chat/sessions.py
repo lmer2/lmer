@@ -111,6 +111,13 @@ class SessionManager:
             and clone a workspace from the conversation. Defaults to a
             dedicated directory under ``/tmp``.
         log_dir: Directory for per-session terminal logs.
+        lmer_env_file: Optional path to a .env file forwarded to each spawned
+            ``lmer chat`` as ``--env-file`` so its variables (git tokens,
+            ``LMER_*`` settings, ...) reach the chat container even though the
+            spawn cwd has no .env (issue #75). Defaults to
+            ``LMER_SLACK_CHAT_ENV_FILE``; when neither is set no ``--env-file``
+            is passed and lmer falls back to its usual cwd/.env + ~/.lmer/.env
+            loading.
     """
 
     def __init__(
@@ -120,6 +127,7 @@ class SessionManager:
         lmer_bin: str | None = None,
         spawn_cwd: str | None = None,
         log_dir: str | None = None,
+        lmer_env_file: str | None = None,
     ):
         self.idle_timeout_minutes = (
             idle_timeout_minutes
@@ -142,6 +150,7 @@ class SessionManager:
                 "LMER_SLACK_CHAT_LOG_DIR", "/tmp/lmer-slack-chat-sessions/logs"
             )
         )
+        self.lmer_env_file = lmer_env_file or os.getenv("LMER_SLACK_CHAT_ENV_FILE")
         self._sessions: dict[tuple[str, str], Session] = {}
 
     # ------------------------------------------------------------------
@@ -200,9 +209,14 @@ class SessionManager:
     async def spawn(self, channel: str, thread_ts: str, permalink: str) -> Session:
         """Spawn an ``lmer chat`` process attached to a Slack thread.
 
-        The process inherits the listener's full environment, so lmer
-        configuration (LMER_* vars, git tokens, model API keys, ...) is
-        passed through from the listener's ``.env`` file automatically.
+        The process inherits the listener's full environment, so host-side
+        lmer configuration is visible to the spawned CLI. Values that must
+        also reach *inside* the chat container, however, only do so if lmer
+        forwards them — the explicitly-allowlisted ``LMER_*`` keys, plus
+        anything in a forwarded ``.env``. When ``lmer_env_file`` is set it is
+        passed as ``lmer --env-file`` so that file's variables (git tokens,
+        ``LMER_*`` settings, ...) are forwarded into the container even though
+        the spawn cwd has no ``.env`` of its own (issue #75).
 
         Raises:
             RuntimeError: If a running session already exists for the
@@ -224,11 +238,16 @@ class SessionManager:
         # instance inside needs one. Nobody types into it - it exists so
         # the interactive (non-headless) claude session runs normally.
         master_fd, slave_fd = pty.openpty()
+        # Forward an explicit .env into the chat container when configured, so
+        # vars that live only in the listener's deployment dir reach lmer even
+        # though the spawn cwd is a scratch dir with no .env (issue #75).
+        lmer_argv = [self.lmer_bin]
+        if self.lmer_env_file:
+            lmer_argv += ["--env-file", self.lmer_env_file]
+        lmer_argv += ["chat", permalink]
         try:
             process = await asyncio.create_subprocess_exec(
-                self.lmer_bin,
-                "chat",
-                permalink,
+                *lmer_argv,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,

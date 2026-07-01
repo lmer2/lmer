@@ -41,6 +41,32 @@ def _fake_session(
     return session
 
 
+def _write_recording_lmer(tmp_path: Path, argv_log: Path) -> Path:
+    """A stand-in lmer that records the argv it was called with, then sleeps."""
+    script = tmp_path / "recording-lmer"
+    script.write_text(
+        "#!/bin/bash\n"
+        f'printf "%s\\n" "$@" > "{argv_log}"\n'
+        "sleep 60\n"
+    )
+    script.chmod(script.stat().st_mode | stat.S_IXUSR)
+    return script
+
+
+async def _read_recorded_argv(argv_log: Path, timeout: float = 3.0) -> list[str]:
+    """Poll until the recording fake-lmer has written its argv, then return it."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if argv_log.exists():
+            text = argv_log.read_text()
+            if text.strip():
+                return text.splitlines()
+        await asyncio.sleep(0.02)
+    raise AssertionError(
+        f"fake lmer did not record argv at {argv_log} within {timeout}s"
+    )
+
+
 class TestEnvInt:
     def test_default_when_unset(self, monkeypatch):
         monkeypatch.delenv("SOME_INT_VAR", raising=False)
@@ -71,6 +97,24 @@ class TestRegistry:
         mgr = SessionManager()
         assert mgr.spawn_cwd == Path("/tmp/custom-cwd")
         assert mgr.log_dir == Path("/tmp/custom-logs")
+
+    def test_lmer_env_file_from_env(self, monkeypatch):
+        """LMER_SLACK_CHAT_ENV_FILE configures the forwarded --env-file path."""
+        monkeypatch.setenv("LMER_SLACK_CHAT_ENV_FILE", "/etc/lmer/deploy.env")
+        mgr = SessionManager()
+        assert mgr.lmer_env_file == "/etc/lmer/deploy.env"
+
+    def test_lmer_env_file_arg_overrides_env(self, monkeypatch):
+        """An explicit lmer_env_file arg wins over LMER_SLACK_CHAT_ENV_FILE."""
+        monkeypatch.setenv("LMER_SLACK_CHAT_ENV_FILE", "/etc/lmer/deploy.env")
+        mgr = SessionManager(lmer_env_file="/custom/x.env")
+        assert mgr.lmer_env_file == "/custom/x.env"
+
+    def test_lmer_env_file_default_none(self, monkeypatch):
+        """With neither arg nor env var, lmer_env_file is None (no --env-file)."""
+        monkeypatch.delenv("LMER_SLACK_CHAT_ENV_FILE", raising=False)
+        mgr = SessionManager()
+        assert mgr.lmer_env_file is None
 
     def test_get_active_and_tracked(self):
         mgr = SessionManager(idle_timeout_minutes=30, max_sessions=5)
@@ -161,6 +205,61 @@ class TestSpawnAndTerminate:
 
         assert not session.is_running
         assert manager.get("C1", "111.222") is None
+
+    @pytest.mark.asyncio
+    async def test_spawn_forwards_env_file(self, tmp_path: Path):
+        """When lmer_env_file is set, spawn passes '--env-file <path>' before
+        the 'chat' subcommand to the spawned lmer process (issue #75)."""
+        argv_log = tmp_path / "argv.txt"
+        script = _write_recording_lmer(tmp_path, argv_log)
+        env_file = tmp_path / "deploy.env"
+        env_file.write_text("GITLAB_TOKEN_example_com=glpat-fixturetoken\n")
+
+        manager = SessionManager(
+            idle_timeout_minutes=30,
+            max_sessions=2,
+            lmer_bin=str(script),
+            spawn_cwd=str(tmp_path / "cwd"),
+            log_dir=str(tmp_path / "logs"),
+            lmer_env_file=str(env_file),
+        )
+        permalink = "https://x.slack.com/archives/C1/p1112220000000000"
+        session = await manager.spawn("C1", "111.222", permalink)
+        try:
+            args = await _read_recorded_argv(argv_log)
+            assert "--env-file" in args, f"args={args}"
+            idx = args.index("--env-file")
+            assert args[idx + 1] == str(env_file)
+            assert idx < args.index("chat"), "--env-file must precede 'chat'"
+            assert args[-2:] == ["chat", permalink]
+        finally:
+            await manager.terminate(session)
+
+    @pytest.mark.asyncio
+    async def test_spawn_omits_env_file_when_unset(
+        self, tmp_path: Path, monkeypatch
+    ):
+        """With no lmer_env_file (and no LMER_SLACK_CHAT_ENV_FILE), spawn passes
+        only 'chat <permalink>' — spawning is unchanged."""
+        monkeypatch.delenv("LMER_SLACK_CHAT_ENV_FILE", raising=False)
+        argv_log = tmp_path / "argv.txt"
+        script = _write_recording_lmer(tmp_path, argv_log)
+
+        manager = SessionManager(
+            idle_timeout_minutes=30,
+            max_sessions=2,
+            lmer_bin=str(script),
+            spawn_cwd=str(tmp_path / "cwd"),
+            log_dir=str(tmp_path / "logs"),
+        )
+        permalink = "https://x.slack.com/archives/C1/p1112220000000000"
+        session = await manager.spawn("C1", "111.222", permalink)
+        try:
+            args = await _read_recorded_argv(argv_log)
+            assert "--env-file" not in args
+            assert args == ["chat", permalink]
+        finally:
+            await manager.terminate(session)
 
     @pytest.mark.asyncio
     async def test_spawn_rejects_duplicate_thread(self, manager: SessionManager):
