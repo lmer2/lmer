@@ -85,16 +85,18 @@ def verify_no_secrets():
     ]
 
     diff_lower = result.stdout.lower()
-    found_secrets = []
+    matched_patterns = []
 
     for pattern in secret_patterns:
         if pattern.lower() in diff_lower:
-            found_secrets.append(pattern)
+            matched_patterns.append(pattern)
 
-    if found_secrets:
+    if matched_patterns:
         print("\n⚠️  WARNING: Potential secrets detected in staged changes:")
-        for secret in found_secrets:
-            print(f"   - Pattern '{secret}' found")
+        # `matched_pattern` holds a detector pattern name (e.g. "password="),
+        # not a secret value — printing it is safe and intentional.
+        for matched_pattern in matched_patterns:
+            print(f"   - Pattern '{matched_pattern}' found")
         print("🔍 Please review your changes carefully!")
 
         # Don't block, just warn

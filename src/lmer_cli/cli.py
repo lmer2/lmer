@@ -549,11 +549,15 @@ def _redact_env_value(name: str, value: str) -> str:
             parsed = urlparse(value)
             if parsed.password or parsed.username:
                 cleaned = parsed._replace(
-                    netloc=parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+                    netloc=(parsed.hostname or "") + (f":{parsed.port}" if parsed.port else "")
                 )
                 return urlunparse(cleaned)
         except Exception:
-            pass
+            # Fail closed: never return a value that may still carry the
+            # credential when parsing fails (e.g. an out-of-range port makes
+            # `parsed.port` raise). Strip the userinfo with a regex that cannot
+            # raise instead.
+            return re.sub(r"(://)[^/]*@", r"\1", value)
     return value
 
 
@@ -992,7 +996,11 @@ def main(argv: list[str] | None = None) -> int:
                 success(f"🔑 Found GitLab token for {work_host} (using HTTPS auth for work repo)")
             else:
                 info(f"🔑 No GitLab token found for {work_host} (work repo will use SSH)")
-        info(f"📦 Work repo URL: {work_repo_url[:50]}..." if len(work_repo_url) > 50 else f"📦 Work repo URL: {work_repo_url}")
+        # work_repo_url may be an https URL carrying an `oauth2:<token>@` prefix
+        # (see _convert_ssh_to_https_if_token_available). _redact_env_value
+        # rebuilds the URL from host/port only, so the embedded token never
+        # reaches the log sink (lmer_cli.log.info -> print).
+        info(f"📦 Work repo URL: {_redact_env_value('LMER_WORK_REPO', work_repo_url)}")
 
     # Remap resolved_taskdef_dir to container paths when it lives in an
     # external taskdef directory (host path won't exist inside the container).

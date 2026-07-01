@@ -10,7 +10,9 @@ import pytest
 from hooks.start import (
     main,
     read_and_display_instructions,
+    check_task_context,
     _is_github_host,
+    _redact_url_credentials,
     _target_provider_flags,
 )
 
@@ -317,3 +319,55 @@ class TestTargetProviderFlags:
             output = f.getvalue()
             assert "use github-review" in output
             assert "use gitlab-review" not in output
+
+
+class TestRedactUrlCredentials:
+    """The /start task-context banner must not leak clone-URL credentials."""
+
+    def test_strips_oauth2_token(self):
+        url = "https://oauth2:glpat-FAKEtoken1234567890abcd@git.example.com/org/repo.git"
+        result = _redact_url_credentials(url)
+        assert "glpat-" not in result
+        assert "oauth2" not in result
+        assert result == "https://git.example.com/org/repo.git"
+
+    def test_strips_userinfo_with_port(self):
+        url = "https://user:secretpass@git.example.com:8443/org/repo.git"
+        result = _redact_url_credentials(url)
+        assert "secretpass" not in result
+        assert result == "https://git.example.com:8443/org/repo.git"
+
+    def test_preserves_plain_url(self):
+        url = "https://git.example.com/org/repo.git"
+        assert _redact_url_credentials(url) == url
+
+    def test_leaves_ssh_url_untouched(self):
+        # scp-style SSH URLs have no scheme:// and carry no inline credentials.
+        url = "git@git.example.com:org/repo.git"
+        assert _redact_url_credentials(url) == url
+
+    def test_handles_empty_and_none(self):
+        assert _redact_url_credentials("") == ""
+        assert _redact_url_credentials(None) is None
+
+    def test_fails_closed_on_unparseable_url(self):
+        # An out-of-range port makes urlparse(...).port raise; the helper must
+        # still strip the credential (fail closed), never return it verbatim.
+        url = "https://oauth2:glpat-FAKEtoken1234567890abcd@git.example.com:99999/repo.git"
+        result = _redact_url_credentials(url)
+        assert "glpat-" not in result
+        assert "oauth2" not in result
+
+    def test_banner_redacts_token(self, monkeypatch, capsys):
+        """check_task_context must print the host but never the token."""
+        monkeypatch.setenv(
+            "LMER_REPO_URL",
+            "https://oauth2:glpat-FAKEtoken1234567890abcd@git.example.com/org/repo.git",
+        )
+        for var in ("LMER_TASK_TARGET", "LMER_TASK", "LMER_TASKDEF"):
+            monkeypatch.delenv(var, raising=False)
+        check_task_context()
+        out = capsys.readouterr().out
+        assert "glpat-" not in out
+        assert "oauth2" not in out
+        assert "git.example.com" in out
