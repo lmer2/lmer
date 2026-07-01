@@ -51,6 +51,23 @@ def check_call(cmd: list[str]) -> None:
     subprocess.check_call(cmd)
 
 
+def _scrub_credentials(text: str) -> str:
+    """Strip ``user:password@`` / ``oauth2:<token>@`` credentials from any URL
+    embedded in *text*.
+
+    The clone commands here carry the tokenized clone URL as an argument, so a
+    failed clone surfaces the live token when its ``subprocess.CalledProcessError``
+    is stringified — ``str(e)`` includes ``e.cmd`` (e.g.
+    ``git clone https://oauth2:<token>@host/...``). CodeQL does not track this
+    (the value flows through ``subprocess`` and stdlib exception formatting), so
+    scrub error strings before printing them to stderr. Uses a regex that cannot
+    raise, so it is always safe to wrap an error string with.
+    """
+    if not text:
+        return text
+    return re.sub(r"(://)[^/\s]*@", r"\1", text)
+
+
 def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Optional[str]) -> None:
     """
     Clone repository into workspace if not already present.
@@ -658,7 +675,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             ensure_clone(ws, repo_url, branch, ref)
         except subprocess.CalledProcessError as e:
-            print(f"❌ git operation failed: {e}", file=sys.stderr)
+            print(f"❌ git operation failed: {_scrub_credentials(str(e))}", file=sys.stderr)
             return e.returncode or 1
 
     # Trust workspace mise config if present and opt-in via LMER_TRUST_MISE.
@@ -700,7 +717,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ensure_clone(work_repo_path, work_repo_url, None, None)
     except subprocess.CalledProcessError as e:
-        print(f"❌ work repo clone failed: {e}", file=sys.stderr)
+        print(f"❌ work repo clone failed: {_scrub_credentials(str(e))}", file=sys.stderr)
         return e.returncode or 1
 
     # Clone secondary MRs if any
@@ -711,10 +728,10 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 clone_secondary_mr(secondary_target, ws)
             except subprocess.CalledProcessError as e:
-                print(f"⚠️  Failed to clone secondary MR {secondary_target}: {e}", file=sys.stderr)
+                print(f"⚠️  Failed to clone secondary MR {secondary_target}: {_scrub_credentials(str(e))}", file=sys.stderr)
                 # Don't fail the entire operation if secondary MR clone fails
             except Exception as e:
-                print(f"⚠️  Error processing secondary MR {secondary_target}: {e}", file=sys.stderr)
+                print(f"⚠️  Error processing secondary MR {secondary_target}: {_scrub_credentials(str(e))}", file=sys.stderr)
                 # Don't fail the entire operation if secondary MR processing fails
 
     # Create directory structure in work repo

@@ -206,6 +206,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--match-uid", dest="match_uid", action="store_true", help="Run container as your host UID:GID (fixes SSH agent permissions)")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--show-env", dest="show_env", action="store_true", help="Display LMER environment variable configuration on startup")
+    parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
 
     # Use parse_known_args so we can capture the command after --exec
     parser.add_argument("--no-task", dest="no_task", action="store_true", help="Run without selecting a task (exec mode only)")
@@ -549,11 +550,15 @@ def _redact_env_value(name: str, value: str) -> str:
             parsed = urlparse(value)
             if parsed.password or parsed.username:
                 cleaned = parsed._replace(
-                    netloc=parsed.hostname + (f":{parsed.port}" if parsed.port else "")
+                    netloc=(parsed.hostname or "") + (f":{parsed.port}" if parsed.port else "")
                 )
                 return urlunparse(cleaned)
         except Exception:
-            pass
+            # Fail closed: never return a value that may still carry the
+            # credential when parsing fails (e.g. an out-of-range port makes
+            # `parsed.port` raise). Strip the userinfo with a regex that cannot
+            # raise instead.
+            return re.sub(r"(://)[^/]*@", r"\1", value)
     return value
 
 
@@ -723,8 +728,24 @@ def main(argv: list[str] | None = None) -> int:
     # since we use a first-wins pattern (if key not in os.environ).
     # Also track sources for --show-env.
     cwd_env_file = Path.cwd() / ".env"
+    # Optional explicit --env-file: highest-priority .env source (still below
+    # already-exported environment variables, which the first-wins loop never
+    # overwrites). Lets a caller forward a .env that lives neither in cwd nor
+    # the state dir — e.g. the Slack listener spawning `lmer chat` from a
+    # scratch cwd (issue #75). Warn (non-fatal) when an explicitly named file
+    # is missing so a typo'd path is visible rather than silently ignored.
+    explicit_env_file = Path(ns.env_file).expanduser() if ns.env_file else None
+    if explicit_env_file is not None and not explicit_env_file.is_file():
+        warning(f"⚠️  --env-file not found, skipping: {explicit_env_file}")
     early_env_file_sources: dict[str, str] = {}
-    env_file_candidates = [
+    env_file_candidates = []
+    # Gate on .is_file() (not the loop's .exists()) so a path that exists but
+    # isn't a regular file — e.g. a directory — is skipped here too, keeping
+    # this consistent with the warning above and the container-merge guard
+    # below (all three agree, and the "skipping" warning stays accurate).
+    if explicit_env_file is not None and explicit_env_file.is_file():
+        env_file_candidates.append(("--env-file", explicit_env_file))
+    env_file_candidates += [
         ("working directory", cwd_env_file),
         ("lmer state dir", state_dir / ".env"),
     ]
@@ -992,7 +1013,11 @@ def main(argv: list[str] | None = None) -> int:
                 success(f"🔑 Found GitLab token for {work_host} (using HTTPS auth for work repo)")
             else:
                 info(f"🔑 No GitLab token found for {work_host} (work repo will use SSH)")
-        info(f"📦 Work repo URL: {work_repo_url[:50]}..." if len(work_repo_url) > 50 else f"📦 Work repo URL: {work_repo_url}")
+        # work_repo_url may be an https URL carrying an `oauth2:<token>@` prefix
+        # (see _convert_ssh_to_https_if_token_available). _redact_env_value
+        # rebuilds the URL from host/port only, so the embedded token never
+        # reaches the log sink (lmer_cli.log.info -> print).
+        info(f"📦 Work repo URL: {_redact_env_value('LMER_WORK_REPO', work_repo_url)}")
 
     # Remap resolved_taskdef_dir to container paths when it lives in an
     # external taskdef directory (host path won't exist inside the container).
@@ -1128,6 +1153,17 @@ def main(argv: list[str] | None = None) -> int:
         already_listed = any(f == state_env_file for _, f in env_files_to_load)
         if not already_listed and state_env_file != cwd_env_file:
             env_files_to_load.append(("lmer state dir", state_env_file))
+
+    # An explicit --env-file (resolved above) is appended LAST so it wins: the
+    # merge below lets later .env files override earlier ones, so last == the
+    # highest precedence among .env files. This is what carries a forwarded
+    # .env into the container when cwd has none — e.g. the Slack listener
+    # passing its deployment .env to the spawned `lmer chat` (issue #75). Skip
+    # if it duplicates a path already queued (harmless, just avoids a re-merge).
+    if explicit_env_file is not None and explicit_env_file.is_file():
+        already_listed = any(f == explicit_env_file for _, f in env_files_to_load)
+        if not already_listed:
+            env_files_to_load.append(("--env-file", explicit_env_file))
 
     # Track which keys came from .env files (not hardcoded in env dict above)
     env_file_keys: set[str] = set()

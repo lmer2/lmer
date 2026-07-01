@@ -484,6 +484,17 @@ def main(argv=None) -> int:
         default=os.getenv("LMER_SLACK_LOG_LEVEL", "INFO"),
         help="Python logging level (default: INFO; or LMER_SLACK_LOG_LEVEL).",
     )
+    parser.add_argument(
+        "--lmer-env-file",
+        default=None,
+        help=(
+            "Path to a .env file forwarded to each spawned 'lmer chat' as "
+            "'lmer --env-file', so its variables (git tokens, LMER_* settings, "
+            "...) reach the chat container even though the spawn cwd has no "
+            ".env. Defaults to LMER_SLACK_CHAT_ENV_FILE; when neither is set, "
+            "spawning is unchanged."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -501,7 +512,7 @@ def main(argv=None) -> int:
     _ensure_ca_bundle()
 
     global session_manager, DM_ALLOWED_USERS
-    session_manager = SessionManager()
+    session_manager = SessionManager(lmer_env_file=args.lmer_env_file)
     DM_ALLOWED_USERS = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
 
     if not os.environ.get("SLACK_BOT_TOKEN"):
