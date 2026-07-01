@@ -8,9 +8,10 @@ Usage:
 """
 import sys
 import os
+import re
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 import json
 from jinja2 import Environment, FileSystemLoader, Template
 
@@ -252,6 +253,33 @@ def read_and_display_instructions(instructions_file, work_mode="finish"):
     return True
 
 
+def _redact_url_credentials(url):
+    """Strip any embedded ``user:password@`` credentials from a URL.
+
+    LMER_REPO_URL is typically an https clone URL carrying an ``oauth2:<token>@``
+    prefix; printing it verbatim leaks the token to the console. Rebuild the URL
+    from scheme/host/port/path only. Mirror of the URL branch of
+    ``lmer_cli.cli._redact_env_value`` — kept local because this hook runs under
+    the global venv and does not import the lmer_cli package.
+    """
+    if not url or "://" not in url or "@" not in url:
+        return url
+    try:
+        parsed = urlparse(url)
+        if parsed.username or parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            return urlunparse(parsed._replace(netloc=netloc))
+        return url
+    except Exception:
+        # Fail closed: a redaction helper must never emit a value that may still
+        # carry credentials. If urlparse raises (e.g. an out-of-range port makes
+        # `parsed.port` raise ValueError), strip the userinfo with a regex that
+        # cannot raise instead of returning the original token-bearing URL.
+        return re.sub(r"(://)[^/]*@", r"\1", url)
+
+
 def check_task_context():
     """Display current task context from environment variables."""
     repo_url = os.environ.get('LMER_REPO_URL')
@@ -263,7 +291,7 @@ def check_task_context():
         if task:
             print(f"  • Task: {task}")
         if repo_url:
-            print(f"  • Repository: {repo_url}")
+            print(f"  • Repository: {_redact_url_credentials(repo_url)}")
         if task_target:
             print(f"  • Target: {task_target}")
         print()

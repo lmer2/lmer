@@ -280,6 +280,15 @@ def _pick_ports(port_range: tuple[int, int], host: str, count: int) -> list[int]
     to confirm it is currently free. Returns the chosen ports in the order they
     were found.
 
+    The probe binds the *same* ``host`` the FastAPI service will use so the
+    free-port check reflects the interface the service actually listens on.
+    ``host`` defaults to loopback (``DEFAULT_FASTAPI_HOST``); binding to all
+    interfaces (``0.0.0.0`` / ``::`` / ``""``) only happens when explicitly
+    configured via ``LMER_FASTAPI_HOST`` / ``--fastapi-host`` to expose the
+    control endpoint beyond the container — an intentional opt-in, not the
+    default. (CodeQL's ``py/bind-socket-all-network-interfaces`` alert is
+    expected for that opt-in path and is accepted by design.)
+
     Raises :class:`ValueError` for an inverted range or non-positive ``count``,
     and :class:`RuntimeError` if fewer than ``count`` free ports are available.
     """
@@ -872,6 +881,7 @@ def run_supervisor(
     # frozen and consumers inside the container would have no way to discover
     # an auto-generated token.
     fastapi_token = options["token"]
+    fastapi_host = options["host"]
     fastapi_port: Optional[int] = None
     if options["fastapi"]:
         if not fastapi_token:
@@ -931,9 +941,13 @@ def run_supervisor(
     server_thread = None
     if options["fastapi"]:
         app = _build_fastapi_app(output, write_to_child, fastapi_token)
-        server_thread, fastapi_shutdown = _start_fastapi_server(app, options["host"], fastapi_port)
+        server_thread, fastapi_shutdown = _start_fastapi_server(app, fastapi_host, fastapi_port)
+        # Status line carries only host + port (no secret value): the bearer
+        # token is never interpolated, only the name of the env var that holds
+        # it. Host/port are read from plain locals above rather than the
+        # secret-bearing options dict.
         sys.stderr.write(
-            f"🛰  lmer-supervisor FastAPI listening on http://{options['host']}:{fastapi_port} "
+            f"🛰  lmer-supervisor FastAPI listening on http://{fastapi_host}:{fastapi_port} "
             f"(bearer token in LMER_FASTAPI_TOKEN)\n"
         )
         sys.stderr.flush()

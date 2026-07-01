@@ -21,11 +21,30 @@ class TestRedactEnvValue:
         url = "https://oauth2:token123@git.example.com/repo.git"
         result = _redact_env_value("LMER_REPO_URL", url)
         assert "token123" not in result
-        assert "git.example.com" in result
+        # Exact match (not a substring check) so the host is preserved verbatim
+        # and the credential is fully stripped.
+        assert result == "https://git.example.com/repo.git"
 
     def test_preserves_plain_url(self):
         url = "https://git.example.com/repo.git"
         assert _redact_env_value("LMER_REPO_URL", url) == url
+
+    def test_redacts_work_repo_url_token(self):
+        # Regression for the cli.py work-repo URL log line: LMER_WORK_REPO does
+        # not match the TOKEN/KEY/SECRET name regex, so it takes the URL branch
+        # and the embedded oauth2:<token>@ credential is stripped, not logged.
+        url = "https://oauth2:glpat-FAKEtoken1234567890abcd@git.example.com/org/repo.git"
+        result = _redact_env_value("LMER_WORK_REPO", url)
+        assert "glpat-" not in result
+        assert result == "https://git.example.com/org/repo.git"
+
+    def test_fails_closed_on_unparseable_url(self):
+        # An out-of-range port makes urlparse(...).port raise; the redactor must
+        # still strip the credential (fail closed) rather than return it verbatim.
+        url = "https://oauth2:glpat-FAKEtoken1234567890abcd@git.example.com:99999/repo.git"
+        result = _redact_env_value("LMER_REPO_URL", url)
+        assert "glpat-" not in result
+        assert "oauth2" not in result
 
     def test_redacts_key_vars(self):
         assert _redact_env_value("API_KEY", "sk-1234567890") == "sk-1***"
