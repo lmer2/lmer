@@ -178,11 +178,17 @@ if [ ! -e "$CLAUDE_HOME/settings.json" ] && [ -f "/Agents/global/agent-files/cla
           "permissions": { "defaultMode": "bypassPermissions" }
         }'
         if command -v jq >/dev/null 2>&1; then
+            # Shallow-merge over the FULL global settings so hooks (SessionEnd
+            # run-state release, Stop slack guard) survive — the earlier shape
+            # kept only statusLine and silently dropped every hook in
+            # danger-zone sessions. $perms still replaces the permissions
+            # object wholesale, which is fine: allow-lists are moot under
+            # bypassPermissions.
             jq --argjson perms "$DANGER_PERMS" \
-               '{statusLine} + $perms' \
+               '. + $perms' \
                /Agents/global/agent-files/claude/settings.json > "$CLAUDE_HOME/settings.json"
         else
-            # Fallback without jq: no statusLine, but still bypass prompts
+            # Fallback without jq: no statusLine/hooks, but still bypass prompts
             echo "$DANGER_PERMS" > "$CLAUDE_HOME/settings.json"
         fi
         echo "⚡ Danger zone: settings.json written with bypass-permissions mode"

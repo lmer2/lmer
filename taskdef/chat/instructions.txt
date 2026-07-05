@@ -225,3 +225,5 @@ If you are using the `lmer-slack poll` fallback instead of `/monitor`, fold
 any message it returns mid-task into your work before continuing (the human
 may be redirecting you), and still post the progress notes above.
 {% endif %}
+
+{% include 'run-state.jinja2' ignore missing %}

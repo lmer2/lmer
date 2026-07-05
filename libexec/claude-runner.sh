@@ -4,6 +4,12 @@
 export PATH="/home/developer/.npm-global/bin:$PATH"
 export HOME="/home/developer"
 
+# Mint a stable per-session id for run-state owner claims and event
+# attribution (`work session-start` / `work session-end`). A host-injected
+# LMER_SESSION_ID is preserved; otherwise UTC timestamp + pid + random is
+# unique enough for one container session.
+export LMER_SESSION_ID="${LMER_SESSION_ID:-$(date -u +%Y%m%d-%H%M%S)-$$-$RANDOM}"
+
 # Check if we have credentials
 if [ -f "$HOME/.claude/.credentials.json" ]; then
     echo "✅ Credentials found in .claude/"
@@ -176,7 +182,9 @@ fi
 # Merge personal permissions if settings.local.json exists
 # This allows users to add personal permissions without modifying the base settings.json
 # Place your file at ~/.lmer/.claude/settings.local.json
-SETTINGS_FILE="/home/developer/.claude/settings.json"
+# LMER_SETTINGS_FILE overrides the path for non-standard layouts and tests
+# (mirrors LMER_AGENT_MEMORY_DIR); defaults to the container's real location.
+SETTINGS_FILE="${LMER_SETTINGS_FILE:-/home/developer/.claude/settings.json}"
 SETTINGS_LOCAL="/home/developer/.claude/settings.local.json"
 if [ -f "$SETTINGS_LOCAL" ] && [ -f "$SETTINGS_FILE" ] && command -v jq >/dev/null 2>&1; then
     echo "🔧 Merging personal permissions from settings.local.json"
@@ -343,6 +351,60 @@ case "${LMER_PERSIST_AGENT_MEMORY,,}" in
         fi
         ;;
 esac
+
+# ── Masterplan plugin provisioning ──
+# When the session runs the masterplan workflow (LMER_TASK=masterplan or a
+# truthy LMER_MASTERPLAN), install the masterplan plugin from the work-repo
+# mirror and point its bundle root into the current run dir. The gating and
+# run-dir computation live in lmer_cli.container.masterplan (get_bool_env +
+# work_repo.run_state) so this stays a thin wrapper. The helper's exit code is
+# the contract: 0 => print the bundle root, provision; 1 => not a masterplan
+# session (or import failure in the claude-runner unit tests) => skip silently;
+# 2 => masterplan was explicitly requested but the run dir is indeterminate
+# (e.g. no LMER_REPO_HOST/LMER_REPO_PROJECT) => skip but warn, so an opt-in that
+# silently did nothing is visible rather than mistaken for a plain session.
+# superpowers is baked into the image but left disabled (no enabledPlugins entry
+# after the image bake removes settings.json); `claude plugin install
+# masterplan@...` re-enables it automatically as masterplan's declared
+# dependency. masterplan comes from the local mirror at /work/mirrors/masterplan.
+# Every step is idempotent (service mode may re-enter this block) and non-fatal —
+# any failure warns and continues, never aborting the session (matches
+# run-state's logged-never-fatal contract).
+MASTERPLAN_RUNS_DIR="$("${LMER_PYTHON:-python3}" -m lmer_cli.container.masterplan 2>/dev/null)"
+masterplan_rc=$?
+if [ "$masterplan_rc" -eq 2 ]; then
+    echo "⚠️  masterplan: enabled but the run dir is indeterminate (LMER_REPO_HOST/LMER_REPO_PROJECT unset?); skipping provisioning"
+elif [ "$masterplan_rc" -eq 0 ] && [ -n "$MASTERPLAN_RUNS_DIR" ]; then
+    export MASTERPLAN_RUNS_DIR
+    echo "✅ Masterplan mode: bundles nest at $MASTERPLAN_RUNS_DIR"
+    if command -v claude >/dev/null 2>&1; then
+        # `claude plugin` calls persist enable-state into settings.json. If it is
+        # still a symlink to a read-only mount (i.e. no settings.local.json merge
+        # above materialized it), the write fails and the plugin never enables.
+        # Materialize a writable copy first (same concern the merge block handles
+        # at line ~196). This branch is live: with the image bake no longer
+        # leaving a settings.json behind, the runtime file starts as a symlink.
+        if [ -L "$SETTINGS_FILE" ]; then
+            # cp preserves the source's mode bits, so if the linked global
+            # settings is itself mode 0444 the copy would be read-only and the
+            # plugin writes below would still fail. Force owner-write after the
+            # copy so materialization always yields a writable regular file.
+            if cp --remove-destination "$(readlink -f "$SETTINGS_FILE")" "$SETTINGS_FILE" 2>/dev/null; then
+                chmod u+w "$SETTINGS_FILE" 2>/dev/null || true
+            else
+                echo "⚠️  masterplan: could not materialize settings.json (continuing)"
+            fi
+        fi
+        claude plugin marketplace add /work/mirrors/masterplan \
+            || echo "⚠️  masterplan: marketplace add failed (continuing)"
+        claude plugin install masterplan@rasatpetabit-masterplan \
+            || echo "⚠️  masterplan: plugin install failed (continuing)"
+        claude plugin enable masterplan \
+            || echo "⚠️  masterplan: plugin enable failed (continuing)"
+    else
+        echo "⚠️  masterplan: claude not on PATH; skipping plugin provisioning"
+    fi
+fi
 
 # Run Claude through the lmer supervisor when available.
 #

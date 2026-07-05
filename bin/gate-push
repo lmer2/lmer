@@ -14,11 +14,18 @@ sys.path.insert(0, src_dir)
 
 from lmer_cli.gates import push_gate, Colors
 
+try:
+    from work_repo.run_state import emit_gate_event
+except ImportError:  # run-state wiring must never break a gate
+    def emit_gate_event(gate, outcome):
+        pass
+
 
 def gate_push(verbose: bool = False):
     """Run gate checks and push if passed"""
 
     result = push_gate(verbose=verbose)
+    emit_gate_event("gate-push", "pass" if result == 0 else "fail")
     if result != 0:
         return result
 

@@ -133,6 +133,7 @@ class TestCommitWorkChanges:
         """commit_work_path stages exactly the path it is given, with -A."""
         rel = "git.example.com/group/proj/memory"
         with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / rel).mkdir(parents=True)  # only existing paths are staged
             with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": tmpdir}):
                 with patch("work_repo.git_ops.run_git_command") as mock_git:
                     def git_side_effect(cmd, cwd, check=False):
@@ -214,3 +215,118 @@ class TestCommitWorkChanges:
                     # Verify custom message was used
                     commit_calls = [call for call in mock_git.call_args_list if call[0][0] == ["commit", "-m", "Custom message"]]
                     assert len(commit_calls) > 0
+
+
+class TestCommitWorkPathResilience:
+    """Commit-first ordering, stderr surfacing, and push retry (the session-end
+    push race observed 2026-07-05: dirty tree -> pull refused -> non-FF push,
+    all with empty error messages)."""
+
+    def test_failure_output_includes_stderr(self, tmp_path):
+        # Not a git repo: git prints the error to stderr, which must surface.
+        rc, output = run_git_command(["status"], tmp_path, check=False)
+        assert rc != 0
+        assert output.strip(), "failure output must not be empty"
+        assert "not a git repository" in output.lower()
+
+    def test_commit_happens_before_pull_and_push_retries_with_rebase(self, tmp_path):
+        rel = "git.example.com/grp/proj/runs/develop-x"
+        (tmp_path / rel).mkdir(parents=True)
+        calls = []
+
+        def side_effect(cmd, cwd, check=False):
+            calls.append(cmd)
+            if cmd[0] == "status":
+                return (0, f"M  {rel}/state.yaml\n")
+            if cmd == ["push"]:
+                # First push rejected (non-FF), second succeeds.
+                pushes = [c for c in calls if c == ["push"]]
+                if len(pushes) == 1:
+                    return (1, "! [rejected] main -> main (fetch first)")
+                return (0, "")
+            return (0, "")
+
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            with patch("work_repo.git_ops.run_git_command", side_effect=side_effect):
+                assert commit_work_path(rel) == 0
+
+        commit_i = calls.index(["commit", "-m", f"Update work repo: {rel}"])
+        first_pull_i = next(i for i, c in enumerate(calls) if c == ["pull", "--rebase"])
+        first_push_i = calls.index(["push"])
+        assert commit_i < first_pull_i < first_push_i, calls
+        # A rebase happens between the rejected and the retried push.
+        push_indices = [i for i, c in enumerate(calls) if c == ["push"]]
+        assert len(push_indices) == 2
+        rebases_between = [
+            c for c in calls[push_indices[0] + 1:push_indices[1]] if c == ["pull", "--rebase"]
+        ]
+        assert rebases_between, "must rebase between push attempts"
+
+    def test_push_gives_up_after_retries(self, tmp_path):
+        rel = "git.example.com/grp/proj/memory"
+        (tmp_path / rel).mkdir(parents=True)
+
+        def side_effect(cmd, cwd, check=False):
+            if cmd[0] == "status":
+                return (0, f"M  {rel}/fact.md\n")
+            if cmd == ["push"]:
+                return (1, "! [rejected]")
+            return (0, "")
+
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
+                assert commit_work_path(rel) == 1
+                assert [c for c in (call[0][0] for call in mock_git.call_args_list)
+                        if c == ["push"]].count(["push"]) == 3
+
+    def test_multi_path_staging_skips_missing(self, tmp_path):
+        existing = "git.example.com/grp/proj/develop/issue-1"
+        missing = "git.example.com/grp/proj/runs/develop-issue-1"
+        (tmp_path / existing).mkdir(parents=True)
+
+        def side_effect(cmd, cwd, check=False):
+            if cmd[0] == "status":
+                return (0, "M  something\n")
+            return (0, "")
+
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
+                assert commit_work_path([existing, missing]) == 0
+                add_calls = [call[0][0] for call in mock_git.call_args_list
+                             if call[0][0][:3] == ["add", "-A", "--"]]
+                assert add_calls == [["add", "-A", "--", existing]]
+
+    def test_all_paths_missing_is_clean_noop(self, tmp_path):
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            with patch("work_repo.git_ops.run_git_command") as mock_git:
+                assert commit_work_path(["nope/a", "nope/b"]) == 0
+                mock_git.assert_not_called()
+
+    def test_commit_work_changes_includes_runs_dir(self, tmp_path):
+        env_vars = {
+            "LMER_WORK_REPO_PATH": str(tmp_path),
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "grp/proj",
+            "LMER_TASK": "develop",
+            "LMER_TASK_TARGET": "https://git.example.com/grp/proj/-/issues/9",
+        }
+        task_dir = tmp_path / "git.example.com/grp/proj/develop/issue-9"
+        runs_dir = tmp_path / "git.example.com/grp/proj/runs/develop-issue-9"
+        task_dir.mkdir(parents=True)
+        runs_dir.mkdir(parents=True)
+
+        def side_effect(cmd, cwd, check=False):
+            if cmd[0] == "status":
+                return (0, "M  x\n")
+            return (0, "")
+
+        with patch.dict(os.environ, env_vars):
+            with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
+                assert commit_work_changes() == 0
+                add_calls = [call[0][0] for call in mock_git.call_args_list
+                             if call[0][0][:3] == ["add", "-A", "--"]]
+                assert add_calls == [[
+                    "add", "-A", "--",
+                    "git.example.com/grp/proj/develop/issue-9",
+                    "git.example.com/grp/proj/runs/develop-issue-9",
+                ]]

@@ -110,3 +110,11 @@ class TestContainerfile:
                     if any(word in line.lower() for word in ['renamed', 'moved', 'was', 'legacy']):
                         continue
                     assert False, f"{file_path} still references Dockerfile: {line}"
+
+
+class TestBuildProvenanceBaked:
+    def test_containerfile_bakes_build_commit(self):
+        content = (Path(__file__).parent.parent / "Containerfile").read_text()
+        assert "ARG LMER_BUILD_COMMIT" in content
+        assert "ENV LMER_BUILD_COMMIT" in content
+        assert "/Agents/global/BUILD_INFO" in content

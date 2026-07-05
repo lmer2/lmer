@@ -218,6 +218,11 @@ def base_run_args(runtime: str, exec_mode: bool, user: str) -> List[str]:
         List of base Docker/Podman arguments
     """
     args: List[str] = [runtime, "run", "--rm"]
+    # PID 1 init (tini): reap orphaned grandchildren and forward signals.
+    # clone_and_exec.py runs the claude-runner as a child (session-end
+    # backstop) instead of exec'ing it, so without an init the Python
+    # process is PID 1 and zombies accumulate unreaped.
+    args += ["--init"]
     args += tty_flags()
     # Resource limits and security
     args += ["--cpus", "1", "--memory", "2g", "--pids-limit", _resolve_pids_limit(), "--security-opt", "no-new-privileges"]

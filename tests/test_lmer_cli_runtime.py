@@ -178,6 +178,9 @@ class TestBaseRunArgs:
         assert "docker" in args
         assert "run" in args
         assert "--rm" in args
+        # PID 1 init: reaps zombies now that clone_and_exec.py keeps the
+        # runner as a child (session-end backstop) instead of exec'ing it.
+        assert "--init" in args
         assert "--cpus" in args
         assert "1" in args
         assert "--memory" in args

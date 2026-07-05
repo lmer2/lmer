@@ -5,13 +5,16 @@ from __future__ import annotations
 import sys
 import argparse
 import os
+import json
+import re
 from pathlib import Path
 from datetime import datetime
 import yaml
 
 from .loggers import get_logger
 from .info_reader import read_project_info
-from .git_ops import commit_work_changes
+from .git_ops import commit_work_changes, commit_work_path
+from . import run_state
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
 
@@ -130,6 +133,82 @@ Examples:
         help="Commit message (defaults to auto-generated)",
     )
 
+    # state command (run-state kernel — spec §4.3)
+    state_parser = subparsers.add_parser(
+        "state",
+        help="Show or mutate the durable run state (state.yaml)",
+    )
+    state_parser.add_argument(
+        "action", nargs="?", choices=["set"],
+        help="'set' to mutate; omit to display current state",
+    )
+    state_parser.add_argument("--phase", help="Set the current phase (free-form)")
+    state_parser.add_argument(
+        "--stop-reason", dest="stop_reason",
+        choices=["question", "yield", "complete", "critical_error", "none"],
+        help="Why the session is stopping ('none' clears it)",
+    )
+    state_parser.add_argument(
+        "--status", choices=["in-progress", "complete", "archived"],
+        help="Run status",
+    )
+    state_parser.add_argument(
+        "--critical-error", dest="critical_error",
+        help='JSON object {"summary": ..., "detail": ...}; required with --stop-reason=critical_error',
+    )
+
+    # name command (run naming — spec §1)
+    name_parser = subparsers.add_parser(
+        "name",
+        help="Set or display the run's human-readable kebab-case name",
+    )
+    name_parser.add_argument(
+        "value",
+        nargs="?",
+        help="Name to set (normalized to kebab-case; omit to display the current name)",
+    )
+
+    # event command
+    event_parser = subparsers.add_parser(
+        "event",
+        help="Append an event to the run's events.jsonl",
+    )
+    event_parser.add_argument("type", help="Event type (e.g. review_posted)")
+    event_parser.add_argument("--note", help="Short human-readable note")
+    event_parser.add_argument("--data", help="JSON object with extra data")
+
+    # resume command
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Print the resume brief for the current run (read-only)",
+    )
+    resume_parser.add_argument("--json", action="store_true", dest="as_json",
+                               help="Emit the decision as JSON")
+
+    # artifact command
+    artifact_parser = subparsers.add_parser(
+        "artifact",
+        help="Copy a file into the run dir and register it as a durable artifact",
+    )
+    artifact_parser.add_argument("name", nargs="?",
+                                 help="Artifact filename (e.g. spec.md)")
+    artifact_parser.add_argument("--file", "-f",
+                                 help="Source file to copy into the run dir")
+    artifact_parser.add_argument(
+        "--sync", action="store_true",
+        help="Link masterplan bundle artifacts at the run-dir root (spec §6)",
+    )
+
+    # session-start / session-end (hook plumbing — spec §4.4)
+    subparsers.add_parser(
+        "session-start",
+        help="Seed/claim the run for this session and print the resume brief (hook-facing)",
+    )
+    subparsers.add_parser(
+        "session-end",
+        help="Record session end, release the owner claim, push run state (hook-facing)",
+    )
+
     return parser
 
 
@@ -239,6 +318,24 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
         return 1
 
 
+def _sync_masterplan_links() -> list[str]:
+    """Fail-soft masterplan artifact-link sync for the current run dir (spec §6).
+
+    The kernel helper already never raises, but this wraps it in the same
+    defensive style as the hook-facing commands: no sync problem may ever
+    change the host command's behavior or exit code. Returns the link names
+    now present at the run-dir root ([] when there is nothing to sync).
+    """
+    try:
+        rdir = run_state.run_dir()
+        if rdir is None or not rdir.is_dir():
+            return []
+        return run_state.sync_masterplan_artifacts(rdir)
+    except Exception as exc:
+        print(f"⚠️  masterplan artifact sync skipped: {exc}")
+        return []
+
+
 def cmd_commit(message: str | None) -> int:
     """
     Execute commit command.
@@ -249,6 +346,10 @@ def cmd_commit(message: str | None) -> int:
     Returns:
         Exit code
     """
+    # Self-maintain masterplan artifact links before staging (spec §6) so
+    # every push carries the run-dir-root links. Fail-soft: never changes
+    # the commit's behavior or exit code.
+    _sync_masterplan_links()
     return commit_work_changes(message)
 
 
@@ -325,6 +426,21 @@ def cmd_goal(description: str | None) -> int:
             # Set the goal
             goal_file.write_text(description, encoding="utf-8")
             print(f"✅ Goal set: {description}")
+
+            # Also record the goal durably in the run state when a run
+            # context exists (spec §5.5). Fails soft — the legacy goal file
+            # above is already written, and a state-layer problem must not
+            # break `work goal`.
+            try:
+                rdir = run_state.run_dir()
+                if rdir is not None:
+                    state = _load_or_seed(rdir)
+                    state["goal"] = description
+                    run_state.write_state(rdir, state)
+                    run_state.append_event(rdir, "goal_set", note=description)
+            except Exception:
+                pass
+
             return 0
         else:
             # Display current goal
@@ -362,6 +478,387 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
         return 1
 
 
+def _require_run_dir() -> Path | None:
+    """Run dir for mutations; prints the standard no-context error when unset."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+    return rdir
+
+
+def _load_or_seed(rdir: Path) -> dict:
+    """Load state, seeding a fresh run (with run_seeded event) if absent.
+
+    Defensive auto-seed: taskdef instructions call `work state set` assuming
+    the /start hook seeded the run — if it didn't (host session, older
+    runner), the mutation must still land rather than fail.
+    """
+    state = run_state.load_state(rdir)
+    if state is None:
+        state = run_state.seed_state(
+            run_state.derive_slug(),
+            os.environ.get("LMER_TASK", "default"),
+            os.environ.get("LMER_TASK_TARGET", ""),
+        )
+        run_state.write_state(rdir, state)
+        run_state.append_event(rdir, "run_seeded")
+    return state
+
+
+def cmd_state(args) -> int:
+    """Execute state / state set commands."""
+    if args.action != "set":
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+            return 0
+        try:
+            state = run_state.load_state(rdir)
+        except run_state.RunStateError as exc:
+            print(f"⚠️  {exc}", file=sys.stderr)
+            return 1
+        if state is None:
+            print(f"No run state yet at {rdir}")
+            return 0
+        print(yaml.safe_dump(state, sort_keys=False), end="")
+        return 0
+
+    # --- mutation path ---
+    if not any([args.phase, args.stop_reason, args.status, args.critical_error]):
+        print("❌ state set requires at least one of --phase/--stop-reason/--status", file=sys.stderr)
+        return 1
+    if args.stop_reason == "critical_error" and not args.critical_error:
+        print("❌ --stop-reason=critical_error requires --critical-error JSON", file=sys.stderr)
+        return 1
+    critical_error = None
+    if args.critical_error:
+        try:
+            critical_error = json.loads(args.critical_error)
+        except json.JSONDecodeError as exc:
+            print(f"❌ --critical-error is not valid JSON: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(critical_error, dict):
+            print("❌ --critical-error must be a JSON object, e.g. '{\"summary\": \"...\", \"detail\": \"...\"}'", file=sys.stderr)
+            return 1
+
+    rdir = _require_run_dir()
+    if rdir is None:
+        return 1
+    try:
+        state = _load_or_seed(rdir)
+    except run_state.RunStateError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+
+    changed = {}
+    phase_changed = False
+    if args.phase and args.phase != state.get("phase"):
+        state["phase"] = args.phase
+        changed["phase"] = args.phase
+        phase_changed = True
+    if args.stop_reason:
+        state["stop_reason"] = None if args.stop_reason == "none" else args.stop_reason
+        changed["stop_reason"] = state["stop_reason"]
+        if state["stop_reason"] != "critical_error":
+            state["critical_error"] = None
+    if critical_error is not None:
+        state["critical_error"] = critical_error
+        changed["critical_error"] = True
+    if args.status:
+        state["status"] = args.status
+        changed["status"] = args.status
+
+    if not changed:
+        print("✅ State unchanged")
+        return 0
+
+    run_state.write_state(rdir, state)
+    if phase_changed:
+        run_state.append_event(rdir, "phase", note=args.phase)
+    if set(changed) - {"phase"}:
+        run_state.append_event(rdir, "state_changed", data=changed)
+    print(f"✅ State updated: {changed}")
+
+    # Durability (spec §4.4): push on phase transitions and completion.
+    if phase_changed or args.status == "complete":
+        rel = run_state.run_rel_path()
+        detail = f"phase={args.phase}" if phase_changed else f"status={args.status}"
+        rc = commit_work_path(rel, f"run-state: {state['slug']} {detail}")
+        if rc != 0:
+            print("⚠️  Warning: run-state push failed (state saved locally)")
+    return 0
+
+
+def cmd_event(args) -> int:
+    """Execute event command."""
+    data = None
+    if args.data:
+        try:
+            data = json.loads(args.data)
+        except json.JSONDecodeError as exc:
+            print(f"❌ --data is not valid JSON: {exc}", file=sys.stderr)
+            return 1
+    rdir = _require_run_dir()
+    if rdir is None:
+        return 1
+    try:
+        _load_or_seed(rdir)
+    except run_state.RunStateError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    run_state.append_event(rdir, args.type, note=args.note, data=data)
+    print(f"✅ Event appended: {args.type}")
+    return 0
+
+
+def _normalize_name(value: str) -> str:
+    """Kebab-case normalization (spec §1): lowercase; spaces/underscores to
+    '-'; strip anything outside [a-z0-9-]; collapse '-' runs; trim ends."""
+    value = re.sub(r"[ _]", "-", value.lower())
+    value = re.sub(r"[^a-z0-9-]", "", value)
+    value = re.sub(r"-+", "-", value)
+    return value.strip("-")
+
+
+def _name_conflict(rdir: Path, name: str) -> str | None:
+    """Slug of another run in this project already holding `name`, or None.
+
+    Scans sibling run dirs for state.yaml (plus legacy state.yml).
+    Corrupt/unreadable siblings are skipped — a broken run must not block
+    naming — and the archive/ subtree is ignored (archived runs no longer
+    hold their names). A sibling's directory slug also holds its name: a
+    name equal to another run's slug would break findability today and
+    collide outright if the name-as-directory growth path lands.
+    """
+    base = rdir.parent
+    if not base.is_dir():
+        return None
+    for sibling in sorted(base.iterdir()):
+        if not sibling.is_dir() or sibling.name in (rdir.name, "archive"):
+            continue
+        if sibling.name == name:
+            return sibling.name
+        for fname in (run_state.STATE_FILE, run_state.LEGACY_STATE_FILE):
+            path = sibling / fname
+            if not path.exists():
+                continue
+            try:
+                sib_state = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except Exception:
+                sib_state = None  # corrupt/unreadable sibling — skip it
+            if isinstance(sib_state, dict) and sib_state.get("name") == name:
+                return sibling.name
+            break  # state.yaml wins on read; ignore a leftover legacy file
+    return None
+
+
+def cmd_name(value: str | None) -> int:
+    """Execute name command (spec §1 `work name`)."""
+    if value is None:
+        # Display path — read-only; never breaks a session (always 0).
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+            return 0
+        try:
+            state = run_state.load_state(rdir)
+        except run_state.RunStateError as exc:
+            print(f"⚠️  {exc}", file=sys.stderr)
+            return 0
+        if state is None or not state.get("name"):
+            print("No name set")
+        else:
+            print(state["name"])
+        return 0
+
+    # --- mutation path ---
+    name = _normalize_name(value)
+    if not name:
+        print(f"❌ Nothing left of {value!r} after kebab-case normalization", file=sys.stderr)
+        return 1
+    if name != value:
+        print(f"Normalized to: {name}")
+    if name == "archive":
+        # The cleaner's archive/ subtree shares the runs namespace; if the
+        # name-as-directory growth path lands, this name would collide.
+        print("❌ 'archive' is a reserved name (the archived-runs subtree)", file=sys.stderr)
+        return 1
+    rdir = _require_run_dir()
+    if rdir is None:
+        return 1
+    try:
+        state = _load_or_seed(rdir)
+    except run_state.RunStateError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    if state.get("name") == name:
+        print(f"✅ Name unchanged: {name}")
+        return 0
+    holder = _name_conflict(rdir, name)
+    if holder is not None:
+        print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
+        return 1
+    state["name"] = name
+    run_state.write_state(rdir, state)
+    run_state.append_event(rdir, "run_named", note=name)
+    print(f"✅ Run named: {name}")
+    return 0
+
+
+def cmd_resume(as_json: bool = False) -> int:
+    """Execute resume command. Read-only; never breaks a session (always 0)."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    try:
+        state = run_state.load_state(rdir)
+    except run_state.RunStateError as exc:
+        print(f"⚠️  Run state unreadable — falling back to worklog. ({exc})")
+        return 0
+    events = run_state.read_events(rdir, last_n=5)
+    decision = run_state.decide(state, events, run_state.current_session_id())
+    if as_json:
+        print(json.dumps(decision, ensure_ascii=False))
+    else:
+        print(run_state.format_brief(decision))
+    return 0
+
+
+def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) -> int:
+    """Execute artifact command (spec §4.3 `work artifact`, §6 `--sync`)."""
+    if sync:
+        # Manual masterplan artifact-link sync (spec §6). Standalone mode:
+        # combining it with a copy invocation is ambiguous — reject cleanly.
+        if name is not None or file_path is not None:
+            print("❌ --sync takes no artifact name or --file", file=sys.stderr)
+            return 1
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset) — nothing to sync")
+            return 0
+        linked = _sync_masterplan_links()
+        if linked:
+            print(f"✅ Masterplan artifacts linked: {', '.join(linked)}")
+        else:
+            print("No masterplan artifacts to link")
+        return 0
+
+    if name is None:
+        print("❌ artifact requires a name (or --sync)", file=sys.stderr)
+        return 1
+    if file_path is None:
+        print("❌ artifact requires --file/-f (or --sync)", file=sys.stderr)
+        return 1
+    if not name or Path(name).name != name or name.startswith("."):
+        print(f"❌ Invalid artifact name: {name!r} (plain filename required)", file=sys.stderr)
+        return 1
+    reserved = (run_state.STATE_FILE, run_state.LEGACY_STATE_FILE, run_state.EVENTS_FILE)
+    reserved_prefixes = tuple(f"{f}." for f in (run_state.STATE_FILE, run_state.LEGACY_STATE_FILE))
+    if name in reserved or name.startswith(reserved_prefixes):
+        print(f"❌ Reserved artifact name: {name}", file=sys.stderr)
+        return 1
+    source = Path(file_path)
+    if not source.exists():
+        print(f"❌ Artifact source not found: {file_path}", file=sys.stderr)
+        return 1
+    rdir = _require_run_dir()
+    if rdir is None:
+        return 1
+    try:
+        state = _load_or_seed(rdir)
+    except run_state.RunStateError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    content = redact_secrets(source.read_text(encoding="utf-8"))
+    (rdir / name).write_text(content, encoding="utf-8")
+    state.setdefault("artifacts", {})[Path(name).stem] = name
+    run_state.write_state(rdir, state)
+    run_state.append_event(rdir, "artifact_written", note=name)
+    print(f"✅ Artifact registered: {rdir / name}")
+
+    # Durability: artifacts are exactly what a dead session must not lose —
+    # push the run dir now rather than waiting for session end (non-fatal).
+    rc = commit_work_path(run_state.run_rel_path(), f"run-state: {state['slug']} artifact {name}")
+    if rc != 0:
+        print("⚠️  Warning: run-state push failed (artifact saved locally)")
+    return 0
+
+
+def cmd_session_start() -> int:
+    """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
+    ALWAYS exits 0 — a broken state layer must never break session start."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset) — run state skipped")
+        return 0
+    try:
+        recovered = False
+        try:
+            state = run_state.load_state(rdir)
+        except run_state.RunStateError:
+            # Corrupt file was backed up by load_state; recover with a fresh seed.
+            state = None
+            recovered = True
+        if state is None:
+            state = run_state.seed_state(
+                run_state.derive_slug(),
+                os.environ.get("LMER_TASK", "default"),
+                os.environ.get("LMER_TASK_TARGET", ""),
+            )
+            run_state.write_state(rdir, state)
+            run_state.append_event(rdir, "run_seeded")
+
+        # Decide BEFORE claiming so a foreign claim surfaces as a warning.
+        events = run_state.read_events(rdir, last_n=5)
+        decision = run_state.decide(state, events, run_state.current_session_id())
+
+        run_state.append_event(rdir, "session_start")
+        state["owner"] = {
+            "session_id": run_state.current_session_id(),
+            "claimed_at": run_state.utc_now_iso(),
+        }
+        run_state.write_state(rdir, state)
+
+        if recovered:
+            print("⚠️  Previous state.yaml was unreadable (backed up); recovered with a fresh seed.")
+        print(run_state.format_brief(decision))
+    except Exception as exc:  # never break a session (spec §6)
+        print(f"⚠️  run-state session-start failed (continuing): {exc}")
+    return 0
+
+
+def cmd_session_end() -> int:
+    """Record session end and release our claim. Hook-facing: ALWAYS exits 0."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        return 0
+    # Surface masterplan artifacts at the run-dir root before the final
+    # staging/push (spec §6). Runs before load_state so any registration the
+    # sync writes lands in the state loaded below; fail-soft like the rest.
+    _sync_masterplan_links()
+    try:
+        try:
+            state = run_state.load_state(rdir)
+        except run_state.RunStateError as exc:
+            print(f"⚠️  run-state unreadable at session end: {exc}")
+            return 0
+        if state is None:
+            return 0
+        run_state.append_event(rdir, "session_end")
+        owner = state.get("owner")
+        if isinstance(owner, dict) and owner.get("session_id") == run_state.current_session_id():
+            state["owner"] = None
+        run_state.write_state(rdir, state)
+        rel = run_state.run_rel_path()
+        rc = commit_work_path(rel, f"run-state: session end {state['slug']}")
+        if rc != 0:
+            print("⚠️  Warning: run-state push failed at session end (state saved locally)")
+    except Exception as exc:
+        print(f"⚠️  run-state session-end failed (continuing): {exc}")
+    return 0
+
+
 def main() -> int:
     """Main entry point for work CLI."""
     parser = create_parser()
@@ -383,6 +880,20 @@ def main() -> int:
         return cmd_goal(args.description)
     elif args.command == "memory":
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
+    elif args.command == "state":
+        return cmd_state(args)
+    elif args.command == "event":
+        return cmd_event(args)
+    elif args.command == "name":
+        return cmd_name(args.value)
+    elif args.command == "resume":
+        return cmd_resume(args.as_json)
+    elif args.command == "artifact":
+        return cmd_artifact(args.name, args.file, args.sync)
+    elif args.command == "session-start":
+        return cmd_session_start()
+    elif args.command == "session-end":
+        return cmd_session_end()
     else:
         print(f"❌ Unknown command: {args.command}", file=sys.stderr)
         return 1

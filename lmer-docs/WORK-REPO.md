@@ -265,6 +265,162 @@ work goal "Focus on security review of auth endpoints"
 
 **Note**: The `work goal` command is particularly useful when using `/start phasic` mode, as it helps track objectives for each phase of work. In phasic mode, Claude will automatically set goals for each phase and check them regularly.
 
+## Run state (Run D.M.C.)
+
+Every session maintains durable, machine-readable state for its run —
+`state.yaml` and an append-only `events.jsonl` — at
+`{host}/{project}/runs/<slug>/` in the work repo. (Older runs may still
+hold a legacy `state.yml`; it is read transparently and migrated to
+`state.yaml` on the run's first mutation.) This is separate from
+`log.yaml`/reports above: those are narrative, this is structured and safe
+for hooks and external tools to read.
+
+**Single-writer rule: never edit `state.yaml` directly.** All mutation goes
+through the `work` CLI, which does atomic writes and appends the matching
+event. Editing the file by hand (or from a script outside `work`) breaks the
+single-writer guarantee the state layer depends on.
+
+**Fail-soft guarantee:** the state layer never breaks your session.
+`work session-start` and `work session-end` always exit 0, `work resume`
+never exits non-zero, and the gate/goal integrations never change their
+host command's behavior or exit code — state-layer errors are reported and
+skipped. Without a run context (`LMER_REPO_HOST`/`LMER_REPO_PROJECT`
+unset), the read-only and hook-facing verbs (`work state`, `work resume`,
+`work session-start`, `work session-end`) print a "no run context" message
+and exit 0, but the mutating verbs (`work state set`, `work event`,
+`work artifact`) print an error to stderr and exit 1 — scripts chaining
+them under `set -e` should expect that.
+
+### Show current state
+
+```bash
+work state
+```
+
+Prints the run's `state.yaml` (read-only). If no run exists yet, says so and
+exits 0.
+
+### Update state
+
+```bash
+work state set --phase=implementation --stop-reason=question --status=in-progress \
+  --critical-error='{"summary": "tests hang", "detail": "..."}'
+```
+
+- `--phase=<free-form string>` — record the current phase (taskdef-defined).
+- `--stop-reason=<question|yield|complete|critical_error|none>` — why the
+  session is stopping. `question` = waiting on a human; `yield` = a
+  deliberate phasic phase-end; `complete` = the run is done;
+  `critical_error` = actually broken (routine blockers are `question`, not
+  this). Use `--stop-reason=none` to clear it back to unset:
+
+  ```bash
+  work state set --stop-reason=none
+  ```
+- `--status=<in-progress|complete|archived>` — the run's overall status.
+- `--critical-error=<json>` — a JSON object (`{"summary": ..., "detail":
+  ...}`); required when `--stop-reason=critical_error` is given.
+
+At least one of `--phase`/`--stop-reason`/`--status`/`--critical-error` is
+required. Only `--phase` is compared against the current value:
+re-submitting the same `--phase` with no other flags short-circuits with
+`State unchanged` and writes nothing. Passing `--stop-reason`, `--status`,
+or `--critical-error` always writes state and appends a `state_changed`
+event, even when the value is identical to what's already recorded — and
+`--status=complete` triggers a work-repo push each time, so an idempotent
+retry of the close-out command re-pushes (harmless, but not silent).
+
+### Name the run
+
+```bash
+# Set (or change) the run's human-readable name
+work name auth-refactor
+
+# Display the current name
+work name
+```
+
+Records a short kebab-case `name:` in the run state (input is normalized:
+lowercased, spaces/underscores become hyphens). Auto-derived slugs like
+`develop-issue-123` are hard to find later — the name is the label you'll
+recognize, shown first in the resume brief:
+`Run: auth-refactor (slug: develop-issue-123, status: in-progress)`.
+
+Names are **unique per project**: a name already held by another run — via
+its `name:` or its directory slug — is rejected with the conflicting slug
+named. Renaming is free (each rename appends a `run_named` event);
+re-setting the run's own current name is a no-op. Set the name early, once
+direction is clear — an unanswered name proposal may default to accepted,
+unlike task questions.
+
+### Record an event
+
+```bash
+work event review_posted --note "posted round 2 comments" --data '{"count": 4}'
+```
+
+Appends one line to `events.jsonl`. `--note` and `--data` (a JSON object)
+are both optional. The run is auto-seeded if this is the first `work`
+invocation for it.
+
+### Print the resume brief
+
+```bash
+work resume
+work resume --json
+```
+
+Reads state + recent events and prints a human-readable brief (slug,
+status, phase, stop_reason, goal, last ~5 events, artifacts, and an
+owner-claim warning if another session has the run claimed). `--json` emits
+the same decision as machine-readable JSON, for hooks/scripts.
+
+### Register a durable artifact
+
+```bash
+work artifact spec.md --file /tmp/agreed-approach.md
+```
+
+Copies the file into the run dir (secrets redacted) under a plain filename
+(no paths, no leading dot), registers it in `state.artifacts`, and appends
+an `artifact_written` event.
+
+### Masterplan artifact links
+
+```bash
+work artifact --sync
+```
+
+For masterplan-mode runs (a `masterplan/<mp-slug>/` bundle nested in the run
+dir), maintains relative symlinks at the run-dir root for the bundle's
+well-known artifacts (`spec.md`, `goals.md`, `plan.md`, `plan.html`,
+`retro.md`) so they are findable without digging into the bundle, and
+registers them in `state.artifacts`. The same sync runs automatically during
+`work commit` and `work session-end`, so you rarely need the manual form.
+Fail-soft: sync problems never change the host command's exit code; runs
+without a bundle are untouched.
+
+### Session hooks
+
+```bash
+work session-start   # hook-facing: seed/claim the run, print the resume brief
+work session-end     # hook-facing: release the claim, push run state
+```
+
+These back the `/start` render pipeline and the `SessionEnd` Claude Code
+hook respectively — you generally won't invoke them by hand. Both always
+exit 0.
+
+### `work goal` also records into the run
+
+When a run context exists, `work goal "description"` now additionally
+writes the goal into `state.yaml` and appends a `goal_set` event, in
+addition to its existing `/tmp` goal-file behavior — no change to how you
+call it.
+
+See [docs/RUN-STATE.md](../docs/RUN-STATE.md) for the full design: schema,
+slug derivation, session lifecycle, and the external cleaner contract.
+
 ## See Also
 
 - `gitlab-review` - GitLab merge request and issue management

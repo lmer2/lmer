@@ -54,3 +54,6 @@ implement/
 build/
 dist/
 third-party-docs/
+
+# Local-only holding area (untracked scratch, reference clones)
+/LOCAL/

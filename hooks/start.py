@@ -10,6 +10,8 @@ import sys
 import os
 import re
 import time
+import shutil
+import subprocess
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 import json
@@ -87,6 +89,21 @@ def work_repo_taskdef_dirs():
     return dirs
 
 
+def builtin_taskdef_root():
+    """Locate the built-in taskdef directory — shared fragments
+    (service-mode.jinja2, run-state.jinja2, changelog.jinja2, …) live here."""
+    lmer_global = Path("/home/developer/.lmer")
+    agents_global = Path("/Agents/global")
+
+    if lmer_global.exists():
+        base_path = lmer_global
+    elif agents_global.exists():
+        base_path = agents_global
+    else:
+        base_path = Path.cwd()
+    return base_path / "taskdef"
+
+
 def taskdef_search_dirs():
     """Return ordered list of directories to search for task definitions.
 
@@ -97,16 +114,6 @@ def taskdef_search_dirs():
       4. Built-in taskdef directory (under /home/developer/.lmer or
          /Agents/global, depending on what is mounted)
     """
-    lmer_global = Path("/home/developer/.lmer")
-    agents_global = Path("/Agents/global")
-
-    if lmer_global.exists():
-        base_path = lmer_global
-    elif agents_global.exists():
-        base_path = agents_global
-    else:
-        base_path = Path.cwd()
-
     search_dirs = list(work_repo_taskdef_dirs())
 
     extra_paths = os.environ.get("LMER_TASKDEF_PATHS", "")
@@ -116,7 +123,7 @@ def taskdef_search_dirs():
             if p:
                 search_dirs.append(Path(p))
 
-    search_dirs.append(base_path / "taskdef")
+    search_dirs.append(builtin_taskdef_root())
     return search_dirs
 
 
@@ -206,6 +213,15 @@ def render_taskdef_template(template_file, extra_context=None):
     builtin_taskdef = Path(os.environ.get("LMER_TASKDEF_ROOT", ""))
     if builtin_taskdef.is_dir() and str(builtin_taskdef) not in search_paths:
         search_paths.append(str(builtin_taskdef))
+    # Defensive (issue #80): LMER_TASKDEF_ROOT can carry a path that doesn't
+    # exist in this environment (e.g. a host path leaked into the container),
+    # which the is_dir() guard above silently drops — always add the real
+    # built-in root so shared fragments (service-mode.jinja2,
+    # run-state.jinja2, …) resolve for taskdefs served from external mounts
+    # or alternate work repos.
+    detected_builtin = builtin_taskdef_root()
+    if str(detected_builtin) not in search_paths:
+        search_paths.append(str(detected_builtin))
     env = Environment(loader=FileSystemLoader(search_paths))
 
     template_name = template_file.relative_to(taskdef_dir)
@@ -223,6 +239,29 @@ def render_taskdef_template(template_file, extra_context=None):
     return template.render(**context)
 
 
+def run_state_session_start():
+    """Start/claim the durable run for this session via `work session-start`
+    and return its resume brief for template injection.
+
+    Fail-soft by design (the state layer must never break a session): any
+    missing binary, non-zero exit, timeout, or exception returns "".
+    """
+    if not shutil.which("work"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["work", "session-start"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
 def read_and_display_instructions(instructions_file, work_mode="finish"):
     """Read and display the task instructions, rendering with Jinja2."""
     print(f"📋 Task Instructions: {instructions_file.parent.name}")
@@ -234,6 +273,7 @@ def read_and_display_instructions(instructions_file, work_mode="finish"):
         extra_context={
             'instructions_file': str(instructions_file),
             'work_mode': work_mode,
+            'run_state_brief': run_state_session_start(),
         },
     )
     print(rendered_content)

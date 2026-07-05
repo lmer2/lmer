@@ -34,11 +34,18 @@ def _run_main(env, argv=None):
     def fake_execv(path, args):
         execv_calls.append((path, args))
 
+    def fake_dispatch_runner(runner):
+        # The runner is now dispatched as a child process (dispatch_runner)
+        # rather than execv'd; record it in the same shape for assertions.
+        execv_calls.append((runner, [runner]))
+        return 0
+
     with patch.dict(os.environ, env, clear=True):
         with patch.object(clone_and_exec, "ensure_clone", fake_ensure_clone), \
              patch.object(clone_and_exec, "ensure_work_repo_directory"), \
              patch.object(clone_and_exec, "provision_documentation"), \
              patch.object(clone_and_exec, "find_runner", return_value="/bin/true"), \
+             patch.object(clone_and_exec, "dispatch_runner", fake_dispatch_runner), \
              patch.object(clone_and_exec.os, "execv", fake_execv):
             rc = clone_and_exec.main(argv if argv is not None else ["--", "claude-runner"])
 

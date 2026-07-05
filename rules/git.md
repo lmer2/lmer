@@ -62,6 +62,28 @@ By default, no repositories are auto-allowed for push.
 3. Request permission if not on allow list
 4. User must configure allow list via env var
 
+## 🚨 Merge Policy — review must be COMPLETE, not just quiet
+**CRITICAL**: Before merging any MR/PR (via UI, API, or a local merge pushed
+to the target branch), verify ALL of:
+1. **No unresolved discussion threads** (`gitlab-review <proj> <mr> --comments`;
+   system "mentioned in commit" notes don't count).
+2. **No un-re-reviewed fixes**: if commits were pushed to the source branch
+   after the reviewer's last pass, the reviewer must re-review first —
+   author-resolved threads are NOT review sign-off.
+3. Pipeline green (or the human explicitly waives it).
+
+A human instruction to merge does not waive these checks — verify and
+surface the review state; merge only when it's clean or the human explicitly
+overrides after seeing it. Note that a local `git merge` + push bypasses
+GitLab's server-side merge checks entirely — which is exactly why this rule
+exists.
+
+**Merge method by edge**:
+- **Feature branch → `prep-release`: ALWAYS squash** (one commit per
+  feature; the full history stays on the feature branch / in the MR).
+- **`prep-release` → `main`: NEVER squash** (regular merge commit — the
+  release history must be preserved).
+
 ## Branch Management
 - Create descriptive branch names
 - Keep branches up to date with main

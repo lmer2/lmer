@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from lmer_cli.cli import _resolve_afk_timeout_ms
 from tests._claude_runner_harness import run_claude_runner, skip_if_npm_claude_present
 
 
@@ -32,6 +33,38 @@ def test_cli_env_dict_declares_reasoning_effort():
         r"""["']LMER_REASONING_EFFORT["']\s*:\s*os\.environ\.get\(\s*["']LMER_REASONING_EFFORT["']\s*\)"""
     )
     assert pattern.search(source), "LMER_REASONING_EFFORT entry missing from cli.py env dict"
+
+
+def test_cli_env_dict_declares_afk_timeout_ms():
+    """Guard against accidental removal of CLAUDE_AFK_TIMEOUT_MS from cli.py's env dict."""
+    source = CLI_PY.read_text()
+    pattern = re.compile(
+        r"""["']CLAUDE_AFK_TIMEOUT_MS["']\s*:\s*os\.environ\.get\(\s*["']CLAUDE_AFK_TIMEOUT_MS["']\s*\)"""
+    )
+    assert pattern.search(source), "CLAUDE_AFK_TIMEOUT_MS entry missing from cli.py env dict"
+
+
+def test_cli_env_dict_declares_run_state_guard():
+    """Guard against accidental removal of LMER_RUN_STATE_GUARD from cli.py's env dict."""
+    source = CLI_PY.read_text()
+    pattern = re.compile(
+        r"""["']LMER_RUN_STATE_GUARD["']\s*:\s*os\.environ\.get\(\s*["']LMER_RUN_STATE_GUARD["']\s*\)"""
+    )
+    assert pattern.search(source), "LMER_RUN_STATE_GUARD entry missing from cli.py env dict"
+
+
+class TestResolveAfkTimeoutMs:
+    """Behavior tests for cli._resolve_afk_timeout_ms (Slack-default AFK timeout)."""
+
+    def test_slack_bridged_defaults_to_300000_when_unset(self):
+        assert _resolve_afk_timeout_ms(None, slack_bridged=True) == "300000"
+
+    @pytest.mark.parametrize("slack_bridged", [True, False])
+    def test_explicit_value_is_preserved(self, slack_bridged):
+        assert _resolve_afk_timeout_ms("120000", slack_bridged=slack_bridged) == "120000"
+
+    def test_plain_terminal_stays_untouched_when_unset(self):
+        assert _resolve_afk_timeout_ms(None, slack_bridged=False) is None
 
 
 def _run_claude_runner(tmp_path, env_value=None):

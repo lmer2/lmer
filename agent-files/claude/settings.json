@@ -175,6 +175,20 @@
           {
             "type": "command",
             "command": "python3 /Agents/global/hooks/slack_reply_guard.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 /Agents/global/hooks/run_state_guard.py"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v work >/dev/null 2>&1 && work session-end || true"
           }
         ]
       }

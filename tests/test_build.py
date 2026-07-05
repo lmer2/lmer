@@ -345,3 +345,35 @@ class TestBuildImage:
         with patch("lmer_cli.build.image_exists", return_value=False), \
              patch("lmer_cli.build.build_image_local", return_value=1):
             assert build_image("docker", "img:v1", tmp_path) is False
+
+
+class TestBuildProvenance:
+    """Every image build bakes its commit (BUILD_INFO / LMER_BUILD_COMMIT) so
+    sessions can answer 'what code am I running?' without symbol-grepping."""
+
+    def test_local_build_passes_commit_build_arg(self, tmp_path):
+        with patch("lmer_cli.build.subprocess.call", return_value=0) as mock_call, \
+             patch("lmer_cli.build._build_provenance", return_value="abc1234 (feat/x) built=T"):
+            build_image_local("docker", "myimage:abc1234", tmp_path)
+            cmd = mock_call.call_args[0][0]
+        assert "--build-arg" in cmd
+        assert "LMER_BUILD_COMMIT=abc1234 (feat/x) built=T" in cmd
+
+    def test_checkout_commit_none_outside_git(self, tmp_path):
+        from lmer_cli.build import checkout_commit
+        assert checkout_commit(tmp_path) is None
+        assert checkout_commit(None) is None
+
+    def test_checkout_commit_clean_and_dirty(self, tmp_path):
+        from lmer_cli.build import checkout_commit
+        import subprocess as sp
+        sp.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+        sp.run(["git", "config", "user.email", "t@example.com"], cwd=tmp_path, check=True, capture_output=True)
+        sp.run(["git", "config", "user.name", "T"], cwd=tmp_path, check=True, capture_output=True)
+        (tmp_path / "f.txt").write_text("x")
+        sp.run(["git", "add", "f.txt"], cwd=tmp_path, check=True, capture_output=True)
+        sp.run(["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True)
+        clean = checkout_commit(tmp_path)
+        assert clean and "-dirty" not in clean
+        (tmp_path / "f.txt").write_text("changed")
+        assert checkout_commit(tmp_path) == f"{clean}-dirty"

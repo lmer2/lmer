@@ -15,12 +15,19 @@ sys.path.insert(0, src_dir)
 from lmer_cli.gates import GateSystem, Colors
 from lmer_cli.util import get_bool_env
 
+try:
+    from work_repo.run_state import emit_gate_event
+except ImportError:  # run-state wiring must never break a gate
+    def emit_gate_event(gate, outcome):
+        pass
+
 
 def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
     """Run gate checks and commit if passed"""
 
     if bypass:
         print(f"{Colors.YELLOW}{Colors.BOLD}⚠️  GATE COMMIT - Bypassing checks{Colors.NC}\n")
+        emit_gate_event("gate-commit", "bypass")
     else:
         print(f"{Colors.CYAN}{Colors.BOLD}🔒 GATE COMMIT - Running checks...{Colors.NC}\n")
 
@@ -35,6 +42,7 @@ def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
         gate = GateSystem(verbose=verbose)
         if not gate.run_commit_gate(skip_tests=skip_tests):
             print(f"\n{Colors.RED}❌ Commit aborted due to gate failures{Colors.NC}")
+            emit_gate_event("gate-commit", "fail")
             return 1
 
     # Check for Claude attribution in commit message
@@ -48,6 +56,8 @@ def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
 
     # Commit with message
     print(f"\n{Colors.GREEN}✅ Gate checks passed!{Colors.NC}")
+    if not bypass:
+        emit_gate_event("gate-commit", "pass")
     print(f"{Colors.CYAN}Committing with message: {message}{Colors.NC}")
 
     result = subprocess.run(["git", "commit", "-m", message], check=False)

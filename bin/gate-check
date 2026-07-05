@@ -12,7 +12,15 @@ sys.path.insert(0, src_dir)
 
 from lmer_cli.gates import commit_gate
 
+try:
+    from work_repo.run_state import emit_gate_event
+except ImportError:  # run-state wiring must never break a gate
+    def emit_gate_event(gate, outcome):
+        pass
+
 if __name__ == "__main__":
     verbose = '-v' in sys.argv or '--verbose' in sys.argv
     debug = '--debug' in sys.argv
-    sys.exit(commit_gate(verbose=verbose, debug=debug))
+    rc = commit_gate(verbose=verbose, debug=debug)
+    emit_gate_event("gate-check", "pass" if rc == 0 else "fail")
+    sys.exit(rc)

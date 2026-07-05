@@ -170,6 +170,30 @@ class TestClaudeLinkAgentFiles:
         assert link.is_symlink()
         assert link.resolve() == (global_src / "commands" / "rgr.md").resolve()
 
+    def test_links_agents_from_global(self, trees):
+        home_claude, global_src, work_src = trees
+        (global_src / "agents").mkdir(parents=True)
+        (global_src / "agents" / "explorer.md").write_text("global explorer")
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), ""
+        )
+        assert result.returncode == 0, result.stderr
+        linked = home_claude / "agents" / "explorer.md"
+        assert linked.is_symlink()
+        assert linked.read_text() == "global explorer"
+
+    def test_work_agents_override_global(self, trees):
+        home_claude, global_src, work_src = trees
+        (global_src / "agents").mkdir(parents=True)
+        (global_src / "agents" / "explorer.md").write_text("global explorer")
+        (work_src / "agents").mkdir(parents=True)
+        (work_src / "agents" / "explorer.md").write_text("work explorer")
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), str(work_src)
+        )
+        assert result.returncode == 0, result.stderr
+        assert (home_claude / "agents" / "explorer.md").read_text() == "work explorer"
+
 
 class TestClaudeMergeWorkSettings:
     """claude_merge_work_settings <home_claude> <work_src>."""

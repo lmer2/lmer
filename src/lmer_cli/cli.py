@@ -39,7 +39,7 @@ from .mounts import (
     build_service_mode_mounts,
     resolve_host_uv_cache_dir,
 )
-from .build import DEFAULT_IMAGE, ensure_image, build_image, resolve_image_tag
+from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
 from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
 from .service import ServiceError, resolve_container, inspect_container_workdir
 from .tokens import (
@@ -49,7 +49,7 @@ from .tokens import (
     _inject_gitlab_token_if_available,
 )
 from .util import get_bool_env, resolve_human_identity
-from .targets import partition_targets, special_target_env
+from .targets import SlackThreadTargets, partition_targets, special_target_env
 
 # Default pool for general port passthrough (--ports / --port-pool). Kept
 # distinct from the FastAPI range (8700-8799) so both features can be used in
@@ -537,6 +537,47 @@ def _check_ssh_setup(container_home: Path, ssh_agent_enabled: bool) -> None:
     warning("")
 
 
+def _remap_taskdef_to_container(
+    resolved_taskdef_dir: Path,
+    external_pairs: list[tuple[Path, str]],
+    repo_root: Path | None,
+) -> tuple[str, str, str]:
+    """Translate a host-resolved taskdef dir into container paths.
+
+    Returns (taskdef_root, taskdef_dir, instructions_path) as they must
+    appear INSIDE the container. Three cases:
+
+    1. Under an external LMER_TASKDEF_PATHS entry -> the corresponding
+       /Agents/taskdefs/<n> mount.
+    2. Under the developer checkout's built-in taskdef/ -> the
+       /Agents/global/taskdef mount. (Previously passed through as the raw
+       host path, e.g. /home/<user>/.../taskdef — which doesn't exist in the
+       container, so start.py silently dropped the built-in root from the
+       include search path and shared fragments failed to resolve; issue #80.)
+    3. Anything else passes through unchanged (already a container path).
+    """
+    for host_path, cpath in external_pairs:
+        try:
+            rel = resolved_taskdef_dir.relative_to(host_path)
+            return cpath, f"{cpath}/{rel}", f"{cpath}/{rel}/instructions.txt"
+        except ValueError:
+            continue
+
+    if repo_root is not None:
+        try:
+            rel = resolved_taskdef_dir.relative_to(repo_root / "taskdef")
+            croot = "/Agents/global/taskdef"
+            return croot, f"{croot}/{rel}", f"{croot}/{rel}/instructions.txt"
+        except ValueError:
+            pass
+
+    return (
+        str(resolved_taskdef_dir.parent),
+        str(resolved_taskdef_dir),
+        str(resolved_taskdef_dir / "instructions.txt"),
+    )
+
+
 def _redact_env_value(name: str, value: str) -> str:
     """Redact sensitive env var values, showing only a hint."""
     if re.search(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIALS", name, re.IGNORECASE):
@@ -601,6 +642,19 @@ def _display_env_config_cli(
     for name, value, source in rows:
         print(f"  {name:<{name_width}}  {value:<{value_width}}  {source}")
     print("---")
+
+
+def _resolve_afk_timeout_ms(explicit_value: str | None, slack_bridged: bool) -> str | None:
+    """Resolve the CLAUDE_AFK_TIMEOUT_MS value forwarded into the container.
+
+    An explicit host-side value always wins. When it is unset and the
+    session is Slack-bridged, default to 5 minutes (300000 ms) so an idle
+    session pings the thread instead of sitting silent; plain terminal
+    sessions stay untouched (None).
+    """
+    if explicit_value is not None:
+        return explicit_value
+    return "300000" if slack_bridged else None
 
 
 def _handle_build(argv: list[str]) -> int:
@@ -1025,24 +1079,13 @@ def main(argv: list[str] | None = None) -> int:
     container_taskdef_dir: str | None = None
     container_task_instructions: str | None = None
     if resolved_taskdef_dir and not ns.no_task:
-        # Check if the resolved dir is under one of the external host paths
-        # and remap to the corresponding container mount point.
-        remapped = False
-        for host_path, cpath in zip(external_taskdef_host_paths, container_taskdef_paths):
-            try:
-                rel = resolved_taskdef_dir.relative_to(host_path)
-                container_taskdef_dir = f"{cpath}/{rel}"
-                container_taskdef_root = cpath
-                container_task_instructions = f"{container_taskdef_dir}/instructions.txt"
-                remapped = True
-                break
-            except ValueError:
-                continue
-        if not remapped:
-            # Built-in taskdef or developer-mode path already inside container
-            container_taskdef_root = str(resolved_taskdef_dir.parent)
-            container_taskdef_dir = str(resolved_taskdef_dir)
-            container_task_instructions = str(resolved_taskdef_dir / "instructions.txt")
+        container_taskdef_root, container_taskdef_dir, container_task_instructions = (
+            _remap_taskdef_to_container(
+                resolved_taskdef_dir,
+                list(zip(external_taskdef_host_paths, container_taskdef_paths)),
+                repo_root_path(),
+            )
+        )
     elif not ns.no_task:
         container_taskdef_root = "/Agents/global/taskdef"
         container_taskdef_dir = f"/Agents/global/taskdef/{task_id}" if task_id else None
@@ -1051,12 +1094,27 @@ def main(argv: list[str] | None = None) -> int:
     env = {
         "HOME": "/home/developer",
         "CLAUDE_CODE_ENTRYPOINT": os.environ.get("CLAUDE_CODE_ENTRYPOINT", "cli"),
+        # Claude Code's own AFK-timeout variable (no LMER_ prefix, like
+        # GITLAB_HOST). Host value passes through; when unset, Slack-bridged
+        # sessions get a 5-minute default applied just below the dict.
+        "CLAUDE_AFK_TIMEOUT_MS": os.environ.get("CLAUDE_AFK_TIMEOUT_MS"),
         "LMER_GLOBAL_DIR": os.environ.get("LMER_GLOBAL_DIR", "/home/developer/.lmer"),
         "LMER_DANGER_ZONE": os.environ.get("LMER_DANGER_ZONE"),
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
         "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         "LMER_PERSIST_AGENT_MEMORY": os.environ.get("LMER_PERSIST_AGENT_MEMORY"),
+        # Source provenance for the live-mounted dirs (dev mode): the commit
+        # of the host checkout at session launch, "-dirty" when uncommitted.
+        # The image's own commit is baked as LMER_BUILD_COMMIT/BUILD_INFO;
+        # together a session can answer "what code am I actually running?".
+        "LMER_SOURCE_COMMIT": checkout_commit(repo_root_path()),
+        "LMER_RUN_STATE_GUARD": os.environ.get("LMER_RUN_STATE_GUARD"),
+        # Opt-in to the masterplan workflow. Truthy (get_bool_env) turns on the
+        # session-start plugin provisioning in claude-runner.sh; LMER_TASK=masterplan
+        # implies it. MASTERPLAN_RUNS_DIR is computed in-container from the run
+        # state (not passed through here), so bundles nest inside the run dir.
+        "LMER_MASTERPLAN": os.environ.get("LMER_MASTERPLAN"),
         "LMER_HUMAN_IDENTITY": resolve_human_identity(),
         # Optional git identity overrides for commits made inside the container.
         # When set, entrypoint.sh exports them as GIT_AUTHOR_*/GIT_COMMITTER_*
@@ -1134,6 +1192,14 @@ def main(argv: list[str] | None = None) -> int:
         # workspace clone instead of failing on the missing LMER_REPO_URL.
         "LMER_NO_REPO": "1" if no_repo_session else None,
     }
+
+    # Slack-bridged sessions (a SlackThreadTargets handler contributed
+    # LMER_SLACK_CHANNEL above) default the Claude Code AFK timeout to
+    # 5 minutes when the host left it unset; terminal sessions keep None.
+    env["CLAUDE_AFK_TIMEOUT_MS"] = _resolve_afk_timeout_ms(
+        env["CLAUDE_AFK_TIMEOUT_MS"],
+        any(isinstance(handler, SlackThreadTargets) for handler in special_targets),
+    )
 
     # Merge all variables from .env file into container env dict
     # Check state dir (~/.lmer/) and cwd for .env files

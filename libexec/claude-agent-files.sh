@@ -13,8 +13,8 @@
 # This file is sourced by claude-runner.sh and by tests.
 
 # claude_link_agent_files <home_claude> <global_src> <work_src>
-#   Populate <home_claude>/commands/ and <home_claude>/skills/ with symlinks
-#   from each source's commands/ and skills/ subdirectory. <global_src> and
+#   Populate <home_claude>/commands/, skills/, and agents/ with symlinks
+#   from each source's corresponding subdirectory. <global_src> and
 #   <work_src> may each be empty. <home_claude> is taken as a parameter so
 #   tests can target a temporary directory.
 claude_link_agent_files() {
@@ -23,7 +23,7 @@ claude_link_agent_files() {
     local work_src="$3"
     local subdir target item linked_global linked_work
 
-    for subdir in commands skills; do
+    for subdir in commands skills agents; do
         target="$home_claude/$subdir"
         # An older runner may have left ~/.claude/$subdir as a directory
         # symlink pointing at the global tree. Replace it with a real

@@ -371,3 +371,84 @@ class TestRedactUrlCredentials:
         assert "glpat-" not in out
         assert "oauth2" not in out
         assert "git.example.com" in out
+
+
+class TestRunStateSessionStart:
+    """run_state_session_start() — fail-soft subprocess wrapper."""
+
+    def test_returns_brief_on_success(self, monkeypatch):
+        from hooks import start as start_hook
+        monkeypatch.setattr(start_hook.shutil, "which", lambda _: "/usr/bin/work")
+
+        class FakeResult:
+            returncode = 0
+            stdout = "Run: develop-issue-123 (status: in-progress)\n"
+
+        monkeypatch.setattr(
+            start_hook.subprocess, "run", lambda *a, **k: FakeResult()
+        )
+        assert "develop-issue-123" in start_hook.run_state_session_start()
+
+    def test_empty_when_work_missing(self, monkeypatch):
+        from hooks import start as start_hook
+        monkeypatch.setattr(start_hook.shutil, "which", lambda _: None)
+        assert start_hook.run_state_session_start() == ""
+
+    def test_empty_on_nonzero_exit(self, monkeypatch):
+        from hooks import start as start_hook
+        monkeypatch.setattr(start_hook.shutil, "which", lambda _: "/usr/bin/work")
+
+        class FakeResult:
+            returncode = 1
+            stdout = ""
+
+        monkeypatch.setattr(start_hook.subprocess, "run", lambda *a, **k: FakeResult())
+        assert start_hook.run_state_session_start() == ""
+
+    def test_empty_on_exception(self, monkeypatch):
+        from hooks import start as start_hook
+        monkeypatch.setattr(start_hook.shutil, "which", lambda _: "/usr/bin/work")
+
+        def boom(*a, **k):
+            raise OSError("no exec")
+
+        monkeypatch.setattr(start_hook.subprocess, "run", boom)
+        assert start_hook.run_state_session_start() == ""
+
+
+class TestIncludeResolutionDefense:
+    """Issue #80, observed live: LMER_TASKDEF_ROOT carried a host path that
+    doesn't exist in the container, the is_dir() guard dropped it, and
+    `{% include 'service-mode.jinja2' %}` hard-failed for a taskdef served
+    from an external mount with an alternate work repo."""
+
+    def test_shared_fragment_resolves_despite_bogus_taskdef_root(
+        self, monkeypatch, tmp_path
+    ):
+        from hooks.start import render_taskdef_template
+
+        # Taskdef served from an "external mount" containing no fragments.
+        external = tmp_path / "taskdefs" / "0" / "chat"
+        external.mkdir(parents=True)
+        (external / "instructions.txt").write_text(
+            "before\n{% include 'service-mode.jinja2' %}\nafter\n"
+        )
+        # The exact failure conditions from the live session:
+        monkeypatch.setenv("LMER_TASKDEF_ROOT", "/home/nobody/Agents/global/taskdef")
+        monkeypatch.delenv("LMER_TASKDEF_PATHS", raising=False)
+        monkeypatch.delenv("LMER_WORK_REPO_PATH", raising=False)
+        # builtin_taskdef_root() falls back to cwd/taskdef on hosts without
+        # the container mounts — run from the repo root, where the real
+        # built-in fragments live.
+        monkeypatch.chdir(Path(__file__).parent.parent)
+
+        out = render_taskdef_template(
+            external / "instructions.txt", {"work_mode": "finish"}
+        )
+        assert "before" in out and "after" in out  # no TemplateNotFound
+
+    def test_builtin_root_appended_to_search_dirs(self, monkeypatch, tmp_path):
+        from hooks.start import builtin_taskdef_root, taskdef_search_dirs
+
+        monkeypatch.chdir(tmp_path)
+        assert taskdef_search_dirs()[-1] == builtin_taskdef_root()
