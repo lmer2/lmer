@@ -113,6 +113,14 @@ class TestSanitizeTaskTarget:
         """Test commit SHA handling"""
         assert sanitize_task_target(sha) == sha
 
+    def test_full_sha_is_not_truncated_here(self):
+        """SHA truncation is a slug concern (run_state.derive_slug), NOT a
+        sanitize concern: legacy {task_type}/{target}/ fallback paths are
+        built from this function and must keep matching the full-SHA dirs
+        that exist on disk."""
+        sha = "2a418231d83e1b7f4ff952656724f4de18a15d6e"
+        assert sanitize_task_target(sha) == sha
+
     @pytest.mark.parametrize(
         "input_value",
         [

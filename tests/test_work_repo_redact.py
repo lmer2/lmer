@@ -285,7 +285,8 @@ class TestCmdReportRedaction:
 
                 # Find the copied report file
                 target_dir = (
-                    work_dir / "github.com" / "owner" / "repo" / "review" / "pr-456"
+                    work_dir / "github.com" / "owner" / "repo"
+                    / "runs" / "review-pr-456" / "reports"
                 )
                 report_files = list(target_dir.glob("*.md"))
                 assert len(report_files) == 1
@@ -315,7 +316,8 @@ class TestCmdReportRedaction:
                 assert result == 0
 
                 target_dir = (
-                    work_dir / "github.com" / "owner" / "repo" / "review" / "pr-789"
+                    work_dir / "github.com" / "owner" / "repo"
+                    / "runs" / "review-pr-789" / "reports"
                 )
                 report_files = list(target_dir.glob("*.md"))
                 assert len(report_files) == 1

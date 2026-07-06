@@ -1,13 +1,24 @@
 """Durable run-state kernel (Layer 1).
 
-One run = one directory at {work}/{host}/{project}/runs/<slug>/ holding
-state.yaml (authoritative run state) and events.jsonl (append-only session
-and audit log). Single-writer discipline: state.yaml is only ever written by
-write_state() (atomic tmp+rename); events only via append_event(). Sessions
-never edit these files directly — the `work` CLI is the sole writer.
-Legacy runs that predate the rename still hold state.yml: load_state()
-reads it when state.yaml is absent, and the first write_state() migrates
-it aside as state.yml.migrated.
+One run = one directory under {work}/{host}/{project}/runs/ holding
+state.yaml (authoritative run state), events.jsonl (append-only session and
+audit log), log.yaml, reports/, and any registered artifacts — the single
+home for everything the run produces. Single-writer discipline: state.yaml
+is only ever written by write_state() (atomic tmp+rename); events only via
+append_event(). Sessions never edit these files directly — the `work` CLI
+is the sole writer.
+
+The CLI also owns the DIRECTORY lifecycle (issue #87): runs are created as
+`.new-*` temp dirs and atomically renamed to `runs/<slug>/` once seeded
+(seed_run_dir), then renamed exactly once more to `runs/<slug>--<name>/`
+at the pre-execution freeze gate when the run is named (freeze_run_dir).
+Because dirs can be renamed, a directory name is never a valid address:
+every lookup goes through find_run_dir(), which matches on state.yaml
+content (slug, then name).
+
+Legacy runs that predate the state-file rename still hold state.yml:
+load_state() reads it when state.yaml is absent, and the first
+write_state() migrates it aside as state.yml.migrated.
 
 Design: this feature's spec lives in the work repo, in this project's run
 directory ({work}/{host}/{project}/runs/develop-durable-run-state/spec.md).
@@ -17,6 +28,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -30,6 +44,27 @@ STATE_FILE = "state.yaml"
 # Pre-rename runs wrote this name; read-fallback + rename-on-write migration.
 LEGACY_STATE_FILE = "state.yml"
 EVENTS_FILE = "events.jsonl"
+# Run dirs are created under a temporary dot-name and atomically renamed to
+# their final name once seeded (issue #87 D2). A crash in between leaves a
+# sweepable `.new-*` orphan — the external cleaner contract (RUN-STATE.md §6)
+# owns removing those; the resolver never matches dot-dirs.
+TMP_DIR_PREFIX = ".new-"
+# The archived-runs subtree shares the runs/ namespace; the resolver skips it.
+ARCHIVE_DIR = "archive"
+# Phases whose (case-insensitive) prefix marks the run as still planning —
+# the first `work state set --phase` OUTSIDE this family is the pre-execution
+# freeze gate that takes the single name-bearing dir rename (issue #87 D2).
+# The list covers the shipped taskdefs' pre-execution phases (develop records
+# branch-setup/issue-analysis/interview, review records retrieve, before
+# naming is even expected) — a premature freeze on an unnamed run forfeits
+# the rename forever, so the family errs wide. An unrecognized phase string
+# still counts as execution.
+PLANNING_PHASE_PREFIXES = (
+    "spec", "plan", "brainstorm", "explor", "design", "review",
+    "branch", "issue", "interview", "setup", "retriev",
+)
+# A bare full SHA-1 task target; slugs use its 12-char short form (D4).
+_FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 # Masterplan bundles nest at <run>/masterplan/<mp-slug>/; these well-known
 # artifacts get relative symlinks at the run-dir root when present (spec §6).
 MASTERPLAN_DIR = "masterplan"
@@ -54,10 +89,20 @@ def current_session_id() -> str:
 
 
 def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> str:
-    """Deterministic run slug: same taskdef + target => same slug (spec §4.5)."""
+    """Deterministic run slug: same taskdef + target => same slug (spec §4.5).
+
+    A bare full 40-hex commit SHA is truncated to its 12-char short form —
+    a slug-only concern (readable dir names, issue #87 D4); the legacy
+    ``{task_type}/{target}/`` path builders keep the full form so read-side
+    fallback still matches pre-unification dirs on disk. Legacy full-SHA
+    runs keep their recorded slug: the resolver matches recorded
+    ``state.slug`` exactly, with no aliasing between the two forms.
+    """
     taskdef = taskdef or os.environ.get("LMER_TASK", "default")
     if target is None:
         target = os.environ.get("LMER_TASK_TARGET", "")
+    if target and _FULL_SHA_RE.fullmatch(target):
+        return f"{taskdef}-{target[:12].lower()}"
     safe = sanitize_task_target(target) if target else "default"
     if safe == "default":
         return taskdef
@@ -71,20 +116,128 @@ def runs_base() -> Optional[Path]:
     return base / "runs"
 
 
+def _read_sibling_state(rdir: Path) -> Optional[dict]:
+    """Best-effort state read for resolver scans: state.yaml (legacy state.yml
+    fallback), None for corrupt/unreadable/absent — a broken sibling must
+    never break resolution of the run actually being looked up."""
+    for name in (STATE_FILE, LEGACY_STATE_FILE):
+        path = rdir / name
+        if not path.exists():
+            continue
+        try:
+            state = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return state if isinstance(state, dict) else None
+    return None
+
+
+def find_run_dir(
+    identifier: str,
+    base: Optional[Path] = None,
+    match_names: bool = False,
+) -> Optional[Path]:
+    """Resolve a run dir by CONTENT, never by directory name (issue #87 D1).
+
+    Scans runs/*/state.yaml for `state.slug == identifier`; with
+    `match_names`, falls back to `state.name == identifier` (a slug match
+    always wins — names are unique per project). Session-level resolution
+    keeps `match_names` off so a run *name* can never hijack another
+    session's derived slug; explicit lookups (e.g. `work seed`'s duplicate
+    check) opt in. Dot-dirs (`.new-*` orphans), the archive/ subtree, and
+    corrupt siblings are skipped, and any fs error during the scan resolves
+    to "no match" — a broken runs/ tree must never raise out of a resolver
+    that hook-facing always-exit-0 commands sit on. Returns None when
+    nothing matches — dirs can be renamed, so `dir name == slug` is not a
+    valid address.
+    """
+    if base is None:
+        base = runs_base()
+    if base is None:
+        return None
+    name_match: Optional[Path] = None
+    try:
+        children = sorted(base.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        try:
+            if not child.is_dir() or child.name.startswith(".") or child.name == ARCHIVE_DIR:
+                continue
+            state = _read_sibling_state(child)
+        except OSError:
+            continue
+        if state is None:
+            continue
+        if state.get("slug") == identifier:
+            return child
+        if match_names and name_match is None and state.get("name") == identifier:
+            name_match = child
+    return name_match
+
+
+def _unreadable_state_candidate(base: Path, slug: str) -> Optional[Path]:
+    """A conventionally-named dir for `slug` whose state file exists but
+    cannot be read. The content resolver can't match it, but preferring it
+    over a fresh creation address lets load_state()'s backup-and-recover
+    path run instead of shadow-seeding a duplicate run beside the stranded
+    one. A dir whose state is readable but records a different slug is NOT
+    a candidate — that is a foreign run, not a broken one."""
+    try:
+        candidates = [base / slug] + sorted(base.glob(f"{slug}--*"))
+        for cand in candidates:
+            if not cand.is_dir():
+                continue
+            has_state_file = any(
+                (cand / name).exists() for name in (STATE_FILE, LEGACY_STATE_FILE)
+            )
+            if has_state_file and _read_sibling_state(cand) is None:
+                return cand
+    except OSError:
+        return None
+    return None
+
+
 def run_dir(slug: Optional[str] = None) -> Optional[Path]:
+    """The current run's directory: resolved by state content when the run
+    exists (rename-proof), else the canonical `runs/<slug>` creation address."""
     base = runs_base()
     if base is None:
         return None
-    return base / (slug or derive_slug())
+    slug = slug or derive_slug()
+    found = find_run_dir(slug, base)
+    if found is not None:
+        return found
+    corrupt = _unreadable_state_candidate(base, slug)
+    if corrupt is not None:
+        return corrupt
+    return base / slug
 
 
 def run_rel_path(slug: Optional[str] = None) -> Optional[str]:
     """Run dir relative to the work-repo root, for git_ops.commit_work_path()."""
+    rels = run_rel_path_candidates(slug)
+    return rels[0] if rels else None
+
+
+def run_rel_path_candidates(slug: Optional[str] = None) -> list[str]:
+    """Work-repo-relative paths worth staging for the run: the resolved dir
+    first, then the bare-slug dir when it differs. Staging both lets a
+    commit after a dir rename pick up the old path's deletions even when
+    the rename-time push failed (commit_work_path skips clean paths)."""
     host = os.environ.get("LMER_REPO_HOST")
     project = os.environ.get("LMER_REPO_PROJECT")
     if not host or not project:
-        return None
-    return f"{host}/{project}/runs/{slug or derive_slug()}"
+        return []
+    slug = slug or derive_slug()
+    rels = []
+    found = find_run_dir(slug)
+    if found is not None:
+        rels.append(f"{host}/{project}/runs/{found.name}")
+    bare = f"{host}/{project}/runs/{slug}"
+    if bare not in rels:
+        rels.append(bare)
+    return rels
 
 
 def seed_state(slug: str, taskdef: str, target: str) -> dict:
@@ -103,9 +256,157 @@ def seed_state(slug: str, taskdef: str, target: str) -> dict:
         "goal": None,
         "artifacts": {},
         "owner": None,
+        "frozen": None,
         "created": now,
         "updated": now,
     }
+
+
+def seed_run_dir(
+    slug: str,
+    taskdef: str,
+    target: str,
+    note: Optional[str] = None,
+    adopt_existing: bool = True,
+) -> tuple[Path, dict]:
+    """Create a run dir via the tmp-dir-then-rename lifecycle (issue #87 D2).
+
+    The seed lands in a `runs/.new-<session>-*` temp dir through the normal
+    writers, then a single atomic rename() moves it to `runs/<slug>/` — no
+    observer ever sees a half-seeded dir at a canonical name, and a crash in
+    between leaves only a sweepable `.new-*` orphan. Losing the rename race
+    (the final dir appeared concurrently with content) adopts the existing
+    run and discards the temp seed — unless `adopt_existing` is False, in
+    which case it raises so callers that must not touch a run they didn't
+    create (`work seed`) can refuse instead. (An *empty* dir appearing in
+    the race window is silently replaced — POSIX rename semantics — which
+    is harmless: an empty dir holds no run.) Writes only — pushing is the
+    caller's business.
+    """
+    base = runs_base()
+    if base is None:
+        raise RunStateError("no run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+    base.mkdir(parents=True, exist_ok=True)
+    tmp = Path(
+        tempfile.mkdtemp(prefix=f"{TMP_DIR_PREFIX}{current_session_id()}-", dir=base)
+    )
+    os.chmod(tmp, 0o755)  # mkdtemp defaults to 0700; match mkdir-created runs
+    state = seed_state(slug, taskdef, target)
+    write_state(tmp, state)
+    append_event(tmp, "run_seeded", note=note)
+    final = base / slug
+    try:
+        tmp.rename(final)
+    except OSError as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if not final.exists():
+            # Not a collision — EACCES/ENOSPC/EXDEV/...: report the real
+            # error, or "already exists" would send debugging the wrong way.
+            raise RunStateError(f"cannot seed run at {final}: {exc}")
+        if not adopt_existing:
+            raise RunStateError(f"run '{slug}' already exists at {final}")
+        existing = load_state(final)
+        if existing is None:
+            raise RunStateError(
+                f"cannot seed run at {final}: rename failed ({exc}) "
+                f"and no readable state there"
+            )
+        return final, existing
+    return final, state
+
+
+def ensure_run(
+    slug: Optional[str] = None,
+    taskdef: Optional[str] = None,
+    target: Optional[str] = None,
+) -> tuple[Path, dict]:
+    """Load the current run's state, creating the run when needed.
+
+    Fresh runs are created through seed_run_dir (tmp-then-rename); a dir
+    that already exists but lacks readable state is reseeded IN PLACE — it
+    already holds its final (possibly name-bearing) name and other files.
+    That covers both a stateless legacy dir (load_state returns None) and
+    a parse-corrupt state file (load_state backs it up and raises):
+    recovering at the already-resolved rdir within this call matters for
+    renamed dirs, whose backed-up state file would make them unresolvable
+    on a retry — a second invocation would seed a duplicate at the bare
+    slug and strand the renamed dir. Only load_state's read-only refusal
+    (schema newer than this kernel) propagates.
+    """
+    slug = slug or derive_slug()
+    rdir = run_dir(slug)
+    if rdir is None:
+        raise RunStateError("no run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+    try:
+        state = load_state(rdir)
+    except RunStateError:
+        if _state_path(rdir) is not None:
+            # Newer-schema refusal: the file is intact and must not be
+            # overwritten by a reseed — surface the refusal unchanged.
+            raise
+        state = None  # corrupt file was backed up — recover below, in place
+    if state is None:
+        taskdef = taskdef or os.environ.get("LMER_TASK", "default")
+        if target is None:
+            target = os.environ.get("LMER_TASK_TARGET", "")
+        if rdir.exists():
+            state = seed_state(slug, taskdef, target)
+            write_state(rdir, state)
+            append_event(rdir, "run_seeded")
+        else:
+            rdir, state = seed_run_dir(slug, taskdef, target)
+    return rdir, state
+
+
+def is_planning_phase(phase: Optional[str]) -> bool:
+    """True when the phase string belongs to the planning family (issue #87
+    D2): case-insensitive prefix match against PLANNING_PHASE_PREFIXES.
+    None/empty counts as planning (nothing recorded yet is not execution)."""
+    if not phase:
+        return True
+    lowered = phase.strip().lower()
+    return lowered.startswith(PLANNING_PHASE_PREFIXES)
+
+
+def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
+    """Pre-execution freeze gate (issue #87 D2): the run's identity is final.
+
+    Stamps `state["frozen"]` (the caller persists it via write_state) and,
+    when the run is named and the dir is not already name-bearing, takes the
+    SINGLE rename to `runs/<slug>--<name>/`. A run unnamed at the freeze
+    keeps `runs/<slug>/` — the frozen stamp is what makes "one rename means
+    one" durable, so there is no second chance. Fail-soft: a rename that
+    cannot happen (target taken, fs error) is reported and skipped.
+
+    Returns (possibly-renamed rdir, previous dir name when a rename
+    happened, else None).
+    """
+    state["frozen"] = utc_now_iso()
+    name = state.get("name")
+    slug = state.get("slug") or rdir.name
+    if not name:
+        return rdir, None
+    final_name = f"{slug}--{name}"
+    if rdir.name == final_name:
+        return rdir, None
+    target = rdir.parent / final_name
+    if target.exists():
+        print(f"⚠️  run-dir rename skipped: {target} already exists")
+        return rdir, None
+    old_name = rdir.name
+    try:
+        rdir = rdir.rename(target)
+    except OSError as exc:
+        print(f"⚠️  run-dir rename failed (continuing at runs/{old_name}): {exc}")
+        return rdir, None
+    # The rename has happened — the caller MUST get the new path back even
+    # if recording the audit event fails, or its next state write would
+    # recreate the old dir and fork the run.
+    try:
+        append_event(rdir, "run_dir_renamed", note=f"runs/{old_name} -> runs/{final_name}")
+    except OSError as exc:
+        print(f"⚠️  run_dir_renamed event not recorded: {exc}")
+    return rdir, old_name
 
 
 def _backup_bad_state(path: Path, reason: str) -> "RunStateError":

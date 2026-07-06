@@ -41,8 +41,11 @@ Examples:
   # Commit with custom message
   work commit --message "Updated project logs"
 
-  # Copy a report file to work repository
+  # Copy a report file into the run dir (runs/<slug>/reports/)
   work report --file report.md
+
+  # Seed a run for another slug (out-of-session run creation)
+  work seed develop gate-receipts --goal "..." --name gate-receipts
 
   # Set a temporary goal/context
   work goal "description of current goal"
@@ -91,13 +94,35 @@ Examples:
     # report command
     report_parser = subparsers.add_parser(
         "report",
-        help="Copy a report file to work repository with timestamp",
+        help="Copy a report file into the run dir (reports/) with timestamp",
     )
     report_parser.add_argument(
         "--file",
         "-f",
         required=True,
         help="Path to the report file to copy",
+    )
+
+    # seed command (out-of-session run creation — issue #87 D3)
+    seed_parser = subparsers.add_parser(
+        "seed",
+        help="Create a run for a slug other than the current session's",
+    )
+    seed_parser.add_argument(
+        "taskdef",
+        help="Taskdef of the new run (e.g. develop, review)",
+    )
+    seed_parser.add_argument(
+        "target",
+        help="Task target the slug derives from (URL, branch, SHA, or short token)",
+    )
+    seed_parser.add_argument(
+        "--goal",
+        help="Initial goal to record (appends a goal_set event)",
+    )
+    seed_parser.add_argument(
+        "--name",
+        help="Human-readable run name (kebab-case normalized; appends run_named)",
     )
 
     # goal command
@@ -273,16 +298,20 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
         Exit code
     """
     try:
-        logger = get_logger()
-
         # If no message provided, display recent log entries
         if message is None:
-            # Get log file path from logger
-            if not hasattr(logger, 'log_file'):
+            # Read-only path: prefer the run-dir log, fall back to the
+            # legacy task-target location for pre-unification runs
+            # (issue #87 D4 — the CLI never moves legacy files).
+            rdir = run_state.run_dir()
+            if rdir is None:
                 print("❌ Cannot determine log file location", file=sys.stderr)
                 return 1
-
-            log_file = logger.log_file
+            log_file = rdir / "log.yaml"
+            if not log_file.exists():
+                legacy_dir = task_target_dir()
+                if legacy_dir is not None and (legacy_dir / "log.yaml").exists():
+                    log_file = legacy_dir / "log.yaml"
 
             # Display log file location
             print(f"Log file: {log_file}")
@@ -309,6 +338,15 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
                 key, value = item.split("=", 1)
                 metadata_dict[key] = value
 
+        # Make sure the run exists first so log.yaml never lands in a
+        # stateless dir. Fail-soft: a broken state layer must not block
+        # logging — the entry still lands at the resolved run path.
+        try:
+            run_state.ensure_run()
+        except Exception:
+            pass
+
+        logger = get_logger()
         logger.log(message, metadata_dict if metadata_dict else None)
         # Redact the confirmation output too (logger already redacts what's written to file)
         print(f"✅ Logged: {redact_secrets(message)}")
@@ -357,8 +395,9 @@ def cmd_report(file_path: str) -> int:
     """
     Execute report command.
 
-    Copies a file to the work repository with a timestamped filename:
-    {host}/{project}/{task_type}/{task_target}/{YYMMDD-HH-MM-SS.md}
+    Copies a file into the run dir with a timestamped filename:
+    {host}/{project}/runs/{slug}/reports/{YYMMDD-HH-MM-SS.md}
+    (issue #87 D4 — the run dir is the single home for run output).
 
     Args:
         file_path: Path to the report file to copy
@@ -367,9 +406,8 @@ def cmd_report(file_path: str) -> int:
         Exit code
     """
     try:
-        # Build target directory path: {host}/{project}/{task_type}/{task_target}
-        target_dir = task_target_dir()
-        if target_dir is None:
+        rdir = run_state.run_dir()
+        if rdir is None:
             print("❌ LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
             return 1
 
@@ -384,6 +422,14 @@ def cmd_report(file_path: str) -> int:
             print(f"❌ Report file not found: {file_path}", file=sys.stderr)
             return 1
 
+        # Make sure the run exists so reports never land in a stateless
+        # dir. Fail-soft: a state-layer problem must not lose the report.
+        try:
+            rdir, _ = run_state.ensure_run()
+        except Exception:
+            pass
+
+        target_dir = rdir / "reports"
         target_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate timestamp filename: YYMMDD-HH-MM-SS.md
@@ -432,9 +478,8 @@ def cmd_goal(description: str | None) -> int:
             # above is already written, and a state-layer problem must not
             # break `work goal`.
             try:
-                rdir = run_state.run_dir()
-                if rdir is not None:
-                    state = _load_or_seed(rdir)
+                if run_state.run_dir() is not None:
+                    rdir, state = run_state.ensure_run()
                     state["goal"] = description
                     run_state.write_state(rdir, state)
                     run_state.append_event(rdir, "goal_set", note=description)
@@ -478,31 +523,23 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
         return 1
 
 
-def _require_run_dir() -> Path | None:
-    """Run dir for mutations; prints the standard no-context error when unset."""
-    rdir = run_state.run_dir()
-    if rdir is None:
-        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
-    return rdir
+def _require_run() -> tuple[Path, dict] | tuple[None, None]:
+    """Resolve (and if needed create) the current run for mutations.
 
-
-def _load_or_seed(rdir: Path) -> dict:
-    """Load state, seeding a fresh run (with run_seeded event) if absent.
-
-    Defensive auto-seed: taskdef instructions call `work state set` assuming
-    the /start hook seeded the run — if it didn't (host session, older
-    runner), the mutation must still land rather than fail.
+    Defensive auto-seed via run_state.ensure_run: taskdef instructions call
+    `work state set` assuming the /start hook seeded the run — if it didn't
+    (host session, older runner), the mutation must still land rather than
+    fail. Prints the standard error and returns (None, None) when there is
+    no run context or the state layer refuses.
     """
-    state = run_state.load_state(rdir)
-    if state is None:
-        state = run_state.seed_state(
-            run_state.derive_slug(),
-            os.environ.get("LMER_TASK", "default"),
-            os.environ.get("LMER_TASK_TARGET", ""),
-        )
-        run_state.write_state(rdir, state)
-        run_state.append_event(rdir, "run_seeded")
-    return state
+    if run_state.run_dir() is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return None, None
+    try:
+        return run_state.ensure_run()
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return None, None
 
 
 def cmd_state(args) -> int:
@@ -514,7 +551,7 @@ def cmd_state(args) -> int:
             return 0
         try:
             state = run_state.load_state(rdir)
-        except run_state.RunStateError as exc:
+        except (run_state.RunStateError, OSError) as exc:
             print(f"⚠️  {exc}", file=sys.stderr)
             return 1
         if state is None:
@@ -541,13 +578,8 @@ def cmd_state(args) -> int:
             print("❌ --critical-error must be a JSON object, e.g. '{\"summary\": \"...\", \"detail\": \"...\"}'", file=sys.stderr)
             return 1
 
-    rdir = _require_run_dir()
+    rdir, state = _require_run()
     if rdir is None:
-        return 1
-    try:
-        state = _load_or_seed(rdir)
-    except run_state.RunStateError as exc:
-        print(f"❌ {exc}", file=sys.stderr)
         return 1
 
     changed = {}
@@ -572,6 +604,22 @@ def cmd_state(args) -> int:
         print("✅ State unchanged")
         return 0
 
+    # Pre-execution freeze gate (issue #87 D2): the first phase transition
+    # out of the planning family finalizes the run's identity — the frozen
+    # stamp lands in this same state write, and a named run's dir takes its
+    # single name-bearing rename. Fail-soft: a freeze problem must not
+    # block the state mutation itself.
+    old_dir_name = None
+    if (
+        phase_changed
+        and not run_state.is_planning_phase(args.phase)
+        and not state.get("frozen")
+    ):
+        try:
+            rdir, old_dir_name = run_state.freeze_run_dir(rdir, state)
+        except Exception as exc:
+            print(f"⚠️  pre-execution freeze skipped: {exc}")
+
     run_state.write_state(rdir, state)
     if phase_changed:
         run_state.append_event(rdir, "phase", note=args.phase)
@@ -581,9 +629,15 @@ def cmd_state(args) -> int:
 
     # Durability (spec §4.4): push on phase transitions and completion.
     if phase_changed or args.status == "complete":
-        rel = run_state.run_rel_path()
+        rels = run_state.run_rel_path_candidates()
+        if old_dir_name:
+            host = os.environ.get("LMER_REPO_HOST")
+            project = os.environ.get("LMER_REPO_PROJECT")
+            old_rel = f"{host}/{project}/runs/{old_dir_name}"
+            if old_rel not in rels:
+                rels.append(old_rel)
         detail = f"phase={args.phase}" if phase_changed else f"status={args.status}"
-        rc = commit_work_path(rel, f"run-state: {state['slug']} {detail}")
+        rc = commit_work_path(rels, f"run-state: {state['slug']} {detail}")
         if rc != 0:
             print("⚠️  Warning: run-state push failed (state saved locally)")
     return 0
@@ -598,13 +652,8 @@ def cmd_event(args) -> int:
         except json.JSONDecodeError as exc:
             print(f"❌ --data is not valid JSON: {exc}", file=sys.stderr)
             return 1
-    rdir = _require_run_dir()
+    rdir, _state = _require_run()
     if rdir is None:
-        return 1
-    try:
-        _load_or_seed(rdir)
-    except run_state.RunStateError as exc:
-        print(f"❌ {exc}", file=sys.stderr)
         return 1
     run_state.append_event(rdir, args.type, note=args.note, data=data)
     print(f"✅ Event appended: {args.type}")
@@ -620,15 +669,39 @@ def _normalize_name(value: str) -> str:
     return value.strip("-")
 
 
+def _validate_name(value: str) -> str | None:
+    """Normalize and validate a run name for the mutating verbs.
+
+    Shared by `work name` and `work seed --name` so the naming rules can't
+    drift between them. Prints the normalization note / errors itself;
+    returns the kebab-case name, or None when nothing valid survives.
+    """
+    name = _normalize_name(value)
+    if not name:
+        print(f"❌ Nothing left of {value!r} after kebab-case normalization", file=sys.stderr)
+        return None
+    if name != value:
+        print(f"Normalized to: {name}")
+    if name == "archive":
+        # The cleaner's archive/ subtree shares the runs namespace; if the
+        # name-as-directory growth path lands, this name would collide.
+        print("❌ 'archive' is a reserved name (the archived-runs subtree)", file=sys.stderr)
+        return None
+    return name
+
+
 def _name_conflict(rdir: Path, name: str) -> str | None:
     """Slug of another run in this project already holding `name`, or None.
 
     Scans sibling run dirs for state.yaml (plus legacy state.yml).
     Corrupt/unreadable siblings are skipped — a broken run must not block
     naming — and the archive/ subtree is ignored (archived runs no longer
-    hold their names). A sibling's directory slug also holds its name: a
-    name equal to another run's slug would break findability today and
-    collide outright if the name-as-directory growth path lands.
+    hold their names). A sibling's slug also holds its name: a name equal
+    to another run's slug would let the name shadow that run's address.
+    The slug is checked from the sibling's recorded state (dirs get
+    renamed to `<slug>--<name>` at the freeze, so the dir name alone no
+    longer carries the slug), with the dir-name check kept as a fallback
+    for stateless dirs.
     """
     base = rdir.parent
     if not base.is_dir():
@@ -638,17 +711,11 @@ def _name_conflict(rdir: Path, name: str) -> str | None:
             continue
         if sibling.name == name:
             return sibling.name
-        for fname in (run_state.STATE_FILE, run_state.LEGACY_STATE_FILE):
-            path = sibling / fname
-            if not path.exists():
-                continue
-            try:
-                sib_state = yaml.safe_load(path.read_text(encoding="utf-8"))
-            except Exception:
-                sib_state = None  # corrupt/unreadable sibling — skip it
-            if isinstance(sib_state, dict) and sib_state.get("name") == name:
-                return sibling.name
-            break  # state.yaml wins on read; ignore a leftover legacy file
+        sib_state = run_state._read_sibling_state(sibling)
+        if sib_state is not None and name in (
+            sib_state.get("name"), sib_state.get("slug")
+        ):
+            return sibling.name
     return None
 
 
@@ -662,7 +729,7 @@ def cmd_name(value: str | None) -> int:
             return 0
         try:
             state = run_state.load_state(rdir)
-        except run_state.RunStateError as exc:
+        except (run_state.RunStateError, OSError) as exc:
             print(f"⚠️  {exc}", file=sys.stderr)
             return 0
         if state is None or not state.get("name"):
@@ -672,24 +739,11 @@ def cmd_name(value: str | None) -> int:
         return 0
 
     # --- mutation path ---
-    name = _normalize_name(value)
-    if not name:
-        print(f"❌ Nothing left of {value!r} after kebab-case normalization", file=sys.stderr)
+    name = _validate_name(value)
+    if name is None:
         return 1
-    if name != value:
-        print(f"Normalized to: {name}")
-    if name == "archive":
-        # The cleaner's archive/ subtree shares the runs namespace; if the
-        # name-as-directory growth path lands, this name would collide.
-        print("❌ 'archive' is a reserved name (the archived-runs subtree)", file=sys.stderr)
-        return 1
-    rdir = _require_run_dir()
+    rdir, state = _require_run()
     if rdir is None:
-        return 1
-    try:
-        state = _load_or_seed(rdir)
-    except run_state.RunStateError as exc:
-        print(f"❌ {exc}", file=sys.stderr)
         return 1
     if state.get("name") == name:
         print(f"✅ Name unchanged: {name}")
@@ -713,11 +767,16 @@ def cmd_resume(as_json: bool = False) -> int:
         return 0
     try:
         state = run_state.load_state(rdir)
-    except run_state.RunStateError as exc:
+        events = run_state.read_events(rdir, last_n=5)
+    except (run_state.RunStateError, OSError) as exc:
         print(f"⚠️  Run state unreadable — falling back to worklog. ({exc})")
         return 0
-    events = run_state.read_events(rdir, last_n=5)
     decision = run_state.decide(state, events, run_state.current_session_id())
+    if decision.get("kind") == "run":
+        # Dirs are renamed by the lifecycle (issue #87 D2), so consumers —
+        # e.g. the stop-hook guard's push check — need the resolved path,
+        # not a slug-derived guess.
+        decision["run_dir"] = str(rdir)
     if as_json:
         print(json.dumps(decision, ensure_ascii=False))
     else:
@@ -762,13 +821,8 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
     if not source.exists():
         print(f"❌ Artifact source not found: {file_path}", file=sys.stderr)
         return 1
-    rdir = _require_run_dir()
+    rdir, state = _require_run()
     if rdir is None:
-        return 1
-    try:
-        state = _load_or_seed(rdir)
-    except run_state.RunStateError as exc:
-        print(f"❌ {exc}", file=sys.stderr)
         return 1
     content = redact_secrets(source.read_text(encoding="utf-8"))
     (rdir / name).write_text(content, encoding="utf-8")
@@ -779,9 +833,77 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
 
     # Durability: artifacts are exactly what a dead session must not lose —
     # push the run dir now rather than waiting for session end (non-fatal).
-    rc = commit_work_path(run_state.run_rel_path(), f"run-state: {state['slug']} artifact {name}")
+    # Candidates (resolved + bare-slug dirs) so a rename whose own push
+    # failed still gets its old path's deletions staged here.
+    rc = commit_work_path(
+        run_state.run_rel_path_candidates(),
+        f"run-state: {state['slug']} artifact {name}",
+    )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (artifact saved locally)")
+    return 0
+
+
+def cmd_seed(args) -> int:
+    """Execute seed command (issue #87 D3 — out-of-session run creation).
+
+    Creates a run for a slug OTHER than the current session's, through the
+    same create-tmp → write-state → rename lifecycle as session seeding,
+    recording CLI-shaped events (run_seeded, then goal_set / run_named as
+    applicable). Seeding is not owning: no `owner` claim is made. Writes
+    only — the caller batches the push with `work commit`.
+    """
+    base = run_state.runs_base()
+    if base is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+
+    slug = run_state.derive_slug(args.taskdef, args.target)
+    # match_names too: a sibling run NAMED like this slug would make the
+    # new run unfindable by name lookups — refuse the ambiguity outright.
+    existing = run_state.find_run_dir(slug, match_names=True)
+    if existing is not None:
+        print(f"❌ Run '{slug}' already exists at {existing}", file=sys.stderr)
+        return 1
+    if (base / slug).exists():
+        print(f"❌ {base / slug} already exists (stateless dir — not seeding over it)", file=sys.stderr)
+        return 1
+
+    name = None
+    if args.name:
+        name = _validate_name(args.name)
+        if name is None:
+            return 1
+        holder = _name_conflict(base / slug, name)
+        if holder is not None:
+            print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
+            return 1
+
+    try:
+        rdir, state = run_state.seed_run_dir(
+            slug,
+            args.taskdef,
+            args.target,
+            note=f"seeded via `work seed` ({args.taskdef}, target: {args.target})",
+            adopt_existing=False,  # seeding must never mutate a run it didn't create
+        )
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+
+    if args.goal:
+        state["goal"] = args.goal
+    if name:
+        state["name"] = name
+    if args.goal or name:
+        run_state.write_state(rdir, state)
+        if args.goal:
+            run_state.append_event(rdir, "goal_set", note=args.goal)
+        if name:
+            run_state.append_event(rdir, "run_named", note=name)
+
+    print(f"✅ Run seeded: {rdir}")
+    print("   Not pushed — run `work commit` to publish it.")
     return 0
 
 
@@ -801,13 +923,24 @@ def cmd_session_start() -> int:
             state = None
             recovered = True
         if state is None:
-            state = run_state.seed_state(
-                run_state.derive_slug(),
-                os.environ.get("LMER_TASK", "default"),
-                os.environ.get("LMER_TASK_TARGET", ""),
-            )
-            run_state.write_state(rdir, state)
-            run_state.append_event(rdir, "run_seeded")
+            if rdir.exists():
+                # The dir already holds its final name (and possibly other
+                # files, e.g. the backed-up corrupt state) — seed in place.
+                state = run_state.seed_state(
+                    run_state.derive_slug(),
+                    os.environ.get("LMER_TASK", "default"),
+                    os.environ.get("LMER_TASK_TARGET", ""),
+                )
+                run_state.write_state(rdir, state)
+                run_state.append_event(rdir, "run_seeded")
+            else:
+                # Fresh run: create through the tmp-dir-then-rename
+                # lifecycle (issue #87 D2).
+                rdir, state = run_state.seed_run_dir(
+                    run_state.derive_slug(),
+                    os.environ.get("LMER_TASK", "default"),
+                    os.environ.get("LMER_TASK_TARGET", ""),
+                )
 
         # Decide BEFORE claiming so a foreign claim surfaces as a warning.
         events = run_state.read_events(rdir, last_n=5)
@@ -850,8 +983,8 @@ def cmd_session_end() -> int:
         if isinstance(owner, dict) and owner.get("session_id") == run_state.current_session_id():
             state["owner"] = None
         run_state.write_state(rdir, state)
-        rel = run_state.run_rel_path()
-        rc = commit_work_path(rel, f"run-state: session end {state['slug']}")
+        rels = run_state.run_rel_path_candidates()
+        rc = commit_work_path(rels, f"run-state: session end {state['slug']}")
         if rc != 0:
             print("⚠️  Warning: run-state push failed at session end (state saved locally)")
     except Exception as exc:
@@ -890,6 +1023,8 @@ def main() -> int:
         return cmd_resume(args.as_json)
     elif args.command == "artifact":
         return cmd_artifact(args.name, args.file, args.sync)
+    elif args.command == "seed":
+        return cmd_seed(args)
     elif args.command == "session-start":
         return cmd_session_start()
     elif args.command == "session-end":

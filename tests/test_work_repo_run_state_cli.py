@@ -61,7 +61,7 @@ class TestStateSet:
         assert any(e["type"] == "run_seeded" for e in events)
         assert any(e["type"] == "phase" and e["note"] == "interview" for e in events)
         push.assert_called_once_with(
-            "git.example.com/org/repo/runs/develop-issue-123",
+            ["git.example.com/org/repo/runs/develop-issue-123"],
             "run-state: develop-issue-123 phase=interview",
         )
 
@@ -434,7 +434,7 @@ class TestSessionEnd:
         events = run_state.read_events(run_env, last_n=0)
         assert events[-1]["type"] == "session_end"
         push.assert_called_once_with(
-            "git.example.com/org/repo/runs/develop-issue-123",
+            ["git.example.com/org/repo/runs/develop-issue-123"],
             "run-state: session end develop-issue-123",
         )
 
@@ -501,7 +501,7 @@ class TestArtifactProactivePush:
         with patch("work_repo.cli.commit_work_path", return_value=0) as push:
             assert _main(["artifact", "spec.md", "--file", str(src)]) == 0
         push.assert_called_once_with(
-            "git.example.com/org/repo/runs/develop-issue-123",
+            ["git.example.com/org/repo/runs/develop-issue-123"],
             "run-state: develop-issue-123 artifact spec.md",
         )
 
