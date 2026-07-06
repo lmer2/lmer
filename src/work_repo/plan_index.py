@@ -23,8 +23,17 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from fnmatch import fnmatchcase
+
+from .findings import Finding, error as _error, warning as _warning, format_findings
+from .goals import active_goals, parse_goals
+
+__all__ = [
+    "Finding", "format_findings", "PLAN_INDEX_FILE",
+    "PLAN_INDEX_SCHEMA_VERSION", "SESSION_SCOPES", "parse_plan_index",
+    "parse_goal_ids", "count_plan_checkboxes", "paths_overlap",
+    "lint_plan_index",
+]
 
 PLAN_INDEX_FILE = "plan.index.json"
 PLAN_INDEX_SCHEMA_VERSION = 1
@@ -33,26 +42,6 @@ SESSION_SCOPES = ("one", "multi")
 # plan.md task checkboxes — the drift signal compares their count with the
 # index's task count. Matches GFM `- [ ]` / `* [x]` items at any indent.
 _CHECKBOX_RE = re.compile(r"^\s*[-*]\s+\[[ xX]\]", re.MULTILINE)
-# goals.md goal headings, per the masterplan parseGoals convention:
-# `## G<number>: <statement>`.
-_GOAL_HEADING_RE = re.compile(r"^##\s+(G\d+):", re.MULTILINE | re.IGNORECASE)
-
-
-@dataclass(frozen=True)
-class Finding:
-    """One lint finding. level is 'error' (blocks the gate) or 'warning'."""
-
-    level: str
-    rule: str
-    message: str
-
-
-def _error(rule: str, message: str) -> Finding:
-    return Finding("error", rule, message)
-
-
-def _warning(rule: str, message: str) -> Finding:
-    return Finding("warning", rule, message)
 
 
 def parse_plan_index(text: str) -> tuple[dict | None, list[Finding]]:
@@ -85,8 +74,13 @@ def parse_plan_index(text: str) -> tuple[dict | None, list[Finding]]:
 
 
 def parse_goal_ids(goals_md_text: str) -> set[str]:
-    """Goal ids declared in goals.md (`## G<n>: …` headings), uppercased."""
-    return {m.upper() for m in _GOAL_HEADING_RE.findall(goals_md_text or "")}
+    """Goal ids declared in goals.md (active AND tombstoned), via the goals
+    kernel's parser — one definition of "a goal heading" for every rule in
+    this lint (ids come back uppercase-normalized from the kernel)."""
+    return {
+        g["id"] for g in parse_goals(goals_md_text or "")["goals"]
+        if isinstance(g.get("id"), str)
+    }
 
 
 def count_plan_checkboxes(plan_md_text: str) -> int:
@@ -201,9 +195,9 @@ def lint_plan_index(
     """Run every lint rule over a parsed plan index. Pure; ordered findings.
 
     plan_md / goals_md are the sibling documents' text when they exist,
-    None when they don't — the drift and goal-ref rules only fire when the
-    document they compare against is actually present (the goals rule stays
-    soft until develop-goal-freeze lands a real goals contract).
+    None when they don't — the drift, goal-ref, and goal-coverage rules
+    only fire when the document they compare against is actually present.
+    Both goal rules stay warnings (nudge-don't-block, issue #91 D3 v1).
     """
     findings: list[Finding] = []
     tasks = index.get("tasks")
@@ -350,13 +344,26 @@ def lint_plan_index(
                     "goals",
                     f"task {task['id']}: goal ref(s) {', '.join(missing)} "
                     "not found in goals.md"))
+        # Goal coverage (issue #91 D3, soft in v1): every ACTIVE goal needs
+        # at least one covering task — a `goals` ref in the index, or (the
+        # degraded path) a textual mention of the goal id in plan.md.
+        # Tombstoned goals need no coverage.
+        covered = {
+            g.strip().upper()
+            for task in valid_tasks
+            for g in task.get("goals") or []
+        }
+        for goal in active_goals(parse_goals(goals_md)):
+            goal_id = goal["id"]
+            if goal_id.upper() in covered:
+                continue
+            if plan_md is not None and re.search(
+                rf"(?<![\w-]){re.escape(goal_id)}(?![\w-])", plan_md, re.IGNORECASE
+            ):
+                continue
+            findings.append(_warning(
+                "coverage",
+                f"goal {goal_id} has no covering task — reference it from a "
+                "task's goals field in plan.index.json (or mention it in plan.md)"))
 
     return findings
-
-
-def format_findings(findings: list[Finding]) -> list[str]:
-    """Render findings as report lines (errors ❌, warnings ⚠️ )."""
-    return [
-        ("❌ " if f.level == "error" else "⚠️  ") + f.message
-        for f in findings
-    ]

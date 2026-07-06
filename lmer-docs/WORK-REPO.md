@@ -449,14 +449,60 @@ The lint verifies what plan-gate approval otherwise takes on faith:
 overlap between dependency-independent tasks not covered by
 `shared_files`, and missing session-scope declarations; **warnings**
 (exit 0) on plan.md checkbox/index count drift, tasks with no
-`verify_commands`, unresolvable `goals` refs (when goals.md exists), and
-stale `shared_files` entries. Findings print to stdout so the report can
-go straight into the plan-approval request — the plan gate wants plan.md
-presented **with a green `work plan check`** included.
+`verify_commands`, unresolvable `goals` refs (when goals.md exists),
+active goals with no covering task (a task's `goals` ref, or a plan.md
+mention as fallback), and stale `shared_files` entries. Findings print to
+stdout so the report can go straight into the plan-approval request — the
+plan gate wants plan.md presented **with a green `work plan check`**
+included.
 
 No plan index (or no run context) is a clean exit 0 with a message —
 chat/review runs have no index and are never nagged. The command writes
 nothing: no event, no push; safe to re-run anytime.
+
+### Track the run's goal contract
+
+```bash
+work goals               # status: counts, hash, frozen/diverged
+work goals check         # draft lint (read-only)
+work goals freeze --note "approved in review thread"
+work goals amend --note "scope grew at plan time"
+work goals assess        # print the verdict skeleton + divergence report
+work goals assess \
+  --verdict 'G1=met:t1-tests receipt' \
+  --verdict 'G2=partial:docs/FEATURE.md landed, examples pending'
+```
+
+`runs/<slug>/goals.md` is the run's goal contract (issue #91): drafted
+during spec/brainstorm, **frozen at spec approval**, amended only
+explicitly, assessed goal-by-goal at finish. Format: `## G<N>: <title>`
+headings, each active goal carrying `signal:` (one of
+`test|command|artifact|docs`) and `evidence:` (where the proof lives);
+removed goals become tombstones (`tombstone_reason:`/`tombstone_at:`) and
+ids never renumber.
+
+- `check` — draft lint: structural problems error; missing
+  `signal:`/`evidence:` warns (drafts may sketch; frozen goals may not).
+- `freeze` — the spec-approval gate: strict validation, records
+  `goals_frozen` with the canonical goal list + hash (put the approval
+  context in `--note`), registers goals.md as an artifact, invokes the
+  run's pre-execution freeze seam (named runs only — an unnamed run's
+  seam is left to the phase gate so the one-shot dir rename isn't
+  forfeited), pushes. Re-freezing errors — use amend.
+- `amend` — every post-freeze change: validated against the last agreed
+  set (tombstone-not-renumber), recorded as `goal_amended` with a
+  per-goal diff. Editing goals.md without amending is silent divergence
+  and assess will say so.
+- `assess` — the finish step, BEFORE `work state set --status=complete`.
+  Bare form prints the verdict skeleton and the receipt names you can
+  cite; the `--verdict` form (one flag per active goal, complete map
+  required, verdicts `met|partial|missed|waived`) records
+  `goals_assessed` and prints the completed table — land it in retro.md.
+  Evidence citing a recorded receipt or registered artifact is classified
+  as such; free prose is allowed but marked `(prose)`.
+
+Everything is nudge-don't-block in v1: divergence and coverage gaps are
+reported loudly, never fatal.
 
 ### Print the resume brief
 
