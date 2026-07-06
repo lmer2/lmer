@@ -37,7 +37,7 @@ from typing import Optional
 
 import yaml
 
-from .utils import _work_repo_base, sanitize_task_target
+from .utils import _work_repo_base, redact_secrets, sanitize_task_target
 
 SCHEMA_VERSION = 1
 STATE_FILE = "state.yaml"
@@ -676,14 +676,41 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
     return linked
 
 
-def emit_gate_event(gate: str, outcome: str) -> None:
+def emit_gate_event(
+    gate: str,
+    outcome: str,
+    exit_code: Optional[int] = None,
+    duration_s: Optional[float] = None,
+    summary: Optional[str] = None,
+    argv: Optional[list] = None,
+    commit_sha: Optional[str] = None,
+) -> None:
     """Record a gate command outcome ('pass' | 'fail' | 'bypass') on the
-    current run. Guarded so gate behavior is byte-identical when no run
+    current run, as a machine-written receipt (issue #88): the `data`
+    payload proves the gate actually ran and is stamped by the tool
+    process, never typed by the model. `gate` and `outcome` are always
+    present; the remaining fields land only when the caller measured them
+    (`summary` is best-effort and simply absent when unparseable — never
+    fabricated). Guarded so gate behavior is byte-identical when no run
     exists, and no failure here can ever change a gate's exit code."""
     try:
         rdir = run_dir()
         if rdir is None or _state_path(rdir) is None:
             return
-        append_event(rdir, "gate", note=f"{gate}: {outcome}")
+        data: dict = {"gate": gate, "outcome": outcome}
+        if exit_code is not None:
+            data["exit_code"] = exit_code
+        if duration_s is not None:
+            data["duration_s"] = round(duration_s, 1)
+        if summary is not None:
+            # Receipt text lands in the (shared) work repo — redact like
+            # the other writers do (gate-commit's argv carries the commit
+            # message; a summary line could echo anything).
+            data["summary"] = redact_secrets(summary)
+        if argv is not None:
+            data["argv"] = [redact_secrets(str(arg)) for arg in argv]
+        if commit_sha is not None:
+            data["commit_sha"] = commit_sha
+        append_event(rdir, "gate", note=f"{gate}: {outcome}", data=data)
     except Exception:
         pass

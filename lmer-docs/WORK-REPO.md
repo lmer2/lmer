@@ -296,8 +296,8 @@ skipped. Without a run context (`LMER_REPO_HOST`/`LMER_REPO_PROJECT`
 unset), the read-only and hook-facing verbs (`work state`, `work resume`,
 `work session-start`, `work session-end`) print a "no run context" message
 and exit 0, but the mutating verbs (`work state set`, `work event`,
-`work artifact`) print an error to stderr and exit 1 — scripts chaining
-them under `set -e` should expect that.
+`work verify`, `work artifact`) print an error to stderr and exit 1 —
+scripts chaining them under `set -e` should expect that.
 
 ### Show current state
 
@@ -370,6 +370,35 @@ work event review_posted --note "posted round 2 comments" --data '{"count": 4}'
 Appends one line to `events.jsonl`. `--note` and `--data` (a JSON object)
 are both optional. The run is auto-seeded if this is the first `work`
 invocation for it.
+
+### Record a validation receipt
+
+```bash
+work verify tests -- pytest tests/ -q
+work verify lint -- uv run pre-commit run --all-files
+```
+
+Runs the command (stderr merged into stdout, `2>&1`-style), streams its
+output through, **mirrors its exit code**, and appends a `verify` receipt
+event to `events.jsonl`: `{name, argv, exit_code, duration_s, summary_line,
+output_tail_sha256}`. The receipt is written by the tool process — never
+typed by the model — which is what makes it proof that the validation
+actually ran. `output_tail_sha256` is the sha256 of the last 64 KiB of
+output, so the receipt is checkable later without storing the output
+itself; `summary_line` is the last non-empty output line, and both it and
+`argv` are secret-redacted before landing in the work repo.
+
+The `--` separator is **required**. A signal-killed command exits (and is
+recorded as) `128+N`, shell-style; a command that cannot start exits 127.
+
+Use this for every validation named in a plan task's `verify:` line that
+isn't already a gate command — `gate-check`/`gate-commit`/`gate-push`
+record their own `gate` receipts automatically. Claiming a plan task
+complete requires a matching receipt from the current session.
+
+This is a mutating verb: without run context it errors *before* running
+the command. If the receipt append fails after the command ran, a loud
+stderr warning is printed but the exit code still mirrors the command.
 
 ### Print the resume brief
 

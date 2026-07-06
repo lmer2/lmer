@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import sys
 import argparse
+import hashlib
 import os
 import json
 import re
+import subprocess
+import time
 from pathlib import Path
 from datetime import datetime
 import yaml
@@ -17,6 +20,13 @@ from .git_ops import commit_work_changes, commit_work_path
 from . import run_state
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
+
+# `work verify` keeps only this much of the tail of the verified command's
+# combined output in memory — enough to cover any runner's summary, bounded
+# for arbitrarily chatty commands. The receipt's `output_tail_sha256` is the
+# sha256 of exactly these bytes, so a receipt can be checked after the fact
+# without the work repo ever storing the output itself.
+VERIFY_TAIL_BYTES = 64 * 1024
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -191,6 +201,23 @@ Examples:
         "value",
         nargs="?",
         help="Name to set (normalized to kebab-case; omit to display the current name)",
+    )
+
+    # verify command (gate receipts — issue #88 D2)
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Run a validation command and record a verify receipt event",
+    )
+    verify_parser.add_argument(
+        "name",
+        help="Receipt name matching the plan task's validation contract (e.g. tests)",
+    )
+    # dest must not be `command` — that is the top-level subcommand slot.
+    verify_parser.add_argument(
+        "verify_command",
+        nargs=argparse.REMAINDER,
+        metavar="-- command …",
+        help="The command to run, after a `--` separator",
     )
 
     # event command
@@ -643,6 +670,108 @@ def cmd_state(args) -> int:
     return 0
 
 
+def _last_non_empty_line(tail: bytes) -> str | None:
+    """Best-effort final line of captured output; None when there is none."""
+    for line in reversed(tail.decode("utf-8", errors="replace").splitlines()):
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+def cmd_verify(name: str, command: list[str]) -> int:
+    """Execute verify command (issue #88 D2 — receipts for non-gate validation).
+
+    Runs the command with stderr merged into stdout (so the hashed tail sees
+    the whole story, like `2>&1`), streams the output through to stdout,
+    mirrors the command's exit code, and appends a `verify` receipt event —
+    written by this tool process, never typed by the model. The caller
+    (main) has already enforced and stripped the `--` separator; `command`
+    is the raw post-separator argv. Mutating-verb rules apply: without run
+    context this errors out BEFORE running the command (a validation whose
+    receipt can never land proves nothing).
+    A receipt-append failure after the command ran is reported loudly but
+    the exit code still mirrors the command — the run's result stays
+    truthful for pipelines either way.
+    """
+    command = list(command or [])
+    if not command:
+        print("❌ verify requires a command after `--`", file=sys.stderr)
+        return 1
+    name = name.strip()
+    if not name:
+        print("❌ verify requires a non-empty receipt name", file=sys.stderr)
+        return 1
+
+    rdir, _state = _require_run()
+    if rdir is None:
+        return 1
+
+    started = time.monotonic()
+    tail = bytearray()
+    try:
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+    except (OSError, ValueError) as exc:
+        # Shell convention: 127 for a command that could not be started.
+        print(f"❌ verify could not start {command[0]!r}: {exc}", file=sys.stderr)
+        exit_code = 127
+    else:
+        echo = sys.stdout.buffer
+        try:
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    break
+                if echo is not None:
+                    try:
+                        echo.write(chunk)
+                        echo.flush()
+                    except BrokenPipeError:
+                        # Downstream consumer closed early (`… | head`):
+                        # stop echoing but keep draining and hashing so the
+                        # receipt still lands and the exit code still
+                        # mirrors the command.
+                        echo = None
+                tail += chunk
+                if len(tail) > VERIFY_TAIL_BYTES:
+                    del tail[: len(tail) - VERIFY_TAIL_BYTES]
+            exit_code = proc.wait()
+        except KeyboardInterrupt:
+            # The child shares the terminal's SIGINT; reap it and mirror
+            # the shell convention for an interrupted command.
+            proc.wait()
+            exit_code = 130
+        if exit_code < 0:
+            # Signal-killed: wait() reports -N; mirror the shell's 128+N so
+            # the receipt and the observed exit code agree.
+            exit_code = 128 - exit_code
+
+    data = {
+        "name": name,
+        "argv": [redact_secrets(arg) for arg in command],
+        "exit_code": exit_code,
+        "duration_s": round(time.monotonic() - started, 1),
+        "output_tail_sha256": hashlib.sha256(bytes(tail)).hexdigest(),
+    }
+    summary_line = _last_non_empty_line(bytes(tail))
+    if summary_line is not None:
+        data["summary_line"] = redact_secrets(summary_line)
+    note = f"{name}: {'pass' if exit_code == 0 else f'exit {exit_code}'}"
+    try:
+        run_state.append_event(rdir, "verify", note=note, data=data)
+        # Receipt chrome goes to stderr: the command's own stdout streams
+        # through untouched for pipelines.
+        print(f"✅ Verify receipt recorded: {note}", file=sys.stderr)
+    except Exception as exc:
+        print(
+            f"❌ verify receipt NOT recorded ({exc}) — exit code still mirrors the command",
+            file=sys.stderr,
+        )
+    return exit_code
+
+
 def cmd_event(args) -> int:
     """Execute event command."""
     data = None
@@ -1015,6 +1144,20 @@ def main() -> int:
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
     elif args.command == "state":
         return cmd_state(args)
+    elif args.command == "verify":
+        # The `--` separator is REQUIRED, not decorative: without it,
+        # `work verify -- pytest tests/` (name forgotten) silently parses
+        # as name="pytest", command=["tests/"] and records a receipt named
+        # pytest for a command that never was. argparse consumes the first
+        # `--` itself, so the contract is enforced on the RAW argv.
+        raw = sys.argv[1:]
+        if len(raw) < 3 or raw[2] != "--":
+            print(
+                "❌ verify requires the `--` separator: work verify <name> -- <command …>",
+                file=sys.stderr,
+            )
+            return 1
+        return cmd_verify(raw[1], raw[3:])
     elif args.command == "event":
         return cmd_event(args)
     elif args.command == "name":

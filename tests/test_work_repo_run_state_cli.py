@@ -1,4 +1,5 @@
 """Tests for run-state verbs in the work CLI."""
+import hashlib
 import json
 import os
 import subprocess
@@ -141,6 +142,130 @@ class TestEvent:
 
     def test_event_auto_seeds_missing_run(self, run_env):
         assert _main(["event", "x"]) == 0
+        assert run_state.load_state(run_env) is not None
+        events = run_state.read_events(run_env, last_n=0)
+        assert events[0]["type"] == "run_seeded"
+
+
+def _verify_events(run_env):
+    return [e for e in run_state.read_events(run_env, last_n=0) if e["type"] == "verify"]
+
+
+class TestVerify:
+    def test_no_context_exits_one_and_never_runs_command(self, tmp_path, capsys):
+        marker = tmp_path / "ran.txt"
+        assert _main(["verify", "tests", "--", "touch", str(marker)]) == 1
+        assert not marker.exists()
+        assert "run context" in capsys.readouterr().err.lower()
+
+    def test_pass_receipt_shape(self, run_env, capsys):
+        assert _main(["verify", "tests", "--", "echo", "1397 passed in 41.8s"]) == 0
+        event = _verify_events(run_env)[-1]
+        assert event["note"] == "tests: pass"
+        data = event["data"]
+        assert data["name"] == "tests"
+        assert data["argv"] == ["echo", "1397 passed in 41.8s"]
+        assert data["exit_code"] == 0
+        assert data["duration_s"] >= 0
+        assert data["summary_line"] == "1397 passed in 41.8s"
+        assert data["output_tail_sha256"] == hashlib.sha256(
+            b"1397 passed in 41.8s\n").hexdigest()
+
+    def test_mirrors_nonzero_exit_code(self, run_env):
+        assert _main(["verify", "tests", "--", "sh", "-c", "exit 4"]) == 4
+        event = _verify_events(run_env)[-1]
+        assert event["note"] == "tests: exit 4"
+        assert event["data"]["exit_code"] == 4
+
+    def test_streams_output_and_reports_on_stderr(self, run_env, capsys):
+        assert _main(["verify", "ok", "--", "echo", "hello"]) == 0
+        captured = capsys.readouterr()
+        assert "hello" in captured.out
+        assert "Verify receipt recorded: ok: pass" in captured.err
+
+    def test_stderr_merged_into_tail(self, run_env):
+        assert _main(["verify", "warn", "--", "sh", "-c", "echo boom >&2"]) == 0
+        assert _verify_events(run_env)[-1]["data"]["summary_line"] == "boom"
+
+    def test_tail_bounded_to_last_64k(self, run_env):
+        script = "import sys; sys.stdout.write('a' * 100000 + 'END\\n')"
+        assert _main(["verify", "big", "--", sys.executable, "-c", script]) == 0
+        expected_tail = ("a" * 100000 + "END\n").encode()[-work_cli.VERIFY_TAIL_BYTES:]
+        data = _verify_events(run_env)[-1]["data"]
+        assert data["output_tail_sha256"] == hashlib.sha256(expected_tail).hexdigest()
+
+    def test_command_not_found_exits_127(self, run_env, capsys):
+        assert _main(["verify", "x", "--", "definitely-not-a-command-xyz"]) == 127
+        data = _verify_events(run_env)[-1]["data"]
+        assert data["exit_code"] == 127
+        assert "summary_line" not in data  # no output — nothing fabricated
+        assert data["output_tail_sha256"] == hashlib.sha256(b"").hexdigest()
+        assert "could not start" in capsys.readouterr().err
+
+    def test_requires_command(self, run_env, capsys):
+        assert _main(["verify", "tests"]) == 1
+        assert _main(["verify", "tests", "--"]) == 1
+        assert not _verify_events(run_env)
+
+    def test_requires_separator(self, run_env, capsys):
+        """A forgotten name must not silently become the command:
+        `work verify -- pytest tests/` parses as name='pytest' with no
+        leading `--` left in the remainder — refuse it."""
+        marker_free_cmd = ["verify", "--", "echo", "hi"]  # name swallows "echo"
+        assert _main(marker_free_cmd) == 1
+        assert _main(["verify", "tests", "echo", "hi"]) == 1  # separator missing
+        assert not _verify_events(run_env)
+        assert "`--` separator" in capsys.readouterr().err
+
+    def test_signal_killed_maps_to_shell_convention(self, run_env):
+        assert _main(["verify", "sig", "--", "sh", "-c", "kill -9 $$"]) == 137
+        event = _verify_events(run_env)[-1]
+        assert event["note"] == "sig: exit 137"
+        assert event["data"]["exit_code"] == 137
+
+    def test_broken_pipe_keeps_receipt_and_exit_code(self, run_env, monkeypatch):
+        """A downstream consumer closing early (`… | head`) must not kill
+        the receipt or the exit-code mirror — echoing stops, hashing goes on."""
+        class _BrokenBuffer:
+            def write(self, chunk):
+                raise BrokenPipeError
+            def flush(self):
+                pass
+
+        class _FakeStdout:
+            buffer = _BrokenBuffer()
+
+        monkeypatch.setattr(work_cli.sys, "stdout", _FakeStdout())
+        assert _main(["verify", "piped", "--", "sh", "-c", "echo out; echo more"]) == 0
+        event = _verify_events(run_env)[-1]
+        assert event["note"] == "piped: pass"
+        assert event["data"]["exit_code"] == 0
+        # The tail kept accumulating after the echo died.
+        assert event["data"]["summary_line"] == "more"
+        assert event["data"]["output_tail_sha256"] == hashlib.sha256(
+            b"out\nmore\n").hexdigest()
+
+    def test_requires_nonempty_name(self, run_env, capsys):
+        assert _main(["verify", "   ", "--", "true"]) == 1
+        assert not _verify_events(run_env)
+
+    def test_summary_line_is_redacted(self, run_env, monkeypatch):
+        monkeypatch.setattr(work_cli, "redact_secrets", lambda s: "<redacted>")
+        assert _main(["verify", "t", "--", "echo", "token=hunter2"]) == 0
+        assert _verify_events(run_env)[-1]["data"]["summary_line"] == "<redacted>"
+
+    def test_receipt_failure_warns_but_mirrors_exit_code(self, run_env, capsys, monkeypatch):
+        # Seed first: only the RECEIPT append may fail, not the auto-seed.
+        run_state.write_state(run_env, run_state.seed_state("develop-issue-123", "develop", "t"))
+        monkeypatch.setattr(
+            work_cli.run_state, "append_event",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("read-only fs")),
+        )
+        assert _main(["verify", "t", "--", "echo", "fine"]) == 0
+        assert "NOT recorded" in capsys.readouterr().err
+
+    def test_auto_seeds_missing_run(self, run_env):
+        assert _main(["verify", "t", "--", "true"]) == 0
         assert run_state.load_state(run_env) is not None
         events = run_state.read_events(run_env, last_n=0)
         assert events[0]["type"] == "run_seeded"

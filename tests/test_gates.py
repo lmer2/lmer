@@ -563,6 +563,67 @@ class TestGateSystem:
         self.gate.check_tests.assert_called_once()
 
 
+class TestReceiptSummary:
+    """GateSystem.receipt_summary(): best-effort, never fabricated (#88)."""
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=False)
+
+    def test_failed_check_names_win(self):
+        self.gate.results = [
+            CheckResult("Python Tests", CheckStatus.FAILED),
+            CheckResult("Branch Check", CheckStatus.PASSED),
+            CheckResult("Security Check", CheckStatus.FAILED),
+        ]
+        assert self.gate.receipt_summary() == "failed: Python Tests, Security Check"
+
+    def test_noncritical_failures_and_warnings_do_not_count(self):
+        self.gate.results = [
+            CheckResult("Code Quality", CheckStatus.FAILED, is_critical=False),
+            CheckResult("Changelog", CheckStatus.WARNING),
+        ]
+        assert self.gate.receipt_summary() is None
+
+    def test_pytest_tail_line_on_pass(self):
+        self.gate.results = [
+            CheckResult(
+                "Python Tests", CheckStatus.PASSED,
+                message="All 1397 tests passed",
+                full_output="....\nlots of dots\n1397 passed in 41.80s\n",
+            ),
+        ]
+        assert self.gate.receipt_summary() == "1397 passed in 41.80s"
+
+    def test_decorated_pytest_summary_is_stripped(self):
+        self.gate.results = [
+            CheckResult(
+                "Python Tests", CheckStatus.PASSED,
+                full_output="=========== 5 passed, 1 skipped in 2.10s ===========\n",
+            ),
+        ]
+        assert self.gate.receipt_summary() == "5 passed, 1 skipped in 2.10s"
+
+    def test_none_without_parseable_output(self):
+        self.gate.results = [
+            CheckResult("Python Tests", CheckStatus.PASSED,
+                        message="No tests directory found (skipped)"),
+            CheckResult("Branch Check", CheckStatus.PASSED),
+        ]
+        assert self.gate.receipt_summary() is None
+
+    def test_no_tests_ran_is_not_a_summary(self):
+        # "no tests ran in 0.01s" carries no count — matching it would let a
+        # receipt look like a test-suite pass when nothing executed.
+        self.gate.results = [
+            CheckResult("Python Tests", CheckStatus.PASSED,
+                        full_output="no tests ran in 0.01s\n"),
+        ]
+        assert self.gate.receipt_summary() is None
+
+    def test_empty_results_is_none(self):
+        assert self.gate.receipt_summary() is None
+
+
 class TestWriteLogFile:
     """Test the gate-check log file written for post-failure investigation."""
 
