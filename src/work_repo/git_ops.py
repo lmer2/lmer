@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from .run_state import run_rel_path
+from .run_state import run_rel_path_candidates
 from .utils import sanitize_task_target
 
 
@@ -42,6 +42,15 @@ def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int,
 PUSH_RETRIES = 3
 
 
+def _has_tracked_files(work_repo_path: Path, rel_path: str) -> bool:
+    """True when git tracks anything under rel_path — even if it is gone
+    from disk (pending deletions still need staging)."""
+    rc, output = run_git_command(
+        ["ls-files", "--", rel_path], work_repo_path, check=False
+    )
+    return rc == 0 and bool(output.strip())
+
+
 def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
     """
     Sync one or more paths in the work repo: add -> commit -> rebase -> push.
@@ -63,7 +72,10 @@ def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
     Args:
         target_path: Path (or list of paths) within the work repo to stage,
             relative to its root (e.g. ``github.com/owner/repo/review/pr-123``).
-            Paths that don't exist on disk are skipped.
+            Paths that neither exist on disk nor hold tracked files are
+            skipped; a tracked path missing from disk is KEPT so that
+            deletions — e.g. the old name after a run-dir rename — get
+            staged and the move lands as a move, not a duplicate.
         commit_message: Optional commit message (defaults to auto-generated
             from the first path).
 
@@ -77,7 +89,11 @@ def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
         return 1
 
     all_paths = [target_path] if isinstance(target_path, str) else list(target_path)
-    paths = [p for p in all_paths if (work_repo_path / p).exists()]
+    paths = [
+        p
+        for p in all_paths
+        if (work_repo_path / p).exists() or _has_tracked_files(work_repo_path, p)
+    ]
     if not paths:
         print("✅ No existing paths to commit in work repository")
         return 0
@@ -157,15 +173,16 @@ def commit_work_changes(commit_message: Optional[str] = None) -> int:
     # Sanitize task_target to match directory structure
     safe_task_target = sanitize_task_target(task_target) if task_target else "default"
 
-    # Build path to add: {host}/{project}/{task_type}/{task_target}
+    # Legacy task-target dir: log/report output predating the run-dir
+    # unification (issue #87 D4) may still sit here — keep staging it.
     target_path = f"{repo_host}/{repo_project}/{task_type}/{safe_task_target}"
 
-    # Also sync the durable run-state directory, so `work commit` pushes
-    # run artifacts/state alongside the worklogs (commit_work_path skips
-    # paths that don't exist).
+    # The run dir itself: the resolved (possibly renamed) dir plus the
+    # bare-slug dir, so a rename whose own push failed still gets its old
+    # path's deletions staged (commit_work_path skips clean paths).
     paths = [target_path]
-    runs_path = run_rel_path()
-    if runs_path:
-        paths.append(runs_path)
+    for rel in run_rel_path_candidates():
+        if rel not in paths:
+            paths.append(rel)
 
     return commit_work_path(paths, commit_message)

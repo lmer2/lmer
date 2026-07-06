@@ -49,7 +49,7 @@ Display recent log entries (last 50 lines):
 work log
 ```
 
-Logs are written to `log.yaml` in the target work directory: `{host}/{project}/{task_type}/{task_target}/log.yaml`
+Logs are written to `log.yaml` at the run-dir root: `{host}/{project}/runs/{slug}/log.yaml` (the run dir is the single home for run output). Displaying falls back to the legacy `{host}/{project}/{task_type}/{task_target}/log.yaml` location when the run dir has no log yet.
 
 When run without a message, `work log` displays:
 - The location of the log file
@@ -67,7 +67,7 @@ work log "Review completed" --metadata issues_found=3 severity=low
 # Display recent log entries
 work log
 # Output:
-# Log file: /work/github.com/owner/repo/review/pr-123/log.yaml
+# Log file: /work/github.com/owner/repo/runs/review-pr-123/log.yaml
 #
 # (truncated to last 50 lines)
 # - timestamp: 2024-01-01T12:00:00Z
@@ -111,7 +111,7 @@ Copy a report file to the work repository with a timestamped filename:
 work report --file report.md
 ```
 
-The file will be copied to: `{host}/{project}/{task_type}/{task_target}/{YYMMDD-HH-MM-SS.md}`
+The file will be copied to: `{host}/{project}/runs/{slug}/reports/{YYMMDD-HH-MM-SS.md}` (inside the run dir — the single home for run output).
 
 **Examples:**
 ```bash
@@ -185,17 +185,25 @@ The work repository uses the following directory structure:
 {host}/{project}/info/                    # Global project info
 {host}/{project}/info/gate-check.yaml     # Optional per-project gate-check config
 {host}/{project}/{task_type}/info/        # Task-specific info
-{host}/{project}/{task_type}/{task_target}/log.yaml  # Logs
-{host}/{project}/{task_type}/{task_target}/{YYMMDD-HH-MM-SS.md}  # Reports
+{host}/{project}/runs/{slug}/             # Run dir — the single home for run output
+{host}/{project}/runs/{slug}/log.yaml     # Logs
+{host}/{project}/runs/{slug}/reports/{YYMMDD-HH-MM-SS.md}  # Reports
 ```
 
 **Example:**
 ```
 github.com/owner/repo/info/              # Project-wide info
 github.com/owner/repo/review/info/       # Review task info
-github.com/owner/repo/review/pr-123/log.yaml  # PR-123 logs
-github.com/owner/repo/review/pr-123/241215-14-30-45.md  # Timestamped report
+github.com/owner/repo/runs/review-pr-123/log.yaml  # PR-123 logs
+github.com/owner/repo/runs/review-pr-123/reports/241215-14-30-45.md  # Timestamped report
 ```
+
+A named run's dir may carry the name-bearing form `runs/{slug}--{name}/`
+after its pre-execution freeze; never address a run by directory name —
+the `work` CLI resolves runs by the `slug:`/`name:` recorded in
+`state.yaml`. Runs that predate the run-dir unification keep their
+log/report files at the legacy `{task_type}/{task_target}/` location,
+which `work log` still reads as a display fallback.
 
 ## Environment Variables
 
@@ -399,6 +407,26 @@ registers them in `state.artifacts`. The same sync runs automatically during
 `work commit` and `work session-end`, so you rarely need the manual form.
 Fail-soft: sync problems never change the host command's exit code; runs
 without a bundle are untouched.
+
+### Seed a run for another slug
+
+```bash
+work seed <taskdef> <target> [--goal "..."] [--name <kebab-case>]
+# e.g.
+work seed develop gate-receipts --goal "receipt-based gate hardening" --name gate-receipts
+work seed review https://git.example.com/org/repo/-/merge_requests/456
+```
+
+Out-of-session run creation: derives the slug from the given taskdef +
+target (exactly like a session would) and creates the run dir through the
+same create-tmp → write-state → rename lifecycle, recording CLI-shaped
+events (`run_seeded`, then `goal_set` / `run_named` when the flags are
+given). Use this instead of ever hand-authoring `state.yaml` /
+`events.jsonl` — hand-written files sidestep the single-writer rule.
+
+Seeding is not owning: no `owner` claim is made, and nothing is pushed —
+batch the push with `work commit`. An existing run for the slug, or a
+`--name` already held by another run, is an error (exit 1).
 
 ### Session hooks
 

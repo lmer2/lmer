@@ -196,7 +196,7 @@ With optional metadata:
 work log "Task completed" --metadata status=success duration=5m
 ```
 
-Logs are written to `log.yaml` in the target work directory: `{host}/{project}/{task_type}/{task_target}/log.yaml`
+Logs are written to `log.yaml` at the run-dir root in the work repository: `{host}/{project}/runs/{slug}/log.yaml`
 
 #### Commit Changes
 Commit and push changes to the work repository:

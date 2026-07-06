@@ -115,7 +115,7 @@ class TestGetLogger:
                 logger = get_logger()
 
                 assert isinstance(logger, YamlFileLogger)
-                expected_path = Path(tmpdir) / "github.com" / "owner" / "repo" / "review" / "pr-123" / "log.yaml"
+                expected_path = Path(tmpdir) / "github.com" / "owner" / "repo" / "runs" / "review-pr-123" / "log.yaml"
                 assert logger.log_file == expected_path
 
     def test_get_logger_missing_env_vars(self):

@@ -296,11 +296,61 @@ class TestCommitWorkPathResilience:
                              if call[0][0][:3] == ["add", "-A", "--"]]
                 assert add_calls == [["add", "-A", "--", existing]]
 
+    def test_tracked_but_deleted_path_is_kept_for_staging(self, tmp_path):
+        # A run-dir rename leaves the old path gone from disk but its files
+        # still tracked — staging it is what commits the move as a move.
+        existing = "git.example.com/grp/proj/runs/develop-issue-1--lifecycle"
+        deleted = "git.example.com/grp/proj/runs/develop-issue-1"
+        (tmp_path / existing).mkdir(parents=True)
+
+        def side_effect(cmd, cwd, check=False):
+            if cmd[0] == "ls-files":
+                return (0, f"{deleted}/state.yaml\n")
+            if cmd[0] == "status":
+                return (0, "R  something\n")
+            return (0, "")
+
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
+                assert commit_work_path([existing, deleted]) == 0
+                add_calls = [call[0][0] for call in mock_git.call_args_list
+                             if call[0][0][:3] == ["add", "-A", "--"]]
+                assert add_calls == [["add", "-A", "--", existing, deleted]]
+
+    def test_has_tracked_files_against_real_repo(self, tmp_path):
+        import subprocess
+
+        from work_repo.git_ops import _has_tracked_files
+
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        tracked = tmp_path / "runs" / "old-run"
+        tracked.mkdir(parents=True)
+        (tracked / "state.yaml").write_text("schema: 1\n", encoding="utf-8")
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_path), "commit", "-q", "-m", "seed"],
+            check=True, env=env,
+        )
+        import shutil
+
+        shutil.rmtree(tracked)
+        assert _has_tracked_files(tmp_path, "runs/old-run") is True
+        assert _has_tracked_files(tmp_path, "runs/never-existed") is False
+
     def test_all_paths_missing_is_clean_noop(self, tmp_path):
         with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
-            with patch("work_repo.git_ops.run_git_command") as mock_git:
+            with patch(
+                "work_repo.git_ops.run_git_command", return_value=(0, "")
+            ) as mock_git:
                 assert commit_work_path(["nope/a", "nope/b"]) == 0
-                mock_git.assert_not_called()
+                # Missing paths get a read-only tracked-files probe (they may
+                # hold pending deletions) — but nothing is staged or committed.
+                assert all(
+                    call.args[0][0] == "ls-files"
+                    for call in mock_git.call_args_list
+                )
 
     def test_commit_work_changes_includes_runs_dir(self, tmp_path):
         env_vars = {
