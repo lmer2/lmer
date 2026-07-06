@@ -295,6 +295,53 @@ class TestWarnings:
         assert "G7" in msgs and "G1" not in msgs
 
 
+class TestGoalCoverage:
+    """Issue #91 D3: active goals with zero covering tasks warn (soft v1)."""
+
+    GOALS_MD = (
+        "## G1: ship it\nsignal: test\nevidence: e\n\n"
+        "## G2: document it\nsignal: docs\nevidence: e\n"
+    )
+
+    def test_uncovered_goal_warns(self):
+        findings = lint_plan_index(
+            _index(_task("T1", goals=["G1"])), goals_md=self.GOALS_MD)
+        msgs = _messages(_warnings(findings))
+        assert "G2 has no covering task" in msgs
+        assert not _errors(findings)
+
+    def test_index_goals_refs_cover(self):
+        findings = lint_plan_index(
+            _index(_task("T1", goals=["G1"]), _task("T2", goals=["g2"], deps=["T1"])),
+            goals_md=self.GOALS_MD)
+        assert "covering task" not in _messages(findings)
+
+    def test_plan_md_mention_is_the_fallback(self):
+        findings = lint_plan_index(
+            _index(_task("T1", goals=["G1"])),
+            plan_md="- [ ] T1 also lands G2 docs\n",
+            goals_md=self.GOALS_MD)
+        assert "covering task" not in _messages(findings)
+        # An embedded token (G2x / docs-G2) is not a mention.
+        findings = lint_plan_index(
+            _index(_task("T1", goals=["G1"])),
+            plan_md="- [ ] T1 lands G2x\n",
+            goals_md=self.GOALS_MD)
+        assert "G2 has no covering task" in _messages(_warnings(findings))
+
+    def test_tombstoned_goals_need_no_coverage(self):
+        goals_md = self.GOALS_MD + (
+            "\n## G3: dropped\ntombstone_reason: descoped\n"
+            "tombstone_at: 2026-07-01T00:00:00Z\n"
+        )
+        findings = lint_plan_index(
+            _index(_task("T1", goals=["G1", "G2"])), goals_md=goals_md)
+        assert "covering task" not in _messages(findings)
+
+    def test_no_goals_md_skips_coverage(self):
+        assert lint_plan_index(_index(_task("T1"))) == []
+
+
 class TestTextHelpers:
     def test_parse_goal_ids(self):
         text = "topic: x\n\n## G1: first\nsignal: s\n\n## g2: second\n### G3: not a goal heading\n"

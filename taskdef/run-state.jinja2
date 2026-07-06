@@ -87,6 +87,27 @@ the work, not optional bookkeeping:
   atomicity declarations are complete. A failing check blocks the plan
   gate: fix the plan (or declare the shared touchpoint) and re-run until
   green before asking.
+- **Goals are a frozen contract.** For runs that produce a spec, draft
+  `goals.md` beside it during the interview/brainstorm phase — masterplan
+  format: `## G<N>: <title>` headings, each active goal carrying
+  `signal:` (one of `test|command|artifact|docs`) and `evidence:` naming
+  its evidence source; lint drafts with `work goals check`. The moment the
+  spec is approved, freeze the set:
+  `work goals freeze --note "<approval context>"` — approving the spec IS
+  the freeze. Any later change to goals.md goes through
+  `work goals amend` (removed goals become tombstones, ids never
+  renumber) — never a silent edit; an unamended edit surfaces as
+  divergence at finish. `work plan check` warns on goals no plan task
+  covers.
+- **Assess goals before declaring the run complete.** BEFORE
+  `work state set --status=complete`, run `work goals assess` (bare form
+  prints the skeleton), then record the verdicts:
+  `work goals assess --verdict 'G<N>=<met|partial|missed|waived>:<evidence>'`
+  — one flag per active goal, evidence citing a receipt or registered
+  artifact where possible (free prose is allowed but marked) — and land
+  the printed verdict table in retro.md. Nudge-don't-block: assess never
+  stops you, but a completed run with no assessment is a gap the reviewer
+  will flag.
 - **Ledger every landed task in the same breath as its commit.** The moment
   a gate-commit lands a plan task, record it before doing anything else:
   `work ledger set <task-id> --status done --commit <sha> [--receipt <name>]`.

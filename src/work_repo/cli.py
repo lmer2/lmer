@@ -17,7 +17,7 @@ import yaml
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import commit_work_changes, commit_work_path
-from . import plan_index, run_state
+from . import goals, plan_index, run_state
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
 
@@ -278,6 +278,28 @@ Examples:
         "check",
         help="Lint the run's plan.index.json (read-only): DAG acyclic, "
              "write-scopes disjoint, session_scope declared",
+    )
+
+    # goals command (frozen goal-sets — issue #91)
+    goals_parser = subparsers.add_parser(
+        "goals",
+        help="Goal-set lifecycle for the run's goals.md "
+             "(check / freeze / amend / assess)",
+    )
+    goals_parser.add_argument(
+        "goals_action", nargs="?",
+        choices=["check", "freeze", "amend", "assess"],
+        help="Verb; omit to display the goal-set status",
+    )
+    goals_parser.add_argument(
+        "--note",
+        help="Context note for the recorded event (e.g. spec-approval context)",
+    )
+    goals_parser.add_argument(
+        "--verdict", action="append", default=[],
+        metavar="G<N>=<verdict>:<evidence>",
+        help="assess only, repeatable — per-goal verdict "
+             f"({'|'.join(goals.GOAL_VERDICTS)}) with its evidence",
     )
 
     # resume command
@@ -620,6 +642,29 @@ def _require_run() -> tuple[Path, dict] | tuple[None, None]:
         return None, None
 
 
+def _push_run_dir(
+    state: dict,
+    detail: str,
+    old_dir_name: str | None = None,
+    saved: str = "state",
+) -> None:
+    """Durability push of the run dir after a mutation (non-fatal, like
+    artifact writes). When a freeze-gate rename just happened, the
+    pre-rename path is staged too so the old path's deletions land even
+    when the rename-time push fails. `saved` names what stays local in the
+    warning when the push fails."""
+    rels = run_state.run_rel_path_candidates()
+    if old_dir_name:
+        host = os.environ.get("LMER_REPO_HOST")
+        project = os.environ.get("LMER_REPO_PROJECT")
+        old_rel = f"{host}/{project}/runs/{old_dir_name}"
+        if old_rel not in rels:
+            rels.append(old_rel)
+    rc = commit_work_path(rels, f"run-state: {state['slug']} {detail}")
+    if rc != 0:
+        print(f"⚠️  Warning: run-state push failed ({saved} saved locally)")
+
+
 def cmd_state(args) -> int:
     """Execute state / state set commands."""
     if args.action != "set":
@@ -707,17 +752,8 @@ def cmd_state(args) -> int:
 
     # Durability (spec §4.4): push on phase transitions and completion.
     if phase_changed or args.status == "complete":
-        rels = run_state.run_rel_path_candidates()
-        if old_dir_name:
-            host = os.environ.get("LMER_REPO_HOST")
-            project = os.environ.get("LMER_REPO_PROJECT")
-            old_rel = f"{host}/{project}/runs/{old_dir_name}"
-            if old_rel not in rels:
-                rels.append(old_rel)
         detail = f"phase={args.phase}" if phase_changed else f"status={args.status}"
-        rc = commit_work_path(rels, f"run-state: {state['slug']} {detail}")
-        if rc != 0:
-            print("⚠️  Warning: run-state push failed (state saved locally)")
+        _push_run_dir(state, detail, old_dir_name)
     return 0
 
 
@@ -1062,6 +1098,352 @@ def cmd_plan_check() -> int:
     return 0
 
 
+def _read_goals_md(rdir: Path) -> str | None:
+    """Text of the run's goals.md, or None when absent/unreadable.
+
+    Redacted at read: goal statements, evidence, and topic seed all flow
+    into events.jsonl (goals_frozen/goal_amended payloads, amend diffs), so
+    like every other agent-typed text landing in the shared work repo they
+    must never carry a secret. Redacting the source text ONCE keeps every
+    derived value — canonical goals, diffs, and crucially the hash — computed
+    over the same bytes, so hash comparisons across verbs stay stable
+    (redaction is deterministic, and `work artifact` already redacts the
+    file itself on copy-in).
+    """
+    path = rdir / goals.GOALS_FILE
+    try:
+        text = path.read_text(encoding="utf-8") if path.is_file() else None
+    except OSError:
+        return None
+    return redact_secrets(text) if text is not None else None
+
+
+def _print_goal_findings(findings) -> bool:
+    """Print lint findings; True when any is an error (blocks the verb)."""
+    for line in goals.format_findings(findings):
+        print(line)
+    return any(f.level == "error" for f in findings)
+
+
+def _receipt_names(events: list[dict]) -> set[str]:
+    """Names of recorded verify/gate receipts, for evidence classification."""
+    names: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        if event.get("type") == "verify" and data.get("name"):
+            names.add(str(data["name"]))
+        elif event.get("type") == "gate" and data.get("gate"):
+            names.add(str(data["gate"]))
+    return names
+
+
+def _cmd_goals_status() -> int:
+    """Bare `work goals`: read-only status display. Always exits 0."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    text = _read_goals_md(rdir)
+    if text is None:
+        print(f"No goals.md in run dir ({rdir})")
+        return 0
+    parsed = goals.parse_goals(text)
+    active = goals.active_goals(parsed)
+    tombstoned = len(parsed["goals"]) - len(active)
+    current_hash = goals.goals_hash(parsed)
+    print(f"Goals: {len(active)} active, {tombstoned} tombstoned ({current_hash})")
+    last = goals.latest_goals_event(run_state.read_events(rdir, last_n=0))
+    if last is None:
+        print("Not frozen — `work goals freeze` records the agreed set at spec approval")
+    elif last["goals_hash"] == current_hash:
+        print("Frozen — goals.md matches the last frozen/amended set")
+    else:
+        print(f"⚠️  DIVERGED from the last frozen/amended set ({last['goals_hash']}) "
+              "— run `work goals amend`")
+    return 0
+
+
+def _cmd_goals_check() -> int:
+    """`work goals check`: read-only draft lint (spec D2). The freeze
+    contract (signal class, evidence) reports as warnings here — drafts may
+    sketch goals before naming their proof — and structural problems error."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    text = _read_goals_md(rdir)
+    if text is None:
+        print(f"No goals.md ({rdir / goals.GOALS_FILE} not found) — nothing to check")
+        return 0
+    parsed = goals.parse_goals(text)
+    findings = goals.validate_goals(parsed)
+    print(f"Goals check: {rdir / goals.GOALS_FILE} — "
+          f"{len(goals.active_goals(parsed))} active goal(s)")
+    has_errors = _print_goal_findings(findings)
+    warnings = [f for f in findings if f.level == "warning"]
+    if has_errors:
+        errors = [f for f in findings if f.level == "error"]
+        print(f"❌ goals check failed: {len(errors)} error(s), {len(warnings)} warning(s)")
+        return 1
+    if warnings:
+        print(f"✅ goals check green ({len(warnings)} warning(s) above become "
+              "errors at freeze)")
+    else:
+        print("✅ goals check green: every goal names its signal and evidence")
+    return 0
+
+
+def _cmd_goals_freeze(note: str | None) -> int:
+    """`work goals freeze`: the spec-approval gate (spec D2 + decision 1).
+
+    Strict-validates goals.md (signal enum + evidence required), records the
+    `goals_frozen` event carrying the canonical goal list + hash — the
+    agreed set every later amend/assess is measured against — registers
+    goals.md in state.artifacts, and invokes the run's pre-execution freeze
+    seam (`freeze_run_dir`: `frozen` stamp + one-shot name-bearing dir
+    rename) when the run is named and not already frozen: both mark the
+    same gate. An UNNAMED run's seam is left to the phase gate instead —
+    the frozen stamp would forfeit the single rename forever, and spec
+    approval can precede the name proposal. Re-freezing is an error —
+    post-freeze changes go through amend.
+    """
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    text = _read_goals_md(rdir)
+    if text is None:
+        print(f"❌ No goals.md in the run dir ({rdir}) — draft it during "
+              "spec/brainstorm, then freeze at approval", file=sys.stderr)
+        return 1
+    if goals.latest_goals_event(run_state.read_events(rdir, last_n=0)) is not None:
+        print("❌ Goals are already frozen — use `work goals amend` for changes",
+              file=sys.stderr)
+        return 1
+    parsed = goals.parse_goals(text)
+    if _print_goal_findings(goals.validate_goals(parsed, strict=True)):
+        print("❌ Cannot freeze: fix the errors above (every active goal must "
+              "name its signal class and evidence source)", file=sys.stderr)
+        return 1
+
+    old_dir_name = None
+    if not state.get("frozen"):
+        if not state.get("name"):
+            # Spec approval usually precedes the run-name proposal, and the
+            # frozen stamp would forfeit the one-shot name-bearing rename
+            # forever ("no second chance") — leave the seam to the phase
+            # gate, which fires at the first execution-family transition.
+            print("⚠️  run not named yet — pre-execution freeze left to the "
+                  "phase gate (name the run with `work name`)")
+        else:
+            # Fail-soft like cmd_state's phase-transition freeze: a rename
+            # problem must not block recording the agreed goal set.
+            try:
+                rdir, old_dir_name = run_state.freeze_run_dir(rdir, state)
+            except Exception as exc:
+                print(f"⚠️  pre-execution freeze skipped: {exc}")
+    state.setdefault("artifacts", {})["goals"] = goals.GOALS_FILE
+    run_state.write_state(rdir, state)
+    goals_hash_value = goals.goals_hash(parsed)
+    run_state.append_event(
+        rdir, goals.GOALS_FROZEN_EVENT,
+        note=redact_secrets(note) if note else None,
+        data={
+            "goals_hash": goals_hash_value,
+            "topic_seed": parsed["topic_seed"],
+            "goals": goals.canonical_goals(parsed),
+        },
+    )
+    print(f"✅ Goals frozen: {goals_hash_value} "
+          f"({len(goals.active_goals(parsed))} active goal(s))")
+    _push_run_dir(state, "goals frozen", old_dir_name, saved="goals change")
+    return 0
+
+
+def _cmd_goals_amend(note: str | None) -> int:
+    """`work goals amend`: explicit post-freeze change (spec D2). Validates
+    the edited goals.md against the last agreed set with the
+    tombstone-not-renumber rules and records the `goal_amended` event with
+    the diff — a goals.md edit without this is exactly the silent
+    divergence assess reports."""
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    text = _read_goals_md(rdir)
+    if text is None:
+        print(f"❌ No goals.md in the run dir ({rdir})", file=sys.stderr)
+        return 1
+    last = goals.latest_goals_event(run_state.read_events(rdir, last_n=0))
+    if last is None:
+        print("❌ Goals are not frozen yet — use `work goals freeze`", file=sys.stderr)
+        return 1
+    parsed = goals.parse_goals(text)
+    new_hash = goals.goals_hash(parsed)
+    if new_hash == last["goals_hash"]:
+        print("✅ No changes to amend — goals.md matches the frozen set")
+        return 0
+    if _print_goal_findings(goals.validate_amendment(last["goals"], parsed["goals"])):
+        print("❌ Cannot amend: fix the errors above (removed goals tombstone, "
+              "ids never renumber)", file=sys.stderr)
+        return 1
+    diff = goals.amendment_diff(last["goals"], parsed["goals"])
+    run_state.append_event(
+        rdir, goals.GOAL_AMENDED_EVENT,
+        note=redact_secrets(note) if note else None,
+        data={
+            "old_goals_hash": last["goals_hash"],
+            "new_goals_hash": new_hash,
+            "diff": diff,
+            "topic_seed": parsed["topic_seed"],
+            "goals": goals.canonical_goals(parsed),
+        },
+    )
+    for change in diff:
+        print(f"  {change['id']}: {change['change']}")
+    if diff:
+        print(f"✅ Goals amended: {new_hash} ({len(diff)} change(s))")
+    else:
+        # The hash moved but no goal changed — a topic-seed edit (the only
+        # per-goal-invisible part of the canonical identity).
+        print(f"✅ Goals amended: {new_hash} (topic-seed change)")
+    _push_run_dir(state, "goals amended", saved="goals change")
+    return 0
+
+
+def _cmd_goals_assess(verdict_flags: list[str], note: str | None) -> int:
+    """`work goals assess`: the finish gate (spec D2 + D3, nudge-don't-block).
+
+    Bare: prints the per-goal verdict skeleton for the session to complete
+    into retro.md, plus a divergence report — read-only and never a
+    failure once a run context exists (missing/invalid goals.md degrades
+    to a note over the skeleton path). With repeatable
+    `--verdict 'G<N>=<verdict>:<evidence>'` flags: validates a complete
+    verdict map over every active goal, classifies each evidence string
+    against recorded receipts and registered artifacts (free prose is
+    allowed but marked), records the `goals_assessed` event, and prints the
+    completed table for retro.md. Divergence from the last frozen/amended
+    hash is reported and recorded, never blocking.
+    """
+    recording = bool(verdict_flags)
+    state: dict | None = None
+    if recording:
+        rdir, state = _require_run()
+        if rdir is None:
+            return 1
+    else:
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+            return 0
+    text = _read_goals_md(rdir)
+    if text is None:
+        if recording:
+            print(f"❌ No goals.md in the run dir ({rdir}) — nothing to assess",
+                  file=sys.stderr)
+            return 1
+        # Bare form is the nudge path — a run without goals gets a note,
+        # never a failure (check-verb symmetry).
+        print(f"No goals.md ({rdir / goals.GOALS_FILE} not found) — nothing to assess")
+        return 0
+    parsed = goals.parse_goals(text)
+    if _print_goal_findings(goals.validate_goals(parsed, strict=True)):
+        if recording:
+            print("❌ Cannot record against a goal set that fails strict "
+                  "validation — fix goals.md (and `work goals amend`) first",
+                  file=sys.stderr)
+            return 1
+        # Bare form: report, then still print the skeleton (nudge-don't-block).
+        print("⚠️  goals.md fails strict validation (see above) — fix it "
+              "before recording verdicts")
+
+    events = run_state.read_events(rdir, last_n=0)
+    last = goals.latest_goals_event(events)
+    current_hash = goals.goals_hash(parsed)
+    diverged = last is not None and last["goals_hash"] != current_hash
+    if last is None:
+        print("⚠️  Goals were never frozen — assessing the working goals.md")
+    elif diverged:
+        print(f"⚠️  goals.md has DIVERGED from the last frozen/amended set "
+              f"({last['goals_hash']}) — a silent edit; `work goals amend` "
+              "it or explain in the retro")
+
+    if not recording:
+        print()
+        print(goals.render_verdict_skeleton(parsed["goals"]))
+        receipts = sorted(_receipt_names(events))
+        if receipts:
+            print()
+            print(f"Receipts available to cite as evidence: {', '.join(receipts)}")
+        print("\nRecord with: work goals assess --verdict 'G1=met:<evidence>' …")
+        return 0
+
+    verdicts: dict[str, dict] = {}
+    for flag in verdict_flags:
+        try:
+            goal_id, verdict, evidence = goals.parse_verdict_flag(flag)
+        except ValueError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+        if goal_id in verdicts:
+            print(f"❌ Duplicate --verdict for goal {goal_id}", file=sys.stderr)
+            return 1
+        verdicts[goal_id] = {"verdict": verdict, "evidence": redact_secrets(evidence)}
+    if _print_goal_findings(goals.validate_verdicts(parsed["goals"], verdicts)):
+        print("❌ Cannot record: the assessment must cover every active goal, "
+              "exactly", file=sys.stderr)
+        return 1
+
+    artifact_names: set[str] = set()
+    if isinstance(state, dict):
+        artifacts = state.get("artifacts") or {}
+        artifact_names = {str(v) for v in artifacts.values()} | {str(k) for k in artifacts}
+    receipt_names = _receipt_names(events)
+    for entry in verdicts.values():
+        entry["evidence_kind"] = goals.classify_evidence(
+            entry["evidence"], receipt_names, artifact_names)
+
+    counts = {v: 0 for v in goals.GOAL_VERDICTS}
+    for entry in verdicts.values():
+        counts[entry["verdict"]] += 1
+    summary = ", ".join(f"{v} {counts[v]}" for v in goals.GOAL_VERDICTS if counts[v])
+    data = {"goals_hash": current_hash, "verdicts": verdicts, "diverged": diverged}
+    if last is not None:
+        data["last_agreed_hash"] = last["goals_hash"]
+    run_state.append_event(
+        rdir, goals.GOALS_ASSESSED_EVENT,
+        note=redact_secrets(note) if note else summary + (" (diverged)" if diverged else ""),
+        data=data,
+    )
+    print()
+    print(goals.render_verdict_table(parsed["goals"], verdicts))
+    print()
+    print(f"✅ Goals assessed: {summary} — land the table above in retro.md")
+    _push_run_dir(state, "goals assessed", saved="goals change")
+    return 0
+
+
+def cmd_goals(args) -> int:
+    """Execute goals verbs (issue #91 — frozen goal-sets)."""
+    if args.verdict and args.goals_action != "assess":
+        print("❌ --verdict is only valid with `work goals assess`", file=sys.stderr)
+        return 1
+    if args.note and args.goals_action in (None, "check"):
+        print("❌ --note is only valid with freeze/amend/assess", file=sys.stderr)
+        return 1
+    if args.goals_action == "check":
+        return _cmd_goals_check()
+    if args.goals_action == "freeze":
+        return _cmd_goals_freeze(args.note)
+    if args.goals_action == "amend":
+        return _cmd_goals_amend(args.note)
+    if args.goals_action == "assess":
+        return _cmd_goals_assess(args.verdict, args.note)
+    return _cmd_goals_status()
+
+
 def cmd_resume(as_json: bool = False) -> int:
     """Execute resume command. Read-only; never breaks a session (always 0)."""
     rdir = run_state.run_dir()
@@ -1360,6 +1742,8 @@ def main() -> int:
         return cmd_name(args.value)
     elif args.command == "ledger":
         return cmd_ledger(args)
+    elif args.command == "goals":
+        return cmd_goals(args)
     elif args.command == "plan":
         if args.plan_action == "check":
             return cmd_plan_check()
