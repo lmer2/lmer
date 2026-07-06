@@ -428,6 +428,36 @@ with its sha — `--receipt` names the `verify`/gate receipt that proves it.
 exist). A Stop-hook nudge fires (once per session) when a session has
 landed gate-commits without writing any ledger row.
 
+### Check the plan index
+
+```bash
+work plan check
+```
+
+Read-only lint of the run's `plan.index.json` — the machine-readable
+companion you author beside plan.md when the plan has more than one task
+(and register with `work artifact plan.index.json --file <path>`). Schema
+v1: per task `id`, `description`, `files` (declared write-scope,
+project-relative paths/globs), `deps`, `verify_commands`, and
+`session_scope: "one"` — or `"multi"` plus a `scope_rationale` saying why
+the task cannot fit one session. Genuinely shared touchpoints between
+independent tasks (CHANGELOG.yaml, docs indexes) are declared in a
+top-level `shared_files` allowlist: `{"T2+T4": ["CHANGELOG.yaml"]}`.
+
+The lint verifies what plan-gate approval otherwise takes on faith:
+**errors** (exit 1) on dependency cycles, unknown/duplicate task ids, file
+overlap between dependency-independent tasks not covered by
+`shared_files`, and missing session-scope declarations; **warnings**
+(exit 0) on plan.md checkbox/index count drift, tasks with no
+`verify_commands`, unresolvable `goals` refs (when goals.md exists), and
+stale `shared_files` entries. Findings print to stdout so the report can
+go straight into the plan-approval request — the plan gate wants plan.md
+presented **with a green `work plan check`** included.
+
+No plan index (or no run context) is a clean exit 0 with a message —
+chat/review runs have no index and are never nagged. The command writes
+nothing: no event, no push; safe to re-run anytime.
+
 ### Print the resume brief
 
 ```bash

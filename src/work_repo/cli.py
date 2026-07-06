@@ -17,7 +17,7 @@ import yaml
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import commit_work_changes, commit_work_path
-from . import run_state
+from . import plan_index, run_state
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
 
@@ -265,6 +265,20 @@ Examples:
         help="Name of the verify/gate receipt proving the task",
     )
     ledger_parser.add_argument("--note", help="Short free-form note")
+
+    # plan command (plan-index lint — issue #90)
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="Plan-index tooling (plan.index.json)",
+    )
+    plan_subparsers = plan_parser.add_subparsers(
+        dest="plan_action", help="Plan action to perform"
+    )
+    plan_subparsers.add_parser(
+        "check",
+        help="Lint the run's plan.index.json (read-only): DAG acyclic, "
+             "write-scopes disjoint, session_scope declared",
+    )
 
     # resume command
     resume_parser = subparsers.add_parser(
@@ -992,6 +1006,62 @@ def cmd_ledger(args) -> int:
     return 0
 
 
+def cmd_plan_check() -> int:
+    """Execute `work plan check` (issue #90 — checkable plan gates).
+
+    Read-only by contract: reads plan.index.json (+ plan.md / goals.md when
+    present) from the run dir, feeds the pure lint kernel, prints the
+    findings report to stdout. Exit 1 only when the lint finds errors —
+    no run context and no plan index are both clean exits (chat/review
+    taskdefs have no index and must not be nagged). Writes nothing: no
+    event append, no push — safe to run anywhere, any number of times.
+    """
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    index_path = rdir / plan_index.PLAN_INDEX_FILE
+    if not index_path.is_file():
+        print(f"No plan index ({index_path} not found) — nothing to check")
+        return 0
+    try:
+        index_text = index_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"❌ cannot read {index_path}: {exc}", file=sys.stderr)
+        return 1
+
+    index, findings = plan_index.parse_plan_index(index_text)
+    if index is not None:
+        # Sibling documents are optional context for the drift/goal rules;
+        # an unreadable sibling degrades to "absent" rather than failing a
+        # read-only lint.
+        def _sibling(name: str) -> str | None:
+            path = rdir / name
+            try:
+                return path.read_text(encoding="utf-8") if path.is_file() else None
+            except OSError:
+                return None
+
+        findings = plan_index.lint_plan_index(
+            index, plan_md=_sibling("plan.md"), goals_md=_sibling("goals.md")
+        )
+
+    task_count = len(index.get("tasks") or []) if isinstance(index, dict) else 0
+    print(f"Plan check: {index_path} — {task_count} task(s)")
+    for line in plan_index.format_findings(findings):
+        print(line)
+    errors = [f for f in findings if f.level == "error"]
+    warnings = [f for f in findings if f.level == "warning"]
+    if errors:
+        print(f"❌ plan check failed: {len(errors)} error(s), {len(warnings)} warning(s)")
+        return 1
+    if warnings:
+        print(f"✅ plan check green ({len(warnings)} warning(s) above are non-blocking)")
+    else:
+        print("✅ plan check green: DAG acyclic, write-scopes disjoint, session scopes declared")
+    return 0
+
+
 def cmd_resume(as_json: bool = False) -> int:
     """Execute resume command. Read-only; never breaks a session (always 0)."""
     rdir = run_state.run_dir()
@@ -1290,6 +1360,11 @@ def main() -> int:
         return cmd_name(args.value)
     elif args.command == "ledger":
         return cmd_ledger(args)
+    elif args.command == "plan":
+        if args.plan_action == "check":
+            return cmd_plan_check()
+        parser.print_help()
+        return 1
     elif args.command == "resume":
         return cmd_resume(args.as_json)
     elif args.command == "artifact":
