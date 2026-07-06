@@ -378,6 +378,60 @@ class TestEmitGateEvent:
         run_state.write_state(rdir, run_state.seed_state("s", "develop", "t"))
         run_state.emit_gate_event("gate-commit", "bypass")  # must not raise
 
+    def test_minimal_receipt_payload(self, run_env):
+        """gate/outcome are always in data; unmeasured fields stay absent."""
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        run_state.emit_gate_event("gate-check", "fail")
+        event = run_state.read_events(rdir, last_n=0)[-1]
+        assert event["note"] == "gate-check: fail"
+        assert event["data"] == {"gate": "gate-check", "outcome": "fail"}
+
+    def test_full_receipt_payload(self, run_env):
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        run_state.emit_gate_event(
+            "gate-commit", "pass",
+            exit_code=0,
+            duration_s=12.34,
+            summary="1397 passed in 41.8s",
+            argv=["gate-commit", "-m", "msg"],
+            commit_sha="a" * 40,
+        )
+        event = run_state.read_events(rdir, last_n=0)[-1]
+        assert event["note"] == "gate-commit: pass"
+        assert event["data"] == {
+            "gate": "gate-commit",
+            "outcome": "pass",
+            "exit_code": 0,
+            "duration_s": 12.3,  # rounded to one decimal
+            "summary": "1397 passed in 41.8s",
+            "argv": ["gate-commit", "-m", "msg"],
+            "commit_sha": "a" * 40,
+        }
+
+    def test_exit_code_zero_is_recorded(self, run_env):
+        """0 is a value, not an absence — the receipt must record it."""
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        run_state.emit_gate_event("gate-push", "pass", exit_code=0)
+        event = run_state.read_events(rdir, last_n=0)[-1]
+        assert event["data"]["exit_code"] == 0
+
+    def test_summary_and_argv_are_redacted(self, run_env, monkeypatch):
+        """Receipt text lands in the shared work repo — it goes through
+        redact_secrets like the other writers' output."""
+        monkeypatch.setattr(run_state, "redact_secrets", lambda s: "<redacted>")
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        run_state.emit_gate_event(
+            "gate-commit", "pass",
+            summary="token=hunter2", argv=["gate-commit", "-m", "token=hunter2"],
+        )
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert data["summary"] == "<redacted>"
+        assert data["argv"] == ["<redacted>"] * 3
+
 
 def _make_bundle(rdir, mp_slug, *names):
     """Create masterplan/<mp_slug>/ under rdir holding the given artifacts."""
@@ -541,26 +595,215 @@ class TestSyncMasterplanArtifacts:
         assert run_state.load_state(rdir)["artifacts"] == {}  # nothing registered
 
 
-def _load_gate_commit_module():
-    """Load bin/gate-commit (extensionless script) as an importable module."""
-    path = Path(__file__).parent.parent / "bin" / "gate-commit"
-    loader = importlib.machinery.SourceFileLoader("gate_commit_bin", str(path))
-    spec = importlib.util.spec_from_loader("gate_commit_bin", loader)
+def _load_gate_bin(name):
+    """Load a bin/gate-* script (extensionless) as an importable module."""
+    path = Path(__file__).parent.parent / "bin" / name
+    modname = name.replace("-", "_") + "_bin"
+    loader = importlib.machinery.SourceFileLoader(modname, str(path))
+    spec = importlib.util.spec_from_loader(modname, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
 
 
-class TestGateCommitBypassEmit:
-    def test_bypass_emits_single_bypass_event(self, run_env, monkeypatch):
+def _gate_events(rdir):
+    return [e for e in run_state.read_events(rdir, last_n=0) if e["type"] == "gate"]
+
+
+def _fake_git(sha="c0ffee12deadbeefc0ffee12deadbeefc0ffee12", commit_rc=0):
+    """A subprocess.run stand-in covering gate-commit's two git calls:
+    `git commit` (returncode only) and `git rev-parse HEAD` (stdout)."""
+    def run(cmd, **kwargs):
+        if cmd[:2] == ["git", "rev-parse"]:
+            return types.SimpleNamespace(returncode=0, stdout=f"{sha}\n")
+        return types.SimpleNamespace(returncode=commit_rc, stdout="")
+    return run
+
+
+class TestGateCommitReceipt:
+    """bin/gate-commit emits exactly ONE receipt per invocation, at the end,
+    carrying the whole-command exit code and — when a commit landed — the
+    resulting sha (issue #88 D1)."""
+
+    SHA = "c0ffee12deadbeefc0ffee12deadbeefc0ffee12"
+
+    def _seeded_rdir(self):
         rdir = run_state.run_dir()
         run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
-        mod = _load_gate_commit_module()
+        return rdir
+
+    def _patched(self, monkeypatch, gate_passes=True, commit_rc=0):
+        mod = _load_gate_bin("gate-commit")
+        monkeypatch.setattr(mod.subprocess, "run", _fake_git(self.SHA, commit_rc))
         monkeypatch.setattr(
-            mod.subprocess, "run",
-            lambda *a, **k: types.SimpleNamespace(returncode=0),
+            "lmer_cli.gates.GateSystem.run_commit_gate",
+            lambda self, skip_tests=False: gate_passes,
         )
+        return mod
+
+    def test_pass_receipt_carries_sha(self, run_env, monkeypatch):
+        rdir = self._seeded_rdir()
+        mod = self._patched(monkeypatch, gate_passes=True, commit_rc=0)
+        assert mod.gate_commit("safe message") == 0
+        events = _gate_events(rdir)
+        assert [e["note"] for e in events] == ["gate-commit: pass"]
+        data = events[0]["data"]
+        assert data["outcome"] == "pass"
+        assert data["exit_code"] == 0
+        assert data["commit_sha"] == self.SHA
+        assert data["duration_s"] >= 0
+        assert data["argv"]  # invocation recorded (pytest's argv here)
+        assert "summary" not in data  # no checks captured output — not fabricated
+
+    def test_bypass_receipt_carries_sha(self, run_env, monkeypatch):
+        rdir = self._seeded_rdir()
+        mod = self._patched(monkeypatch, commit_rc=0)
         assert mod.gate_commit("safe message", bypass=True) == 0
-        notes = [e.get("note") for e in run_state.read_events(rdir, last_n=0)
-                 if e["type"] == "gate"]
-        assert notes == ["gate-commit: bypass"]
+        events = _gate_events(rdir)
+        assert [e["note"] for e in events] == ["gate-commit: bypass"]
+        data = events[0]["data"]
+        assert data["outcome"] == "bypass"
+        assert data["exit_code"] == 0
+        assert data["commit_sha"] == self.SHA
+        assert "summary" not in data  # nothing ran — nothing to summarize
+
+    def test_fail_receipt_has_no_sha(self, run_env, monkeypatch):
+        rdir = self._seeded_rdir()
+        mod = self._patched(monkeypatch, gate_passes=False)
+        assert mod.gate_commit("safe message") == 1
+        events = _gate_events(rdir)
+        assert [e["note"] for e in events] == ["gate-commit: fail"]
+        data = events[0]["data"]
+        assert data["exit_code"] == 1
+        assert "commit_sha" not in data
+
+    def test_attribution_block_is_pass_with_exit_one(self, run_env, monkeypatch):
+        rdir = self._seeded_rdir()
+        mod = self._patched(monkeypatch, gate_passes=True)
+        assert mod.gate_commit("done\n\nCo-Authored-By: Claude <noreply@anthropic.com>") == 1
+        events = _gate_events(rdir)
+        assert [e["note"] for e in events] == ["gate-commit: pass"]
+        data = events[0]["data"]
+        assert data["exit_code"] == 1
+        assert "commit_sha" not in data  # nothing was committed
+
+    def test_commit_failure_is_pass_with_commit_exit_code(self, run_env, monkeypatch):
+        rdir = self._seeded_rdir()
+        mod = self._patched(monkeypatch, gate_passes=True, commit_rc=128)
+        assert mod.gate_commit("safe message") == 128
+        data = _gate_events(rdir)[0]["data"]
+        assert data["outcome"] == "pass"
+        assert data["exit_code"] == 128
+        assert "commit_sha" not in data
+
+    def test_receipt_assembly_failure_never_changes_exit_code(self, run_env, monkeypatch):
+        """Fail-soft covers ASSEMBLY too: a summary/sha computation that
+        blows up must not turn a successful commit into a failure."""
+        self._seeded_rdir()
+        mod = self._patched(monkeypatch, gate_passes=True, commit_rc=0)
+        monkeypatch.setattr(
+            "lmer_cli.gates.GateSystem.receipt_summary",
+            lambda self: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert mod.gate_commit("safe message") == 0
+
+    def test_head_sha_failure_never_changes_exit_code(self, run_env, monkeypatch):
+        self._seeded_rdir()
+        mod = self._patched(monkeypatch, gate_passes=True, commit_rc=0)
+        monkeypatch.setattr(
+            mod, "_head_sha",
+            lambda: (_ for _ in ()).throw(OSError("fork failed")),
+        )
+        assert mod.gate_commit("safe message") == 0
+
+
+class TestGateCheckReceipt:
+    def test_pass_receipt(self, run_env, monkeypatch):
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        mod = _load_gate_bin("gate-check")
+        monkeypatch.setattr(mod, "commit_gate", lambda *a, **k: 0)
+        monkeypatch.setattr(mod.sys, "argv", ["gate-check"])
+        assert mod.main() == 0
+        events = _gate_events(rdir)
+        assert [e["note"] for e in events] == ["gate-check: pass"]
+        data = events[0]["data"]
+        assert data == {
+            "gate": "gate-check", "outcome": "pass", "exit_code": 0,
+            "duration_s": data["duration_s"], "argv": ["gate-check"],
+        }
+
+    def test_fail_receipt(self, run_env, monkeypatch):
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        mod = _load_gate_bin("gate-check")
+        monkeypatch.setattr(mod, "commit_gate", lambda *a, **k: 1)
+        monkeypatch.setattr(mod.sys, "argv", ["gate-check", "-v"])
+        assert mod.main() == 1
+        data = _gate_events(rdir)[0]["data"]
+        assert data["outcome"] == "fail"
+        assert data["exit_code"] == 1
+        assert data["argv"] == ["gate-check", "-v"]
+
+    def test_receipt_assembly_failure_never_changes_exit_code(self, run_env, monkeypatch):
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        mod = _load_gate_bin("gate-check")
+        monkeypatch.setattr(mod, "commit_gate", lambda *a, **k: 0)
+        monkeypatch.setattr(mod.sys, "argv", ["gate-check"])
+        monkeypatch.setattr(
+            "lmer_cli.gates.GateSystem.receipt_summary",
+            lambda self: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        assert mod.main() == 0
+
+
+class TestGatePushReceipt:
+    def _seeded(self):
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        return rdir
+
+    def _patched(self, monkeypatch, checks_rc=0, push_rc=0, branch="feature/x"):
+        mod = _load_gate_bin("gate-push")
+        monkeypatch.setattr(mod, "push_gate", lambda *a, **k: checks_rc)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["git", "branch"]:
+                return types.SimpleNamespace(returncode=0, stdout=f"{branch}\n")
+            return types.SimpleNamespace(returncode=push_rc, stdout="")
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        return mod
+
+    def test_pass_receipt(self, run_env, monkeypatch):
+        rdir = self._seeded()
+        mod = self._patched(monkeypatch)
+        assert mod.gate_push() == 0
+        events = _gate_events(rdir)
+        assert [e["note"] for e in events] == ["gate-push: pass"]
+        assert events[0]["data"]["exit_code"] == 0
+
+    def test_checks_fail_receipt(self, run_env, monkeypatch):
+        rdir = self._seeded()
+        mod = self._patched(monkeypatch, checks_rc=1)
+        assert mod.gate_push() == 1
+        data = _gate_events(rdir)[0]["data"]
+        assert data["outcome"] == "fail"
+        assert data["exit_code"] == 1
+
+    def test_push_failure_is_pass_with_push_exit_code(self, run_env, monkeypatch):
+        rdir = self._seeded()
+        mod = self._patched(monkeypatch, push_rc=1)
+        assert mod.gate_push() == 1
+        data = _gate_events(rdir)[0]["data"]
+        assert data["outcome"] == "pass"
+        assert data["exit_code"] == 1
+
+    def test_no_branch_is_pass_with_exit_one(self, run_env, monkeypatch):
+        rdir = self._seeded()
+        mod = self._patched(monkeypatch, branch="")
+        assert mod.gate_push() == 1
+        data = _gate_events(rdir)[0]["data"]
+        assert data["outcome"] == "pass"
+        assert data["exit_code"] == 1

@@ -5,22 +5,42 @@ Gate Check - Runs all gate checks without committing
 
 import sys
 import os
+import time
 
 # Add src directory to path to use source files, not installed package
 src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, src_dir)
 
-from lmer_cli.gates import commit_gate
+from lmer_cli.gates import GateSystem, commit_gate, receipt_argv
 
 try:
     from work_repo.run_state import emit_gate_event
 except ImportError:  # run-state wiring must never break a gate
-    def emit_gate_event(gate, outcome):
+    def emit_gate_event(gate, outcome, **kwargs):
         pass
 
-if __name__ == "__main__":
+
+def main() -> int:
     verbose = '-v' in sys.argv or '--verbose' in sys.argv
     debug = '--debug' in sys.argv
-    rc = commit_gate(verbose=verbose, debug=debug)
-    emit_gate_event("gate-check", "pass" if rc == 0 else "fail")
-    sys.exit(rc)
+    started = time.monotonic()
+    gate = GateSystem(verbose=verbose, debug=debug)
+    rc = commit_gate(verbose=verbose, debug=debug, gate=gate)
+    try:
+        # Receipt assembly AND append are fail-soft: no receipt problem may
+        # ever change the gate's exit code.
+        emit_gate_event(
+            "gate-check",
+            "pass" if rc == 0 else "fail",
+            exit_code=rc,
+            duration_s=time.monotonic() - started,
+            summary=gate.receipt_summary(),
+            argv=receipt_argv(),
+        )
+    except Exception:
+        pass
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -87,7 +87,7 @@ artifact set is:
 | File | Contents |
 |---|---|
 | `spec.md` | the agreed approach / approved design |
-| `plan.md` | the implementation plan |
+| `plan.md` | the implementation plan — each task carries a `verify: <command or gate>` line naming the validation that proves it (its receipt, §2) |
 | `retro.md` | close-out: what was done, key decisions, gotchas |
 | `ledger.md` | execution ledger (per-task commits, review outcomes) |
 | `followups.md` | deferred/follow-up work tracked out of the run |
@@ -166,8 +166,70 @@ never left readable-but-stale.
 (`note` and `data` optional). Core event types: `run_seeded`, `session_start`,
 `session_end`, `phase`, `state_changed` (non-phase mutations to
 status/stop_reason/critical_error), `goal_set`, `run_named`,
-`artifact_written`, `gate`, `run_dir_renamed` (the freeze-gate rename, §1).
-The type set is open-ended — later growth adds types without schema churn.
+`artifact_written`, `gate`, `verify`, `run_dir_renamed` (the freeze-gate
+rename, §1). The type set is open-ended — later growth adds types without
+schema churn.
+
+### Receipt events (`gate`, `verify`)
+
+Receipts are the anti-fabrication layer (issue #88): proof that a named
+validation command actually ran, written into `events.jsonl` by the tool
+process itself — never typed by the model. Two producers:
+
+**`gate` events** — emitted by `gate-check`/`gate-commit`/`gate-push`,
+exactly one per invocation, at command end:
+
+```json
+{"ts": "…", "session": "…", "type": "gate",
+ "note": "gate-check: pass",
+ "data": {"gate": "gate-check", "outcome": "pass", "exit_code": 0,
+          "duration_s": 142.3, "summary": "1397 passed in 140.2s",
+          "argv": ["gate-check"]}}
+```
+
+- `outcome` (`pass` | `fail` | `bypass`) carries the check verdict;
+  `exit_code` is the whole command's result — a push that fails *after*
+  passing checks is `outcome: pass` with a non-zero `exit_code`.
+- `summary` is a best-effort parse of the run (the test runner's tail line
+  on pass, the failed check names on fail); absent when unparseable —
+  never fabricated. A `bypass` receipt carries no summary (nothing ran).
+- `gate-commit` receipts additionally record `commit_sha` whenever a commit
+  actually landed — including bypass commits. It is read from HEAD
+  immediately after the commit (best-effort). The sha is the natural join
+  key for ledger-side attribution, as a *cross-check*: gates stay
+  ledger-unaware entirely (no `--task` flags, no auto-add — one writer for
+  the task↔receipt mapping, and it is not the gates).
+- Receipt text that could echo arbitrary content — `summary`, `argv`
+  elements (gate-commit's argv carries the commit message), verify's
+  `summary_line` — is secret-redacted before landing in the work repo.
+- Fail-soft contract unchanged: with no run context the gates behave
+  byte-identically, and no receipt failure can ever change a gate's exit
+  code.
+
+**`verify` events** — emitted by `work verify <name> -- <command …>` (§4),
+the receipt path for validation that isn't a gate command:
+
+```json
+{"ts": "…", "session": "…", "type": "verify",
+ "note": "tests: pass",
+ "data": {"name": "tests", "argv": ["pytest", "tests/", "-q"],
+          "exit_code": 0, "duration_s": 41.9,
+          "summary_line": "1397 passed in 41.8s",
+          "output_tail_sha256": "8b35e1c7…"}}
+```
+
+`output_tail_sha256` is the sha256 of the last 64 KiB of the command's
+combined output (stderr merged into stdout, `2>&1`-style), so a receipt is
+checkable after the fact without the work repo storing bulky output —
+receipt bodies are hash-only by design. `summary_line` is the last
+non-empty output line (secret-redacted), absent when there was no output.
+
+**Validation contracts:** plans name the validation that proves each task —
+a `verify: <command or gate>` line per plan.md task (see the artifacts
+convention, §1) — and claiming a task complete requires a matching
+`verify`/`gate` receipt from the current session. v1 enforcement is soft:
+the finish/retro step compares claims to receipts; a guard-hook nudge is
+deliberately deferred (§7).
 
 ## 3. Slug derivation
 
@@ -200,6 +262,7 @@ occupy the slug, so a genuinely new engagement seeds a fresh run.
 | `work state` | Print current run state (read-only). |
 | `work state set --phase=… --stop-reason=… --status=… [--critical-error=<json>]` | The only mutation path. Constrained fields; atomic write; bumps `updated`; appends a corresponding event. Re-submitting the same `--phase` value with no other flags short-circuits with `State unchanged` and does not write; the other flags always write (see below). |
 | `work event <type> [--note "…"] [--data <json>]` | Append one event line. Auto-seeds the run if it doesn't exist yet. |
+| `work verify <name> -- <command …>` | Run the command (stderr merged into stdout), stream its output through, mirror its exit code, and append a `verify` receipt event (§2): `{name, argv, exit_code, duration_s, summary_line, output_tail_sha256}`. The `--` separator is required (a forgotten name must not silently become the command). A signal-killed command mirrors the shell convention `128+N` (receipt and observed exit code agree); a command that cannot start exits 127. Mutating-verb rules: without run context this errors *before* running the command. A receipt-append failure after the command ran is reported loudly on stderr but the exit code still mirrors the command. |
 | `work resume [--json]` | Pure decide function: reads state + events, prints a resume brief — slug, status, phase, stop_reason, goal, last ~5 events, artifacts, owner-claim warning if applicable. `--json` for hooks/machines. Never exits non-zero — an unreadable or missing run degrades to a message, not a failure. |
 | `work name <kebab-case>` | Set the run's name (a label — the directory slug never changes). Normalizes to kebab-case (lowercase; spaces/underscores → `-`; strip other characters; collapse/trim `-`), printing the normalized form when it differs; errors if nothing survives. Names are **unique per project** — a name held by another run is rejected with an error citing the conflicting slug. Renaming is allowed anytime (same uniqueness check; appends another `run_named` event — history lives in the event log); re-setting the run's own current name is an idempotent no-op success. Bare `work name` prints the current name (or "No name set"), read-only, exit 0. |
 | `work artifact <name> --file <path>` | Copy the file into the run dir (secret-redacted), register it in `state.artifacts` (through the single writer, keyed by the artifact's filename stem), append `artifact_written`. `<name>` must be a plain filename (no path components, no leading dot). |
@@ -260,9 +323,9 @@ records it into `state.yaml` and appends a `goal_set` event; the legacy
   repo), the read-only and hook-facing verbs (`work state`, `work resume`,
   `work session-start`, `work session-end`) print a "no run context" message
   and exit 0, but the mutating verbs (`work state set`, `work event`,
-  `work artifact`) print an error to stderr and exit 1 — scripts chaining
-  them under `set -e` should expect that. Session behavior without a repo is
-  unchanged from before this feature existed.
+  `work verify`, `work artifact`) print an error to stderr and exit 1 —
+  scripts chaining them under `set -e` should expect that. Session behavior
+  without a repo is unchanged from before this feature existed.
 
 ## 6. External cleaner contract
 
@@ -286,7 +349,10 @@ Recorded so the design can be worked into deliberately, not accidentally:
 
 - `plan.index.json` task DAG, wave-based execution, planner/decomposer agent
   briefs.
-- Receipt-based anti-fabrication hardening of gates.
+- Hard anti-fabrication for receipts (hash-chained events, signed receipts)
+  and a guard-hook nudge enforcing the claim↔receipt match. The soft v1 —
+  structured gate receipts, `work verify`, plan validation contracts —
+  shipped with issue #88 (§2).
 - Frozen goal-sets with plan-coverage checks and finish-time per-goal
   assessment.
 - Durable finish/branch-fate gate objects.

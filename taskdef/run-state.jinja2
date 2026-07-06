@@ -60,4 +60,14 @@ the work, not optional bookkeeping:
 - To resume work on the run (e.g. it was marked complete but new work arrived): `work state set --status=in-progress --stop-reason=none`
 - Persist durable artifacts (specs, plans, retros): `work artifact <name>.md --file <path>`
 - Log notable moments: `work event <type> --note "..."`
+- **Prove "done" with receipts.** Validation only counts when a tool
+  recorded it: the gate commands (`gate-check`/`gate-commit`/`gate-push`)
+  write gate receipts automatically; for any other validation command run
+  it through `work verify <name> -- <command …>` (streams the output,
+  mirrors the exit code, records a `verify` receipt). Claiming a plan task
+  complete requires a matching `verify`/`gate` receipt from the current
+  session — a "done" with no receipt is prose, not proof.
+- **Plans carry validation contracts.** Give each task in plan.md a
+  `verify: <command or gate>` line naming the command that proves it, and
+  use that name/command when recording the receipt.
 {% endif %}

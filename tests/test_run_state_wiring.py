@@ -4,6 +4,7 @@ The runner and settings.json are exercised for real only inside the
 container; these guards pin the wiring so a refactor can't silently drop
 it (same pattern as the source-guard test in tests/test_start_hook.py).
 """
+import inspect
 import json
 import re
 from pathlib import Path
@@ -64,6 +65,11 @@ class TestRunStateFragment:
         assert "work state set --phase=" in out
         assert "stop-reason=question" in out
         assert "work artifact" in out
+        # Receipts contract (issue #88 D3): validation runs through the
+        # tools, plans name their validation, claims need receipts.
+        assert "work verify" in out
+        assert "verify:" in out
+        assert "receipt" in out.lower()
 
     def test_empty_without_project_context(self):
         out = self._render(None, {})
@@ -81,6 +87,40 @@ class TestChatInclude:
     def test_chat_includes_fragment(self):
         chat = (REPO_ROOT / "taskdef" / "chat" / "instructions.txt").read_text()
         assert "{% include 'run-state.jinja2' ignore missing %}" in chat
+
+
+class TestGateReceiptStubs:
+    """The gate bins import emit_gate_event behind an ImportError stub so
+    run-state wiring can never break a gate (issue #88 D4). The stub must
+    swallow the receipt keyword arguments too, or a broken import would
+    surface as a TypeError at the enriched call sites."""
+
+    GATE_BINS = ("gate-check", "gate-commit", "gate-push")
+
+    def test_bins_keep_import_fallback_stub(self):
+        for name in self.GATE_BINS:
+            text = (REPO_ROOT / "bin" / name).read_text()
+            assert "from work_repo.run_state import emit_gate_event" in text, \
+                f"{name}: emit_gate_event import missing"
+            assert "except ImportError" in text, \
+                f"{name}: ImportError fallback missing"
+            assert re.search(
+                r"def emit_gate_event\(gate, outcome, \*\*kwargs\):", text
+            ), f"{name}: stub must accept the receipt kwargs"
+
+    def test_real_signature_accepts_receipt_kwargs(self):
+        """The kwargs the bins pass must exist on the real function — else
+        the receipt path works with the stub and dies with the import."""
+        from work_repo.run_state import emit_gate_event
+        accepted = set(inspect.signature(emit_gate_event).parameters)
+        assert {"exit_code", "duration_s", "summary", "argv", "commit_sha"} <= accepted
+
+    def test_bins_pass_receipt_fields(self):
+        for name in self.GATE_BINS:
+            text = (REPO_ROOT / "bin" / name).read_text()
+            for field in ("exit_code=", "duration_s=", "summary=", "argv="):
+                assert field in text, f"{name}: receipt field {field} dropped"
+        assert "commit_sha=" in (REPO_ROOT / "bin" / "gate-commit").read_text()
 
 
 class TestAgentBriefs:
