@@ -18,8 +18,9 @@ taskdef's instructions mention it.
 Two layers:
 
 - **Layer 1 — run state (always-on, lmer core):** small, universal, stable.
-  `state.yaml` + `events.jsonl` per run, written only through the `work` CLI,
-  wired into session hooks.
+  `state.yaml` + `events.jsonl` per run — plus `ledger.yaml` once the run
+  has plan tasks to track (issue #89) — written only through the `work`
+  CLI, wired into session hooks.
 - **Layer 2 — orchestration artifacts (per-task, additive):** `spec.md`,
   `plan.md`, `retro.md` written next to the state file only when the taskdef
   produces them.
@@ -30,6 +31,7 @@ Layout, per project (`{host}/{project}/` already namespaces by project):
 {host}/{project}/runs/<slug>/          # or runs/<slug>--<name>/ after the freeze rename
 ├── state.yaml     # Layer 1: authoritative run state (single writer: work CLI)
 ├── events.jsonl   # Layer 1: append-only session/audit log
+├── ledger.yaml    # Layer 1: per-task execution ledger (single writer: work ledger set)
 ├── log.yaml       # worklog (`work log`) — structural since the run-dir unification
 ├── reports/       # timestamped report files (`work report`)
 ├── spec.md        # Layer 2: agreed approach from the develop interview
@@ -89,7 +91,6 @@ artifact set is:
 | `spec.md` | the agreed approach / approved design |
 | `plan.md` | the implementation plan — each task carries a `verify: <command or gate>` line naming the validation that proves it (its receipt, §2) |
 | `retro.md` | close-out: what was done, key decisions, gotchas |
-| `ledger.md` | execution ledger (per-task commits, review outcomes) |
 | `followups.md` | deferred/follow-up work tracked out of the run |
 | `reports/` | per-task or per-review reports, when the run produced them |
 
@@ -166,9 +167,9 @@ never left readable-but-stale.
 (`note` and `data` optional). Core event types: `run_seeded`, `session_start`,
 `session_end`, `phase`, `state_changed` (non-phase mutations to
 status/stop_reason/critical_error), `goal_set`, `run_named`,
-`artifact_written`, `gate`, `verify`, `run_dir_renamed` (the freeze-gate
-rename, §1). The type set is open-ended — later growth adds types without
-schema churn.
+`artifact_written`, `gate`, `verify`, `task` (every ledger mutation, §2),
+`run_dir_renamed` (the freeze-gate rename, §1). The type set is open-ended
+— later growth adds types without schema churn.
 
 ### Receipt events (`gate`, `verify`)
 
@@ -231,6 +232,52 @@ convention, §1) — and claiming a task complete requires a matching
 the finish/retro step compares claims to receipts; a guard-hook nudge is
 deliberately deferred (§7).
 
+### `ledger.yaml` — per-task execution ledger
+
+The ledger (issue #89) is what makes a crashed orchestrated run recoverable
+by *reading state* instead of diff archaeology: one row per plan task,
+carrying exactly what the next session needs — is it landed (which commit,
+which receipt), in flight, or untouched.
+
+```yaml
+schema: 1
+tasks:
+  T2:
+    title: lmer wiring
+    status: done        # pending | in-progress | done | deferred | dropped
+    commit: 4a1f9c2     # optional; project-repo sha
+    receipt: t2-tests   # optional; name of a verify/gate receipt event
+    note: "22 tests, env passthrough + guard"
+    updated: 2026-07-05T04:12:03Z
+```
+
+- **Single writer, atomic writes** — the `state.yaml` contract exactly:
+  only `work ledger set` mutates it (tmp+rename, corrupt files backed up
+  as `ledger.yaml.bad-<stamp>`, newer schema is a read-only refusal).
+  Fields omitted on a later write are preserved, so
+  `work ledger set T2 --status done --commit <sha>` keeps an earlier title.
+- **Snapshot + audit trail** — every mutation also appends a `task` event
+  (`{task, status, commit?, receipt?}` in `data`), so `ledger.yaml` is the
+  at-a-glance current state and `events.jsonl` stays the history.
+- **Task ids come from plan.md** (or `plan.index.json` once it exists);
+  hand-named ids are fine — the ledger does not depend on the plan format.
+- **The same-breath rule** (taskdef fragment): the moment a gate-commit
+  lands a plan task, record it — gate-commit, then
+  `work ledger set <id> --status done --commit <sha>`, before moving on.
+  A Stop-hook nudge (trigger 3 of `hooks/run_state_guard.py`, same
+  `LMER_RUN_STATE_GUARD` kill switch, once per session, fail-open) fires
+  when a session has landed gate-commits but written no ledger row.
+- **Gates stay ledger-unaware** — `work ledger set` is the only writer of
+  the task↔commit mapping; the `commit_sha` on gate receipts exists for
+  finish-time cross-checking (every ledger `--commit` sha should match a
+  `gate` event), never as a write path into the ledger.
+- **`done` with no `--commit` warns loudly but succeeds** — docs-only
+  tasks exist; the warning is for the forgotten-sha case.
+- Each mutation pushes the run dir (like `work artifact`) — an unledgered,
+  unpushed row is exactly what a dead session loses.
+- The ledger is machine-authoritative and has no rendered `ledger.md`
+  counterpart; humans read `work ledger` (or the YAML itself).
+
 ## 3. Slug derivation
 
 Per project (the `{host}/{project}/` prefix already namespaces):
@@ -263,7 +310,9 @@ occupy the slug, so a genuinely new engagement seeds a fresh run.
 | `work state set --phase=… --stop-reason=… --status=… [--critical-error=<json>]` | The only mutation path. Constrained fields; atomic write; bumps `updated`; appends a corresponding event. Re-submitting the same `--phase` value with no other flags short-circuits with `State unchanged` and does not write; the other flags always write (see below). |
 | `work event <type> [--note "…"] [--data <json>]` | Append one event line. Auto-seeds the run if it doesn't exist yet. |
 | `work verify <name> -- <command …>` | Run the command (stderr merged into stdout), stream its output through, mirror its exit code, and append a `verify` receipt event (§2): `{name, argv, exit_code, duration_s, summary_line, output_tail_sha256}`. The `--` separator is required (a forgotten name must not silently become the command). A signal-killed command mirrors the shell convention `128+N` (receipt and observed exit code agree); a command that cannot start exits 127. Mutating-verb rules: without run context this errors *before* running the command. A receipt-append failure after the command ran is reported loudly on stderr but the exit code still mirrors the command. |
-| `work resume [--json]` | Pure decide function: reads state + events, prints a resume brief — slug, status, phase, stop_reason, goal, last ~5 events, artifacts, owner-claim warning if applicable. `--json` for hooks/machines. Never exits non-zero — an unreadable or missing run degrades to a message, not a failure. |
+| `work resume [--json]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
+| `work ledger` | Print the execution ledger table (read-only): the summary line plus one row per task. With no ledger prints `No ledger`, exit 0. |
+| `work ledger set <task-id> --status <s> [--title …] [--commit <sha>] [--receipt <name>] [--note …]` | The only mutation path for `ledger.yaml` (§2): upserts the row (omitted fields preserved), stamps `updated`, appends a `task` event, pushes the run dir. `--status` is one of `pending\|in-progress\|done\|deferred\|dropped`; `done` with no `--commit` warns loudly but succeeds. |
 | `work name <kebab-case>` | Set the run's name (a label — the directory slug never changes). Normalizes to kebab-case (lowercase; spaces/underscores → `-`; strip other characters; collapse/trim `-`), printing the normalized form when it differs; errors if nothing survives. Names are **unique per project** — a name held by another run is rejected with an error citing the conflicting slug. Renaming is allowed anytime (same uniqueness check; appends another `run_named` event — history lives in the event log); re-setting the run's own current name is an idempotent no-op success. Bare `work name` prints the current name (or "No name set"), read-only, exit 0. |
 | `work artifact <name> --file <path>` | Copy the file into the run dir (secret-redacted), register it in `state.artifacts` (through the single writer, keyed by the artifact's filename stem), append `artifact_written`. `<name>` must be a plain filename (no path components, no leading dot). |
 | `work seed <taskdef> <target> [--goal …] [--name …]` | Out-of-session run creation: derives the slug from its args and creates a run for it through the same create-tmp → write-state → rename lifecycle, recording CLI-shaped events (`run_seeded`, then `goal_set` / `run_named` as given). Does **not** claim `owner` (seeding is not owning) and does **not** push — batch with `work commit`. An existing run for the slug (or a name conflict) is an error. |
@@ -323,8 +372,9 @@ records it into `state.yaml` and appends a `goal_set` event; the legacy
   repo), the read-only and hook-facing verbs (`work state`, `work resume`,
   `work session-start`, `work session-end`) print a "no run context" message
   and exit 0, but the mutating verbs (`work state set`, `work event`,
-  `work verify`, `work artifact`) print an error to stderr and exit 1 —
-  scripts chaining them under `set -e` should expect that. Session behavior
+  `work verify`, `work artifact`, `work ledger set`) print an error to
+  stderr and exit 1 — scripts chaining them under `set -e` should expect
+  that. Session behavior
   without a repo is unchanged from before this feature existed.
 
 ## 6. External cleaner contract
@@ -355,6 +405,10 @@ Recorded so the design can be worked into deliberately, not accidentally:
   shipped with issue #88 (§2).
 - Frozen goal-sets with plan-coverage checks and finish-time per-goal
   assessment.
+- Ledger-driven automated recovery (re-running stranded tasks) and
+  resume-time commit-sha existence checks — the ledger (issue #89) makes
+  state legible; acting on it stays with the session/human, and the brief
+  never requires the project repo to be cloned.
 - Durable finish/branch-fate gate objects.
 - The external cleaner process itself (contract defined in §6 above).
 - Multi-session GitLab/GitHub coordination — separate effort by explicit

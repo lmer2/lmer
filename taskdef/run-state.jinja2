@@ -4,7 +4,8 @@
 This session participates in lmer's durable run-state layer. Your run has a
 directory in the work repository (`work state` shows it) holding `state.yaml`
 (authoritative state — never edit it directly; the `work` CLI is the only
-writer) and `events.jsonl` (append-only log).
+writer), `events.jsonl` (append-only log), and — once the run has a task
+plan — `ledger.yaml` (per-task execution ledger, same single-writer rule).
 {% if run_state_brief %}
 
 ### Current run state (read this first)
@@ -70,4 +71,12 @@ the work, not optional bookkeeping:
 - **Plans carry validation contracts.** Give each task in plan.md a
   `verify: <command or gate>` line naming the command that proves it, and
   use that name/command when recording the receipt.
+- **Ledger every landed task in the same breath as its commit.** The moment
+  a gate-commit lands a plan task, record it before doing anything else:
+  `work ledger set <task-id> --status done --commit <sha> [--receipt <name>]`.
+  Task ids come from plan.md (hand-named ids are fine); `work ledger set`
+  is the ONLY writer of the task↔commit mapping — gates never write it.
+  Mark a task `in-progress` when you start it, `deferred`/`dropped` when it
+  leaves scope. A crashed run's successor recovers by reading `work ledger`
+  — an unledgered commit is invisible to it.
 {% endif %}

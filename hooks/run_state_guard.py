@@ -33,7 +33,14 @@ nag forever. The sentinel (once) and the counter (cap 3) live in separate
 ``/tmp`` files keyed by ``LMER_SESSION_ID`` so the two cadences never
 interfere.
 
-Both triggers share the kill switch (``LMER_RUN_STATE_GUARD`` unset or
+Trigger 3 — ledger after commits (issue #89). If this session landed
+project-repo commits (``gate`` events carrying a ``commit_sha``, stamped by
+gate-commit) while writing nothing to the run's execution ledger (no
+``task`` event from this session), the stop is blocked with a ``work ledger
+set`` nudge: unledgered commits are exactly what crash recovery cannot see.
+Once per session via its own sentinel, like trigger 1.
+
+All triggers share the kill switch (``LMER_RUN_STATE_GUARD`` unset or
 truthy enables; ``=0`` disables — ``get_bool_env`` semantics replicated
 inline because hooks import no project code), the run-context gate
 (``LMER_REPO_HOST`` + ``LMER_REPO_PROJECT`` set, ``work`` on PATH), and
@@ -84,6 +91,7 @@ GIT_TIMEOUT_SECONDS = 5
 # interfering with each other.
 SENTINEL_TEMPLATE = "/tmp/lmer_run_state_guard.{session}"
 COUNTER_TEMPLATE = "/tmp/lmer_run_state_guard_push.{session}"
+LEDGER_SENTINEL_TEMPLATE = "/tmp/lmer_run_state_guard_ledger.{session}"
 
 # get_bool_env semantics (src/lmer_cli/util.py), replicated inline: hooks are
 # standalone-stdlib and import no project code.
@@ -229,6 +237,46 @@ def derive_run_dir(
     return base
 
 
+def ledger_nudge_needed(events: list | None, session: str) -> bool:
+    """
+    Trigger-3 decision, given the run's parsed events and the session id.
+
+    True when this session landed at least one project-repo commit (a
+    ``gate`` event whose data carries a ``commit_sha`` — gate-commit stamps
+    one exactly when a commit succeeded) while recording no ``task`` event,
+    i.e. nothing was written to the execution ledger. Events from other
+    sessions never count either way: a prior session's ledger writes do not
+    excuse this session's unledgered commits, and its commits are not this
+    session's to ledger. ``None`` events (log unreadable/absent) count as
+    compliant — fail open.
+    """
+    if not events:
+        return False
+    committed = False
+    for event in events:
+        if not isinstance(event, dict) or event.get("session") != session:
+            continue
+        if event.get("type") == "task":
+            return False
+        data = event.get("data")
+        if event.get("type") == "gate" and isinstance(data, dict) and data.get("commit_sha"):
+            committed = True
+    return committed
+
+
+def build_ledger_reason() -> str:
+    """Trigger-3 block reason: the `work ledger set` nudge."""
+    return (
+        "Ledger check: this session committed to the project repo but wrote "
+        "nothing to the run's execution ledger — unledgered commits are "
+        "exactly what crash recovery cannot see. Record each landed task "
+        "now — `work ledger set <task-id> --status done --commit <sha>` — "
+        "then stop again. (This nudge fires once per session; if the "
+        "commits genuinely map to no plan task, stopping again proceeds "
+        "normally.)"
+    )
+
+
 def build_state_reason(missing: list[str]) -> str:
     """Trigger-1 block reason: exactly the missing pieces, exact commands."""
     pieces = ", ".join(missing)
@@ -271,29 +319,41 @@ def evaluate(
     push_nudge_count: int,
     run_dir: str | None = None,
     push_cap: int = PUSH_NUDGE_CAP,
+    ledger_needed: bool = False,
+    ledger_already_nudged: bool = True,
 ) -> dict:
     """
-    Combine both triggers into one decision, from fully injected inputs.
+    Combine the triggers into one decision, from fully injected inputs.
 
-    Returns ``{"state_reason": str | None, "push_reason": str | None}`` —
-    one entry per trigger so the caller can drop a reason whose bookkeeping
-    side effect (sentinel / counter write) fails, keeping fail-open per
-    trigger rather than all-or-nothing.
+    Returns ``{"state_reason": str | None, "ledger_reason": str | None,
+    "push_reason": str | None}`` — one entry per trigger so the caller can
+    drop a reason whose bookkeeping side effect (sentinel / counter write)
+    fails, keeping fail-open per trigger rather than all-or-nothing.
 
     Trigger 1 fires when there is real activity, at least one missing state
-    field, and the session has not been nudged before. Trigger 2 fires
-    independently whenever the run dir is dirty or unpushed and the session
-    cap has not been reached.
+    field, and the session has not been nudged before. Trigger 3 fires when
+    the injected ledger check found unledgered commits and its own sentinel
+    is unset (defaults keep it off for callers that never gathered it).
+    Trigger 2 fires independently whenever the run dir is dirty or unpushed
+    and the session cap has not been reached.
     """
     state_reason = None
     if missing_fields and activity and not state_already_nudged:
         state_reason = build_state_reason(missing_fields)
 
+    ledger_reason = None
+    if ledger_needed and not ledger_already_nudged:
+        ledger_reason = build_ledger_reason()
+
     push_reason = None
     if (run_dir_dirty or run_dir_unpushed) and push_nudge_count < push_cap:
         push_reason = build_push_reason(run_dir_dirty, run_dir_unpushed, run_dir)
 
-    return {"state_reason": state_reason, "push_reason": push_reason}
+    return {
+        "state_reason": state_reason,
+        "ledger_reason": ledger_reason,
+        "push_reason": push_reason,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +428,36 @@ def gather_run_dir_status(run_dir: str) -> tuple[bool, bool]:
     except ValueError:
         ahead = None
     return run_dir_noncompliance(status, ahead)
+
+
+def read_run_events(run_dir: str) -> list | None:
+    """
+    Parse the run dir's events.jsonl; None when absent or unreadable.
+
+    Torn/corrupt lines are skipped (a crash mid-append must not break the
+    guard) — same tolerance as the work CLI's own reader, replicated here
+    because hooks import no project code.
+    """
+    path = os.path.join(run_dir, "events.jsonl")
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    events = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            events.append(parsed)
+    return events
 
 
 def _run_work_resume() -> dict | None:
@@ -472,6 +562,20 @@ def main(argv: list[str] | None = None) -> int:
     if push_count is None:
         push_count = PUSH_NUDGE_CAP  # counter unreadable — fail open, no nudge
 
+    # Trigger 3 inputs. The events log is read only when the sentinel leaves
+    # the trigger in play (and only from the resolved run dir).
+    ledger_sentinel_path = LEDGER_SENTINEL_TEMPLATE.format(session=session)
+    try:
+        ledger_already_nudged = os.path.exists(ledger_sentinel_path)
+    except OSError:
+        ledger_already_nudged = True  # sentinel unreadable — fail open, no nudge
+    ledger_needed = False
+    if run_dir and not ledger_already_nudged:
+        try:
+            ledger_needed = ledger_nudge_needed(read_run_events(run_dir), session)
+        except Exception:
+            ledger_needed = False
+
     verdict = evaluate(
         missing_fields=missing,
         activity=activity,
@@ -480,6 +584,8 @@ def main(argv: list[str] | None = None) -> int:
         run_dir_unpushed=unpushed,
         push_nudge_count=push_count,
         run_dir=run_dir,
+        ledger_needed=ledger_needed,
+        ledger_already_nudged=ledger_already_nudged,
     )
 
     # Bookkeeping BEFORE blocking, each failing open per trigger: a nudge
@@ -491,6 +597,13 @@ def main(argv: list[str] | None = None) -> int:
             with open(sentinel_path, "w", encoding="utf-8"):
                 pass
             reasons.append(verdict["state_reason"])
+        except OSError:
+            pass
+    if verdict["ledger_reason"]:
+        try:
+            with open(ledger_sentinel_path, "w", encoding="utf-8"):
+                pass
+            reasons.append(verdict["ledger_reason"])
         except OSError:
             pass
     if verdict["push_reason"]:

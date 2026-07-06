@@ -10,18 +10,22 @@ import pytest
 
 from hooks.run_state_guard import (
     COUNTER_TEMPLATE,
+    LEDGER_SENTINEL_TEMPLATE,
     PUSH_NUDGE_CAP,
     SENTINEL_TEMPLATE,
     STATE_COMMANDS,
     STATE_FIELDS,
+    build_ledger_reason,
     build_push_reason,
     build_state_reason,
     derive_run_dir,
     detect_activity,
     env_flag,
     evaluate,
+    ledger_nudge_needed,
     missing_state_fields,
     parse_resume_json,
+    read_run_events,
     run_dir_noncompliance,
 )
 
@@ -346,6 +350,124 @@ class TestEvaluateBothTriggers:
         assert "Push-before-stop check" in verdict["push_reason"]
 
 
+def _gate_event(session, sha="abc1234", gate="gate-commit", outcome="pass"):
+    data = {"gate": gate, "outcome": outcome}
+    if sha is not None:
+        data["commit_sha"] = sha
+    return {"ts": "2026-07-06T00:00:00Z", "session": session, "type": "gate", "data": data}
+
+
+def _task_event(session, task="T1", status="done"):
+    return {"ts": "2026-07-06T00:00:01Z", "session": session, "type": "task",
+            "data": {"task": task, "status": status}}
+
+
+class TestLedgerNudgeNeeded:
+    S = "s-1"
+
+    def test_commit_without_ledger_write_fires(self):
+        assert ledger_nudge_needed([_gate_event(self.S)], self.S) is True
+
+    def test_task_event_suppresses(self):
+        events = [_gate_event(self.S), _task_event(self.S)]
+        assert ledger_nudge_needed(events, self.S) is False
+
+    def test_task_before_commit_also_suppresses(self):
+        events = [_task_event(self.S), _gate_event(self.S)]
+        assert ledger_nudge_needed(events, self.S) is False
+
+    def test_other_sessions_commit_does_not_fire(self):
+        assert ledger_nudge_needed([_gate_event("s-other")], self.S) is False
+
+    def test_other_sessions_task_does_not_suppress(self):
+        events = [_gate_event(self.S), _task_event("s-other")]
+        assert ledger_nudge_needed(events, self.S) is True
+
+    def test_gate_event_without_sha_does_not_fire(self):
+        # gate-check / a failed gate-commit never stamps a commit_sha.
+        assert ledger_nudge_needed([_gate_event(self.S, sha=None)], self.S) is False
+
+    @pytest.mark.parametrize("events", [None, []])
+    def test_no_events_fail_open(self, events):
+        assert ledger_nudge_needed(events, self.S) is False
+
+    def test_malformed_events_tolerated(self):
+        events = ["junk", {"type": "gate"}, {"session": self.S, "type": "gate", "data": "x"},
+                  _gate_event(self.S)]
+        assert ledger_nudge_needed(events, self.S) is True
+
+
+class TestBuildLedgerReason:
+    def test_names_the_command(self):
+        reason = build_ledger_reason()
+        assert "work ledger set" in reason
+        assert "--commit <sha>" in reason
+
+
+class TestEvaluateLedgerTrigger:
+    @staticmethod
+    def _evaluate(needed, nudged=False):
+        return evaluate(
+            missing_fields=[],
+            activity=False,
+            state_already_nudged=False,
+            run_dir_dirty=False,
+            run_dir_unpushed=False,
+            push_nudge_count=0,
+            ledger_needed=needed,
+            ledger_already_nudged=nudged,
+        )
+
+    def test_fires_when_needed(self):
+        verdict = self._evaluate(True)
+        assert "Ledger check" in verdict["ledger_reason"]
+        assert verdict["state_reason"] is None
+        assert verdict["push_reason"] is None
+
+    def test_sentinel_suppresses(self):
+        assert self._evaluate(True, nudged=True)["ledger_reason"] is None
+
+    def test_not_needed_is_silent(self):
+        assert self._evaluate(False)["ledger_reason"] is None
+
+    def test_defaults_keep_trigger_off(self):
+        verdict = evaluate(
+            missing_fields=[],
+            activity=False,
+            state_already_nudged=False,
+            run_dir_dirty=False,
+            run_dir_unpushed=False,
+            push_nudge_count=0,
+        )
+        assert verdict["ledger_reason"] is None
+
+    def test_all_three_triggers_fire_independently(self):
+        verdict = evaluate(
+            missing_fields=["name"],
+            activity=True,
+            state_already_nudged=False,
+            run_dir_dirty=True,
+            run_dir_unpushed=False,
+            push_nudge_count=0,
+            ledger_needed=True,
+            ledger_already_nudged=False,
+        )
+        assert "Run-state check" in verdict["state_reason"]
+        assert "Ledger check" in verdict["ledger_reason"]
+        assert "Push-before-stop check" in verdict["push_reason"]
+
+
+class TestReadRunEvents:
+    def test_absent_returns_none(self, tmp_path):
+        assert read_run_events(str(tmp_path)) is None
+
+    def test_parses_lines_and_skips_torn_ones(self, tmp_path):
+        lines = [json.dumps(_gate_event("s-1")), "{torn", "", json.dumps(_task_event("s-1")), '"str"']
+        (tmp_path / "events.jsonl").write_text("\n".join(lines) + "\n")
+        events = read_run_events(str(tmp_path))
+        assert [e["type"] for e in events] == ["gate", "task"]
+
+
 # ---- main() via subprocess -------------------------------------------------------
 
 # Env vars the harness controls per test; anything inherited is scrubbed first
@@ -368,7 +490,7 @@ def session():
     from the uuid, and cleanup keeps /tmp from accumulating."""
     sid = f"pytest-{uuid.uuid4().hex}"
     yield sid
-    for template in (SENTINEL_TEMPLATE, COUNTER_TEMPLATE):
+    for template in (SENTINEL_TEMPLATE, COUNTER_TEMPLATE, LEDGER_SENTINEL_TEMPLATE):
         try:
             os.unlink(template.format(session=sid))
         except OSError:
@@ -612,6 +734,65 @@ class TestMainPushTrigger:
         assert "Run-state check" in out["reason"]
         assert "Push-before-stop check" in out["reason"]
         assert "\n\n" in out["reason"]
+
+
+class TestMainLedgerTrigger:
+    def _setup(self, tmp_path, session, events):
+        """Compliant decision (trigger 1 silent) + committed-and-pushed run
+        dir carrying the given events.jsonl (trigger 2 silent)."""
+        bin_dir = _make_work_cli(tmp_path, _decision())
+        clone, run_dir = _make_work_repo(tmp_path)
+        (run_dir / "events.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in events) + "\n"
+        )
+        _git(clone, "add", ".")
+        _git(clone, "commit", "-q", "-m", "events")
+        _git(clone, "push", "-q")
+        return _guard_env(bin_dir, session, clone)
+
+    def test_unledgered_commit_blocks(self, tmp_path, session):
+        env = self._setup(tmp_path, session, [_gate_event(session)])
+        r = _run_hook({"cwd": str(tmp_path)}, env)
+        assert r.returncode == 0
+        out = json.loads(r.stdout)
+        assert out["decision"] == "block"
+        assert "Ledger check" in out["reason"]
+        assert "work ledger set" in out["reason"]
+
+    def test_second_stop_allowed_by_sentinel(self, tmp_path, session):
+        env = self._setup(tmp_path, session, [_gate_event(session)])
+        first = _run_hook({"cwd": str(tmp_path)}, env)
+        assert "Ledger check" in json.loads(first.stdout)["reason"]
+        second = _run_hook({"cwd": str(tmp_path)}, env)
+        assert second.returncode == 0
+        assert second.stdout.strip() == ""
+
+    def test_ledgered_commit_passes(self, tmp_path, session):
+        env = self._setup(
+            tmp_path, session, [_gate_event(session), _task_event(session)]
+        )
+        r = _run_hook({"cwd": str(tmp_path)}, env)
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_gate_without_commit_sha_passes(self, tmp_path, session):
+        env = self._setup(tmp_path, session, [_gate_event(session, sha=None)])
+        r = _run_hook({"cwd": str(tmp_path)}, env)
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_other_sessions_commit_passes(self, tmp_path, session):
+        env = self._setup(tmp_path, session, [_gate_event("someone-else")])
+        r = _run_hook({"cwd": str(tmp_path)}, env)
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_kill_switch_disables_ledger_nudge(self, tmp_path, session):
+        env = self._setup(tmp_path, session, [_gate_event(session)])
+        env["LMER_RUN_STATE_GUARD"] = "0"
+        r = _run_hook({"cwd": str(tmp_path)}, env)
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
 
 
 class TestMainFailOpen:

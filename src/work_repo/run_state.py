@@ -44,6 +44,11 @@ STATE_FILE = "state.yaml"
 # Pre-rename runs wrote this name; read-fallback + rename-on-write migration.
 LEGACY_STATE_FILE = "state.yml"
 EVENTS_FILE = "events.jsonl"
+# Per-task execution ledger (issue #89): one row per plan task, snapshot of
+# current state; every mutation also appends a `task` event to events.jsonl.
+LEDGER_FILE = "ledger.yaml"
+LEDGER_SCHEMA_VERSION = 1
+TASK_STATUSES = ("pending", "in-progress", "done", "deferred", "dropped")
 # Run dirs are created under a temporary dot-name and atomically renamed to
 # their final name once seeded (issue #87 D2). A crash in between leaves a
 # sweepable `.new-*` orphan — the external cleaner contract (RUN-STATE.md §6)
@@ -432,6 +437,28 @@ def _state_path(rdir: Path) -> Optional[Path]:
     return None
 
 
+def _load_yaml_mapping(path: Path, label: str, supported_version: int) -> dict:
+    """Shared parse/validate preamble for the schema'd single-writer YAML
+    files (state.yaml, ledger.yaml): parse → mapping check → schema
+    int check → newer-schema read-only refusal. Corrupt files are backed up
+    first (spec §6); a newer schema leaves the file untouched."""
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise _backup_bad_state(path, f"unparseable {path.name} ({exc})")
+    if not isinstance(data, dict):
+        raise _backup_bad_state(path, f"{path.name} is not a mapping")
+    schema = data.get("schema", 0)
+    if not isinstance(schema, int) or isinstance(schema, bool):
+        raise _backup_bad_state(path, f"{path.name} schema field is not an integer ({schema!r})")
+    if schema > supported_version:
+        raise RunStateError(
+            f"{label} schema {schema} is newer than supported "
+            f"{supported_version} — read-only refusal"
+        )
+    return data
+
+
 def load_state(rdir: Path) -> Optional[dict]:
     """Read state.yaml (falling back to legacy state.yml). None if absent.
     RunStateError if corrupt (backed up first) or if `schema` is newer than
@@ -439,21 +466,7 @@ def load_state(rdir: Path) -> Optional[dict]:
     path = _state_path(rdir)
     if path is None:
         return None
-    try:
-        state = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
-        raise _backup_bad_state(path, f"unparseable {path.name} ({exc})")
-    if not isinstance(state, dict):
-        raise _backup_bad_state(path, f"{path.name} is not a mapping")
-    schema = state.get("schema", 0)
-    if not isinstance(schema, int) or isinstance(schema, bool):
-        raise _backup_bad_state(path, f"{path.name} schema field is not an integer ({schema!r})")
-    if schema > SCHEMA_VERSION:
-        raise RunStateError(
-            f"state schema {schema} is newer than supported "
-            f"{SCHEMA_VERSION} — read-only refusal"
-        )
-    return state
+    return _load_yaml_mapping(path, "state", SCHEMA_VERSION)
 
 
 def write_state(rdir: Path, state: dict) -> None:
@@ -510,6 +523,153 @@ def read_events(rdir: Path, last_n: int = 5) -> list[dict]:
     return events[-last_n:] if last_n else events
 
 
+def load_ledger(rdir: Path) -> Optional[dict]:
+    """Read ledger.yaml. None if absent. Same safety contract as state.yaml
+    (the shared preamble): corrupt files are backed up first (RunStateError),
+    a newer schema is a read-only refusal, and a non-mapping `tasks` counts
+    as corrupt."""
+    path = rdir / LEDGER_FILE
+    if not path.exists():
+        return None
+    ledger = _load_yaml_mapping(path, "ledger", LEDGER_SCHEMA_VERSION)
+    tasks = ledger.get("tasks")
+    if tasks is None:
+        ledger["tasks"] = {}
+    elif not isinstance(tasks, dict):
+        raise _backup_bad_state(path, f"{path.name} tasks field is not a mapping")
+    return ledger
+
+
+def write_ledger(rdir: Path, ledger: dict) -> None:
+    """Atomic tmp+rename write. The ONLY writer of ledger.yaml (issue #89:
+    single-writer contract, same as state.yaml)."""
+    rdir.mkdir(parents=True, exist_ok=True)
+    tmp = rdir / f".{LEDGER_FILE}.tmp"
+    tmp.write_text(yaml.safe_dump(ledger, sort_keys=False), encoding="utf-8")
+    tmp.replace(rdir / LEDGER_FILE)
+
+
+def set_ledger_task(
+    rdir: Path,
+    task_id: str,
+    status: str,
+    title: Optional[str] = None,
+    commit: Optional[str] = None,
+    receipt: Optional[str] = None,
+    note: Optional[str] = None,
+) -> dict:
+    """Upsert one ledger row and append the `task` audit event (issue #89:
+    ledger.yaml is the snapshot, events.jsonl the audit trail — every
+    mutation writes both). Fields not passed are preserved from the existing
+    row, so `set T2 --status done --commit <sha>` keeps an earlier title.
+    Returns the updated row."""
+    if status not in TASK_STATUSES:
+        raise RunStateError(
+            f"invalid task status {status!r} (expected one of {', '.join(TASK_STATUSES)})"
+        )
+    ledger = load_ledger(rdir) or {"schema": LEDGER_SCHEMA_VERSION, "tasks": {}}
+    tasks = ledger["tasks"]
+    old = tasks.get(task_id)
+    row = dict(old) if isinstance(old, dict) else {}
+    # Free-text fields land in the (shared) work repo — redact like the
+    # other agent-typed writers (log, artifact, verify/gate receipts) do.
+    if title is not None:
+        row["title"] = redact_secrets(title)
+    row["status"] = status
+    if commit is not None:
+        row["commit"] = commit
+    if receipt is not None:
+        row["receipt"] = receipt
+    if note is not None:
+        row["note"] = redact_secrets(note)
+    row["updated"] = utc_now_iso()
+    tasks[task_id] = row
+    write_ledger(rdir, ledger)
+    data = {"task": task_id, "status": status}
+    for key, value in (("commit", commit), ("receipt", receipt)):
+        if value is not None:
+            data[key] = value
+    append_event(rdir, "task", note=f"{task_id}: {status}", data=data)
+    return row
+
+
+def summarize_ledger(ledger: Optional[dict]) -> Optional[dict]:
+    """Compact ledger summary for the resume brief: done/total counts, the
+    in-flight task ids, and the most recently recorded commit sha. None when
+    there is no ledger (or no tasks) — the brief omits the line entirely.
+    Tolerates malformed rows (a broken row must never break resume)."""
+    if not isinstance(ledger, dict):
+        return None
+    tasks = ledger.get("tasks")
+    if not isinstance(tasks, dict) or not tasks:
+        return None
+    counts = {status: 0 for status in TASK_STATUSES}
+    in_flight: list[str] = []
+    last_commit = None
+    last_commit_ts = ""
+    for task_id, row in tasks.items():
+        if not isinstance(row, dict):
+            continue
+        status = row.get("status")
+        if isinstance(status, str) and status in counts:
+            counts[status] += 1
+        if status == "in-progress":
+            in_flight.append(str(task_id))
+        commit = row.get("commit")
+        # ISO-8601 Z timestamps order lexicographically; rows without a
+        # stamp lose ties to any stamped row.
+        ts = str(row.get("updated") or "")
+        if commit and ts >= last_commit_ts:
+            last_commit = str(commit)
+            last_commit_ts = ts
+    return {
+        "total": len(tasks),
+        "done": counts["done"],
+        "counts": counts,
+        "in_flight": in_flight,
+        "last_commit": last_commit,
+    }
+
+
+def format_ledger_line(summary: Optional[dict]) -> Optional[str]:
+    """The one-line brief form: `Ledger: 4/7 done, in-flight: T3a, last
+    commit 4a1f9c2` — parts absent when empty. None when no summary."""
+    if not summary:
+        return None
+    line = f"Ledger: {summary['done']}/{summary['total']} done"
+    if summary["in_flight"]:
+        line += f", in-flight: {', '.join(summary['in_flight'])}"
+    if summary["last_commit"]:
+        line += f", last commit {summary['last_commit']}"
+    return line
+
+
+def format_ledger(ledger: Optional[dict]) -> str:
+    """Human-readable ledger table for `work ledger` (read-only view; the
+    YAML stays authoritative). Rows print in file order — plan order."""
+    summary = summarize_ledger(ledger)
+    if summary is None:
+        return "No ledger"
+    lines = [format_ledger_line(summary)]
+    tasks = ledger["tasks"]
+    id_width = max(len(str(task_id)) for task_id in tasks)
+    for task_id, row in tasks.items():
+        if not isinstance(row, dict):
+            row = {}
+        status = str(row.get("status") or "?")
+        parts = [f"  {str(task_id):<{id_width}}  {status:<11}"]
+        if row.get("commit"):
+            parts.append(f"commit={row['commit']}")
+        if row.get("receipt"):
+            parts.append(f"receipt={row['receipt']}")
+        if row.get("title"):
+            parts.append(str(row["title"]))
+        if row.get("note"):
+            parts.append(f"— {row['note']}")
+        lines.append(" ".join(parts).rstrip())
+    return "\n".join(lines)
+
+
 def _iso_to_minutes_apart(earlier: str, later: str) -> Optional[float]:
     """Minutes between two ISO-8601 Z timestamps; None if unparseable."""
     try:
@@ -525,6 +685,7 @@ def decide(
     events: list[dict],
     session: str,
     now: Optional[str] = None,
+    ledger: Optional[dict] = None,
 ) -> dict:
     """Pure resume decision (spec §4.3 `work resume`). No fs, no env reads —
     fully unit-testable; all inputs are passed in by the caller."""
@@ -554,6 +715,9 @@ def decide(
         "critical_error": state.get("critical_error"),
         "goal": state.get("goal"),
         "artifacts": state.get("artifacts") or {},
+        # Full ledger for --json consumers; the brief renders the one-line
+        # summary from it (issue #89).
+        "ledger": ledger,
         "recent_events": events,
         "warnings": warnings,
     }
@@ -583,6 +747,9 @@ def format_brief(decision: dict) -> str:
     if decision.get("artifacts"):
         arts = ", ".join(sorted(decision["artifacts"].values()))
         lines.append(f"Artifacts in run dir: {arts}")
+    ledger_line = format_ledger_line(summarize_ledger(decision.get("ledger")))
+    if ledger_line:
+        lines.append(ledger_line)
     for warning in decision.get("warnings", []):
         lines.append(f"⚠️  {warning}")
     events = decision.get("recent_events") or []

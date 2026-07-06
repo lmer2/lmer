@@ -70,6 +70,10 @@ class TestRunStateFragment:
         assert "work verify" in out
         assert "verify:" in out
         assert "receipt" in out.lower()
+        # Ledger contract (issue #89): gate-commit then ledger in the same
+        # breath, ledger.yaml single-writer taught up front.
+        assert "work ledger set <task-id> --status done --commit <sha>" in out
+        assert "ledger.yaml" in out
 
     def test_empty_without_project_context(self):
         out = self._render(None, {})
