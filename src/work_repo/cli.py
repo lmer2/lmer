@@ -57,6 +57,12 @@ Examples:
   # Seed a run for another slug (out-of-session run creation)
   work seed develop gate-receipts --goal "..." --name gate-receipts
 
+  # Record a plan task's completion in the execution ledger
+  work ledger set T2 --status done --commit 4a1f9c2 --receipt t2-tests
+
+  # Show the ledger table
+  work ledger
+
   # Set a temporary goal/context
   work goal "description of current goal"
 
@@ -228,6 +234,37 @@ Examples:
     event_parser.add_argument("type", help="Event type (e.g. review_posted)")
     event_parser.add_argument("--note", help="Short human-readable note")
     event_parser.add_argument("--data", help="JSON object with extra data")
+
+    # ledger command (per-task execution ledger — issue #89)
+    ledger_parser = subparsers.add_parser(
+        "ledger",
+        help="Show or mutate the per-task execution ledger (ledger.yaml)",
+    )
+    ledger_parser.add_argument(
+        "action", nargs="?", choices=["set"],
+        help="'set' to mutate; omit to display the ledger table",
+    )
+    ledger_parser.add_argument(
+        "task_id", nargs="?", metavar="task-id",
+        help="Plan task id (e.g. T3a); required with 'set'",
+    )
+    ledger_parser.add_argument(
+        "--status", choices=list(run_state.TASK_STATUSES),
+        help="Task status (required with 'set')",
+    )
+    ledger_parser.add_argument(
+        "--title",
+        help="Short task title (fields omitted on later writes are kept)",
+    )
+    ledger_parser.add_argument(
+        "--commit",
+        help="Project-repo commit sha the task landed as",
+    )
+    ledger_parser.add_argument(
+        "--receipt",
+        help="Name of the verify/gate receipt proving the task",
+    )
+    ledger_parser.add_argument("--note", help="Short free-form note")
 
     # resume command
     resume_parser = subparsers.add_parser(
@@ -888,6 +925,73 @@ def cmd_name(value: str | None) -> int:
     return 0
 
 
+def cmd_ledger(args) -> int:
+    """Execute ledger / ledger set commands (issue #89).
+
+    `work ledger set` is the ONLY writer of the task↔commit mapping — gates
+    stay ledger-unaware (spec decision 3). Every mutation lands both the
+    ledger.yaml snapshot and a `task` audit event, then pushes: the ledger
+    write is exactly the record a dead session must not lose.
+    """
+    if args.action != "set":
+        # Read-only display; no ledger is a normal state (exit 0).
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+            return 0
+        try:
+            ledger = run_state.load_ledger(rdir)
+        except (run_state.RunStateError, OSError) as exc:
+            print(f"⚠️  {exc}", file=sys.stderr)
+            return 1
+        print(run_state.format_ledger(ledger))
+        return 0
+
+    # --- mutation path ---
+    task_id = (args.task_id or "").strip()
+    if not task_id:
+        print("❌ ledger set requires a task id: work ledger set <task-id> --status <s>", file=sys.stderr)
+        return 1
+    if not args.status:
+        print("❌ ledger set requires --status", file=sys.stderr)
+        return 1
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    if args.status == "done" and not args.commit:
+        # Loud but non-fatal: docs-only tasks legitimately have no commit,
+        # but a forgotten sha is exactly what crash recovery later misses.
+        print(
+            f"⚠️  '{task_id}' marked done with NO --commit — fine for docs-only "
+            "tasks; otherwise re-run with --commit <sha> so recovery can find it",
+            file=sys.stderr,
+        )
+    try:
+        run_state.set_ledger_task(
+            rdir,
+            task_id,
+            args.status,
+            title=args.title,
+            commit=args.commit,
+            receipt=args.receipt,
+            note=args.note,
+        )
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    print(f"✅ Ledger updated: {task_id} = {args.status}")
+
+    # Durability: the ledger row is the crash-recovery record — push now,
+    # not at session end (non-fatal, like artifact writes).
+    rc = commit_work_path(
+        run_state.run_rel_path_candidates(),
+        f"run-state: {state['slug']} ledger {task_id}={args.status}",
+    )
+    if rc != 0:
+        print("⚠️  Warning: run-state push failed (ledger saved locally)")
+    return 0
+
+
 def cmd_resume(as_json: bool = False) -> int:
     """Execute resume command. Read-only; never breaks a session (always 0)."""
     rdir = run_state.run_dir()
@@ -900,7 +1004,15 @@ def cmd_resume(as_json: bool = False) -> int:
     except (run_state.RunStateError, OSError) as exc:
         print(f"⚠️  Run state unreadable — falling back to worklog. ({exc})")
         return 0
-    decision = run_state.decide(state, events, run_state.current_session_id())
+    try:
+        ledger = run_state.load_ledger(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        # A broken ledger must not break resume — the brief just omits it.
+        ledger = None
+        print(f"⚠️  ledger unreadable — brief omits it. ({exc})", file=sys.stderr)
+    decision = run_state.decide(
+        state, events, run_state.current_session_id(), ledger=ledger
+    )
     if decision.get("kind") == "run":
         # Dirs are renamed by the lifecycle (issue #87 D2), so consumers —
         # e.g. the stop-hook guard's push check — need the resolved path,
@@ -941,8 +1053,16 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
     if not name or Path(name).name != name or name.startswith("."):
         print(f"❌ Invalid artifact name: {name!r} (plain filename required)", file=sys.stderr)
         return 1
-    reserved = (run_state.STATE_FILE, run_state.LEGACY_STATE_FILE, run_state.EVENTS_FILE)
-    reserved_prefixes = tuple(f"{f}." for f in (run_state.STATE_FILE, run_state.LEGACY_STATE_FILE))
+    reserved = (
+        run_state.STATE_FILE,
+        run_state.LEGACY_STATE_FILE,
+        run_state.EVENTS_FILE,
+        run_state.LEDGER_FILE,
+    )
+    reserved_prefixes = tuple(
+        f"{f}."
+        for f in (run_state.STATE_FILE, run_state.LEGACY_STATE_FILE, run_state.LEDGER_FILE)
+    )
     if name in reserved or name.startswith(reserved_prefixes):
         print(f"❌ Reserved artifact name: {name}", file=sys.stderr)
         return 1
@@ -1073,7 +1193,13 @@ def cmd_session_start() -> int:
 
         # Decide BEFORE claiming so a foreign claim surfaces as a warning.
         events = run_state.read_events(rdir, last_n=5)
-        decision = run_state.decide(state, events, run_state.current_session_id())
+        try:
+            ledger = run_state.load_ledger(rdir)
+        except (run_state.RunStateError, OSError):
+            ledger = None
+        decision = run_state.decide(
+            state, events, run_state.current_session_id(), ledger=ledger
+        )
 
         run_state.append_event(rdir, "session_start")
         state["owner"] = {
@@ -1162,6 +1288,8 @@ def main() -> int:
         return cmd_event(args)
     elif args.command == "name":
         return cmd_name(args.value)
+    elif args.command == "ledger":
+        return cmd_ledger(args)
     elif args.command == "resume":
         return cmd_resume(args.as_json)
     elif args.command == "artifact":

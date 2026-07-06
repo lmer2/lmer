@@ -276,7 +276,8 @@ work goal "Focus on security review of auth endpoints"
 ## Run state (Run D.M.C.)
 
 Every session maintains durable, machine-readable state for its run —
-`state.yaml` and an append-only `events.jsonl` — at
+`state.yaml`, an append-only `events.jsonl`, and (once the run has plan
+tasks to track) a per-task `ledger.yaml` — at
 `{host}/{project}/runs/<slug>/` in the work repo. (Older runs may still
 hold a legacy `state.yml`; it is read transparently and migrated to
 `state.yaml` on the run's first mutation.) This is separate from
@@ -294,10 +295,11 @@ never exits non-zero, and the gate/goal integrations never change their
 host command's behavior or exit code — state-layer errors are reported and
 skipped. Without a run context (`LMER_REPO_HOST`/`LMER_REPO_PROJECT`
 unset), the read-only and hook-facing verbs (`work state`, `work resume`,
-`work session-start`, `work session-end`) print a "no run context" message
-and exit 0, but the mutating verbs (`work state set`, `work event`,
-`work verify`, `work artifact`) print an error to stderr and exit 1 —
-scripts chaining them under `set -e` should expect that.
+`work ledger`, `work session-start`, `work session-end`) print a "no run
+context" message and exit 0, but the mutating verbs (`work state set`,
+`work event`, `work verify`, `work artifact`, `work ledger set`) print an
+error to stderr and exit 1 — scripts chaining them under `set -e` should
+expect that.
 
 ### Show current state
 
@@ -400,6 +402,32 @@ This is a mutating verb: without run context it errors *before* running
 the command. If the receipt append fails after the command ran, a loud
 stderr warning is printed but the exit code still mirrors the command.
 
+### Track plan tasks in the execution ledger
+
+```bash
+# Record a task's state — the same-breath rule: gate-commit, then this
+work ledger set T2 --status done --commit 4a1f9c2 --receipt t2-tests
+work ledger set T3a --status in-progress --title "resume brief line"
+
+# Show the ledger table (read-only; "No ledger" + exit 0 when none exists)
+work ledger
+```
+
+`ledger.yaml` holds one row per plan task (`pending | in-progress | done |
+deferred | dropped`, plus optional `title`/`commit`/`receipt`/`note`), so a
+crashed run's successor recovers by reading state, not by diffing.
+`work ledger set` is the **only** writer (atomic, single-writer — never
+edit the file by hand; gates never write it either): it upserts the row
+(fields omitted on a later write are preserved), appends a `task` event to
+`events.jsonl`, and pushes the run dir. Task ids come from plan.md;
+hand-named ids are fine.
+
+Record `done` **immediately after the gate-commit that lands the task**,
+with its sha — `--receipt` names the `verify`/gate receipt that proves it.
+`done` with no `--commit` warns loudly but succeeds (docs-only tasks
+exist). A Stop-hook nudge fires (once per session) when a session has
+landed gate-commits without writing any ledger row.
+
 ### Print the resume brief
 
 ```bash
@@ -407,10 +435,12 @@ work resume
 work resume --json
 ```
 
-Reads state + recent events and prints a human-readable brief (slug,
-status, phase, stop_reason, goal, last ~5 events, artifacts, and an
-owner-claim warning if another session has the run claimed). `--json` emits
-the same decision as machine-readable JSON, for hooks/scripts.
+Reads state + recent events (+ ledger) and prints a human-readable brief
+(slug, status, phase, stop_reason, goal, a `Ledger: 4/7 done, in-flight:
+T3a, last commit 4a1f9c2` line when a ledger exists, last ~5 events,
+artifacts, and an owner-claim warning if another session has the run
+claimed). `--json` emits the same decision as machine-readable JSON — with
+the full ledger — for hooks/scripts.
 
 ### Register a durable artifact
 
