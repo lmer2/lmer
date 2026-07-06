@@ -74,6 +74,12 @@ class TestRunStateFragment:
         # breath, ledger.yaml single-writer taught up front.
         assert "work ledger set <task-id> --status done --commit <sha>" in out
         assert "ledger.yaml" in out
+        # Plan-gate lint (issue #90): the index is authored beside plan.md
+        # and the gate presents plan.md only with a green check included.
+        assert "plan.index.json" in out
+        assert "work plan check" in out
+        assert "green" in out.lower()
+        assert "shared_files" in out
 
     def test_empty_without_project_context(self):
         out = self._render(None, {})

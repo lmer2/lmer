@@ -71,6 +71,22 @@ the work, not optional bookkeeping:
 - **Plans carry validation contracts.** Give each task in plan.md a
   `verify: <command or gate>` line naming the command that proves it, and
   use that name/command when recording the receipt.
+- **Multi-task plans carry a machine-checkable index.** When plan.md has
+  more than one task, author `plan.index.json` beside it (schema 1: per
+  task `id`, `description`, `files` — the declared write-scope as
+  project-relative paths/globs, `deps`, `verify_commands`, and
+  `session_scope: "one"`, or `"multi"` plus a `scope_rationale` saying in
+  writing why it cannot fit one session). Genuinely shared touchpoints
+  (CHANGELOG.yaml, docs indexes) between independent tasks go in a
+  top-level `shared_files` allowlist (`{"T2+T4": ["CHANGELOG.yaml"]}`).
+  Register it: `work artifact plan.index.json --file <path>`.
+- **The plan gate requires a green `work plan check`.** Run the lint
+  BEFORE presenting plan.md for approval and include its output in the
+  approval request — the human approves a plan whose task DAG is checked
+  acyclic, whose independent tasks touch disjoint paths, and whose
+  atomicity declarations are complete. A failing check blocks the plan
+  gate: fix the plan (or declare the shared touchpoint) and re-run until
+  green before asking.
 - **Ledger every landed task in the same breath as its commit.** The moment
   a gate-commit lands a plan task, record it before doing anything else:
   `work ledger set <task-id> --status done --commit <sha> [--receipt <name>]`.

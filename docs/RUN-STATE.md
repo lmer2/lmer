@@ -36,6 +36,7 @@ Layout, per project (`{host}/{project}/` already namespaces by project):
 ├── reports/       # timestamped report files (`work report`)
 ├── spec.md        # Layer 2: agreed approach from the develop interview
 ├── plan.md        # Layer 2: execution plan (markdown checklist in v1)
+├── plan.index.json# Layer 2: machine-readable task index (linted by work plan check)
 └── retro.md       # Layer 2: close-out summary
 ```
 
@@ -90,6 +91,7 @@ artifact set is:
 |---|---|
 | `spec.md` | the agreed approach / approved design |
 | `plan.md` | the implementation plan — each task carries a `verify: <command or gate>` line naming the validation that proves it (its receipt, §2) |
+| `plan.index.json` | machine-readable companion to plan.md — the task DAG with declared write-scopes, linted by `work plan check` (§2) |
 | `retro.md` | close-out: what was done, key decisions, gotchas |
 | `followups.md` | deferred/follow-up work tracked out of the run |
 | `reports/` | per-task or per-review reports, when the run produced them |
@@ -259,8 +261,9 @@ tasks:
 - **Snapshot + audit trail** — every mutation also appends a `task` event
   (`{task, status, commit?, receipt?}` in `data`), so `ledger.yaml` is the
   at-a-glance current state and `events.jsonl` stays the history.
-- **Task ids come from plan.md** (or `plan.index.json` once it exists);
-  hand-named ids are fine — the ledger does not depend on the plan format.
+- **Task ids come from plan.md** (or `plan.index.json` when the run has
+  one); hand-named ids are fine — the ledger does not depend on the plan
+  format.
 - **The same-breath rule** (taskdef fragment): the moment a gate-commit
   lands a plan task, record it — gate-commit, then
   `work ledger set <id> --status done --commit <sha>`, before moving on.
@@ -277,6 +280,53 @@ tasks:
   unpushed row is exactly what a dead session loses.
 - The ledger is machine-authoritative and has no rendered `ledger.md`
   counterpart; humans read `work ledger` (or the YAML itself).
+
+### `plan.index.json` — checkable plan gates
+
+The machine-readable companion to plan.md (issue #90): plan-gate approval
+becomes partially machine-checkable instead of resting on properties humans
+assert by hand. Authored alongside plan.md (never generated from its
+prose), registered like any artifact
+(`work artifact plan.index.json --file <path>`), linted by
+`work plan check` (§4). Schema v1, field-compatible with the masterplan
+fork's plan index where the two overlap (`id`, `description`, `files`,
+`verify_commands`, `goals`) so a future unification is a merge, not a
+migration:
+
+```json
+{"schema": 1,
+ "tasks": [
+   {"id": "T2", "description": "lmer wiring",
+    "files": ["src/lmer_cli/cli.py", "libexec/claude-runner.sh"],
+    "deps": ["T0.1"],
+    "verify_commands": ["gate-check"],
+    "session_scope": "one",
+    "goals": ["G1", "G3"]}],
+ "shared_files": {"T2+T4": ["CHANGELOG.yaml"]}}
+```
+
+- `files` — the task's **declared write-scope**: project-repo-relative
+  paths, globs allowed. Overlap detection treats two entries as colliding
+  when they are equal or either matches the other as an fnmatch pattern
+  (so `src/*.py` collides with `src/foo.py`, and — fnmatch's `*` crossing
+  `/` — `src/*` collides with `src/a/b.py`: over-detection, never
+  under-detection); glob-vs-glob pairs that don't textually match each
+  other are a documented v1 limitation.
+- `session_scope` — `"one"` (atomic: completable in a single session) or
+  `"multi"` plus a required `scope_rationale` string. The point is not
+  enforcement — it forces the atomicity question to be answered in
+  writing at plan time, when descoping is cheap.
+- `shared_files` — top-level allowlist exempting declared pairs' genuinely
+  shared touchpoints (CHANGELOG.yaml, docs indexes) from the overlap rule;
+  entries use the same overlap semantics as `files`, so a glob entry
+  covers the literal paths it matches — and an entry exempts a collision
+  only when it covers *both* colliding sides.
+- `goals` — optional cross-reference plumbing for goal-coverage linting
+  (soft until `develop-goal-freeze` lands).
+
+The lint stops deliberately at plan time: wave-based *execution*
+(dispatch, worktrees) and runtime write-scope enforcement stay out of
+scope — run-state is a state layer (§7).
 
 ## 3. Slug derivation
 
@@ -313,6 +363,7 @@ occupy the slug, so a genuinely new engagement seeds a fresh run.
 | `work resume [--json]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
 | `work ledger` | Print the execution ledger table (read-only): the summary line plus one row per task. With no ledger prints `No ledger`, exit 0. |
 | `work ledger set <task-id> --status <s> [--title …] [--commit <sha>] [--receipt <name>] [--note …]` | The only mutation path for `ledger.yaml` (§2): upserts the row (omitted fields preserved), stamps `updated`, appends a `task` event, pushes the run dir. `--status` is one of `pending\|in-progress\|done\|deferred\|dropped`; `done` with no `--commit` warns loudly but succeeds. |
+| `work plan check` | Read-only lint of the run's `plan.index.json` (§2). Errors (exit 1): invalid/newer schema, structural problems (non-string/duplicate ids, missing description), unknown `deps` ids, dependency cycles, file overlap between dependency-independent tasks not declared in `shared_files`, missing/invalid `session_scope`, `multi` without `scope_rationale`. Warnings (exit 0): plan.md checkbox count drifting from the index task count, empty `verify_commands`, `goals` refs that don't parse from goals.md (`## G<n>:` headings; skipped when goals.md is absent), stale/malformed `shared_files` entries. Findings print to stdout so the report can be pasted into the plan-approval request. No run context or no `plan.index.json` prints a message and exits 0 (chat/review taskdefs have no index); writes nothing — no event, no push. |
 | `work name <kebab-case>` | Set the run's name (a label — the directory slug never changes). Normalizes to kebab-case (lowercase; spaces/underscores → `-`; strip other characters; collapse/trim `-`), printing the normalized form when it differs; errors if nothing survives. Names are **unique per project** — a name held by another run is rejected with an error citing the conflicting slug. Renaming is allowed anytime (same uniqueness check; appends another `run_named` event — history lives in the event log); re-setting the run's own current name is an idempotent no-op success. Bare `work name` prints the current name (or "No name set"), read-only, exit 0. |
 | `work artifact <name> --file <path>` | Copy the file into the run dir (secret-redacted), register it in `state.artifacts` (through the single writer, keyed by the artifact's filename stem), append `artifact_written`. `<name>` must be a plain filename (no path components, no leading dot). |
 | `work seed <taskdef> <target> [--goal …] [--name …]` | Out-of-session run creation: derives the slug from its args and creates a run for it through the same create-tmp → write-state → rename lifecycle, recording CLI-shaped events (`run_seeded`, then `goal_set` / `run_named` as given). Does **not** claim `owner` (seeding is not owning) and does **not** push — batch with `work commit`. An existing run for the slug (or a name conflict) is an error. |
@@ -397,8 +448,10 @@ enum, `updated` timestamps, `owner` claims. Actions:
 
 Recorded so the design can be worked into deliberately, not accidentally:
 
-- `plan.index.json` task DAG, wave-based execution, planner/decomposer agent
-  briefs.
+- Wave-based execution and planner/decomposer agent briefs on top of the
+  `plan.index.json` task DAG. The DAG itself — schema v1 plus the
+  `work plan check` lint — shipped with issue #90 (§2); dispatch,
+  worktrees, and runtime write-scope enforcement remain deferred.
 - Hard anti-fabrication for receipts (hash-chained events, signed receipts)
   and a guard-hook nudge enforcing the claim↔receipt match. The soft v1 —
   structured gate receipts, `work verify`, plan validation contracts —
