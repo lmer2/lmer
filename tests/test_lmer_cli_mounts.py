@@ -7,7 +7,9 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 import tempfile
 
+from lmer_cli.cli import parse_file_mount_specs
 from lmer_cli.mounts import (
+    FileMountSpec,
     selinux_opt,
     _is_selinux_enforcing,
     build_workspace_mount,
@@ -17,6 +19,7 @@ from lmer_cli.mounts import (
     build_host_uv_cache_mount,
     build_user_mounts,
     build_checkout_mount,
+    build_file_mounts,
     build_service_mode_mounts,
     resolve_host_uv_cache_dir,
     CONTAINER_UV_CACHE_DIR,
@@ -434,3 +437,143 @@ class TestBuildHostUvCacheMount:
             _is_selinux_enforcing.cache_clear()
             args = build_host_uv_cache_mount("podman", Path("/home/user/.cache/uv"))
         assert args[-1].endswith(":rw,z")
+
+
+class TestBuildFileMounts:
+    """Mount-arg construction for explicit per-file mounts (--mount-file)."""
+
+    def test_single_ro_mount_arg_shape(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args = build_file_mounts(
+                "docker",
+                [FileMountSpec(Path("/home/user/.kube/config"), "/home/developer/.kube/config", "ro")],
+            )
+        assert args == [
+            "-v",
+            "/home/user/.kube/config:/home/developer/.kube/config:ro",
+        ]
+
+    def test_rw_mode_preserved(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args = build_file_mounts(
+                "docker", [FileMountSpec(Path("/tmp/a"), "/etc/a", "rw")]
+            )
+        assert args[-1].endswith(":rw")
+
+    def test_selinux_suffix_when_enforcing(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=True):
+            _is_selinux_enforcing.cache_clear()
+            args = build_file_mounts(
+                "podman", [FileMountSpec(Path("/tmp/a"), "/etc/a", "ro")]
+            )
+        assert args[-1].endswith(":ro,z")
+
+    def test_multiple_specs_in_order(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args = build_file_mounts(
+                "docker",
+                [
+                    FileMountSpec(Path("/tmp/a"), "/etc/a", "ro"),
+                    FileMountSpec(Path("/tmp/b"), "/etc/b", "rw"),
+                ],
+            )
+        assert args == [
+            "-v", "/tmp/a:/etc/a:ro",
+            "-v", "/tmp/b:/etc/b:rw",
+        ]
+
+    def test_empty_specs_no_args(self):
+        assert build_file_mounts("docker", []) == []
+
+
+class TestParseFileMountSpecs:
+    """Validation and merge semantics for --mount-file / LMER_MOUNT_FILES."""
+
+    @pytest.fixture()
+    def host_file(self, tmp_path):
+        f = tmp_path / "kubeconfig"
+        f.write_text("apiVersion: v1")
+        return f
+
+    def test_valid_single_flag_defaults_ro(self, host_file):
+        specs = parse_file_mount_specs([f"{host_file}:/home/developer/.kube/config"], "")
+        assert specs == [
+            FileMountSpec(host_file, "/home/developer/.kube/config", "ro")
+        ]
+
+    def test_valid_multi_with_modes(self, host_file, tmp_path):
+        other = tmp_path / "token"
+        other.write_text("secret")
+        specs = parse_file_mount_specs(
+            [f"{host_file}:/etc/kube:ro", f"{other}:/etc/token:rw"], ""
+        )
+        assert [s.mode for s in specs] == ["ro", "rw"]
+        assert [s.container for s in specs] == ["/etc/kube", "/etc/token"]
+
+    def test_tilde_expansion(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        f = tmp_path / "cred"
+        f.write_text("x")
+        specs = parse_file_mount_specs(["~/cred:/etc/cred"], "")
+        assert specs[0].host == f
+
+    def test_env_var_expansion(self, host_file, monkeypatch):
+        monkeypatch.setenv("MY_KUBE", str(host_file))
+        specs = parse_file_mount_specs(["$MY_KUBE:/etc/kube"], "")
+        assert specs[0].host == host_file
+
+    def test_env_entries_come_before_flags(self, host_file, tmp_path):
+        other = tmp_path / "other"
+        other.write_text("x")
+        specs = parse_file_mount_specs(
+            [f"{other}:/etc/b"], f"{host_file}:/etc/a"
+        )
+        assert [s.container for s in specs] == ["/etc/a", "/etc/b"]
+
+    def test_env_value_splits_on_comma(self, host_file, tmp_path):
+        other = tmp_path / "other"
+        other.write_text("x")
+        specs = parse_file_mount_specs(
+            [], f"{host_file}:/etc/a, {other}:/etc/b:rw"
+        )
+        assert [s.container for s in specs] == ["/etc/a", "/etc/b"]
+        assert specs[1].mode == "rw"
+
+    def test_last_wins_dedup_with_warning(self, host_file, tmp_path):
+        other = tmp_path / "other"
+        other.write_text("x")
+        with patch("lmer_cli.cli.warning") as mock_warning:
+            specs = parse_file_mount_specs(
+                [f"{other}:/etc/same:rw"], f"{host_file}:/etc/same"
+            )
+        assert len(specs) == 1
+        assert specs[0].host == other
+        assert specs[0].mode == "rw"
+        mock_warning.assert_called_once()
+
+    def test_missing_host_file_fails_fast(self, tmp_path):
+        with pytest.raises(ValueError, match="not an existing file"):
+            parse_file_mount_specs([f"{tmp_path}/nope:/etc/nope"], "")
+
+    def test_host_directory_fails_fast(self, tmp_path):
+        with pytest.raises(ValueError, match="not an existing file"):
+            parse_file_mount_specs([f"{tmp_path}:/etc/dir"], "")
+
+    def test_relative_container_path_fails_fast(self, host_file):
+        with pytest.raises(ValueError, match="must be absolute"):
+            parse_file_mount_specs([f"{host_file}:relative/dest"], "")
+
+    def test_bad_mode_fails_fast(self, host_file):
+        with pytest.raises(ValueError, match="must be 'ro' or 'rw'"):
+            parse_file_mount_specs([f"{host_file}:/etc/kube:rwx"], "")
+
+    def test_malformed_entry_fails_fast(self, host_file):
+        with pytest.raises(ValueError, match="host:container"):
+            parse_file_mount_specs([str(host_file)], "")
+
+    def test_empty_inputs_yield_no_specs(self):
+        assert parse_file_mount_specs([], "") == []
+        assert parse_file_mount_specs([], " , ") == []
