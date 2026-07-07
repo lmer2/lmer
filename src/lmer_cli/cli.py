@@ -27,9 +27,11 @@ from . import resolve
 from .container_home import ensure_container_home
 from .log import error, info, success, warning
 from .mounts import (
+    FileMountSpec,
     build_checkout_mount,
     build_container_home_mounts,
     build_external_taskdef_mounts,
+    build_file_mounts,
     build_global_mount,
     build_host_repo_ro_mount,
     build_host_uv_cache_mount,
@@ -206,6 +208,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--match-uid", dest="match_uid", action="store_true", help="Run container as your host UID:GID (fixes SSH agent permissions)")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--show-env", dest="show_env", action="store_true", help="Display LMER environment variable configuration on startup")
+    parser.add_argument("--mount-file", dest="mount_file", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a single host file into the container at an explicit destination (repeatable). HOST supports ~ and $VAR expansion and must be an existing file; CONTAINER must be an absolute path; MODE is ro (default) or rw. Invalid entries abort the run. (env: LMER_MOUNT_FILES, comma-separated entries)")
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
 
     # Use parse_known_args so we can capture the command after --exec
@@ -472,6 +475,76 @@ def _resolve_taskdef_dir(task_id: str, taskdef_paths: list[Path]) -> Path | None
         if candidate.is_dir() and (candidate / "instructions.txt").exists():
             return candidate
     return None
+
+
+def parse_file_mount_specs(
+    flag_values: list[str], env_value: str
+) -> list[FileMountSpec]:
+    """Parse and validate --mount-file / LMER_MOUNT_FILES entries.
+
+    Each entry is ``host:container[:mode]``: ``host`` gets ``~`` and ``$VAR``
+    expansion and must resolve to an existing file; ``container`` must be an
+    absolute path; ``mode`` is ``ro`` (default) or ``rw``.
+
+    ``env_value`` is split on commas (the entry separator — ``:`` is taken by
+    the field grammar, cf. LMER_TASKDEF_PATHS choosing its own separator) and
+    its entries are ordered BEFORE the flags, so a persistent ``.env`` sets a
+    baseline an ad-hoc flag can override. When two entries target the same
+    container destination, last wins and a warning is emitted.
+
+    Fail-fast by design — deliberately stricter than the skip-and-warn mount
+    builders (external taskdefs, uv cache): these entries are credentials the
+    user explicitly asked for, and silently launching without a kubeconfig
+    would only surface as confusing downstream auth failures. Raises
+    ``ValueError`` naming the offending entry on any invalid input.
+    """
+    entries: list[tuple[str, str]] = []  # (source, raw entry)
+    for raw in env_value.split(","):
+        raw = raw.strip()
+        if raw:
+            entries.append(("LMER_MOUNT_FILES", raw))
+    for raw in flag_values:
+        raw = raw.strip()
+        if raw:
+            entries.append(("--mount-file", raw))
+
+    by_container: dict[str, FileMountSpec] = {}
+    for source, raw in entries:
+        parts = raw.split(":")
+        if len(parts) == 2:
+            host_raw, container = parts
+            mode = "ro"
+        elif len(parts) == 3:
+            host_raw, container, mode = parts
+        else:
+            raise ValueError(
+                f"{source} entry {raw!r} is not of the form host:container[:mode]"
+            )
+
+        host = Path(os.path.expandvars(host_raw)).expanduser()
+        if not host.is_file():
+            raise ValueError(
+                f"{source} entry {raw!r}: host path {str(host)!r} is not an "
+                f"existing file"
+            )
+        if not container.startswith("/"):
+            raise ValueError(
+                f"{source} entry {raw!r}: container path {container!r} must be "
+                f"absolute"
+            )
+        if mode not in ("ro", "rw"):
+            raise ValueError(
+                f"{source} entry {raw!r}: mode {mode!r} must be 'ro' or 'rw'"
+            )
+
+        if container in by_container:
+            warning(
+                f"⚠️  Duplicate mount destination {container} — "
+                f"{source} entry {raw!r} overrides the earlier one (last wins)"
+            )
+        by_container[container] = FileMountSpec(host=host, container=container, mode=mode)
+
+    return list(by_container.values())
 
 
 def _check_ssh_setup(container_home: Path, ssh_agent_enabled: bool) -> None:
@@ -982,6 +1055,20 @@ def main(argv: list[str] | None = None) -> int:
 
     # Check SSH setup and warn if not configured
     _check_ssh_setup(container_home, ssh_agent_enabled)
+
+    # Explicit per-file mounts: --mount-file flags + LMER_MOUNT_FILES env.
+    # Invalid entries abort the run (fail-fast; see parse_file_mount_specs).
+    try:
+        file_mount_specs = parse_file_mount_specs(
+            ns.mount_file or [], os.environ.get("LMER_MOUNT_FILES", "")
+        )
+    except ValueError as exc:
+        error(f"❌ Invalid file mount: {exc}")
+        return 1
+    if file_mount_specs:
+        run += build_file_mounts(runtime, file_mount_specs)
+        for spec in file_mount_specs:
+            success(f"✅ Mounting file: {spec.host} → {spec.container} ({spec.mode})")
 
     # Optional: mount the host's uv cache so target-repo `uv sync` reuses
     # already-downloaded packages instead of re-fetching them each session.
