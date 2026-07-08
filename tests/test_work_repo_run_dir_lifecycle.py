@@ -193,7 +193,7 @@ class TestPlanningPhaseClassifier:
          # shipped-taskdef pre-execution phases: these precede naming, and a
          # premature freeze on an unnamed run forfeits the rename forever
          # (develop records branch-setup/issue-analysis/interview, review
-         # records retrieve, before the name proposal).
+         # records retrieve, before the run is named).
          "branch-setup", "issue-analysis", "interview", "setup",
          "retrieve"],
     )

@@ -360,8 +360,8 @@ Names are **unique per project**: a name already held by another run — via
 its `name:` or its directory slug — is rejected with the conflicting slug
 named. Renaming is free (each rename appends a `run_named` event);
 re-setting the run's own current name is a no-op. Set the name early, once
-direction is clear — an unanswered name proposal may default to accepted,
-unlike task questions.
+direction is clear — pick it yourself and record it without asking the
+user to confirm (renaming later is cheap).
 
 ### Record an event
 

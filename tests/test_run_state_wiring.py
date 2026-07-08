@@ -92,6 +92,22 @@ class TestRunStateFragment:
         assert "work state set" in out             # contract still taught
         assert "read this first" not in out.lower()  # no brief block rendered
 
+    def test_run_naming_needs_no_confirmation(self):
+        """Issue #94: the agent names the run itself — the fragment must
+        teach `work name` directly, never routed through AskUserQuestion
+        (the old propose-and-default-accept flow must not return)."""
+        out = self._render(None, {
+            "LMER_REPO_HOST": "h", "LMER_REPO_PROJECT": "p",
+        })
+        assert "work name" in out
+        assert "DEFAULTS TO ACCEPTED" not in out
+        name_bullet = re.search(r"- \*\*Name the run.*?(?=\n- |\Z)", out, re.DOTALL)
+        assert name_bullet, "the Name-the-run ground rule went missing"
+        # The task-direction rule legitimately keeps AskUserQuestion; the
+        # naming bullet must not ask anything.
+        assert "AskUserQuestion" not in name_bullet.group(0)
+        assert "confirm" in name_bullet.group(0).lower()
+
 
 class TestChatInclude:
     def test_chat_includes_fragment(self):

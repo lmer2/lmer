@@ -33,16 +33,15 @@ Ground rules — these come before any work:
   - **Post-plan / resume context** (direction already recorded, picking up
     where a previous session left off): you may proceed on your best
     judgment after the timeout.
-  - **Exception:** the run-name proposal below default-accepts on timeout.
 - **Once direction is clear, record it before starting:**
   `work goal "<one-line statement of the task>"`. A run with work happening
   and no goal recorded is a contract violation, not a shortcut.
-- **Name the run once direction is clear:** propose a short, memorable
-  kebab-case name derived from the task via AskUserQuestion, then record it
-  with `work name <proposed-name>`. Unlike the task-definition question, an
-  unanswered name proposal DEFAULTS TO ACCEPTED — record the proposal and
-  continue (a name can safely default; auto-slugs are unfindable later).
-  Skip this if the resume brief already shows a name.
+- **Name the run once direction is clear:** derive a short, memorable
+  kebab-case name from the task and record it with `work name <name>`.
+  Do NOT ask the user to confirm the name — pick it yourself and move
+  on (the user can rename at any time with `work name <new-name>`;
+  auto-slugs are unfindable later). Skip this if the resume brief
+  already shows a name.
 - **HARD RULE — commit before every stop that awaits the human.** Every
   stop that awaits the human — a blocking question, a phasic yield, an
   approval gate — must be preceded by `work commit`: unpushed artifacts
