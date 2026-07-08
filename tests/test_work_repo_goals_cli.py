@@ -180,7 +180,7 @@ class TestGoalsFreeze:
 
     def test_unnamed_run_leaves_the_seam_to_the_phase_gate(self, run_env, capsys):
         # The frozen stamp would forfeit the one-shot name-bearing rename
-        # forever, and spec approval can precede the name proposal.
+        # forever, and spec approval can precede the run being named.
         _write_goals(run_env)
         assert _main(["goals", "freeze"]) == 0
         assert "left to the phase gate" in capsys.readouterr().out

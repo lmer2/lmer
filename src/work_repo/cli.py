@@ -1208,7 +1208,7 @@ def _cmd_goals_freeze(note: str | None) -> int:
     rename) when the run is named and not already frozen: both mark the
     same gate. An UNNAMED run's seam is left to the phase gate instead —
     the frozen stamp would forfeit the single rename forever, and spec
-    approval can precede the name proposal. Re-freezing is an error —
+    approval can precede the run being named. Re-freezing is an error —
     post-freeze changes go through amend.
     """
     rdir, state = _require_run()
@@ -1232,7 +1232,7 @@ def _cmd_goals_freeze(note: str | None) -> int:
     old_dir_name = None
     if not state.get("frozen"):
         if not state.get("name"):
-            # Spec approval usually precedes the run-name proposal, and the
+            # A run can still be unnamed at spec approval, and the
             # frozen stamp would forfeit the one-shot name-bearing rename
             # forever ("no second chance") — leave the seam to the phase
             # gate, which fires at the first execution-family transition.

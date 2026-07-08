@@ -380,7 +380,7 @@ the last agreed set is always recoverable from `events.jsonl` alone:
   name-bearing dir rename) when the run is *named* and not already frozen
   — both mark the same gate. An unnamed run's seam is left to the phase
   gate: the `frozen` stamp would forfeit the single rename, and spec
-  approval can precede the name proposal.
+  approval can precede the run being named.
 - `goal_amended` — every post-freeze change, with the old/new hash and a
   per-goal diff (`added`/`modified`/`tombstoned`/`untombstoned`). A
   goals.md edit *without* an amend is silent divergence, and assess
