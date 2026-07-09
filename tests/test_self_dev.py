@@ -7,6 +7,20 @@ import pytest
 
 from hooks.start import read_and_display_instructions
 from lmer_cli.runtime import _is_lmer_pyproject
+from tests.conftest import strip_lmer_env
+
+
+@pytest.fixture(autouse=True)
+def _clean_lmer_env(monkeypatch):
+    """Strip LMER_* env vars so each test starts from a clean slate.
+
+    The TestSelfDevJinja2 tests reach read_and_display_instructions(),
+    whose run_state_session_start() shells out to the real
+    `work session-start`. Run fully ambient, that hit the live session's
+    own run dir in the operational work repo (issue #93); with no
+    LMER_REPO_HOST/LMER_REPO_PROJECT it no-ops and writes nothing.
+    """
+    strip_lmer_env(monkeypatch)
 
 
 class TestSelfDevJinja2:

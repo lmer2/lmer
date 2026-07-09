@@ -1,6 +1,5 @@
 """Test start hook functionality with Jinja2 rendering."""
 import io
-import os
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -15,6 +14,20 @@ from hooks.start import (
     _redact_url_credentials,
     _target_provider_flags,
 )
+from tests.conftest import strip_lmer_env
+
+
+@pytest.fixture(autouse=True)
+def _clean_lmer_env(monkeypatch):
+    """Strip LMER_* env vars so each test starts from a clean slate.
+
+    Tests here reach read_and_display_instructions(), whose
+    run_state_session_start() shells out to the real `work session-start`.
+    Without this isolation the subprocess inherits the running session's
+    env and seeds/claims runs in the operational work repo (issue #93);
+    with no LMER_REPO_HOST/LMER_REPO_PROJECT it no-ops and writes nothing.
+    """
+    strip_lmer_env(monkeypatch)
 
 
 class TestStartHook:

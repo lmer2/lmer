@@ -1,6 +1,5 @@
 """Test followup hook functionality."""
 import io
-import os
 from contextlib import redirect_stdout
 
 import pytest
@@ -10,14 +9,13 @@ from hooks.followup import (
     main,
     read_and_display_followup,
 )
+from tests.conftest import strip_lmer_env
 
 
 @pytest.fixture(autouse=True)
 def _clean_lmer_env(monkeypatch):
     """Strip LMER_* env vars so tests start from a clean slate."""
-    for key in list(os.environ):
-        if key.startswith("LMER_"):
-            monkeypatch.delenv(key, raising=False)
+    strip_lmer_env(monkeypatch)
 
 
 class TestFollowupHook:
