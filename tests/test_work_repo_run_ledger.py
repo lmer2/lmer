@@ -1,20 +1,18 @@
 """Tests for the per-task execution ledger (issue #89): kernel functions in
 run_state.py, the `work ledger` CLI verbs, and the resume-brief line."""
 import json
-import os
 from unittest.mock import patch
 
 import pytest
 
 from work_repo import cli as work_cli
 from work_repo import run_state
+from tests.conftest import strip_lmer_env
 
 
 @pytest.fixture(autouse=True)
 def _clean_lmer_env(monkeypatch):
-    for key in list(os.environ):
-        if key.startswith("LMER_"):
-            monkeypatch.delenv(key, raising=False)
+    strip_lmer_env(monkeypatch)
 
 
 @pytest.fixture

@@ -3,7 +3,6 @@
 Covers project-scoped, work-globally-scoped, precedence ordering, and
 graceful handling of missing env vars / paths.
 """
-import os
 from pathlib import Path
 
 import pytest
@@ -15,14 +14,13 @@ from hooks.start import (
     work_repo_taskdef_dirs,
 )
 from lmer_cli import cli as lmer_cli
+from tests.conftest import strip_lmer_env
 
 
 @pytest.fixture(autouse=True)
 def _clean_lmer_env(monkeypatch):
     """Strip LMER_* env vars so each test starts from a clean slate."""
-    for key in list(os.environ):
-        if key.startswith("LMER_"):
-            monkeypatch.delenv(key, raising=False)
+    strip_lmer_env(monkeypatch)
 
 
 def _make_taskdef(parent: Path, task_name: str, marker: str) -> Path:
