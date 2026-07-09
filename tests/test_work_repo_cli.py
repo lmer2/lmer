@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock
 from io import StringIO
 import sys
 
-from work_repo.cli import cmd_log, create_parser
+from work_repo.cli import cmd_log, cmd_commit, create_parser
 
 
 class TestCmdLog:
@@ -294,3 +294,39 @@ class TestCreateParser:
         args = parser.parse_args(["log"])
         assert args.command == "log"
         assert args.message is None
+
+
+class TestCmdCommit:
+    """cmd_commit wiring for issue #85: it must run the stray-file reminder
+    after committing, and never let the reminder alter the commit's exit code."""
+
+    def test_reports_untracked_after_commit_and_passes_rc_through(self):
+        """Commit runs first, then the reminder; the commit's rc is returned."""
+        order = []
+        with patch("work_repo.cli._sync_masterplan_links", return_value=[]), \
+             patch(
+                 "work_repo.cli.commit_work_changes",
+                 side_effect=lambda m: order.append("commit") or 0,
+             ) as mock_commit, \
+             patch(
+                 "work_repo.cli.report_uncommitted_work_items",
+                 side_effect=lambda: order.append("report") or 3,
+             ) as mock_report:
+            rc = cmd_commit("my message")
+
+        assert rc == 0
+        mock_commit.assert_called_once_with("my message")
+        mock_report.assert_called_once_with()
+        # The reminder must fire AFTER the commit (so a just-committed run dir
+        # is already clean and only genuine leftovers are flagged).
+        assert order == ["commit", "report"]
+
+    def test_reminder_findings_do_not_override_failed_commit_rc(self):
+        """A non-zero commit rc stands even when the reminder finds items."""
+        with patch("work_repo.cli._sync_masterplan_links", return_value=[]), \
+             patch("work_repo.cli.commit_work_changes", return_value=1), \
+             patch(
+                 "work_repo.cli.report_uncommitted_work_items", return_value=5
+             ) as mock_report:
+            assert cmd_commit(None) == 1
+        mock_report.assert_called_once_with()

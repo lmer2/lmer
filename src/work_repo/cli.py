@@ -16,7 +16,11 @@ import yaml
 
 from .loggers import get_logger
 from .info_reader import read_project_info
-from .git_ops import commit_work_changes, commit_work_path
+from .git_ops import (
+    commit_work_changes,
+    commit_work_path,
+    report_uncommitted_work_items,
+)
 from . import goals, plan_index, run_state
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
@@ -488,7 +492,12 @@ def cmd_commit(message: str | None) -> int:
     # every push carries the run-dir-root links. Fail-soft: never changes
     # the commit's behavior or exit code.
     _sync_masterplan_links()
-    return commit_work_changes(message)
+    rc = commit_work_changes(message)
+    # Flag any stray untracked/unstaged files left behind — `work commit`
+    # stages only the run dir, so a new info file elsewhere would otherwise
+    # go unnoticed (issue #85). Fail-soft: the commit's exit code stands.
+    report_uncommitted_work_items()
+    return rc
 
 
 def cmd_report(file_path: str) -> int:

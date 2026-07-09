@@ -8,7 +8,13 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from work_repo.git_ops import run_git_command, commit_work_changes, commit_work_path
+from work_repo.git_ops import (
+    run_git_command,
+    commit_work_changes,
+    commit_work_path,
+    report_uncommitted_work_items,
+    UNTRACKED_REPORT_CAP,
+)
 
 
 class TestRunGitCommand:
@@ -380,3 +386,134 @@ class TestCommitWorkPathResilience:
                     "git.example.com/grp/proj/develop/issue-9",
                     "git.example.com/grp/proj/runs/develop-issue-9",
                 ]]
+
+
+class TestReportUncommittedWorkItems:
+    """report_uncommitted_work_items: the issue #85 stray-file reminder.
+
+    `work commit` stages only the run dir, so a file added elsewhere in the
+    work repo is left behind. This repo-wide, fail-soft reminder flags it.
+    """
+
+    @staticmethod
+    def _init_repo(path):
+        subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=path, check=True, capture_output=True)
+
+    @staticmethod
+    def _commit_all(path, message="init"):
+        subprocess.run(["git", "add", "-A"], cwd=path, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", message], cwd=path, check=True, capture_output=True)
+
+    def test_clean_tree_reports_nothing(self, tmp_path, capsys):
+        """A clean work repo prints nothing and returns 0 (no noise)."""
+        self._init_repo(tmp_path)
+        (tmp_path / "README.md").write_text("x\n")
+        self._commit_all(tmp_path)
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            assert report_uncommitted_work_items() == 0
+        assert capsys.readouterr().out == ""
+
+    def test_missing_repo_is_silent_zero(self, tmp_path, capsys):
+        """No work repo on disk → silent 0 (fail-soft)."""
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path / "nope")}):
+            assert report_uncommitted_work_items() == 0
+        assert capsys.readouterr().out == ""
+
+    def test_untracked_and_modified_are_listed(self, tmp_path, capsys):
+        """Both a new untracked file and a modified tracked file are flagged."""
+        self._init_repo(tmp_path)
+        info = tmp_path / "git.example.com" / "grp" / "proj" / "info"
+        info.mkdir(parents=True)
+        tracked = info / "existing.md"
+        tracked.write_text("v1\n")
+        self._commit_all(tmp_path)
+
+        # A stray new info file + an edit to a tracked one — both left behind
+        # by a run-dir-scoped `work commit`.
+        (info / "new.md").write_text("new\n")
+        tracked.write_text("v2\n")
+
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            assert report_uncommitted_work_items() == 2
+        out = capsys.readouterr().out
+        assert "2 uncommitted item(s)" in out
+        assert "not staged by `work commit`" in out
+        assert "info/new.md" in out
+        assert "info/existing.md" in out
+
+    def test_list_is_capped_with_overflow_note(self, tmp_path, capsys):
+        """More than the cap of stray items → cap lines + a '... and N more'."""
+        self._init_repo(tmp_path)
+        overflow = 3
+        total = UNTRACKED_REPORT_CAP + overflow
+        for i in range(total):
+            (tmp_path / f"stray_{i:02d}.txt").write_text("x\n")
+
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            assert report_uncommitted_work_items() == total
+        out = capsys.readouterr().out
+        assert f"{total} uncommitted item(s)" in out
+        assert f"... and {overflow} more" in out
+        # Exactly the cap number of untracked-entry lines are printed.
+        item_lines = [ln for ln in out.splitlines() if ln.strip().startswith("??")]
+        assert len(item_lines) == UNTRACKED_REPORT_CAP
+
+    def test_git_error_is_silent_zero(self, tmp_path, capsys):
+        """A dir that is not a git repo → git status fails → silent 0."""
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            assert report_uncommitted_work_items() == 0
+        assert capsys.readouterr().out == ""
+
+    def test_exception_is_swallowed(self, tmp_path):
+        """Any unexpected error is swallowed to 0 — a reminder is never a gate."""
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            with patch(
+                "work_repo.git_ops.run_git_command",
+                side_effect=RuntimeError("boom"),
+            ):
+                assert report_uncommitted_work_items() == 0
+
+    def test_new_untracked_subtree_lists_files_individually(self, tmp_path, capsys):
+        """A brand-new untracked directory is enumerated per file, not collapsed
+        into one entry — the literal issue #85 shape (a new, untracked info dir).
+
+        Plain `git status --porcelain` would emit a single `?? .../info/` line
+        and undercount; `--untracked-files=all` names each file.
+        """
+        self._init_repo(tmp_path)
+        (tmp_path / "README.md").write_text("x\n")
+        self._commit_all(tmp_path)
+        # An entirely-untracked new directory holding two files.
+        info = tmp_path / "git.example.com" / "grp" / "proj" / "info"
+        info.mkdir(parents=True)
+        (info / "new.md").write_text("a\n")
+        (info / "another.md").write_text("b\n")
+
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            assert report_uncommitted_work_items() == 2
+        out = capsys.readouterr().out
+        assert "2 uncommitted item(s)" in out
+        assert "info/new.md" in out
+        assert "info/another.md" in out
+        # The directory must NOT appear as a single collapsed entry.
+        assert not any(
+            ln.strip() == "?? git.example.com/grp/proj/info/"
+            for ln in out.splitlines()
+        )
+
+    def test_exact_cap_has_no_overflow_note(self, tmp_path, capsys):
+        """Exactly UNTRACKED_REPORT_CAP items → all listed, no '... and N more'
+        (the off-by-one boundary of the `remaining > 0` guard)."""
+        self._init_repo(tmp_path)
+        for i in range(UNTRACKED_REPORT_CAP):
+            (tmp_path / f"stray_{i:02d}.txt").write_text("x\n")
+
+        with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": str(tmp_path)}):
+            assert report_uncommitted_work_items() == UNTRACKED_REPORT_CAP
+        out = capsys.readouterr().out
+        assert f"{UNTRACKED_REPORT_CAP} uncommitted item(s)" in out
+        assert "more" not in out  # no overflow tail exactly at the cap
+        item_lines = [ln for ln in out.splitlines() if ln.strip().startswith("??")]
+        assert len(item_lines) == UNTRACKED_REPORT_CAP
