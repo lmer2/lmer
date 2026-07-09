@@ -94,6 +94,16 @@ work commit --message "Updated project logs"
 
 This performs: `git fetch → git pull → git add → git commit → git push` in the work repository (not the project repository being worked on).
 
+Only the current run dir (and the legacy task-target dir) are staged, so a file
+added elsewhere in the work repo is left untouched. After committing, `work
+commit` therefore prints a **reminder** listing any untracked or unstaged items
+that remain anywhere in the work repo — a repo-wide `git status --porcelain`,
+capped with a `... and N more` tail — so a stray file (for example a new
+`{host}/{project}/info/*.md`) is not silently left uncommitted. The reminder is
+advisory only: it never changes the commit's exit code, and prints nothing when
+the tree is clean. Add and commit any flagged items manually if they should be
+kept.
+
 **Examples:**
 ```bash
 # Commit with auto-generated message

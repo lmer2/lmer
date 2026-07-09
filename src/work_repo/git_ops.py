@@ -41,6 +41,11 @@ def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int,
 
 PUSH_RETRIES = 3
 
+# Cap on how many stray entries ``report_uncommitted_work_items`` lists before
+# collapsing the rest into a "... and N more" line, so a large dirty tree can
+# never flood ``work commit``'s output.
+UNTRACKED_REPORT_CAP = 10
+
 
 def _has_tracked_files(work_repo_path: Path, rel_path: str) -> bool:
     """True when git tracks anything under rel_path — even if it is gone
@@ -186,3 +191,58 @@ def commit_work_changes(commit_message: Optional[str] = None) -> int:
             paths.append(rel)
 
     return commit_work_path(paths, commit_message)
+
+
+def report_uncommitted_work_items() -> int:
+    """Flag items left uncommitted in the work repo after a ``work commit``.
+
+    ``work commit`` stages only the run dir and legacy task-target dir (see
+    :func:`commit_work_changes`), so a file added elsewhere — e.g. a new
+    ``{host}/{project}/info/*.md`` — is silently left behind (issue #85). This
+    runs a repo-wide ``git status --porcelain --untracked-files=all`` and prints
+    one ⚠️ block naming the untracked/unstaged entries so the user notices them.
+    ``--untracked-files=all`` lists files individually rather than collapsing a
+    brand-new directory into a single entry, so the count is per-file and every
+    stray file is named. The list is capped at :data:`UNTRACKED_REPORT_CAP`
+    entries with a "... and N more" tail so a large dirty tree cannot flood the
+    output. Nothing is printed when the tree is clean.
+
+    Fail-soft by contract: this is a reminder, never a gate. It never raises
+    and returns 0 on any error (or when the work repo is absent), so a caller
+    can invoke it after a commit without risk to that commit's exit code.
+
+    Returns:
+        The number of uncommitted entries found (0 when clean or on error).
+    """
+    try:
+        work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
+        if not work_repo_path.exists():
+            return 0
+        rc, output = run_git_command(
+            ["status", "--porcelain", "--untracked-files=all"],
+            work_repo_path,
+            check=False,
+        )
+        if rc != 0:
+            return 0
+        entries = [line for line in output.splitlines() if line.strip()]
+        if not entries:
+            return 0
+
+        print(
+            f"⚠️  {len(entries)} uncommitted item(s) remain in the work repo "
+            "(not staged by `work commit`):"
+        )
+        for line in entries[:UNTRACKED_REPORT_CAP]:
+            print(f"   {line}")
+        remaining = len(entries) - UNTRACKED_REPORT_CAP
+        if remaining > 0:
+            print(f"   ... and {remaining} more")
+        print(
+            "   These fell outside the paths `work commit` stages — add & "
+            "commit them manually if they should be kept."
+        )
+        return len(entries)
+    except Exception:
+        # Reminder only: a status hiccup must never affect the commit result.
+        return 0
