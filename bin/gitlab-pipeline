@@ -49,7 +49,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("project", help="Project path (e.g., agents/global)")
+    parser.add_argument("project", help="Project path (e.g., group/project)")
     parser.add_argument("id", type=int, help="Pipeline ID, MR ID, or Job ID")
     parser.add_argument("--mr", action="store_true", help="ID is a merge request ID")
     parser.add_argument("--watch", "-w", action="store_true", help="Watch until complete")

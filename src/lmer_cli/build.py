@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .log import error, success
@@ -72,8 +73,6 @@ def checkout_commit(repo_root: Path | None) -> str | None:
 
 def _build_provenance(repo_root: Path) -> str:
     """Human-readable provenance string baked into the image (BUILD_INFO)."""
-    from datetime import datetime, timezone
-
     commit = checkout_commit(repo_root) or "unknown"
     branch = "unknown"
     try:

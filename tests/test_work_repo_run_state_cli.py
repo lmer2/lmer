@@ -541,6 +541,24 @@ class TestSessionStart:
         assert "complete" in capsys.readouterr().out
         assert run_state.load_state(run_env)["status"] == "complete"
 
+    def test_newer_schema_refusal_is_not_reseeded_over(self, run_env, capsys):
+        # The read-only refusal leaves the file intact — session-start must
+        # NOT mistake it for the backed-up-corrupt case and write a schema-1
+        # seed over a newer build's run (mixed-build fleets share work repos).
+        state = run_state.seed_state("develop-issue-123", "develop", "t")
+        state["schema"] = run_state.SCHEMA_VERSION + 1
+        state["name"] = "kept-by-refusal"
+        run_state.write_state(run_env, state)
+        assert _main(["session-start"]) == 0  # still fail-soft for the hook
+        out = capsys.readouterr().out
+        assert "read-only refusal" in out
+        assert "recovered" not in out.lower()  # nothing was backed up
+        on_disk = yaml.safe_load((run_env / "state.yaml").read_text())
+        assert on_disk["schema"] == run_state.SCHEMA_VERSION + 1
+        assert on_disk["name"] == "kept-by-refusal"
+        assert on_disk.get("owner") is None  # not claimed either
+        assert not (run_env / "events.jsonl").exists()  # no session_start event
+
 
 class TestSessionEnd:
     def test_no_context_soft_exit(self):

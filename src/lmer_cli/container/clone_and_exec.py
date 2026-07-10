@@ -16,11 +16,14 @@ must not import from lmer_cli or work_repo modules.
 from __future__ import annotations
 
 import os
+import random
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -603,7 +606,6 @@ def _forward_signals(proc: subprocess.Popen) -> None:
     directly; now that it is a child (see dispatch_runner), relay them so
     `docker stop` still reaches the supervisor/claude tree.
     """
-    import signal
 
     def _relay(signum, _frame):
         try:
@@ -636,9 +638,28 @@ def run_state_session_end() -> None:
         print(f"⚠️  run-state session-end failed (continuing): {e}", file=sys.stderr)
 
 
+def mint_session_id() -> None:
+    """Ensure LMER_SESSION_ID exists BEFORE the runner spawns.
+
+    The id used to be minted only inside claude-runner.sh — a child — so it
+    never reached this process, and the session-end backstop above ran as
+    session "unknown": cmd_session_end clears `owner` only when the claim
+    matches the current session, so the claim this backstop exists to
+    release was left behind. Minting here (runner.sh's `${LMER_SESSION_ID:-…}`
+    preserves an inherited value) gives runner, hooks, and backstop one id.
+    A host-injected id is preserved the same way (setdefault).
+    """
+    os.environ.setdefault(
+        "LMER_SESSION_ID",
+        f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        f"-{os.getpid()}-{random.randint(0, 32767)}",
+    )
+
+
 def dispatch_runner(runner: str) -> int:
     """Run claude-runner as a child (not execv) so post-session teardown can
     run while the container is still alive. Returns the runner's exit code."""
+    mint_session_id()
     proc = subprocess.Popen([runner])
     _forward_signals(proc)
     rc = proc.wait()
