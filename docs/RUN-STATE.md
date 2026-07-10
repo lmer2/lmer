@@ -41,8 +41,10 @@ Layout, per project (`{host}/{project}/` already namespaces by project):
 └── retro.md       # Layer 2: close-out summary
 ```
 
-Archived runs move to `{host}/{project}/archive/<slug>/` (see §6, the
-external cleaner contract).
+Archived runs move to `{host}/{project}/runs/archive/<slug>/` (see §6, the
+external cleaner contract) — the archive subtree lives INSIDE `runs/`,
+sharing its namespace: the resolver skips it and `archive` is a reserved
+run name.
 
 ### Run-dir lifecycle
 
@@ -71,7 +73,7 @@ The `work` CLI owns the directory's whole lifecycle (issue #87):
   by scanning `runs/*/state.yaml` for a matching `slug:` (then `name:`) —
   cheap at current scale, and name uniqueness is already enforced. Resume
   stays deterministic: the same taskdef + target derives the same slug and
-  finds the run regardless of any rename. Dot-dirs and `archive/` are
+  finds the run regardless of any rename. Dot-dirs and `runs/archive/` are
   never matched.
 - **Legacy layout fallback.** `work log` / `work report` used to write to
   `{host}/{project}/{task_type}/{target}/`; those dirs get read-side
@@ -418,7 +420,7 @@ slug (no aliasing between the two forms).
 `status: complete`, the session does not re-seed — the resume brief reports
 the completed run, and the session reopens it (`work state set
 --status=in-progress`) only if new work on that target is actually
-requested. Runs the external cleaner has moved to `archive/` no longer
+requested. Runs the external cleaner has moved to `runs/archive/` no longer
 occupy the slug, so a genuinely new engagement seeds a fresh run.
 
 ## 4. CLI verbs
@@ -507,9 +509,11 @@ The cleaner is an external process (cron or host command, user-owned).
 Contract it can rely on: single-writer state, append-only events, `status`
 enum, `updated` timestamps, `owner` claims. Actions:
 
-- Move `runs/<slug>/` (or `runs/<slug>--<name>/`) → `archive/<slug>/` (or
-  set `status: archived`) for runs that are `complete` or stale past a
-  threshold.
+- Move `runs/<slug>/` (or `runs/<slug>--<name>/`) → `runs/archive/<slug>/`
+  (or set `status: archived`) for runs that are `complete` or stale past a
+  threshold. The archive subtree stays inside `runs/` — that is the tree
+  the resolver's skip logic and the `work name` reservation guard — never
+  a `runs/` sibling.
 - Sweep `runs/.new-*` orphans: a crash between run-dir create and rename
   leaves one behind; any `.new-*` dir stale past an mtime threshold is
   safe to delete (the resolver never matches dot-dirs).

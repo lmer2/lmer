@@ -9,6 +9,13 @@ from typing import Optional
 from .run_state import run_rel_path_candidates
 from .utils import sanitize_task_target
 
+PUSH_RETRIES = 3
+
+# Cap on how many stray entries ``report_uncommitted_work_items`` lists before
+# collapsing the rest into a "... and N more" line, so a large dirty tree can
+# never flood ``work commit``'s output.
+UNTRACKED_REPORT_CAP = 10
+
 
 def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int, str]:
     """
@@ -37,14 +44,6 @@ def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int,
         return result.returncode, (result.stdout + result.stderr).strip()
     except subprocess.CalledProcessError as e:
         return e.returncode, ((e.stdout or "") + (e.stderr or "")).strip()
-
-
-PUSH_RETRIES = 3
-
-# Cap on how many stray entries ``report_uncommitted_work_items`` lists before
-# collapsing the rest into a "... and N more" line, so a large dirty tree can
-# never flood ``work commit``'s output.
-UNTRACKED_REPORT_CAP = 10
 
 
 def _has_tracked_files(work_repo_path: Path, rel_path: str) -> bool:

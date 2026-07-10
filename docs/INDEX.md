@@ -85,8 +85,8 @@ How lmer provides default AGENTS.md and rules/ files when the target repository 
 ### [RUN-STATE.md](./RUN-STATE.md)
 **Run D.M.C. — Durable Run State**
 
-Durable per-run state in the work repo — `state.yml`/`events.jsonl`, resume briefs, `work` CLI verbs, cleaner contract:
-- The `runs/<slug>/` layout and the `state.yml` schema
+Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume briefs, `work` CLI verbs, cleaner contract:
+- The `runs/<slug>/` layout and the `state.yaml` schema
 - Deterministic slug derivation and the completed-run policy
 - `work` CLI verbs (`state`, `state set`, `event`, `resume`, `artifact`, `session-start`, `session-end`)
 - Session lifecycle (seeding, owner claims, `LMER_SESSION_ID`) and fail-soft guarantees

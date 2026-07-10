@@ -21,6 +21,49 @@ class TestSessionIdMinting:
         assert 'LMER_SESSION_ID:-' in runner, \
             "a host-injected LMER_SESSION_ID must be preserved"
 
+    def test_dispatch_runner_mints_id_shared_with_backstop(self, monkeypatch):
+        # The id must exist BEFORE the runner spawns (the child inherits it;
+        # runner.sh preserves it) and still be the same when the session-end
+        # backstop runs in THIS process — otherwise the backstop releases
+        # the owner claim as session "unknown", i.e. never.
+        import os
+        from lmer_cli.container import clone_and_exec
+
+        monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+        seen = {}
+
+        class FakeProc:
+            def wait(self):
+                return 0
+
+        def fake_popen(cmd):
+            seen["at_spawn"] = os.environ.get("LMER_SESSION_ID")
+            return FakeProc()
+
+        monkeypatch.setattr(clone_and_exec.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(clone_and_exec, "_forward_signals", lambda proc: None)
+        monkeypatch.setattr(
+            clone_and_exec, "run_state_session_end",
+            lambda: seen.setdefault("at_backstop", os.environ.get("LMER_SESSION_ID")),
+        )
+        clone_and_exec.dispatch_runner("/bin/runner")
+        assert seen["at_spawn"], "id must be minted before the runner spawns"
+        assert seen["at_backstop"] == seen["at_spawn"]
+
+    def test_dispatch_runner_preserves_host_injected_id(self, monkeypatch):
+        import os
+        from lmer_cli.container import clone_and_exec
+
+        monkeypatch.setenv("LMER_SESSION_ID", "host-injected-id")
+        monkeypatch.setattr(
+            clone_and_exec.subprocess, "Popen",
+            lambda cmd: type("P", (), {"wait": lambda self: 0})(),
+        )
+        monkeypatch.setattr(clone_and_exec, "_forward_signals", lambda proc: None)
+        monkeypatch.setattr(clone_and_exec, "run_state_session_end", lambda: None)
+        clone_and_exec.dispatch_runner("/bin/runner")
+        assert os.environ["LMER_SESSION_ID"] == "host-injected-id"
+
 
 class TestSessionEndHook:
     def test_settings_has_session_end_hook(self):

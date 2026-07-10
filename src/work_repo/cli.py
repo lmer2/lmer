@@ -1628,7 +1628,14 @@ def cmd_session_start() -> int:
         recovered = False
         try:
             state = run_state.load_state(rdir)
-        except run_state.RunStateError:
+        except run_state.RunStateError as exc:
+            if run_state._state_path(rdir) is not None:
+                # Newer-schema read-only refusal: the file is intact and must
+                # NOT be reseeded over (same distinction ensure_run makes) —
+                # a schema-1 seed here would silently downgrade a newer
+                # build's run. Fail soft like cmd_session_end.
+                print(f"⚠️  run-state untouched at session start: {exc}")
+                return 0
             # Corrupt file was backed up by load_state; recover with a fresh seed.
             state = None
             recovered = True
