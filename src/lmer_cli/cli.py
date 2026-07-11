@@ -204,7 +204,10 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--checkout", dest="checkout", help="Path to existing local source checkout (mounted as /workspace)")
     parser.add_argument("--user", dest="user", help="Container user (e.g., developer or 0:0)")
     parser.add_argument("--match-uid", dest="match_uid", action="store_true", help="Run container as your host UID:GID (fixes SSH agent permissions)")
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable verbose logging (same as LMER_VERBOSE=1).")
+    parser.add_argument("--debug", action="store_true",
+                        help="Alias for --verbose (sets LMER_VERBOSE=1).")
     parser.add_argument("--show-env", dest="show_env", action="store_true", help="Display LMER environment variable configuration on startup")
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
 
@@ -725,7 +728,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ns, rest = parse_args(argv)
 
-    if ns.verbose:
+    if ns.verbose or ns.debug:
         os.environ["LMER_VERBOSE"] = "1"
 
     # Validate mutually exclusive options
@@ -1314,6 +1317,12 @@ def main(argv: list[str] | None = None) -> int:
             ]
 
     info("Running: " + shlex.join(run))
+    success(f"🚀 Launching container ({runtime} run {image})")
+    if runtime == "podman":
+        success(
+            "   (first run with this image may take several minutes "
+            "while podman remaps UIDs for --userns=keep-id)"
+        )
     try:
         return subprocess.call(run)
     except KeyboardInterrupt:
