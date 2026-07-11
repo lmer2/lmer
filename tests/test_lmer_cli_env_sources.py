@@ -1,8 +1,66 @@
 """Test environment variable display and redaction."""
 import io
+import re
 from contextlib import redirect_stdout
+from pathlib import Path
 
-from lmer_cli.cli import _redact_env_value, _display_env_config_cli
+from lmer_cli.cli import _redact_env_value, _display_env_config_cli, _resolve_napkin_path
+
+CLI_PY = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+
+
+class TestResolveNapkinPath:
+    """_resolve_napkin_path picks /napkin (separate) or a work-repo subdir."""
+
+    def test_separate_repo_uses_slash_napkin(self):
+        assert _resolve_napkin_path("https://oauth2:t@h/org/napkin.git", "/work") == "/napkin"
+
+    def test_subdir_mode_uses_work_repo_subdir(self):
+        assert _resolve_napkin_path("", "/work") == "/work/napkin"
+
+    def test_subdir_mode_honors_custom_work_path(self):
+        assert _resolve_napkin_path("", "/custom") == "/custom/napkin"
+
+
+class TestCliEnvDictDeclaresNapkinTaskdef:
+    """Source-level guard: the inline env dict in main() declares the new
+    container-bound vars and seeds the raw token vars to None so the .env
+    merge cannot forward them (env-var convention §4)."""
+
+    def test_napkin_repo_forwarded(self):
+        source = CLI_PY.read_text()
+        assert re.search(r"""["']LMER_NAPKIN_REPO["']\s*:\s*napkin_repo_url""", source)
+
+    def test_napkin_path_forwarded(self):
+        source = CLI_PY.read_text()
+        assert re.search(r"""["']LMER_NAPKIN_PATH["']\s*:\s*napkin_path""", source)
+
+    def test_taskdef_repo_forwarded(self):
+        source = CLI_PY.read_text()
+        assert re.search(r"""["']LMER_TASKDEF_REPO["']\s*:\s*taskdef_repo_url""", source)
+
+    def test_taskdef_ref_forwarded(self):
+        source = CLI_PY.read_text()
+        assert re.search(
+            r"""["']LMER_TASKDEF_REF["']\s*:\s*os\.environ\.get\(\s*["']LMER_TASKDEF_REF["']\s*\)""",
+            source,
+        )
+
+    def test_napkin_token_seeded_none(self):
+        source = CLI_PY.read_text()
+        assert re.search(r"""["']LMER_NAPKIN_TOKEN["']\s*:\s*None""", source)
+
+    def test_taskdef_token_seeded_none(self):
+        source = CLI_PY.read_text()
+        assert re.search(r"""["']LMER_TASKDEF_TOKEN["']\s*:\s*None""", source)
+
+    def test_token_vars_not_read_into_env_dict(self):
+        """Raw token vars must not be passed through via os.environ.get in cli.py
+        (they are consumed only inside tokens.py's
+        _inject_gitlab_token_if_available via its dedicated_env arg)."""
+        source = CLI_PY.read_text()
+        assert not re.search(r"""os\.environ\.get\(\s*["']LMER_NAPKIN_TOKEN["']""", source)
+        assert not re.search(r"""os\.environ\.get\(\s*["']LMER_TASKDEF_TOKEN["']""", source)
 
 
 class TestRedactEnvValue:

@@ -101,6 +101,18 @@ The following environment variables control LMER behavior:
 
 - **`LMER_WORK_REPO_PATH`** - In-container clone location of the work repo. Defaults to `/work`; rarely needs overriding.
 
+- **`LMER_NAPKIN_REPO`** - Optional Git URL (SSH or HTTPS) of a dedicated *napkin* repo for shared team working notes. When set, lmer clones it to `/napkin` inside the container and points `LMER_NAPKIN_PATH` there. When unset, napkin falls back to a `napkin/` subdir of the work repo. **Host-side only:** the URL is credentialed on the host and the resulting URL is forwarded into the container; the variable name itself is not consumed inside the container.
+
+- **`LMER_NAPKIN_TOKEN`** - Optional auth token for `LMER_NAPKIN_REPO`. **Consumed host-side only** (highest-priority lookup for the napkin URL), baked into the URL as `https://oauth2:<token>@…`, and **never forwarded into the container**. Falls back to the standard per-host `GITLAB_TOKEN_<host>` / `GH_TOKEN` lookups when unset.
+
+- **`LMER_NAPKIN_PATH`** - **Computed and injected by lmer** (not a host input): the in-container path agents write napkin notes to. `/napkin` in separate-repo mode, else `{LMER_WORK_REPO_PATH}/napkin`. Agents and company-level Claude config should always reference `$LMER_NAPKIN_PATH` (and `~/napkin`, which is symlinked to it). Because it is computed rather than read from the host environment, it does not appear in `lmer --show-env` unless also set as a host `LMER_` variable.
+
+- **`LMER_TASKDEF_REPO`** - Optional Git URL (SSH or HTTPS) of a shared taskdef repo. When set, lmer clones it to `/taskdef` inside the container and inserts it into the task-definition search order **between** the work-repo taskdefs and the lmer built-in (i.e. after `{work_repo}/taskdef/`, before `/Agents/global/taskdef`). **Host-side only**, credentialed like `LMER_NAPKIN_REPO`.
+
+- **`LMER_TASKDEF_TOKEN`** - Optional auth token for `LMER_TASKDEF_REPO`. **Consumed host-side only**, baked into the URL, and **never forwarded into the container**. Falls back to per-host `GITLAB_TOKEN_<host>` / `GH_TOKEN` lookups when unset.
+
+- **`LMER_TASKDEF_REF`** - Optional git ref/branch/tag to pin the `LMER_TASKDEF_REPO` clone for reproducibility. Forwarded into the container and passed to the clone checkout. When unset, the repo's default branch is used.
+
 - **`GITLAB_TOKEN`** / **`GITLAB_TOKEN_<sanitized_host>`** - Per-host or generic API token used to authenticate against GitLab hosts (also used by the legacy URL-token-injection path for target repos). Hostname suffix is lowercased with dots/hyphens replaced by underscores — e.g. `git.example.com` → `GITLAB_TOKEN_git_example_com`.
 
 - **`GH_TOKEN`** / **`GITHUB_TOKEN`** - Tokens used for GitHub hosts (`github.com`, `*.github.com`, `*.ghe.com`). `GH_TOKEN` takes priority over `GITHUB_TOKEN`. Either is consulted only after a more-specific per-host `GITLAB_TOKEN_<host>` is checked.

@@ -773,6 +773,18 @@ def _handle_build(argv: list[str]) -> int:
     return 1
 
 
+def _resolve_napkin_path(napkin_repo_url: str, work_repo_path: str) -> str:
+    """Container path agents write napkin notes to.
+
+    Separate-repo mode (a napkin repo URL is configured) -> ``/napkin``.
+    Subdir mode -> ``{work_repo_path}/napkin``. Agents always reference
+    ``$LMER_NAPKIN_PATH``, so the mode is transparent to them.
+    """
+    if napkin_repo_url:
+        return "/napkin"
+    return f"{work_repo_path}/napkin"
+
+
 def main(argv: list[str] | None = None) -> int:
     """
     Main entry point for the lmerpy CLI.
@@ -1163,6 +1175,22 @@ def main(argv: list[str] | None = None) -> int:
         # reaches the log sink (lmer_cli.log.info -> print).
         info(f"📦 Work repo URL: {_redact_env_value('LMER_WORK_REPO', work_repo_url)}")
 
+    # Resolve optional napkin/taskdef repo URLs host-side, baking auth into the
+    # URL so the standalone container clone script can clone them as-is. The raw
+    # *_TOKEN vars are consumed here and never forwarded into the container.
+    napkin_repo_url = os.environ.get("LMER_NAPKIN_REPO", "")
+    if napkin_repo_url:
+        napkin_repo_url = _inject_gitlab_token_if_available(napkin_repo_url, dedicated_env="LMER_NAPKIN_TOKEN")
+
+    taskdef_repo_url = os.environ.get("LMER_TASKDEF_REPO", "")
+    if taskdef_repo_url:
+        taskdef_repo_url = _inject_gitlab_token_if_available(taskdef_repo_url, dedicated_env="LMER_TASKDEF_TOKEN")
+
+    # Compute the in-container napkin path (separate repo -> /napkin, else a
+    # subdir of the work repo). Always injected so agents can use it in any mode.
+    container_work_repo_path = os.environ.get("LMER_WORK_REPO_PATH", "/work")
+    napkin_path = _resolve_napkin_path(napkin_repo_url, container_work_repo_path)
+
     # Remap resolved_taskdef_dir to container paths when it lives in an
     # external taskdef directory (host path won't exist inside the container).
     container_taskdef_root: str | None = None
@@ -1180,6 +1208,13 @@ def main(argv: list[str] | None = None) -> int:
         container_taskdef_root = "/Agents/global/taskdef"
         container_taskdef_dir = f"/Agents/global/taskdef/{task_id}" if task_id else None
         container_task_instructions = f"/Agents/global/taskdef/{task_id}/instructions.txt" if task_id else None
+
+    # When a shared taskdef repo is configured it is cloned to /taskdef inside
+    # the container; append it AFTER any external taskdef mounts so it lands
+    # between the work-repo taskdefs and the lmer built-in (taskdef_search_dirs
+    # in hooks/start.py already orders LMER_TASKDEF_PATHS in that slot).
+    if taskdef_repo_url:
+        container_taskdef_paths.append("/taskdef")
 
     env = {
         "HOME": "/home/developer",
@@ -1215,6 +1250,16 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_REPO_URL": repo_url,
         "LMER_WORK_REPO": work_repo_url,
         "LMER_WORK_REPO_PATH": os.environ.get("LMER_WORK_REPO_PATH", "/work"),
+        # Optional napkin/taskdef auxiliary repos. The *credentialed* URLs are
+        # forwarded (they carry their own auth); LMER_NAPKIN_PATH is always set
+        # so agents can write in any mode. The raw *_TOKEN vars are seeded None
+        # so the .env merge below cannot leak them into the container.
+        "LMER_NAPKIN_REPO": napkin_repo_url or None,
+        "LMER_NAPKIN_PATH": napkin_path,
+        "LMER_NAPKIN_TOKEN": None,
+        "LMER_TASKDEF_REPO": taskdef_repo_url or None,
+        "LMER_TASKDEF_REF": os.environ.get("LMER_TASKDEF_REF"),
+        "LMER_TASKDEF_TOKEN": None,
         # Task routing env
         "LMER_TASK": task_id if not ns.no_task else None,
         "LMER_TASK_TARGET": primary_target if not ns.no_task else None,

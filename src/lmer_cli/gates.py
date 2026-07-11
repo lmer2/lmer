@@ -314,12 +314,19 @@ class GateSystem:
                 message="No tests directory found (skipped)"
             )
 
-        # Determine python executable - prefer venv if available
+        # Determine python executable - prefer venv if it can actually import
+        # pytest. In self-dev a bind-mounted host `.venv/bin/python` can resolve
+        # to a system interpreter without the venv's site-packages, so existence
+        # alone is insufficient — probe an import before trusting it.
         venv_python = self.project_root / ".venv" / "bin" / "python"
-        if venv_python.exists():
+        if venv_python.exists() and self._interpreter_can_import(str(venv_python)):
             python_cmd = str(venv_python)
         else:
             python_cmd = "python"
+            for cand in ("python3", "python"):
+                if self._interpreter_can_import(cand):
+                    python_cmd = cand
+                    break
 
         # Prepend the dev src/ tree to PYTHONPATH so pytest imports the working
         # copy. Without this, an inherited PYTHONPATH (e.g. lmer self-dev's
@@ -390,6 +397,22 @@ class GateSystem:
                 details=failures[:5],  # Show first 5 failures
                 full_output=combined_output,
             )
+
+    @staticmethod
+    def _interpreter_can_import(python_cmd: str, module: str = "pytest") -> bool:
+        """True iff ``python_cmd -c 'import <module>'`` succeeds.
+
+        A bind-mounted host venv can leave a ``.venv/bin/python`` that resolves to
+        a system interpreter without the venv's site-packages (self-dev), so a mere
+        existence check is insufficient — probe an actual import.
+        """
+        try:
+            return subprocess.run(
+                [python_cmd, "-c", f"import {module}"],
+                capture_output=True, timeout=30,
+            ).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     @staticmethod
     def _venv_script_launchable(script_path: Path) -> bool:

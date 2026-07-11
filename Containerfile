@@ -106,12 +106,12 @@ RUN chown -R developer:developer /opt/tools
 # Create /Agents/global as the primary location for lmer tools
 # This is where host directories will be mounted at runtime
 # The .venv is built here and persists (not overwritten by mounts)
-RUN mkdir -p /Agents/global /workspace /work && \
+RUN mkdir -p /Agents/global /workspace /work /napkin /taskdef && \
     echo "CONTAINER_ENV=true" > /etc/container-environment && \
     echo "CONTAINER_TYPE=lmer" >> /etc/container-environment && \
     echo "RESOURCE_LIMITS=cpu:1,memory:2G,procs:512" >> /etc/container-environment && \
     chown -R developer:developer /Agents && \
-    chown developer:developer /workspace /work
+    chown developer:developer /workspace /work /napkin /taskdef
 
 # === DEVELOPER: uv + python deps (cached until pyproject.toml/uv.lock change) ===
 

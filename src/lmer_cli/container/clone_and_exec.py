@@ -110,6 +110,69 @@ def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Opt
             check_call(["git", "-C", str(workspace), "checkout", branch])
 
 
+def clone_aux_repos(
+    napkin_repo_url: "str | None",
+    taskdef_repo_url: "str | None",
+    taskdef_ref: "str | None",
+) -> None:
+    """Clone the optional napkin/taskdef repos.
+
+    The URLs already carry credentials (baked in host-side by the launching
+    CLI), so they clone as-is. Clone failures are non-fatal — warn and continue,
+    matching the secondary-MR clone behavior.
+    """
+    if napkin_repo_url:
+        try:
+            ensure_clone(Path("/napkin"), napkin_repo_url, None, None)
+        except Exception as e:
+            print(f"⚠️  napkin clone failed (continuing): {_scrub_credentials(str(e))}", file=sys.stderr)
+    if taskdef_repo_url:
+        try:
+            ensure_clone(Path("/taskdef"), taskdef_repo_url, None, taskdef_ref)
+        except Exception as e:
+            print(f"⚠️  taskdef clone failed (continuing): {_scrub_credentials(str(e))}", file=sys.stderr)
+
+
+def link_into_home(link: Path, target: Path) -> None:
+    """Idempotently point *link* at *target* (unlink-if-exists, then symlink).
+
+    Service mode can re-enter the entrypoint over a container's lifetime, so a
+    stale link/file/dir at *link* is removed first rather than letting
+    ``symlink_to`` raise ``FileExistsError``. Best-effort: failures warn.
+    """
+    try:
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() or link.is_file():
+                link.unlink()
+            else:
+                shutil.rmtree(link)
+        link.symlink_to(target)
+    except OSError as e:
+        print(f"⚠️  Failed to link {link} -> {target}: {e}", file=sys.stderr)
+
+
+def setup_napkin_and_links(
+    work_repo_path: Path,
+    napkin_path: Path,
+    *,
+    napkin_is_separate: bool,
+    home: Path,
+) -> None:
+    """Ensure the napkin dir exists (subdir mode) and create stable home links.
+
+    - Subdir mode (napkin under the work repo): ``mkdir -p`` the napkin dir so
+      ``~/napkin`` is not a dangling link before the first write.
+    - Always: idempotent ``~/work`` -> work repo and ``~/napkin`` -> napkin path.
+    """
+    if not napkin_is_separate:
+        try:
+            napkin_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"⚠️  Failed to create napkin dir {napkin_path}: {e}", file=sys.stderr)
+    link_into_home(home / "work", work_repo_path)
+    link_into_home(home / "napkin", napkin_path)
+
+
 def find_runner() -> str:
     """
     Locate Claude Code runner script in the container.
@@ -823,6 +886,18 @@ def main(argv: list[str] | None = None) -> int:
             provision_documentation(ws, work_repo_path, global_path)
         except Exception as e:
             print(f"⚠️  Failed to provision documentation: {e}", file=sys.stderr)
+
+    # --- Optional napkin/taskdef auxiliary repos + stable home symlinks ---
+    napkin_repo_url = os.environ.get("LMER_NAPKIN_REPO")
+    taskdef_repo_url = os.environ.get("LMER_TASKDEF_REPO")
+    taskdef_ref = os.environ.get("LMER_TASKDEF_REF")
+    clone_aux_repos(napkin_repo_url, taskdef_repo_url, taskdef_ref)
+
+    napkin_path = Path(os.environ.get("LMER_NAPKIN_PATH", str(work_repo_path / "napkin")))
+    home = Path(os.environ.get("HOME", "/home/developer"))
+    setup_napkin_and_links(
+        work_repo_path, napkin_path, napkin_is_separate=bool(napkin_repo_url), home=home
+    )
 
     # Dispatch
     if len(cmd_tokens) == 1 and cmd_tokens[0] == "claude-runner":

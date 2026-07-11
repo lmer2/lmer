@@ -133,14 +133,29 @@ class TestGateSystem:
         assert "On main branch" in result.message
         assert not result.is_critical
 
+    @staticmethod
+    def _is_probe_call(cmd):
+        """True if `cmd` is an `_interpreter_can_import` probe (`-c 'import ...'`)."""
+        return "-c" in cmd and any(
+            isinstance(a, str) and a.startswith("import ") for a in cmd
+        )
+
+    @staticmethod
+    def _is_pytest_run(cmd):
+        """True if `cmd` is the actual pytest invocation (`-m pytest`)."""
+        return "-m" in cmd and "pytest" in cmd
+
     @patch('subprocess.run')
     def test_check_tests_pass(self, mock_run):
         """Test running tests when they pass"""
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="5 passed in 0.5s",
-            stderr=""
-        )
+        # The probe (`python -c 'import pytest'`) and the pytest run both hit
+        # subprocess.run; distinguish them via side_effect.
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="5 passed in 0.5s", stderr="")
+
+        mock_run.side_effect = side_effect
 
         result = self.gate.check_tests()
         assert result.status == CheckStatus.PASSED
@@ -152,11 +167,16 @@ class TestGateSystem:
     @patch('subprocess.run')
     def test_check_tests_fail(self, mock_run):
         """Test running tests when they fail"""
-        mock_run.return_value = MagicMock(
-            returncode=1,
-            stdout="FAILED tests/test_main.py::test_function",
-            stderr=""
-        )
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(
+                returncode=1,
+                stdout="FAILED tests/test_main.py::test_function",
+                stderr="",
+            )
+
+        mock_run.side_effect = side_effect
 
         result = self.gate.check_tests()
         assert result.status == CheckStatus.FAILED
@@ -165,6 +185,62 @@ class TestGateSystem:
         # from the log without re-running the suite.
         assert result.full_output is not None
         assert "FAILED tests/test_main.py::test_function" in result.full_output
+
+    @patch('subprocess.run')
+    def test_check_tests_uses_venv_python_when_importable(self, mock_run, tmp_path):
+        """Venv python that can import pytest is used for the pytest run."""
+        (tmp_path / "tests").mkdir()
+        venv_python = tmp_path / ".venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("#!/bin/sh\n")
+        self.gate.project_root = tmp_path
+
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                # Any interpreter probed reports pytest importable.
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="3 passed in 0.1s", stderr="")
+
+        mock_run.side_effect = side_effect
+
+        result = self.gate.check_tests()
+        assert result.status == CheckStatus.PASSED
+
+        pytest_calls = [
+            c for c in mock_run.call_args_list if self._is_pytest_run(c.args[0])
+        ]
+        assert len(pytest_calls) == 1
+        assert pytest_calls[0].args[0][0] == str(venv_python)
+
+    @patch('subprocess.run')
+    def test_check_tests_falls_back_when_venv_cannot_import(self, mock_run, tmp_path):
+        """Venv python that cannot import pytest falls back to a PATH interpreter."""
+        (tmp_path / "tests").mkdir()
+        venv_python = tmp_path / ".venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("#!/bin/sh\n")
+        self.gate.project_root = tmp_path
+
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                # The venv python cannot import pytest; PATH interpreters can.
+                if cmd[0] == str(venv_python):
+                    return MagicMock(returncode=1, stdout="", stderr="")
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="3 passed in 0.1s", stderr="")
+
+        mock_run.side_effect = side_effect
+
+        result = self.gate.check_tests()
+        assert result.status == CheckStatus.PASSED
+
+        pytest_calls = [
+            c for c in mock_run.call_args_list if self._is_pytest_run(c.args[0])
+        ]
+        assert len(pytest_calls) == 1
+        chosen = pytest_calls[0].args[0][0]
+        assert chosen != str(venv_python)
+        assert chosen in ("python3", "python")
 
     @patch('subprocess.run')
     def test_check_precommit_pass(self, mock_run):
