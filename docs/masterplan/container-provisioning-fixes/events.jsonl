@@ -1,0 +1,5 @@
+{"type":"phase_transition","phase":"plan","note":"spec+plan authored interactively; brainstorm decisions locked"}
+{"type":"phase_transition","phase":"execute"}
+{"type":"wave_complete","wave":0,"note":"tasks 1,2 done — Containerfile /napkin+/taskdef pre-create; gates.py interpreter-import probe fallback; 96 passed/1 skipped"}
+{"type":"wave_complete","wave":1,"note":"task 3 done — requires_container smoke test (napkin resolves, in-container import pytest); 2 skipped (no runtime)"}
+{"type":"run_complete","note":"3/3 tasks done across 2 waves; both fixes need lmer build to reach normal users"}

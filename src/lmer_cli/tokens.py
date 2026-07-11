@@ -37,14 +37,19 @@ def _is_github_host(host: str) -> bool:
     return h == "github.com" or h.endswith(".github.com") or h.endswith(".ghe.com")
 
 
-def _get_gitlab_token(host: str, *, for_work_repo: bool = False) -> str | None:
+def _get_gitlab_token(
+    host: str, *, for_work_repo: bool = False, dedicated_env: str | None = None
+) -> str | None:
     """
     Look up an API token for ``host`` from environment variables.
 
     Despite the historical name, this function supports both GitLab and
     GitHub hosts. Lookup order:
 
-    For work-repo lookups (``for_work_repo=True``), check first:
+    0. ``dedicated_env`` — when given, the named env var is checked first
+       (used by napkin/taskdef: ``LMER_NAPKIN_TOKEN`` / ``LMER_TASKDEF_TOKEN``).
+
+    For work-repo lookups (``for_work_repo=True``), check next:
       1. ``LMER_WORK_REPO_TOKEN`` — provider-agnostic dedicated work-repo token
       2. ``GITLAB_TOKEN_worklog`` — deprecated; kept as fallback
 
@@ -57,6 +62,11 @@ def _get_gitlab_token(host: str, *, for_work_repo: bool = False) -> str | None:
 
     Returns the token string, or ``None`` if nothing matches.
     """
+    if dedicated_env:
+        token = os.environ.get(dedicated_env)
+        if token:
+            return token
+
     if for_work_repo:
         token = os.environ.get("LMER_WORK_REPO_TOKEN")
         if token:
@@ -84,13 +94,17 @@ def _prefer_ssh() -> bool:
     return os.environ.get("REPO_AUTH_PREFER_SSH", "").lower() in ("1", "true", "yes")
 
 
-def _convert_ssh_to_https_if_token_available(ssh_url: str, *, for_work_repo: bool = False) -> str:
+def _convert_ssh_to_https_if_token_available(
+    ssh_url: str, *, for_work_repo: bool = False, dedicated_env: str | None = None
+) -> str:
     """
     Convert an SSH git URL to HTTPS with token auth if a token is available.
 
     Args:
         ssh_url: Git URL in SSH format (e.g., 'git@gitlab.example.com:group/project')
         for_work_repo: If True, check _worklog suffix first for token lookup
+        dedicated_env: If given, the named env var is checked first for the token
+            (used by napkin/taskdef: ``LMER_NAPKIN_TOKEN`` / ``LMER_TASKDEF_TOKEN``)
 
     Returns:
         HTTPS URL with token if available, otherwise original SSH URL.
@@ -112,7 +126,7 @@ def _convert_ssh_to_https_if_token_available(ssh_url: str, *, for_work_repo: boo
         host, path = after_at.split(':', 1)
 
         # Check if we have a token for this host
-        token = _get_gitlab_token(host, for_work_repo=for_work_repo)
+        token = _get_gitlab_token(host, for_work_repo=for_work_repo, dedicated_env=dedicated_env)
         if token:
             # Ensure path ends with .git
             if not path.endswith('.git'):
@@ -124,7 +138,7 @@ def _convert_ssh_to_https_if_token_available(ssh_url: str, *, for_work_repo: boo
         return ssh_url
 
 
-def _inject_gitlab_token_if_available(url: str) -> str:
+def _inject_gitlab_token_if_available(url: str, *, dedicated_env: str | None = None) -> str:
     """
     Inject GitLab token into HTTPS URL if available and not already present.
 
@@ -132,8 +146,16 @@ def _inject_gitlab_token_if_available(url: str) -> str:
     - HTTPS: https://gitlab.example.com/group/project.git -> https://oauth2:TOKEN@gitlab.example.com/group/project.git
     - SSH: git@gitlab.example.com:group/project -> https://oauth2:TOKEN@gitlab.example.com/group/project.git
 
+    The token is consumed on the host and baked into the returned URL, so the
+    URL is cloneable as-is inside the container (where the standalone clone
+    script has no token argument). This is the single credentialing helper used
+    for the target repo and the optional napkin/taskdef repos alike.
+
     Args:
         url: Git URL in HTTPS or SSH format
+        dedicated_env: If given, the named env var is checked first for the token
+            (used by napkin/taskdef: ``LMER_NAPKIN_TOKEN`` / ``LMER_TASKDEF_TOKEN``),
+            falling back to the standard host-based lookup.
 
     Returns:
         URL with token injected if available, otherwise original URL
@@ -143,7 +165,7 @@ def _inject_gitlab_token_if_available(url: str) -> str:
 
     # Handle SSH URLs by converting to HTTPS with token
     if url.startswith("git@"):
-        return _convert_ssh_to_https_if_token_available(url)
+        return _convert_ssh_to_https_if_token_available(url, dedicated_env=dedicated_env)
 
     # Only process HTTPS URLs
     if not url.startswith("https://"):
@@ -157,7 +179,7 @@ def _inject_gitlab_token_if_available(url: str) -> str:
             return url
 
         # Check if we have a token for this host
-        token = _get_gitlab_token(parsed.hostname)
+        token = _get_gitlab_token(parsed.hostname, dedicated_env=dedicated_env)
         if not token:
             return url
 

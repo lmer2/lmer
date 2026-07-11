@@ -339,3 +339,58 @@ class TestInjectGitlabToken:
         with patch.dict(os.environ, {"GITLAB_TOKEN": "tok"}, clear=True):
             result = _inject_gitlab_token_if_available("https://gitlab.com/group/subgroup/project.git")
             assert result == "https://oauth2:tok@gitlab.com/group/subgroup/project.git"
+
+
+class TestDedicatedEnvToken:
+    """_get_gitlab_token honors an explicit dedicated_env first."""
+
+    def test_dedicated_env_wins(self):
+        with patch.dict(os.environ, {"LMER_NAPKIN_TOKEN": "napkintok"}, clear=True):
+            assert _get_gitlab_token("git.example.com", dedicated_env="LMER_NAPKIN_TOKEN") == "napkintok"
+
+    def test_dedicated_env_absent_falls_back_to_host(self):
+        with patch.dict(os.environ, {"GITLAB_TOKEN_git_example_com": "hosttok"}, clear=True):
+            assert _get_gitlab_token("git.example.com", dedicated_env="LMER_NAPKIN_TOKEN") == "hosttok"
+
+    def test_no_token_returns_none(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert _get_gitlab_token("git.example.com", dedicated_env="LMER_NAPKIN_TOKEN") is None
+
+
+class TestInjectGitlabTokenDedicatedEnv:
+    """_inject_gitlab_token_if_available with dedicated_env credentials
+    napkin/taskdef URLs host-side (the single helper, no separate copy)."""
+
+    def test_ssh_url_with_dedicated_token(self):
+        with patch.dict(os.environ, {"LMER_NAPKIN_TOKEN": "tok123"}, clear=True):
+            out = _inject_gitlab_token_if_available("git@git.example.com:org/napkin", dedicated_env="LMER_NAPKIN_TOKEN")
+            assert out == "https://oauth2:tok123@git.example.com/org/napkin.git"
+
+    def test_https_url_with_dedicated_token(self):
+        with patch.dict(os.environ, {"LMER_NAPKIN_TOKEN": "tok123"}, clear=True):
+            out = _inject_gitlab_token_if_available("https://git.example.com/org/napkin", dedicated_env="LMER_NAPKIN_TOKEN")
+            assert out == "https://oauth2:tok123@git.example.com/org/napkin.git"
+
+    def test_falls_back_to_host_token(self):
+        with patch.dict(os.environ, {"GITLAB_TOKEN_git_example_com": "hosttok"}, clear=True):
+            out = _inject_gitlab_token_if_available("git@git.example.com:org/napkin", dedicated_env="LMER_NAPKIN_TOKEN")
+            assert out == "https://oauth2:hosttok@git.example.com/org/napkin.git"
+
+    def test_no_token_returns_unchanged(self):
+        with patch.dict(os.environ, {}, clear=True):
+            url = "git@git.example.com:org/napkin"
+            assert _inject_gitlab_token_if_available(url, dedicated_env="LMER_NAPKIN_TOKEN") == url
+
+    def test_prefer_ssh_leaves_ssh_unchanged(self):
+        with patch.dict(os.environ, {"LMER_NAPKIN_TOKEN": "tok", "REPO_AUTH_PREFER_SSH": "1"}, clear=True):
+            url = "git@git.example.com:org/napkin"
+            assert _inject_gitlab_token_if_available(url, dedicated_env="LMER_NAPKIN_TOKEN") == url
+
+    def test_already_credentialed_https_unchanged(self):
+        with patch.dict(os.environ, {"LMER_NAPKIN_TOKEN": "tok"}, clear=True):
+            url = "https://oauth2:existing@git.example.com/org/napkin.git"
+            assert _inject_gitlab_token_if_available(url, dedicated_env="LMER_NAPKIN_TOKEN") == url
+
+    def test_empty_url_unchanged(self):
+        with patch.dict(os.environ, {"LMER_NAPKIN_TOKEN": "tok"}, clear=True):
+            assert _inject_gitlab_token_if_available("", dedicated_env="LMER_NAPKIN_TOKEN") == ""

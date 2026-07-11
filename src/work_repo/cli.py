@@ -17,8 +17,10 @@ import yaml
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import (
+    commit_napkin_if_subdir,
     commit_work_changes,
     commit_work_path,
+    push_napkin_if_separate,
     report_uncommitted_work_items,
 )
 from . import goals, plan_index, run_state
@@ -480,22 +482,32 @@ def _sync_masterplan_links() -> list[str]:
 
 def cmd_commit(message: str | None) -> int:
     """
-    Execute commit command.
+    Execute commit command (work repo, plus napkin in either mode).
 
     Args:
         message: Optional commit message
 
     Returns:
-        Exit code
+        Exit code (the work-repo commit result; napkin capture is best-effort)
     """
     # Self-maintain masterplan artifact links before staging (spec §6) so
     # every push carries the run-dir-root links. Fail-soft: never changes
     # the commit's behavior or exit code.
     _sync_masterplan_links()
     rc = commit_work_changes(message)
+    # Napkin capture is best-effort in both modes and must never block the
+    # worklog commit: a failure is logged but does not change the exit code.
+    # Subdir mode needs its own staging pass — commit_work_changes stages only
+    # the task-target and run-dir paths, never {work_repo}/napkin/.
+    if commit_napkin_if_subdir(message) != 0:
+        print("⚠️  napkin subdir commit failed (continuing); work-repo commit was unaffected", file=sys.stderr)
+    if push_napkin_if_separate(message) != 0:
+        print("⚠️  napkin push failed (continuing); work-repo commit was unaffected", file=sys.stderr)
     # Flag any stray untracked/unstaged files left behind — `work commit`
     # stages only the run dir, so a new info file elsewhere would otherwise
-    # go unnoticed (issue #85). Fail-soft: the commit's exit code stands.
+    # go unnoticed (issue #85). Runs after the napkin subdir commit so files
+    # that pass just captured aren't flagged as strays. Fail-soft: the
+    # commit's exit code stands.
     report_uncommitted_work_items()
     return rc
 

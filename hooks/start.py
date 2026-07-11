@@ -91,7 +91,14 @@ def work_repo_taskdef_dirs():
 
 def builtin_taskdef_root():
     """Locate the built-in taskdef directory — shared fragments
-    (service-mode.jinja2, run-state.jinja2, changelog.jinja2, …) live here."""
+    (service-mode.jinja2, run-state.jinja2, changelog.jinja2, …) live here.
+
+    Resolves the global install location mounted inside the container
+    (``/home/developer/.lmer`` or ``/Agents/global``) rather than trusting
+    ``LMER_TASKDEF_ROOT``, which the CLI sets to a *host* path that does not
+    exist inside the container. Both task lookup and include-resolution must
+    be able to reach it regardless of which external taskdef repo
+    (LMER_TASKDEF_PATHS) is active."""
     lmer_global = Path("/home/developer/.lmer")
     agents_global = Path("/Agents/global")
 
@@ -218,7 +225,9 @@ def render_taskdef_template(template_file, extra_context=None):
     # which the is_dir() guard above silently drops — always add the real
     # built-in root so shared fragments (service-mode.jinja2,
     # run-state.jinja2, …) resolve for taskdefs served from external mounts
-    # or alternate work repos.
+    # or alternate work repos. Without it an external taskdef repo that
+    # {% include %}s a shared partial it does not vendor would crash
+    # rendering with TemplateNotFound.
     detected_builtin = builtin_taskdef_root()
     if str(detected_builtin) not in search_paths:
         search_paths.append(str(detected_builtin))

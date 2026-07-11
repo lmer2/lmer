@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock
 from io import StringIO
 import sys
 
-from work_repo.cli import cmd_log, cmd_commit, create_parser
+from work_repo.cli import cmd_commit, cmd_log, create_parser
 
 
 class TestCmdLog:
@@ -311,7 +311,9 @@ class TestCmdCommit:
              patch(
                  "work_repo.cli.report_uncommitted_work_items",
                  side_effect=lambda: order.append("report") or 3,
-             ) as mock_report:
+             ) as mock_report, \
+             patch("work_repo.cli.commit_napkin_if_subdir", return_value=0), \
+             patch("work_repo.cli.push_napkin_if_separate", return_value=0):
             rc = cmd_commit("my message")
 
         assert rc == 0
@@ -327,6 +329,31 @@ class TestCmdCommit:
              patch("work_repo.cli.commit_work_changes", return_value=1), \
              patch(
                  "work_repo.cli.report_uncommitted_work_items", return_value=5
-             ) as mock_report:
+             ) as mock_report, \
+             patch("work_repo.cli.commit_napkin_if_subdir", return_value=0), \
+             patch("work_repo.cli.push_napkin_if_separate", return_value=0):
             assert cmd_commit(None) == 1
         mock_report.assert_called_once_with()
+
+
+class TestCmdCommitNapkin:
+    def test_napkin_push_failure_does_not_change_work_exit(self):
+        with patch("work_repo.cli._sync_masterplan_links", return_value=[]), \
+             patch("work_repo.cli.commit_work_changes", return_value=0) as mock_work, \
+             patch("work_repo.cli.report_uncommitted_work_items", return_value=0), \
+             patch("work_repo.cli.commit_napkin_if_subdir", return_value=0), \
+             patch("work_repo.cli.push_napkin_if_separate", return_value=1) as mock_napkin:
+            rc = cmd_commit("msg")
+        assert rc == 0                 # work-repo result is preserved
+        mock_napkin.assert_called_once_with("msg")
+
+    def test_napkin_subdir_commit_runs_and_failure_does_not_change_work_exit(self):
+        """work commit must attempt the subdir-mode napkin capture (the
+        work-repo commit paths never include {work_repo}/napkin/), and a
+        failure there stays a warning."""
+        with patch("work_repo.cli.commit_work_changes", return_value=0), \
+             patch("work_repo.cli.commit_napkin_if_subdir", return_value=1) as mock_subdir, \
+             patch("work_repo.cli.push_napkin_if_separate", return_value=0):
+            rc = cmd_commit("msg")
+        assert rc == 0
+        mock_subdir.assert_called_once_with("msg")
