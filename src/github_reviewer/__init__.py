@@ -9,5 +9,4 @@ downstream consumers don't have to branch on host provider.
 
 from .cli import main
 
-__version__ = "0.1.0"
 __all__ = ["main"]
