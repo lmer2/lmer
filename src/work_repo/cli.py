@@ -4,16 +4,33 @@ from __future__ import annotations
 
 import sys
 import argparse
+import hashlib
 import os
+import json
+import re
+import subprocess
+import time
 from pathlib import Path
 from datetime import datetime
 import yaml
 
 from .loggers import get_logger
 from .info_reader import read_project_info
-from .git_ops import commit_work_changes
+from .git_ops import (
+    commit_work_changes,
+    commit_work_path,
+    report_uncommitted_work_items,
+)
+from . import goals, plan_index, run_state
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
+
+# `work verify` keeps only this much of the tail of the verified command's
+# combined output in memory — enough to cover any runner's summary, bounded
+# for arbitrarily chatty commands. The receipt's `output_tail_sha256` is the
+# sha256 of exactly these bytes, so a receipt can be checked after the fact
+# without the work repo ever storing the output itself.
+VERIFY_TAIL_BYTES = 64 * 1024
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -38,8 +55,17 @@ Examples:
   # Commit with custom message
   work commit --message "Updated project logs"
 
-  # Copy a report file to work repository
+  # Copy a report file into the run dir (runs/<slug>/reports/)
   work report --file report.md
+
+  # Seed a run for another slug (out-of-session run creation)
+  work seed develop gate-receipts --goal "..." --name gate-receipts
+
+  # Record a plan task's completion in the execution ledger
+  work ledger set T2 --status done --commit 4a1f9c2 --receipt t2-tests
+
+  # Show the ledger table
+  work ledger
 
   # Set a temporary goal/context
   work goal "description of current goal"
@@ -88,13 +114,35 @@ Examples:
     # report command
     report_parser = subparsers.add_parser(
         "report",
-        help="Copy a report file to work repository with timestamp",
+        help="Copy a report file into the run dir (reports/) with timestamp",
     )
     report_parser.add_argument(
         "--file",
         "-f",
         required=True,
         help="Path to the report file to copy",
+    )
+
+    # seed command (out-of-session run creation — issue #87 D3)
+    seed_parser = subparsers.add_parser(
+        "seed",
+        help="Create a run for a slug other than the current session's",
+    )
+    seed_parser.add_argument(
+        "taskdef",
+        help="Taskdef of the new run (e.g. develop, review)",
+    )
+    seed_parser.add_argument(
+        "target",
+        help="Task target the slug derives from (URL, branch, SHA, or short token)",
+    )
+    seed_parser.add_argument(
+        "--goal",
+        help="Initial goal to record (appends a goal_set event)",
+    )
+    seed_parser.add_argument(
+        "--name",
+        help="Human-readable run name (kebab-case normalized; appends run_named)",
     )
 
     # goal command
@@ -128,6 +176,166 @@ Examples:
         "--message",
         "-m",
         help="Commit message (defaults to auto-generated)",
+    )
+
+    # state command (run-state kernel — spec §4.3)
+    state_parser = subparsers.add_parser(
+        "state",
+        help="Show or mutate the durable run state (state.yaml)",
+    )
+    state_parser.add_argument(
+        "action", nargs="?", choices=["set"],
+        help="'set' to mutate; omit to display current state",
+    )
+    state_parser.add_argument("--phase", help="Set the current phase (free-form)")
+    state_parser.add_argument(
+        "--stop-reason", dest="stop_reason",
+        choices=["question", "yield", "complete", "critical_error", "none"],
+        help="Why the session is stopping ('none' clears it)",
+    )
+    state_parser.add_argument(
+        "--status", choices=["in-progress", "complete", "archived"],
+        help="Run status",
+    )
+    state_parser.add_argument(
+        "--critical-error", dest="critical_error",
+        help='JSON object {"summary": ..., "detail": ...}; required with --stop-reason=critical_error',
+    )
+
+    # name command (run naming — spec §1)
+    name_parser = subparsers.add_parser(
+        "name",
+        help="Set or display the run's human-readable kebab-case name",
+    )
+    name_parser.add_argument(
+        "value",
+        nargs="?",
+        help="Name to set (normalized to kebab-case; omit to display the current name)",
+    )
+
+    # verify command (gate receipts — issue #88 D2)
+    verify_parser = subparsers.add_parser(
+        "verify",
+        help="Run a validation command and record a verify receipt event",
+    )
+    verify_parser.add_argument(
+        "name",
+        help="Receipt name matching the plan task's validation contract (e.g. tests)",
+    )
+    # dest must not be `command` — that is the top-level subcommand slot.
+    verify_parser.add_argument(
+        "verify_command",
+        nargs=argparse.REMAINDER,
+        metavar="-- command …",
+        help="The command to run, after a `--` separator",
+    )
+
+    # event command
+    event_parser = subparsers.add_parser(
+        "event",
+        help="Append an event to the run's events.jsonl",
+    )
+    event_parser.add_argument("type", help="Event type (e.g. review_posted)")
+    event_parser.add_argument("--note", help="Short human-readable note")
+    event_parser.add_argument("--data", help="JSON object with extra data")
+
+    # ledger command (per-task execution ledger — issue #89)
+    ledger_parser = subparsers.add_parser(
+        "ledger",
+        help="Show or mutate the per-task execution ledger (ledger.yaml)",
+    )
+    ledger_parser.add_argument(
+        "action", nargs="?", choices=["set"],
+        help="'set' to mutate; omit to display the ledger table",
+    )
+    ledger_parser.add_argument(
+        "task_id", nargs="?", metavar="task-id",
+        help="Plan task id (e.g. T3a); required with 'set'",
+    )
+    ledger_parser.add_argument(
+        "--status", choices=list(run_state.TASK_STATUSES),
+        help="Task status (required with 'set')",
+    )
+    ledger_parser.add_argument(
+        "--title",
+        help="Short task title (fields omitted on later writes are kept)",
+    )
+    ledger_parser.add_argument(
+        "--commit",
+        help="Project-repo commit sha the task landed as",
+    )
+    ledger_parser.add_argument(
+        "--receipt",
+        help="Name of the verify/gate receipt proving the task",
+    )
+    ledger_parser.add_argument("--note", help="Short free-form note")
+
+    # plan command (plan-index lint — issue #90)
+    plan_parser = subparsers.add_parser(
+        "plan",
+        help="Plan-index tooling (plan.index.json)",
+    )
+    plan_subparsers = plan_parser.add_subparsers(
+        dest="plan_action", help="Plan action to perform"
+    )
+    plan_subparsers.add_parser(
+        "check",
+        help="Lint the run's plan.index.json (read-only): DAG acyclic, "
+             "write-scopes disjoint, session_scope declared",
+    )
+
+    # goals command (frozen goal-sets — issue #91)
+    goals_parser = subparsers.add_parser(
+        "goals",
+        help="Goal-set lifecycle for the run's goals.md "
+             "(check / freeze / amend / assess)",
+    )
+    goals_parser.add_argument(
+        "goals_action", nargs="?",
+        choices=["check", "freeze", "amend", "assess"],
+        help="Verb; omit to display the goal-set status",
+    )
+    goals_parser.add_argument(
+        "--note",
+        help="Context note for the recorded event (e.g. spec-approval context)",
+    )
+    goals_parser.add_argument(
+        "--verdict", action="append", default=[],
+        metavar="G<N>=<verdict>:<evidence>",
+        help="assess only, repeatable — per-goal verdict "
+             f"({'|'.join(goals.GOAL_VERDICTS)}) with its evidence",
+    )
+
+    # resume command
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Print the resume brief for the current run (read-only)",
+    )
+    resume_parser.add_argument("--json", action="store_true", dest="as_json",
+                               help="Emit the decision as JSON")
+
+    # artifact command
+    artifact_parser = subparsers.add_parser(
+        "artifact",
+        help="Copy a file into the run dir and register it as a durable artifact",
+    )
+    artifact_parser.add_argument("name", nargs="?",
+                                 help="Artifact filename (e.g. spec.md)")
+    artifact_parser.add_argument("--file", "-f",
+                                 help="Source file to copy into the run dir")
+    artifact_parser.add_argument(
+        "--sync", action="store_true",
+        help="Link masterplan bundle artifacts at the run-dir root (spec §6)",
+    )
+
+    # session-start / session-end (hook plumbing — spec §4.4)
+    subparsers.add_parser(
+        "session-start",
+        help="Seed/claim the run for this session and print the resume brief (hook-facing)",
+    )
+    subparsers.add_parser(
+        "session-end",
+        help="Record session end, release the owner claim, push run state (hook-facing)",
     )
 
     return parser
@@ -194,16 +402,20 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
         Exit code
     """
     try:
-        logger = get_logger()
-
         # If no message provided, display recent log entries
         if message is None:
-            # Get log file path from logger
-            if not hasattr(logger, 'log_file'):
+            # Read-only path: prefer the run-dir log, fall back to the
+            # legacy task-target location for pre-unification runs
+            # (issue #87 D4 — the CLI never moves legacy files).
+            rdir = run_state.run_dir()
+            if rdir is None:
                 print("❌ Cannot determine log file location", file=sys.stderr)
                 return 1
-
-            log_file = logger.log_file
+            log_file = rdir / "log.yaml"
+            if not log_file.exists():
+                legacy_dir = task_target_dir()
+                if legacy_dir is not None and (legacy_dir / "log.yaml").exists():
+                    log_file = legacy_dir / "log.yaml"
 
             # Display log file location
             print(f"Log file: {log_file}")
@@ -230,6 +442,15 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
                 key, value = item.split("=", 1)
                 metadata_dict[key] = value
 
+        # Make sure the run exists first so log.yaml never lands in a
+        # stateless dir. Fail-soft: a broken state layer must not block
+        # logging — the entry still lands at the resolved run path.
+        try:
+            run_state.ensure_run()
+        except Exception:
+            pass
+
+        logger = get_logger()
         logger.log(message, metadata_dict if metadata_dict else None)
         # Redact the confirmation output too (logger already redacts what's written to file)
         print(f"✅ Logged: {redact_secrets(message)}")
@@ -237,6 +458,24 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
     except Exception as e:
         print(f"❌ Error logging message: {e}", file=sys.stderr)
         return 1
+
+
+def _sync_masterplan_links() -> list[str]:
+    """Fail-soft masterplan artifact-link sync for the current run dir (spec §6).
+
+    The kernel helper already never raises, but this wraps it in the same
+    defensive style as the hook-facing commands: no sync problem may ever
+    change the host command's behavior or exit code. Returns the link names
+    now present at the run-dir root ([] when there is nothing to sync).
+    """
+    try:
+        rdir = run_state.run_dir()
+        if rdir is None or not rdir.is_dir():
+            return []
+        return run_state.sync_masterplan_artifacts(rdir)
+    except Exception as exc:
+        print(f"⚠️  masterplan artifact sync skipped: {exc}")
+        return []
 
 
 def cmd_commit(message: str | None) -> int:
@@ -249,15 +488,25 @@ def cmd_commit(message: str | None) -> int:
     Returns:
         Exit code
     """
-    return commit_work_changes(message)
+    # Self-maintain masterplan artifact links before staging (spec §6) so
+    # every push carries the run-dir-root links. Fail-soft: never changes
+    # the commit's behavior or exit code.
+    _sync_masterplan_links()
+    rc = commit_work_changes(message)
+    # Flag any stray untracked/unstaged files left behind — `work commit`
+    # stages only the run dir, so a new info file elsewhere would otherwise
+    # go unnoticed (issue #85). Fail-soft: the commit's exit code stands.
+    report_uncommitted_work_items()
+    return rc
 
 
 def cmd_report(file_path: str) -> int:
     """
     Execute report command.
 
-    Copies a file to the work repository with a timestamped filename:
-    {host}/{project}/{task_type}/{task_target}/{YYMMDD-HH-MM-SS.md}
+    Copies a file into the run dir with a timestamped filename:
+    {host}/{project}/runs/{slug}/reports/{YYMMDD-HH-MM-SS.md}
+    (issue #87 D4 — the run dir is the single home for run output).
 
     Args:
         file_path: Path to the report file to copy
@@ -266,9 +515,8 @@ def cmd_report(file_path: str) -> int:
         Exit code
     """
     try:
-        # Build target directory path: {host}/{project}/{task_type}/{task_target}
-        target_dir = task_target_dir()
-        if target_dir is None:
+        rdir = run_state.run_dir()
+        if rdir is None:
             print("❌ LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
             return 1
 
@@ -283,6 +531,14 @@ def cmd_report(file_path: str) -> int:
             print(f"❌ Report file not found: {file_path}", file=sys.stderr)
             return 1
 
+        # Make sure the run exists so reports never land in a stateless
+        # dir. Fail-soft: a state-layer problem must not lose the report.
+        try:
+            rdir, _ = run_state.ensure_run()
+        except Exception:
+            pass
+
+        target_dir = rdir / "reports"
         target_dir.mkdir(parents=True, exist_ok=True)
 
         # Generate timestamp filename: YYMMDD-HH-MM-SS.md
@@ -325,6 +581,20 @@ def cmd_goal(description: str | None) -> int:
             # Set the goal
             goal_file.write_text(description, encoding="utf-8")
             print(f"✅ Goal set: {description}")
+
+            # Also record the goal durably in the run state when a run
+            # context exists (spec §5.5). Fails soft — the legacy goal file
+            # above is already written, and a state-layer problem must not
+            # break `work goal`.
+            try:
+                if run_state.run_dir() is not None:
+                    rdir, state = run_state.ensure_run()
+                    state["goal"] = description
+                    run_state.write_state(rdir, state)
+                    run_state.append_event(rdir, "goal_set", note=description)
+            except Exception:
+                pass
+
             return 0
         else:
             # Display current goal
@@ -362,6 +632,1089 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
         return 1
 
 
+def _require_run() -> tuple[Path, dict] | tuple[None, None]:
+    """Resolve (and if needed create) the current run for mutations.
+
+    Defensive auto-seed via run_state.ensure_run: taskdef instructions call
+    `work state set` assuming the /start hook seeded the run — if it didn't
+    (host session, older runner), the mutation must still land rather than
+    fail. Prints the standard error and returns (None, None) when there is
+    no run context or the state layer refuses.
+    """
+    if run_state.run_dir() is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return None, None
+    try:
+        return run_state.ensure_run()
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return None, None
+
+
+def _push_run_dir(
+    state: dict,
+    detail: str,
+    old_dir_name: str | None = None,
+    saved: str = "state",
+) -> None:
+    """Durability push of the run dir after a mutation (non-fatal, like
+    artifact writes). When a freeze-gate rename just happened, the
+    pre-rename path is staged too so the old path's deletions land even
+    when the rename-time push fails. `saved` names what stays local in the
+    warning when the push fails."""
+    rels = run_state.run_rel_path_candidates()
+    if old_dir_name:
+        host = os.environ.get("LMER_REPO_HOST")
+        project = os.environ.get("LMER_REPO_PROJECT")
+        old_rel = f"{host}/{project}/runs/{old_dir_name}"
+        if old_rel not in rels:
+            rels.append(old_rel)
+    rc = commit_work_path(rels, f"run-state: {state['slug']} {detail}")
+    if rc != 0:
+        print(f"⚠️  Warning: run-state push failed ({saved} saved locally)")
+
+
+def cmd_state(args) -> int:
+    """Execute state / state set commands."""
+    if args.action != "set":
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+            return 0
+        try:
+            state = run_state.load_state(rdir)
+        except (run_state.RunStateError, OSError) as exc:
+            print(f"⚠️  {exc}", file=sys.stderr)
+            return 1
+        if state is None:
+            print(f"No run state yet at {rdir}")
+            return 0
+        print(yaml.safe_dump(state, sort_keys=False), end="")
+        return 0
+
+    # --- mutation path ---
+    if not any([args.phase, args.stop_reason, args.status, args.critical_error]):
+        print("❌ state set requires at least one of --phase/--stop-reason/--status", file=sys.stderr)
+        return 1
+    if args.stop_reason == "critical_error" and not args.critical_error:
+        print("❌ --stop-reason=critical_error requires --critical-error JSON", file=sys.stderr)
+        return 1
+    critical_error = None
+    if args.critical_error:
+        try:
+            critical_error = json.loads(args.critical_error)
+        except json.JSONDecodeError as exc:
+            print(f"❌ --critical-error is not valid JSON: {exc}", file=sys.stderr)
+            return 1
+        if not isinstance(critical_error, dict):
+            print("❌ --critical-error must be a JSON object, e.g. '{\"summary\": \"...\", \"detail\": \"...\"}'", file=sys.stderr)
+            return 1
+
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+
+    changed = {}
+    phase_changed = False
+    if args.phase and args.phase != state.get("phase"):
+        state["phase"] = args.phase
+        changed["phase"] = args.phase
+        phase_changed = True
+    if args.stop_reason:
+        state["stop_reason"] = None if args.stop_reason == "none" else args.stop_reason
+        changed["stop_reason"] = state["stop_reason"]
+        if state["stop_reason"] != "critical_error":
+            state["critical_error"] = None
+    if critical_error is not None:
+        state["critical_error"] = critical_error
+        changed["critical_error"] = True
+    if args.status:
+        state["status"] = args.status
+        changed["status"] = args.status
+
+    if not changed:
+        print("✅ State unchanged")
+        return 0
+
+    # Pre-execution freeze gate (issue #87 D2): the first phase transition
+    # out of the planning family finalizes the run's identity — the frozen
+    # stamp lands in this same state write, and a named run's dir takes its
+    # single name-bearing rename. Fail-soft: a freeze problem must not
+    # block the state mutation itself.
+    old_dir_name = None
+    if (
+        phase_changed
+        and not run_state.is_planning_phase(args.phase)
+        and not state.get("frozen")
+    ):
+        try:
+            rdir, old_dir_name = run_state.freeze_run_dir(rdir, state)
+        except Exception as exc:
+            print(f"⚠️  pre-execution freeze skipped: {exc}")
+
+    run_state.write_state(rdir, state)
+    if phase_changed:
+        run_state.append_event(rdir, "phase", note=args.phase)
+    if set(changed) - {"phase"}:
+        run_state.append_event(rdir, "state_changed", data=changed)
+    print(f"✅ State updated: {changed}")
+
+    # Durability (spec §4.4): push on phase transitions and completion.
+    if phase_changed or args.status == "complete":
+        detail = f"phase={args.phase}" if phase_changed else f"status={args.status}"
+        _push_run_dir(state, detail, old_dir_name)
+    return 0
+
+
+def _last_non_empty_line(tail: bytes) -> str | None:
+    """Best-effort final line of captured output; None when there is none."""
+    for line in reversed(tail.decode("utf-8", errors="replace").splitlines()):
+        line = line.strip()
+        if line:
+            return line
+    return None
+
+
+def cmd_verify(name: str, command: list[str]) -> int:
+    """Execute verify command (issue #88 D2 — receipts for non-gate validation).
+
+    Runs the command with stderr merged into stdout (so the hashed tail sees
+    the whole story, like `2>&1`), streams the output through to stdout,
+    mirrors the command's exit code, and appends a `verify` receipt event —
+    written by this tool process, never typed by the model. The caller
+    (main) has already enforced and stripped the `--` separator; `command`
+    is the raw post-separator argv. Mutating-verb rules apply: without run
+    context this errors out BEFORE running the command (a validation whose
+    receipt can never land proves nothing).
+    A receipt-append failure after the command ran is reported loudly but
+    the exit code still mirrors the command — the run's result stays
+    truthful for pipelines either way.
+    """
+    command = list(command or [])
+    if not command:
+        print("❌ verify requires a command after `--`", file=sys.stderr)
+        return 1
+    name = name.strip()
+    if not name:
+        print("❌ verify requires a non-empty receipt name", file=sys.stderr)
+        return 1
+
+    rdir, _state = _require_run()
+    if rdir is None:
+        return 1
+
+    started = time.monotonic()
+    tail = bytearray()
+    try:
+        proc = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+        )
+    except (OSError, ValueError) as exc:
+        # Shell convention: 127 for a command that could not be started.
+        print(f"❌ verify could not start {command[0]!r}: {exc}", file=sys.stderr)
+        exit_code = 127
+    else:
+        echo = sys.stdout.buffer
+        try:
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    break
+                if echo is not None:
+                    try:
+                        echo.write(chunk)
+                        echo.flush()
+                    except BrokenPipeError:
+                        # Downstream consumer closed early (`… | head`):
+                        # stop echoing but keep draining and hashing so the
+                        # receipt still lands and the exit code still
+                        # mirrors the command.
+                        echo = None
+                tail += chunk
+                if len(tail) > VERIFY_TAIL_BYTES:
+                    del tail[: len(tail) - VERIFY_TAIL_BYTES]
+            exit_code = proc.wait()
+        except KeyboardInterrupt:
+            # The child shares the terminal's SIGINT; reap it and mirror
+            # the shell convention for an interrupted command.
+            proc.wait()
+            exit_code = 130
+        if exit_code < 0:
+            # Signal-killed: wait() reports -N; mirror the shell's 128+N so
+            # the receipt and the observed exit code agree.
+            exit_code = 128 - exit_code
+
+    data = {
+        "name": name,
+        "argv": [redact_secrets(arg) for arg in command],
+        "exit_code": exit_code,
+        "duration_s": round(time.monotonic() - started, 1),
+        "output_tail_sha256": hashlib.sha256(bytes(tail)).hexdigest(),
+    }
+    summary_line = _last_non_empty_line(bytes(tail))
+    if summary_line is not None:
+        data["summary_line"] = redact_secrets(summary_line)
+    note = f"{name}: {'pass' if exit_code == 0 else f'exit {exit_code}'}"
+    try:
+        run_state.append_event(rdir, "verify", note=note, data=data)
+        # Receipt chrome goes to stderr: the command's own stdout streams
+        # through untouched for pipelines.
+        print(f"✅ Verify receipt recorded: {note}", file=sys.stderr)
+    except Exception as exc:
+        print(
+            f"❌ verify receipt NOT recorded ({exc}) — exit code still mirrors the command",
+            file=sys.stderr,
+        )
+    return exit_code
+
+
+def cmd_event(args) -> int:
+    """Execute event command."""
+    data = None
+    if args.data:
+        try:
+            data = json.loads(args.data)
+        except json.JSONDecodeError as exc:
+            print(f"❌ --data is not valid JSON: {exc}", file=sys.stderr)
+            return 1
+    rdir, _state = _require_run()
+    if rdir is None:
+        return 1
+    run_state.append_event(rdir, args.type, note=args.note, data=data)
+    print(f"✅ Event appended: {args.type}")
+    return 0
+
+
+def _normalize_name(value: str) -> str:
+    """Kebab-case normalization (spec §1): lowercase; spaces/underscores to
+    '-'; strip anything outside [a-z0-9-]; collapse '-' runs; trim ends."""
+    value = re.sub(r"[ _]", "-", value.lower())
+    value = re.sub(r"[^a-z0-9-]", "", value)
+    value = re.sub(r"-+", "-", value)
+    return value.strip("-")
+
+
+def _validate_name(value: str) -> str | None:
+    """Normalize and validate a run name for the mutating verbs.
+
+    Shared by `work name` and `work seed --name` so the naming rules can't
+    drift between them. Prints the normalization note / errors itself;
+    returns the kebab-case name, or None when nothing valid survives.
+    """
+    name = _normalize_name(value)
+    if not name:
+        print(f"❌ Nothing left of {value!r} after kebab-case normalization", file=sys.stderr)
+        return None
+    if name != value:
+        print(f"Normalized to: {name}")
+    if name == "archive":
+        # The cleaner's archive/ subtree shares the runs namespace; if the
+        # name-as-directory growth path lands, this name would collide.
+        print("❌ 'archive' is a reserved name (the archived-runs subtree)", file=sys.stderr)
+        return None
+    return name
+
+
+def _name_conflict(rdir: Path, name: str) -> str | None:
+    """Slug of another run in this project already holding `name`, or None.
+
+    Scans sibling run dirs for state.yaml (plus legacy state.yml).
+    Corrupt/unreadable siblings are skipped — a broken run must not block
+    naming — and the archive/ subtree is ignored (archived runs no longer
+    hold their names). A sibling's slug also holds its name: a name equal
+    to another run's slug would let the name shadow that run's address.
+    The slug is checked from the sibling's recorded state (dirs get
+    renamed to `<slug>--<name>` at the freeze, so the dir name alone no
+    longer carries the slug), with the dir-name check kept as a fallback
+    for stateless dirs.
+    """
+    base = rdir.parent
+    if not base.is_dir():
+        return None
+    for sibling in sorted(base.iterdir()):
+        if not sibling.is_dir() or sibling.name in (rdir.name, "archive"):
+            continue
+        if sibling.name == name:
+            return sibling.name
+        sib_state = run_state._read_sibling_state(sibling)
+        if sib_state is not None and name in (
+            sib_state.get("name"), sib_state.get("slug")
+        ):
+            return sibling.name
+    return None
+
+
+def cmd_name(value: str | None) -> int:
+    """Execute name command (spec §1 `work name`)."""
+    if value is None:
+        # Display path — read-only; never breaks a session (always 0).
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+            return 0
+        try:
+            state = run_state.load_state(rdir)
+        except (run_state.RunStateError, OSError) as exc:
+            print(f"⚠️  {exc}", file=sys.stderr)
+            return 0
+        if state is None or not state.get("name"):
+            print("No name set")
+        else:
+            print(state["name"])
+        return 0
+
+    # --- mutation path ---
+    name = _validate_name(value)
+    if name is None:
+        return 1
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    if state.get("name") == name:
+        print(f"✅ Name unchanged: {name}")
+        return 0
+    holder = _name_conflict(rdir, name)
+    if holder is not None:
+        print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
+        return 1
+    state["name"] = name
+    run_state.write_state(rdir, state)
+    run_state.append_event(rdir, "run_named", note=name)
+    print(f"✅ Run named: {name}")
+    return 0
+
+
+def cmd_ledger(args) -> int:
+    """Execute ledger / ledger set commands (issue #89).
+
+    `work ledger set` is the ONLY writer of the task↔commit mapping — gates
+    stay ledger-unaware (spec decision 3). Every mutation lands both the
+    ledger.yaml snapshot and a `task` audit event, then pushes: the ledger
+    write is exactly the record a dead session must not lose.
+    """
+    if args.action != "set":
+        # Read-only display; no ledger is a normal state (exit 0).
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+            return 0
+        try:
+            ledger = run_state.load_ledger(rdir)
+        except (run_state.RunStateError, OSError) as exc:
+            print(f"⚠️  {exc}", file=sys.stderr)
+            return 1
+        print(run_state.format_ledger(ledger))
+        return 0
+
+    # --- mutation path ---
+    task_id = (args.task_id or "").strip()
+    if not task_id:
+        print("❌ ledger set requires a task id: work ledger set <task-id> --status <s>", file=sys.stderr)
+        return 1
+    if not args.status:
+        print("❌ ledger set requires --status", file=sys.stderr)
+        return 1
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    if args.status == "done" and not args.commit:
+        # Loud but non-fatal: docs-only tasks legitimately have no commit,
+        # but a forgotten sha is exactly what crash recovery later misses.
+        print(
+            f"⚠️  '{task_id}' marked done with NO --commit — fine for docs-only "
+            "tasks; otherwise re-run with --commit <sha> so recovery can find it",
+            file=sys.stderr,
+        )
+    try:
+        run_state.set_ledger_task(
+            rdir,
+            task_id,
+            args.status,
+            title=args.title,
+            commit=args.commit,
+            receipt=args.receipt,
+            note=args.note,
+        )
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    print(f"✅ Ledger updated: {task_id} = {args.status}")
+
+    # Durability: the ledger row is the crash-recovery record — push now,
+    # not at session end (non-fatal, like artifact writes).
+    rc = commit_work_path(
+        run_state.run_rel_path_candidates(),
+        f"run-state: {state['slug']} ledger {task_id}={args.status}",
+    )
+    if rc != 0:
+        print("⚠️  Warning: run-state push failed (ledger saved locally)")
+    return 0
+
+
+def cmd_plan_check() -> int:
+    """Execute `work plan check` (issue #90 — checkable plan gates).
+
+    Read-only by contract: reads plan.index.json (+ plan.md / goals.md when
+    present) from the run dir, feeds the pure lint kernel, prints the
+    findings report to stdout. Exit 1 only when the lint finds errors —
+    no run context and no plan index are both clean exits (chat/review
+    taskdefs have no index and must not be nagged). Writes nothing: no
+    event append, no push — safe to run anywhere, any number of times.
+    """
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    index_path = rdir / plan_index.PLAN_INDEX_FILE
+    if not index_path.is_file():
+        print(f"No plan index ({index_path} not found) — nothing to check")
+        return 0
+    try:
+        index_text = index_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"❌ cannot read {index_path}: {exc}", file=sys.stderr)
+        return 1
+
+    index, findings = plan_index.parse_plan_index(index_text)
+    if index is not None:
+        # Sibling documents are optional context for the drift/goal rules;
+        # an unreadable sibling degrades to "absent" rather than failing a
+        # read-only lint.
+        def _sibling(name: str) -> str | None:
+            path = rdir / name
+            try:
+                return path.read_text(encoding="utf-8") if path.is_file() else None
+            except OSError:
+                return None
+
+        findings = plan_index.lint_plan_index(
+            index, plan_md=_sibling("plan.md"), goals_md=_sibling("goals.md")
+        )
+
+    task_count = len(index.get("tasks") or []) if isinstance(index, dict) else 0
+    print(f"Plan check: {index_path} — {task_count} task(s)")
+    for line in plan_index.format_findings(findings):
+        print(line)
+    errors = [f for f in findings if f.level == "error"]
+    warnings = [f for f in findings if f.level == "warning"]
+    if errors:
+        print(f"❌ plan check failed: {len(errors)} error(s), {len(warnings)} warning(s)")
+        return 1
+    if warnings:
+        print(f"✅ plan check green ({len(warnings)} warning(s) above are non-blocking)")
+    else:
+        print("✅ plan check green: DAG acyclic, write-scopes disjoint, session scopes declared")
+    return 0
+
+
+def _read_goals_md(rdir: Path) -> str | None:
+    """Text of the run's goals.md, or None when absent/unreadable.
+
+    Redacted at read: goal statements, evidence, and topic seed all flow
+    into events.jsonl (goals_frozen/goal_amended payloads, amend diffs), so
+    like every other agent-typed text landing in the shared work repo they
+    must never carry a secret. Redacting the source text ONCE keeps every
+    derived value — canonical goals, diffs, and crucially the hash — computed
+    over the same bytes, so hash comparisons across verbs stay stable
+    (redaction is deterministic, and `work artifact` already redacts the
+    file itself on copy-in).
+    """
+    path = rdir / goals.GOALS_FILE
+    try:
+        text = path.read_text(encoding="utf-8") if path.is_file() else None
+    except OSError:
+        return None
+    return redact_secrets(text) if text is not None else None
+
+
+def _print_goal_findings(findings) -> bool:
+    """Print lint findings; True when any is an error (blocks the verb)."""
+    for line in goals.format_findings(findings):
+        print(line)
+    return any(f.level == "error" for f in findings)
+
+
+def _receipt_names(events: list[dict]) -> set[str]:
+    """Names of recorded verify/gate receipts, for evidence classification."""
+    names: set[str] = set()
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            continue
+        if event.get("type") == "verify" and data.get("name"):
+            names.add(str(data["name"]))
+        elif event.get("type") == "gate" and data.get("gate"):
+            names.add(str(data["gate"]))
+    return names
+
+
+def _cmd_goals_status() -> int:
+    """Bare `work goals`: read-only status display. Always exits 0."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    text = _read_goals_md(rdir)
+    if text is None:
+        print(f"No goals.md in run dir ({rdir})")
+        return 0
+    parsed = goals.parse_goals(text)
+    active = goals.active_goals(parsed)
+    tombstoned = len(parsed["goals"]) - len(active)
+    current_hash = goals.goals_hash(parsed)
+    print(f"Goals: {len(active)} active, {tombstoned} tombstoned ({current_hash})")
+    last = goals.latest_goals_event(run_state.read_events(rdir, last_n=0))
+    if last is None:
+        print("Not frozen — `work goals freeze` records the agreed set at spec approval")
+    elif last["goals_hash"] == current_hash:
+        print("Frozen — goals.md matches the last frozen/amended set")
+    else:
+        print(f"⚠️  DIVERGED from the last frozen/amended set ({last['goals_hash']}) "
+              "— run `work goals amend`")
+    return 0
+
+
+def _cmd_goals_check() -> int:
+    """`work goals check`: read-only draft lint (spec D2). The freeze
+    contract (signal class, evidence) reports as warnings here — drafts may
+    sketch goals before naming their proof — and structural problems error."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    text = _read_goals_md(rdir)
+    if text is None:
+        print(f"No goals.md ({rdir / goals.GOALS_FILE} not found) — nothing to check")
+        return 0
+    parsed = goals.parse_goals(text)
+    findings = goals.validate_goals(parsed)
+    print(f"Goals check: {rdir / goals.GOALS_FILE} — "
+          f"{len(goals.active_goals(parsed))} active goal(s)")
+    has_errors = _print_goal_findings(findings)
+    warnings = [f for f in findings if f.level == "warning"]
+    if has_errors:
+        errors = [f for f in findings if f.level == "error"]
+        print(f"❌ goals check failed: {len(errors)} error(s), {len(warnings)} warning(s)")
+        return 1
+    if warnings:
+        print(f"✅ goals check green ({len(warnings)} warning(s) above become "
+              "errors at freeze)")
+    else:
+        print("✅ goals check green: every goal names its signal and evidence")
+    return 0
+
+
+def _cmd_goals_freeze(note: str | None) -> int:
+    """`work goals freeze`: the spec-approval gate (spec D2 + decision 1).
+
+    Strict-validates goals.md (signal enum + evidence required), records the
+    `goals_frozen` event carrying the canonical goal list + hash — the
+    agreed set every later amend/assess is measured against — registers
+    goals.md in state.artifacts, and invokes the run's pre-execution freeze
+    seam (`freeze_run_dir`: `frozen` stamp + one-shot name-bearing dir
+    rename) when the run is named and not already frozen: both mark the
+    same gate. An UNNAMED run's seam is left to the phase gate instead —
+    the frozen stamp would forfeit the single rename forever, and spec
+    approval can precede the run being named. Re-freezing is an error —
+    post-freeze changes go through amend.
+    """
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    text = _read_goals_md(rdir)
+    if text is None:
+        print(f"❌ No goals.md in the run dir ({rdir}) — draft it during "
+              "spec/brainstorm, then freeze at approval", file=sys.stderr)
+        return 1
+    if goals.latest_goals_event(run_state.read_events(rdir, last_n=0)) is not None:
+        print("❌ Goals are already frozen — use `work goals amend` for changes",
+              file=sys.stderr)
+        return 1
+    parsed = goals.parse_goals(text)
+    if _print_goal_findings(goals.validate_goals(parsed, strict=True)):
+        print("❌ Cannot freeze: fix the errors above (every active goal must "
+              "name its signal class and evidence source)", file=sys.stderr)
+        return 1
+
+    old_dir_name = None
+    if not state.get("frozen"):
+        if not state.get("name"):
+            # A run can still be unnamed at spec approval, and the
+            # frozen stamp would forfeit the one-shot name-bearing rename
+            # forever ("no second chance") — leave the seam to the phase
+            # gate, which fires at the first execution-family transition.
+            print("⚠️  run not named yet — pre-execution freeze left to the "
+                  "phase gate (name the run with `work name`)")
+        else:
+            # Fail-soft like cmd_state's phase-transition freeze: a rename
+            # problem must not block recording the agreed goal set.
+            try:
+                rdir, old_dir_name = run_state.freeze_run_dir(rdir, state)
+            except Exception as exc:
+                print(f"⚠️  pre-execution freeze skipped: {exc}")
+    state.setdefault("artifacts", {})["goals"] = goals.GOALS_FILE
+    run_state.write_state(rdir, state)
+    goals_hash_value = goals.goals_hash(parsed)
+    run_state.append_event(
+        rdir, goals.GOALS_FROZEN_EVENT,
+        note=redact_secrets(note) if note else None,
+        data={
+            "goals_hash": goals_hash_value,
+            "topic_seed": parsed["topic_seed"],
+            "goals": goals.canonical_goals(parsed),
+        },
+    )
+    print(f"✅ Goals frozen: {goals_hash_value} "
+          f"({len(goals.active_goals(parsed))} active goal(s))")
+    _push_run_dir(state, "goals frozen", old_dir_name, saved="goals change")
+    return 0
+
+
+def _cmd_goals_amend(note: str | None) -> int:
+    """`work goals amend`: explicit post-freeze change (spec D2). Validates
+    the edited goals.md against the last agreed set with the
+    tombstone-not-renumber rules and records the `goal_amended` event with
+    the diff — a goals.md edit without this is exactly the silent
+    divergence assess reports."""
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    text = _read_goals_md(rdir)
+    if text is None:
+        print(f"❌ No goals.md in the run dir ({rdir})", file=sys.stderr)
+        return 1
+    last = goals.latest_goals_event(run_state.read_events(rdir, last_n=0))
+    if last is None:
+        print("❌ Goals are not frozen yet — use `work goals freeze`", file=sys.stderr)
+        return 1
+    parsed = goals.parse_goals(text)
+    new_hash = goals.goals_hash(parsed)
+    if new_hash == last["goals_hash"]:
+        print("✅ No changes to amend — goals.md matches the frozen set")
+        return 0
+    if _print_goal_findings(goals.validate_amendment(last["goals"], parsed["goals"])):
+        print("❌ Cannot amend: fix the errors above (removed goals tombstone, "
+              "ids never renumber)", file=sys.stderr)
+        return 1
+    diff = goals.amendment_diff(last["goals"], parsed["goals"])
+    run_state.append_event(
+        rdir, goals.GOAL_AMENDED_EVENT,
+        note=redact_secrets(note) if note else None,
+        data={
+            "old_goals_hash": last["goals_hash"],
+            "new_goals_hash": new_hash,
+            "diff": diff,
+            "topic_seed": parsed["topic_seed"],
+            "goals": goals.canonical_goals(parsed),
+        },
+    )
+    for change in diff:
+        print(f"  {change['id']}: {change['change']}")
+    if diff:
+        print(f"✅ Goals amended: {new_hash} ({len(diff)} change(s))")
+    else:
+        # The hash moved but no goal changed — a topic-seed edit (the only
+        # per-goal-invisible part of the canonical identity).
+        print(f"✅ Goals amended: {new_hash} (topic-seed change)")
+    _push_run_dir(state, "goals amended", saved="goals change")
+    return 0
+
+
+def _cmd_goals_assess(verdict_flags: list[str], note: str | None) -> int:
+    """`work goals assess`: the finish gate (spec D2 + D3, nudge-don't-block).
+
+    Bare: prints the per-goal verdict skeleton for the session to complete
+    into retro.md, plus a divergence report — read-only and never a
+    failure once a run context exists (missing/invalid goals.md degrades
+    to a note over the skeleton path). With repeatable
+    `--verdict 'G<N>=<verdict>:<evidence>'` flags: validates a complete
+    verdict map over every active goal, classifies each evidence string
+    against recorded receipts and registered artifacts (free prose is
+    allowed but marked), records the `goals_assessed` event, and prints the
+    completed table for retro.md. Divergence from the last frozen/amended
+    hash is reported and recorded, never blocking.
+    """
+    recording = bool(verdict_flags)
+    state: dict | None = None
+    if recording:
+        rdir, state = _require_run()
+        if rdir is None:
+            return 1
+    else:
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+            return 0
+    text = _read_goals_md(rdir)
+    if text is None:
+        if recording:
+            print(f"❌ No goals.md in the run dir ({rdir}) — nothing to assess",
+                  file=sys.stderr)
+            return 1
+        # Bare form is the nudge path — a run without goals gets a note,
+        # never a failure (check-verb symmetry).
+        print(f"No goals.md ({rdir / goals.GOALS_FILE} not found) — nothing to assess")
+        return 0
+    parsed = goals.parse_goals(text)
+    if _print_goal_findings(goals.validate_goals(parsed, strict=True)):
+        if recording:
+            print("❌ Cannot record against a goal set that fails strict "
+                  "validation — fix goals.md (and `work goals amend`) first",
+                  file=sys.stderr)
+            return 1
+        # Bare form: report, then still print the skeleton (nudge-don't-block).
+        print("⚠️  goals.md fails strict validation (see above) — fix it "
+              "before recording verdicts")
+
+    events = run_state.read_events(rdir, last_n=0)
+    last = goals.latest_goals_event(events)
+    current_hash = goals.goals_hash(parsed)
+    diverged = last is not None and last["goals_hash"] != current_hash
+    if last is None:
+        print("⚠️  Goals were never frozen — assessing the working goals.md")
+    elif diverged:
+        print(f"⚠️  goals.md has DIVERGED from the last frozen/amended set "
+              f"({last['goals_hash']}) — a silent edit; `work goals amend` "
+              "it or explain in the retro")
+
+    if not recording:
+        print()
+        print(goals.render_verdict_skeleton(parsed["goals"]))
+        receipts = sorted(_receipt_names(events))
+        if receipts:
+            print()
+            print(f"Receipts available to cite as evidence: {', '.join(receipts)}")
+        print("\nRecord with: work goals assess --verdict 'G1=met:<evidence>' …")
+        return 0
+
+    verdicts: dict[str, dict] = {}
+    for flag in verdict_flags:
+        try:
+            goal_id, verdict, evidence = goals.parse_verdict_flag(flag)
+        except ValueError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+        if goal_id in verdicts:
+            print(f"❌ Duplicate --verdict for goal {goal_id}", file=sys.stderr)
+            return 1
+        verdicts[goal_id] = {"verdict": verdict, "evidence": redact_secrets(evidence)}
+    if _print_goal_findings(goals.validate_verdicts(parsed["goals"], verdicts)):
+        print("❌ Cannot record: the assessment must cover every active goal, "
+              "exactly", file=sys.stderr)
+        return 1
+
+    artifact_names: set[str] = set()
+    if isinstance(state, dict):
+        artifacts = state.get("artifacts") or {}
+        artifact_names = {str(v) for v in artifacts.values()} | {str(k) for k in artifacts}
+    receipt_names = _receipt_names(events)
+    for entry in verdicts.values():
+        entry["evidence_kind"] = goals.classify_evidence(
+            entry["evidence"], receipt_names, artifact_names)
+
+    counts = {v: 0 for v in goals.GOAL_VERDICTS}
+    for entry in verdicts.values():
+        counts[entry["verdict"]] += 1
+    summary = ", ".join(f"{v} {counts[v]}" for v in goals.GOAL_VERDICTS if counts[v])
+    data = {"goals_hash": current_hash, "verdicts": verdicts, "diverged": diverged}
+    if last is not None:
+        data["last_agreed_hash"] = last["goals_hash"]
+    run_state.append_event(
+        rdir, goals.GOALS_ASSESSED_EVENT,
+        note=redact_secrets(note) if note else summary + (" (diverged)" if diverged else ""),
+        data=data,
+    )
+    print()
+    print(goals.render_verdict_table(parsed["goals"], verdicts))
+    print()
+    print(f"✅ Goals assessed: {summary} — land the table above in retro.md")
+    _push_run_dir(state, "goals assessed", saved="goals change")
+    return 0
+
+
+def cmd_goals(args) -> int:
+    """Execute goals verbs (issue #91 — frozen goal-sets)."""
+    if args.verdict and args.goals_action != "assess":
+        print("❌ --verdict is only valid with `work goals assess`", file=sys.stderr)
+        return 1
+    if args.note and args.goals_action in (None, "check"):
+        print("❌ --note is only valid with freeze/amend/assess", file=sys.stderr)
+        return 1
+    if args.goals_action == "check":
+        return _cmd_goals_check()
+    if args.goals_action == "freeze":
+        return _cmd_goals_freeze(args.note)
+    if args.goals_action == "amend":
+        return _cmd_goals_amend(args.note)
+    if args.goals_action == "assess":
+        return _cmd_goals_assess(args.verdict, args.note)
+    return _cmd_goals_status()
+
+
+def cmd_resume(as_json: bool = False) -> int:
+    """Execute resume command. Read-only; never breaks a session (always 0)."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    try:
+        state = run_state.load_state(rdir)
+        events = run_state.read_events(rdir, last_n=5)
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"⚠️  Run state unreadable — falling back to worklog. ({exc})")
+        return 0
+    try:
+        ledger = run_state.load_ledger(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        # A broken ledger must not break resume — the brief just omits it.
+        ledger = None
+        print(f"⚠️  ledger unreadable — brief omits it. ({exc})", file=sys.stderr)
+    decision = run_state.decide(
+        state, events, run_state.current_session_id(), ledger=ledger
+    )
+    if decision.get("kind") == "run":
+        # Dirs are renamed by the lifecycle (issue #87 D2), so consumers —
+        # e.g. the stop-hook guard's push check — need the resolved path,
+        # not a slug-derived guess.
+        decision["run_dir"] = str(rdir)
+    if as_json:
+        print(json.dumps(decision, ensure_ascii=False))
+    else:
+        print(run_state.format_brief(decision))
+    return 0
+
+
+def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) -> int:
+    """Execute artifact command (spec §4.3 `work artifact`, §6 `--sync`)."""
+    if sync:
+        # Manual masterplan artifact-link sync (spec §6). Standalone mode:
+        # combining it with a copy invocation is ambiguous — reject cleanly.
+        if name is not None or file_path is not None:
+            print("❌ --sync takes no artifact name or --file", file=sys.stderr)
+            return 1
+        rdir = run_state.run_dir()
+        if rdir is None:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset) — nothing to sync")
+            return 0
+        linked = _sync_masterplan_links()
+        if linked:
+            print(f"✅ Masterplan artifacts linked: {', '.join(linked)}")
+        else:
+            print("No masterplan artifacts to link")
+        return 0
+
+    if name is None:
+        print("❌ artifact requires a name (or --sync)", file=sys.stderr)
+        return 1
+    if file_path is None:
+        print("❌ artifact requires --file/-f (or --sync)", file=sys.stderr)
+        return 1
+    if not name or Path(name).name != name or name.startswith("."):
+        print(f"❌ Invalid artifact name: {name!r} (plain filename required)", file=sys.stderr)
+        return 1
+    reserved = (
+        run_state.STATE_FILE,
+        run_state.LEGACY_STATE_FILE,
+        run_state.EVENTS_FILE,
+        run_state.LEDGER_FILE,
+    )
+    reserved_prefixes = tuple(
+        f"{f}."
+        for f in (run_state.STATE_FILE, run_state.LEGACY_STATE_FILE, run_state.LEDGER_FILE)
+    )
+    if name in reserved or name.startswith(reserved_prefixes):
+        print(f"❌ Reserved artifact name: {name}", file=sys.stderr)
+        return 1
+    source = Path(file_path)
+    if not source.exists():
+        print(f"❌ Artifact source not found: {file_path}", file=sys.stderr)
+        return 1
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    content = redact_secrets(source.read_text(encoding="utf-8"))
+    (rdir / name).write_text(content, encoding="utf-8")
+    state.setdefault("artifacts", {})[Path(name).stem] = name
+    run_state.write_state(rdir, state)
+    run_state.append_event(rdir, "artifact_written", note=name)
+    print(f"✅ Artifact registered: {rdir / name}")
+
+    # Durability: artifacts are exactly what a dead session must not lose —
+    # push the run dir now rather than waiting for session end (non-fatal).
+    # Candidates (resolved + bare-slug dirs) so a rename whose own push
+    # failed still gets its old path's deletions staged here.
+    rc = commit_work_path(
+        run_state.run_rel_path_candidates(),
+        f"run-state: {state['slug']} artifact {name}",
+    )
+    if rc != 0:
+        print("⚠️  Warning: run-state push failed (artifact saved locally)")
+    return 0
+
+
+def cmd_seed(args) -> int:
+    """Execute seed command (issue #87 D3 — out-of-session run creation).
+
+    Creates a run for a slug OTHER than the current session's, through the
+    same create-tmp → write-state → rename lifecycle as session seeding,
+    recording CLI-shaped events (run_seeded, then goal_set / run_named as
+    applicable). Seeding is not owning: no `owner` claim is made. Writes
+    only — the caller batches the push with `work commit`.
+    """
+    base = run_state.runs_base()
+    if base is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+
+    slug = run_state.derive_slug(args.taskdef, args.target)
+    # match_names too: a sibling run NAMED like this slug would make the
+    # new run unfindable by name lookups — refuse the ambiguity outright.
+    existing = run_state.find_run_dir(slug, match_names=True)
+    if existing is not None:
+        print(f"❌ Run '{slug}' already exists at {existing}", file=sys.stderr)
+        return 1
+    if (base / slug).exists():
+        print(f"❌ {base / slug} already exists (stateless dir — not seeding over it)", file=sys.stderr)
+        return 1
+
+    name = None
+    if args.name:
+        name = _validate_name(args.name)
+        if name is None:
+            return 1
+        holder = _name_conflict(base / slug, name)
+        if holder is not None:
+            print(f"❌ Name '{name}' is already held by run '{holder}' (names are unique per project)", file=sys.stderr)
+            return 1
+
+    try:
+        rdir, state = run_state.seed_run_dir(
+            slug,
+            args.taskdef,
+            args.target,
+            note=f"seeded via `work seed` ({args.taskdef}, target: {args.target})",
+            adopt_existing=False,  # seeding must never mutate a run it didn't create
+        )
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+
+    if args.goal:
+        state["goal"] = args.goal
+    if name:
+        state["name"] = name
+    if args.goal or name:
+        run_state.write_state(rdir, state)
+        if args.goal:
+            run_state.append_event(rdir, "goal_set", note=args.goal)
+        if name:
+            run_state.append_event(rdir, "run_named", note=name)
+
+    print(f"✅ Run seeded: {rdir}")
+    print("   Not pushed — run `work commit` to publish it.")
+    return 0
+
+
+def cmd_session_start() -> int:
+    """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
+    ALWAYS exits 0 — a broken state layer must never break session start."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset) — run state skipped")
+        return 0
+    try:
+        recovered = False
+        try:
+            state = run_state.load_state(rdir)
+        except run_state.RunStateError as exc:
+            if run_state._state_path(rdir) is not None:
+                # Newer-schema read-only refusal: the file is intact and must
+                # NOT be reseeded over (same distinction ensure_run makes) —
+                # a schema-1 seed here would silently downgrade a newer
+                # build's run. Fail soft like cmd_session_end.
+                print(f"⚠️  run-state untouched at session start: {exc}")
+                return 0
+            # Corrupt file was backed up by load_state; recover with a fresh seed.
+            state = None
+            recovered = True
+        if state is None:
+            if rdir.exists():
+                # The dir already holds its final name (and possibly other
+                # files, e.g. the backed-up corrupt state) — seed in place.
+                state = run_state.seed_state(
+                    run_state.derive_slug(),
+                    os.environ.get("LMER_TASK", "default"),
+                    os.environ.get("LMER_TASK_TARGET", ""),
+                )
+                run_state.write_state(rdir, state)
+                run_state.append_event(rdir, "run_seeded")
+            else:
+                # Fresh run: create through the tmp-dir-then-rename
+                # lifecycle (issue #87 D2).
+                rdir, state = run_state.seed_run_dir(
+                    run_state.derive_slug(),
+                    os.environ.get("LMER_TASK", "default"),
+                    os.environ.get("LMER_TASK_TARGET", ""),
+                )
+
+        # Decide BEFORE claiming so a foreign claim surfaces as a warning.
+        events = run_state.read_events(rdir, last_n=5)
+        try:
+            ledger = run_state.load_ledger(rdir)
+        except (run_state.RunStateError, OSError):
+            ledger = None
+        decision = run_state.decide(
+            state, events, run_state.current_session_id(), ledger=ledger
+        )
+
+        run_state.append_event(rdir, "session_start")
+        state["owner"] = {
+            "session_id": run_state.current_session_id(),
+            "claimed_at": run_state.utc_now_iso(),
+        }
+        run_state.write_state(rdir, state)
+
+        if recovered:
+            print("⚠️  Previous state.yaml was unreadable (backed up); recovered with a fresh seed.")
+        print(run_state.format_brief(decision))
+    except Exception as exc:  # never break a session (spec §6)
+        print(f"⚠️  run-state session-start failed (continuing): {exc}")
+    return 0
+
+
+def cmd_session_end() -> int:
+    """Record session end and release our claim. Hook-facing: ALWAYS exits 0."""
+    rdir = run_state.run_dir()
+    if rdir is None:
+        return 0
+    # Surface masterplan artifacts at the run-dir root before the final
+    # staging/push (spec §6). Runs before load_state so any registration the
+    # sync writes lands in the state loaded below; fail-soft like the rest.
+    _sync_masterplan_links()
+    try:
+        try:
+            state = run_state.load_state(rdir)
+        except run_state.RunStateError as exc:
+            print(f"⚠️  run-state unreadable at session end: {exc}")
+            return 0
+        if state is None:
+            return 0
+        run_state.append_event(rdir, "session_end")
+        owner = state.get("owner")
+        if isinstance(owner, dict) and owner.get("session_id") == run_state.current_session_id():
+            state["owner"] = None
+        run_state.write_state(rdir, state)
+        rels = run_state.run_rel_path_candidates()
+        rc = commit_work_path(rels, f"run-state: session end {state['slug']}")
+        if rc != 0:
+            print("⚠️  Warning: run-state push failed at session end (state saved locally)")
+    except Exception as exc:
+        print(f"⚠️  run-state session-end failed (continuing): {exc}")
+    return 0
+
+
 def main() -> int:
     """Main entry point for work CLI."""
     parser = create_parser()
@@ -383,6 +1736,45 @@ def main() -> int:
         return cmd_goal(args.description)
     elif args.command == "memory":
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
+    elif args.command == "state":
+        return cmd_state(args)
+    elif args.command == "verify":
+        # The `--` separator is REQUIRED, not decorative: without it,
+        # `work verify -- pytest tests/` (name forgotten) silently parses
+        # as name="pytest", command=["tests/"] and records a receipt named
+        # pytest for a command that never was. argparse consumes the first
+        # `--` itself, so the contract is enforced on the RAW argv.
+        raw = sys.argv[1:]
+        if len(raw) < 3 or raw[2] != "--":
+            print(
+                "❌ verify requires the `--` separator: work verify <name> -- <command …>",
+                file=sys.stderr,
+            )
+            return 1
+        return cmd_verify(raw[1], raw[3:])
+    elif args.command == "event":
+        return cmd_event(args)
+    elif args.command == "name":
+        return cmd_name(args.value)
+    elif args.command == "ledger":
+        return cmd_ledger(args)
+    elif args.command == "goals":
+        return cmd_goals(args)
+    elif args.command == "plan":
+        if args.plan_action == "check":
+            return cmd_plan_check()
+        parser.print_help()
+        return 1
+    elif args.command == "resume":
+        return cmd_resume(args.as_json)
+    elif args.command == "artifact":
+        return cmd_artifact(args.name, args.file, args.sync)
+    elif args.command == "seed":
+        return cmd_seed(args)
+    elif args.command == "session-start":
+        return cmd_session_start()
+    elif args.command == "session-end":
+        return cmd_session_end()
     else:
         print(f"❌ Unknown command: {args.command}", file=sys.stderr)
         return 1

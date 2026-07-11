@@ -7,19 +7,50 @@ import sys
 import os
 import subprocess
 import argparse
+import time
 
 # Add src directory to path for container compatibility
 src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, src_dir)
 
-from lmer_cli.gates import push_gate, Colors
+from lmer_cli.gates import GateSystem, push_gate, Colors, receipt_argv
+
+try:
+    from work_repo.run_state import emit_gate_event
+except ImportError:  # run-state wiring must never break a gate
+    def emit_gate_event(gate, outcome, **kwargs):
+        pass
 
 
 def gate_push(verbose: bool = False):
-    """Run gate checks and push if passed"""
+    """Run gate checks and push if passed.
 
-    result = push_gate(verbose=verbose)
+    Emits exactly ONE gate receipt per invocation, at the end: `outcome`
+    carries the check verdict, `exit_code` the whole command's result —
+    a push that fails after passing checks is pass/exit_code!=0 (#88).
+    """
+    started = time.monotonic()
+    gate = GateSystem(verbose=verbose)
+    result = push_gate(verbose=verbose, gate=gate)
+    outcome = "pass" if result == 0 else "fail"
+
+    def emit(exit_code):
+        # Receipt assembly AND append are fail-soft: no receipt problem may
+        # ever change the gate's exit code.
+        try:
+            emit_gate_event(
+                "gate-push",
+                outcome,
+                exit_code=exit_code,
+                duration_s=time.monotonic() - started,
+                summary=gate.receipt_summary(),
+                argv=receipt_argv(),
+            )
+        except Exception:
+            pass
+
     if result != 0:
+        emit(result)
         return result
 
     # Get current branch
@@ -31,6 +62,7 @@ def gate_push(verbose: bool = False):
 
     if not branch:
         print(f"{Colors.RED}❌ Could not determine current branch{Colors.NC}")
+        emit(1)
         return 1
 
     print(f"{Colors.CYAN}Pushing branch: {branch}{Colors.NC}")
@@ -44,6 +76,7 @@ def gate_push(verbose: bool = False):
     else:
         print(f"{Colors.RED}❌ Push failed{Colors.NC}")
 
+    emit(result.returncode)
     return result.returncode
 
 

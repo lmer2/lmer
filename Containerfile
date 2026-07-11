@@ -163,6 +163,29 @@ RUN mkdir -p /home/developer/.npm-global && \
 ARG CLAUDE_CACHE_BUST=0
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
+# Preinstall the superpowers plugin from the official marketplace so masterplan
+# sessions resolve their dependency locally at start with no network round-trip.
+# Masterplan itself is NOT baked here — it is installed at session start from the
+# work-repo mirror (/work/mirrors/masterplan) when a session opts in via
+# LMER_TASK=masterplan or a truthy LMER_MASTERPLAN (see libexec/claude-runner.sh).
+#
+# CRITICAL: `claude plugin marketplace add`/`install` persist their state
+# (`extraKnownMarketplaces` + `enabledPlugins`) into ~/.claude/settings.json,
+# creating a regular file there. Both runtime settings-link guards
+# (Ctl/container/entrypoint.sh and libexec/claude-runner.sh) only link the global
+# settings.json when it does NOT already exist (`[ ! -e ... ]`), so a baked
+# settings.json would silently shadow the link for EVERY session — dropping the
+# permissions allowlist, hooks, and statusLine. We therefore remove it as the
+# last step of this RUN. The plugin files and install/marketplace records live
+# under ~/.claude/plugins/ (installed_plugins.json, known_marketplaces.json) and
+# survive the removal, so superpowers still resolves offline. With no
+# `enabledPlugins` entry it defaults to disabled, so plain sessions pay no
+# runtime (token) cost and an explicit `disable --all` is unnecessary; masterplan
+# sessions re-enable it as a declared dependency of the masterplan plugin.
+RUN claude plugin marketplace add https://github.com/anthropics/claude-plugins-official && \
+    claude plugin install superpowers@claude-plugins-official && \
+    rm -f /home/developer/.claude/settings.json
+
 # Install Playwright MCP and Browsers
 # We install globally to make the package available, and install browsers to user cache
 # Use mise exec for both commands so node/npm are on PATH for reshimming and playwright
@@ -218,6 +241,15 @@ RUN source .venv/bin/activate && \
 RUN cp -r agent-files/claude/. .claude/
 
 # Note: pre-commit hooks will be installed when running in an actual git repository
+
+# Bake build provenance so any session can answer "what commit is this
+# image?" — /Agents/global has no .git in-container, and on dev hosts the
+# live-mounted subdirs can be NEWER than the image (BUILD_INFO describes
+# the image; LMER_SOURCE_COMMIT in the session env describes the mounts).
+# Placed after the heavy layers so a changing commit doesn't bust cache.
+ARG LMER_BUILD_COMMIT=unknown
+ENV LMER_BUILD_COMMIT=${LMER_BUILD_COMMIT}
+RUN printf '%s\n' "${LMER_BUILD_COMMIT}" > /Agents/global/BUILD_INFO
 
 # Set working directory to /workspace for convenience
 WORKDIR /workspace

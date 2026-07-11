@@ -10,7 +10,7 @@ from unittest.mock import patch, MagicMock
 from io import StringIO
 import sys
 
-from work_repo.cli import cmd_log, create_parser
+from work_repo.cli import cmd_log, cmd_commit, create_parser
 
 
 class TestCmdLog:
@@ -19,7 +19,10 @@ class TestCmdLog:
     def test_log_with_message(self):
         """Test logging with a message"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_file = Path(tmpdir) / "log.yaml"
+            log_file = (
+                Path(tmpdir) / "github.com" / "owner" / "repo"
+                / "runs" / "review-pr-123" / "log.yaml"
+            )
             env_vars = {
                 "LMER_WORK_REPO_PATH": tmpdir,
                 "LMER_REPO_HOST": "github.com",
@@ -46,7 +49,10 @@ class TestCmdLog:
     def test_log_with_message_and_metadata(self):
         """Test logging with message and metadata"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_file = Path(tmpdir) / "log.yaml"
+            log_file = (
+                Path(tmpdir) / "github.com" / "owner" / "repo"
+                / "runs" / "review-pr-123" / "log.yaml"
+            )
             env_vars = {
                 "LMER_WORK_REPO_PATH": tmpdir,
                 "LMER_REPO_HOST": "github.com",
@@ -71,7 +77,10 @@ class TestCmdLog:
     def test_log_with_short_message(self):
         """Test logging with message that's too short"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_file = Path(tmpdir) / "log.yaml"
+            log_file = (
+                Path(tmpdir) / "github.com" / "owner" / "repo"
+                / "runs" / "review-pr-123" / "log.yaml"
+            )
             env_vars = {
                 "LMER_WORK_REPO_PATH": tmpdir,
                 "LMER_REPO_HOST": "github.com",
@@ -106,7 +115,10 @@ class TestCmdLog:
     def test_log_with_exactly_minimum_length(self):
         """Test logging with message that's exactly the minimum length"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_file = Path(tmpdir) / "log.yaml"
+            log_file = (
+                Path(tmpdir) / "github.com" / "owner" / "repo"
+                / "runs" / "review-pr-123" / "log.yaml"
+            )
             env_vars = {
                 "LMER_WORK_REPO_PATH": tmpdir,
                 "LMER_REPO_HOST": "github.com",
@@ -134,7 +146,10 @@ class TestCmdLog:
     def test_log_without_message_displays_recent_entries(self):
         """Test logging without message displays last 50 lines"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_file = Path(tmpdir) / "log.yaml"
+            log_file = (
+                Path(tmpdir) / "github.com" / "owner" / "repo"
+                / "runs" / "review-pr-123" / "log.yaml"
+            )
             env_vars = {
                 "LMER_WORK_REPO_PATH": tmpdir,
                 "LMER_REPO_HOST": "github.com",
@@ -149,32 +164,31 @@ class TestCmdLog:
             log_file.write_text("".join(lines))
 
             with patch.dict(os.environ, env_vars):
-                from work_repo.loggers import YamlFileLogger
-                logger = YamlFileLogger(log_file)
+                captured_output = StringIO()
+                sys.stdout = captured_output
+                try:
+                    result = cmd_log(None, [])
+                    output = captured_output.getvalue()
+                finally:
+                    sys.stdout = sys.__stdout__
 
-                with patch("work_repo.cli.get_logger", return_value=logger):
-                    captured_output = StringIO()
-                    sys.stdout = captured_output
-                    try:
-                        result = cmd_log(None, [])
-                        output = captured_output.getvalue()
-                    finally:
-                        sys.stdout = sys.__stdout__
-
-                    assert result == 0
-                    assert f"Log file: {log_file}" in output
-                    assert "(truncated to last 50 lines)" in output
-                    # Should show last 50 lines (lines 10-59)
-                    assert "Line 10" in output
-                    assert "Line 59" in output
-                    # Should not show first 10 lines
-                    assert "Line 0" not in output
-                    assert "Line 9" not in output
+                assert result == 0
+                assert f"Log file: {log_file}" in output
+                assert "(truncated to last 50 lines)" in output
+                # Should show last 50 lines (lines 10-59)
+                assert "Line 10" in output
+                assert "Line 59" in output
+                # Should not show first 10 lines
+                assert "Line 0" not in output
+                assert "Line 9" not in output
 
     def test_log_without_message_no_log_file(self):
         """Test logging without message when log file doesn't exist"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_file = Path(tmpdir) / "log.yaml"
+            log_file = (
+                Path(tmpdir) / "github.com" / "owner" / "repo"
+                / "runs" / "review-pr-123" / "log.yaml"
+            )
             env_vars = {
                 "LMER_WORK_REPO_PATH": tmpdir,
                 "LMER_REPO_HOST": "github.com",
@@ -184,26 +198,25 @@ class TestCmdLog:
             }
 
             with patch.dict(os.environ, env_vars):
-                from work_repo.loggers import YamlFileLogger
-                logger = YamlFileLogger(log_file)
+                captured_output = StringIO()
+                sys.stdout = captured_output
+                try:
+                    result = cmd_log(None, [])
+                    output = captured_output.getvalue()
+                finally:
+                    sys.stdout = sys.__stdout__
 
-                with patch("work_repo.cli.get_logger", return_value=logger):
-                    captured_output = StringIO()
-                    sys.stdout = captured_output
-                    try:
-                        result = cmd_log(None, [])
-                        output = captured_output.getvalue()
-                    finally:
-                        sys.stdout = sys.__stdout__
-
-                    assert result == 0
-                    assert f"Log file: {log_file}" in output
-                    assert "No log entries found." in output
+                assert result == 0
+                assert f"Log file: {log_file}" in output
+                assert "No log entries found." in output
 
     def test_log_without_message_empty_log_file(self):
         """Test logging without message when log file is empty"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_file = Path(tmpdir) / "log.yaml"
+            log_file = (
+                Path(tmpdir) / "github.com" / "owner" / "repo"
+                / "runs" / "review-pr-123" / "log.yaml"
+            )
             env_vars = {
                 "LMER_WORK_REPO_PATH": tmpdir,
                 "LMER_REPO_HOST": "github.com",
@@ -217,26 +230,25 @@ class TestCmdLog:
             log_file.write_text("")
 
             with patch.dict(os.environ, env_vars):
-                from work_repo.loggers import YamlFileLogger
-                logger = YamlFileLogger(log_file)
+                captured_output = StringIO()
+                sys.stdout = captured_output
+                try:
+                    result = cmd_log(None, [])
+                    output = captured_output.getvalue()
+                finally:
+                    sys.stdout = sys.__stdout__
 
-                with patch("work_repo.cli.get_logger", return_value=logger):
-                    captured_output = StringIO()
-                    sys.stdout = captured_output
-                    try:
-                        result = cmd_log(None, [])
-                        output = captured_output.getvalue()
-                    finally:
-                        sys.stdout = sys.__stdout__
-
-                    assert result == 0
-                    assert f"Log file: {log_file}" in output
-                    assert "No log entries found." in output
+                assert result == 0
+                assert f"Log file: {log_file}" in output
+                assert "No log entries found." in output
 
     def test_log_without_message_less_than_50_lines(self):
         """Test logging without message when there are less than 50 lines"""
         with tempfile.TemporaryDirectory() as tmpdir:
-            log_file = Path(tmpdir) / "log.yaml"
+            log_file = (
+                Path(tmpdir) / "github.com" / "owner" / "repo"
+                / "runs" / "review-pr-123" / "log.yaml"
+            )
             env_vars = {
                 "LMER_WORK_REPO_PATH": tmpdir,
                 "LMER_REPO_HOST": "github.com",
@@ -251,23 +263,19 @@ class TestCmdLog:
             log_file.write_text("".join(lines))
 
             with patch.dict(os.environ, env_vars):
-                from work_repo.loggers import YamlFileLogger
-                logger = YamlFileLogger(log_file)
+                captured_output = StringIO()
+                sys.stdout = captured_output
+                try:
+                    result = cmd_log(None, [])
+                    output = captured_output.getvalue()
+                finally:
+                    sys.stdout = sys.__stdout__
 
-                with patch("work_repo.cli.get_logger", return_value=logger):
-                    captured_output = StringIO()
-                    sys.stdout = captured_output
-                    try:
-                        result = cmd_log(None, [])
-                        output = captured_output.getvalue()
-                    finally:
-                        sys.stdout = sys.__stdout__
-
-                    assert result == 0
-                    assert "(truncated" not in output  # Should not show truncation message
-                    # Should show all 10 lines
-                    for i in range(10):
-                        assert f"Line {i}" in output
+                assert result == 0
+                assert "(truncated" not in output  # Should not show truncation message
+                # Should show all 10 lines
+                for i in range(10):
+                    assert f"Line {i}" in output
 
 
 class TestCreateParser:
@@ -286,3 +294,39 @@ class TestCreateParser:
         args = parser.parse_args(["log"])
         assert args.command == "log"
         assert args.message is None
+
+
+class TestCmdCommit:
+    """cmd_commit wiring for issue #85: it must run the stray-file reminder
+    after committing, and never let the reminder alter the commit's exit code."""
+
+    def test_reports_untracked_after_commit_and_passes_rc_through(self):
+        """Commit runs first, then the reminder; the commit's rc is returned."""
+        order = []
+        with patch("work_repo.cli._sync_masterplan_links", return_value=[]), \
+             patch(
+                 "work_repo.cli.commit_work_changes",
+                 side_effect=lambda m: order.append("commit") or 0,
+             ) as mock_commit, \
+             patch(
+                 "work_repo.cli.report_uncommitted_work_items",
+                 side_effect=lambda: order.append("report") or 3,
+             ) as mock_report:
+            rc = cmd_commit("my message")
+
+        assert rc == 0
+        mock_commit.assert_called_once_with("my message")
+        mock_report.assert_called_once_with()
+        # The reminder must fire AFTER the commit (so a just-committed run dir
+        # is already clean and only genuine leftovers are flagged).
+        assert order == ["commit", "report"]
+
+    def test_reminder_findings_do_not_override_failed_commit_rc(self):
+        """A non-zero commit rc stands even when the reminder finds items."""
+        with patch("work_repo.cli._sync_masterplan_links", return_value=[]), \
+             patch("work_repo.cli.commit_work_changes", return_value=1), \
+             patch(
+                 "work_repo.cli.report_uncommitted_work_items", return_value=5
+             ) as mock_report:
+            assert cmd_commit(None) == 1
+        mock_report.assert_called_once_with()

@@ -76,6 +76,18 @@ if ! $QUIET; then
     echo "🩺 DOCTOR — Container Health Check"
     echo "============================================================"
     detail "Global dir: $GLOBAL_DIR"
+    # Provenance: which code is this, exactly? BUILD_INFO/LMER_BUILD_COMMIT
+    # describe the baked image; LMER_SOURCE_COMMIT describes the host
+    # checkout live-mounted over bin/src/hooks/… (dev mode; empty when the
+    # session runs purely on the baked image).
+    if [[ -f "$GLOBAL_DIR/BUILD_INFO" ]]; then
+        echo "  image build: $(cat "$GLOBAL_DIR/BUILD_INFO")"
+    elif [[ -n "${LMER_BUILD_COMMIT:-}" ]]; then
+        echo "  image build: $LMER_BUILD_COMMIT"
+    fi
+    if [[ -n "${LMER_SOURCE_COMMIT:-}" ]]; then
+        echo "  mounted source: $LMER_SOURCE_COMMIT"
+    fi
 fi
 
 # =============================================================================

@@ -1,0 +1,118 @@
+{% if LMER_REPO_HOST and LMER_REPO_PROJECT %}
+## Durable run state
+
+This session participates in lmer's durable run-state layer. Your run has a
+directory in the work repository (`work state` shows it) holding `state.yaml`
+(authoritative state — never edit it directly; the `work` CLI is the only
+writer), `events.jsonl` (append-only log), and — once the run has a task
+plan — `ledger.yaml` (per-task execution ledger, same single-writer rule).
+{% if run_state_brief %}
+
+### Current run state (read this first)
+
+{{ run_state_brief }}
+
+If the state shows an in-progress run, you are RESUMING it: honor the
+recorded phase, goal, and artifacts instead of starting over. If
+`stop_reason` is `question`, the previous session stopped waiting for a
+human answer — check the conversation/thread for it before doing anything
+else.
+{% endif %}
+
+Ground rules — these come before any work:
+
+- **Never invent work.** If you do not have explicit direction (a stated
+  task, an issue/MR target, or concrete instructions), ask with
+  AskUserQuestion and wait for the answer. What an unanswered question
+  timeout MEANS depends on where the run is:
+  - **Pre-plan** (initial task definition, brainstorming, design/spec/plan
+    approval): a timed-out question means STOP AND WAIT — record
+    `work state set --stop-reason=question` and end your turn. The user
+    will find the open question via the resume brief. Never proceed on a
+    guess.
+  - **Post-plan / resume context** (direction already recorded, picking up
+    where a previous session left off): you may proceed on your best
+    judgment after the timeout.
+- **Once direction is clear, record it before starting:**
+  `work goal "<one-line statement of the task>"`. A run with work happening
+  and no goal recorded is a contract violation, not a shortcut.
+- **Name the run once direction is clear:** derive a short, memorable
+  kebab-case name from the task and record it with `work name <name>`.
+  Do NOT ask the user to confirm the name — pick it yourself and move
+  on (the user can rename at any time with `work name <new-name>`;
+  auto-slugs are unfindable later). Skip this if the resume brief
+  already shows a name.
+- **HARD RULE — commit before every stop that awaits the human.** Every
+  stop that awaits the human — a blocking question, a phasic yield, an
+  approval gate — must be preceded by `work commit`: unpushed artifacts
+  are invisible to the reviewer.
+
+Contract — keep the state truthful as you work. State updates are part of
+the work, not optional bookkeeping:
+
+- Record each phase transition BEFORE starting the phase's work:
+  `work state set --phase=<name>` — treat an unrecorded phase as not
+  started.
+- BEFORE stopping to ask the user a blocking question: `work state set --stop-reason=question`
+- At a phasic phase-end yield: `work state set --stop-reason=yield`
+- On completion: `work state set --status=complete --stop-reason=complete`
+- Only for a genuine unrecoverable failure: `work state set --stop-reason=critical_error --critical-error '{"summary": "...", "detail": "..."}'`
+- To resume work on the run (e.g. it was marked complete but new work arrived): `work state set --status=in-progress --stop-reason=none`
+- Persist durable artifacts (specs, plans, retros): `work artifact <name>.md --file <path>`
+- Log notable moments: `work event <type> --note "..."`
+- **Prove "done" with receipts.** Validation only counts when a tool
+  recorded it: the gate commands (`gate-check`/`gate-commit`/`gate-push`)
+  write gate receipts automatically; for any other validation command run
+  it through `work verify <name> -- <command …>` (streams the output,
+  mirrors the exit code, records a `verify` receipt). Claiming a plan task
+  complete requires a matching `verify`/`gate` receipt from the current
+  session — a "done" with no receipt is prose, not proof.
+- **Plans carry validation contracts.** Give each task in plan.md a
+  `verify: <command or gate>` line naming the command that proves it, and
+  use that name/command when recording the receipt.
+- **Multi-task plans carry a machine-checkable index.** When plan.md has
+  more than one task, author `plan.index.json` beside it (schema 1: per
+  task `id`, `description`, `files` — the declared write-scope as
+  project-relative paths/globs, `deps`, `verify_commands`, and
+  `session_scope: "one"`, or `"multi"` plus a `scope_rationale` saying in
+  writing why it cannot fit one session). Genuinely shared touchpoints
+  (CHANGELOG.yaml, docs indexes) between independent tasks go in a
+  top-level `shared_files` allowlist (`{"T2+T4": ["CHANGELOG.yaml"]}`).
+  Register it: `work artifact plan.index.json --file <path>`.
+- **The plan gate requires a green `work plan check`.** Run the lint
+  BEFORE presenting plan.md for approval and include its output in the
+  approval request — the human approves a plan whose task DAG is checked
+  acyclic, whose independent tasks touch disjoint paths, and whose
+  atomicity declarations are complete. A failing check blocks the plan
+  gate: fix the plan (or declare the shared touchpoint) and re-run until
+  green before asking.
+- **Goals are a frozen contract.** For runs that produce a spec, draft
+  `goals.md` beside it during the interview/brainstorm phase — masterplan
+  format: `## G<N>: <title>` headings, each active goal carrying
+  `signal:` (one of `test|command|artifact|docs`) and `evidence:` naming
+  its evidence source; lint drafts with `work goals check`. The moment the
+  spec is approved, freeze the set:
+  `work goals freeze --note "<approval context>"` — approving the spec IS
+  the freeze. Any later change to goals.md goes through
+  `work goals amend` (removed goals become tombstones, ids never
+  renumber) — never a silent edit; an unamended edit surfaces as
+  divergence at finish. `work plan check` warns on goals no plan task
+  covers.
+- **Assess goals before declaring the run complete.** BEFORE
+  `work state set --status=complete`, run `work goals assess` (bare form
+  prints the skeleton), then record the verdicts:
+  `work goals assess --verdict 'G<N>=<met|partial|missed|waived>:<evidence>'`
+  — one flag per active goal, evidence citing a receipt or registered
+  artifact where possible (free prose is allowed but marked) — and land
+  the printed verdict table in retro.md. Nudge-don't-block: assess never
+  stops you, but a completed run with no assessment is a gap the reviewer
+  will flag.
+- **Ledger every landed task in the same breath as its commit.** The moment
+  a gate-commit lands a plan task, record it before doing anything else:
+  `work ledger set <task-id> --status done --commit <sha> [--receipt <name>]`.
+  Task ids come from plan.md (hand-named ids are fine); `work ledger set`
+  is the ONLY writer of the task↔commit mapping — gates never write it.
+  Mark a task `in-progress` when you start it, `deferred`/`dropped` when it
+  leaves scope. A crashed run's successor recovers by reading `work ledger`
+  — an unledgered commit is invisible to it.
+{% endif %}

@@ -50,6 +50,19 @@ class CheckResult:
 # never committed and needs no per-project configuration.
 GATE_CHECK_LOG_PATH = Path("/tmp/gate-check.log")
 
+# A pytest tail line ("1397 passed in 42.1s", "1 failed, 12 passed in 3s",
+# "no tests ran in 0.01s" is intentionally NOT matched — no count, no claim).
+PYTEST_SUMMARY_RE = re.compile(
+    r"\b\d+ (?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?)\b"
+)
+
+
+def receipt_argv() -> List[str]:
+    """The invocation as run, with the interpreter-resolved path reduced to
+    the command name (receipts record WHAT ran, not where it was installed).
+    Shared by the gate bins so the argv normalization can't drift (#88)."""
+    return [os.path.basename(sys.argv[0])] + sys.argv[1:]
+
 
 class Colors:
     """Terminal colors for output"""
@@ -795,6 +808,29 @@ class GateSystem:
                 warnings += 1
         return failures, warnings
 
+    def receipt_summary(self) -> Optional[str]:
+        """Best-effort one-line summary of this run for gate receipts (#88).
+
+        On a failing run: the names of the critically failed checks. On a
+        passing run: the test runner's own tail line (the pytest summary)
+        when one is parseable from the tests check's captured output. None
+        when neither exists — the receipt's `summary` field is then simply
+        absent, never fabricated.
+        """
+        failed = [
+            result.name for result in self.results
+            if result.status == CheckStatus.FAILED and result.is_critical
+        ]
+        if failed:
+            return "failed: " + ", ".join(failed)
+        for result in self.results:
+            if result.name == "Python Tests" and result.full_output:
+                for line in reversed(result.full_output.splitlines()):
+                    line = line.strip().strip("=").strip()
+                    if PYTEST_SUMMARY_RE.search(line):
+                        return line
+        return None
+
     def print_results(self):
         """Print all check results"""
         print(f"\n{Colors.BLUE}{'═' * 60}{Colors.NC}")
@@ -983,9 +1019,15 @@ class GateSystem:
         return self.run_commit_gate()
 
 
-def commit_gate(verbose: bool = False, debug: bool = False) -> int:
-    """Entry point for commit gate"""
-    gate = GateSystem(verbose=verbose, debug=debug)
+def commit_gate(verbose: bool = False, debug: bool = False,
+                gate: Optional[GateSystem] = None) -> int:
+    """Entry point for commit gate.
+
+    Callers that need the run's results afterwards (e.g. bin/gate-check
+    building its receipt summary) pass their own GateSystem via `gate`.
+    """
+    if gate is None:
+        gate = GateSystem(verbose=verbose, debug=debug)
     if gate.run_commit_gate():
         print(f"\n{Colors.GREEN}You may proceed with commit.{Colors.NC}")
         return 0
@@ -994,9 +1036,14 @@ def commit_gate(verbose: bool = False, debug: bool = False) -> int:
         return 1
 
 
-def push_gate(verbose: bool = False) -> int:
-    """Entry point for push gate"""
-    gate = GateSystem(verbose=verbose)
+def push_gate(verbose: bool = False, gate: Optional[GateSystem] = None) -> int:
+    """Entry point for push gate.
+
+    Like commit_gate, accepts a caller-owned GateSystem so bin/gate-push can
+    read the results back for its receipt summary.
+    """
+    if gate is None:
+        gate = GateSystem(verbose=verbose)
     if gate.run_push_gate():
         print(f"\n{Colors.GREEN}You may proceed with push.{Colors.NC}")
         return 0

@@ -10,7 +10,7 @@ SELinux labeling requirements for Podman.
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterable, List, NamedTuple, Optional, Tuple
 
 from lmer_cli.runtime import _is_selinux_enforcing
 
@@ -239,6 +239,41 @@ def build_user_mounts(runtime: str) -> Tuple[List[str], bool]:
         args += ["-v", f"{ssh_sock}:/ssh-agent:ro{se}", "-e", "SSH_AUTH_SOCK=/ssh-agent"]
         ssh_agent_enabled = True
     return args, ssh_agent_enabled
+
+
+class FileMountSpec(NamedTuple):
+    """A single host-file → container-destination bind mount.
+
+    Produced by ``cli.parse_file_mount_specs`` (which owns all validation);
+    by the time a spec exists, ``host`` is an existing file, ``container``
+    is an absolute path, and ``mode`` is ``ro`` or ``rw``.
+    """
+
+    host: Path
+    container: str
+    mode: str = "ro"
+
+
+def build_file_mounts(runtime: str, specs: Iterable[FileMountSpec]) -> List[str]:
+    """
+    Build volume mounts for explicit per-file mounts (--mount-file).
+
+    Bind-mounts each host file at its container destination, ``ro`` unless
+    the spec asks for ``rw``. The file is mounted as-is — never copied — so
+    credentials stay wherever the user keeps them on the host.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        specs: Validated file-mount specs
+
+    Returns:
+        List of Docker/Podman arguments for the file mounts
+    """
+    se = selinux_opt(runtime)
+    args: List[str] = []
+    for spec in specs:
+        args += ["-v", f"{spec.host}:{spec.container}:{spec.mode}{se}"]
+    return args
 
 
 def _find_container_socket(runtime: str) -> Optional[Path]:

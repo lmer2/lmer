@@ -227,3 +227,41 @@ class TestNormalizeRepoUrl:
         with tempfile.TemporaryDirectory() as tmpdir:
             with pytest.raises(ResolveError):
                 normalize_repo_url("", Path(tmpdir), None)
+
+
+class TestRemapTaskdefToContainer:
+    """_remap_taskdef_to_container — issue #80: the built-in taskdef resolved
+    on the HOST used to pass its host path into the container verbatim."""
+
+    def test_external_mount_remap(self, tmp_path):
+        from lmer_cli.cli import _remap_taskdef_to_container
+
+        host = tmp_path / "core-tasks"
+        (host / "develop").mkdir(parents=True)
+        root, tdir, instr = _remap_taskdef_to_container(
+            host / "develop", [(host, "/Agents/taskdefs/0")], tmp_path / "repo"
+        )
+        assert root == "/Agents/taskdefs/0"
+        assert tdir == "/Agents/taskdefs/0/develop"
+        assert instr == "/Agents/taskdefs/0/develop/instructions.txt"
+
+    def test_builtin_host_path_remaps_to_global_mount(self, tmp_path):
+        from lmer_cli.cli import _remap_taskdef_to_container
+
+        repo = tmp_path / "Agents" / "global"
+        (repo / "taskdef" / "chat").mkdir(parents=True)
+        root, tdir, instr = _remap_taskdef_to_container(
+            repo / "taskdef" / "chat", [], repo
+        )
+        assert root == "/Agents/global/taskdef"
+        assert tdir == "/Agents/global/taskdef/chat"
+        assert instr == "/Agents/global/taskdef/chat/instructions.txt"
+
+    def test_container_path_passes_through(self, tmp_path):
+        from lmer_cli.cli import _remap_taskdef_to_container
+
+        resolved = Path("/Agents/global/taskdef/chat")
+        root, tdir, instr = _remap_taskdef_to_container(resolved, [], None)
+        assert root == "/Agents/global/taskdef"
+        assert tdir == "/Agents/global/taskdef/chat"
+        assert instr == "/Agents/global/taskdef/chat/instructions.txt"

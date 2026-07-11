@@ -76,6 +76,31 @@ Located in `~/.claude/`:
 - `commits.log` - Commits made via pc
 - `violations.log` - Rule violations (if any)
 
+## Claude Code Stop Hooks
+
+### run_state_guard.py
+
+Registered as a `Stop` hook in `agent-files/claude/settings.json` (after
+`slack_reply_guard.py`). When the agent yields, it enforces two independent
+nudges:
+
+- **Run-state recording** - if the workspace shows real activity (feature
+  branch, dirty tree, or unpushed commits) while the run's `phase`, `goal`,
+  or `name` is still unset, the stop is blocked with the exact `work`
+  commands to record them. Fires **once per session**.
+- **Push before stop** - if the run dir in the work repo has uncommitted
+  changes or commits its upstream lacks, the stop is blocked with a
+  `work commit` nudge. Fires on every non-compliant stop, **capped at 3 per
+  session**, so an environment where pushing genuinely fails cannot nag
+  forever.
+
+Kill switch: `LMER_RUN_STATE_GUARD` with `get_bool_env` semantics — unset or
+truthy enables the guard; `LMER_RUN_STATE_GUARD=0` disables it.
+
+The hook fails open: unreadable payload, git errors, `work` failures, or
+sentinel/counter I/O errors all result in exit 0 with no output. It only
+reads state and never mutates the run, the workspace, or the work repo.
+
 ## Testing
 
 ```bash

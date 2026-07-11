@@ -19,7 +19,9 @@ from lmer_cli.runtime import (
     lmer_state_dir,
     base_run_args,
     env_args,
+    _available_controllers,
     _resolve_pids_limit,
+    _user_cgroup_controllers_path,
     DEFAULT_PIDS_LIMIT,
 )
 
@@ -166,6 +168,16 @@ class TestLmerStateDir:
 class TestBaseRunArgs:
     """Test base container run arguments"""
 
+    @pytest.fixture(autouse=True)
+    def _full_controllers(self, monkeypatch):
+        """Pin a rootless euid and fully delegated controllers so tests don't
+        depend on CI cgroup state or on whether CI runs as root."""
+        monkeypatch.setattr("lmer_cli.runtime.os.geteuid", lambda: 1000)
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: {"cpu", "memory", "pids", "io", "cpuset"},
+        )
+
     def test_base_args_docker(self):
         """Test base args for Docker"""
         # Isolate LMER_PIDS_LIMIT from the ambient environment (it may be
@@ -178,6 +190,9 @@ class TestBaseRunArgs:
         assert "docker" in args
         assert "run" in args
         assert "--rm" in args
+        # PID 1 init: reaps zombies now that clone_and_exec.py keeps the
+        # runner as a child (session-end backstop) instead of exec'ing it.
+        assert "--init" in args
         assert "--cpus" in args
         assert "1" in args
         assert "--memory" in args
@@ -332,3 +347,171 @@ class TestEnvArgs:
         """Test env_args handles numeric values"""
         args = env_args({"PORT": 8080})
         assert args == ["-e", "PORT=8080"]
+
+
+class TestAvailableControllers:
+    """Read cgroup v2 controllers delegated to user@<uid>.service.
+
+    A missing/unreadable file (cgroup v1, root, permission error) returns
+    None — the gate does not apply and callers KEEP the resource flags.
+    Only a readable v2 user-slice file returns a set, possibly empty
+    (delegation known-empty — the crun-abort case the gate exists for).
+    """
+
+    def test_returns_set_from_cgroup_file(self, tmp_path, monkeypatch):
+        fake = tmp_path / "cgroup.controllers"
+        fake.write_text("cpuset cpu io memory pids\n")
+        monkeypatch.setattr(
+            "lmer_cli.runtime._user_cgroup_controllers_path",
+            lambda: fake,
+        )
+        assert _available_controllers() == {"cpuset", "cpu", "io", "memory", "pids"}
+
+    def test_returns_none_when_missing(self, tmp_path, monkeypatch):
+        """Missing file means the gate does not apply (cgroup v1, root) —
+        None, NOT an empty set, so callers keep the resource flags."""
+        missing = tmp_path / "does-not-exist"
+        monkeypatch.setattr(
+            "lmer_cli.runtime._user_cgroup_controllers_path",
+            lambda: missing,
+        )
+        assert _available_controllers() is None
+
+    def test_returns_none_on_read_error(self, tmp_path, monkeypatch):
+        fake = tmp_path / "cgroup.controllers"
+        fake.write_text("cpu memory pids\n")
+        # Simulate a Path whose .exists() succeeds but .read_text() raises.
+        original_read_text = type(fake).read_text
+
+        def boom(self, *args, **kwargs):
+            raise PermissionError("nope")
+
+        monkeypatch.setattr(type(fake), "read_text", boom)
+        monkeypatch.setattr(
+            "lmer_cli.runtime._user_cgroup_controllers_path",
+            lambda: fake,
+        )
+        assert _available_controllers() is None
+        monkeypatch.setattr(type(fake), "read_text", original_read_text)
+
+    def test_path_uses_current_uid(self, monkeypatch):
+        monkeypatch.setattr("lmer_cli.runtime.os.getuid", lambda: 4242)
+        p = _user_cgroup_controllers_path()
+        assert str(p) == (
+            "/sys/fs/cgroup/user.slice/user-4242.slice/"
+            "user@4242.service/cgroup.controllers"
+        )
+
+
+class TestBaseRunArgsCgroupGating:
+    """base_run_args drops podman resource flags when controllers aren't delegated."""
+
+    @pytest.fixture(autouse=True)
+    def _rootless(self, monkeypatch):
+        """The gate only applies to rootless podman; pin a non-root euid so
+        these tests exercise it regardless of the CI user."""
+        monkeypatch.setattr("lmer_cli.runtime.os.geteuid", lambda: 1000)
+
+    def test_podman_with_all_controllers_includes_all_flags(self, monkeypatch):
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: {"cpu", "memory", "pids", "io", "cpuset"},
+        )
+        args = base_run_args("podman", False, "developer")
+        assert "--cpus" in args
+        assert "--memory" in args
+        assert "--pids-limit" in args
+
+    def test_podman_without_cpu_drops_cpus_flag(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: {"memory", "pids"},
+        )
+        args = base_run_args("podman", False, "developer")
+        assert "--cpus" not in args
+        assert "--memory" in args
+        assert "--pids-limit" in args
+        captured = capsys.readouterr()
+        # warning() goes to stdout in this codebase; assert it mentions cpu
+        assert "cpu" in captured.out
+
+    def test_podman_with_no_controllers_drops_all_resource_flags(self, monkeypatch):
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: set(),
+        )
+        args = base_run_args("podman", False, "developer")
+        assert "--cpus" not in args
+        assert "--memory" not in args
+        assert "--pids-limit" not in args
+
+    def test_podman_warning_lists_dropped_controllers(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: {"memory"},  # cpu and pids dropped
+        )
+        base_run_args("podman", False, "developer")
+        out = capsys.readouterr().out
+        assert "cpu" in out
+        assert "pids" in out
+        # the hint should point at the systemd drop-in fix
+        assert "user@" in out and "Delegate=" in out
+
+    def test_podman_no_warning_when_all_controllers_present(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: {"cpu", "memory", "pids"},
+        )
+        base_run_args("podman", False, "developer")
+        out = capsys.readouterr().out
+        assert "not delegated" not in out
+
+    def test_docker_keeps_all_flags_regardless_of_controllers(self, monkeypatch):
+        """Docker uses the root daemon; user-slice cgroup state is irrelevant."""
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: set(),
+        )
+        args = base_run_args("docker", False, "developer")
+        assert "--cpus" in args
+        assert "--memory" in args
+        assert "--pids-limit" in args
+
+    def test_podman_gate_not_applicable_keeps_all_flags(self, monkeypatch):
+        """_available_controllers() -> None (cgroup v1, unreadable slice)
+        means prior behavior: pass every resource flag, no warning."""
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: None,
+        )
+        args = base_run_args("podman", False, "developer")
+        assert "--cpus" in args
+        assert "--memory" in args
+        assert "--pids-limit" in args
+
+    def test_podman_as_root_skips_gate_and_keeps_flags(self, monkeypatch, capsys):
+        """Root podman has the controllers at the root cgroup; the user-slice
+        delegation gate must not apply (and must not warn about a user-slice
+        drop-in that would change nothing)."""
+        monkeypatch.setattr("lmer_cli.runtime.os.geteuid", lambda: 0)
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: set(),  # even a worst-case reading must be ignored for root
+        )
+        args = base_run_args("podman", False, "developer")
+        assert "--cpus" in args
+        assert "--memory" in args
+        assert "--pids-limit" in args
+        assert "not delegated" not in capsys.readouterr().out
+
+    def test_podman_pids_flag_honors_lmer_pids_limit(self, monkeypatch):
+        """The gated podman path must pass the RESOLVED LMER_PIDS_LIMIT value,
+        not a hardcoded 512 (regression guard for the reconciliation with
+        _resolve_pids_limit)."""
+        monkeypatch.setattr(
+            "lmer_cli.runtime._available_controllers",
+            lambda: {"cpu", "memory", "pids"},
+        )
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "4096"}):
+            args = base_run_args("podman", False, "developer")
+        assert args[args.index("--pids-limit") + 1] == "4096"

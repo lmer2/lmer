@@ -16,11 +16,14 @@ must not import from lmer_cli or work_repo modules.
 from __future__ import annotations
 
 import os
+import random
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -596,6 +599,74 @@ def provision_documentation(
     return provisioned
 
 
+def _forward_signals(proc: subprocess.Popen) -> None:
+    """Forward SIGTERM/SIGINT to the runner child.
+
+    The runner used to be exec'd in our place, so docker's signals reached it
+    directly; now that it is a child (see dispatch_runner), relay them so
+    `docker stop` still reaches the supervisor/claude tree.
+    """
+
+    def _relay(signum, _frame):
+        try:
+            proc.send_signal(signum)
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, _relay)
+    signal.signal(signal.SIGINT, _relay)
+
+
+def run_state_session_end() -> None:
+    """Harness-side run-state release — backstop for the SessionEnd hook.
+
+    Claude Code fires SessionEnd hooks without blocking its exit on them, and
+    the container tears down within about a second of claude exiting — which
+    kills the hook's work-repo push mid-flight. Running `work session-end`
+    here, after the runner returns but while the container is still alive,
+    makes the owner release and session_end event durable on every exit path
+    short of a hard container kill. Safe when the hook did complete: the
+    duplicate session_end event is harmless audit detail and the owner clear
+    is a no-op.
+    """
+    work = shutil.which("work")
+    if not work:
+        return
+    try:
+        subprocess.call([work, "session-end"], timeout=180)
+    except Exception as e:  # teardown cleanup must never fail the session
+        print(f"⚠️  run-state session-end failed (continuing): {e}", file=sys.stderr)
+
+
+def mint_session_id() -> None:
+    """Ensure LMER_SESSION_ID exists BEFORE the runner spawns.
+
+    The id used to be minted only inside claude-runner.sh — a child — so it
+    never reached this process, and the session-end backstop above ran as
+    session "unknown": cmd_session_end clears `owner` only when the claim
+    matches the current session, so the claim this backstop exists to
+    release was left behind. Minting here (runner.sh's `${LMER_SESSION_ID:-…}`
+    preserves an inherited value) gives runner, hooks, and backstop one id.
+    A host-injected id is preserved the same way (setdefault).
+    """
+    os.environ.setdefault(
+        "LMER_SESSION_ID",
+        f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
+        f"-{os.getpid()}-{random.randint(0, 32767)}",
+    )
+
+
+def dispatch_runner(runner: str) -> int:
+    """Run claude-runner as a child (not execv) so post-session teardown can
+    run while the container is still alive. Returns the runner's exit code."""
+    mint_session_id()
+    proc = subprocess.Popen([runner])
+    _forward_signals(proc)
+    rc = proc.wait()
+    run_state_session_end()
+    return rc
+
+
 def main(argv: list[str] | None = None) -> int:
     """
     Container entrypoint main function.
@@ -756,8 +827,7 @@ def main(argv: list[str] | None = None) -> int:
     # Dispatch
     if len(cmd_tokens) == 1 and cmd_tokens[0] == "claude-runner":
         runner = find_runner()
-        os.execv(runner, [runner])
-        return 0
+        return dispatch_runner(runner)
 
     # Otherwise, treat tokens as a command to exec via bash -lc
     cmd_str = " ".join(shlex.quote(t) for t in cmd_tokens)

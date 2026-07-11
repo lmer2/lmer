@@ -7,17 +7,64 @@ import sys
 import os
 import subprocess
 import argparse
+import time
 
 # Add src directory to path to use source files, not installed package
 src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, src_dir)
 
-from lmer_cli.gates import GateSystem, Colors
+from lmer_cli.gates import GateSystem, Colors, receipt_argv
 from lmer_cli.util import get_bool_env
+
+try:
+    from work_repo.run_state import emit_gate_event
+except ImportError:  # run-state wiring must never break a gate
+    def emit_gate_event(gate, outcome, **kwargs):
+        pass
+
+
+def _head_sha():
+    """Best-effort sha of HEAD immediately after the commit; None when
+    unreadable. Never raises — receipts are fail-soft."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=False
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception:
+        pass
+    return None
 
 
 def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
-    """Run gate checks and commit if passed"""
+    """Run gate checks and commit if passed.
+
+    Emits exactly ONE gate receipt per invocation, at the end, so the
+    receipt can carry the whole-command exit code and — when a commit
+    actually landed (pass or bypass) — the resulting commit sha (#88).
+    """
+    started = time.monotonic()
+    gate = None
+    outcome = "bypass" if bypass else None
+
+    def emit(exit_code, with_sha=False):
+        # Receipt assembly AND append are fail-soft: no receipt problem may
+        # ever change the gate's exit code (emit_gate_event guards its own
+        # body, but summary/argv/sha assembly runs out here).
+        try:
+            emit_gate_event(
+                "gate-commit",
+                outcome,
+                exit_code=exit_code,
+                duration_s=time.monotonic() - started,
+                summary=gate.receipt_summary() if gate is not None else None,
+                argv=receipt_argv(),
+                commit_sha=_head_sha() if with_sha else None,
+            )
+        except Exception:
+            pass
 
     if bypass:
         print(f"{Colors.YELLOW}{Colors.BOLD}⚠️  GATE COMMIT - Bypassing checks{Colors.NC}\n")
@@ -35,7 +82,10 @@ def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
         gate = GateSystem(verbose=verbose)
         if not gate.run_commit_gate(skip_tests=skip_tests):
             print(f"\n{Colors.RED}❌ Commit aborted due to gate failures{Colors.NC}")
+            outcome = "fail"
+            emit(1)
             return 1
+        outcome = "pass"
 
     # Check for Claude attribution in commit message
     claude_patterns = ["co-authored-by: claude", "co-authored-by: anthropic", "claude opus", "claude sonnet", "claude haiku", "noreply@anthropic.com"]
@@ -44,18 +94,22 @@ def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
         if pattern in msg_lower:
             print(f"\n{Colors.RED}❌ Commit message contains Claude attribution: '{pattern}'{Colors.NC}")
             print(f"{Colors.RED}   Remove it and try again.{Colors.NC}")
+            emit(1)
             return 1
 
     # Commit with message
-    print(f"\n{Colors.GREEN}✅ Gate checks passed!{Colors.NC}")
+    if outcome == "pass":
+        print(f"\n{Colors.GREEN}✅ Gate checks passed!{Colors.NC}")
     print(f"{Colors.CYAN}Committing with message: {message}{Colors.NC}")
 
     result = subprocess.run(["git", "commit", "-m", message], check=False)
 
     if result.returncode == 0:
         print(f"{Colors.GREEN}✅ Commit successful!{Colors.NC}")
+        emit(0, with_sha=True)
     else:
         print(f"{Colors.RED}❌ Commit failed{Colors.NC}")
+        emit(result.returncode)
 
     return result.returncode
 

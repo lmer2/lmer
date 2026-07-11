@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Optional
 import yaml
 
-from .utils import redact_secrets, _collect_secret_values, task_target_dir
+from .run_state import run_dir
+from .utils import redact_secrets, _collect_secret_values
 
 
 class Logger(ABC):
@@ -96,16 +97,17 @@ def get_logger(log_file: Optional[Path] = None) -> Logger:
         Logger instance
     """
     if log_file is None:
-        # Determine log file path from environment variables
-        tgt_dir = task_target_dir()
-
-        if tgt_dir is None:
+        # The run dir is the single home for run output (issue #87 D4):
+        # log.yaml lives at the run root, resolved rename-proof through the
+        # run-state kernel.
+        rdir = run_dir()
+        if rdir is None:
             raise ValueError(
                 "LMER_REPO_HOST and LMER_REPO_PROJECT must be set to determine log file path"
             )
 
-        # Build path: {host}/{project}/{task_type}/{task_target}/log.yaml
-        log_file = tgt_dir / "log.yaml"
+        # Build path: {host}/{project}/runs/{slug}/log.yaml
+        log_file = rdir / "log.yaml"
 
     # Check for logger type from environment
     logger_type = os.environ.get("WORK_LOGGER_TYPE", "yaml").lower()

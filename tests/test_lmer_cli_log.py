@@ -97,3 +97,33 @@ class TestLogFunctions:
             assert "error 1" in captured.out
             assert "warning 1" in captured.out
             assert "info 2" in captured.out
+
+
+class TestLogFlush:
+    """Output must be flushed immediately (block-buffered stdout regression).
+
+    print() is block-buffered when stdout is not a TTY, so anyone wrapping
+    `lmer` in tee/timeout/pipe sees nothing until the process exits. The
+    helpers must pass flush=True to print().
+    """
+
+    def test_info_flushes_stdout(self):
+        with patch.dict(os.environ, {"LMER_VERBOSE": "1"}):
+            with patch("lmer_cli.log.print") as mock_print:
+                info("hello")
+                mock_print.assert_called_once_with("hello", flush=True)
+
+    def test_success_flushes_stdout(self):
+        with patch("lmer_cli.log.print") as mock_print:
+            success("ok")
+            mock_print.assert_called_once_with("ok", flush=True)
+
+    def test_error_flushes_stdout(self):
+        with patch("lmer_cli.log.print") as mock_print:
+            error("boom")
+            mock_print.assert_called_once_with("boom", flush=True)
+
+    def test_warning_flushes_stdout(self):
+        with patch("lmer_cli.log.print") as mock_print:
+            warning("careful")
+            mock_print.assert_called_once_with("careful", flush=True)

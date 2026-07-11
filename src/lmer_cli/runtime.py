@@ -65,6 +65,39 @@ def _is_selinux_enforcing() -> bool:
         return False
 
 
+def _user_cgroup_controllers_path() -> Path:
+    """Path to cgroup.controllers for the current user's systemd user slice."""
+    uid = os.getuid()
+    return Path(
+        f"/sys/fs/cgroup/user.slice/user-{uid}.slice/"
+        f"user@{uid}.service/cgroup.controllers"
+    )
+
+
+def _available_controllers() -> "set[str] | None":
+    """Cgroup v2 controllers delegated to the user's systemd slice.
+
+    Returns the (possibly empty) controller set read from the user slice's
+    ``cgroup.controllers``, or ``None`` when the delegation gate does not
+    apply — the file is missing or unreadable (cgroup v1 hosts, root podman
+    where ``user@0.service`` typically doesn't exist, exotic layouts).
+
+    ``None`` and ``set()`` are deliberately distinct: an *empty set* means
+    "cgroup v2 user slice exists and nothing is delegated" (the crun-abort
+    case the gate exists for), while ``None`` means "we cannot tell —
+    keep prior behavior and pass the resource flags unchanged." Collapsing
+    the two would silently drop the ``--pids-limit`` fork-bomb bound on
+    hosts where the limits worked fine before.
+    """
+    try:
+        path = _user_cgroup_controllers_path()
+        if not path.exists():
+            return None
+        return set(path.read_text().split())
+    except OSError:
+        return None
+
+
 def detect_runtime() -> str:
     """
     Detect available container runtime on the system.
@@ -198,6 +231,55 @@ def _resolve_pids_limit() -> str:
     return DEFAULT_PIDS_LIMIT
 
 
+def _resource_limit_args(runtime: str) -> List[str]:
+    """
+    Resource-limit flags (CPU, memory, PIDs), gated where required.
+
+    crun aborts when --cpus is set but the cpu controller isn't delegated
+    to the user slice, so ROOTLESS podman on cgroup v2 gates each flag on
+    delegation. The gate is scoped to exactly that case: root podman
+    (controllers available at the root cgroup) and hosts where the
+    user-slice controllers file is missing/unreadable (cgroup v1, no user
+    manager) keep the prior always-pass behavior — dropping flags there
+    would silently shed the --pids-limit fork-bomb bound on hosts where
+    the limits worked fine. Docker (root daemon) always passes the flags.
+    """
+    flag_specs = [
+        ("--cpus", "1", "cpu"),
+        ("--memory", "2g", "memory"),
+        ("--pids-limit", _resolve_pids_limit(), "pids"),
+    ]
+    controllers = None
+    if runtime == "podman" and os.geteuid() != 0:
+        controllers = _available_controllers()
+    if controllers is None:
+        # Gate does not apply (docker, root, cgroup v1, unreadable slice) —
+        # pass all resource flags.
+        return [arg for flag, value, _controller in flag_specs for arg in (flag, value)]
+
+    args: List[str] = []
+    dropped: list[str] = []
+    for flag, value, controller in flag_specs:
+        if controller in controllers:
+            args += [flag, value]
+        else:
+            dropped.append(controller)
+    if dropped:
+        uid = os.getuid()
+        dropped_flags = [f for f, _, c in flag_specs if c in dropped]
+        warning(
+            f"⚠️  cgroup controllers not delegated to user@{uid}.service: "
+            f"{', '.join(dropped)} — dropping flags: {', '.join(dropped_flags)}"
+        )
+        warning(
+            "   To enable, create /etc/systemd/system/user@.service.d/delegate.conf:"
+        )
+        warning("     [Service]")
+        warning("     Delegate=cpu cpuset io memory pids")
+        warning("   then: sudo systemctl daemon-reload")
+    return args
+
+
 def base_run_args(runtime: str, exec_mode: bool, user: str) -> List[str]:
     """
     Build base container run arguments.
@@ -218,16 +300,25 @@ def base_run_args(runtime: str, exec_mode: bool, user: str) -> List[str]:
         List of base Docker/Podman arguments
     """
     args: List[str] = [runtime, "run", "--rm"]
+    # PID 1 init (tini): reap orphaned grandchildren and forward signals.
+    # clone_and_exec.py runs the claude-runner as a child (session-end
+    # backstop) instead of exec'ing it, so without an init the Python
+    # process is PID 1 and zombies accumulate unreaped.
+    args += ["--init"]
     args += tty_flags()
-    # Resource limits and security
-    args += ["--cpus", "1", "--memory", "2g", "--pids-limit", _resolve_pids_limit(), "--security-opt", "no-new-privileges"]
+    args += ["--security-opt", "no-new-privileges"]
     # Disable SELinux labeling to allow SSH agent socket access
     # Container processes (container_t) cannot connect to user sockets (unconfined_t) by default
     if _is_selinux_enforcing():
         args += ["--security-opt", "label=disable"]
-    # Podman-specific: maintain user ID mapping for SSH agent and file permissions
+
+    # Resource limits (CPU, memory, PIDs), gated on rootless podman where
+    # delegation requires it — see _resource_limit_args.
+    args += _resource_limit_args(runtime)
     if runtime == "podman":
+        # Podman-specific: maintain user ID mapping for SSH agent and file permissions
         args += ["--userns=keep-id"]
+
     # User and workdir
     args += ["--user", user, "-w", "/workspace"]
     return args

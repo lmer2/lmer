@@ -1,7 +1,9 @@
 """Read and concatenate project info files."""
 
-from typing import List
+from pathlib import Path
+from typing import List, Optional
 
+from .run_state import run_dir
 from .utils import project_info_dir, task_info_dir, task_target_dir
 
 
@@ -14,8 +16,11 @@ def read_project_info() -> str:
     - {host}/{project}/{task_type}/info/ (project+task specific info)
 
     Also reports:
-    - If log.yaml exists in the task target directory (with absolute path)
-    - List of report files (.md files) in the task target directory, sorted by modification time (most recent first), with absolute paths
+    - If log.yaml exists in the run dir (falling back to the legacy task
+      target directory for pre-unification runs), with absolute path
+    - List of report files: .md files under the run dir's reports/ plus the
+      legacy task target directory, sorted by modification time (most
+      recent first), with absolute paths
 
     Returns:
         Concatenated content of all .md files, plus log and report file information
@@ -52,8 +57,10 @@ def read_project_info() -> str:
             except IOError as e:
                 content_parts.append(f"Error reading {md_file}: {e}\n")
 
-    # Check for log.yaml and report files in task target directory
+    # Log and report files live in the run dir (issue #87 D4); the legacy
+    # task target directory is read-side fallback for pre-unification runs.
     tgt_dir = task_target_dir()
+    rdir: Optional[Path] = run_dir()
 
     info_sections: List[str] = []
 
@@ -63,25 +70,35 @@ def read_project_info() -> str:
     else:
         info_sections.append("No info files found in project or task-specific info directories.")
 
-    # Check for log.yaml
-    log_file = tgt_dir / "log.yaml"
-    if log_file.exists():
-        info_sections.append(f"\n---\n\n## Task Related Work Log File\n\nLog file exists: {log_file.resolve()}")
+    # Check for log.yaml: run dir first, legacy task target dir as fallback
+    log_candidates = []
+    if rdir is not None:
+        log_candidates.append(rdir / "log.yaml")
+    log_candidates.append(tgt_dir / "log.yaml")
+    for log_file in log_candidates:
+        if log_file.exists():
+            info_sections.append(f"\n---\n\n## Task Related Work Log File\n\nLog file exists: {log_file.resolve()}")
+            break
 
-    # Check for report files (.md files in task target directory)
-    if tgt_dir.exists() and tgt_dir.is_dir():
-        # Get all .md files, excluding hidden files
-        report_files = [
-            f for f in tgt_dir.glob("*.md")
-            if f.is_file() and not f.name.startswith(".")
-        ]
+    # Check for report files: run dir reports/ plus the legacy location
+    report_dirs = []
+    if rdir is not None:
+        report_dirs.append(rdir / "reports")
+    report_dirs.append(tgt_dir)
+    report_files = [
+        f
+        for report_dir in report_dirs
+        if report_dir.exists() and report_dir.is_dir()
+        for f in report_dir.glob("*.md")
+        if f.is_file() and not f.name.startswith(".")
+    ]
 
-        if report_files:
-            # Sort by modification time, most recent first
-            report_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    if report_files:
+        # Sort by modification time, most recent first
+        report_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
 
-            info_sections.append("\n---\n\n## Task Related Report Files\n")
-            for report_file in report_files:
-                info_sections.append(f"- {report_file.resolve()}")
+        info_sections.append("\n---\n\n## Task Related Report Files\n")
+        for report_file in report_files:
+            info_sections.append(f"- {report_file.resolve()}")
 
     return "\n".join(info_sections)

@@ -9,6 +9,7 @@ import importlib.metadata
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .log import error, success
@@ -45,6 +46,48 @@ def delete_image(runtime: str, image: str) -> bool:
         return False
 
 
+def checkout_commit(repo_root: Path | None) -> str | None:
+    """Short commit of a git checkout, with a ``-dirty`` suffix when the
+    tree has uncommitted changes. None when not a checkout (installed mode)
+    or git is unavailable."""
+    if repo_root is None or not (repo_root / ".git").exists():
+        return None
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+        )
+        if rev.returncode != 0:
+            return None
+        commit = rev.stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+        )
+        if status.returncode == 0 and status.stdout.strip():
+            commit += "-dirty"
+        return commit
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def _build_provenance(repo_root: Path) -> str:
+    """Human-readable provenance string baked into the image (BUILD_INFO)."""
+    commit = checkout_commit(repo_root) or "unknown"
+    branch = "unknown"
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(repo_root), capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            branch = result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    built = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return f"{commit} ({branch}) built={built}"
+
+
 def build_image_local(runtime: str, image: str, repo_root: Path, pull: bool = True, update_claude: bool = False) -> int:
     """Build container image from local repo checkout (developer mode)."""
     import time
@@ -60,6 +103,7 @@ def build_image_local(runtime: str, image: str, repo_root: Path, pull: bool = Tr
         *(["--pull"] if pull else []),
         "--build-arg", f"BUILD_UID={uid}",
         "--build-arg", f"BUILD_GID={gid}",
+        "--build-arg", f"LMER_BUILD_COMMIT={_build_provenance(repo_root)}",
         *claude_args,
         "-t", image,
         "-f", "Containerfile",
