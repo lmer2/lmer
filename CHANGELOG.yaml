@@ -7,6 +7,15 @@
 # https://github.com/lmer2/lmer/issues.
 
 unreleased:
+  added: []
+  changed: []
+  fixed: []
+  deprecated: []
+  removed: []
+  security: []
+
+"0.2.0":
+  date: "2026-07-11"
   added:
     - "`work commit` now flags leftover work: after committing, it prints a reminder listing any untracked/unstaged items still present anywhere in the work repo (repo-wide `git status --porcelain`, capped at 10 entries with a `... and N more` tail), so a file added outside the run dir — e.g. a new `{host}/{project}/info/*.md` — is no longer silently left uncommitted. The reminder is fail-soft (a `git status` hiccup never changes `work commit`'s exit code) and fires only for the user-facing `work commit`, not the low-level path-scoped commits behind `work state set` / ledger / artifact writes (#85)"
     - "`--mount-file HOST:CONTAINER[:MODE]` CLI flag (repeatable) and `LMER_MOUNT_FILES` env var (comma-separated entries, same grammar) to bind-mount individual host files — kubeconfigs, credential files, tool configs — to explicit container destinations. `HOST` gets `~`/`$VAR` expansion and must be an existing file, `CONTAINER` must be absolute, `MODE` is `ro` (default) or `rw`; env entries apply before flags and duplicate destinations resolve last-wins with a warning. Validation is fail-fast: any invalid entry aborts the run instead of launching without a credential the user explicitly asked for. Files are bind-mounted as-is (never copied) with automatic SELinux labeling. Design: docs/superpowers/specs/2026-06-24-mount-file-credentials-design.md"
@@ -135,6 +144,7 @@ unreleased:
     - "Auto `/start` no longer occasionally fails to submit. Three layers cover the failure modes: (1) the supervisor pre-clears `ICRNL`/`ECHO`/`ICANON` on the PTY before fork when auto-start is enabled, so the injected `/start\\r` is delivered to Claude as raw CR (not CR→LF mangled to a literal newline by the default cooked-mode line discipline) and is not echoed back to the host TTY as visible blank lines pushing the banner upward; (2) injection is deferred until Claude's input-prompt glyph (`❯`) appears in the output stream, so any startup modal/dialog (theme picker, IDE detect, permission prompt, etc.) has finished consuming Enter keystrokes — Claude Code v2.1.119 changed Enter routing so an open dialog consumes the submit CR instead of also submitting input-box text, which made the previous time-based injection race against the dialog; (3) the initial `/start\\r` is followed by a few bare carriage-return nudges that re-trigger submission if the initial Enter is swallowed during a startup re-render (each nudge is a no-op once `/start` has gone through). Tune the nudge gap with `--auto-start-nudge-delay` / `LMER_AUTO_START_NUDGE_DELAY` (default 0.5s), the prompt-ready wait with `--auto-start-ready-timeout` / `LMER_AUTO_START_READY_TIMEOUT` (default 15s; 0 disables marker gating), and override the prompt-ready marker bytes with `LMER_AUTO_START_READY_MARKER` (UTF-8; default `❯`; empty string disables marker gating) so a future Claude UI change can be patched without a release (#37)"
   deprecated: []
   removed:
+    - "Stale `__version__ = \"0.1.0\"` strings from `src/gitlab_reviewer`, `src/github_reviewer`, and `src/work_repo` — nothing imported them and they were never bumped with releases (the package version lives in `pyproject.toml` alone), so they only existed to drift"
     - "`docker-compose`-dependent Makefile targets (`make up`, `down`, `restart`, `shell`, `test-container`, `test-fips`, `pre-commit`, `logs`, `status`, `clean`, `clean-all`, `install-hooks`, `exec`, `root-shell`, `quicktest`, `commit-check`) and the `claude-safe` wrapper. The repo no longer ships a `docker-compose.yml`; use `make build` plus `make lmer`/`make lmer-shell` (or `./lmer` directly) instead"
     - install-global.sh (replaced by uv tool install)
     - loading `.env` from the host-side runtime install directory (was previously sourced from `~/Agents/global/.env`); use `~/.lmer/.env` or the project repo's `.env` instead
