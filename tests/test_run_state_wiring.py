@@ -8,9 +8,21 @@ import inspect
 import json
 import re
 from pathlib import Path
+
+import pytest
 from jinja2 import Environment, FileSystemLoader
 
 REPO_ROOT = Path(__file__).parent.parent
+
+
+@pytest.fixture
+def absent_session_id(monkeypatch):
+    # setenv-then-delenv guarantees restore-to-absent: delenv(raising=False)
+    # on an absent var records no undo, so the id dispatch_runner mints via
+    # os.environ.setdefault (outside monkeypatch's tracking) would leak into
+    # the test process.
+    monkeypatch.setenv("LMER_SESSION_ID", "x")
+    monkeypatch.delenv("LMER_SESSION_ID")
 
 
 class TestSessionIdMinting:
@@ -21,7 +33,9 @@ class TestSessionIdMinting:
         assert 'LMER_SESSION_ID:-' in runner, \
             "a host-injected LMER_SESSION_ID must be preserved"
 
-    def test_dispatch_runner_mints_id_shared_with_backstop(self, monkeypatch):
+    def test_dispatch_runner_mints_id_shared_with_backstop(
+        self, monkeypatch, absent_session_id
+    ):
         # The id must exist BEFORE the runner spawns (the child inherits it;
         # runner.sh preserves it) and still be the same when the session-end
         # backstop runs in THIS process — otherwise the backstop releases
@@ -29,7 +43,6 @@ class TestSessionIdMinting:
         import os
         from lmer_cli.container import clone_and_exec
 
-        monkeypatch.delenv("LMER_SESSION_ID", raising=False)
         seen = {}
 
         class FakeProc:
@@ -268,7 +281,9 @@ class TestHarnessSessionEndBackstop:
     exits (Claude fires SessionEnd hooks without blocking exit on them, so
     the in-claude hook's push can be killed by container teardown)."""
 
-    def test_dispatch_runner_runs_session_end_after_runner(self, monkeypatch):
+    def test_dispatch_runner_runs_session_end_after_runner(
+        self, monkeypatch, absent_session_id
+    ):
         from lmer_cli.container import clone_and_exec
         calls = []
 
