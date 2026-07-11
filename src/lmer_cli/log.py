@@ -26,7 +26,7 @@ def info(msg: str) -> None:
         msg: Message to print
     """
     if is_verbose():
-        print(msg)
+        print(msg, flush=True)
 
 
 def success(msg: str) -> None:
@@ -39,7 +39,7 @@ def success(msg: str) -> None:
     Args:
         msg: Success message to print
     """
-    print(msg)
+    print(msg, flush=True)
 
 
 def error(msg: str) -> None:
@@ -49,7 +49,7 @@ def error(msg: str) -> None:
     Args:
         msg: Error message to print
     """
-    print(msg)
+    print(msg, flush=True)
 
 
 def warning(msg: str) -> None:
@@ -59,4 +59,4 @@ def warning(msg: str) -> None:
     Args:
         msg: Warning message to print
     """
-    print(msg)
+    print(msg, flush=True)
