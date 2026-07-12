@@ -7,6 +7,15 @@
 # https://github.com/lmer2/lmer/issues.
 
 unreleased:
+  added: []
+  changed: []
+  fixed: []
+  deprecated: []
+  removed: []
+  security: []
+
+"0.3.0":
+  date: "2026-07-12"
   added:
     - "Base taskdef template `taskdef/base-task.jinja2`: the shared spine of every task document as ordered, individually overridable Jinja blocks (intro → run-state contract → branch setup → self-dev → Phase 0 tools → project-info mandate → secrets → clean-state gate-check → the required per-task `task_phases` middle → changelog → phasic → delivery → close-out → DO-NOT list with a `do_not_extra` extension point). Schema-2 taskdef bodies `{% extends 'base-task.jinja2' %}` and override only what makes them that task; the shared partials `provider-tooling.jinja2`, `phasic.jinja2`, and `self-dev.jinja2` now ship in the builtin taskdef tier. See docs/TASKDEFS.md"
     - "Taskdef schema versioning: a source root may declare its schema in a `taskdef.yaml` manifest (`schema: 2`); an absent manifest means schema 1 (legacy include-style, rendered exactly as before). The renderer checks the manifest of every source root the render actually consults — the rendered file's own root and each parent tier it extends from; manifests in unused tiers are never consulted — and an unsupported schema fails `/start` loudly, naming the source, its schema, and the supported set"
