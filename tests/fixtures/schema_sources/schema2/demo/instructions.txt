@@ -1,0 +1,8 @@
+{% extends 'base-task.jinja2' %}
+{% block intro %}# Demo Task
+
+A schema-2 fixture body used by the renderer tests.{% endblock %}
+{% block task_phases %}## Phase 1: Demo work
+
+Do the demo work.{% endblock %}
+{% block do_not_extra %}- HARD RULE: DO NOT be used outside tests{% endblock %}

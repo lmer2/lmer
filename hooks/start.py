@@ -15,7 +15,18 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 import json
+import yaml
 from jinja2 import Environment, FileSystemLoader, Template
+from jinja2 import nodes as jinja_nodes
+
+# Taskdef schema versions this renderer understands (docs/TASKDEFS.md).
+# Schema 1 is the legacy include-style layout (no manifest); schema 2 adds
+# `{% extends 'base-task.jinja2' %}` bodies over the builtin base template.
+# A source root declares its schema in a `taskdef.yaml` manifest; an absent
+# manifest means schema 1 (grandfather clause).
+SUPPORTED_TASKDEF_SCHEMAS = (1, 2)
+
+TASKDEF_MANIFEST = "taskdef.yaml"
 
 
 def _is_github_host(host):
@@ -199,12 +210,223 @@ def find_taskdef_instructions(taskdef_name=None):
     return None
 
 
+class TaskdefRenderError(Exception):
+    """A taskdef failed schema validation or the block lint.
+
+    Raised (never swallowed) so `/start` and `/followup` fail loudly with the
+    message instead of rendering a silently-wrong prompt.
+    """
+
+
+def taskdef_source_root(template_file):
+    """The source-root directory ``template_file`` actually resolved from.
+
+    The root is the directory whose ``taskdef.yaml`` manifest governs the
+    file: the matching ``taskdef_search_dirs()`` entry when the file came
+    through the canonical search, else the parent of ``LMER_TASKDEF_DIR`` /
+    the ``LMER_TASK_INSTRUCTIONS`` taskdef dir (the CLI fast-paths — both
+    point at the taskdef directory itself, one level below the root). Only
+    the root a file RESOLVED from is consulted — manifests in unused tiers
+    can never affect a session.
+    """
+    resolved = template_file.resolve()
+    for search_dir in taskdef_search_dirs():
+        try:
+            resolved.relative_to(search_dir.resolve())
+        except (ValueError, OSError):
+            continue
+        return search_dir
+    for var in ("LMER_TASKDEF_DIR", "LMER_TASK_INSTRUCTIONS"):
+        value = os.environ.get(var)
+        if not value:
+            continue
+        fast_dir = Path(value)
+        if var == "LMER_TASK_INSTRUCTIONS":
+            fast_dir = fast_dir.parent
+        try:
+            resolved.relative_to(fast_dir.resolve())
+        except (ValueError, OSError):
+            continue
+        return fast_dir.parent
+    # Conventional layout fallback: <root>/<taskdef>/<file>.
+    return template_file.parent.parent
+
+
+def read_taskdef_schema(source_root):
+    """Schema version declared by ``source_root``'s ``taskdef.yaml``.
+
+    Absent manifest → schema 1 (legacy, rendered exactly as before manifests
+    existed). A manifest that cannot be parsed or carries a non-integer
+    ``schema`` raises TaskdefRenderError — a broken manifest must fail loudly,
+    not silently downgrade to legacy rendering. Booleans are explicitly
+    rejected: ``schema: true`` is a YAML bool, and ``isinstance(True, int)``
+    would otherwise let it sail through as schema 1.
+    """
+    manifest = Path(source_root) / TASKDEF_MANIFEST
+    if not manifest.exists():
+        return 1
+    try:
+        data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise TaskdefRenderError(
+            f"❌ ERROR: unreadable {TASKDEF_MANIFEST} at {manifest}: {exc}"
+        )
+    schema = data.get("schema") if isinstance(data, dict) else None
+    if isinstance(schema, bool) or not isinstance(schema, int):
+        raise TaskdefRenderError(
+            f"❌ ERROR: {manifest} must declare an integer `schema:` "
+            f"(supported: {', '.join(str(s) for s in SUPPORTED_TASKDEF_SCHEMAS)})"
+        )
+    return schema
+
+
+def _require_supported_schema(source_root, schema):
+    """Raise TaskdefRenderError when ``schema`` is outside the supported set,
+    naming the source, its schema, and the supported set."""
+    if schema not in SUPPORTED_TASKDEF_SCHEMAS:
+        raise TaskdefRenderError(
+            f"❌ ERROR: taskdef source {source_root} declares schema "
+            f"{schema}, but this renderer supports: "
+            f"{', '.join(str(s) for s in SUPPORTED_TASKDEF_SCHEMAS)}. "
+            "Upgrade lmer or pin a compatible taskdef source "
+            "(LMER_TASKDEF_REF)."
+        )
+
+
+def check_taskdef_schema(template_file):
+    """Validate the schema of the source ``template_file`` resolved from.
+
+    Returns ``(source_root, schema)``. Raises TaskdefRenderError when the
+    declared schema is not in SUPPORTED_TASKDEF_SCHEMAS.
+    """
+    source_root = taskdef_source_root(template_file)
+    schema = read_taskdef_schema(source_root)
+    _require_supported_schema(source_root, schema)
+    return source_root, schema
+
+
+def _template_extends_chain(env, template_name, _seen=None):
+    """Names of the templates ``template_name`` (transitively) extends.
+
+    Only literal `{% extends '...' %}` targets are followed — a dynamic
+    extends expression cannot be resolved statically and is skipped.
+    """
+    if _seen is None:
+        _seen = set()
+    if template_name in _seen:
+        return []
+    _seen.add(template_name)
+    source, _, _ = env.loader.get_source(env, template_name)
+    ast = env.parse(source, name=template_name)
+    chain = []
+    for ext in ast.find_all(jinja_nodes.Extends):
+        if isinstance(ext.template, jinja_nodes.Const):
+            parent = ext.template.value
+            chain.append(parent)
+            chain.extend(_template_extends_chain(env, parent, _seen))
+    return chain
+
+
+def lint_template_blocks(env, template_name):
+    """Render-time block lint: every top-level override block in a child
+    template must exist somewhere in its parent chain.
+
+    Jinja silently ignores a child block whose name is unknown to the parent
+    — a renamed/removed base block would silently drop content from every
+    extending body. This walks the template AST (``env.parse`` →
+    ``Extends``/``Block`` nodes — deliberately NOT ``template.blocks``, a
+    flat dict that cannot distinguish a top-level override from a new block
+    nested inside an overridden block, which is legal Jinja and must not be
+    flagged). Raises TaskdefRenderError on any violation; a template with no
+    literal extends is exempt.
+    """
+    source, _, _ = env.loader.get_source(env, template_name)
+    ast = env.parse(source, name=template_name)
+    parents = _template_extends_chain(env, template_name)
+    if not parents:
+        return
+    top_level = []
+
+    def collect(node, inside_block):
+        for child in node.iter_child_nodes():
+            if isinstance(child, jinja_nodes.Block):
+                if not inside_block:
+                    top_level.append(child.name)
+                collect(child, True)
+            else:
+                collect(child, inside_block)
+
+    collect(ast, False)
+
+    parent_blocks = set()
+    for parent in parents:
+        psource, _, _ = env.loader.get_source(env, parent)
+        past = env.parse(psource, name=parent)
+        for block in past.find_all(jinja_nodes.Block):
+            parent_blocks.add(block.name)
+
+    unknown = [name for name in top_level if name not in parent_blocks]
+    if unknown:
+        raise TaskdefRenderError(
+            f"❌ ERROR: template {template_name} overrides block(s) "
+            f"{', '.join(sorted(unknown))} that do not exist in its parent "
+            f"chain ({' -> '.join(parents)}). Jinja would silently drop "
+            "them. Fix the block name(s), or if a base block was "
+            "renamed/removed this is a taskdef schema bump — see "
+            "docs/TASKDEFS.md."
+        )
+
+
+def taskdef_source_banner(env, template_file, checked=None):
+    """Greppable per-template source/schema banner lines.
+
+    One ``taskdef source: <dir> (schema <n>)`` line for the rendered file's
+    source root, plus one per parent template it (transitively) extends —
+    labelled with the parent's name — so cross-tier shadowing of the base or
+    a partial is always observable in the `/start` output.
+
+    Every consulted source root is schema-gated, parents included — a tier
+    that shadows ``base-task.jinja2`` under an unsupported schema fails the
+    render here, before any banner line is emitted. ``checked`` takes the
+    rendered file's already-validated ``(source_root, schema)`` pair so the
+    caller's gate isn't re-run; when omitted the check runs here.
+    """
+    lines = []
+    source_root, schema = (
+        checked if checked is not None else check_taskdef_schema(template_file)
+    )
+    lines.append(f"taskdef source: {source_root} (schema {schema})")
+    taskdef_dir = template_file.parent.parent
+    template_name = str(template_file.relative_to(taskdef_dir))
+    for parent in _template_extends_chain(env, template_name):
+        _, filename, _ = env.loader.get_source(env, parent)
+        # The loader resolved `<search_path>/<parent>` — strip the template
+        # name to recover the search path, which IS the parent's source root
+        # (base templates and partials live at the root of their tier).
+        parent_root = Path(filename).parent
+        for _ in range(len(Path(parent).parts) - 1):
+            parent_root = parent_root.parent
+        parent_schema = read_taskdef_schema(parent_root)
+        _require_supported_schema(parent_root, parent_schema)
+        lines.append(
+            f"taskdef source ({parent}): {parent_root} "
+            f"(schema {parent_schema})"
+        )
+    return lines
+
+
 def render_taskdef_template(template_file, extra_context=None):
     """Render a task-definition template file with LMER_* env vars as context.
 
     Sets up a Jinja2 environment that can resolve `{% include %}` references
     against the current taskdef's parent directory, any LMER_TASKDEF_PATHS
-    entries, and the built-in taskdef root. Returns the rendered string.
+    entries, and the built-in taskdef root. Validates the source's declared
+    taskdef schema and runs the block lint before rendering, and prints the
+    greppable `taskdef source: <dir> (schema <n>)` banner for the rendered
+    template and its parent base — both `/start` and `/followup` render
+    through here, so both surface the same banner. Returns the rendered
+    string; raises TaskdefRenderError on an unsupported schema or a block
+    lint violation.
     """
     taskdef_dir = template_file.parent.parent
     search_paths = [str(taskdef_dir)]
@@ -234,6 +456,16 @@ def render_taskdef_template(template_file, extra_context=None):
     env = Environment(loader=FileSystemLoader(search_paths))
 
     template_name = template_file.relative_to(taskdef_dir)
+
+    # Schema + block-lint validation, then the greppable source banner —
+    # all BEFORE rendering so a bad source fails loudly instead of
+    # producing a silently-wrong prompt. The banner reuses the schema-check
+    # result and additionally gates every parent tier it reports on.
+    checked = check_taskdef_schema(template_file)
+    lint_template_blocks(env, str(template_name))
+    for line in taskdef_source_banner(env, template_file, checked=checked):
+        print(line)
+
     template = env.get_template(str(template_name))
 
     context = {k: v for k, v in os.environ.items() if k.startswith('LMER_')}
@@ -277,14 +509,18 @@ def read_and_display_instructions(instructions_file, work_mode="finish"):
     print(f"📍 Location: {instructions_file}")
     print("\n" + "="*60)
 
-    rendered_content = render_taskdef_template(
-        instructions_file,
-        extra_context={
-            'instructions_file': str(instructions_file),
-            'work_mode': work_mode,
-            'run_state_brief': run_state_session_start(),
-        },
-    )
+    try:
+        rendered_content = render_taskdef_template(
+            instructions_file,
+            extra_context={
+                'instructions_file': str(instructions_file),
+                'work_mode': work_mode,
+                'run_state_brief': run_state_session_start(),
+            },
+        )
+    except TaskdefRenderError as exc:
+        print(exc)
+        return False
     print(rendered_content)
 
     print("="*60 + "\n")

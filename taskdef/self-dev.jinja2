@@ -1,0 +1,12 @@
+{% if LMER_SELF_DEV == "1" %}
+## Self-Development Mode Active
+
+You are working on the lmer repository itself. Special rules apply:
+
+- **Your development checkout** is `/workspace/` — this is where ALL your edits happen
+- **The operational runtime** at `/Agents/global/` is what is currently running you — **DO NOT modify it**
+- Gate commands (`gate-check`, `gate-commit`, `gate-push`) resolve from `/workspace/bin/` — this is correct
+- Hooks and slash commands work normally (symlinked from `/Agents/global/agent-files/`)
+- Changes you make in `/workspace/` will NOT affect your current session — they are development copies, not the operational ones
+- `PYTHONPATH` is set to `/workspace/src` so `pytest` and Python imports use your development code, not the installed package
+{% endif %}

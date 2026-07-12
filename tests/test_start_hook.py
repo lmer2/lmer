@@ -16,6 +16,9 @@ from hooks.start import (
 )
 from tests.conftest import strip_lmer_env
 
+FIXTURES = Path(__file__).parent / "fixtures" / "schema_sources"
+REPO_TASKDEF = Path(__file__).parent.parent / "taskdef"
+
 
 @pytest.fixture(autouse=True)
 def _clean_lmer_env(monkeypatch):
@@ -465,3 +468,219 @@ class TestIncludeResolutionDefense:
 
         monkeypatch.chdir(tmp_path)
         assert taskdef_search_dirs()[-1] == builtin_taskdef_root()
+
+
+@pytest.fixture
+def _repo_builtin_root(monkeypatch):
+    """Pin builtin_taskdef_root() to this checkout's taskdef/ so the tests
+    exercise the base template under development, not a container mount."""
+    monkeypatch.setattr(
+        "hooks.start.builtin_taskdef_root", lambda: REPO_TASKDEF
+    )
+    monkeypatch.setenv("LMER_TASKDEF_ROOT", str(REPO_TASKDEF))
+
+
+def _render(source_root, name="demo", extra=None):
+    from hooks.start import render_taskdef_template
+
+    context = {"work_mode": "finish", "run_state_brief": ""}
+    context.update(extra or {})
+    return render_taskdef_template(
+        source_root / name / "instructions.txt", context
+    )
+
+
+class TestTaskdefSchemaVersioning:
+    """taskdef.yaml manifests: supported-schema gate + source banner."""
+
+    def test_schema2_body_extends_builtin_base(
+        self, monkeypatch, _repo_builtin_root, capsys
+    ):
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(FIXTURES / "schema2"))
+        out = _render(FIXTURES / "schema2")
+        assert out.startswith("# Demo Task")
+        assert "## Phase 1: Demo work" in out
+        # Inherited spine from base-task.jinja2:
+        assert "## Phase -1: Branch Setup" in out
+        assert "DO NOT be used outside tests" in out
+        banner = capsys.readouterr().out
+        assert (
+            f"taskdef source: {FIXTURES / 'schema2'} (schema 2)" in banner
+        )
+        assert (
+            f"taskdef source (base-task.jinja2): {REPO_TASKDEF} (schema 1)"
+            in banner
+        )
+
+    def test_absent_manifest_is_schema1_legacy(
+        self, monkeypatch, _repo_builtin_root, capsys
+    ):
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(FIXTURES / "schema1"))
+        out = _render(FIXTURES / "schema1")
+        assert out.startswith("# Legacy Demo Task")
+        assert "Work mode: finish" in out
+        banner = capsys.readouterr().out
+        assert (
+            f"taskdef source: {FIXTURES / 'schema1'} (schema 1)" in banner
+        )
+
+    def test_unsupported_schema_fails_naming_source_and_supported_set(
+        self, monkeypatch, _repo_builtin_root
+    ):
+        from hooks.start import TaskdefRenderError
+
+        monkeypatch.setenv(
+            "LMER_TASKDEF_PATHS", str(FIXTURES / "schema-unsupported")
+        )
+        with pytest.raises(TaskdefRenderError) as exc:
+            _render(FIXTURES / "schema-unsupported")
+        message = str(exc.value)
+        assert str(FIXTURES / "schema-unsupported") in message
+        assert "schema 99" in message
+        assert "1, 2" in message
+
+    def test_malformed_manifest_fails_loudly(
+        self, monkeypatch, _repo_builtin_root, tmp_path
+    ):
+        from hooks.start import TaskdefRenderError
+
+        (tmp_path / "taskdef.yaml").write_text("schema: not-an-int\n")
+        taskdef = tmp_path / "demo"
+        taskdef.mkdir()
+        (taskdef / "instructions.txt").write_text("# X\n")
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(tmp_path))
+        with pytest.raises(TaskdefRenderError) as exc:
+            _render(tmp_path)
+        assert "schema" in str(exc.value)
+
+    def test_boolean_schema_fails_loudly(
+        self, monkeypatch, _repo_builtin_root, tmp_path
+    ):
+        """`schema: true` is a YAML bool; bool-is-int must not let it render
+        as schema 1 (the silent downgrade read_taskdef_schema promises can't
+        happen)."""
+        from hooks.start import TaskdefRenderError
+
+        (tmp_path / "taskdef.yaml").write_text("schema: true\n")
+        taskdef = tmp_path / "demo"
+        taskdef.mkdir()
+        (taskdef / "instructions.txt").write_text("# X\n")
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(tmp_path))
+        with pytest.raises(TaskdefRenderError) as exc:
+            _render(tmp_path)
+        assert "integer `schema:`" in str(exc.value)
+
+    def test_unsupported_schema_in_parent_tier_fails(
+        self, monkeypatch, _repo_builtin_root, tmp_path
+    ):
+        """A tier that shadows base-task.jinja2 under an unsupported schema
+        must fail the render, not just surface the schema in the banner —
+        every consulted source root is gated, parents included."""
+        import shutil
+
+        from hooks.start import TaskdefRenderError
+
+        shadow = tmp_path / "shadow-tier"
+        shadow.mkdir()
+        shutil.copy(REPO_TASKDEF / "base-task.jinja2", shadow)
+        (shadow / "taskdef.yaml").write_text("schema: 99\n")
+        monkeypatch.setenv(
+            "LMER_TASKDEF_PATHS", f"{FIXTURES / 'schema2'}:{shadow}"
+        )
+        with pytest.raises(TaskdefRenderError) as exc:
+            _render(FIXTURES / "schema2")
+        message = str(exc.value)
+        assert str(shadow) in message
+        assert "schema 99" in message
+
+    def test_manifest_in_unused_tier_is_never_consulted(
+        self, monkeypatch, _repo_builtin_root, tmp_path
+    ):
+        """A stale/broken manifest in a tier the file did not resolve from
+        must not affect the session (spec: only the resolved root's manifest
+        is checked)."""
+        stale = tmp_path / "stale-tier"
+        stale.mkdir()
+        (stale / "taskdef.yaml").write_text("schema: 99\n")
+        monkeypatch.setenv(
+            "LMER_TASKDEF_PATHS",
+            f"{FIXTURES / 'schema2'}:{stale}",
+        )
+        out = _render(FIXTURES / "schema2")
+        assert out.startswith("# Demo Task")
+
+    def test_taskdef_dir_fastpath_reads_parent_manifest(
+        self, monkeypatch, _repo_builtin_root, tmp_path
+    ):
+        """LMER_TASKDEF_DIR fast-path: the source root is the taskdef dir's
+        parent, and its manifest governs (covers the CLI's pre-resolved
+        path)."""
+        from hooks.start import check_taskdef_schema
+
+        (tmp_path / "taskdef.yaml").write_text("schema: 2\n")
+        taskdef = tmp_path / "demo"
+        taskdef.mkdir()
+        (taskdef / "instructions.txt").write_text("# X\n")
+        monkeypatch.delenv("LMER_TASKDEF_PATHS", raising=False)
+        monkeypatch.setenv("LMER_TASKDEF_DIR", str(taskdef))
+        root, schema = check_taskdef_schema(taskdef / "instructions.txt")
+        assert root == tmp_path
+        assert schema == 2
+
+
+class TestBlockLint:
+    """Render-time block lint over the template AST."""
+
+    def test_unknown_toplevel_override_fails(
+        self, monkeypatch, _repo_builtin_root
+    ):
+        from hooks.start import TaskdefRenderError
+
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(FIXTURES / "lint-bad"))
+        with pytest.raises(TaskdefRenderError) as exc:
+            _render(FIXTURES / "lint-bad")
+        message = str(exc.value)
+        assert "task_phasez" in message
+        assert "base-task.jinja2" in message
+
+    def test_new_block_nested_in_override_is_legal(
+        self, monkeypatch, _repo_builtin_root, tmp_path
+    ):
+        (tmp_path / "taskdef.yaml").write_text("schema: 2\n")
+        taskdef = tmp_path / "demo"
+        taskdef.mkdir()
+        (taskdef / "instructions.txt").write_text(
+            "{% extends 'base-task.jinja2' %}\n"
+            "{% block intro %}# N "
+            "{% block brand_new_nested %}nested{% endblock %}"
+            "{% endblock %}\n"
+            "{% block task_phases %}## P{% endblock %}\n"
+        )
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(tmp_path))
+        out = _render(tmp_path)
+        assert "nested" in out
+
+    def test_template_without_extends_is_exempt(
+        self, monkeypatch, _repo_builtin_root
+    ):
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(FIXTURES / "schema1"))
+        out = _render(FIXTURES / "schema1")
+        assert out.startswith("# Legacy Demo Task")
+
+    def test_read_and_display_fails_soft_with_message(
+        self, monkeypatch, _repo_builtin_root, tmp_path
+    ):
+        """/start integration: a lint violation makes
+        read_and_display_instructions return False and print the error."""
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(FIXTURES / "lint-bad"))
+        with patch("hooks.start.Path.home", return_value=tmp_path):
+            f = io.StringIO()
+            with redirect_stdout(f):
+                ok = read_and_display_instructions(
+                    FIXTURES / "lint-bad" / "demo" / "instructions.txt",
+                    "finish",
+                )
+        assert ok is False
+        output = f.getvalue()
+        assert "❌ ERROR" in output
+        assert "task_phasez" in output
