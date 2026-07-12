@@ -1,0 +1,4 @@
+# Legacy Demo Task
+
+A schema-1 (manifest-less) fixture body: plain text, no extends.
+Work mode: {{ work_mode }}

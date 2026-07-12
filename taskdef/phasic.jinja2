@@ -1,0 +1,17 @@
+{% if work_mode == "phasic" -%}
+## Phasic workflow
+You are to take a phasic approach to this work.
+
+This means:
+
+1. Checking the worklog to understand what needs to be done next
+2. When submitting work logs include the current phase you're working on
+3. Clearly define a stopping point where your work on this phase is complete and you will wait for the user to review your work or give you new instructions.
+    a. Use the `work goal <goal description>` command to set your goal for this phase.
+    b. Often run `work goal` without parameters to remember your current goal. (checking it regularly should be part of your todo list, if you maintain one.)
+    c. You must file a report using the work command at the completion of the phase. This is vital to transfer findings, progress and other information between phases.
+    d. Your todo list must only encompass the completion of the current phase.
+    e. Record the yield in run state before stopping: `work state set --stop-reason=yield` — the next session's resume brief depends on it.
+
+YOU MUST STOP AFTER COMPLETION OF A PHASE AND YIELD BACK TO THE USER.
+{% endif %}

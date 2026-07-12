@@ -25,11 +25,122 @@ Tasks are discovered from multiple sources, in this precedence order
 2. **Work-repo global** — `{work_repo}/taskdef/`, applies to every project.
 3. **`LMER_TASKDEF_PATHS`** — colon-separated list of extra directories
    passed via the environment.
-4. **Built-in** — the `taskdef/` directory shipped with this repository.
+4. **`/taskdef`** — the clone of `LMER_TASKDEF_REPO`, when configured. The
+   CLI appends it after any user-supplied `LMER_TASKDEF_PATHS` entries;
+   `LMER_TASKDEF_REF` pins the clone to a branch/tag/SHA (the rollback
+   lever).
+5. **Built-in** — the `taskdef/` directory shipped with this repository.
 
 This lets a project ship a customised taskdef in its work-repo project
 directory that shadows the built-in one (or adds a new task type) without
 touching the agents/global repo.
+
+## Tier ownership
+
+Each tier has one clear owner:
+
+- **Built-in (`taskdef/` in this repo)** — the base taskdef templates and
+  shared partials: `base-task.jinja2` (the shared document skeleton), the
+  cross-cutting partials (`run-state.jinja2`, `service-mode.jinja2`,
+  `changelog.jinja2`, `provider-tooling.jinja2`, `phasic.jinja2`,
+  `self-dev.jinja2`), and the `chat` taskdef as the zero-config fallback.
+  Everything here is generic. Changing a template here means a release of
+  this repo.
+- **The dedicated taskdef content repo (`LMER_TASKDEF_REPO`)** — the real
+  task bodies (`develop`, `followup`, `review`, `modernize`, `masterplan`):
+  schema-2 `{% raw %}{% extends 'base-task.jinja2' %}{% endraw %}` bodies
+  that override named blocks and contain only what makes each task itself.
+  Prompt iteration is a push to that repo — no image rebuild. The content
+  repo's CI proves its bodies render against a pinned base via the render
+  matrix's external-source mode: from a checkout of this repo at the pinned
+  tag, `LMER_RENDER_SOURCE=<clone of the content repo> uv run pytest
+  tests/test_taskdef_render_matrix.py -q` renders every taskdef directory
+  under the given path — honoring its root `taskdef.yaml` — against that
+  checkout's built-in base.
+- **Work repo** — override tiers. The project tier customises one project;
+  the global tier customises every project. **Work-repo-only mode is
+  first-class**: with no dedicated taskdef or napkin repo configured, the
+  work repo alone serves both (taskdefs from `{work_repo}/taskdef/`
+  extending the built-in base across tiers, napkin at `{work_repo}/napkin/`
+  captured by `work commit`). One work repo, nothing else.
+
+## The base template
+
+`taskdef/base-task.jinja2` defines the shared spine of every task document
+as ordered, individually overridable Jinja blocks: `intro` → `service_mode`
+→ `run_state` → `branch_setup` → `self_dev` → `phase0_tools` (containing
+`provider_tooling`) → `project_info` → `secrets` → `clean_gate` →
+`task_phases` → `changelog` → `phasic` → `delivery` → `close_out` →
+`do_not` (containing `do_not_extra`).
+
+A schema-2 body extends the base and overrides only what makes it that
+task. `intro` and `task_phases` are the required per-task pieces —
+`task_phases` is the task's own workflow and renders empty if not
+overridden. Add task-specific HARD RULES via `do_not_extra` instead of
+replacing the whole `do_not` list; extend a block while keeping its base
+content with `{% raw %}{{ super() }}{% endraw %}`.
+
+## Schema versioning
+
+A taskdef *source root* (any directory on the precedence list) declares its
+schema in a `taskdef.yaml` manifest:
+
+```yaml
+schema: 2
+```
+
+- **Schema 1 (legacy)** — include-style bodies, rendered exactly as before
+  manifests existed. **An absent manifest means schema 1** — this
+  grandfather clause keeps existing work-repo and `LMER_TASKDEF_PATHS`
+  collections working unchanged.
+- **Schema 2** — bodies may extend `base-task.jinja2` and override its
+  blocks; the block lint (below) applies.
+
+The renderer declares the schemas it supports and checks the manifest of
+**every source root the render actually consults**: the root the rendered
+file resolved from, and the root of each parent template it (transitively)
+extends — the same roots the source banner reports, so a tier that shadows
+`base-task.jinja2` under an unsupported schema is gated too. A manifest in
+an unused tier is never consulted, so a stale manifest in an inactive tier
+cannot break sessions. An unsupported schema in any consulted root fails
+`/start` loudly, naming the source, its schema, and the supported set. Cross-source skew is
+what schema versioning guards; *within* schema 2, base evolution is guarded
+by the block-interface stability policy below.
+
+## Shadowing and source banners
+
+Because all tiers share one loader search path, **template shadowing across
+tiers is a supported override feature**: a work-repo tier can shadow not
+just whole taskdefs but also `base-task.jinja2` or any shared partial (e.g.
+patching one shared block for a single deployment) — no loader
+configuration needed.
+
+To keep shadowing observable, `/start` prints a greppable banner naming the
+resolved source of the rendered template and of every parent template it
+extends:
+
+```
+taskdef source: /taskdef (schema 2)
+taskdef source (base-task.jinja2): /Agents/global/taskdef (schema 1)
+```
+
+`/followup` prints the same for `followup.txt`, which resolves
+independently through `find_taskdef_file` — a taskdef's `instructions.txt`
+and `followup.txt` can straddle tiers.
+
+## Block-interface stability policy
+
+Jinja **silently ignores** a child block whose name no longer exists in the
+parent — renaming or removing a base block would silently drop content from
+every extending body while everything still renders green. Two guards:
+
+1. **Renaming or removing a block in `base-task.jinja2` is a schema bump.**
+   Treat the block set as a public interface.
+2. **The renderer lints blocks at render time**: every top-level override
+   block a child defines must exist somewhere in its parent chain, or
+   `/start` fails loudly. The lint walks the template AST (`env.parse` →
+   `Extends`/`Block` nodes), so a *new* block nested inside an overridden
+   block — legal Jinja — is not flagged.
 
 ## Template format
 

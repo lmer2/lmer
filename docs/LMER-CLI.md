@@ -113,6 +113,8 @@ The following environment variables control LMER behavior:
 
 - **`LMER_TASKDEF_REF`** - Optional git ref/branch/tag to pin the `LMER_TASKDEF_REPO` clone for reproducibility. Forwarded into the container and passed to the clone checkout. When unset, the repo's default branch is used.
 
+- **`LMER_RENDER_SOURCE`** - Test/CI-only switch for the render-matrix suite (`tests/test_taskdef_render_matrix.py`), not read by the CLI or the container runtime. When set, every taskdef directory found under the given path is rendered — honoring its root `taskdef.yaml` — against the *current checkout's* built-in base templates: `LMER_RENDER_SOURCE=<clone> uv run pytest tests/test_taskdef_render_matrix.py -q`. This is the contract an external taskdef content repo's CI uses to prove its bodies render against a pinned base (see docs/TASKDEFS.md).
+
 - **`GITLAB_TOKEN`** / **`GITLAB_TOKEN_<sanitized_host>`** - Per-host or generic API token used to authenticate against GitLab hosts (also used by the legacy URL-token-injection path for target repos). Hostname suffix is lowercased with dots/hyphens replaced by underscores — e.g. `git.example.com` → `GITLAB_TOKEN_git_example_com`.
 
 - **`GH_TOKEN`** / **`GITHUB_TOKEN`** - Tokens used for GitHub hosts (`github.com`, `*.github.com`, `*.ghe.com`). `GH_TOKEN` takes priority over `GITHUB_TOKEN`. Either is consulted only after a more-specific per-host `GITLAB_TOKEN_<host>` is checked.
