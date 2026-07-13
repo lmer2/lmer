@@ -27,6 +27,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+# Git config that disables the LFS smudge/process filters and marks them
+# non-required. Used when git-lfs is not installed so a target repo that
+# tracks files via LFS still checks out (as pointer files) instead of
+# aborting the checkout with ``git-lfs: command not found`` (exit 128).
+# Single source of truth for both the ``-c`` clone flags and the repo-local
+# persistence in _persist_lfs_skip_config.
+_LFS_SKIP_CONFIG = (
+    ("filter.lfs.smudge", ""),
+    ("filter.lfs.process", ""),
+    ("filter.lfs.required", "false"),
+)
+
+# The same settings as ``git -c`` flags. Must precede the ``clone`` subcommand
+# so they cover the clone's implicit checkout.
+_LFS_SKIP_FLAGS = [
+    arg for key, value in _LFS_SKIP_CONFIG for arg in ("-c", f"{key}={value}")
+]
+
 
 def run(cmd: list[str]) -> int:
     """
@@ -71,6 +89,71 @@ def _scrub_credentials(text: str) -> str:
     return re.sub(r"(://)[^/\s]*@", r"\1", text)
 
 
+def _git_lfs_available() -> bool:
+    """True when the ``git-lfs`` binary is on PATH."""
+    return shutil.which("git-lfs") is not None
+
+
+def _lfs_safe_git(*args: str) -> list[str]:
+    """A ``git`` invocation carrying the LFS-skip ``-c`` flags when git-lfs is
+    unavailable (a plain ``["git", *args]`` when it is present).
+
+    The ``-c`` flags are process-scoped, so this is safe for git operations on
+    bind-mounted checkouts (service mode / ``--checkout``) where repo-local
+    persistence must never be written — nothing leaks into the user's repo.
+    """
+    cmd = ["git"]
+    if not _git_lfs_available():
+        cmd += _LFS_SKIP_FLAGS
+    cmd += list(args)
+    return cmd
+
+
+def _clone_cmd(repo_url: str, workspace: Path) -> list[str]:
+    """Build the ``git clone`` command.
+
+    When git-lfs is unavailable, insert :data:`_LFS_SKIP_FLAGS` before the
+    ``clone`` subcommand so LFS-tracked repos degrade to pointer files rather
+    than failing the checkout. When git-lfs is present the clone is plain, so
+    LFS content is fetched normally.
+    """
+    return _lfs_safe_git("clone", repo_url, str(workspace))
+
+
+def _persist_lfs_skip_config(repo_dir: Path) -> None:
+    """Persist the LFS-skip settings into *repo_dir*'s local git config.
+
+    The failing ``filter.lfs.*`` config comes from the host ``~/.gitconfig``
+    mounted into the container (``git lfs install`` writes ``required = true``
+    globally), so the ``-c`` flags on the clone only protect the clone's own
+    implicit checkout. Every later operation that materializes LFS-tracked
+    files — the branch/ref checkout in ensure_clone, the GitLab MR
+    auto-checkout in main(), any in-session git use in the repo — would hit
+    the same ``git-lfs: command not found`` abort. Repo-local config overrides
+    the mounted global config and covers all of those.
+
+    Only ever called on a repo this script itself just cloned (never a
+    service-mode bind-mounted checkout), so the settings stay scoped to the
+    ephemeral clone and never disable LFS in a user's host repo. (A
+    secondary-MR repo cloned into a bind-mounted workspace outlives the
+    container together with this config, but the settings live in that
+    clone's own ``.git/config`` — still never the user's checkout's.)
+    Best-effort:
+    a config write failure warns rather than failing the clone — the repo may
+    not touch LFS-tracked files at all.
+    """
+    if _git_lfs_available():
+        return
+    for key, value in _LFS_SKIP_CONFIG:
+        try:
+            check_call(["git", "-C", str(repo_dir), "config", key, value])
+        except Exception as e:
+            print(
+                f"⚠️  Failed to persist {key} in {repo_dir}: {e}",
+                file=sys.stderr,
+            )
+
+
 def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Optional[str]) -> None:
     """
     Clone repository into workspace if not already present.
@@ -91,8 +174,8 @@ def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Opt
     if (workspace / ".git").exists():
         return
 
-    clone_cmd = ["git", "clone", repo_url, str(workspace)]
-    check_call(clone_cmd)
+    check_call(_clone_cmd(repo_url, workspace))
+    _persist_lfs_skip_config(workspace)
 
     # Configure safe.directory to avoid ownership complaints
     try:
@@ -434,8 +517,8 @@ def clone_secondary_mr(target: str, workspace: Path) -> None:
 
     # Clone the repository
     print(f"📦 Cloning secondary MR into {target_dir}...", file=sys.stderr)
-    clone_cmd = ["git", "clone", repo_url, str(target_dir)]
-    check_call(clone_cmd)
+    check_call(_clone_cmd(repo_url, target_dir))
+    _persist_lfs_skip_config(target_dir)
 
     # Configure safe.directory
     try:
@@ -784,17 +867,19 @@ def main(argv: list[str] | None = None) -> int:
             check_call(["git", "config", "--global", "--add", "safe.directory", str(ws)])
         except Exception:
             pass
-        # Checkout branch or ref if specified
+        # Checkout branch or ref if specified. _lfs_safe_git: the bind-mounted
+        # checkout must not get repo-local LFS-skip config, but the checkout
+        # still has to survive a missing git-lfs — process-scoped -c flags do.
         if ref:
             try:
-                check_call(["git", "-C", str(ws), "fetch", "--all", "--tags"])
-                check_call(["git", "-C", str(ws), "checkout", "--detach", ref])
+                check_call(_lfs_safe_git("-C", str(ws), "fetch", "--all", "--tags"))
+                check_call(_lfs_safe_git("-C", str(ws), "checkout", "--detach", ref))
             except subprocess.CalledProcessError as e:
                 print(f"⚠️  Failed to checkout ref {ref}: {e}", file=sys.stderr)
         elif branch:
-            rc = run(["git", "-C", str(ws), "switch", branch])
+            rc = run(_lfs_safe_git("-C", str(ws), "switch", branch))
             if rc != 0:
-                rc = run(["git", "-C", str(ws), "checkout", branch])
+                rc = run(_lfs_safe_git("-C", str(ws), "checkout", branch))
                 if rc != 0:
                     print(f"⚠️  Failed to checkout branch {branch}", file=sys.stderr)
     elif no_repo_mode and not repo_url:
@@ -835,9 +920,12 @@ def main(argv: list[str] | None = None) -> int:
     if gitlab_mr_id and not branch and not ref and not service_mode:
         print(f"🔍 Detected GitLab MR {gitlab_mr_id}, attempting to fetch and checkout MR branch (remote: {git_remote})...", file=sys.stderr)
         try:
-            check_call(["git", "-C", str(ws), "fetch", git_remote,
-                        f"merge-requests/{gitlab_mr_id}/head:mr-{gitlab_mr_id}"])
-            check_call(["git", "-C", str(ws), "checkout", f"mr-{gitlab_mr_id}"])
+            # _lfs_safe_git: /workspace may be a bind-mounted --checkout (no
+            # repo-local LFS-skip config); process-scoped -c flags keep the
+            # checkout alive without touching the mounted repo's config.
+            check_call(_lfs_safe_git("-C", str(ws), "fetch", git_remote,
+                                     f"merge-requests/{gitlab_mr_id}/head:mr-{gitlab_mr_id}"))
+            check_call(_lfs_safe_git("-C", str(ws), "checkout", f"mr-{gitlab_mr_id}"))
             print(f"✅ Checked out MR {gitlab_mr_id} branch (mr-{gitlab_mr_id})", file=sys.stderr)
         except subprocess.CalledProcessError as e:
             print(f"⚠️  Failed to checkout MR {gitlab_mr_id} branch: {e}", file=sys.stderr)
