@@ -22,7 +22,8 @@ unreleased:
     - "Render-time block lint: every top-level override block a taskdef body defines must exist in its parent template chain, or `/start`/`/followup` fail loudly (Jinja would otherwise silently drop the block's content). AST-based — new blocks nested inside an overridden block are legal and not flagged. Renaming/removing a base block is a schema bump by policy (docs/TASKDEFS.md)"
     - "Taskdef source banners: `/start` and `/followup` print a greppable `taskdef source: <dir> (schema <n>)` line for the rendered template and each parent template it extends, so cross-tier shadowing (a supported override feature — a work-repo tier may shadow `base-task.jinja2` or any shared partial) is always observable"
   changed: []
-  fixed: []
+  fixed:
+    - "Cloning a repo that tracks files via git-LFS no longer aborts with `git-lfs: command not found` (exit 128) when git-lfs is not installed in the container: the clone disables the LFS smudge/process filters so LFS-tracked files check out as pointer files, and the same settings are persisted into the cloned repo's local git config — overriding the LFS filter config mounted in from the host's `~/.gitconfig` — so later checkouts (branch/ref checkout, MR auto-checkout, in-session git use) and secondary-MR clones are covered too. Repos cloned with git-lfs available are unaffected, and the repo-local settings are only ever written to repos the container itself cloned — bind-mounted checkouts (service mode / `--checkout`) instead carry the same settings as process-scoped `-c` flags on the entrypoint's own branch/ref/MR checkout commands, so nothing is ever written into the user's repo config"
   deprecated: []
   removed: []
   security: []
