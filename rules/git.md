@@ -62,6 +62,24 @@ By default, no repositories are auto-allowed for push.
 3. Request permission if not on allow list
 4. User must configure allow list via env var
 
+## 🚨 MR Target Policy — target the branch you forked from
+**CRITICAL**: An MR's target branch is ALWAYS the branch you forked from.
+There are no "special" changes that target elsewhere — release version
+bumps, changelog rolls, docs, and hotfixes all follow the same edge as
+feature work.
+
+In repos with a `prep-release` integration branch (this org's standard
+flow), that means:
+- Every MR you create targets `prep-release` — never `main`.
+- `main` only ever receives the standing `prep-release` → `main` release
+  MR, merged by a human as part of the release/deploy process.
+- Do NOT infer the target from repository history (e.g. old
+  `release/vX.Y.Z` branches merged straight to `main`) — history records
+  superseded processes; the rules and project info record the current one.
+
+If a change genuinely seems to require targeting `main` directly, STOP and
+ask the human — never create such an MR on your own judgment.
+
 ## 🚨 Merge Policy — review must be COMPLETE, not just quiet
 **CRITICAL**: Before merging any MR/PR (via UI, API, or a local merge pushed
 to the target branch), verify ALL of:
@@ -86,7 +104,7 @@ exists.
 
 ## Branch Management
 - Create descriptive branch names
-- Keep branches up to date with main
+- Keep branches up to date with the branch you forked from
 - Delete branches after merging
 
 ## Commit Messages

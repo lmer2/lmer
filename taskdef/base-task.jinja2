@@ -124,7 +124,8 @@ Record the phase: `work state set --phase=delivery`
 If you have pushed your branch and no merge/pull request exists yet, create one.
 
 When choosing the target branch:
-- If you forked from a specific branch (e.g., `develop`, `prep-release`), use **that branch** as the target — it is the natural merge target.
+- If you forked from a specific branch (e.g., `develop`, `prep-release`), use **that branch** as the target — it is the natural merge target. This rule has NO exceptions by change type: release version bumps, changelog rolls, docs, and hotfixes all target the fork base like everything else.
+- Do NOT infer the target from repository history (e.g. old release branches merged straight to `main`) — history records superseded processes; the current process is what the rules and project info say.
 - If no specific base branch was given, default to `main`.
 
 {% if is_github %}```bash
