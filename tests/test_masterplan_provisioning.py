@@ -53,10 +53,151 @@ def test_masterplan_task_implies_enabled(monkeypatch):
     assert masterplan.masterplan_enabled() is True
 
 
-def test_other_task_does_not_imply_enabled(monkeypatch):
+def test_other_task_does_not_imply_enabled(monkeypatch, tmp_path):
+    _isolate_taskdef_tiers(monkeypatch, tmp_path)
     monkeypatch.setenv("LMER_TASK", "develop")
-    monkeypatch.delenv("LMER_MASTERPLAN", raising=False)
     assert masterplan.masterplan_enabled() is False
+
+
+# ── Taskdef-declared masterplan (task.yaml beside instructions.txt) ────
+#
+# A taskdef that requires the masterplan plugin (e.g. a work-repo `spec`
+# taskdef) declares it in a per-task manifest instead of relying on the
+# operator to remember LMER_MASTERPLAN=1 at launch. The manifest resolves
+# through the same tier precedence as the taskdef's other files.
+
+
+def _isolate_taskdef_tiers(monkeypatch, tmp_path):
+    """Point the taskdef search at a tmp work repo, away from ambient tiers.
+
+    Without this, masterplan_enabled()'s manifest lookup would consult the
+    running session's real work repo via the inherited LMER_* env.
+    """
+    work = tmp_path / "work"
+    (work / "taskdef").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+    monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+    monkeypatch.setenv("LMER_REPO_PROJECT", "group/proj")
+    for var in (
+        "LMER_TASKDEF_PATHS",
+        "LMER_TASKDEF_DIR",
+        "LMER_TASK_INSTRUCTIONS",
+        "LMER_MASTERPLAN",
+        "LMER_TASKDEF",
+        "LMER_TASK_TARGET",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    return work
+
+
+def _write_task_manifest(work, body, task="spectask", tier="global"):
+    """Create taskdef <task> with a task.yaml carrying *body* in a tier."""
+    if tier == "global":
+        tdir = work / "taskdef" / task
+    else:
+        tdir = work / "git.example.com" / "group/proj" / "taskdef" / task
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "instructions.txt").write_text("body\n")
+    (tdir / "task.yaml").write_text(body)
+
+
+def test_taskdef_manifest_declares_masterplan(monkeypatch, tmp_path):
+    work = _isolate_taskdef_tiers(monkeypatch, tmp_path)
+    _write_task_manifest(work, "masterplan: true\n")
+    monkeypatch.setenv("LMER_TASK", "spectask")
+    assert masterplan.masterplan_enabled() is True
+
+
+@pytest.mark.parametrize("body", ["masterplan: false\n", "masterplan: no\n", 'masterplan: "0"\n'])
+def test_taskdef_manifest_falsy_not_enabled(monkeypatch, tmp_path, body):
+    work = _isolate_taskdef_tiers(monkeypatch, tmp_path)
+    _write_task_manifest(work, body)
+    monkeypatch.setenv("LMER_TASK", "spectask")
+    assert masterplan.masterplan_enabled() is False
+
+
+@pytest.mark.parametrize("body", ['masterplan: "yes"\n', 'masterplan: "1"\n', "masterplan: 1\n"])
+def test_taskdef_manifest_truthy_variants(monkeypatch, tmp_path, body):
+    work = _isolate_taskdef_tiers(monkeypatch, tmp_path)
+    _write_task_manifest(work, body)
+    monkeypatch.setenv("LMER_TASK", "spectask")
+    assert masterplan.masterplan_enabled() is True
+
+
+def test_taskdef_without_manifest_not_enabled(monkeypatch, tmp_path):
+    work = _isolate_taskdef_tiers(monkeypatch, tmp_path)
+    tdir = work / "taskdef" / "spectask"
+    tdir.mkdir(parents=True)
+    (tdir / "instructions.txt").write_text("body\n")
+    monkeypatch.setenv("LMER_TASK", "spectask")
+    assert masterplan.masterplan_enabled() is False
+
+
+@pytest.mark.parametrize("body", ["{ not yaml\n", "- a\n- list\n", ""])
+def test_taskdef_manifest_malformed_not_enabled(monkeypatch, tmp_path, body):
+    """Unreadable/malformed/non-dict manifests count as "not declared".
+
+    Provisioning is logged-never-fatal; a bad YAML file must not take the
+    session down or (worse) silently flip masterplan on.
+    """
+    work = _isolate_taskdef_tiers(monkeypatch, tmp_path)
+    _write_task_manifest(work, body)
+    monkeypatch.setenv("LMER_TASK", "spectask")
+    assert masterplan.masterplan_enabled() is False
+
+
+def test_project_tier_manifest_wins_over_global(monkeypatch, tmp_path):
+    """The manifest resolves like any other taskdef file: the project tier
+    shadows the work-global tier, so a project can flip the flag either way."""
+    work = _isolate_taskdef_tiers(monkeypatch, tmp_path)
+    _write_task_manifest(work, "masterplan: true\n", tier="global")
+    _write_task_manifest(work, "masterplan: false\n", tier="project")
+    monkeypatch.setenv("LMER_TASK", "spectask")
+    assert masterplan.masterplan_enabled() is False
+
+
+def test_declaration_wins_over_falsy_toggle(monkeypatch, tmp_path):
+    """LMER_MASTERPLAN=0 does not veto a taskdef declaration — same contract
+    as LMER_TASK=masterplan, which the falsy toggle does not veto either: a
+    taskdef whose instructions require masterplan stays provisioned."""
+    work = _isolate_taskdef_tiers(monkeypatch, tmp_path)
+    _write_task_manifest(work, "masterplan: true\n")
+    monkeypatch.setenv("LMER_TASK", "spectask")
+    monkeypatch.setenv("LMER_MASTERPLAN", "0")
+    assert masterplan.masterplan_enabled() is True
+
+
+def test_main_provisions_for_declaring_taskdef(monkeypatch, tmp_path, capsys):
+    """End-to-end through main(): a declaring taskdef gets exit 0 and the
+    bundle root — the exact shape the failed spec sessions needed."""
+    work = _isolate_taskdef_tiers(monkeypatch, tmp_path)
+    _write_task_manifest(work, "masterplan: true\n")
+    monkeypatch.setenv("LMER_TASK", "spectask")
+    rc = masterplan.main([])
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert out.endswith("/runs/spectask/masterplan")
+
+
+def test_taskdef_search_mirrors_start_hook():
+    """Guard: lmer_cli.container.taskdefs mirrors hooks/start.py's taskdef
+    tier search. start.py deliberately does not import lmer_cli, so the
+    search is mirrored rather than shared — keep the bodies in sync (same
+    pattern as _is_github_host / lmer_cli.tokens)."""
+    from hooks import start as start_hook
+
+    from lmer_cli.container import taskdefs
+    from tests.conftest import ast_body_lines
+
+    for name in (
+        "work_repo_taskdef_dirs",
+        "builtin_taskdef_root",
+        "taskdef_search_dirs",
+        "find_taskdef_file",
+    ):
+        assert ast_body_lines(getattr(taskdefs, name)) == ast_body_lines(
+            getattr(start_hook, name)
+        ), f"{name} body diverged between lmer_cli.container.taskdefs and hooks/start.py"
 
 
 # ── Run-dir computation (bundle root nests under the run dir) ──────────
@@ -239,6 +380,31 @@ def test_runner_skips_plugin_when_masterplan_disabled(tmp_path):
     joined = "\n".join(calls)
     assert "plugin marketplace add" not in joined
     assert "plugin install masterplan" not in joined
+
+
+def test_runner_provisions_plugin_when_taskdef_declares(tmp_path):
+    """End-to-end through claude-runner.sh: a taskdef shipping
+    `masterplan: true` in task.yaml provisions the plugin without
+    LMER_TASK=masterplan or LMER_MASTERPLAN — the exact gap that left spec
+    sessions without /masterplan and MASTERPLAN_RUNS_DIR."""
+    work_repo = tmp_path / "work"
+    tdir = work_repo / "taskdef" / "spectask"
+    tdir.mkdir(parents=True)
+    (tdir / "instructions.txt").write_text("body\n")
+    (tdir / "task.yaml").write_text("masterplan: true\n")
+    calls = _run_runner_capturing_plugin_calls(
+        tmp_path,
+        {
+            "LMER_TASK": "spectask",
+            "LMER_WORK_REPO_PATH": str(work_repo),
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "proj",
+        },
+    )
+    joined = "\n".join(calls)
+    assert "plugin marketplace add /work/mirrors/masterplan" in joined
+    assert "plugin install masterplan@rasatpetabit-masterplan" in joined
+    assert "plugin enable masterplan" in joined
 
 
 # ── RO-symlink materialization (the second commit's live branch) ──────

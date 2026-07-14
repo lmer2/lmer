@@ -295,26 +295,11 @@ class TestTargetProviderFlags:
         Both implementations must use the same predicate; a future edit to
         either side should fail this test if the bodies diverge.
         """
-        import ast
-        import inspect
-        import textwrap
         from lmer_cli.tokens import _is_github_host as canonical
         from hooks import start as start_hook
+        from tests.conftest import ast_body_lines
 
-        def _body_lines(fn):
-            src = textwrap.dedent(inspect.getsource(fn))
-            tree = ast.parse(src)
-            func = tree.body[0]
-            non_doc = [
-                node
-                for node in func.body
-                if not (
-                    isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
-                )
-            ]
-            return [ast.unparse(node) for node in non_doc]
-
-        assert _body_lines(canonical) == _body_lines(start_hook._is_github_host)
+        assert ast_body_lines(canonical) == ast_body_lines(start_hook._is_github_host)
 
     def test_flags_available_in_template(self, tmp_path, monkeypatch):
         """is_github / is_gitlab are usable in instruction templates."""

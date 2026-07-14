@@ -60,6 +60,12 @@ def _git_config(key: str) -> str | None:
     return value or None
 
 
+# Accepted truthy spellings for boolean values (compared lowercase). Shared
+# by get_bool_env and lmer_cli.container.masterplan's task-manifest parsing so
+# the accepted set cannot drift between the env toggle and the manifest.
+TRUTHY_VALUES = frozenset({"1", "yes", "true"})
+
+
 def get_bool_env(var_name: str, default: bool = False) -> bool:
     """
     Parse a boolean environment variable.
@@ -80,10 +86,9 @@ def get_bool_env(var_name: str, default: bool = False) -> bool:
     if not value:
         return default
 
-    truthy_values = {"1", "yes", "true"}
     falsy_values = {"0", "no", "false"}
 
-    if value in truthy_values:
+    if value in TRUTHY_VALUES:
         return True
     elif value in falsy_values:
         return False
