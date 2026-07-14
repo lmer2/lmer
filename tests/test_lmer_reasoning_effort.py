@@ -77,7 +77,7 @@ def _run_claude_runner(tmp_path, env_value=None):
 class TestClaudeRunnerEffortFlag:
     """Verify claude-runner.sh translates LMER_REASONING_EFFORT → --effort."""
 
-    @pytest.mark.parametrize("level", ["low", "medium", "high", "max"])
+    @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
     def test_valid_levels_pass_effort_flag(self, tmp_path, level):
         output, argv = _run_claude_runner(tmp_path, env_value=level)
 
@@ -120,7 +120,7 @@ class TestClaudeRunnerEffortFlag:
 
         assert "--effort" not in argv
         assert "Ignoring LMER_REASONING_EFFORT='banana'" in output
-        assert "low|medium|high|max|auto" in output
+        assert "low|medium|high|xhigh|max|auto" in output
 
     def test_empty_string_does_not_pass_flag(self, tmp_path):
         output, argv = _run_claude_runner(tmp_path, env_value="")
