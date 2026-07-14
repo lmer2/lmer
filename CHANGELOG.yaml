@@ -13,6 +13,7 @@ unreleased:
   changed:
     - "`explorer.md` no longer hard-pins `model: sonnet`: with `LMER_DISPATCH_EXPLORE` unset the explorer subagent now inherits the session model like every other lane (uniform rule). Operators who want the old always-sonnet behavior set `LMER_DISPATCH_EXPLORE=sonnet`"
     - "`LMER_REASONING_EFFORT` now accepts `xhigh` in addition to `low`/`medium`/`high`/`max`/`auto`, matching the effort vocabulary of the per-lane dispatch vars so the session and lane surfaces accept the same set"
+    - "MR target policy made explicit across the provisioned process docs (`rules/git.md` gains an 'MR Target Policy' section; the base taskdef delivery block strengthens its target-branch guidance): an MR always targets the branch it was forked from — with no exceptions by change type (release version bumps, changelog rolls, docs, hotfixes) — and agents must never infer the target from repository history; in repos with a `prep-release` flow, agent-created MRs never target `main`"
   fixed: []
   deprecated: []
   removed: []
