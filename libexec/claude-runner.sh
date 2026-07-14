@@ -355,11 +355,13 @@ case "${LMER_PERSIST_AGENT_MEMORY,,}" in
 esac
 
 # ── Masterplan plugin provisioning ──
-# When the session runs the masterplan workflow (LMER_TASK=masterplan or a
-# truthy LMER_MASTERPLAN), install the masterplan plugin from the work-repo
-# mirror and point its bundle root into the current run dir. The gating and
+# When the session runs the masterplan workflow (LMER_TASK=masterplan, a
+# truthy LMER_MASTERPLAN, or a taskdef declaring `masterplan: true` in its
+# task.yaml), install the masterplan plugin from the work-repo mirror and
+# point its bundle root into the current run dir. The gating and
 # run-dir computation live in lmer_cli.container.masterplan (get_bool_env +
-# work_repo.run_state) so this stays a thin wrapper. The helper's exit code is
+# taskdef manifest resolution + work_repo.run_state) so this stays a thin
+# wrapper. The helper's exit code is
 # the contract: 0 => print the bundle root, provision; 1 => not a masterplan
 # session (or import failure in the claude-runner unit tests) => skip silently;
 # 2 => masterplan was explicitly requested but the run dir is indeterminate

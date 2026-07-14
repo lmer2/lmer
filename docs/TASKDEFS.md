@@ -8,13 +8,14 @@ one).
 ## Anatomy
 
 A taskdef is a directory containing `instructions.txt` and, optionally,
-`followup.txt`:
+`followup.txt` and a per-task `task.yaml` manifest:
 
 ```
 taskdef/
 └── my-task/
     ├── instructions.txt   # rendered by /start
-    └── followup.txt       # rendered by /followup (optional)
+    ├── followup.txt       # rendered by /followup (optional)
+    └── task.yaml          # per-task manifest (optional)
 ```
 
 Tasks are discovered from multiple sources, in this precedence order
@@ -34,6 +35,39 @@ Tasks are discovered from multiple sources, in this precedence order
 This lets a project ship a customised taskdef in its work-repo project
 directory that shadows the built-in one (or adds a new task type) without
 touching the agents/global repo.
+
+## The per-task manifest (`task.yaml`)
+
+A taskdef whose instructions require the **masterplan plugin** declares that
+need in a `task.yaml` beside its `instructions.txt`:
+
+```yaml
+masterplan: true
+```
+
+At session start the container provisioning gate
+(`lmer_cli.container.masterplan`, called from `libexec/claude-runner.sh`)
+resolves the active task's `task.yaml` through the same tier precedence as
+every other taskdef file and, when the flag is truthy (`true`/`1`/`yes`),
+installs the masterplan plugin and exports `MASTERPLAN_RUNS_DIR` — exactly as
+if `LMER_MASTERPLAN=1` had been set. Without the declaration, a custom
+taskdef that tells the agent to run `/masterplan` comes up without the plugin
+unless the operator remembers the env toggle at launch.
+
+Notes:
+
+- Like `instructions.txt`/`followup.txt`, the manifest resolves per-file:
+  the highest-precedence tier shipping a `task.yaml` wins, so a work-repo
+  override can flip the flag either way.
+- An unreadable, malformed, or non-mapping manifest counts as "not
+  declared" — provisioning is logged-never-fatal and a bad YAML file must
+  not flip masterplan on (or take the session down).
+- The dedicated `masterplan` taskdef needs no manifest (`LMER_TASK=masterplan`
+  implies the workflow), and a truthy `LMER_MASTERPLAN` still enables it for
+  any task. An explicit `LMER_MASTERPLAN=0` switches off the env toggle only;
+  it does not veto a taskdef declaration.
+- Distinct from the source-root `taskdef.yaml` (schema versioning, below):
+  `task.yaml` sits inside one task's directory and describes that task.
 
 ## Tier ownership
 
