@@ -224,11 +224,13 @@ class TestAgentBriefs:
         assert "Write" not in text.split("---")[1]  # no Write tool in frontmatter
 
     def test_model_pins(self):
-        # Recon is mechanical: explorer is pinned to a cheaper tier. The
-        # adversarial reviewer must NOT be pinned — judgment work inherits
-        # the session model.
+        # No shipped agent def carries a hardcoded model pin: per-lane
+        # configuration (LMER_DISPATCH_<LANE>) is the only source of pins,
+        # and an unset lane inherits the session model. explorer's former
+        # `model: sonnet` pin was deliberately removed (dispatch-model-routing
+        # spec G3 — a documented behavior change).
         explorer_fm = (self.AGENTS_DIR / "explorer.md").read_text().split("---")[1]
-        assert "model: sonnet" in explorer_fm
+        assert "model:" not in explorer_fm, "explorer inherits the session model"
         reviewer_fm = (self.AGENTS_DIR / "adversarial-reviewer.md").read_text().split("---")[1]
         assert "model:" not in reviewer_fm, "reviewer inherits the session model"
 

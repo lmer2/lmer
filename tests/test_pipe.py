@@ -230,6 +230,26 @@ def _follow_args(**overrides):
     return argparse.Namespace(**defaults)
 
 
+def _guard_follow_requests(monkeypatch) -> threading.Event:
+    """Make a background cmd_follow loop stoppable.
+
+    cmd_follow retries ConnectionError forever by design, so once the live
+    server is torn down the loop never exits on its own. Wrap requests.get
+    so that after the returned event is set, the next call raises an
+    exception the retry handler does NOT catch, breaking the loop.
+    """
+    stop = threading.Event()
+    real_get = pipe.requests.get
+
+    def guarded_get(*args, **kwargs):
+        if stop.is_set():
+            raise RuntimeError("follow stopped by test")
+        return real_get(*args, **kwargs)
+
+    monkeypatch.setattr(pipe.requests, "get", guarded_get)
+    return stop
+
+
 class TestCmdFollow:
     def test_streams_from_live_endpoint(self, monkeypatch, capsys):
         # Start follow in a background thread, append twice, then stop the
@@ -240,25 +260,27 @@ class TestCmdFollow:
             output.append(b"first ")
 
             args = _follow_args(wait=0.2, retry=0.05, timeout=1.0)
-            errors: list[BaseException] = []
+            stop = _guard_follow_requests(monkeypatch)
 
             def runner():
                 try:
                     pipe.cmd_follow(args)
-                except BaseException as exc:
-                    errors.append(exc)
+                except BaseException:
+                    pass
 
             t = threading.Thread(target=runner, daemon=True)
             t.start()
             time.sleep(0.3)
             output.append(b"second")
             time.sleep(0.5)
-        # _live_app exiting tears down uvicorn; the follow loop's next request
-        # will fail with ConnectionError, get caught, retried, and eventually
-        # succeed against nothing. Reap by joining; the loop is daemon so it
-        # dies with the process if it hangs (it will not, given the test's
-        # short timeout/retry).
+        # _live_app exiting tears down uvicorn; the follow loop retries
+        # ConnectionError forever by design, so it must be stopped
+        # explicitly — a leaked daemon thread spams stderr for the rest of
+        # the pytest run and can abort interpreter shutdown
+        # (_enter_buffered_busy).
+        stop.set()
         t.join(timeout=2.0)
+        assert not t.is_alive()
         captured = capsys.readouterr()
         assert "first " in captured.out
         assert "second" in captured.out
@@ -270,6 +292,7 @@ class TestCmdFollow:
             output.append(b"backlog-bytes")
 
             args = _follow_args(from_end=True, wait=0.2, retry=0.05, timeout=1.0)
+            stop = _guard_follow_requests(monkeypatch)
 
             def runner():
                 try:
@@ -282,7 +305,9 @@ class TestCmdFollow:
             time.sleep(0.3)
             output.append(b"after-probe")
             time.sleep(0.5)
+        stop.set()
         t.join(timeout=2.0)
+        assert not t.is_alive()
         captured = capsys.readouterr()
         # The pre-existing 13 bytes ("backlog-bytes") must be skipped; only
         # data appended after the /healthz probe should print.

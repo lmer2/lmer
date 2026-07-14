@@ -212,19 +212,21 @@ if [ "$LMER_DANGER_ZONE" = "1" ]; then
 fi
 
 # Translate LMER_REASONING_EFFORT into claude's --effort flag.
-# Valid claude values: low, medium, high, max. Treat "auto" or unset as
-# "let claude decide" — pass no flag. Invalid values get a warning + skip.
-# Normalize to lowercase so HIGH/High/high all work.
+# Valid claude values: low, medium, high, xhigh, max. Treat "auto" or unset
+# as "let claude decide" — pass no flag. Invalid values get a warning + skip.
+# Normalize to lowercase so HIGH/High/high all work. The vocabulary matches
+# the per-lane dispatch efforts (LMER_DISPATCH_<LANE>) so the session and
+# lane surfaces accept the same set.
 if [ -n "$LMER_REASONING_EFFORT" ]; then
     effort_lower="${LMER_REASONING_EFFORT,,}"
     if [ "$effort_lower" != "auto" ]; then
         case "$effort_lower" in
-            low|medium|high|max)
+            low|medium|high|xhigh|max)
                 EXTRA_ARGS="$EXTRA_ARGS --effort $effort_lower"
                 echo "✅ Reasoning effort: $effort_lower"
                 ;;
             *)
-                echo "⚠️  Ignoring LMER_REASONING_EFFORT='$LMER_REASONING_EFFORT' (expected: low|medium|high|max|auto)"
+                echo "⚠️  Ignoring LMER_REASONING_EFFORT='$LMER_REASONING_EFFORT' (expected: low|medium|high|xhigh|max|auto)"
                 ;;
         esac
     fi

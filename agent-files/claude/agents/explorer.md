@@ -2,7 +2,6 @@
 name: explorer
 description: Read-only reconnaissance of the workspace and work repo — targeted lookups, situation reports, compact structured digests. Never writes, never commits, never mutates run state.
 tools: Read, Grep, Glob, Bash
-model: sonnet
 ---
 
 # explorer — read-only recon

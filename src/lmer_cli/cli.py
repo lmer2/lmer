@@ -1227,6 +1227,14 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_DANGER_ZONE": os.environ.get("LMER_DANGER_ZONE"),
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
         "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
+        # Per-lane model+effort dispatch for Claude subagent defs
+        # (model[:effort] per lane; parsed in-container by
+        # lmer_cli.container.dispatch_agents via claude-agent-files.sh).
+        "LMER_DISPATCH_REVIEW": os.environ.get("LMER_DISPATCH_REVIEW"),
+        "LMER_DISPATCH_DESIGN": os.environ.get("LMER_DISPATCH_DESIGN"),
+        "LMER_DISPATCH_CODE": os.environ.get("LMER_DISPATCH_CODE"),
+        "LMER_DISPATCH_MECHANICAL": os.environ.get("LMER_DISPATCH_MECHANICAL"),
+        "LMER_DISPATCH_EXPLORE": os.environ.get("LMER_DISPATCH_EXPLORE"),
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         "LMER_PERSIST_AGENT_MEMORY": os.environ.get("LMER_PERSIST_AGENT_MEMORY"),
         # Source provenance for the live-mounted dirs (dev mode): the commit
