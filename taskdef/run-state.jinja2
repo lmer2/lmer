@@ -26,9 +26,9 @@ or invent work — completed runs only reopen on explicit direction:
   `work state set --status=in-progress --stop-reason=none`, then proceed
   on the seed.
 - No seed: ask the user whether this is a new target or a continuation of
-  this run. If the question goes unanswered, record
-  `work state set --stop-reason=question` and end the session — never
-  proceed on a guess.
+  this run. If the question goes unanswered, record it —
+  `work state set --stop-reason=question --question "<the question>"` —
+  and end the session — never proceed on a guess.
 {% endif %}
 
 Ground rules — these come before any work:
@@ -39,9 +39,9 @@ Ground rules — these come before any work:
   timeout MEANS depends on where the run is:
   - **Pre-plan** (initial task definition, brainstorming, design/spec/plan
     approval): a timed-out question means STOP AND WAIT — record
-    `work state set --stop-reason=question` and end your turn. The user
-    will find the open question via the resume brief. Never proceed on a
-    guess.
+    `work state set --stop-reason=question --question "<the question>"`
+    and end your turn. The user will find the open question via the
+    resume brief. Never proceed on a guess.
   - **Post-plan / resume context** (direction already recorded, picking up
     where a previous session left off): you may proceed on your best
     judgment after the timeout.

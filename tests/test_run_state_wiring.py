@@ -150,7 +150,7 @@ class TestRunStateFragment:
         assert "LMER_START_PROMPT" in out
         assert 'work goal "<seed>"' in out
         assert "work state set --status=in-progress --stop-reason=none" in out
-        assert "work state set --stop-reason=question" in out
+        assert 'work state set --stop-reason=question --question "<the question>"' in out
         assert "proceed on a guess" in out
         # The in-progress wording stays untouched beside it.
         assert "you are RESUMING it" in out

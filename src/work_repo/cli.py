@@ -829,9 +829,9 @@ def cmd_state(args) -> int:
         changed["stop_reason"] = state["stop_reason"]
         if state["stop_reason"] != "critical_error":
             state["critical_error"] = None
-        # A stale question must not survive an answered/cleared stop.
-        if state["stop_reason"] != "question":
-            state["open_question"] = None
+        # A stale question must not survive ANY new stop — even a fresh
+        # question-stop starts blank; `--question` below re-sets the text.
+        state["open_question"] = None
     if args.question:
         # Agent-typed free text landing in the (shared) work repo — redact
         # like the other writers (log, ledger title/note, artifacts) do.

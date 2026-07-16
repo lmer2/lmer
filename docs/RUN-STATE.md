@@ -167,8 +167,9 @@ text so it survives the session that asked it (the transcript it would
 otherwise live in is never pushed). It is set via
 `work state set --stop-reason=question --question "<text>"` (secret-redacted,
 recorded in the `state_changed` event's data) and cleared whenever
-`--stop-reason` is set to anything other than `question` (including `none`) —
-a stale question must not survive an answered/cleared stop. When
+`--stop-reason` is set at all — even a fresh `question` stop starts blank
+unless `--question` re-records the text, so a stale question never survives
+any new stop. When
 `stop_reason` is `question` and a question is recorded, the resume brief
 renders it FIRST, before the run header, as a
 `❓ OPEN QUESTION (answer before anything else):` block.
@@ -477,8 +478,9 @@ the resume brief appends an explicit direction contract: with a seed
 (`work goal "<seed>"`), reopens with `work state set --status=in-progress
 --stop-reason=none`, and proceeds on the seed; without one it asks the
 user (new target vs continue this run), recording
-`work state set --stop-reason=question` and ending the session if the
-question goes unanswered — never proceeding on a guess. The run-state
+`work state set --stop-reason=question --question "<text>"` and ending
+the session if the question goes unanswered — never proceeding on a
+guess. The run-state
 taskdef fragment teaches the same contract. Runs the external cleaner has
 moved to `runs/archive/` no longer occupy the slug, so a genuinely new
 engagement seeds a fresh run.
@@ -514,8 +516,9 @@ and is required when `--stop-reason=critical_error` is given; `--question`
 stores `open_question` (§2) and is only valid together with
 `--stop-reason=question` — or on its own while the recorded stop reason is
 already `question` — any other combination errors (exit 1). Setting
-`--stop-reason` to anything other than `question` (including `none`) clears
-`open_question`. `--status=complete` additionally stamps the completion
+`--stop-reason` at all clears `open_question` — even a fresh `question`
+stop starts blank unless `--question` re-records the text (§2).
+`--status=complete` additionally stamps the completion
 actuals (§2) into the `state_changed` event's data.
 
 **No-op behavior:** only `--phase` is compared against the current value —
