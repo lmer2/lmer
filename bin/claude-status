@@ -1,6 +1,21 @@
 #!/bin/bash
 # Claude Code status line wrapper
-# Runs claude-powerline (all defaults) then appends container indicators
+#
+# Delegates to the lmer statusline renderer (hooks/statusline.py, issue
+# #106), which reads the Claude Code JSON payload from stdin and prints
+# repo @ branch | task | ctx N% plus the container/danger-zone indicators.
+# The renderer is stdlib-only python — no network, no external tools — so
+# every lmer session gets a working status line without claude-powerline.
+#
+# Fallback: when the renderer is missing (e.g. a trimmed install), keep the
+# previous claude-powerline behavior.
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+STATUSLINE="$SCRIPT_DIR/../hooks/statusline.py"
+
+if [ -f "$STATUSLINE" ]; then
+    exec python3 "$STATUSLINE"
+fi
 
 # Ensure mise shims are on PATH for claude-powerline
 export PATH="${HOME}/.local/share/mise/shims:${PATH}"
