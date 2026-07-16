@@ -121,6 +121,162 @@ class TestStateSet:
         assert _main(["state", "set", "--stop-reason=critical_error",
                       "--critical-error", '[1, 2]']) == 1
 
+    def test_question_stored_and_event_carries_it(self, run_env):
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            rc = _main(["state", "set", "--stop-reason=question",
+                        "--question", "sqlite or postgres?"])
+        assert rc == 0
+        state = run_state.load_state(run_env)
+        assert state["stop_reason"] == "question"
+        assert state["open_question"] == "sqlite or postgres?"
+        events = run_state.read_events(run_env, last_n=0)
+        changed = [e for e in events if e["type"] == "state_changed"]
+        assert changed[-1]["data"]["open_question"] == "sqlite or postgres?"
+
+    def test_question_alone_valid_after_question_stop(self, run_env):
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            _main(["state", "set", "--stop-reason=question"])
+            assert _main(["state", "set", "--question", "which branch?"]) == 0
+        assert run_state.load_state(run_env)["open_question"] == "which branch?"
+
+    def test_question_without_question_stop_reason_errors(self, run_env, capsys):
+        assert _main(["state", "set", "--question", "orphaned?"]) == 1
+        assert "--stop-reason=question" in capsys.readouterr().err
+        assert _main(["state", "set", "--stop-reason=yield",
+                      "--question", "mismatched?"]) == 1
+        assert "--stop-reason=question" in capsys.readouterr().err
+
+    def test_clearing_stop_reason_clears_question(self, run_env):
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            _main(["state", "set", "--stop-reason=question",
+                   "--question", "sqlite or postgres?"])
+            assert _main(["state", "set", "--stop-reason=none"]) == 0
+        state = run_state.load_state(run_env)
+        assert state["stop_reason"] is None
+        assert state["open_question"] is None
+
+    def test_other_stop_reason_clears_question(self, run_env):
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            _main(["state", "set", "--stop-reason=question",
+                   "--question", "sqlite or postgres?"])
+            assert _main(["state", "set", "--stop-reason=yield"]) == 0
+        assert run_state.load_state(run_env)["open_question"] is None
+
+    def test_completion_event_carries_actuals(self, run_env):
+        # Issue #99: two sessions ran, then the run completes — the
+        # state_changed event carries the machine-computed actuals.
+        _main(["session-start"])
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            _main(["session-end"])
+        _main(["session-start"])
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["state", "set", "--status=complete",
+                          "--stop-reason=complete"]) == 0
+        events = run_state.read_events(run_env, last_n=0)
+        first_start = next(e for e in events if e["type"] == "session_start")
+        changed = [e for e in events if e["type"] == "state_changed"][-1]
+        actuals = changed["data"]["actuals"]
+        assert actuals["sessions_used"] == 2
+        assert actuals["first_session_at"] == first_start["ts"]
+        assert actuals["completed_at"].endswith("Z")
+
+    def test_completion_actuals_fail_soft_to_null(self, run_env, capsys, monkeypatch):
+        # An events read problem must never block completion — the actuals
+        # degrade to null (the completion stamp itself is still recorded).
+        run_state.write_state(run_env, run_state.seed_state("develop-issue-123", "develop", "t"))
+        captured = {}
+        real_append = run_state.append_event
+
+        def failing_read(rdir, last_n=5):
+            raise OSError("events unreadable")
+
+        def spying_append(rdir, event_type, note=None, data=None):
+            captured[event_type] = data
+            return real_append(rdir, event_type, note=note, data=data)
+
+        monkeypatch.setattr(work_cli.run_state, "read_events", failing_read)
+        monkeypatch.setattr(work_cli.run_state, "append_event", spying_append)
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["state", "set", "--status=complete",
+                          "--stop-reason=complete"]) == 0
+        actuals = captured["state_changed"]["actuals"]
+        assert actuals["sessions_used"] is None
+        assert actuals["first_session_at"] is None
+        assert actuals["completed_at"].endswith("Z")
+
+    def test_non_completion_event_carries_no_actuals(self, run_env):
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["state", "set", "--stop-reason=yield"]) == 0
+        changed = [e for e in run_state.read_events(run_env, last_n=0)
+                   if e["type"] == "state_changed"][-1]
+        assert "actuals" not in changed["data"]
+
+
+def _ask_question(run_env, question="sqlite or postgres?"):
+    """Record a question stop on the run, the way a session would (#97)."""
+    with patch("work_repo.cli.commit_work_path", return_value=0):
+        assert _main(["state", "set", "--stop-reason=question",
+                      "--question", question]) == 0
+
+
+class TestAnswer:
+    """`work answer` — resume-on-answer (issue #98)."""
+
+    def test_answer_clears_question_appends_event_and_pushes(self, run_env):
+        _ask_question(run_env)
+        with patch("work_repo.cli.commit_work_path", return_value=0) as push:
+            assert _main(["answer", "postgres"]) == 0
+        state = run_state.load_state(run_env)
+        assert state["open_question"] is None
+        assert state["stop_reason"] is None
+        assert state["status"] == "in-progress"
+        event = run_state.read_events(run_env, last_n=0)[-1]
+        assert event["type"] == "question_answered"
+        assert event["data"] == {"question": "sqlite or postgres?",
+                                 "answer": "postgres"}
+        push.assert_called_once_with(
+            ["git.example.com/org/repo/runs/develop-issue-123"],
+            "run-state: develop-issue-123 question answered",
+        )
+
+    def test_completed_run_keeps_status(self, run_env):
+        _ask_question(run_env)
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            # A question can outlive completion (the #97 completed-run ask
+            # path); answering must not silently reopen the run.
+            state = run_state.load_state(run_env)
+            state["status"] = "complete"
+            run_state.write_state(run_env, state)
+            assert _main(["answer", "archive it"]) == 0
+        assert run_state.load_state(run_env)["status"] == "complete"
+
+    def test_no_open_question_errors(self, run_env, capsys):
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            _main(["state", "set", "--phase=spec"])  # run exists, no question
+        assert _main(["answer", "unasked"]) == 1
+        assert "No open question" in capsys.readouterr().err
+
+    def test_no_run_at_all_errors(self, run_env, capsys):
+        assert _main(["answer", "nothing there"]) == 1
+        assert "No open question" in capsys.readouterr().err
+        assert run_state.load_state(run_env) is None  # never auto-seeds
+
+    def test_no_context_exits_one(self, capsys):
+        assert _main(["answer", "postgres"]) == 1
+        assert "No run context" in capsys.readouterr().err
+
+    def test_empty_answer_errors(self, run_env, capsys):
+        _ask_question(run_env)
+        assert _main(["answer", "   "]) == 1
+        assert "non-empty" in capsys.readouterr().err
+        assert run_state.load_state(run_env)["open_question"] == "sqlite or postgres?"
+
+    def test_push_failure_is_nonfatal(self, run_env, capsys):
+        _ask_question(run_env)
+        with patch("work_repo.cli.commit_work_path", return_value=1):
+            assert _main(["answer", "postgres"]) == 0
+        assert "push failed" in capsys.readouterr().out
+
 
 class TestEvent:
     def test_appends_event(self, run_env):
@@ -538,8 +694,73 @@ class TestSessionStart:
         state["status"] = "complete"
         run_state.write_state(run_env, state)
         assert _main(["session-start"]) == 0
-        assert "complete" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "complete" in out
+        # No seed (autouse fixture strips LMER_*): the ask-or-stop line.
+        assert "COMPLETED RUN" in out
+        assert "work state set --stop-reason=question" in out
         assert run_state.load_state(run_env)["status"] == "complete"
+
+    def test_completed_run_with_seed_prints_seed_line(self, run_env, capsys, monkeypatch):
+        state = run_state.seed_state("develop-issue-123", "develop", "t")
+        state["status"] = "complete"
+        run_state.write_state(run_env, state)
+        monkeypatch.setenv("LMER_START_PROMPT", "pick up issue 97 next")
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "COMPLETED RUN" in out
+        assert "Seed provided (LMER_START_PROMPT): pick up issue 97 next" in out
+        assert "work state set --status=in-progress --stop-reason=none" in out
+
+    def test_lmer_answer_applied_and_brief_leads_with_pair(self, run_env, capsys, monkeypatch):
+        # Issue #98: a pushed answer (LMER_ANSWER, from `lmer --answer`) is
+        # applied before the brief prints, and the brief leads with the pair.
+        _ask_question(run_env)
+        capsys.readouterr()  # drain the setup command's output
+        monkeypatch.setenv("LMER_ANSWER", "postgres")
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        lines = out.splitlines()
+        assert lines[0].startswith("✅ ANSWERED QUESTION")
+        assert lines[1] == "Q: sqlite or postgres?"
+        assert lines[2] == "A: postgres"
+        assert "record the follow-up goal/phase" in lines[3]
+        assert "OPEN QUESTION" not in out  # the stale block it just resolved
+        state = run_state.load_state(run_env)
+        assert state["open_question"] is None
+        assert state["stop_reason"] is None
+        assert state["owner"]["session_id"] == "s-cli-1"  # still claimed
+        events = [e["type"] for e in run_state.read_events(run_env, last_n=0)]
+        assert "question_answered" in events
+        assert events[-1] == "session_start"  # answer applied BEFORE deciding
+
+    def test_lmer_answer_keeps_completed_status(self, run_env, capsys, monkeypatch):
+        _ask_question(run_env)
+        state = run_state.load_state(run_env)
+        state["status"] = "complete"
+        run_state.write_state(run_env, state)
+        monkeypatch.setenv("LMER_ANSWER", "reopen with the new target")
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "ANSWERED QUESTION" in out
+        assert "COMPLETED RUN" in out  # the #96 directive still governs reopening
+        assert run_state.load_state(run_env)["status"] == "complete"
+
+    def test_lmer_answer_ignored_without_open_question(self, run_env, capsys, monkeypatch):
+        monkeypatch.setenv("LMER_ANSWER", "answer to nothing")
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "ANSWERED QUESTION" not in out
+        events = [e["type"] for e in run_state.read_events(run_env, last_n=0)]
+        assert "question_answered" not in events
+
+    def test_lmer_answer_ignored_when_stop_reason_moved_on(self, run_env, capsys, monkeypatch):
+        _ask_question(run_env)
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            _main(["state", "set", "--stop-reason=yield"])  # question resolved in-session
+        monkeypatch.setenv("LMER_ANSWER", "stale answer")
+        assert _main(["session-start"]) == 0
+        assert "ANSWERED QUESTION" not in capsys.readouterr().out
 
     def test_newer_schema_refusal_is_not_reseeded_over(self, run_env, capsys):
         # The read-only refusal leaves the file intact — session-start must
@@ -611,6 +832,84 @@ class TestGoalKernelIntegration:
         capsys.readouterr()
         assert _main(["goal"]) == 0
         assert "the goal text" in capsys.readouterr().out
+
+
+class TestGoalEstimate:
+    """`work goal --estimate-*` — session estimation (issue #99)."""
+
+    def test_estimate_lands_in_state_and_event(self, run_env, capsys):
+        assert _main(["goal", "fix the auth bug",
+                      "--estimate-sessions", "2", "--estimate-time", "3h"]) == 0
+        state = run_state.load_state(run_env)
+        assert state["goal"] == "fix the auth bug"
+        assert state["estimate"] == {"sessions": 2, "time": "3h"}
+        event = [e for e in run_state.read_events(run_env, last_n=0)
+                 if e["type"] == "goal_set"][-1]
+        assert event["note"] == "fix the auth bug"
+        assert event["data"] == {"estimate": {"sessions": 2, "time": "3h"}}
+        assert "Estimate: ~2 sessions / 3h" in capsys.readouterr().out
+
+    def test_sessions_only(self, run_env):
+        assert _main(["goal", "small fix", "--estimate-sessions", "1"]) == 0
+        assert run_state.load_state(run_env)["estimate"] == {
+            "sessions": 1, "time": None}
+
+    def test_time_only(self, run_env):
+        assert _main(["goal", "medium fix", "--estimate-time", "2d"]) == 0
+        assert run_state.load_state(run_env)["estimate"] == {
+            "sessions": None, "time": "2d"}
+
+    def test_goal_without_estimate_unchanged(self, run_env):
+        # No flags: no estimate recorded, and the goal_set event stays
+        # byte-for-byte what it was before #99 (no data payload).
+        assert _main(["goal", "plain goal"]) == 0
+        assert run_state.load_state(run_env)["estimate"] is None
+        event = [e for e in run_state.read_events(run_env, last_n=0)
+                 if e["type"] == "goal_set"][-1]
+        assert "data" not in event
+
+    def test_estimate_flags_require_description(self, run_env, capsys):
+        assert _main(["goal", "--estimate-sessions", "2"]) == 1
+        assert "goal description" in capsys.readouterr().err
+        assert run_state.load_state(run_env) is None  # nothing written
+
+    def test_estimate_sessions_must_be_positive(self, run_env, capsys):
+        assert _main(["goal", "g", "--estimate-sessions", "0"]) == 1
+        assert "positive" in capsys.readouterr().err
+        assert run_state.load_state(run_env) is None
+
+    def test_estimate_time_must_be_nonempty(self, run_env, capsys):
+        assert _main(["goal", "g", "--estimate-time", "  "]) == 1
+        assert "non-empty" in capsys.readouterr().err
+        assert run_state.load_state(run_env) is None
+
+    def test_brief_shows_estimate_with_used_count(self, run_env, capsys):
+        _main(["goal", "fix the auth bug",
+               "--estimate-sessions", "3", "--estimate-time", "4h"])
+        run_state.append_event(run_env, "session_start")
+        run_state.append_event(run_env, "session_end")
+        run_state.append_event(run_env, "session_start")
+        capsys.readouterr()
+        assert _main(["resume"]) == 0
+        assert "Estimate: ~3 sessions / 4h — used: 2 sessions" in capsys.readouterr().out
+
+    def test_resume_json_carries_estimate_and_sessions_used(self, run_env, capsys):
+        _main(["goal", "fix it", "--estimate-sessions", "2"])
+        run_state.append_event(run_env, "session_start")
+        capsys.readouterr()
+        assert _main(["resume", "--json"]) == 0
+        decision = json.loads(capsys.readouterr().out)
+        assert decision["estimate"] == {"sessions": 2, "time": None}
+        assert decision["sessions_used"] == 1
+
+    def test_session_start_brief_counts_prior_sessions(self, run_env, capsys):
+        _main(["goal", "fix it", "--estimate-sessions", "2"])
+        _main(["session-start"])
+        capsys.readouterr()
+        # The second session's brief counts the first (its own session_start
+        # lands after the decide — "used so far").
+        assert _main(["session-start"]) == 0
+        assert "Estimate: ~2 sessions — used: 1 session" in capsys.readouterr().out
 
 
 class TestBinWorkExitCodes:

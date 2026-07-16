@@ -22,6 +22,7 @@ from .git_ops import (
     commit_work_path,
     push_napkin_if_separate,
     report_uncommitted_work_items,
+    web_url_for,
 )
 from . import goals, plan_index, run_state
 from .memory import persist_memory, restore_memory
@@ -157,6 +158,14 @@ Examples:
         nargs="?",
         help="Description of current goal (optional - if omitted, displays current goal)",
     )
+    goal_parser.add_argument(
+        "--estimate-sessions", dest="estimate_sessions", type=int, metavar="N",
+        help="Estimated sessions until solved, recorded with the goal (issue #99)",
+    )
+    goal_parser.add_argument(
+        "--estimate-time", dest="estimate_time", metavar="STR",
+        help='Estimated time until solved — free-form human string ("4h", "2d"), never parsed',
+    )
 
     # memory command
     memory_parser = subparsers.add_parser(
@@ -202,6 +211,20 @@ Examples:
     state_parser.add_argument(
         "--critical-error", dest="critical_error",
         help='JSON object {"summary": ..., "detail": ...}; required with --stop-reason=critical_error',
+    )
+    state_parser.add_argument(
+        "--question",
+        help="The blocking question's text; only valid with (or after) --stop-reason=question",
+    )
+
+    # answer command (resume-on-answer — issue #98)
+    answer_parser = subparsers.add_parser(
+        "answer",
+        help="Record the human's answer to the run's recorded open question",
+    )
+    answer_parser.add_argument(
+        "text",
+        help="The answer's text (clears open_question and the question stop)",
     )
 
     # name command (run naming — spec §1)
@@ -419,8 +442,12 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
                 if legacy_dir is not None and (legacy_dir / "log.yaml").exists():
                     log_file = legacy_dir / "log.yaml"
 
-            # Display log file location
+            # Display log file location, with its web URL when derivable
+            # (issue #104 — user-facing paths carry the clickable form).
             print(f"Log file: {log_file}")
+            url = web_url_for(log_file)
+            if url:
+                print(f"Web: {url}")
             print()
 
             return render_truncated_log(log_file)
@@ -564,13 +591,20 @@ def cmd_report(file_path: str) -> int:
         target_file.write_text(redacted_content, encoding="utf-8")
 
         print(f"✅ Copied report to: {target_file}")
+        url = web_url_for(target_file)
+        if url:
+            print(f"   Web: {url}")
         return 0
     except Exception as e:
         print(f"❌ Error copying report: {e}", file=sys.stderr)
         return 1
 
 
-def cmd_goal(description: str | None) -> int:
+def cmd_goal(
+    description: str | None,
+    estimate_sessions: int | None = None,
+    estimate_time: str | None = None,
+) -> int:
     """
     Execute goal command.
 
@@ -580,11 +614,27 @@ def cmd_goal(description: str | None) -> int:
     Args:
         description: Optional goal description. If provided, sets the goal.
                     If None, displays the current goal.
+        estimate_sessions: Optional sessions-until-solved estimate (issue #99).
+        estimate_time: Optional time-until-solved estimate — a free-form
+                    human string ("4h", "2d"), stored verbatim, never parsed.
 
     Returns:
         Exit code
     """
     try:
+        # Estimate flags (issue #99) only make sense while recording a goal,
+        # and land only in the run state below — validate them up front.
+        has_estimate = estimate_sessions is not None or estimate_time is not None
+        if has_estimate and not description:
+            print("❌ --estimate-sessions/--estimate-time require a goal description", file=sys.stderr)
+            return 1
+        if estimate_sessions is not None and estimate_sessions < 1:
+            print("❌ --estimate-sessions must be a positive integer", file=sys.stderr)
+            return 1
+        if estimate_time is not None and not estimate_time.strip():
+            print("❌ --estimate-time requires a non-empty string", file=sys.stderr)
+            return 1
+
         # Use a temporary file in /tmp for storing the goal
         # This persists across CLI invocations but is temporary (not permanent)
         goal_file = Path("/tmp") / "lmer_work_goal.txt"
@@ -593,17 +643,28 @@ def cmd_goal(description: str | None) -> int:
             # Set the goal
             goal_file.write_text(description, encoding="utf-8")
             print(f"✅ Goal set: {description}")
+            estimate = None
+            if has_estimate:
+                estimate = {"sessions": estimate_sessions, "time": estimate_time}
+                print(f"✅ Estimate: {run_state.format_estimate(estimate)}")
 
             # Also record the goal durably in the run state when a run
             # context exists (spec §5.5). Fails soft — the legacy goal file
             # above is already written, and a state-layer problem must not
-            # break `work goal`.
+            # break `work goal`. The estimate (issue #99) rides along in
+            # state.estimate and the goal_set event's data; a goal without
+            # one keeps today's behavior byte-for-byte (no data payload).
             try:
                 if run_state.run_dir() is not None:
                     rdir, state = run_state.ensure_run()
                     state["goal"] = description
+                    if estimate is not None:
+                        state["estimate"] = estimate
                     run_state.write_state(rdir, state)
-                    run_state.append_event(rdir, "goal_set", note=description)
+                    run_state.append_event(
+                        rdir, "goal_set", note=description,
+                        data={"estimate": estimate} if estimate else None,
+                    )
             except Exception:
                 pass
 
@@ -686,6 +747,29 @@ def _push_run_dir(
         print(f"⚠️  Warning: run-state push failed ({saved} saved locally)")
 
 
+def _completion_actuals(rdir: Path) -> dict:
+    """The run's actuals for the completion event (issue #99): sessions_used
+    (count of `session_start` events), first_session_at (the first one's ts),
+    and the completion stamp — computed by the tool process, never typed by
+    the model. Fail-soft: an events read problem nulls the event-derived
+    fields rather than blocking completion."""
+    sessions_used = None
+    first_session_at = None
+    try:
+        events = run_state.read_events(rdir, last_n=0)
+        sessions_used = run_state.count_session_starts(events)
+        first_session_at = next(
+            (e.get("ts") for e in events if e.get("type") == "session_start"), None
+        )
+    except Exception:
+        pass
+    return {
+        "sessions_used": sessions_used,
+        "first_session_at": first_session_at,
+        "completed_at": run_state.utc_now_iso(),
+    }
+
+
 def cmd_state(args) -> int:
     """Execute state / state set commands."""
     if args.action != "set":
@@ -705,11 +789,14 @@ def cmd_state(args) -> int:
         return 0
 
     # --- mutation path ---
-    if not any([args.phase, args.stop_reason, args.status, args.critical_error]):
-        print("❌ state set requires at least one of --phase/--stop-reason/--status", file=sys.stderr)
+    if not any([args.phase, args.stop_reason, args.status, args.critical_error, args.question]):
+        print("❌ state set requires at least one of --phase/--stop-reason/--status/--question", file=sys.stderr)
         return 1
     if args.stop_reason == "critical_error" and not args.critical_error:
         print("❌ --stop-reason=critical_error requires --critical-error JSON", file=sys.stderr)
+        return 1
+    if args.question and args.stop_reason not in (None, "question"):
+        print("❌ --question is only valid with --stop-reason=question", file=sys.stderr)
         return 1
     critical_error = None
     if args.critical_error:
@@ -725,6 +812,11 @@ def cmd_state(args) -> int:
     rdir, state = _require_run()
     if rdir is None:
         return 1
+    # The "after" form (issue #97): a bare `--question` is only valid while
+    # the recorded stop reason is already `question`.
+    if args.question and not args.stop_reason and state.get("stop_reason") != "question":
+        print("❌ --question requires --stop-reason=question (pass both, or set it first)", file=sys.stderr)
+        return 1
 
     changed = {}
     phase_changed = False
@@ -737,6 +829,14 @@ def cmd_state(args) -> int:
         changed["stop_reason"] = state["stop_reason"]
         if state["stop_reason"] != "critical_error":
             state["critical_error"] = None
+        # A stale question must not survive an answered/cleared stop.
+        if state["stop_reason"] != "question":
+            state["open_question"] = None
+    if args.question:
+        # Agent-typed free text landing in the (shared) work repo — redact
+        # like the other writers (log, ledger title/note, artifacts) do.
+        state["open_question"] = redact_secrets(args.question)
+        changed["open_question"] = state["open_question"]
     if critical_error is not None:
         state["critical_error"] = critical_error
         changed["critical_error"] = True
@@ -768,13 +868,54 @@ def cmd_state(args) -> int:
     if phase_changed:
         run_state.append_event(rdir, "phase", note=args.phase)
     if set(changed) - {"phase"}:
-        run_state.append_event(rdir, "state_changed", data=changed)
+        event_data = dict(changed)
+        if args.status == "complete":
+            # Estimate-vs-actual raw data (issue #99): the completion event
+            # carries the actuals — no new state field needed.
+            event_data["actuals"] = _completion_actuals(rdir)
+        run_state.append_event(rdir, "state_changed", data=event_data)
     print(f"✅ State updated: {changed}")
 
     # Durability (spec §4.4): push on phase transitions and completion.
     if phase_changed or args.status == "complete":
         detail = f"phase={args.phase}" if phase_changed else f"status={args.status}"
         _push_run_dir(state, detail, old_dir_name)
+    return 0
+
+
+def cmd_answer(text: str) -> int:
+    """Execute answer command (issue #98 — resume-on-answer).
+
+    Applies a human's answer to the run's recorded open question through
+    run_state.answer_question (appends `question_answered`, clears
+    `open_question` + `stop_reason`; status untouched), then pushes the run
+    dir — the answer is exactly the record a fresh session resumes from, so
+    it must not stay local. Mutating-verb rules: no run context and no open
+    question recorded are errors (exit 1). No auto-seed: an answer can only
+    land on a run that already asked something.
+    """
+    if not text.strip():
+        print("❌ answer requires a non-empty text", file=sys.stderr)
+        return 1
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+    try:
+        state = run_state.load_state(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    if state is None or not state.get("open_question"):
+        print("❌ No open question recorded — nothing to answer", file=sys.stderr)
+        return 1
+    try:
+        run_state.answer_question(rdir, state, text)
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    print("✅ Question answered — open question and question stop cleared")
+    _push_run_dir(state, "question answered", saved="answer")
     return 0
 
 
@@ -1473,7 +1614,9 @@ def cmd_resume(as_json: bool = False) -> int:
         return 0
     try:
         state = run_state.load_state(rdir)
-        events = run_state.read_events(rdir, last_n=5)
+        # All events, not just the brief's tail: the sessions-used count
+        # (issue #99) needs the whole log; the brief still shows the last 5.
+        all_events = run_state.read_events(rdir, last_n=0)
     except (run_state.RunStateError, OSError) as exc:
         print(f"⚠️  Run state unreadable — falling back to worklog. ({exc})")
         return 0
@@ -1484,7 +1627,8 @@ def cmd_resume(as_json: bool = False) -> int:
         ledger = None
         print(f"⚠️  ledger unreadable — brief omits it. ({exc})", file=sys.stderr)
     decision = run_state.decide(
-        state, events, run_state.current_session_id(), ledger=ledger
+        state, all_events[-5:], run_state.current_session_id(), ledger=ledger,
+        sessions_used=run_state.count_session_starts(all_events),
     )
     if decision.get("kind") == "run":
         # Dirs are renamed by the lifecycle (issue #87 D2), so consumers —
@@ -1494,7 +1638,13 @@ def cmd_resume(as_json: bool = False) -> int:
     if as_json:
         print(json.dumps(decision, ensure_ascii=False))
     else:
-        print(run_state.format_brief(decision))
+        print(run_state.format_brief(
+            decision,
+            seed=os.environ.get("LMER_START_PROMPT") or None,
+            # Web (tree) URL of the run dir (issue #104) — fail-soft None
+            # keeps the brief byte-identical when no URL is derivable.
+            run_dir_url=web_url_for(rdir),
+        ))
     return 0
 
 
@@ -1552,6 +1702,9 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
     run_state.write_state(rdir, state)
     run_state.append_event(rdir, "artifact_written", note=name)
     print(f"✅ Artifact registered: {rdir / name}")
+    url = web_url_for(rdir / name)
+    if url:
+        print(f"   Web: {url}")
 
     # Durability: artifacts are exactly what a dead session must not lose —
     # push the run dir now rather than waiting for session end (non-fatal).
@@ -1671,14 +1824,37 @@ def cmd_session_start() -> int:
                     os.environ.get("LMER_TASK_TARGET", ""),
                 )
 
+        # Resume-on-answer (issue #98): a pushed answer (LMER_ANSWER, set by
+        # `lmer --answer "<text>"` on the host) to the run's recorded open
+        # question is applied BEFORE deciding, so the brief leads with the
+        # answered pair instead of the stale question block. Fail-soft: a
+        # problem applying it degrades to the plain brief, never a failure.
+        answered = None
+        answer = (os.environ.get("LMER_ANSWER") or "").strip()
+        if (
+            answer
+            and state.get("stop_reason") == "question"
+            and state.get("open_question")
+        ):
+            try:
+                question = state.get("open_question")
+                state = run_state.answer_question(rdir, state, answer)
+                answered = {"question": question, "answer": redact_secrets(answer)}
+            except Exception as exc:
+                print(f"⚠️  LMER_ANSWER not applied (continuing): {exc}")
+
         # Decide BEFORE claiming so a foreign claim surfaces as a warning.
-        events = run_state.read_events(rdir, last_n=5)
+        # All events for the sessions-used count (issue #99) — this session's
+        # own session_start lands after the decide, so the count reads
+        # "sessions used so far"; the brief still shows the last 5.
+        all_events = run_state.read_events(rdir, last_n=0)
         try:
             ledger = run_state.load_ledger(rdir)
         except (run_state.RunStateError, OSError):
             ledger = None
         decision = run_state.decide(
-            state, events, run_state.current_session_id(), ledger=ledger
+            state, all_events[-5:], run_state.current_session_id(), ledger=ledger,
+            sessions_used=run_state.count_session_starts(all_events),
         )
 
         run_state.append_event(rdir, "session_start")
@@ -1690,7 +1866,12 @@ def cmd_session_start() -> int:
 
         if recovered:
             print("⚠️  Previous state.yaml was unreadable (backed up); recovered with a fresh seed.")
-        print(run_state.format_brief(decision))
+        print(run_state.format_brief(
+            decision,
+            seed=os.environ.get("LMER_START_PROMPT") or None,
+            answered=answered,
+            run_dir_url=web_url_for(rdir),
+        ))
     except Exception as exc:  # never break a session (spec §6)
         print(f"⚠️  run-state session-start failed (continuing): {exc}")
     return 0
@@ -1745,7 +1926,7 @@ def main() -> int:
     elif args.command == "report":
         return cmd_report(args.file)
     elif args.command == "goal":
-        return cmd_goal(args.description)
+        return cmd_goal(args.description, args.estimate_sessions, args.estimate_time)
     elif args.command == "memory":
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
     elif args.command == "state":
@@ -1766,6 +1947,8 @@ def main() -> int:
         return cmd_verify(raw[1], raw[3:])
     elif args.command == "event":
         return cmd_event(args)
+    elif args.command == "answer":
+        return cmd_answer(args.text)
     elif args.command == "name":
         return cmd_name(args.value)
     elif args.command == "ledger":

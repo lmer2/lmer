@@ -1,10 +1,12 @@
 """Git operations for work repository."""
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote, urlsplit
 
 from .run_state import run_rel_path_candidates
 from .utils import sanitize_task_target
@@ -44,6 +46,85 @@ def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int,
         return result.returncode, (result.stdout + result.stderr).strip()
     except subprocess.CalledProcessError as e:
         return e.returncode, ((e.stdout or "") + (e.stderr or "")).strip()
+
+
+def _web_base_from_remote(remote: str) -> Optional[str]:
+    """Web base URL (``https://host/project``) for a git remote URL.
+
+    Any userinfo in the remote — the work repo's remote is typically
+    tokenized, e.g. ``https://oauth2:TOKEN@git.example.com/agents/work.git``
+    — is STRIPPED: only the hostname (plus port) and project path survive,
+    so a derived URL can never leak the token. ssh remotes, both the
+    ``ssh://git@host/path.git`` scheme form and the scp-style
+    ``git@host:path.git``, normalize to https. Returns None when no
+    host/project can be derived (e.g. a local-path remote).
+    """
+    if "://" in remote:
+        parts = urlsplit(remote)
+        host = parts.hostname
+        if not host:
+            return None
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        project = parts.path.strip("/")
+    else:
+        match = re.match(r"^(?:[^@/]+@)?([^:/]+):(.+)$", remote)
+        if match is None:
+            return None
+        host, project = match.group(1), match.group(2).strip("/")
+    if project.endswith(".git"):
+        project = project[: -len(".git")]
+    if not project:
+        return None
+    return f"https://{host}/{project}"
+
+
+def web_url_for(path) -> Optional[str]:
+    """GitLab web URL for a path inside the work-repo checkout, or None.
+
+    Maps an absolute path under ``LMER_WORK_REPO_PATH`` (default ``/work``)
+    to ``https://<host>/<project>/-/blob/<branch>/<relpath>`` for files and
+    ``/-/tree/<branch>/<relpath>`` for directories — the clickable form a
+    human on a phone can actually open, instead of a container path. The
+    web base comes from the checkout's ``origin`` remote with credentials
+    stripped (:func:`_web_base_from_remote`); the branch is the current
+    branch, falling back to ``main`` when detection fails (detached HEAD).
+
+    Fail-soft by contract: any problem — no work repo, no origin remote, a
+    remote with no host, a path outside or missing from the checkout —
+    returns None and callers print the plain path as before. Never raises.
+    """
+    try:
+        work_repo_path = Path(
+            os.environ.get("LMER_WORK_REPO_PATH", "/work")
+        ).resolve()
+        target = Path(path).resolve()
+        if not target.exists():
+            return None
+        if target != work_repo_path and work_repo_path not in target.parents:
+            return None
+        rc, remote = run_git_command(
+            ["remote", "get-url", "origin"], work_repo_path, check=False
+        )
+        if rc != 0 or not remote.strip():
+            return None
+        base = _web_base_from_remote(remote.strip())
+        if base is None:
+            return None
+        # symbolic-ref (not rev-parse) so an unborn initial branch still
+        # names itself; a detached HEAD fails and falls back to main.
+        rc, branch = run_git_command(
+            ["symbolic-ref", "--short", "HEAD"], work_repo_path, check=False
+        )
+        branch = branch.strip() if rc == 0 else ""
+        branch_q = quote(branch or "main", safe="/")
+        if target == work_repo_path:
+            return f"{base}/-/tree/{branch_q}"
+        kind = "tree" if target.is_dir() else "blob"
+        rel = quote(target.relative_to(work_repo_path).as_posix(), safe="/")
+        return f"{base}/-/{kind}/{branch_q}/{rel}"
+    except Exception:
+        return None
 
 
 def _has_tracked_files(work_repo_path: Path, rel_path: str) -> bool:
