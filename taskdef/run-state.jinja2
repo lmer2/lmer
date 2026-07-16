@@ -17,6 +17,18 @@ recorded phase, goal, and artifacts instead of starting over. If
 `stop_reason` is `question`, the previous session stopped waiting for a
 human answer — check the conversation/thread for it before doing anything
 else.
+
+If the state shows a COMPLETED run (`status: complete`), do NOT resume it
+or invent work — completed runs only reopen on explicit direction:
+
+- Seed provided (the brief shows a `Seed provided (LMER_START_PROMPT):`
+  line): record it as the goal (`work goal "<seed>"`), reopen with
+  `work state set --status=in-progress --stop-reason=none`, then proceed
+  on the seed.
+- No seed: ask the user whether this is a new target or a continuation of
+  this run. If the question goes unanswered, record
+  `work state set --stop-reason=question` and end the session — never
+  proceed on a guess.
 {% endif %}
 
 Ground rules — these come before any work:
@@ -35,7 +47,10 @@ Ground rules — these come before any work:
     judgment after the timeout.
 - **Once direction is clear, record it before starting:**
   `work goal "<one-line statement of the task>"`. A run with work happening
-  and no goal recorded is a contract violation, not a shortcut.
+  and no goal recorded is a contract violation, not a shortcut. Include an
+  estimate when you can size the work —
+  `work goal "..." --estimate-sessions 2 --estimate-time "3h"` — it is
+  compared against the actuals at completion.
 - **Name the run once direction is clear:** derive a short, memorable
   kebab-case name from the task and record it with `work name <name>`.
   Do NOT ask the user to confirm the name — pick it yourself and move
@@ -53,7 +68,14 @@ the work, not optional bookkeeping:
 - Record each phase transition BEFORE starting the phase's work:
   `work state set --phase=<name>` — treat an unrecorded phase as not
   started.
-- BEFORE stopping to ask the user a blocking question: `work state set --stop-reason=question`
+- BEFORE stopping to ask the user a blocking question: record the question
+  text too — `work state set --stop-reason=question --question "<the question>"`
+  — then `work commit`, then END the session immediately. Never idle in-session
+  waiting for an answer: the next session's resume brief surfaces the recorded
+  question first. Answers arrive via a FRESH session — the human relaunches
+  with `lmer ... --answer "<text>"` (or records `work answer "<text>"`) and
+  that session resumes seeded with the question+answer pair; never revive
+  the asking session.
 - At a phasic phase-end yield: `work state set --stop-reason=yield`
 - On completion: `work state set --status=complete --stop-reason=complete`
 - Only for a genuine unrecoverable failure: `work state set --stop-reason=critical_error --critical-error '{"summary": "...", "detail": "..."}'`

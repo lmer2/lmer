@@ -143,7 +143,11 @@ status: in-progress          # in-progress | complete | archived
 phase: interview             # free-form string, taskdef-defined; null for chat
 stop_reason: question        # null | question | yield | complete | critical_error
 critical_error: null         # {summary, detail} — only when stop_reason=critical_error
+open_question: "sqlite or postgres for the cache?"  # only when stop_reason=question; null otherwise
 goal: "align on auth refactor approach"
+estimate:                    # optional, recorded via `work goal --estimate-*`; null until set
+  sessions: 3                # estimated sessions until solved; null when not given
+  time: "4h"                 # free-form human string ("4h", "2d") — stored verbatim, never parsed
 artifacts:                   # present only once registered via `work artifact`
   spec: spec.md
 owner: null                  # {session_id, claimed_at} while a session is live
@@ -158,9 +162,54 @@ deliberate phase-end stop (phasic mode); `complete` = run finished;
 `question`, not `critical_error`. `taskdef` and `target` are set at seed time
 and treated as immutable.
 
-`name` and `frozen` are additive — **schema stays 1**, no migration: older
-readers ignore unknown keys, and the schema guard only refuses *newer*
-schema numbers.
+**Open question (issue #97):** `open_question` holds the blocking question's
+text so it survives the session that asked it (the transcript it would
+otherwise live in is never pushed). It is set via
+`work state set --stop-reason=question --question "<text>"` (secret-redacted,
+recorded in the `state_changed` event's data) and cleared whenever
+`--stop-reason` is set to anything other than `question` (including `none`) —
+a stale question must not survive an answered/cleared stop. When
+`stop_reason` is `question` and a question is recorded, the resume brief
+renders it FIRST, before the run header, as a
+`❓ OPEN QUESTION (answer before anything else):` block.
+
+**Answering (issue #98):** the answer arrives in a FRESH session — the
+asking session already ended (that is the #97 contract). Two delivery
+paths, one mechanism: `work answer "<text>"` in-container, or
+`lmer ... --answer "<text>"` on the host, which exports `LMER_ANSWER` so
+`work session-start` applies it automatically before printing the brief
+(only when the loaded state is actually stopped on a recorded question;
+fail-soft — a problem applying it degrades to the plain brief). Both go
+through `run_state.answer_question`: append a `question_answered` event
+carrying `{question, answer}` (both secret-redacted), clear
+`open_question`, clear `stop_reason`, write through the single writer.
+`status` is never touched — an answered question on a completed run keeps
+`status: complete`; reopening goes through the §3 completed-run directive.
+The auto-applied path renders the brief leading with an
+`✅ ANSWERED QUESTION` block (the question, the answer, and "proceed
+accordingly — record the follow-up goal/phase as you go") in place of the
+open-question block it just resolved.
+
+**Session estimation (issue #99):** `estimate` records how big the run was
+expected to be — set with the goal via
+`work goal "<text>" --estimate-sessions N --estimate-time "<str>"` (either
+flag alone is fine; `time` is a free-form human string like `4h` or `2d`,
+stored verbatim and never parsed). The `goal_set` event echoes the estimate
+in its data; a goal recorded without the flags behaves exactly as before
+(no data payload). When an estimate exists, the resume brief renders
+`Estimate: ~3 sessions / 4h — used: 2 sessions` — the used count is the
+run's `session_start` events so far (computed by the CLI callers that
+already read events; `decide()` stays IO-free and just carries it). At
+completion, `work state set --status=complete` appends the actuals into
+the `state_changed` event's data as
+`actuals: {sessions_used, first_session_at, completed_at}` — computed from
+events by the tool process, fail-soft to null when events can't be read —
+so estimate vs. actual is comparable per run with no extra state field.
+
+`name`, `frozen`, `open_question`, and `estimate` are additive — **schema
+stays 1**, no migration: older readers ignore unknown keys (an old
+state.yaml without the key reads as null), and the schema guard only
+refuses *newer* schema numbers.
 
 **File rename, lazy migration:** the state file is `state.yaml` (lmer-owned
 YAML files standardize on `.yaml`). Run dirs written before the rename hold
@@ -173,7 +222,9 @@ never left readable-but-stale.
 `events.jsonl` is one JSON object per line: `{ts, session, type, note, data}`
 (`note` and `data` optional). Core event types: `run_seeded`, `session_start`,
 `session_end`, `phase`, `state_changed` (non-phase mutations to
-status/stop_reason/critical_error), `goal_set`, `run_named`,
+status/stop_reason/critical_error; on `status=complete` its data also
+carries the estimate-vs-actual `actuals`), `question_answered` (the recorded open
+question plus its human answer, both secret-redacted), `goal_set`, `run_named`,
 `artifact_written`, `gate`, `verify`, `task` (every ledger mutation, §2),
 `run_dir_renamed` (the freeze-gate rename, §1), `goals_frozen`,
 `goal_amended`, `goals_assessed` (the goal-set lifecycle, §2). The type set
@@ -417,21 +468,31 @@ directory name, so legacy full-SHA runs stay addressable by their original
 slug (no aliasing between the two forms).
 
 **Completed-run policy:** if the slug resolves to a run with
-`status: complete`, the session does not re-seed — the resume brief reports
-the completed run, and the session reopens it (`work state set
---status=in-progress`) only if new work on that target is actually
-requested. Runs the external cleaner has moved to `runs/archive/` no longer
-occupy the slug, so a genuinely new engagement seeds a fresh run.
+`status: complete`, the session does not re-seed — and it never silently
+resumes either (#96). `decide()` marks the decision with
+`completed_run: true` (carried into `work resume --json` for hooks), and
+the resume brief appends an explicit direction contract: with a seed
+(`LMER_START_PROMPT`, threaded into `format_brief` by
+`work session-start`/`work resume`) the session records it as the goal
+(`work goal "<seed>"`), reopens with `work state set --status=in-progress
+--stop-reason=none`, and proceeds on the seed; without one it asks the
+user (new target vs continue this run), recording
+`work state set --stop-reason=question` and ending the session if the
+question goes unanswered — never proceeding on a guess. The run-state
+taskdef fragment teaches the same contract. Runs the external cleaner has
+moved to `runs/archive/` no longer occupy the slug, so a genuinely new
+engagement seeds a fresh run.
 
 ## 4. CLI verbs
 
 | Verb | Behavior |
 |---|---|
 | `work state` | Print current run state (read-only). |
-| `work state set --phase=… --stop-reason=… --status=… [--critical-error=<json>]` | The only mutation path. Constrained fields; atomic write; bumps `updated`; appends a corresponding event. Re-submitting the same `--phase` value with no other flags short-circuits with `State unchanged` and does not write; the other flags always write (see below). |
+| `work state set --phase=… --stop-reason=… --status=… [--critical-error=<json>] [--question "<text>"]` | The only mutation path. Constrained fields; atomic write; bumps `updated`; appends a corresponding event. Re-submitting the same `--phase` value with no other flags short-circuits with `State unchanged` and does not write; the other flags always write (see below). |
+| `work answer "<text>"` | Record the human's answer to the run's recorded open question (§2): appends `question_answered` (`{question, answer}`, both secret-redacted), clears `open_question` and `stop_reason` (`status` untouched — a completed run stays complete), pushes the run dir. Errors (exit 1) without run context or when no open question is recorded; never auto-seeds. The same logic is applied automatically by `work session-start` when `LMER_ANSWER` is set (the host CLI's `--answer` flag). |
 | `work event <type> [--note "…"] [--data <json>]` | Append one event line. Auto-seeds the run if it doesn't exist yet. |
 | `work verify <name> -- <command …>` | Run the command (stderr merged into stdout), stream its output through, mirror its exit code, and append a `verify` receipt event (§2): `{name, argv, exit_code, duration_s, summary_line, output_tail_sha256}`. The `--` separator is required (a forgotten name must not silently become the command). A signal-killed command mirrors the shell convention `128+N` (receipt and observed exit code agree); a command that cannot start exits 127. Mutating-verb rules: without run context this errors *before* running the command. A receipt-append failure after the command ran is reported loudly on stderr but the exit code still mirrors the command. |
-| `work resume [--json]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
+| `work resume [--json]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, an `Estimate: ~3 sessions / 4h — used: 2 sessions` line when an estimate is recorded (§2), a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
 | `work ledger` | Print the execution ledger table (read-only): the summary line plus one row per task. With no ledger prints `No ledger`, exit 0. |
 | `work ledger set <task-id> --status <s> [--title …] [--commit <sha>] [--receipt <name>] [--note …]` | The only mutation path for `ledger.yaml` (§2): upserts the row (omitted fields preserved), stamps `updated`, appends a `task` event, pushes the run dir. `--status` is one of `pending\|in-progress\|done\|deferred\|dropped`; `done` with no `--commit` warns loudly but succeeds. |
 | `work plan check` | Read-only lint of the run's `plan.index.json` (§2). Errors (exit 1): invalid/newer schema, structural problems (non-string/duplicate ids, missing description), unknown `deps` ids, dependency cycles, file overlap between dependency-independent tasks not declared in `shared_files`, missing/invalid `session_scope`, `multi` without `scope_rationale`. Warnings (exit 0): plan.md checkbox count drifting from the index task count, empty `verify_commands`, `goals` refs that don't parse from goals.md (`## G<n>:` headings; skipped when goals.md is absent), active goals with no covering task (a `goals` ref, or a plan.md mention as fallback), stale/malformed `shared_files` entries. Findings print to stdout so the report can be pasted into the plan-approval request. No run context or no `plan.index.json` prints a message and exits 0 (chat/review taskdefs have no index); writes nothing — no event, no push. |
@@ -442,14 +503,20 @@ occupy the slug, so a genuinely new engagement seeds a fresh run.
 | `work name <kebab-case>` | Set the run's name (a label — the directory slug never changes). Normalizes to kebab-case (lowercase; spaces/underscores → `-`; strip other characters; collapse/trim `-`), printing the normalized form when it differs; errors if nothing survives. Names are **unique per project** — a name held by another run is rejected with an error citing the conflicting slug. Renaming is allowed anytime (same uniqueness check; appends another `run_named` event — history lives in the event log); re-setting the run's own current name is an idempotent no-op success. Bare `work name` prints the current name (or "No name set"), read-only, exit 0. |
 | `work artifact <name> --file <path>` | Copy the file into the run dir (secret-redacted), register it in `state.artifacts` (through the single writer, keyed by the artifact's filename stem), append `artifact_written`. `<name>` must be a plain filename (no path components, no leading dot). |
 | `work seed <taskdef> <target> [--goal …] [--name …]` | Out-of-session run creation: derives the slug from its args and creates a run for it through the same create-tmp → write-state → rename lifecycle, recording CLI-shaped events (`run_seeded`, then `goal_set` / `run_named` as given). Does **not** claim `owner` (seeding is not owning) and does **not** push — batch with `work commit`. An existing run for the slug (or a name conflict) is an error. |
-| `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), decide the resume brief *before* claiming, append `session_start`, claim `owner`, print the brief. Always exits 0. |
+| `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), apply a pushed `LMER_ANSWER` when the run is stopped on a recorded question (§2, fail-soft), decide the resume brief *before* claiming, append `session_start`, claim `owner`, print the brief (leading with the answered question+answer pair when one was just applied). Always exits 0. |
 | `work session-end` | Hook-facing. Append `session_end`, clear `owner` if it's ours, push the run-state path via `work commit`. Always exits 0. |
 
 `work state set` field choices: `--stop-reason` is one of
 `question|yield|complete|critical_error|none` (`none` clears it back to
 `null`); `--status` is one of `in-progress|complete|archived`;
 `--critical-error` takes a JSON object (`{"summary": ..., "detail": ...}`)
-and is required when `--stop-reason=critical_error` is given.
+and is required when `--stop-reason=critical_error` is given; `--question`
+stores `open_question` (§2) and is only valid together with
+`--stop-reason=question` — or on its own while the recorded stop reason is
+already `question` — any other combination errors (exit 1). Setting
+`--stop-reason` to anything other than `question` (including `none`) clears
+`open_question`. `--status=complete` additionally stamps the completion
+actuals (§2) into the `state_changed` event's data.
 
 **No-op behavior:** only `--phase` is compared against the current value —
 re-submitting the same `--phase` with no other flags short-circuits with
@@ -459,10 +526,13 @@ event, even when the value is identical to what's already recorded — and
 `--status=complete` triggers a work-repo push each time, so an idempotent
 retry of the close-out command re-pushes (harmless, but not silent).
 
-`work goal` (existing verb, unchanged interface): when a run context exists
+`work goal` (existing verb): when a run context exists
 (`LMER_REPO_HOST`/`LMER_REPO_PROJECT` set), setting a goal additionally
 records it into `state.yaml` and appends a `goal_set` event; the legacy
-`/tmp` goal-file behavior is preserved unconditionally either way.
+`/tmp` goal-file behavior is preserved unconditionally either way. Optional
+`--estimate-sessions N` / `--estimate-time "<str>"` flags (issue #99, §2)
+store a `{sessions, time}` estimate in `state.estimate` and echo it in the
+event's data — a goal without them behaves byte-for-byte as before.
 
 ## 5. Session lifecycle
 
@@ -498,9 +568,9 @@ records it into `state.yaml` and appends a `goal_set` event; the legacy
   repo), the read-only and hook-facing verbs (`work state`, `work resume`,
   `work session-start`, `work session-end`) print a "no run context" message
   and exit 0, but the mutating verbs (`work state set`, `work event`,
-  `work verify`, `work artifact`, `work ledger set`) print an error to
-  stderr and exit 1 — scripts chaining them under `set -e` should expect
-  that. Session behavior
+  `work verify`, `work artifact`, `work ledger set`, `work answer`) print
+  an error to stderr and exit 1 — scripts chaining them under `set -e`
+  should expect that. Session behavior
   without a repo is unchanged from before this feature existed.
 
 ## 6. External cleaner contract

@@ -101,7 +101,9 @@ class TestStateIO:
         assert state["phase"] is None
         assert state["stop_reason"] is None
         assert state["critical_error"] is None
+        assert state["open_question"] is None
         assert state["goal"] is None
+        assert state["estimate"] is None
         assert state["artifacts"] == {}
         assert state["owner"] is None
         assert state["created"].endswith("Z")
@@ -271,12 +273,28 @@ class TestDecide:
     def test_completed_run(self):
         d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")
         assert d["status"] == "complete"
+        assert d["completed_run"] is True
+
+    def test_in_progress_not_flagged_completed(self):
+        d = run_state.decide(_state(), [], "s-1")
+        assert d["completed_run"] is False
 
     def test_critical_error_carried(self):
         state = _state(stop_reason="critical_error",
                        critical_error={"summary": "boom", "detail": "trace"})
         d = run_state.decide(state, [], "s-1")
         assert d["critical_error"]["summary"] == "boom"
+
+    def test_open_question_carried(self):
+        state = _state(stop_reason="question", open_question="sqlite or postgres?")
+        d = run_state.decide(state, [], "s-1")
+        assert d["open_question"] == "sqlite or postgres?"
+
+    def test_legacy_state_without_open_question_key(self):
+        state = _state(stop_reason="question")
+        del state["open_question"]  # pre-#97 state.yaml files lack the key entirely
+        d = run_state.decide(state, [], "s-1")
+        assert d["open_question"] is None
 
     def test_fresh_foreign_claim_warns_live(self):
         state = _state(owner={"session_id": "s-other", "claimed_at": "2026-07-03T11:30:00Z"})
@@ -312,6 +330,69 @@ class TestDecide:
                               "claimed_at": run_state.utc_now_iso()})
         d = run_state.decide(state, [], "s-1")
         assert any("another live session" in w for w in d["warnings"])
+
+    def test_estimate_carried(self):
+        state = _state(estimate={"sessions": 3, "time": "4h"})
+        d = run_state.decide(state, [], "s-1")
+        assert d["estimate"] == {"sessions": 3, "time": "4h"}
+
+    def test_legacy_state_without_estimate_key(self):
+        state = _state()
+        del state["estimate"]  # pre-#99 state.yaml files lack the key entirely
+        d = run_state.decide(state, [], "s-1")
+        assert d["estimate"] is None
+
+    def test_sessions_used_threaded_through(self):
+        # decide() stays IO-free — the caller counts and passes it in.
+        d = run_state.decide(_state(), [], "s-1", sessions_used=2)
+        assert d["sessions_used"] == 2
+
+    def test_sessions_used_defaults_to_none(self):
+        d = run_state.decide(_state(), [], "s-1")
+        assert d["sessions_used"] is None
+
+
+class TestCountSessionStarts:
+    def test_counts_only_session_starts(self):
+        events = [
+            {"type": "run_seeded"},
+            {"type": "session_start"},
+            {"type": "phase", "note": "interview"},
+            {"type": "session_end"},
+            {"type": "session_start"},
+        ]
+        assert run_state.count_session_starts(events) == 2
+
+    def test_empty_is_zero(self):
+        assert run_state.count_session_starts([]) == 0
+
+    def test_tolerates_non_dict_entries(self):
+        assert run_state.count_session_starts(
+            ["torn", None, {"type": "session_start"}]) == 1
+
+
+class TestFormatEstimate:
+    def test_both_parts(self):
+        assert run_state.format_estimate(
+            {"sessions": 3, "time": "4h"}) == "~3 sessions / 4h"
+
+    def test_sessions_only(self):
+        assert run_state.format_estimate({"sessions": 2, "time": None}) == "~2 sessions"
+
+    def test_singular_session(self):
+        assert run_state.format_estimate({"sessions": 1, "time": None}) == "~1 session"
+
+    def test_time_only(self):
+        assert run_state.format_estimate({"sessions": None, "time": "2d"}) == "2d"
+
+    def test_none_and_malformed_degrade_to_none(self):
+        assert run_state.format_estimate(None) is None
+        assert run_state.format_estimate("3 sessions") is None
+        assert run_state.format_estimate({}) is None
+        assert run_state.format_estimate({"sessions": None, "time": None}) is None
+        # Hand-edited junk must never break the brief.
+        assert run_state.format_estimate({"sessions": True, "time": ""}) is None
+        assert run_state.format_estimate({"sessions": -1}) is None
 
 
 class TestFormatBrief:
@@ -349,6 +430,170 @@ class TestFormatBrief:
         d = run_state.decide(state, [], "s-1")
         text = run_state.format_brief(d)
         assert "oops" in text
+
+    def test_completed_brief_with_seed_renders_seed_path(self):
+        d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")
+        text = run_state.format_brief(d, seed="pick up issue 97 next")
+        assert "COMPLETED RUN" in text
+        assert "Seed provided (LMER_START_PROMPT): pick up issue 97 next" in text
+        assert 'work goal "<seed>"' in text
+        assert "work state set --status=in-progress --stop-reason=none" in text
+
+    def test_completed_brief_seed_excerpt_truncated(self):
+        d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")
+        text = run_state.format_brief(d, seed="x" * 200)
+        assert "x" * 120 + "…" in text
+        assert "x" * 121 not in text
+
+    def test_completed_brief_without_seed_renders_ask_or_stop(self):
+        d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")
+        text = run_state.format_brief(d)
+        assert "COMPLETED RUN" in text
+        assert "work state set --stop-reason=question" in text
+        assert "never proceed on a guess" in text
+
+    def test_in_progress_brief_has_no_completed_directive(self):
+        d = run_state.decide(_state(), [], "s-1")
+        text = run_state.format_brief(d, seed="a seed that must not surface")
+        assert "COMPLETED RUN" not in text
+        assert "Seed provided" not in text
+
+    def test_open_question_renders_first(self):
+        state = _state(stop_reason="question", open_question="sqlite or postgres?")
+        text = run_state.format_brief(run_state.decide(state, [], "s-1"))
+        lines = text.splitlines()
+        assert lines[0] == "❓ OPEN QUESTION (answer before anything else):"
+        assert lines[1] == "sqlite or postgres?"
+        assert lines[2] == ""
+        assert lines[3].startswith("Run: develop-issue-123")
+
+    def test_no_question_block_without_recorded_question(self):
+        state = _state(stop_reason="question")  # pre-#97 stop: text never recorded
+        text = run_state.format_brief(run_state.decide(state, [], "s-1"))
+        assert "OPEN QUESTION" not in text
+        assert text.splitlines()[0].startswith("Run:")
+
+    def test_no_question_block_when_stop_reason_moved_on(self):
+        # decide() passes open_question through verbatim; the brief only
+        # surfaces it while the run is actually stopped on it.
+        state = _state(stop_reason="yield", open_question="stale?")
+        text = run_state.format_brief(run_state.decide(state, [], "s-1"))
+        assert "OPEN QUESTION" not in text
+
+    def test_completed_run_with_open_question_orders_blocks(self):
+        # Interplay with the #96 directive: question block first, then the
+        # header, then the completed-run directive.
+        state = _state(status="complete", stop_reason="question",
+                       open_question="reopen or archive?")
+        text = run_state.format_brief(run_state.decide(state, [], "s-1"))
+        q_at = text.index("OPEN QUESTION")
+        header_at = text.index("Run: develop-issue-123")
+        directive_at = text.index("COMPLETED RUN")
+        assert q_at < header_at < directive_at
+
+    def test_answered_question_leads_brief(self):
+        # Issue #98: a just-applied answer (LMER_ANSWER at session start) is
+        # the new direction — the pair leads everything else the brief says.
+        d = run_state.decide(_state(), [], "s-1")  # question already cleared
+        text = run_state.format_brief(
+            d, answered={"question": "sqlite or postgres?", "answer": "postgres"}
+        )
+        lines = text.splitlines()
+        assert lines[0] == "✅ ANSWERED QUESTION (this run's blocking question has its answer):"
+        assert lines[1] == "Q: sqlite or postgres?"
+        assert lines[2] == "A: postgres"
+        assert lines[3] == "Proceed accordingly — record the follow-up goal/phase as you go."
+        assert lines[4] == ""
+        assert lines[5].startswith("Run: develop-issue-123")
+
+    def test_no_answered_block_by_default(self):
+        text = run_state.format_brief(run_state.decide(_state(), [], "s-1"))
+        assert "ANSWERED QUESTION" not in text
+
+    def test_estimate_line_with_used_count(self):
+        state = _state(estimate={"sessions": 3, "time": "4h"})
+        d = run_state.decide(state, [], "s-1", sessions_used=2)
+        text = run_state.format_brief(d)
+        assert "Estimate: ~3 sessions / 4h — used: 2 sessions" in text
+
+    def test_estimate_line_without_used_count(self):
+        # sessions_used=None (caller didn't count) — the used part is absent.
+        state = _state(estimate={"sessions": 3, "time": "4h"})
+        text = run_state.format_brief(run_state.decide(state, [], "s-1"))
+        assert "Estimate: ~3 sessions / 4h" in text
+        assert "used:" not in text
+
+    def test_estimate_line_time_only(self):
+        state = _state(estimate={"sessions": None, "time": "2d"})
+        d = run_state.decide(state, [], "s-1", sessions_used=1)
+        assert "Estimate: 2d — used: 1 session" in run_state.format_brief(d)
+
+    def test_no_estimate_line_without_estimate(self):
+        d = run_state.decide(_state(), [], "s-1", sessions_used=2)
+        assert "Estimate:" not in run_state.format_brief(d)
+
+    def test_estimate_line_placed_after_phase_line(self):
+        state = _state(estimate={"sessions": 2, "time": None}, goal="ship it")
+        text = run_state.format_brief(run_state.decide(state, [], "s-1"))
+        lines = text.splitlines()
+        assert lines[0].startswith("Run:")
+        assert lines[1].startswith("Phase:")
+        assert lines[2] == "Estimate: ~2 sessions"
+        assert lines[3] == "Goal: ship it"
+
+
+class TestAnswerQuestion:
+    """run_state.answer_question — resume-on-answer (issue #98)."""
+
+    def _asked(self, tmp_path, **overrides):
+        rdir = tmp_path / "r"
+        state = _state(stop_reason="question",
+                       open_question="sqlite or postgres?", **overrides)
+        run_state.write_state(rdir, state)
+        return rdir, state
+
+    def test_clears_question_and_stop_reason(self, run_env, tmp_path):
+        rdir, state = self._asked(tmp_path)
+        updated = run_state.answer_question(rdir, state, "postgres")
+        assert updated["open_question"] is None
+        assert updated["stop_reason"] is None
+        on_disk = run_state.load_state(rdir)  # persisted via the single writer
+        assert on_disk["open_question"] is None
+        assert on_disk["stop_reason"] is None
+
+    def test_event_carries_both_texts(self, run_env, tmp_path):
+        rdir, state = self._asked(tmp_path)
+        run_state.answer_question(rdir, state, "postgres")
+        event = run_state.read_events(rdir, last_n=0)[-1]
+        assert event["type"] == "question_answered"
+        assert event["data"] == {"question": "sqlite or postgres?",
+                                 "answer": "postgres"}
+
+    def test_texts_are_redacted(self, run_env, tmp_path, monkeypatch):
+        rdir, state = self._asked(tmp_path)
+        monkeypatch.setattr(run_state, "redact_secrets", lambda s: "<redacted>")
+        run_state.answer_question(rdir, state, "token=hunter2")
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert data == {"question": "<redacted>", "answer": "<redacted>"}
+
+    def test_in_progress_status_kept(self, run_env, tmp_path):
+        rdir, state = self._asked(tmp_path)
+        assert run_state.answer_question(rdir, state, "postgres")["status"] == "in-progress"
+
+    def test_completed_run_status_preserved(self, run_env, tmp_path):
+        # An answered question never silently reopens a completed run —
+        # the #96 directive governs reopening.
+        rdir, state = self._asked(tmp_path, status="complete")
+        updated = run_state.answer_question(rdir, state, "archive it")
+        assert updated["status"] == "complete"
+        assert run_state.load_state(rdir)["status"] == "complete"
+
+    def test_no_open_question_raises(self, run_env, tmp_path):
+        rdir = tmp_path / "r"
+        state = _state()
+        run_state.write_state(rdir, state)
+        with pytest.raises(run_state.RunStateError, match="no open question"):
+            run_state.answer_question(rdir, state, "nothing was asked")
 
 
 class TestEmitGateEvent:

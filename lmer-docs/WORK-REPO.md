@@ -215,6 +215,19 @@ the `work` CLI resolves runs by the `slug:`/`name:` recorded in
 log/report files at the legacy `{task_type}/{task_target}/` location,
 which `work log` still reads as a display fallback.
 
+## Web URLs
+
+User-facing `work` output links run artifacts by their GitLab web URL, not
+just the container path: `work artifact` and `work report` print the copied
+file's blob URL, `work log` (display mode) links the log file, and the
+resume brief printed by `work resume` / `work session-start` ends with a
+`Run dir: <tree URL>` line. Cite these URLs — never a bare `/work/...`
+container path — when pointing a human at run output. URLs derive from the
+work repo checkout's `origin` remote (credentials are stripped, so a
+tokenized remote never leaks) and its current branch (`main` when detection
+fails). Derivation is fail-soft: when no URL can be derived (no remote,
+path outside the checkout), only the plain path is printed, as before.
+
 ## Environment Variables
 
 The `work` command uses the following environment variables (set automatically by lmer):
