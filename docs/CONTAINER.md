@@ -18,6 +18,7 @@ This project provides a FIPS 140-2 compliant development environment using Oracl
   - [SELinux Support](#selinux-support)
 - [Container Usage](#container-usage)
   - [Development Workflow](#development-workflow)
+  - [Status Line](#status-line)
   - [Volume Mounts](#volume-mounts)
   - [User ID and Permissions](#user-id-and-permissions)
     - [Build-Time User ID Handling](#build-time-user-id-handling)
@@ -194,6 +195,10 @@ hashlib.md5(b'test').hexdigest()
    make test-all   # All tests locally
    make fips-check # Verify FIPS mode in the container
    ```
+
+### Status Line
+
+Every Claude Code session in an lmer container gets a status line automatically — no user setup. The provisioned `settings.json` points `statusLine` at `claude-status` (on `PATH` via `/Agents/global/bin`), which delegates to the stdlib-only renderer `hooks/statusline.py`. It reads Claude Code's JSON status payload from stdin and prints one line of the form `group/project @ feature/x | develop | ctx 42%`: the repo (`LMER_REPO_PROJECT`, falling back to the git toplevel's basename), the current branch (`git branch --show-current` at the session's cwd, short timeout), the lmer task (`LMER_TASK`), and the percentage of the context window used (from the payload's `context_window` fields). Segments whose inputs are unavailable are simply omitted — the payload schema evolves and the renderer degrades instead of erroring — and the 📦 (container) / ⚡ (danger zone) indicators are appended. No network or expensive calls are made on render.
 
 ### Volume Mounts
 
