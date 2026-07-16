@@ -162,6 +162,17 @@ class TestStateSet:
             assert _main(["state", "set", "--stop-reason=yield"]) == 0
         assert run_state.load_state(run_env)["open_question"] is None
 
+    def test_bare_question_stop_clears_previous_question(self, run_env):
+        # A NEW question-stop without text must not resurface the previous
+        # stop's question as if it were the current blocker.
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            _main(["state", "set", "--stop-reason=question",
+                   "--question", "sqlite or postgres?"])
+            assert _main(["state", "set", "--stop-reason=question"]) == 0
+        state = run_state.load_state(run_env)
+        assert state["stop_reason"] == "question"
+        assert state["open_question"] is None
+
     def test_completion_event_carries_actuals(self, run_env):
         # Issue #99: two sessions ran, then the run completes — the
         # state_changed event carries the machine-computed actuals.
@@ -698,7 +709,7 @@ class TestSessionStart:
         assert "complete" in out
         # No seed (autouse fixture strips LMER_*): the ask-or-stop line.
         assert "COMPLETED RUN" in out
-        assert "work state set --stop-reason=question" in out
+        assert 'work state set --stop-reason=question --question "<text>"' in out
         assert run_state.load_state(run_env)["status"] == "complete"
 
     def test_completed_run_with_seed_prints_seed_line(self, run_env, capsys, monkeypatch):

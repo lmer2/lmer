@@ -449,7 +449,7 @@ class TestFormatBrief:
         d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")
         text = run_state.format_brief(d)
         assert "COMPLETED RUN" in text
-        assert "work state set --stop-reason=question" in text
+        assert 'work state set --stop-reason=question --question "<text>"' in text
         assert "never proceed on a guess" in text
 
     def test_in_progress_brief_has_no_completed_directive(self):

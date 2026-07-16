@@ -875,8 +875,8 @@ def format_brief(
             lines.append(
                 "No seed — ask the user (new target vs continue this run). "
                 "If the question goes unanswered, record "
-                "`work state set --stop-reason=question` and end the session "
-                "— never proceed on a guess."
+                '`work state set --stop-reason=question --question "<text>"` '
+                "and end the session — never proceed on a guess."
             )
     if run_dir_url:
         lines.append(f"Run dir: {run_dir_url}")
