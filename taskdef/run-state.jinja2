@@ -81,7 +81,9 @@ the work, not optional bookkeeping:
 - On completion: `work state set --status=complete --stop-reason=complete`
 - Only for a genuine unrecoverable failure: `work state set --stop-reason=critical_error --critical-error '{"summary": "...", "detail": "..."}'`
 - To resume work on the run (e.g. it was marked complete but new work arrived): `work state set --status=in-progress --stop-reason=none`
-- Persist durable artifacts (specs, plans, retros): `work artifact <name>.md --file <path>`
+- Persist durable artifacts (specs, plans, retros): `work artifact <name>.md --file <path>`.
+  Specs, plans, and reports deliver as Markdown (`.md`) — never docx/pdf/binary
+  documents (unreviewable, undiffable, unlinkable at line level).
 - Log notable moments: `work event <type> --note "..."`
 - **Prove "done" with receipts.** Validation only counts when a tool
   recorded it: the gate commands (`gate-check`/`gate-commit`/`gate-push`)

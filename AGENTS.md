@@ -4,6 +4,7 @@
 - **NEVER** use `git add -A` or `git add .` - ONLY add specific files you've modified
 - **ALWAYS** use gate commands for git operations
 - **ALWAYS** write documentation for new features and APIs
+- **ALWAYS** deliver specs, plans, and reports as Markdown (`.md`) — never docx/pdf/binary documents
 - **ALWAYS** check that ALL tests pass before declaring anything complete
 - **ALWAYS** check git rules before commit
 - **NEVER** push to any repository without explicit permission (except allow list)

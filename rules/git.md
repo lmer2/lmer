@@ -16,6 +16,9 @@ Gate commands run the full test suite and pre-commit hooks, and routinely take s
 ### `LMER_QUICK_GATE_COMMIT`: skip tests during `gate-commit`
 Setting `LMER_QUICK_GATE_COMMIT` to a truthy value (`1`, `true`, `yes`, case-insensitive) makes `gate-commit` skip the test suite (the slowest check) while still running pre-commit hooks, secret scans, and the other fast checks. Tests are still run by standalone `gate-check` and by `gate-push`, so coverage is preserved before code leaves the local repo. The flag only affects `gate-commit` — `gate-check` and `gate-push` ignore it. Set to `0`, `false`, `no`, or leave unset to keep tests running.
 
+### Deliverable format check
+The gate checks warn when a staged file that names a spec-class deliverable (any path component with a word starting `spec`, `plan`, or `report`) uses a binary document extension (`.docx`, `.doc`, `.pdf`, `.odt`, `.rtf`). Specs, plans, and reports deliver as Markdown (`.md`) — binary documents are unreviewable in GitLab (undiffable, unlinkable at line level). This is a WARNING, not a hard fail, because reports from external sources may legitimately be PDF; unrelated binary files (vendored manuals, fixtures) are not flagged.
+
 ## 🚨 Critical Git Rules
 - **NEVER** use `git add -A` or `git add .` - ONLY add specific files you've modified
 - **ALWAYS** use gate commands instead of direct git commit/push
