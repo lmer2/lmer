@@ -8,6 +8,7 @@ import hashlib
 import os
 import json
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -34,6 +35,12 @@ from .utils import redact_secrets, task_target_dir
 # sha256 of exactly these bytes, so a receipt can be checked after the fact
 # without the work repo ever storing the output itself.
 VERIFY_TAIL_BYTES = 64 * 1024
+
+
+# Where setup-workspace writes the routing env vars for the session to source.
+# /tmp is container-local and session-scoped — never committed and never mounted
+# from the host — so it can't leak into the host's ~/.lmer or into other sessions.
+WORKSPACE_ENV_FILE = Path("/tmp/lmer-workspace-env.sh")
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -75,6 +82,9 @@ Examples:
 
   # Display current goal
   work goal
+
+  # Bootstrap /workspace for dev work in a chat-mode session
+  work setup-workspace https://git.example.com/group/project/-/issues/42
         """,
     )
 
@@ -187,6 +197,26 @@ Examples:
         "--message",
         "-m",
         help="Commit message (defaults to auto-generated)",
+    )
+
+    # setup-workspace command
+    setup_ws_parser = subparsers.add_parser(
+        "setup-workspace",
+        help="Clone + provision /workspace for a task target (chat-mode dev bootstrap)",
+    )
+    setup_ws_parser.add_argument(
+        "target",
+        help="Task target: an MR/PR/issue/work_items URL, or a plain repository URL",
+    )
+    setup_ws_parser.add_argument(
+        "--task",
+        default="develop",
+        help="Task type for the work-repo layout / LMER_TASK (default: develop)",
+    )
+    setup_ws_parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="Skip dependency sync (uv sync); only clone + provision docs",
     )
 
     # state command (run-state kernel — spec §4.3)
@@ -703,6 +733,122 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
     else:
         parser.print_help()
         return 1
+
+
+def _write_workspace_env(result: dict) -> Path:
+    """Write the derived LMER_* routing vars to a sourceable shell file.
+
+    These four vars are what ``lmer <verb> <target>`` sets at container launch;
+    a mid-session ``setup-workspace`` can't inject them into future shells, so
+    they are persisted here for the session to ``source``. None are secret
+    (host/project/task/target only — no tokens).
+    """
+    lines = [
+        "# lmer workspace routing env — written by `work setup-workspace`.",
+        "# Source this so `work log`/`commit`/`report` and gate-check's",
+        "# work-repo-aware features can find this project:",
+        f"#   source {WORKSPACE_ENV_FILE}",
+        f"export LMER_REPO_HOST={shlex.quote(result['host'])}",
+        f"export LMER_REPO_PROJECT={shlex.quote(result['project'])}",
+        f"export LMER_TASK={shlex.quote(result['task'])}",
+        f"export LMER_TASK_TARGET={shlex.quote(result['task_target'])}",
+    ]
+    WORKSPACE_ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return WORKSPACE_ENV_FILE
+
+
+def cmd_setup_workspace(target: str, task: str, sync_deps: bool) -> int:
+    """Execute setup-workspace command.
+
+    Bootstraps /workspace for a session that needs to do real dev work on a repo
+    it was not started with (the chat-mode case in issue #69): clone, work-repo
+    dirs, documentation provisioning, and dependency sync — the same setup a
+    repo-targeted ``lmer`` session gets at container startup. Then writes the
+    routing env vars for the session to source. Hard-errors if /workspace is
+    already set up.
+
+    Args:
+        target: Task target (resource URL or plain repo URL).
+        task: Task type for the work-repo layout / LMER_TASK.
+        sync_deps: Run dependency sync when True.
+
+    Returns:
+        Exit code (0 success, 1 on any setup failure including already-set-up).
+    """
+    # Lazy import: only setup-workspace needs lmer_cli. Plain `work log`/`commit`
+    # invocations should not pay to import the lmer_cli package.
+    try:
+        from lmer_cli.container.clone_and_exec import (
+            setup_workspace,
+            WorkspaceExistsError,
+        )
+    except ImportError as e:
+        print(f"❌ Could not load workspace setup support: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        result = setup_workspace(target, task=task, sync_deps=sync_deps)
+    except WorkspaceExistsError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        print(
+            "   Remove the existing /workspace contents first if you really "
+            "want to re-create it.",
+            file=sys.stderr,
+        )
+        return 1
+    except ValueError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"❌ Workspace setup failed: {e}", file=sys.stderr)
+        return 1
+
+    # Restore this project's persisted agent memory now that setup_workspace has
+    # set LMER_REPO_HOST/LMER_REPO_PROJECT in the environment. At normal container
+    # startup this is done by claude-runner via `work memory restore` *after* the
+    # entrypoint clones the repo; the chat->dev pivot never runs that runner step,
+    # so do it here. No-op unless LMER_PERSIST_AGENT_MEMORY is enabled; best-effort
+    # (the workspace is already set up, so a restore failure must not fail setup).
+    try:
+        restore_memory()
+    except Exception as e:
+        print(f"⚠️  Agent memory restore failed: {e}", file=sys.stderr)
+
+    env_file = _write_workspace_env(result)
+
+    provisioned = result.get("provisioned") or []
+    provisioned_str = (
+        ", ".join(provisioned) if provisioned else "none (project ships its own)"
+    )
+
+    print(f"✅ /workspace set up for {result['host']}/{result['project']}")
+    print(f"   Branch:            {result.get('branch') or '(detached/unknown)'}")
+    print(f"   Provisioned docs:  {provisioned_str}")
+    print(f"   Dependencies:      {result.get('deps_status')}")
+    print(f"   Task:              {result['task']}")
+    print()
+    print(
+        "Routing vars for `work log`/`commit`/`report` and gate-check were "
+        f"written to {env_file}."
+    )
+    print("Load them into your shell with:")
+    print(f"   source {env_file}")
+    print("Or export them directly:")
+    print(f"   export LMER_REPO_HOST={shlex.quote(result['host'])}")
+    print(f"   export LMER_REPO_PROJECT={shlex.quote(result['project'])}")
+    print(f"   export LMER_TASK={shlex.quote(result['task'])}")
+    print(f"   export LMER_TASK_TARGET={shlex.quote(result['task_target'])}")
+
+    if str(result.get("deps_status", "")).startswith("FAILED"):
+        # The workspace IS set up, so this is a warning rather than a failure
+        # (mirrors container startup treating sync/provisioning as best-effort).
+        print()
+        print(
+            "⚠️  Dependency sync failed — see the output above. The workspace "
+            "is set up, but gate-check tests may fail until deps install."
+        )
+
+    return 0
 
 
 def _require_run() -> tuple[Path, dict] | tuple[None, None]:
@@ -1929,6 +2075,8 @@ def main() -> int:
         return cmd_goal(args.description, args.estimate_sessions, args.estimate_time)
     elif args.command == "memory":
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
+    elif args.command == "setup-workspace":
+        return cmd_setup_workspace(args.target, args.task, not args.no_sync)
     elif args.command == "state":
         return cmd_state(args)
     elif args.command == "verify":

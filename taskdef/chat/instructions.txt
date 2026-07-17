@@ -36,6 +36,11 @@ has no project context to read — skip it. The same applies to the work-repo
 logging commands: `work log`, `work commit`, and `work report` all need a
 project to file under and will fail with "LMER_REPO_HOST and
 LMER_REPO_PROJECT must be set" — don't use them. Only `work goal` works.
+
+If the conversation turns into real development work on a specific repository,
+you can bootstrap `/workspace` with `work setup-workspace` — see **Pivoting to
+development work** below. That sets the project context and re-enables these
+commands.
 {% endif %}
 
 {% if LMER_REPO_URL %}
@@ -46,6 +51,33 @@ setting session goals), run:
 bash /Agents/global/hooks/work-view-docs.sh
 ```
 {% endif %}
+
+## Pivoting to development work
+
+If the conversation turns from chat into actual development on a specific
+repository — implementing an issue, fixing a bug, opening an MR — and
+`/workspace` is not already a checkout of that repo, do **not** hand-clone it
+or reverse-engineer the right token. Bootstrap it in one step:
+
+```bash
+work setup-workspace <TARGET_URL>
+source /tmp/lmer-workspace-env.sh
+```
+
+`<TARGET_URL>` is the issue / merge-request / pull-request / `work_items` URL
+(or a plain repository URL). This clones the repo into `/workspace`, checks out
+the MR source branch when given an MR, provisions `AGENTS.md` / `rules/`, and
+runs `uv sync` for uv-managed projects — the same setup a `develop` session
+gets at startup, so a clean-state `gate-check` passes instead of reporting
+environmental failures. It **hard-errors if `/workspace` is already set up**, so
+it is safe to run. Sourcing the printed env file loads the routing variables so
+`work log` / `commit` / `report` and the work-repo-aware `gate-check` features
+work for the project.
+
+Once `/workspace` is set up, follow the project's `develop` conventions: run
+`work read-project-info` for project-specific instructions, create a feature
+branch (never work on the default branch), and use the `gate-check` /
+`gate-commit` gate commands before committing.
 
 {% if LMER_SLACK_CHANNEL %}
 ## Slack conversation mode

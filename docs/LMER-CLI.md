@@ -195,6 +195,8 @@ The following environment variables control LMER behavior:
 
 - **`LMER_SLACK_LOG_LEVEL`** - Read **host-side by `lmer-slack-listener`**: Python logging level for the listener (default `INFO`). Overridden by the `--log-level` flag.
 
+- **`LMER_PRESETS_FILE`** - Read **host-side by `lmer-slack-listener`**: path to a JSON file of named startup presets a Slack user can select with a `$preset:<name>` token in the triggering message. Unset (the default) disables the feature. Each preset may set `checkout` (mounted via `--checkout`), `service` (a running container/Compose service targeted via `--service`; requires `checkout`), `env` (extra environment variables merged over the inherited environment), and `args` (extra `lmer` CLI tokens appended verbatim). Presets are **operator-defined on the listener host** — a user only selects one by name, never supplies a path or flag — so access to use them is the same as access to reach the bot (channel membership / `LMER_SLACK_DM_ALLOWED_USERS`); there is no separate preset gate. A malformed file or invalid entry is logged and skipped (the entry, or the whole file, simply does not load), and selecting a name that did not load is rejected with a thread reply. See [Spawning sessions automatically (`lmer-slack-listener`)](#spawning-sessions-automatically-lmer-slack-listener).
+
 - **`LMER_SLACK_CHANNEL`** / **`LMER_SLACK_THREAD_TS`** - Set **by lmer inside the container** (not host inputs): the channel ID and thread timestamp parsed from the first Slack thread permalink target given to `lmer chat`. Their presence switches the `chat` taskdef into Slack conversation mode and supplies the default channel/thread for `lmer-slack` invocations (overridable per-invocation with `--permalink`). Empty/unset when no Slack target was given.
 
 - **`LMER_SLACK_PERMALINK`** - Also set **by lmer inside the container**: the original Slack thread permalink URL the channel/thread values were derived from, kept for reference and diagnostics.
@@ -447,11 +449,51 @@ While testing, `LMER_SLACK_CHAT_MAX_SESSIONS=2` and a shorter `LMER_SLACK_CHAT_I
 
 Behavior:
 
-- **Mention outside a thread** — the mention message becomes a new thread's parent and a session is attached to it. **Mention inside a thread** — a session is attached only if none is already running (a live session sees the message through its own polling). **DMs** — a non-bot DM connects a session the same way; one session runs per DM conversation (a new top-level DM while one is live is pointed back at the active thread).
+- **Mention outside a thread** — the mention message becomes a new thread's parent and a session is attached to it. **Mention inside a thread** — a session is attached only if none is already connected (a live session sees the message through its own polling). **DMs** — a non-bot DM connects a session the same way; one session runs per DM conversation (a new top-level DM while one is live is pointed back at the active thread).
+- **One lmer per thread, even for sessions the listener didn't spawn.** The listener won't connect a second lmer to a thread that already has one — including a session you started yourself with `lmer chat <permalink>` from a shell. Every host-side `lmer chat` session attached to a Slack thread records its attachment in a small registry under `~/.lmer/slack-sessions/` (keyed by channel + thread_ts) and clears it on exit; before spawning, the listener checks that registry and stays silent when a live session is already attached. A stale entry left by an unclean death is detected via the recorded process PID and ignored, so a crash never permanently blocks a thread. This relies on the manual session running on the **same host** as the listener (the shared state dir), which is the normal arrangement since both need the same `lmer` CLI and container runtime.
 - Every message in a connected thread — yours or the agent's own posts — resets that session's idle timer. After `LMER_SLACK_CHAT_IDLE_TIMEOUT_MINUTES` of silence the session is disconnected and a reconnect hint is posted; mentioning the bot again spawns a fresh session that reads the thread history. A crashed session posts the same hint; a clean sign-off leaves quietly. When the human signals the conversation is over, the agent can also end the session itself with `lmer-slack end-session` (typically after a goodbye), freeing the slot immediately rather than holding it until the idle timeout.
 - At most `LMER_SLACK_CHAT_MAX_SESSIONS` sessions run at once. DM access can be restricted with `LMER_SLACK_DM_ALLOWED_USERS`. See [Environment Variables](#environment-variables) for the full `LMER_SLACK_CHAT_*` / `LMER_SLACK_DM_ALLOWED_USERS` set.
 
 It must run **on a host** (not inside a container): lmer launches a container per session, so the listener has to sit alongside those containers, not within one. Spawned sessions inherit the listener's full environment, so any lmer configuration (`LMER_IMAGE`, git tokens, model API keys, `SLACK_BOT_TOKEN`, ...) in the listener's `.env` reaches the sessions automatically.
+
+##### Service-mode presets (`$preset:<name>`)
+
+By default every spawned session is a generic, repo-less `lmer chat`. **Presets** let the operator pre-define named startup configurations that a Slack user can opt into — for example to start a session in **service mode** (`--service` + `--checkout`) against a specific running stack — without ever exposing raw paths or flags to Slack. The user picks a configuration *by name*; the operator controls what each name maps to.
+
+Point `LMER_PRESETS_FILE` at a JSON file on the listener host:
+
+```json
+{
+  "my_service": {
+    "checkout": "/srv/my-service",
+    "service": "mysvc",
+    "env": { "LMER_LLM_NAME": "opus" },
+    "args": ["--ports", "2"]
+  }
+}
+```
+
+Each preset's fields are all optional:
+
+- **`checkout`** — host path to a local source checkout, passed as `--checkout` (mounted as `/workspace`). Required whenever `service` is set.
+- **`service`** — a running container / Compose service to target, passed as `--service` (service mode; the agent can then run commands in that container via `target-exec`).
+- **`env`** — extra environment variables merged over the inherited environment (the preset wins on conflict). Use for "other startup variables" such as `LMER_LLM_NAME` or `LMER_REASONING_EFFORT`.
+- **`args`** — extra `lmer` CLI tokens appended verbatim to the spawned `lmer chat <permalink>` command.
+
+A user selects a preset with a `$preset:<name>` token anywhere in the message that starts the session:
+
+```
+@lmer-bot $preset:my_service can you check why the worker queue is backed up?
+```
+
+The listener then spawns, e.g., `lmer chat <permalink> --checkout /srv/my-service --service mysvc --ports 2` with `LMER_LLM_NAME=opus` in its environment, and the connecting ack names the applied preset.
+
+Notes:
+
+- **Trust boundary.** Presets live in a file on the listener host, writable only by whoever runs the listener; a Slack user can only *select* a name, never supply a path/flag. Using a preset therefore requires no permission beyond reaching the bot (channel membership / `LMER_SLACK_DM_ALLOWED_USERS`) — there is no separate preset allowlist.
+- **Unknown name** → the listener rejects it with a thread reply listing the available presets and does not spawn.
+- **Already-connected thread** → the token is moot (the live session handles the new message), so a `$preset:` token only takes effect on the message that *starts* a session.
+- **Validation is forgiving** — a missing/unreadable/malformed file, or an individual invalid entry (e.g. `service` without `checkout`, which mirrors the `--service requires --checkout` CLI rule, or a name outside the `$preset:` selector charset `[A-Za-z0-9_-]` that could never be picked), is logged and skipped rather than crashing the listener.
 
 ##### Slack app setup for the listener
 

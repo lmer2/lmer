@@ -29,6 +29,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from lmer_cli.presets import Preset, load_presets, parse_preset_token
+
+from .registry import is_thread_connected
 from .sessions import SessionManager
 
 logger = logging.getLogger("lmer_slack.listener")
@@ -114,6 +117,12 @@ def _csv_env_set(name: str, default: str = "") -> set[str]:
 # default) DMs are open to everyone; when set, a DM from anyone not on the
 # list is silently ignored. Repopulated from env in main() after .env load.
 DM_ALLOWED_USERS: set[str] = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
+
+# Operator-defined startup presets a user can select with the ``$preset:<name>``
+# token (see :mod:`lmer_cli.presets`). Empty when LMER_PRESETS_FILE is
+# unset. Repopulated from env in main() after .env load, mirroring how the
+# session manager and DM allowlist are reconstructed there.
+PRESETS: dict[str, Preset] = load_presets()
 
 
 def build_app(token: str | None = None):
@@ -219,7 +228,12 @@ async def _post_crash_disconnect_notice(session) -> None:
 
 
 async def _connect_lmer_session(
-    channel: str, thread_ts: str, say, is_dm: bool = False, dedup_channel: bool = False
+    channel: str,
+    thread_ts: str,
+    say,
+    is_dm: bool = False,
+    dedup_channel: bool = False,
+    preset_name: str | None = None,
 ) -> None:
     """Attach an lmer chat session to a Slack thread.
 
@@ -243,7 +257,13 @@ async def _connect_lmer_session(
             near-simultaneous top-level DMs - which key on their own ``ts``
             and so slip past the per-thread ``touch()`` dedup below - cannot
             both fall through and spawn two containers in one DM.
+        preset_name: Name selected via ``$preset:<name>`` in the triggering
+            message, or None. Resolved against the configured presets only on
+            the spawn path: an unknown name is rejected with a thread reply
+            (no spawn); on an already-tracked thread the token is moot and
+            ignored, since the running agent handles the new message itself.
     """
+    preset: Preset | None = None
     async with _connect_lock:
         if dedup_channel:
             active = session_manager.get_active_in_channel(channel)
@@ -272,6 +292,47 @@ async def _connect_lmer_session(
             )
             return
 
+        # A session this listener did not spawn — e.g. one started manually with
+        # `lmer chat <permalink>` from a shell — is invisible to the in-memory
+        # manager above, but it registers itself in the host-side session
+        # registry. If a live one is attached to this thread, stay out: a second
+        # lmer would put two agents in one thread (issue #74). Silent by design
+        # — the already-connected session is handling the conversation, so an
+        # extra notice would just be noise. A stale entry (dead PID) is treated
+        # as absent by is_thread_connected, so a crashed manual session doesn't
+        # block reconnection.
+        if is_thread_connected(channel, thread_ts):
+            logger.info(
+                "lmer_session_external_active channel=%s thread_ts=%s",
+                channel,
+                thread_ts,
+            )
+            return
+
+        # Resolve a selected preset before spawning. An unknown name is a user
+        # error worth flagging clearly (and more actionable than a later "busy"
+        # message), so this is checked ahead of the capacity gate. On an
+        # already-served thread (handled by the guards above) the token is moot,
+        # so this only runs when we are about to spawn a new session.
+        if preset_name is not None:
+            preset = PRESETS.get(preset_name)
+            if preset is None:
+                available = ", ".join(sorted(PRESETS)) or "(none configured)"
+                logger.warning(
+                    "unknown_preset channel=%s thread_ts=%s preset=%s",
+                    channel,
+                    thread_ts,
+                    preset_name,
+                )
+                await say(
+                    text=(
+                        f"❌ Unknown preset `{preset_name}`. "
+                        f"Available presets: {available}."
+                    ),
+                    thread_ts=thread_ts,
+                )
+                return
+
         if session_manager.at_capacity():
             logger.warning(
                 "lmer_session_capacity_reached channel=%s thread_ts=%s max_sessions=%s",
@@ -298,7 +359,7 @@ async def _connect_lmer_session(
             return
 
         try:
-            await session_manager.spawn(channel, thread_ts, permalink)
+            await session_manager.spawn(channel, thread_ts, permalink, preset=preset)
         except Exception as e:
             logger.exception(
                 "lmer_session_spawn_failed channel=%s thread_ts=%s error=%s",
@@ -312,7 +373,10 @@ async def _connect_lmer_session(
             )
             return
 
-    ack = "Connecting a session to this thread... ⏳ (the first reply can take a minute)"
+    ack = "Connecting a session to this thread"
+    if preset is not None:
+        ack += f" using preset `{preset.name}`"
+    ack += "... ⏳ (the first reply can take a minute)"
     if is_dm:
         ack += "\nPlease reply *in this thread* to continue the conversation."
     await say(text=ack, thread_ts=thread_ts)
@@ -373,7 +437,10 @@ async def handle_mention(event, say):
 
     # Pass is_dm so a session started by mentioning the bot inside a DM gets the
     # same "reply in this thread" hint as the plain-message DM path.
-    await _connect_lmer_session(channel, thread_ts, say, is_dm=is_dm)
+    preset_name = parse_preset_token(event.get("text"))
+    await _connect_lmer_session(
+        channel, thread_ts, say, is_dm=is_dm, preset_name=preset_name
+    )
 
 
 async def handle_message_event(event, say):
@@ -427,8 +494,14 @@ async def handle_message_event(event, say):
     # inside the connect lock (dedup_channel) to stay race-free; a threaded
     # reply keys on its real thread_ts and goes through normal touch/spawn.
     dedup_channel = not event.get("thread_ts")
+    preset_name = parse_preset_token(event.get("text"))
     await _connect_lmer_session(
-        channel, thread_ts, say, is_dm=True, dedup_channel=dedup_channel
+        channel,
+        thread_ts,
+        say,
+        is_dm=True,
+        dedup_channel=dedup_channel,
+        preset_name=preset_name,
     )
 
 
@@ -511,9 +584,10 @@ def main(argv=None) -> int:
     # SSL_CERT_FILE override is honored.
     _ensure_ca_bundle()
 
-    global session_manager, DM_ALLOWED_USERS
+    global session_manager, DM_ALLOWED_USERS, PRESETS
     session_manager = SessionManager(lmer_env_file=args.lmer_env_file)
     DM_ALLOWED_USERS = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
+    PRESETS = load_presets()
 
     if not os.environ.get("SLACK_BOT_TOKEN"):
         logger.error("slack_bot_token_missing")
