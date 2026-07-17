@@ -252,6 +252,22 @@ the work repo on a **per-project** basis (stored under
 Only persist durable, project-level facts to memory — never credentials,
 secrets, or customer data, since the work repo is shared.
 
+## Masterplan On Demand
+
+Any session can turn on the masterplan workflow mid-session. When the user
+asks to masterplan something (e.g. "let's masterplan this") and the
+`/masterplan` command is not available:
+
+1. Run `/Agents/global/libexec/masterplan-enable.sh`.
+2. If it exits 2 reporting the run dir is indeterminate, ask the user which
+   repo host/project the work is for, then re-run it with
+   `--repo-host <host> --repo-project <project>`. Never guess a project.
+3. When it succeeds, ask the user to type `/reload-plugins` (a built-in you
+   cannot run for them), then proceed with `/masterplan`.
+
+The script is idempotent and non-fatal; masterplan bundles land inside the
+work-repo run directory (`MASTERPLAN_RUNS_DIR`), never in the code repo.
+
 ## Efficient Command Usage
 
 ### Avoid Compound Commands
