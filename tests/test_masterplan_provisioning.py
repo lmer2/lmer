@@ -391,13 +391,21 @@ def _run_runner_capturing_plugin_calls(tmp_path, env):
     Returns the list of captured argv lines (one per claude invocation, joined).
     """
     calls_file = tmp_path / "claude_calls.txt"
+    env_file = tmp_path / "claude_env.txt"
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
 
+    # The stub mimics the real CLI's success chatter on stdout — that is what
+    # masterplan-enable.sh must keep out of its own stdout (the runner
+    # captures ALL of it into MASTERPLAN_RUNS_DIR). It also snapshots the
+    # exported MASTERPLAN_RUNS_DIR so tests can assert the captured value is
+    # a clean single-line path (the final exec'd call wins the overwrite).
     fake_claude = fake_bin / "claude"
     fake_claude.write_text(
         "#!/bin/bash\n"
         f'printf "%s\\n" "$*" >> "{calls_file}"\n'
+        f'printf "%s\\n" "${{MASTERPLAN_RUNS_DIR-}}" > "{env_file}"\n'
+        'echo "Successfully processed $1 $2"\n'
         "exit 0\n"
     )
     _make_executable(fake_claude)
@@ -427,6 +435,75 @@ def _run_runner_capturing_plugin_calls(tmp_path, env):
     if calls_file.exists():
         return [line for line in calls_file.read_text().splitlines() if line]
     return []
+
+
+def test_runner_exports_clean_masterplan_runs_dir(tmp_path):
+    """The runner's captured MASTERPLAN_RUNS_DIR is exactly the bundle root.
+
+    Regression: the `claude plugin` calls in masterplan-enable.sh print
+    success chatter to stdout; if the script does not redirect them, the
+    runner's `MASTERPLAN_RUNS_DIR="$(masterplan-enable.sh --gated)"` capture
+    exports a multi-line value (chatter + path) instead of a path.
+    """
+    work_repo = tmp_path / "work"
+    work_repo.mkdir()
+    _run_runner_capturing_plugin_calls(
+        tmp_path,
+        {
+            "LMER_MASTERPLAN": "1",
+            "LMER_WORK_REPO_PATH": str(work_repo),
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "proj",
+        },
+    )
+    env_file = tmp_path / "claude_env.txt"
+    assert env_file.exists()
+    captured = env_file.read_text()
+    lines = [line for line in captured.splitlines() if line]
+    assert len(lines) == 1, f"MASTERPLAN_RUNS_DIR is not a single line: {captured!r}"
+    assert lines[0].endswith("/runs/default/masterplan")
+
+
+def test_runner_warns_when_enable_script_missing(tmp_path):
+    """Legacy baked-copy path: claude-runner.sh alone (no sibling
+    masterplan-enable.sh) must warn and continue, not die on a raw bash
+    "No such file or directory" (review on !126)."""
+    import shutil as _shutil
+
+    lone_runner = tmp_path / "claude-runner.sh"
+    _shutil.copy(CLAUDE_RUNNER, lone_runner)
+    lone_runner.chmod(0o755)
+
+    calls_file = tmp_path / "claude_calls.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_claude = fake_bin / "claude"
+    fake_claude.write_text(
+        "#!/bin/bash\n"
+        f'printf "%s\\n" "$*" >> "{calls_file}"\n'
+        "exit 0\n"
+    )
+    _make_executable(fake_claude)
+
+    proc = subprocess.run(
+        ["bash", str(lone_runner)],
+        env={
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "LMER_MASTERPLAN": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    combined = proc.stdout + proc.stderr
+    assert "masterplan-enable.sh not found" in combined
+    # The guarded call itself never surfaces a raw bash error (other sibling
+    # helpers the legacy copy also lacks produce their own noise — out of
+    # scope here, and pre-existing on that path).
+    assert "masterplan-enable.sh: No such file or directory" not in combined
+    # The session still reached the final claude exec (non-fatality contract).
+    assert calls_file.exists()
 
 
 def test_runner_provisions_plugin_when_masterplan_enabled(tmp_path):
@@ -570,10 +647,15 @@ def _run_enable_script(tmp_path, env, args=()):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
 
+    # Stdout chatter mirrors the real CLI (`claude plugin marketplace add`
+    # prints its success message to stdout) so these tests catch any plugin
+    # call whose stdout the script fails to redirect away from its
+    # bundle-root-only stdout contract.
     fake_claude = fake_bin / "claude"
     fake_claude.write_text(
         "#!/bin/bash\n"
         f'printf "%s\\n" "$*" >> "{calls_file}"\n'
+        'echo "Successfully processed $1 $2"\n'
         "exit 0\n"
     )
     _make_executable(fake_claude)
@@ -616,6 +698,9 @@ def _forced_env(tmp_path):
 def test_enable_forced_provisions_and_persists_env(tmp_path):
     rc, out, err, calls = _run_enable_script(tmp_path, _forced_env(tmp_path))
     assert rc == 0
+    # stdout carries exactly the bundle root — no plugin-call chatter (the
+    # gated caller captures all of stdout into MASTERPLAN_RUNS_DIR).
+    assert len(out.strip().splitlines()) == 1, f"stdout not just the bundle root: {out!r}"
     bundle = out.strip()
     assert bundle.endswith("/runs/default/masterplan")
     assert "/git.example.com/group/proj/" in bundle
@@ -777,10 +862,42 @@ def test_enable_gated_provisions_when_enabled(tmp_path):
     env["LMER_MASTERPLAN"] = "1"
     rc, out, err, calls = _run_enable_script(tmp_path, env, args=("--gated",))
     assert rc == 0
+    # The gated caller does MASTERPLAN_RUNS_DIR="$(this script)" — stdout
+    # must be exactly the bundle root, nothing else.
+    assert len(out.strip().splitlines()) == 1, f"stdout not just the bundle root: {out!r}"
     assert out.strip().endswith("/masterplan")
     assert any("plugin enable masterplan" in c for c in calls)
     # gated mode must NOT write the mid-session drop-in
     assert not (tmp_path / ".bashrc.d" / "masterplan-env.sh").exists()
+
+
+@pytest.mark.parametrize(
+    "broken_python",
+    ["/bin/false", "/nonexistent/python3"],
+    ids=["exit-1", "exit-127"],
+)
+def test_enable_gated_interpreter_failure_is_loud(tmp_path, broken_python):
+    """Gated mode: rc outside {0,1,2} from the resolution step means an
+    interpreter-level failure, not a gate verdict. That must surface as the
+    interpreter-naming message — not the "enabled but the run dir is
+    indeterminate" warning, which would assert enablement for a session the
+    gate never actually evaluated. (rc 1 from a broken interpreter is
+    indistinguishable from the gate's own "not a masterplan session", so
+    only the non-1 failures can be, and are, told apart.)"""
+    env = _forced_env(tmp_path)
+    env["LMER_MASTERPLAN"] = "1"
+    env["LMER_PYTHON"] = broken_python
+    rc, out, err, calls = _run_enable_script(tmp_path, env, args=("--gated",))
+    assert out.strip() == ""
+    assert calls == []
+    if broken_python == "/bin/false":
+        # rc 1 is gated's silent "not a masterplan session" path by contract.
+        assert rc == 1
+        assert err.strip() == ""
+    else:
+        assert rc == 2
+        assert "failed" in err and "lmer_cli" in err
+        assert "indeterminate" not in err
 
 
 def test_agents_md_teaches_on_demand_flow():

@@ -9,6 +9,7 @@ from typing import Optional
 from urllib.parse import quote, urlsplit
 
 from .run_state import run_rel_path_candidates
+from .specs_index import specs_rel_path
 from .utils import sanitize_task_target
 
 PUSH_RETRIES = 3
@@ -324,6 +325,13 @@ def commit_work_changes(commit_message: Optional[str] = None) -> int:
     for rel in run_rel_path_candidates():
         if rel not in paths:
             paths.append(rel)
+
+    # The specs index (issue #101): entries created by the masterplan sync,
+    # `work specs-index --rebuild`, and the freeze-rename re-point all land
+    # here — without this, only `work artifact` ever pushed them.
+    specs_rel = specs_rel_path()
+    if specs_rel and specs_rel not in paths:
+        paths.append(specs_rel)
 
     return commit_work_path(paths, commit_message)
 

@@ -701,8 +701,10 @@ def cmd_goal(
                 if run_state.run_dir() is not None:
                     rdir, state = run_state.ensure_run()
                     state["goal"] = description
-                    if estimate is not None:
-                        state["estimate"] = estimate
+                    # The estimate belongs to the goal it was recorded with:
+                    # a new goal without estimate flags must not inherit the
+                    # previous goal's estimate into the resume brief.
+                    state["estimate"] = estimate
                     run_state.write_state(rdir, state)
                     run_state.append_event(
                         rdir, "goal_set", note=description,
@@ -2088,6 +2090,28 @@ def cmd_seed(args) -> int:
     return 0
 
 
+#: Overridable directory for LMER_ANSWER consume-once markers (mirrors the
+#: patchable ``slack_chat.registry.REGISTRY_DIR`` convention). ``None`` means
+#: /tmp — container-lifetime scoped, exactly like the env var itself. Tests
+#: point it at a temp dir so markers never leak between runs.
+ANSWER_MARKER_DIR: str | None = None
+
+
+def _answer_marker_path(answer: str) -> Path:
+    """Consume-once marker for a pushed LMER_ANSWER (review on !126).
+
+    The env var lives for the whole container, but an answer belongs to the
+    one question it was pushed for: if the agent records a NEW question and
+    another `work session-start` runs in the same container (followup /
+    restart), the stale value must not be silently applied to a question it
+    was never given for. A /tmp marker keyed by the answer's hash shares the
+    container's lifetime — exactly the env var's — so "applied once in this
+    container" is the right scope.
+    """
+    digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()[:16]
+    return Path(ANSWER_MARKER_DIR or "/tmp") / f".lmer-answer-applied-{digest}"
+
+
 def cmd_session_start() -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
     ALWAYS exits 0 — a broken state layer must never break session start."""
@@ -2141,11 +2165,16 @@ def cmd_session_start() -> int:
             answer
             and state.get("stop_reason") == "question"
             and state.get("open_question")
+            and not _answer_marker_path(answer).exists()
         ):
             try:
                 question = state.get("open_question")
                 state = run_state.answer_question(rdir, state, answer)
                 answered = {"question": question, "answer": redact_secrets(answer)}
+                try:
+                    _answer_marker_path(answer).touch()
+                except OSError:
+                    pass  # marker is best-effort; the answer still applied
             except Exception as exc:
                 print(f"⚠️  LMER_ANSWER not applied (continuing): {exc}")
 
@@ -2206,6 +2235,12 @@ def cmd_session_end() -> int:
             state["owner"] = None
         run_state.write_state(rdir, state)
         rels = run_state.run_rel_path_candidates()
+        # Masterplan-sync (and freeze-rename) specs-index entries ride along —
+        # this is the last push of the session, so leaving them unstaged
+        # strands them locally (review on !126).
+        specs_rel = specs_index.specs_rel_path()
+        if specs_rel and specs_rel not in rels:
+            rels.append(specs_rel)
         rc = commit_work_path(rels, f"run-state: session end {state['slug']}")
         if rc != 0:
             print("⚠️  Warning: run-state push failed at session end (state saved locally)")

@@ -365,8 +365,15 @@ esac
 # bundle root on stdout — captured and exported so masterplan's tooling
 # nests bundles inside the lmer run dir. Mirror resolution, settings.json
 # materialization, and idempotence/non-fatality notes live in the script.
-if MASTERPLAN_RUNS_DIR="$("$(dirname "$0")/masterplan-enable.sh" --gated)"; then
-    export MASTERPLAN_RUNS_DIR
+# [ -x ] guard: on the legacy baked-copy path (claude-runner.sh alone at
+# /home/developer/, no sibling libexec/) the script is absent — keep the
+# non-fatality contract with a warning instead of a raw bash error.
+if [ -x "$(dirname "$0")/masterplan-enable.sh" ]; then
+    if MASTERPLAN_RUNS_DIR="$("$(dirname "$0")/masterplan-enable.sh" --gated)"; then
+        export MASTERPLAN_RUNS_DIR
+    fi
+else
+    echo "⚠️  masterplan: masterplan-enable.sh not found beside claude-runner.sh; skipping provisioning" >&2
 fi
 
 # Run Claude through the lmer supervisor when available.

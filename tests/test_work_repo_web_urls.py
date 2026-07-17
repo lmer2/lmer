@@ -18,8 +18,8 @@ from work_repo import git_ops, run_state
 from tests.conftest import strip_lmer_env
 
 TOKEN = "glpat-supersecrettoken12345678"
-TOKENIZED_REMOTE = f"https://oauth2:{TOKEN}@git.20c.com/agents/work.git"
-WEB_BASE = "https://git.20c.com/agents/work"
+TOKENIZED_REMOTE = f"https://oauth2:{TOKEN}@gitlab.example.com/group/work.git"
+WEB_BASE = "https://gitlab.example.com/group/work"
 
 
 @pytest.fixture(autouse=True)
@@ -82,14 +82,14 @@ class TestWebUrlFor:
         assert git_ops.web_url_for(repo) == f"{WEB_BASE}/-/tree/main"
 
     def test_scp_style_ssh_remote(self, tmp_path, monkeypatch):
-        repo = _init_work_repo(tmp_path, remote="git@git.20c.com:agents/work.git")
+        repo = _init_work_repo(tmp_path, remote="git@gitlab.example.com:group/work.git")
         monkeypatch.setenv("LMER_WORK_REPO_PATH", str(repo))
         target = repo / "f.md"
         target.write_text("x")
         assert git_ops.web_url_for(target) == f"{WEB_BASE}/-/blob/main/f.md"
 
     def test_ssh_scheme_remote(self, tmp_path, monkeypatch):
-        repo = _init_work_repo(tmp_path, remote="ssh://git@git.20c.com/agents/work.git")
+        repo = _init_work_repo(tmp_path, remote="ssh://git@gitlab.example.com/group/work.git")
         monkeypatch.setenv("LMER_WORK_REPO_PATH", str(repo))
         target = repo / "f.md"
         target.write_text("x")

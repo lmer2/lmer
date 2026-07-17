@@ -20,6 +20,14 @@ def _clean_lmer_env(monkeypatch):
     strip_lmer_env(monkeypatch)
 
 
+@pytest.fixture(autouse=True)
+def _tmp_answer_markers(monkeypatch, tmp_path):
+    """Keep LMER_ANSWER consume-once markers out of the real /tmp — a marker
+    left there by one test run would make the next run skip the apply."""
+    monkeypatch.setattr(work_cli, "ANSWER_MARKER_DIR", str(tmp_path / "markers"))
+    (tmp_path / "markers").mkdir(exist_ok=True)
+
+
 @pytest.fixture
 def run_env(monkeypatch, tmp_path):
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tmp_path))
@@ -1001,6 +1009,25 @@ class TestSessionStart:
         monkeypatch.setenv("LMER_ANSWER", "stale answer")
         assert _main(["session-start"]) == 0
         assert "ANSWERED QUESTION" not in capsys.readouterr().out
+
+    def test_lmer_answer_consumed_once_per_container(self, run_env, capsys, monkeypatch):
+        # The env var outlives its question (review on !126): after the answer
+        # is applied once, a NEW question + another session-start in the same
+        # container must not silently receive the same stale answer.
+        _ask_question(run_env)
+        monkeypatch.setenv("LMER_ANSWER", "postgres")
+        assert _main(["session-start"]) == 0
+        assert "ANSWERED QUESTION" in capsys.readouterr().out
+
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            _main(["state", "set", "--stop-reason=question",
+                   "--question", "which cache backend?"])
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "ANSWERED QUESTION" not in out
+        assert "OPEN QUESTION" in out  # the new question still leads the brief
+        state = run_state.load_state(run_env)
+        assert state["open_question"] == "which cache backend?"
     def test_archived_run_gets_direction_contract(self, run_env, capsys):
         # `archived` counts as finished: the slug still resolves until the
         # external cleaner moves the dir, so it must not silently resume.
@@ -1048,7 +1075,12 @@ class TestSessionEnd:
         events = run_state.read_events(run_env, last_n=0)
         assert events[-1]["type"] == "session_end"
         push.assert_called_once_with(
-            ["git.example.com/org/repo/runs/develop-issue-123"],
+            [
+                "git.example.com/org/repo/runs/develop-issue-123",
+                # Specs index rides along on the session's last push, so
+                # masterplan-sync/freeze-repoint entries are never stranded.
+                "git.example.com/org/repo/specs",
+            ],
             "run-state: session end develop-issue-123",
         )
 
@@ -1118,6 +1150,18 @@ class TestGoalEstimate:
         event = [e for e in run_state.read_events(run_env, last_n=0)
                  if e["type"] == "goal_set"][-1]
         assert "data" not in event
+
+    def test_new_goal_without_flags_clears_previous_estimate(self, run_env):
+        # An estimate belongs to its goal (review on !126): re-goaling
+        # without flags must not leave the old estimate to be rendered as
+        # if it were the new goal's.
+        assert _main(["goal", "first goal", "--estimate-sessions", "2"]) == 0
+        assert run_state.load_state(run_env)["estimate"] == {
+            "sessions": 2, "time": None}
+        assert _main(["goal", "second goal"]) == 0
+        state = run_state.load_state(run_env)
+        assert state["goal"] == "second goal"
+        assert state["estimate"] is None
 
     def test_estimate_flags_require_description(self, run_env, capsys):
         assert _main(["goal", "--estimate-sessions", "2"]) == 1

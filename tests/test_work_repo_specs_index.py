@@ -256,6 +256,102 @@ class TestMasterplanSyncIndexes:
         assert "specs index skipped" in capsys.readouterr().out
 
 
+class TestFreezeRenameRepointsIndex:
+    """The freeze's `runs/<slug>/` → `runs/<slug>--<name>/` rename must not
+    leave index entries dangling (review on !126): entries are relative
+    symlinks into the old dir, and the label change (slug → name) defeats
+    upsert's stale-cleanup, so freeze_run_dir re-points them itself."""
+
+    def _seed_named_run(self, run_env, name="specs-index"):
+        state = run_state.seed_state("develop-issue-101", "develop", "issue-101")
+        state["name"] = name
+        run_env.mkdir(parents=True, exist_ok=True)
+        run_state.write_state(run_env, state)
+        return state
+
+    def test_entry_repointed_and_relabelled_on_freeze(self, run_env, tmp_path):
+        state = self._seed_named_run(run_env)
+        (run_env / "spec.md").write_text("# spec\n")
+        # Registered during planning, before the freeze — under the slug
+        # label and an earlier date, like a real `work artifact` call.
+        old = specs_index.upsert_spec_link(
+            run_env / "spec.md", "develop-issue-101",
+            when=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        assert os.readlink(old) == "../runs/develop-issue-101/spec.md"
+
+        rdir, old_name = run_state.freeze_run_dir(run_env, state)
+
+        assert rdir.name == "develop-issue-101--specs-index"
+        assert old_name == "develop-issue-101"
+        entries = specs_index.list_entries()
+        assert [p.name for p in entries] == ["2026-07-01-specs-index-spec.md"]
+        entry = entries[0]
+        assert os.readlink(entry) == (
+            "../runs/develop-issue-101--specs-index/spec.md"
+        )
+        assert entry.read_text() == "# spec\n"  # resolves — not dangling
+        assert not old.exists()  # old slug-labelled entry is gone
+
+    def test_aliased_bundle_entry_keeps_alias(self, run_env, tmp_path):
+        state = self._seed_named_run(run_env)
+        bundle = run_env / "masterplan" / "mp-a"
+        bundle.mkdir(parents=True)
+        (bundle / "spec.md").write_text("mp-a\n")
+        specs_index.upsert_spec_link(
+            bundle / "spec.md", "develop-issue-101",
+            when=datetime(2026, 7, 2, tzinfo=timezone.utc),
+            alias="mp-a-spec.md",
+        )
+
+        run_state.freeze_run_dir(run_env, state)
+
+        entries = specs_index.list_entries()
+        assert [p.name for p in entries] == ["2026-07-02-specs-index-mp-a-spec.md"]
+        assert os.readlink(entries[0]) == (
+            "../runs/develop-issue-101--specs-index/masterplan/mp-a/spec.md"
+        )
+
+    def test_other_runs_entries_untouched(self, run_env, tmp_path):
+        state = self._seed_named_run(run_env)
+        (run_env / "spec.md").write_text("x")
+        specs_index.upsert_spec_link(run_env / "spec.md", "develop-issue-101")
+        other_run = run_env.parent / "develop-issue-7"
+        other_run.mkdir(parents=True)
+        (other_run / "spec.md").write_text("other\n")
+        other = specs_index.upsert_spec_link(other_run / "spec.md", "develop-issue-7")
+
+        run_state.freeze_run_dir(run_env, state)
+
+        assert other.is_symlink()
+        assert os.readlink(other) == "../runs/develop-issue-7/spec.md"
+        assert other.read_text() == "other\n"
+
+    def test_index_trouble_never_fails_freeze(self, run_env, tmp_path, capsys):
+        state = self._seed_named_run(run_env)
+        (run_env / "spec.md").write_text("x")
+        specs_index.upsert_spec_link(run_env / "spec.md", "develop-issue-101")
+        with patch.object(
+            specs_index, "repoint_run_dir_entries",
+            side_effect=RuntimeError("boom"),
+        ):
+            rdir, old_name = run_state.freeze_run_dir(run_env, state)
+        assert rdir.name == "develop-issue-101--specs-index"
+        assert "specs index re-point failed" in capsys.readouterr().out
+
+    def test_unnamed_run_no_rename_no_repoint(self, run_env, tmp_path):
+        state = run_state.seed_state("develop-issue-101", "develop", "issue-101")
+        run_env.mkdir(parents=True, exist_ok=True)
+        run_state.write_state(run_env, state)
+        (run_env / "spec.md").write_text("x")
+        entry = specs_index.upsert_spec_link(run_env / "spec.md", "develop-issue-101")
+
+        rdir, old_name = run_state.freeze_run_dir(run_env, state)
+
+        assert rdir == run_env and old_name is None
+        assert os.readlink(entry) == "../runs/develop-issue-101/spec.md"
+
+
 class TestSpecsIndexVerb:
     def test_no_context_errors(self, capsys):
         assert _main(["specs-index"]) == 1

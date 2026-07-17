@@ -8,6 +8,22 @@
 # backward-compatibility contract for existing installs. New runners must use
 # these helpers instead of copying them again. See docs/HARNESSES.md.
 
+# ── Source-time constants ──
+# Everything evaluated when this file is sourced lives here, above all
+# function definitions, so no source-time code can ever read one unset.
+
+# Marker distinguishing lmer-managed global context files (regenerated each
+# session by harness_render_global_context) from user-authored ones, which
+# are left untouched.
+HARNESS_MANAGED_MARKER="<!-- lmer-managed context: regenerated each session -->"
+
+# Root of the work repo's agent-files tree, for harness_provision_config
+# overrides ("" when the work repo carries none). LMER_WORK_AGENT_FILES_ROOT
+# overrides the path for non-standard layouts and tests (mirrors
+# LMER_SETTINGS_FILE in claude-runner.sh).
+WORK_AGENT_FILES_ROOT="${LMER_WORK_AGENT_FILES_ROOT:-/work/agent-files}"
+[ -d "$WORK_AGENT_FILES_ROOT" ] || WORK_AGENT_FILES_ROOT=""
+
 # ── Session id ──
 # Mint a stable per-session id for run-state owner claims and event
 # attribution (`work session-start` / `work session-end`). A host-injected
@@ -90,10 +106,10 @@ harness_find_resource() {
 # them to the harness's *global* context file location (e.g. ~/.codex/AGENTS.md),
 # which every supported harness also loads automatically.
 #
-# The file is marked lmer-managed and regenerated each session; a file at the
-# target path without the marker is user-authored and is left untouched.
-HARNESS_MANAGED_MARKER="<!-- lmer-managed context: regenerated each session -->"
-
+# The file is marked lmer-managed (HARNESS_MANAGED_MARKER, defined with the
+# source-time constants at the top of this file) and regenerated each
+# session; a file at the target path without the marker is user-authored and
+# is left untouched.
 harness_render_global_context() {
     local target="$1"
     [ -n "$target" ] || return 0
@@ -188,13 +204,6 @@ harness_provision_config() {
         fi
     fi
 }
-
-# Root of the work repo's agent-files tree, for harness_provision_config
-# overrides ("" when the work repo carries none). LMER_WORK_AGENT_FILES_ROOT
-# overrides the path for non-standard layouts and tests (mirrors
-# LMER_SETTINGS_FILE in claude-runner.sh).
-WORK_AGENT_FILES_ROOT="${LMER_WORK_AGENT_FILES_ROOT:-/work/agent-files}"
-[ -d "$WORK_AGENT_FILES_ROOT" ] || WORK_AGENT_FILES_ROOT=""
 
 # ── Slash commands as prompt templates ──
 # codex and pi load markdown *prompt templates* from a per-user directory as

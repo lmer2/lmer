@@ -70,6 +70,33 @@ class TestCloneCmdLfsSkip:
         assert "lfs" not in " ".join(cmd)
 
 
+class TestLfsBypassWarning:
+    """The bypass must not be silent (review on !126): without git-lfs,
+    LFS-tracked files check out as pointer text and tests fail confusingly —
+    one stderr line names the cause, once per process."""
+
+    def test_warns_once_when_git_lfs_missing(self, monkeypatch, capsys):
+        monkeypatch.setattr(clone_and_exec.shutil, "which", lambda name: None)
+        monkeypatch.setattr(clone_and_exec, "_lfs_bypass_warned", False)
+
+        _lfs_safe_git("-C", "/workspace", "checkout", "mr-5")
+        _clone_cmd(REPO_URL, Path("/workspace"))
+
+        err = capsys.readouterr().err
+        assert err.count("git-lfs not installed") == 1
+        assert "pointer files" in err
+
+    def test_no_warning_when_git_lfs_present(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            clone_and_exec.shutil, "which", lambda name: "/usr/bin/git-lfs"
+        )
+        monkeypatch.setattr(clone_and_exec, "_lfs_bypass_warned", False)
+
+        _lfs_safe_git("-C", "/workspace", "checkout", "mr-5")
+
+        assert "git-lfs" not in capsys.readouterr().err
+
+
 class TestLfsSafeGit:
     """Process-scoped `-c` flags for git operations on bind-mounted checkouts
     (service mode / --checkout), where repo-local persistence must never be

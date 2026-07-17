@@ -1,6 +1,9 @@
 """Shared fixtures for tests."""
+import ast
+import inspect
 import os
 import subprocess
+import textwrap
 from pathlib import Path
 import pytest
 
@@ -27,10 +30,6 @@ def ast_body_lines(fn):
     shared): comparing two functions' ast_body_lines asserts their bodies are
     semantically identical while ignoring docstrings and formatting.
     """
-    import ast
-    import inspect
-    import textwrap
-
     src = textwrap.dedent(inspect.getsource(fn))
     tree = ast.parse(src)
     func = tree.body[0]

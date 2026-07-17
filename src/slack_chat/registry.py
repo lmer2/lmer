@@ -41,6 +41,12 @@ letting the listener spawn the duplicate this module exists to prevent (unlike
 the PID-reuse edge above, which fails safe). The only cost is that an entry for
 a thread that is never reconnected lingers as a tiny, harmless file.
 
+The delete path is ownership-checked for the same reason: ``register``
+overwrites unconditionally, so with two manual sessions on one thread the
+first to exit would otherwise unlink the entry out from under the survivor.
+:func:`deregister` therefore removes the entry only when its recorded PID is
+the calling process's own (see its docstring for the residual TOCTOU window).
+
 PID reuse is the one accepted edge: if the recorded PID is dead but the OS has
 since recycled it to an unrelated process, :func:`is_thread_connected` reports a
 false "connected" and the listener declines to spawn. That is the *safe* failure
@@ -160,15 +166,41 @@ def register(
 
 
 def deregister(channel: str | None, thread_ts: str | None) -> None:
-    """Remove the registry entry for ``(channel, thread_ts)`` if present.
+    """Remove the registry entry for ``(channel, thread_ts)`` if present —
+    but only when this process owns it.
 
     Best-effort and idempotent: a missing entry (already gone, or never written)
     is not an error.
+
+    The ownership check closes a delete-path race: ``register`` overwrites
+    unconditionally and manual sessions never consult
+    :func:`is_thread_connected`, so a duplicate manual ``lmer chat`` on the
+    same thread would otherwise let whichever session exits FIRST delete the
+    entry out from under the survivor — and the listener could then spawn a
+    third agent into a thread that still has a live one. Reading the entry
+    and unlinking only when its recorded ``pid`` is ours shrinks the exposed
+    TOCTOU window from the rest of the survivor's lifetime to the microseconds
+    between the read and the unlink. A corrupt/unreadable entry is still
+    removed — it protects nothing.
     """
     if not channel or not thread_ts:
         return
+    path = _entry_path(channel, thread_ts)
     try:
-        _entry_path(channel, thread_ts).unlink()
+        try:
+            owner_pid = json.loads(path.read_text()).get("pid")
+        except (ValueError, AttributeError):
+            owner_pid = None  # corrupt entry: safe to remove
+        if owner_pid is not None and owner_pid != os.getpid():
+            logger.debug(
+                "slack_session_deregister_skipped channel=%s thread_ts=%s "
+                "owner_pid=%s (not ours)",
+                channel,
+                thread_ts,
+                owner_pid,
+            )
+            return
+        path.unlink()
         logger.debug(
             "slack_session_deregistered channel=%s thread_ts=%s",
             channel,

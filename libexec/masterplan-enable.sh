@@ -49,11 +49,13 @@ rc=$?
 if [ "$GATED" -eq 1 ] && [ "$rc" -eq 1 ]; then
     exit 1  # gated: not a masterplan session — silent skip
 fi
-if [ "$GATED" -eq 0 ] && [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
-    # Forced mode only ever returns 0 or 2 from main(), so anything else is
-    # an interpreter-level failure (rc 1: lmer_cli not importable; 126/127:
-    # broken LMER_PYTHON) whose stderr the 2>/dev/null above swallowed — say
-    # so rather than misreporting it as a missing repo target below.
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+    # main() only ever returns 0/2 (forced) or 0/1/2 (gated, and gated rc 1
+    # exited above), so anything reaching here is an interpreter-level
+    # failure (rc 1 forced: lmer_cli not importable; 126/127: broken
+    # LMER_PYTHON) whose stderr the 2>/dev/null above swallowed — say so
+    # rather than misreporting it below as a missing repo target (or,
+    # gated, asserting enablement for a session the gate never evaluated).
     echo "masterplan-enable: ${LMER_PYTHON:-python3} -m lmer_cli.container.masterplan failed (exit $rc) — is lmer_cli importable in this environment?" >&2
     exit 2
 fi
@@ -123,11 +125,14 @@ if command -v claude >/dev/null 2>&1; then
     if [ "$MIRROR" != "$FIRST" ]; then
         echo "⚠️  masterplan: mirror resolved to $MIRROR, not the canonical (first) candidate ($FIRST) — that fallback is deprecated; configure LMER_TASKDEF_REPO with a taskdef repo shipping mirrors/masterplan" >&2
     fi
-    claude plugin marketplace add "$MIRROR" \
+    # >&2 on each: `claude plugin` success chatter goes to stdout, and this
+    # script's stdout contract is the bare bundle root (the gated caller
+    # captures ALL of stdout into MASTERPLAN_RUNS_DIR).
+    claude plugin marketplace add "$MIRROR" >&2 \
         || echo "⚠️  masterplan: marketplace add failed (continuing)" >&2
-    claude plugin install masterplan@rasatpetabit-masterplan \
+    claude plugin install masterplan@rasatpetabit-masterplan >&2 \
         || echo "⚠️  masterplan: plugin install failed (continuing)" >&2
-    claude plugin enable masterplan \
+    claude plugin enable masterplan >&2 \
         || echo "⚠️  masterplan: plugin enable failed (continuing)" >&2
 else
     echo "⚠️  masterplan: claude not on PATH; skipping plugin provisioning" >&2

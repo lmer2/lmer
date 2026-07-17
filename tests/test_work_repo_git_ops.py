@@ -391,6 +391,37 @@ class TestCommitWorkPathResilience:
                 ]]
 
 
+    def test_commit_work_changes_includes_specs_index(self, tmp_path):
+        """The specs index is staged when it exists (review on !126): entries
+        created by the masterplan sync, `specs-index --rebuild`, and the
+        freeze-rename re-point must reach the remote via `work commit`, not
+        only via `work artifact`."""
+        env_vars = {
+            "LMER_WORK_REPO_PATH": str(tmp_path),
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "grp/proj",
+            "LMER_TASK": "develop",
+            "LMER_TASK_TARGET": "https://git.example.com/grp/proj/-/issues/9",
+        }
+        task_dir = tmp_path / "git.example.com/grp/proj/develop/issue-9"
+        specs_dir = tmp_path / "git.example.com/grp/proj/specs"
+        task_dir.mkdir(parents=True)
+        specs_dir.mkdir(parents=True)
+
+        def side_effect(cmd, cwd, check=False):
+            if cmd[0] == "status":
+                return (0, "M  x\n")
+            return (0, "")
+
+        with patch.dict(os.environ, env_vars):
+            with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
+                assert commit_work_changes() == 0
+                add_calls = [call[0][0] for call in mock_git.call_args_list
+                             if call[0][0][:3] == ["add", "-A", "--"]]
+                assert len(add_calls) == 1
+                assert "git.example.com/grp/proj/specs" in add_calls[0]
+
+
 class TestReportUncommittedWorkItems:
     """report_uncommitted_work_items: the issue #85 stray-file reminder.
 

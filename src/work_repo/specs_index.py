@@ -43,6 +43,7 @@ from .utils import _work_repo_base
 __all__ = [
     "SPECS_DIR", "is_spec_artifact", "specs_dir", "specs_rel_path",
     "run_label", "upsert_spec_link", "list_entries", "rebuild",
+    "repoint_run_dir_entries",
 ]
 
 SPECS_DIR = "specs"
@@ -157,6 +158,68 @@ def upsert_spec_link(
     except Exception as exc:
         print(f"⚠️  specs index skipped: {exc}")
         return None
+
+
+def repoint_run_dir_entries(
+    old_dirname: str, new_dirname: str, new_label: str
+) -> None:
+    """Re-point index entries after a run-dir rename (the freeze's
+    `runs/<slug>/` → `runs/<slug>--<name>/`). Fail-soft.
+
+    Without this, every entry registered before the freeze dangles — its
+    relative target still says `../runs/<slug>/…` — and because the rename
+    changes `run_label` (slug → name), upsert's stale-cleanup (keyed on
+    label+basename) never removes the old-label entry either, so the
+    dangling link is permanent. Each affected entry is dropped and
+    re-upserted against the renamed path under the run's new label, keeping
+    the original registration date.
+    """
+    try:
+        base = _work_repo_base()
+        if base is None or old_dirname == new_dirname:
+            return
+        sdir = base / SPECS_DIR
+        if not sdir.is_dir():
+            return
+        old_prefix = f"../runs/{old_dirname}/"
+        for entry in list(sdir.iterdir()):
+            if not entry.is_symlink():
+                continue
+            target = os.readlink(entry).replace(os.sep, "/")
+            if not target.startswith(old_prefix):
+                continue
+            new_target = base / "runs" / new_dirname / target[len(old_prefix):]
+            # Keep the entry's registration date and its basename. The
+            # basename may be an alias (a masterplan run-root link name like
+            # `mp-a-spec.md`) rather than the target's own filename, so it
+            # is parsed out of the entry name (YYYY-MM-DD-<label>-<base>)
+            # by stripping the label the entry was created under — the
+            # pre-rename dir name (slug), or the run's name when it was set
+            # before the freeze. Fallback: the target's filename.
+            m = re.match(r"^(\d{4}-\d{2}-\d{2})-(.+)$", entry.name)
+            if not m:
+                continue
+            when = datetime.strptime(m.group(1), _DATE_PREFIX).replace(
+                tzinfo=timezone.utc
+            )
+            rest = m.group(2)
+            basename = None
+            for candidate in (old_dirname, new_label):
+                safe = _UNSAFE_LABEL_RE.sub("-", str(candidate)).strip("-")
+                if safe and rest.startswith(f"{safe}-"):
+                    basename = rest[len(safe) + 1:]
+                    break
+            if not basename:
+                canonical_name = Path(target).name
+                basename = (
+                    canonical_name
+                    if rest.endswith(f"-{canonical_name}")
+                    else rest
+                )
+            entry.unlink()
+            upsert_spec_link(new_target, new_label, when=when, alias=basename)
+    except Exception as exc:
+        print(f"⚠️  specs index re-point skipped: {exc}")
 
 
 def list_entries() -> list[Path]:

@@ -115,6 +115,24 @@ def _git_lfs_available() -> bool:
     return shutil.which("git-lfs") is not None
 
 
+# One warning per process: the bypass is otherwise silent, and an agent whose
+# LFS-tracked files checked out as pointer text would see confusing test
+# failures with nothing naming the cause.
+_lfs_bypass_warned = False
+
+
+def _warn_lfs_bypass() -> None:
+    global _lfs_bypass_warned
+    if _lfs_bypass_warned:
+        return
+    _lfs_bypass_warned = True
+    print(
+        "⚠️  git-lfs not installed — LFS-tracked files (if the repo has any) "
+        "are checked out as pointer files",
+        file=sys.stderr,
+    )
+
+
 def _lfs_safe_git(*args: str) -> list[str]:
     """A ``git`` invocation carrying the LFS-skip ``-c`` flags when git-lfs is
     unavailable (a plain ``["git", *args]`` when it is present).
@@ -125,6 +143,7 @@ def _lfs_safe_git(*args: str) -> list[str]:
     """
     cmd = ["git"]
     if not _git_lfs_available():
+        _warn_lfs_bypass()
         cmd += _LFS_SKIP_FLAGS
     cmd += list(args)
     return cmd
@@ -1081,9 +1100,17 @@ def setup_workspace(
     os.environ["LMER_TASK"] = task
     os.environ["LMER_TASK_TARGET"] = target
 
-    # 4. Clone.
+    # 4. Clone. repo_url carries the live token, and a failing git command
+    #    surfaces it via str(CalledProcessError) (e.cmd includes the URL) —
+    #    scrub at the source so no caller can print the secret (the same bug
+    #    class !104 fixed on the entrypoint clone paths). Re-raised as
+    #    RuntimeError: the original exception's cmd/args would still hold the
+    #    token, so a scrubbed-message copy is the only safe thing to keep.
     print(f"📦 Cloning {host}/{project} into {ws}...", file=sys.stderr)
-    ensure_clone(ws, repo_url, None, None)
+    try:
+        ensure_clone(ws, repo_url, None, None)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"clone failed: {_scrub_credentials(str(e))}") from None
 
     # 5. GitLab MR source-branch checkout (mirrors container startup).
     _, _, mr_id = _parse_gitlab_mr_url(target)
@@ -1097,7 +1124,12 @@ def setup_workspace(
             _fetch_and_checkout_mr(ws, mr_id, git_remote)
             print(f"✅ Checked out MR {mr_id} branch (mr-{mr_id})", file=sys.stderr)
         except subprocess.CalledProcessError as e:
-            print(f"⚠️  Failed to checkout MR {mr_id} branch: {e}", file=sys.stderr)
+            # Defensive scrub: the fetch/checkout commands carry only the
+            # remote NAME today, but keep this print token-safe regardless.
+            print(
+                f"⚠️  Failed to checkout MR {mr_id} branch: {_scrub_credentials(str(e))}",
+                file=sys.stderr,
+            )
 
     # 6. Trust workspace mise config (mirrors container startup's main()), so
     #    mise-managed repos don't warn on every command and the pinned toolset

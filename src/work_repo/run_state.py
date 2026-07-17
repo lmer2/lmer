@@ -416,6 +416,16 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
         append_event(rdir, "run_dir_renamed", note=f"runs/{old_name} -> runs/{final_name}")
     except OSError as exc:
         print(f"⚠️  run_dir_renamed event not recorded: {exc}")
+    # Specs-index entries are relative symlinks into runs/<dirname>/ — the
+    # rename would leave them dangling (and the label change from slug to
+    # name defeats upsert's stale-cleanup), so re-point them now. Fail-soft
+    # both here and inside (index maintenance never fails a freeze).
+    try:
+        specs_index.repoint_run_dir_entries(
+            old_name, final_name, specs_index.run_label(rdir, state)
+        )
+    except Exception as exc:
+        print(f"⚠️  specs index re-point failed (continuing): {exc}")
     return rdir, old_name
 
 

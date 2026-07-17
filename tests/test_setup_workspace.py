@@ -267,6 +267,35 @@ class TestSetupWorkspaceGuards:
             with pytest.raises(ValueError, match="Could not derive"):
                 setup_workspace("not-a-url", workspace=ws)
 
+    def test_clone_failure_scrubs_token_from_error(self, tmp_path):
+        """A failing clone must not surface the tokenized URL (the !104 bug
+        class): str(CalledProcessError) includes e.cmd with the live token,
+        and cmd_setup_workspace prints the exception verbatim — so
+        setup_workspace itself must re-raise a scrubbed error."""
+        ws = tmp_path / "workspace"
+
+        def failing_clone(workspace, repo_url, branch, ref):
+            raise subprocess.CalledProcessError(
+                128, ["git", "clone", repo_url, str(workspace)]
+            )
+
+        with patch.dict(
+            os.environ, {"GITLAB_TOKEN_gitlab_example_com": "TESTTOK"}, clear=True
+        ):
+            with patch.object(clone_and_exec, "ensure_clone", failing_clone):
+                with pytest.raises(RuntimeError, match="clone failed") as excinfo:
+                    setup_workspace(
+                        "https://gitlab.example.com/group/project/-/issues/10",
+                        workspace=ws,
+                        work_repo_path=tmp_path / "work",
+                        sync_deps=False,
+                    )
+        message = str(excinfo.value)
+        assert "TESTTOK" not in message
+        assert "oauth2" not in message
+        # The command context itself is preserved for diagnosis.
+        assert "git" in message and "clone" in message
+
 
 class TestSetupWorkspaceHappyPath:
     def _fake_clone_with_git_init(self, ws_holder):

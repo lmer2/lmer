@@ -71,6 +71,31 @@ class TestRegisterAndQuery:
         assert registry.is_thread_connected("D999", THREAD_TS) is False
 
 
+class TestDeregisterOwnership:
+    """deregister removes only entries this process owns (review on !126):
+    register overwrites unconditionally, so with two manual sessions on one
+    thread the first exit must not delete the survivor's entry."""
+
+    def test_foreign_entry_is_left_in_place(self):
+        # Entry recorded by "another" (live-or-not doesn't matter) process.
+        registry.register(CHANNEL, THREAD_TS, pid=os.getpid() + 1)
+        registry.deregister(CHANNEL, THREAD_TS)
+        assert registry._entry_path(CHANNEL, THREAD_TS).exists()
+
+    def test_own_entry_is_removed(self):
+        registry.register(CHANNEL, THREAD_TS)  # pid defaults to ours
+        registry.deregister(CHANNEL, THREAD_TS)
+        assert not registry._entry_path(CHANNEL, THREAD_TS).exists()
+
+    def test_corrupt_entry_is_removed(self):
+        # A corrupt entry protects nothing — deregister may clean it up.
+        path = registry._entry_path(CHANNEL, THREAD_TS)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        registry.deregister(CHANNEL, THREAD_TS)
+        assert not path.exists()
+
+
 class TestStaleEntries:
     def test_dead_pid_reads_as_not_connected(self, monkeypatch):
         registry.register(CHANNEL, THREAD_TS)
