@@ -606,7 +606,8 @@ class TestGateSystem:
         for attr in (
             "check_git_status", "check_staged_files", "check_branch",
             "check_precommit", "check_secrets", "check_code_quality",
-            "check_documentation", "check_changelog", "check_permissions",
+            "check_documentation", "check_changelog",
+            "check_deliverable_formats", "check_permissions",
         ):
             setattr(self.gate, attr, MagicMock(__name__=attr, return_value=passed))
         self.gate.check_tests = MagicMock(__name__="check_tests", return_value=passed)
@@ -630,7 +631,7 @@ class TestGateSystem:
             "check_git_status", "check_staged_files", "check_branch",
             "check_tests", "check_precommit", "check_secrets",
             "check_code_quality", "check_documentation", "check_changelog",
-            "check_permissions",
+            "check_deliverable_formats", "check_permissions",
         ):
             setattr(self.gate, attr, MagicMock(__name__=attr, return_value=passed))
 
@@ -820,7 +821,7 @@ class TestWriteLogFile:
             "check_git_status", "check_staged_files", "check_branch",
             "check_tests", "check_precommit", "check_secrets",
             "check_code_quality", "check_documentation", "check_changelog",
-            "check_permissions",
+            "check_deliverable_formats", "check_permissions",
         ):
             setattr(self.gate, attr, MagicMock(__name__=attr, return_value=passed))
 
@@ -951,6 +952,90 @@ class TestCheckChangelog:
         result = self.gate.check_changelog()
         assert result.status == CheckStatus.WARNING
         assert "Changelog not updated" in result.message
+
+
+class TestCheckDeliverableFormats:
+    """check_deliverable_formats(): spec-class deliverables are Markdown (#102)."""
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+
+    @patch('subprocess.run')
+    def test_staged_spec_docx_warns(self, mock_run):
+        """A staged spec.docx gets a warning naming the file and the md rule"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/spec.docx", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+        assert not result.is_critical
+        assert any("docs/spec.docx" in d for d in result.details)
+        assert any("Markdown (.md)" in d for d in result.details)
+
+    @patch('subprocess.run')
+    def test_staged_spec_md_passes(self, mock_run):
+        """A staged spec.md is the contract — no warning"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/spec.md", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.PASSED
+
+    @patch('subprocess.run')
+    def test_staged_report_pdf_warns(self, mock_run):
+        """A staged report.pdf matches the spec-class naming and warns"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="reports/q2-report.pdf", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+        assert not result.is_critical
+        assert any("reports/q2-report.pdf" in d for d in result.details)
+
+    @patch('subprocess.run')
+    def test_unrelated_pdf_passes(self, mock_run):
+        """Binary files outside spec/plan/report naming are out of scope"""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="docs/vendor-manual.pdf\nfixtures/inspect.pdf",
+            stderr=""
+        )
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.PASSED
+
+    @patch('subprocess.run')
+    def test_naming_matched_in_directory_component(self, mock_run):
+        """A spec-named directory flags binary documents inside it"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/specs/api.odt", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+
+    @patch('subprocess.run')
+    def test_leading_word_boundary_only(self, mock_run):
+        """'spec' inside a word (inspect) does not match; a leading match (specification) does"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/inspection.docx", stderr="")
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.PASSED
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/specification.docx", stderr="")
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+
+    @patch('subprocess.run')
+    def test_nothing_staged_passes(self, mock_run):
+        """An empty index has nothing to flag"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.PASSED
+
+    @patch('subprocess.run')
+    def test_git_failure_is_noncritical_warning(self, mock_run):
+        """A git failure degrades to a non-critical warning, never a hard fail"""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+        assert not result.is_critical
 
 
 class TestGateCommands:

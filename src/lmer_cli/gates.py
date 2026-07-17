@@ -56,6 +56,17 @@ PYTEST_SUMMARY_RE = re.compile(
     r"\b\d+ (?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?)\b"
 )
 
+# Spec-class deliverable naming for check_deliverable_formats (#102): any path
+# component with a word starting `spec`/`plan`/`report` (spec.docx, docs/specs/,
+# project-plan.odt, reports/q2.pdf, specification.md). Leading word boundary
+# only, so "inspect.pdf" or "replanted.pdf" do NOT match while
+# "specification.docx" and "planning.pdf" do.
+DELIVERABLE_NAME_RE = re.compile(r"\b(?:spec|plan|report)", re.IGNORECASE)
+
+# Binary/office document extensions that make a spec-class deliverable
+# unreviewable in GitLab (undiffable, unlinkable at line level).
+BINARY_DOC_EXTENSIONS = {".docx", ".doc", ".pdf", ".odt", ".rtf"}
+
 
 def receipt_argv() -> List[str]:
     """The invocation as run, with the interpreter-resolved path reduced to
@@ -777,6 +788,55 @@ class GateSystem:
             message=f"Changelog updated: {', '.join(staged_changelogs)}"
         )
 
+    def check_deliverable_formats(self) -> CheckResult:
+        """Warn when staged spec-class deliverables use binary document formats.
+
+        Specs, plans, and reports are Markdown deliverables — a .docx spec is
+        unreviewable in GitLab (undiffable, unlinkable at line level) (#102).
+        WARNING, not a hard fail: reports from external sources may
+        legitimately arrive as e.g. PDF.
+        """
+        code, stdout, _ = self.run_command(["git", "diff", "--cached", "--name-only"])
+        if code != 0:
+            return CheckResult(
+                name="Deliverable Format",
+                status=CheckStatus.WARNING,
+                message="Could not check staged files for deliverable formats",
+                is_critical=False
+            )
+
+        staged_files = stdout.strip().split('\n') if stdout.strip() else []
+
+        offenders = []
+        for file in staged_files:
+            path = Path(file)
+            if path.suffix.lower() not in BINARY_DOC_EXTENSIONS:
+                continue
+            # Only paths that name a spec-class deliverable in any component
+            # (spec.docx, docs/specs/api.pdf, project-plan.odt). Other binary
+            # documents — vendored manuals, fixtures — are out of scope.
+            if any(DELIVERABLE_NAME_RE.search(part) for part in path.parts):
+                offenders.append(file)
+
+        if offenders:
+            return CheckResult(
+                name="Deliverable Format",
+                status=CheckStatus.WARNING,
+                message="Spec-class deliverable staged in a binary document format",
+                details=[
+                    f"{f}: specs, plans, and reports deliver as Markdown (.md) "
+                    "— never docx/pdf/binary documents"
+                    for f in offenders[:5]
+                ],
+                is_critical=False
+            )
+
+        return CheckResult(
+            name="Deliverable Format",
+            status=CheckStatus.PASSED,
+            message="No binary-document deliverables staged"
+        )
+
     def check_permissions(self) -> CheckResult:
         """Check file permissions"""
         issues = []
@@ -981,6 +1041,7 @@ class GateSystem:
             self.check_code_quality,
             self.check_documentation,
             self.check_changelog,
+            self.check_deliverable_formats,
             self.check_permissions,
         ]
 
