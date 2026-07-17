@@ -469,8 +469,9 @@ directory name, so legacy full-SHA runs stay addressable by their original
 slug (no aliasing between the two forms).
 
 **Completed-run policy:** if the slug resolves to a run with
-`status: complete`, the session does not re-seed — and it never silently
-resumes either (#96). `decide()` marks the decision with
+`status: complete` or `archived` (an archived run still resolves until the
+external cleaner moves it under `runs/archive/`), the session does not
+re-seed — and it never silently resumes either (#96). `decide()` marks the decision with
 `completed_run: true` (carried into `work resume --json` for hooks), and
 the resume brief appends an explicit direction contract: with a seed
 (`LMER_START_PROMPT`, threaded into `format_brief` by

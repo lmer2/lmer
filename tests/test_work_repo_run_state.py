@@ -275,6 +275,13 @@ class TestDecide:
         assert d["status"] == "complete"
         assert d["completed_run"] is True
 
+    def test_archived_run_flagged_completed(self):
+        # `archived` still resolves at session start until the external
+        # cleaner moves the dir — a finished run either way (#96 follow-up).
+        d = run_state.decide(_state(status="archived"), [], "s-1")
+        assert d["status"] == "archived"
+        assert d["completed_run"] is True
+
     def test_in_progress_not_flagged_completed(self):
         d = run_state.decide(_state(), [], "s-1")
         assert d["completed_run"] is False
@@ -444,6 +451,17 @@ class TestFormatBrief:
         text = run_state.format_brief(d, seed="x" * 200)
         assert "x" * 120 + "…" in text
         assert "x" * 121 not in text
+
+    def test_completed_brief_multiline_seed_collapsed_to_one_line(self):
+        d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")
+        text = run_state.format_brief(d, seed="pick up\nissue 97\n\n  next")
+        assert "Seed provided (LMER_START_PROMPT): pick up issue 97 next" in text
+
+    def test_archived_brief_renders_direction_contract(self):
+        d = run_state.decide(_state(status="archived"), [], "s-1")
+        text = run_state.format_brief(d)
+        assert "COMPLETED RUN" in text
+        assert "work state set --stop-reason=question" in text
 
     def test_completed_brief_without_seed_renders_ask_or_stop(self):
         d = run_state.decide(_state(status="complete", stop_reason="complete"), [], "s-1")

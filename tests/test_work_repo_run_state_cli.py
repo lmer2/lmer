@@ -772,6 +772,17 @@ class TestSessionStart:
         monkeypatch.setenv("LMER_ANSWER", "stale answer")
         assert _main(["session-start"]) == 0
         assert "ANSWERED QUESTION" not in capsys.readouterr().out
+    def test_archived_run_gets_direction_contract(self, run_env, capsys):
+        # `archived` counts as finished: the slug still resolves until the
+        # external cleaner moves the dir, so it must not silently resume.
+        state = run_state.seed_state("develop-issue-123", "develop", "t")
+        state["status"] = "archived"
+        run_state.write_state(run_env, state)
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "COMPLETED RUN" in out
+        assert "work state set --stop-reason=question" in out
+        assert run_state.load_state(run_env)["status"] == "archived"
 
     def test_newer_schema_refusal_is_not_reseeded_over(self, run_env, capsys):
         # The read-only refusal leaves the file intact — session-start must

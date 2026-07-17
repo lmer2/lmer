@@ -79,6 +79,8 @@ STATUSES = ("in-progress", "complete", "archived")
 # A foreign owner claim younger than this is treated as a live concurrent
 # session (warn loudly); older claims are reported as stale (likely a crash).
 STALE_CLAIM_MINUTES = 120
+# The one-line seed excerpt in the completed-run direction contract (#96).
+SEED_EXCERPT_MAX_LEN = 120
 
 
 class RunStateError(Exception):
@@ -764,8 +766,10 @@ def decide(
         "name": state.get("name"),
         "status": state.get("status"),
         # Structural signal for guard JSON / brief consumers (issue #96):
-        # a completed run must never be silently resumed.
-        "completed_run": state.get("status") == "complete",
+        # a finished run must never be silently resumed. `archived` counts —
+        # until the external cleaner moves the dir under runs/archive/ the
+        # slug still resolves here.
+        "completed_run": state.get("status") in ("complete", "archived"),
         "phase": state.get("phase"),
         "stop_reason": state.get("stop_reason"),
         "critical_error": state.get("critical_error"),
@@ -862,9 +866,11 @@ def format_brief(
     if decision.get("completed_run"):
         lines.append("")
         lines.append("⚠️  COMPLETED RUN — direction contract:")
-        lines.append("This run is complete. Do NOT resume it or invent work.")
+        lines.append("This run is finished. Do NOT resume it or invent work.")
         if seed:
-            excerpt = seed if len(seed) <= 120 else seed[:120] + "…"
+            seed = " ".join(seed.split())  # keep the brief field one-line
+            excerpt = (seed if len(seed) <= SEED_EXCERPT_MAX_LEN
+                       else seed[:SEED_EXCERPT_MAX_LEN] + "…")
             lines.append(f"Seed provided (LMER_START_PROMPT): {excerpt}")
             lines.append(
                 'Record it as the goal (`work goal "<seed>"`), reopen with '
