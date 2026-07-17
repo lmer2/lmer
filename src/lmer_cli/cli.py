@@ -1287,6 +1287,9 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_DISPATCH_MECHANICAL": os.environ.get("LMER_DISPATCH_MECHANICAL"),
         "LMER_DISPATCH_EXPLORE": os.environ.get("LMER_DISPATCH_EXPLORE"),
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
+        # Statusline segment list (issue #121), consumed in-container by
+        # hooks/statusline.py; unset keeps the default repo,branch,task,ctx.
+        "LMER_STATUSLINE": os.environ.get("LMER_STATUSLINE"),
         "LMER_PERSIST_AGENT_MEMORY": os.environ.get("LMER_PERSIST_AGENT_MEMORY"),
         # Source provenance for the live-mounted dirs (dev mode): the commit
         # of the host checkout at session launch, "-dirty" when uncommitted.
