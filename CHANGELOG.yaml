@@ -14,6 +14,11 @@ unreleased:
   removed: []
   security: []
 
+"0.4.1":
+  date: "2026-07-17"
+  fixed:
+    - "github CI test and container build failures"
+
 "0.4.0":
   date: "2026-07-17"
   added:
