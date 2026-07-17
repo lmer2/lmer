@@ -42,6 +42,7 @@ from .mounts import (
     resolve_host_uv_cache_dir,
 )
 from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
+from .harness import HARNESSES, UnknownHarnessError, get_harness, resolve_harness_selection
 from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
 from .service import ServiceError, resolve_container, inspect_container_workdir
 from .tokens import (
@@ -222,7 +223,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. (env: LMER_ANSWER)")
-    parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec claude directly (debug aid for rendering issues)")
+    parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
+    parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(HARNESSES))}")
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
     parser.add_argument("--fastapi-host", dest="fastapi_host", help="Host for the FastAPI endpoint to bind (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", dest="fastapi_token", help="Bearer token for the FastAPI endpoint (auto-generated if omitted)")
@@ -750,8 +752,19 @@ def _handle_build(argv: list[str]) -> int:
     parser.add_argument("--no-pull", action="store_true", help="Don't pass --pull to docker build (skip refreshing base image layers)")
     parser.add_argument("--force", action="store_true", help="Delete existing image before building")
     parser.add_argument("--local", metavar="PATH", type=Path, help="Path to local repo checkout to build from (useful when installed via pip/uv)")
-    parser.add_argument("--update-claude", action="store_true", help="Force re-install of Claude Code CLI (bust Docker cache for that layer)")
+    parser.add_argument("--update-claude", action="store_true", help="Force re-install of Claude Code CLI (bust Docker cache for that layer); alias for --update-harness claude")
+    parser.add_argument("--update-harness", action="append", metavar="NAME", dest="update_harness", help=f"Force re-install of a harness CLI (bust Docker cache for its install layer). Repeatable. Known: {', '.join(sorted(HARNESSES))}, or 'all'")
     args = parser.parse_args(argv)
+
+    update_harnesses = set(args.update_harness or [])
+    if "all" in update_harnesses:
+        update_harnesses = set(HARNESSES)
+    if args.update_claude:
+        update_harnesses.add("claude")
+    unknown = update_harnesses - set(HARNESSES)
+    if unknown:
+        error(f"❌ Unknown harness(es) for --update-harness: {', '.join(sorted(unknown))} (known: {', '.join(sorted(HARNESSES))}, or 'all')")
+        return 2
 
     try:
         runtime = detect_runtime()
@@ -769,7 +782,7 @@ def _handle_build(argv: list[str]) -> int:
         return 2
 
     success(f"Building image {image}...")
-    if build_image(runtime, image, build_root, force=args.force, pull=not args.no_pull, update_claude=args.update_claude):
+    if build_image(runtime, image, build_root, force=args.force, pull=not args.no_pull, update_harnesses=sorted(update_harnesses)):
         return 0
     return 1
 
@@ -899,6 +912,33 @@ def main(argv: list[str] | None = None) -> int:
                 if key not in os.environ and value is not None:
                     os.environ[key] = value
                     early_env_file_sources[key] = f".env ({location})"
+
+    # Resolve the agent harness (--harness > LMER_HARNESS > LMER_LLM_NAME
+    # model hint > claude). Must run AFTER the early .env load above so
+    # LMER_HARNESS/LMER_LLM_NAME from a .env file are honored (docs promise
+    # ~/.lmer/.env works); still early enough that a typo fails fast, before
+    # any image/container work.
+    try:
+        harness_name, harness_source = resolve_harness_selection(ns.harness)
+        harness = get_harness(harness_name)
+    except UnknownHarnessError as e:
+        # Fail fast — but under --show-env render the env table first: that
+        # table is exactly the diagnostic for finding where a typo'd
+        # LMER_HARNESS value comes from (host export vs. which .env file).
+        if ns.show_env:
+            _display_env_config_cli(host_lmer_vars, early_env_file_sources)
+        error(f"❌ {e}")
+        return 2
+    if harness_source == "model":
+        info(f"🤖 Harness: {harness.name} (auto-selected from LMER_LLM_NAME={os.environ.get('LMER_LLM_NAME')})")
+    elif harness.name != "claude":
+        info(f"🤖 Harness: {harness.name}")
+    if harness.name != "claude":
+        info(
+            f"   (requires an image that ships {harness.runner_script}; "
+            f"if the session fails with '{harness.runner_command}: command not found', "
+            f"rebuild with: lmer build)"
+        )
 
     # Handle --show-env: display env config table
     if ns.show_env:
@@ -1064,7 +1104,7 @@ def main(argv: list[str] | None = None) -> int:
     run += build_container_home_mounts(runtime, container_home)
 
     # Build user mounts and check for SSH agent
-    user_mounts, ssh_agent_enabled = build_user_mounts(runtime)
+    user_mounts, ssh_agent_enabled = build_user_mounts(runtime, harness)
     run += user_mounts
     if ssh_agent_enabled:
         success("✅ SSH agent forwarding enabled")
@@ -1219,6 +1259,16 @@ def main(argv: list[str] | None = None) -> int:
 
     env = {
         "HOME": "/home/developer",
+        # Which agent harness the container should run (resolved above from
+        # --harness/LMER_HARNESS/LMER_LLM_NAME model hint; default claude).
+        # Consumed by clone_and_exec.py (runner selection) and lmer-supervisor
+        # (TUI profile), and available to the per-harness runner scripts.
+        # Always the resolved name — the container never re-derives it from
+        # the model hint.
+        "LMER_HARNESS": harness.name,
+        # Harness-specific fixed environment (registry defaults; a host-
+        # exported value wins, matching the other passthrough vars here).
+        **{k: os.environ.get(k, v) for k, v in harness.extra_env},
         "CLAUDE_CODE_ENTRYPOINT": os.environ.get("CLAUDE_CODE_ENTRYPOINT", "cli"),
         # Claude Code's own AFK-timeout variable (no LMER_ prefix, like
         # GITLAB_HOST). Host value passes through; when unset, Slack-bridged
@@ -1320,6 +1370,16 @@ def main(argv: list[str] | None = None) -> int:
         # supervisor can be re-tuned without a release if claude changes the
         # input-prompt glyph.
         "LMER_AUTO_START_READY_MARKER": os.environ.get("LMER_AUTO_START_READY_MARKER"),
+        # Forward the post-marker settle delay and the winsize recheck delay
+        # so host-set values reach the supervisor running inside the container.
+        "LMER_AUTO_START_SETTLE_DELAY": os.environ.get("LMER_AUTO_START_SETTLE_DELAY"),
+        "LMER_WINSIZE_RECHECK_DELAY": os.environ.get("LMER_WINSIZE_RECHECK_DELAY"),
+        # Forward the harness-profile overrides for the injected start command
+        # and the self-shutdown quit sequence — HARNESSES.md promises every
+        # profile field can be patched via env without a release, which needs
+        # a host-exported value to reach the in-container supervisor.
+        "LMER_START_COMMAND": os.environ.get("LMER_START_COMMAND"),
+        "LMER_QUIT_SEQUENCE": os.environ.get("LMER_QUIT_SEQUENCE"),
         # Forward the gap between the auto-/start and the follow-up prompt so a
         # host-set value reaches the supervisor running inside the container.
         # Without this delay /start can fail to register before the prompt is
@@ -1453,12 +1513,14 @@ def main(argv: list[str] | None = None) -> int:
                 *cmd_tokens,
             ]
         else:
-            # Default to Claude runner, forward any residual args to runner
+            # Default to the harness runner (historically the literal
+            # "claude-runner" token, kept for claude so a new host CLI still
+            # works against older images).
             run += [
                 "python3",
                 clone_script,
                 "--",
-                "claude-runner",
+                harness.runner_command,
             ]
 
     info("Running: " + shlex.join(run))

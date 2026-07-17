@@ -12,6 +12,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .harness import get_harness
 from .log import error, success
 
 DEFAULT_IMAGE = "lmer"
@@ -88,15 +89,32 @@ def _build_provenance(repo_root: Path) -> str:
     return f"{commit} ({branch}) built={built}"
 
 
-def build_image_local(runtime: str, image: str, repo_root: Path, pull: bool = True, update_claude: bool = False) -> int:
-    """Build container image from local repo checkout (developer mode)."""
+def build_image_local(
+    runtime: str,
+    image: str,
+    repo_root: Path,
+    pull: bool = True,
+    update_claude: bool = False,
+    update_harnesses: list[str] | None = None,
+) -> int:
+    """Build container image from local repo checkout (developer mode).
+
+    ``update_harnesses`` names harness install layers whose Docker cache
+    should be busted (each maps to its registry ``cache_bust_arg``);
+    ``update_claude`` is the legacy spelling for ``["claude"]``.
+    """
     import time
 
     uid = os.getuid()
     gid = os.getgid()
     # --cache-from only works with Docker; Podman caches layers automatically
     cache_args = ["--cache-from", image] if Path(runtime).name == "docker" else []
-    claude_args = ["--build-arg", f"CLAUDE_CACHE_BUST={int(time.time())}"] if update_claude else []
+    bust = set(update_harnesses or [])
+    if update_claude:
+        bust.add("claude")
+    harness_args: list[str] = []
+    for name in sorted(bust):
+        harness_args += ["--build-arg", f"{get_harness(name).cache_bust_arg}={int(time.time())}"]
     cmd = [
         runtime, "build",
         *cache_args,
@@ -104,7 +122,7 @@ def build_image_local(runtime: str, image: str, repo_root: Path, pull: bool = Tr
         "--build-arg", f"BUILD_UID={uid}",
         "--build-arg", f"BUILD_GID={gid}",
         "--build-arg", f"LMER_BUILD_COMMIT={_build_provenance(repo_root)}",
-        *claude_args,
+        *harness_args,
         "-t", image,
         "-f", "Containerfile",
         ".",
@@ -240,6 +258,7 @@ def build_image(
     force: bool = False,
     pull: bool = True,
     update_claude: bool = False,
+    update_harnesses: list[str] | None = None,
 ) -> bool:
     """
     Build the container image from a local Containerfile.
@@ -251,6 +270,8 @@ def build_image(
         force: If True, delete existing image before building
         pull: If True, pass --pull to docker build (refresh base image layers)
         update_claude: If True, bust cache for the Claude Code install layer
+            (legacy spelling for ``update_harnesses=["claude"]``)
+        update_harnesses: Harness names whose install-layer cache to bust
 
     Returns True if build succeeded, False otherwise.
     """
@@ -264,7 +285,10 @@ def build_image(
     can_build_locally = repo_root is not None and (repo_root / "Containerfile").exists()
 
     if can_build_locally:
-        rc = build_image_local(runtime, image, repo_root, pull=pull, update_claude=update_claude)
+        rc = build_image_local(
+            runtime, image, repo_root, pull=pull,
+            update_claude=update_claude, update_harnesses=update_harnesses,
+        )
         if rc != 0:
             error(f"Image build failed with exit code {rc}")
             return False

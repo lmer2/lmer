@@ -384,24 +384,27 @@ Claude looks for credentials in these locations (in order):
 
 #### LMER Implementation
 
-LMER mounts credential files **selectively** to avoid ownership issues:
+LMER mounts credential files **selectively** to avoid ownership issues. The
+files to mount come from the active harness's registry entry
+(`src/lmer_cli/harness.py`); for the default claude harness:
 
 ```python
-# From mounts.py - build_user_mounts()
-credentials_file = home / ".claude" / ".credentials.json"
-if credentials_file.exists():
-    # Mount only the credentials file, not entire .claude directory
-    args += ["-v", f"{credentials_file}:/home/developer/.claude/.credentials.json:ro{se}"]
-
-# Also mount .claude.json if it exists
-if (home / ".claude.json").exists():
-    args += ["-v", f"{home}/.claude.json:/home/developer/.claude.json:rw{se}"]
+# From mounts.py - build_user_mounts(runtime, harness)
+for cred in harness.credential_mounts:      # claude: ~/.claude/.credentials.json, ~/.claude.json
+    host_file = home / cred.host_path
+    if host_file.exists():
+        args += ["-v", f"{host_file}:{cred.container_path}:{cred.mode}{se}"]
 ```
 
 **Key Points**:
-- Only the **credentials file** is mounted (not entire `.claude` directory)
-- Mounted as **read-only** for security
+- Only individual **credential files** are mounted (never whole config directories)
 - Avoids ownership/permission issues with other `.claude` subdirectories
+- Alternative harnesses mount their own files the same way — codex:
+  `~/.codex/auth.json`, pi:
+  `~/.pi/agent/auth.json` and `~/.pi/agent/models.json` (custom
+  provider/model registry, e.g. local llama.cpp endpoints). Provider API
+  keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) can be supplied via
+  `.env` instead. See [HARNESSES.md](./HARNESSES.md#authentication).
 
 #### Docker Compose Implementation
 
@@ -414,7 +417,7 @@ volumes:
   - ${HOME}/.config/claude:/home/developer/.config/claude:rw
 ```
 
-**Difference**: Docker Compose mounts the full directory (read-write), while LMER mounts only the credentials file (read-only).
+**Difference**: Docker Compose mounts the full directory (read-write), while LMER mounts only individual files — read-write for credential files that self-refresh (tokens), read-only for hand-authored config such as pi's `models.json` (per-mount `mode` in the harness registry).
 
 #### Verification
 

@@ -56,6 +56,16 @@ _LFS_SKIP_FLAGS = [
     arg for key, value in _LFS_SKIP_CONFIG for arg in ("-c", f"{key}={value}")
 ]
 
+# Runner command tokens this entrypoint dispatches to a harness runner script.
+# NOTE: standalone copy of the names in lmer_cli.harness.HARNESSES (this module
+# runs inside the container without the lmer_cli import path — see header).
+# tests/test_harness_runners.py guards that the two stay in sync.
+KNOWN_HARNESS_RUNNERS = {
+    "claude-runner",
+    "codex-runner",
+    "pi-runner",
+}
+
 
 def run(cmd: list[str]) -> int:
     """
@@ -267,26 +277,36 @@ def setup_napkin_and_links(
     link_into_home(home / "napkin", napkin_path)
 
 
-def find_runner() -> str:
+def find_runner(harness: str = "claude") -> str | None:
     """
-    Locate Claude Code runner script in the container.
+    Locate the harness runner script in the container.
 
-    Searches standard installation locations for claude-runner.sh.
+    Searches standard installation locations for ``<harness>-runner.sh``.
 
     Returns:
-        Path to runner script, or 'claude' as fallback
+        Path to the runner script; for claude, falls back to the plain
+        ``claude`` binary on PATH (legacy behavior). For other harnesses,
+        ``None`` when the image has no runner script for them.
     """
+    script = f"{harness}-runner.sh"
     # Prefer global install location inside container
     candidates = [
-        "/home/developer/.lmer/libexec/claude-runner.sh",
-        "/Agents/global/libexec/claude-runner.sh",
-        "/home/developer/claude-runner.sh",
+        f"/home/developer/.lmer/libexec/{script}",
+        f"/Agents/global/libexec/{script}",
     ]
+    if harness == "claude":
+        # Legacy image-baked copy (Containerfile copies only claude-runner.sh
+        # to /home/developer). Non-claude runners must not run from here:
+        # they source harness-common.sh relative to their own directory,
+        # which only exists under libexec/.
+        candidates.append(f"/home/developer/{script}")
     for p in candidates:
         if Path(p).exists():
             return p
-    # Fallback to plain claude on PATH
-    return "claude"
+    if harness == "claude":
+        # Fallback to plain claude on PATH
+        return "claude"
+    return None
 
 
 def sanitize_task_target(task_target: str) -> str:
@@ -1188,8 +1208,8 @@ def mint_session_id() -> None:
 
 
 def dispatch_runner(runner: str) -> int:
-    """Run claude-runner as a child (not execv) so post-session teardown can
-    run while the container is still alive. Returns the runner's exit code."""
+    """Run the harness runner as a child (not execv) so post-session teardown
+    can run while the container is still alive. Returns the runner's exit code."""
     mint_session_id()
     proc = subprocess.Popen([runner])
     _forward_signals(proc)
@@ -1358,8 +1378,17 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     # Dispatch
-    if len(cmd_tokens) == 1 and cmd_tokens[0] == "claude-runner":
-        runner = find_runner()
+    if len(cmd_tokens) == 1 and cmd_tokens[0] in KNOWN_HARNESS_RUNNERS:
+        harness = cmd_tokens[0][: -len("-runner")]
+        runner = find_runner(harness)
+        if runner is None:
+            print(
+                f"❌ This image has no runner for harness '{harness}' "
+                f"({harness}-runner.sh not found). Rebuild the image with a "
+                f"lmer version that includes it: lmer build",
+                file=sys.stderr,
+            )
+            return 3
         return dispatch_runner(runner)
 
     # Otherwise, treat tokens as a command to exec via bash -lc

@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple
 
+from lmer_cli.harness import get_harness
 from lmer_cli.runtime import _is_selinux_enforcing
 
 EXTERNAL_TASKDEF_MOUNT_BASE = "/Agents/taskdefs"
@@ -205,34 +206,36 @@ def build_container_home_mounts(runtime: str, container_home: Path) -> List[str]
     return args
 
 
-def build_user_mounts(runtime: str) -> Tuple[List[str], bool]:
+def build_user_mounts(runtime: str, harness=None) -> Tuple[List[str], bool]:
     """
     Build mounts for user configuration files and SSH agent.
 
-    Mounts only Claude credentials file (not entire .claude directory) and SSH
-    authentication socket from the host user's home directory into the container.
+    Mounts the active harness's credential files (per its registry entry —
+    individual files rather than whole config directories, which avoids
+    ownership issues with other subdirectories) and the SSH authentication
+    socket from the host user's home directory into the container.
 
     Args:
         runtime: Container runtime ('docker' or 'podman')
+        harness: Harness registry entry whose credential files to mount;
+            defaults to claude (the historical behavior)
 
     Returns:
         Tuple of (mount arguments, ssh_agent_enabled flag)
     """
+    if harness is None:
+        harness = get_harness("claude")
+
     args: List[str] = []
     se = selinux_opt(runtime)
     home = Path.home()
     ssh_agent_enabled = False
 
-    # Only mount credentials file, not entire .claude directory
-    # This avoids ownership issues with other .claude subdirectories
-    credentials_file = home / ".claude" / ".credentials.json"
-    if credentials_file.exists():
-        # Ensure .claude directory exists in container first
-        args += ["-v", f"{credentials_file}:/home/developer/.claude/.credentials.json:rw{se}"]
+    for cred in harness.credential_mounts:
+        host_file = home / cred.host_path
+        if host_file.exists():
+            args += ["-v", f"{host_file}:{cred.container_path}:{cred.mode}{se}"]
 
-    # .claude.json
-    if (home / ".claude.json").exists():
-        args += ["-v", f"{home}/.claude.json:/home/developer/.claude.json:rw{se}"]
     # SSH agent
     ssh_sock = os.environ.get("SSH_AUTH_SOCK")
     if ssh_sock:

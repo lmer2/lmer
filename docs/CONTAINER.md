@@ -317,6 +317,8 @@ Set via the host environment, `~/.lmer/.env`, or a project-local `.env` file:
 - `GITLAB_TOKEN_*`, `GITLAB_TOKEN` - GitLab tokens (host-specific via sanitized hostname suffix, plus generic fallback)
 - `GH_TOKEN`, `GITHUB_TOKEN` - GitHub tokens (consulted for `github.com`, `*.github.com`, `*.ghe.com` hosts)
 - `CLAUDE_API_KEY` - Claude API key (if needed)
+- `LMER_HARNESS` - Agent harness the session runs (`claude` default; `codex`, `pi` — all baked into the image; see [HARNESSES.md](./HARNESSES.md))
+- `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, ... - Provider API keys for non-claude harnesses (forwarded from `.env` like any other variable)
 
 ## Building for Production
 

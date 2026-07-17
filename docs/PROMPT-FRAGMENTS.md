@@ -33,6 +33,13 @@ Three components cooperate:
      with the workspace or user `AGENTS.md`, appends the rendered fragment,
      and passes the result to `claude` via `--append-system-prompt-file`.
 
+   Non-claude harnesses reuse the same templates and renderer through
+   `harness_render_global_context` in `libexec/harness-common.sh`, which
+   writes the rendered fragments (plus `~/.lmer/AGENTS.md`) to the harness's
+   *global* context file (e.g. `~/.codex/AGENTS.md`) instead of a CLI flag —
+   those harnesses read the workspace `AGENTS.md` natively. See
+   [HARNESSES.md](./HARNESSES.md).
+
 The upshot is that the final system prompt Claude sees is:
 
 ```

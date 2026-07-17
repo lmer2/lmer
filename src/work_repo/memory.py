@@ -105,6 +105,18 @@ def restore_memory() -> int:
     if not get_bool_env(PERSIST_ENV_VAR):
         return 0
 
+    # Guarantee the on-disk store unconditionally once persistence is on:
+    # session context (Claude Code's memory instructions, the harness
+    # agent-memory fragment) promises the agent an existing directory gated
+    # solely on LMER_PERSIST_AGENT_MEMORY — a missing path invites an
+    # improvised memory/ dir inside the project workspace instead. This
+    # holds for every graceful no-op branch below, not just fresh start.
+    dest = agent_memory_dir()
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"⚠️  Could not create agent memory dir: {e}", file=sys.stderr)
+
     source = project_memory_dir()
     if source is None:
         print(
@@ -117,7 +129,6 @@ def restore_memory() -> int:
         print("🧠 No saved agent memory found in work repo — starting fresh")
         return 0
 
-    dest = agent_memory_dir()
     try:
         copied = _mirror_tree(source, dest)
     except OSError as e:
