@@ -18,8 +18,9 @@ recorded phase, goal, and artifacts instead of starting over. If
 human answer — check the conversation/thread for it before doing anything
 else.
 
-If the state shows a COMPLETED run (`status: complete`), do NOT resume it
-or invent work — completed runs only reopen on explicit direction:
+If the state shows a COMPLETED run (`status: complete` or `archived`), do
+NOT resume it or invent work — finished runs only reopen on explicit
+direction:
 
 - Seed provided (the brief shows a `Seed provided (LMER_START_PROMPT):`
   line): record it as the goal (`work goal "<seed>"`), reopen with
