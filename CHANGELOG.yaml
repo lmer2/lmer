@@ -7,6 +7,15 @@
 # https://github.com/lmer2/lmer/issues.
 
 unreleased:
+  added: []
+  changed: []
+  fixed: []
+  deprecated: []
+  removed: []
+  security: []
+
+"0.4.0":
+  date: "2026-07-17"
   added:
     - "Configurable status line segments via `LMER_STATUSLINE` (comma-separated, ordered list; forwarded into the container): the default `repo,branch,task,ctx` line is unchanged, and the vocabulary regains the labels lost in the claude-powerline replacement plus a few more — `model` (display name), `cost` (`$1.23`), `5h`/`7d` (subscription usage-limit windows, from the status payload's `rate_limits`), `effort` (`eff high`), `duration` (`1h03m`), and `lines` (`+156/-23`). Unknown names are ignored, an all-unknown list falls back to the default, and segments without data are omitted — the renderer still never errors and makes no network calls. Claude harness only (codex/pi have no custom-statusline hook upstream — follow-up tracked separately) (#121). See docs/LMER-CLI.md"
     - "`work setup-workspace <TARGET_URL>` — on-demand `/workspace` bootstrap for sessions that started without a repository (e.g. a Slack chat that pivots into development work). It clones the target repo (resolving the host-specific token the same way `lmer` does), checks out the MR source branch for merge-request targets, creates the work-repo directory structure, provisions `AGENTS.md`/`rules/`, runs `uv sync` for uv-managed projects (`uv.lock` or `[tool.uv]`), trusts the workspace `.mise.toml` when `LMER_TRUST_MISE` opts in, and restores the project's persisted agent memory when `LMER_PERSIST_AGENT_MEMORY` is enabled — the same `/workspace` setup a repo-targeted session gets at container startup, so a clean-state `gate-check` passes instead of reporting environmental failures (empty checkout, missing deps, missing docs). It hard-errors if `/workspace` is already set up. Because it runs mid-session it can't inject `LMER_REPO_HOST`/`LMER_REPO_PROJECT`/`LMER_TASK`/`LMER_TASK_TARGET` into future shells, so it writes them to `/tmp/lmer-workspace-env.sh` for the session to `source` (needed by `work log`/`commit`/`report` and the work-repo-aware `gate-check` features). The built-in `chat` taskdef now directs the agent to this command when a conversation turns into development work (#69)"
