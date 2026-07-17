@@ -17,6 +17,7 @@ after the editable install is on ``sys.path``, so importing ``lmer_cli`` and
 """
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 from typing import Optional
@@ -138,8 +139,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     An enabled-but-broken session must not fall through to exit 1: that is the
     silent "plain session" path, so any failure once masterplan is enabled maps
     to exit 2 so the warning still fires.
+
+    Flags (mid-session enablement, spec: masterplan-on-demand):
+      * ``--force`` — skip the launch-time gating and resolve the bundle root
+        unconditionally (exit 1 cannot occur under ``--force``);
+      * ``--repo-host`` / ``--repo-project`` — set ``LMER_REPO_HOST`` /
+        ``LMER_REPO_PROJECT`` for this resolution, so a session launched
+        without a repo target can be pointed at one. Flag-less invocation is
+        byte-identical to the pre-flag behavior.
     """
-    if not masterplan_enabled():
+    parser = argparse.ArgumentParser(prog="python3 -m lmer_cli.container.masterplan")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--repo-host")
+    parser.add_argument("--repo-project")
+    args = parser.parse_args(argv)
+    if args.repo_host:
+        os.environ["LMER_REPO_HOST"] = args.repo_host
+    if args.repo_project:
+        os.environ["LMER_REPO_PROJECT"] = args.repo_project
+    if not args.force and not masterplan_enabled():
         return 1
     try:
         rdir = masterplan_runs_dir()

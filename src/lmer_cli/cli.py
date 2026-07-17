@@ -1302,6 +1302,9 @@ def main(argv: list[str] | None = None) -> int:
         # implies it. MASTERPLAN_RUNS_DIR is computed in-container from the run
         # state (not passed through here), so bundles nest inside the run dir.
         "LMER_MASTERPLAN": os.environ.get("LMER_MASTERPLAN"),
+        # Mirror-directory search order for the masterplan plugin, read
+        # in-container by libexec/masterplan-enable.sh.
+        "LMER_MASTERPLAN_MIRROR_CANDIDATES": os.environ.get("LMER_MASTERPLAN_MIRROR_CANDIDATES"),
         "LMER_HUMAN_IDENTITY": resolve_human_identity(),
         # Optional git identity overrides for commits made inside the container.
         # When set, entrypoint.sh exports them as GIT_AUTHOR_*/GIT_COMMITTER_*
