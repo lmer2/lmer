@@ -1,8 +1,10 @@
 # lmer
 
-**lmer** is a containerized harness for running [Claude Code](https://docs.anthropic.com/en/docs/claude-code) against external repositories.
+**lmer** is a containerized harness for running [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — or an alternative agent harness — against external repositories.
 
-It clones a target repo into a sandbox container, mounts a known set of development rules and slash commands, and hands the session to Claude with a task-shaped prompt. Tests, pre-commit, and git operations all run inside the container, so the host stays clean and credentials never leak into the target repo's working tree.
+It clones a target repo into a sandbox container, mounts a known set of development rules and slash commands, and hands the session to the agent with a task-shaped prompt. Tests, pre-commit, and git operations all run inside the container, so the host stays clean and credentials never leak into the target repo's working tree.
+
+Claude Code is the default and most fully integrated harness. [Codex](https://github.com/openai/codex) and [pi](https://github.com/earendil-works/pi) are supported at a core tier — select one with `--harness <name>` or `LMER_HARNESS`; see [docs/HARNESSES.md](docs/HARNESSES.md) for the capability matrix and per-harness setup.
 
 Only `chat` ships as a built-in task in [taskdef/](taskdef/). Additional tasks can be loaded from the work-repo or from directories listed in `LMER_TASKDEF_PATHS` — see [docs/TASKDEFS.md](docs/TASKDEFS.md).
 
@@ -10,7 +12,7 @@ Only `chat` ships as a built-in task in [taskdef/](taskdef/). Additional tasks c
 
 ## What you get
 
-- A reproducible container image (Oracle Linux 9 Slim, FIPS-capable) with `claude`, `git`, `uv`, and a pinned Python toolchain pre-installed.
+- A reproducible container image (Oracle Linux 9 Slim, FIPS-capable) with `claude` (plus the `codex` and `pi` harnesses), `git`, `uv`, and a pinned Python toolchain pre-installed.
 - A consistent ruleset (`AGENTS.md` + `rules/`) injected into Claude's system prompt so behavior is the same across projects: tests before commits, no force-push, show command output, pytest-only, etc.
 - Gate commands (`gate-check`, `gate-commit`, `gate-push`) that enforce those rules at commit-time.
 - Task-specific workflows that load instructions, set up the work environment, and (optionally) drive a follow-up review cycle on the resulting MR.

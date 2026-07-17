@@ -1,0 +1,10 @@
+# lmer base config for the Codex CLI harness.
+# Provisioned to ~/.codex/config.toml at session start when no config exists
+# (an existing file wins — see libexec/codex-runner.sh). Sandbox mode and
+# approval policy are passed as CLI flags by the runner, not set here, so the
+# danger-zone toggle stays in one place.
+
+# The workspace is created fresh by lmer inside the container; pre-trust it so
+# codex's first-run trust dialog can't block the supervisor's auto-start.
+[projects."/workspace"]
+trust_level = "trusted"

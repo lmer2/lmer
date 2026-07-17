@@ -5,13 +5,15 @@
 # Detect script location and set paths accordingly
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Add src directory to PYTHONPATH to find the github_reviewer module
-if [ -d "/Agents/global/src" ]; then
-    # Container environment - src is mounted from host
-    export PYTHONPATH="/Agents/global/src:$PYTHONPATH"
-else
-    # Host environment
+# Add src directory to PYTHONPATH to find the github_reviewer module.
+# Prefer the src tree that ships alongside this script so the wrapper always
+# runs its own repo's code — in self-dev containers /workspace/bin/* must
+# resolve /workspace/src, not the older operational copy at /Agents/global/src.
+if [ -d "${SCRIPT_DIR}/src" ]; then
     export PYTHONPATH="${SCRIPT_DIR}/src:$PYTHONPATH"
+elif [ -d "/Agents/global/src" ]; then
+    # Container fallback when the wrapper is detached from its repo
+    export PYTHONPATH="/Agents/global/src:$PYTHONPATH"
 fi
 
 exec "${LMER_PYTHON:-python3}" -c "from github_reviewer.cli import main; main()" "$@"

@@ -367,6 +367,72 @@ class TestContainerEnvPassthrough:
         assert pattern.search(source), \
             "LMER_START_PROMPT_DELAY entry missing from cli.py container env dict"
 
+    def test_cli_env_dict_declares_auto_start_settle_delay(self):
+        """Guard: LMER_AUTO_START_SETTLE_DELAY must be in cli.py's container env dict.
+
+        The supervisor reads this var inside the container, so a host-set value
+        only takes effect if cli.py forwards it explicitly.
+        """
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_AUTO_START_SETTLE_DELAY["']\s*:\s*os\.environ\.get\(\s*["']LMER_AUTO_START_SETTLE_DELAY["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_AUTO_START_SETTLE_DELAY entry missing from cli.py container env dict"
+
+    def test_cli_env_dict_declares_winsize_recheck_delay(self):
+        """Guard: LMER_WINSIZE_RECHECK_DELAY must be in cli.py's container env dict.
+
+        The supervisor reads this var inside the container, so a host-set value
+        only takes effect if cli.py forwards it explicitly.
+        """
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_WINSIZE_RECHECK_DELAY["']\s*:\s*os\.environ\.get\(\s*["']LMER_WINSIZE_RECHECK_DELAY["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_WINSIZE_RECHECK_DELAY entry missing from cli.py container env dict"
+
+    def test_cli_env_dict_declares_start_command(self):
+        """Guard: LMER_START_COMMAND must be in cli.py's container env dict.
+
+        HARNESSES.md promises every supervisor-profile field has an env
+        override that works without a release; the in-container supervisor
+        only sees a host-exported value if cli.py forwards it explicitly.
+        """
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_START_COMMAND["']\s*:\s*os\.environ\.get\(\s*["']LMER_START_COMMAND["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_START_COMMAND entry missing from cli.py container env dict"
+
+    def test_cli_env_dict_declares_quit_sequence(self):
+        """Guard: LMER_QUIT_SEQUENCE must be in cli.py's container env dict.
+
+        HARNESSES.md promises every supervisor-profile field has an env
+        override that works without a release; the in-container supervisor
+        only sees a host-exported value if cli.py forwards it explicitly.
+        """
+        import re
+        from pathlib import Path
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        source = cli_py.read_text()
+        pattern = re.compile(
+            r"""["']LMER_QUIT_SEQUENCE["']\s*:\s*os\.environ\.get\(\s*["']LMER_QUIT_SEQUENCE["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_QUIT_SEQUENCE entry missing from cli.py container env dict"
+
 
 class TestPreconfigurePtyForInjection:
     """Cover the cooked-mode race fix: ICRNL/ECHO/ICANON cleared pre-fork."""
@@ -767,7 +833,7 @@ class TestSelfShutdown:
     def test_chord_only_when_child_exits_promptly(self, monkeypatch):
         chords: list[bool] = []
         monkeypatch.setattr(
-            supervisor, "_inject_shutdown_chord", lambda w, g: chords.append(True)
+            supervisor, "_inject_shutdown_chord", lambda w, g, s: chords.append(True)
         )
         monkeypatch.setattr(supervisor, "_wait_child_exit", lambda pid, t: True)
         killed: list[tuple[int, int]] = []
@@ -781,7 +847,7 @@ class TestSelfShutdown:
         assert killed == []  # chord worked; no escalation
 
     def test_escalates_to_sigterm_then_sigkill(self, monkeypatch):
-        monkeypatch.setattr(supervisor, "_inject_shutdown_chord", lambda w, g: None)
+        monkeypatch.setattr(supervisor, "_inject_shutdown_chord", lambda w, g, s: None)
         # Child never exits on its own -> both waits time out.
         monkeypatch.setattr(supervisor, "_wait_child_exit", lambda pid, t: False)
         killed: list[tuple[int, int]] = []
@@ -797,7 +863,7 @@ class TestSelfShutdown:
         ]
 
     def test_escalates_to_sigterm_only_when_that_works(self, monkeypatch):
-        monkeypatch.setattr(supervisor, "_inject_shutdown_chord", lambda w, g: None)
+        monkeypatch.setattr(supervisor, "_inject_shutdown_chord", lambda w, g, s: None)
         waits = iter([False, True])  # chord fails, child dies after SIGTERM
         monkeypatch.setattr(supervisor, "_wait_child_exit", lambda pid, t: next(waits))
         killed: list[tuple[int, int]] = []

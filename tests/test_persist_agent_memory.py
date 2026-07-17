@@ -105,7 +105,22 @@ def test_restore_fresh_start_when_no_saved_memory(memory_env, monkeypatch, capsy
     monkeypatch.setenv("LMER_PERSIST_AGENT_MEMORY", "1")
     assert memory.restore_memory() == 0
     assert "starting fresh" in capsys.readouterr().out
-    assert not memory_env["agent_dir"].exists()
+    # The store dir is still created (empty): session context promises the
+    # agent an existing path — a missing one invites an improvised memory/
+    # dir inside the project workspace.
+    assert memory_env["agent_dir"].is_dir()
+    assert not any(memory_env["agent_dir"].iterdir())
+
+
+def test_restore_creates_dir_even_without_repo_identity(memory_env, monkeypatch, capsys):
+    # The "already exists" promise is gated solely on the persistence var,
+    # so the guarantee must hold on the missing-env no-op branch too.
+    monkeypatch.setenv("LMER_PERSIST_AGENT_MEMORY", "1")
+    monkeypatch.delenv("LMER_REPO_HOST", raising=False)
+    monkeypatch.delenv("LMER_REPO_PROJECT", raising=False)
+    assert memory.restore_memory() == 0
+    assert "LMER_REPO_HOST/LMER_REPO_PROJECT not set" in capsys.readouterr().err
+    assert memory_env["agent_dir"].is_dir()
 
 
 def test_restore_mirrors_deletions(memory_env, monkeypatch):

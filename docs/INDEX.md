@@ -49,6 +49,21 @@ User guide for the `lmer` command-line interface:
 
 ---
 
+### [HARNESSES.md](./HARNESSES.md)
+**Agent Harnesses**
+
+How lmer abstracts the agent CLI it runs in the session container, and the
+supported harnesses (Claude Code, Codex, pi):
+- Selecting a harness (`--harness` / `LMER_HARNESS`)
+- Capability matrix (full tier vs core tier) and per-harness env mapping
+- Authentication per harness and sandbox/approval posture
+- Architecture (registry, runner scripts, supervisor profiles)
+- Step-by-step checklist for adding support for a new harness
+
+**Best for**: Running lmer sessions on Codex/pi, understanding what works where, and adding support for additional harnesses.
+
+---
+
 ### [PROMPT-FRAGMENTS.md](./PROMPT-FRAGMENTS.md)
 **Prompt Fragments**
 
@@ -120,6 +135,15 @@ How `.mcp.json` is loaded and how MCP servers are exposed to Claude inside the l
 Reference for the `gitlab-pipeline` helper that watches and traces GitLab CI/CD pipelines from inside (or outside) the lmer container.
 
 **Best for**: Debugging failing CI jobs and tailing pipeline output.
+
+---
+
+### [DEVELOPMENT.md](./DEVELOPMENT.md)
+**Development Conventions**
+
+Design decisions and code conventions for working on lmer itself, recorded as dated sections with rationale (e.g. stdlib dataclasses vs. pydantic for internal records).
+
+**Best for**: Contributing to lmer's own source and understanding why the code is shaped the way it is.
 
 ---
 
