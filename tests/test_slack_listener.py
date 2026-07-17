@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from slack_chat import listener
+from lmer_cli.presets import Preset
 
 PERMALINK = "https://x.slack.com/archives/C1/p1112220000000000"
 
@@ -28,6 +29,11 @@ def manager(monkeypatch) -> MagicMock:
     mgr.idle_timeout_minutes = 30
     mgr.max_sessions = 5
     monkeypatch.setattr(listener, "session_manager", mgr)
+    # The external-session registry check defaults to "no one else is here" so
+    # these tests exercise the in-memory paths without touching the real
+    # ~/.lmer/slack-sessions registry. Tests that need the connected case
+    # override it (see test_external_session_skips_spawn_silently).
+    monkeypatch.setattr(listener, "is_thread_connected", lambda *a, **k: False)
     return mgr
 
 
@@ -45,6 +51,20 @@ def slack_app(monkeypatch) -> types.SimpleNamespace:
     monkeypatch.setattr(listener, "app", fake_app)
     monkeypatch.setattr(listener, "_bot_user_id", None)
     return fake_app
+
+
+@pytest.fixture(autouse=True)
+def isolate_dm_allowlist(monkeypatch):
+    """Isolate the DM allowlist from the ambient environment.
+
+    ``DM_ALLOWED_USERS`` is parsed from ``LMER_SLACK_DM_ALLOWED_USERS`` at import
+    time. When the suite runs inside a live Slack session that variable is
+    populated (e.g. the operator's own user id), which gates the synthetic test
+    users out of the DM-connect paths and fails the tests that assume the CI
+    default (empty allowlist = allow all). Reset it to empty before each test;
+    tests that exercise gating override it explicitly.
+    """
+    monkeypatch.setattr(listener, "DM_ALLOWED_USERS", set())
 
 
 class TestCsvEnvSet:
@@ -80,7 +100,7 @@ class TestConnectLmerSession:
         slack_app.client.chat_getPermalink.assert_awaited_once_with(
             channel="C1", message_ts="111.222"
         )
-        manager.spawn.assert_awaited_once_with("C1", "111.222", PERMALINK)
+        manager.spawn.assert_awaited_once_with("C1", "111.222", PERMALINK, preset=None)
         # An ack is posted in the thread
         say.assert_awaited_once()
         assert say.await_args.kwargs["thread_ts"] == "111.222"
@@ -96,6 +116,42 @@ class TestConnectLmerSession:
         manager.spawn.assert_not_awaited()
         say.assert_not_awaited()
         manager.touch.assert_called_once_with("C1", "111.222")
+
+    @pytest.mark.asyncio
+    async def test_external_session_skips_spawn_silently(
+        self, manager, slack_app, monkeypatch
+    ):
+        """An lmer attached to this thread outside the listener (e.g. a manual
+        `lmer chat <permalink>`) registers itself; the listener must not spawn a
+        second one, and must stay silent — the existing session is handling the
+        conversation (issue #74)."""
+        monkeypatch.setattr(listener, "is_thread_connected", lambda *a, **k: True)
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        manager.spawn.assert_not_awaited()
+        say.assert_not_awaited()
+        # We bail before even resolving the permalink.
+        slack_app.client.chat_getPermalink.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_own_active_session_skips_external_check(
+        self, manager, slack_app, monkeypatch
+    ):
+        """When the listener already tracks a live session for the thread
+        (touch() hits), it returns before consulting the registry — its own
+        session must never be mistaken for a blocking external one."""
+        manager.touch.return_value = True
+        external = MagicMock(return_value=True)
+        monkeypatch.setattr(listener, "is_thread_connected", external)
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        manager.spawn.assert_not_awaited()
+        say.assert_not_awaited()
+        external.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_capacity_reached_posts_busy_message(self, manager, slack_app):
@@ -206,7 +262,7 @@ class TestConnectLmerSession:
             "D1", "111.222", say, is_dm=True, dedup_channel=True
         )
 
-        manager.spawn.assert_awaited_once_with("D1", "111.222", PERMALINK)
+        manager.spawn.assert_awaited_once_with("D1", "111.222", PERMALINK, preset=None)
 
     @pytest.mark.asyncio
     async def test_concurrent_top_level_dms_spawn_once(self, manager, slack_app):
@@ -222,7 +278,7 @@ class TestConnectLmerSession:
             channel="D1", thread_ts="111.222", permalink=PERMALINK
         )
 
-        async def spawn_and_register(channel, thread_ts, permalink):
+        async def spawn_and_register(channel, thread_ts, permalink, preset=None):
             manager.get_active_in_channel.return_value = active
 
         manager.spawn = AsyncMock(side_effect=spawn_and_register)
@@ -248,7 +304,7 @@ class TestConnectLmerSession:
         """
         say = AsyncMock()
 
-        async def spawn_and_register(channel, thread_ts, permalink):
+        async def spawn_and_register(channel, thread_ts, permalink, preset=None):
             manager.touch.return_value = True
 
         manager.spawn = AsyncMock(side_effect=spawn_and_register)
@@ -276,7 +332,9 @@ class TestHandleMention:
         event = {"user": "U1", "channel": "C1", "ts": "111.222"}
         await listener.handle_mention(event, say)
 
-        connect.assert_awaited_once_with("C1", "111.222", say, is_dm=False)
+        connect.assert_awaited_once_with(
+            "C1", "111.222", say, is_dm=False, preset_name=None
+        )
 
     @pytest.mark.asyncio
     async def test_mention_inside_thread_uses_thread_ts(
@@ -294,7 +352,9 @@ class TestHandleMention:
         }
         await listener.handle_mention(event, say)
 
-        connect.assert_awaited_once_with("C1", "111.222", say, is_dm=False)
+        connect.assert_awaited_once_with(
+            "C1", "111.222", say, is_dm=False, preset_name=None
+        )
 
     @pytest.mark.asyncio
     async def test_bot_authored_mention_is_ignored(
@@ -336,7 +396,9 @@ class TestHandleMention:
         event = {"user": "U_NOPE", "channel": "C1", "ts": "111.222"}
         await listener.handle_mention(event, say)
 
-        connect.assert_awaited_once_with("C1", "111.222", say, is_dm=False)
+        connect.assert_awaited_once_with(
+            "C1", "111.222", say, is_dm=False, preset_name=None
+        )
 
     @pytest.mark.asyncio
     async def test_dm_mention_connects_with_is_dm(
@@ -351,7 +413,9 @@ class TestHandleMention:
         event = {"user": "U1", "channel": "D1", "ts": "111.222"}
         await listener.handle_mention(event, say)
 
-        connect.assert_awaited_once_with("D1", "111.222", say, is_dm=True)
+        connect.assert_awaited_once_with(
+            "D1", "111.222", say, is_dm=True, preset_name=None
+        )
 
 
 class TestHandleMessageEvent:
@@ -387,7 +451,7 @@ class TestHandleMessageEvent:
         await listener.handle_message_event(event, say)
 
         connect.assert_awaited_once_with(
-            "D1", "111.222", say, is_dm=True, dedup_channel=True
+            "D1", "111.222", say, is_dm=True, dedup_channel=True, preset_name=None
         )
 
     @pytest.mark.asyncio
@@ -411,7 +475,7 @@ class TestHandleMessageEvent:
         await listener.handle_message_event(event, say)
 
         connect.assert_awaited_once_with(
-            "D1", "111.222", say, is_dm=True, dedup_channel=False
+            "D1", "111.222", say, is_dm=True, dedup_channel=False, preset_name=None
         )
 
     @pytest.mark.asyncio
@@ -476,7 +540,7 @@ class TestHandleMessageEvent:
         await listener.handle_message_event(event, say)
 
         connect.assert_awaited_once_with(
-            "D1", "111.222", say, is_dm=True, dedup_channel=True
+            "D1", "111.222", say, is_dm=True, dedup_channel=True, preset_name=None
         )
 
     @pytest.mark.asyncio
@@ -664,6 +728,122 @@ class TestEnsureCaBundle:
         listener._ensure_ca_bundle()
 
         assert os.environ["SSL_CERT_FILE"] == "/custom/corporate-ca.pem"
+
+
+class TestPresetSelection:
+    """Resolving a $preset:<name> token: known presets reach spawn(), unknown
+    names are rejected, and the token is parsed off the triggering message."""
+
+    @pytest.mark.asyncio
+    async def test_known_preset_passed_to_spawn(self, manager, slack_app, monkeypatch):
+        preset = Preset(name="my_service", checkout="/co", service="svc")
+        monkeypatch.setattr(listener, "PRESETS", {"my_service": preset})
+        say = AsyncMock()
+
+        await listener._connect_lmer_session(
+            "C1", "111.222", say, preset_name="my_service"
+        )
+
+        manager.spawn.assert_awaited_once_with(
+            "C1", "111.222", PERMALINK, preset=preset
+        )
+        # The ack names the applied preset.
+        assert "my_service" in say.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_preset_rejected_without_spawn(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listener,
+            "PRESETS",
+            {"my_service": Preset(name="my_service", checkout="/co")},
+        )
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say, preset_name="bogus")
+
+        manager.spawn.assert_not_awaited()
+        say.assert_awaited_once()
+        text = say.await_args.kwargs["text"]
+        assert "Unknown preset" in text
+        assert "bogus" in text
+        assert "my_service" in text  # lists what IS available
+
+    @pytest.mark.asyncio
+    async def test_unknown_preset_with_none_configured(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(listener, "PRESETS", {})
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say, preset_name="x")
+
+        manager.spawn.assert_not_awaited()
+        assert "none configured" in say.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_preset_on_active_thread_is_ignored(
+        self, manager, slack_app, monkeypatch
+    ):
+        """A $preset token on a thread that already has a live session is moot:
+        touch() wins, so nothing is spawned and nothing is rejected."""
+        manager.touch.return_value = True
+        monkeypatch.setattr(listener, "PRESETS", {})
+        say = AsyncMock()
+
+        await listener._connect_lmer_session(
+            "C1", "111.222", say, preset_name="anything"
+        )
+
+        manager.spawn.assert_not_awaited()
+        say.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_mention_token_is_parsed_and_passed(
+        self, manager, slack_app, monkeypatch
+    ):
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+        say = AsyncMock()
+
+        event = {
+            "user": "U1",
+            "channel": "C1",
+            "ts": "111.222",
+            "text": "<@U_BOT> $preset:my_service please do X",
+        }
+        await listener.handle_mention(event, say)
+
+        connect.assert_awaited_once_with(
+            "C1", "111.222", say, is_dm=False, preset_name="my_service"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dm_token_is_parsed_and_passed(
+        self, manager, slack_app, monkeypatch
+    ):
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+        say = AsyncMock()
+
+        event = {
+            "channel": "D1",
+            "channel_type": "im",
+            "user": "U1",
+            "ts": "111.222",
+            "text": "$preset:my_service hello",
+        }
+        await listener.handle_message_event(event, say)
+
+        connect.assert_awaited_once_with(
+            "D1",
+            "111.222",
+            say,
+            is_dm=True,
+            dedup_channel=True,
+            preset_name="my_service",
+        )
 
 
 class TestMainLmerEnvFile:

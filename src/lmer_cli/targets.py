@@ -26,6 +26,7 @@ import os
 from typing import ClassVar
 
 from slack_chat.permalink import is_slack_thread_url, parse_slack_permalink
+from slack_chat.registry import deregister, register
 
 
 class TargetHandler:
@@ -84,6 +85,20 @@ class TargetHandler:
     def container_env(self) -> dict[str, str | None]:
         """Env vars this handler forwards into the container."""
         return {}
+
+    def on_session_start(self) -> None:
+        """Hook fired just before a real session launches for these targets.
+
+        Default no-op. A handler overrides it to announce or register the
+        session — :class:`SlackThreadTargets` records its Slack-thread
+        attachment so the listener won't connect a second lmer to a thread that
+        already has one. Called only for the actual interactive session launch
+        (not ``--exec``/``--no-task`` one-shots), and paired with
+        :meth:`on_session_end`.
+        """
+
+    def on_session_end(self) -> None:
+        """Teardown counterpart to :meth:`on_session_start`. Default no-op."""
 
 
 class SlackThreadTargets(TargetHandler):
@@ -150,6 +165,22 @@ class SlackThreadTargets(TargetHandler):
             "LMER_SLACK_THREAD_TS": self.thread_ts,
             "LMER_SLACK_PERMALINK": self.permalink,
         }
+
+    def on_session_start(self) -> None:
+        """Record this Slack-thread attachment in the host-side registry.
+
+        Lets the Slack listener detect that an lmer is already connected to the
+        thread — including a session it didn't spawn, e.g. a manual
+        ``lmer chat <permalink>`` from a shell — and decline to connect a second
+        one (issue #74). The registry call is best-effort and keyed on the
+        parsed ``channel`` / ``thread_ts``; with no Slack target parsed it is a
+        no-op.
+        """
+        register(self.channel, self.thread_ts, permalink=self.permalink)
+
+    def on_session_end(self) -> None:
+        """Clear the registry entry recorded by :meth:`on_session_start`."""
+        deregister(self.channel, self.thread_ts)
 
 
 #: Registry of special target types, in match-priority order.

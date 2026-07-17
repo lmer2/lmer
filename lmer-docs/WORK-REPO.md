@@ -160,6 +160,61 @@ work goal
 # Output: No goal set
 ```
 
+### Set Up Workspace
+
+Bootstrap `/workspace` for development work in a session that was **not**
+started against a repository — most commonly a Slack chat-mode session that
+pivots into real dev work on a specific issue/MR. It performs the same
+`/workspace` setup a repo-targeted `lmer <verb> <target>` session gets at
+container startup:
+
+```bash
+work setup-workspace <TARGET_URL>
+```
+
+`<TARGET_URL>` may be an issue, merge-request, pull-request, or `work_items`
+URL, or a plain repository URL. The command:
+
+1. **Hard-errors if `/workspace` is already set up** (contains a git checkout
+   or any files) — it never clobbers an existing checkout.
+2. Resolves the clone URL and auth token from the target (using the same
+   host-specific `GITLAB_TOKEN_<host>` / `GH_TOKEN` lookup as `lmer`).
+3. Clones the repository into `/workspace`. For a GitLab MR target it also
+   fetches and checks out the MR source branch.
+4. Creates the work-repo directory structure for the project/task.
+5. Provisions missing documentation (`AGENTS.md`, `rules/`) from the work repo
+   or lmer defaults — so a clean-state `gate-check` doesn't report missing docs.
+6. Runs a dependency sync (`uv sync`) when the project is uv-managed
+   (`uv.lock` or `[tool.uv]` in `pyproject.toml`), so `gate-check`'s test step
+   finds the project `.venv` instead of failing with import errors.
+
+**Options:**
+
+- `--task <type>` — task type used for the work-repo layout / `LMER_TASK`
+  (default: `develop`).
+- `--no-sync` — skip the dependency sync step (clone + provision docs only).
+
+**Loading routing variables.** Because the command runs mid-session (not at
+container launch), it cannot inject `LMER_REPO_HOST` / `LMER_REPO_PROJECT` /
+`LMER_TASK` / `LMER_TASK_TARGET` into future shells the way `lmer` does. These
+are needed by `work log` / `commit` / `report` and a couple of work-repo-aware
+`gate-check` features. The command writes them to a sourceable file and prints
+them; load them with:
+
+```bash
+source /tmp/lmer-workspace-env.sh
+```
+
+**Examples:**
+```bash
+# Bootstrap from a GitLab issue, then load routing vars
+work setup-workspace https://git.example.com/group/project/-/issues/42
+source /tmp/lmer-workspace-env.sh
+
+# Bootstrap from a merge request without running uv sync
+work setup-workspace https://git.example.com/group/project/-/merge_requests/7 --no-sync
+```
+
 ## Project-Specific Gate Configuration
 
 An optional `gate-check.yaml` (or `.yml`) in the project info directory lets you tune `gate-check` behavior per project. The file is read directly from `{LMER_WORK_REPO_PATH}/{host}/{project}/info/gate-check.yaml`.

@@ -36,6 +36,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lmer_cli.presets import Preset
+
 logger = logging.getLogger("lmer_slack.sessions")
 
 # How often the reaper loop wakes up to check sessions, in seconds.
@@ -206,7 +208,13 @@ class SessionManager:
     # Spawning
     # ------------------------------------------------------------------
 
-    async def spawn(self, channel: str, thread_ts: str, permalink: str) -> Session:
+    async def spawn(
+        self,
+        channel: str,
+        thread_ts: str,
+        permalink: str,
+        preset: Preset | None = None,
+    ) -> Session:
         """Spawn an ``lmer chat`` process attached to a Slack thread.
 
         The process inherits the listener's full environment, so host-side
@@ -217,6 +225,11 @@ class SessionManager:
         passed as ``lmer --env-file`` so that file's variables (git tokens,
         ``LMER_*`` settings, ...) are forwarded into the container even though
         the spawn cwd has no ``.env`` of its own (issue #75).
+
+        When *preset* is given, its operator-defined startup configuration is
+        layered on: ``--checkout``/``--service`` flags and any extra ``args``
+        are appended to the command, and its ``env`` is merged over the
+        inherited environment (the preset wins on conflict).
 
         Raises:
             RuntimeError: If a running session already exists for the
@@ -233,26 +246,38 @@ class SessionManager:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         log_path = self.log_dir / f"{channel}-{thread_ts}.log"
 
+        # Base command + inherited environment, then layer the preset on top.
+        env = dict(os.environ)
+        cmd: list[str] = [self.lmer_bin]
+        # Global lmer flags precede the `chat` subcommand. Forward an explicit
+        # .env into the chat container when configured, so vars that live only
+        # in the listener's deployment dir reach lmer even though the spawn cwd
+        # is a scratch dir with no .env of its own (issue #75).
+        if self.lmer_env_file:
+            cmd += ["--env-file", self.lmer_env_file]
+        cmd += ["chat", permalink]
+        # Preset options are `chat` subcommand flags / args, appended after.
+        if preset is not None:
+            if preset.checkout:
+                cmd += ["--checkout", preset.checkout]
+            if preset.service:
+                cmd += ["--service", preset.service]
+            cmd += preset.args
+            env.update(preset.env)
+
         # Spawn under a PTY: lmer only allocates an interactive container
         # terminal (-it) when its own stdin is a TTY, and the claude
         # instance inside needs one. Nobody types into it - it exists so
         # the interactive (non-headless) claude session runs normally.
         master_fd, slave_fd = pty.openpty()
-        # Forward an explicit .env into the chat container when configured, so
-        # vars that live only in the listener's deployment dir reach lmer even
-        # though the spawn cwd is a scratch dir with no .env (issue #75).
-        lmer_argv = [self.lmer_bin]
-        if self.lmer_env_file:
-            lmer_argv += ["--env-file", self.lmer_env_file]
-        lmer_argv += ["chat", permalink]
         try:
             process = await asyncio.create_subprocess_exec(
-                *lmer_argv,
+                *cmd,
                 stdin=slave_fd,
                 stdout=slave_fd,
                 stderr=slave_fd,
                 cwd=str(self.spawn_cwd),
-                env=dict(os.environ),
+                env=env,
                 start_new_session=True,
             )
         except Exception:
@@ -280,6 +305,7 @@ class SessionManager:
                 thread_ts=thread_ts,
                 pid=process.pid,
                 permalink=permalink,
+                preset=preset.name if preset else "-",
                 log_path=log_path,
                 active_sessions=self.active_count(),
             ),

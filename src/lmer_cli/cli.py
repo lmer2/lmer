@@ -1457,6 +1457,20 @@ def main(argv: list[str] | None = None) -> int:
             ]
 
     info("Running: " + shlex.join(run))
+
+    # A real interactive session (the default claude-runner path) attached to a
+    # special target announces itself via its handler's lifecycle hooks while it
+    # runs, so peers can tell the target is already taken. For a Slack thread
+    # this records the attachment in the host-side registry the listener
+    # consults, so it won't connect a second lmer to a thread that already has
+    # one — including this session if it was started manually (issue #74).
+    # --exec / --no-task one-shots are not interactive sessions, so they don't
+    # announce.
+    announce_session = use_clone_script and not exec_mode
+    if announce_session:
+        for handler in special_targets:
+            handler.on_session_start()
+
     success(f"🚀 Launching container ({runtime} run {image})")
     if runtime == "podman":
         success(
@@ -1467,6 +1481,10 @@ def main(argv: list[str] | None = None) -> int:
         return subprocess.call(run)
     except KeyboardInterrupt:
         return 130
+    finally:
+        if announce_session:
+            for handler in special_targets:
+                handler.on_session_end()
 
 
 if __name__ == "__main__":

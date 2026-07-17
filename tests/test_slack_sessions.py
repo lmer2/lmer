@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from lmer_cli.presets import Preset
 from slack_chat.sessions import Session, SessionManager, _env_int
 
 
@@ -424,3 +425,107 @@ class TestReap:
 
         terminate.assert_not_awaited()
         assert mgr.get(*session.key) is session
+
+
+PERMALINK = "https://x.slack.com/archives/C1/p1112220000000000"
+
+
+class TestSpawnWithPreset:
+    """spawn() layers a preset's checkout/service/args onto the command and
+    merges its env, without a preset producing the plain repo-less command."""
+
+    @pytest.fixture
+    def captured(self, monkeypatch):
+        """Patch the subprocess spawn and PTY drain; capture the exec call.
+
+        The real ``lmer`` is never launched - we only assert on how spawn()
+        builds the command and environment.
+        """
+        import slack_chat.sessions as sessions_mod
+
+        calls: dict = {}
+
+        class _StubProc:
+            returncode = None
+            pid = 4242
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*args, **kwargs):
+            calls["args"] = args
+            calls["kwargs"] = kwargs
+            return _StubProc()
+
+        async def noop_drain(self, session):
+            return None
+
+        monkeypatch.setattr(sessions_mod.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(SessionManager, "_drain", noop_drain)
+        return calls
+
+    @pytest.fixture
+    def manager(self, tmp_path: Path) -> SessionManager:
+        return SessionManager(
+            idle_timeout_minutes=30,
+            max_sessions=5,
+            lmer_bin="lmer",
+            spawn_cwd=str(tmp_path / "cwd"),
+            log_dir=str(tmp_path / "logs"),
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_preset_is_plain_command(self, manager, captured):
+        session = await manager.spawn("C1", "1.1", PERMALINK)
+        os.close(session.master_fd)
+
+        assert list(captured["args"]) == ["lmer", "chat", PERMALINK]
+        # Inherits the listener environment unchanged.
+        assert captured["kwargs"]["env"] == dict(os.environ)
+
+    @pytest.mark.asyncio
+    async def test_full_preset_builds_command_and_env(
+        self, manager, captured, monkeypatch
+    ):
+        monkeypatch.delenv("LMER_LLM_NAME", raising=False)
+        preset = Preset(
+            name="my_service",
+            checkout="/srv/my-service",
+            service="mysvc",
+            env={"LMER_LLM_NAME": "opus"},
+            args=["--ports", "2"],
+        )
+        session = await manager.spawn("C1", "1.1", PERMALINK, preset=preset)
+        os.close(session.master_fd)
+
+        assert list(captured["args"]) == [
+            "lmer",
+            "chat",
+            PERMALINK,
+            "--checkout",
+            "/srv/my-service",
+            "--service",
+            "mysvc",
+            "--ports",
+            "2",
+        ]
+        assert captured["kwargs"]["env"]["LMER_LLM_NAME"] == "opus"
+
+    @pytest.mark.asyncio
+    async def test_checkout_only_preset_omits_service(self, manager, captured):
+        preset = Preset(name="co", checkout="/co")
+        session = await manager.spawn("C1", "1.1", PERMALINK, preset=preset)
+        os.close(session.master_fd)
+
+        cmd = list(captured["args"])
+        assert cmd == ["lmer", "chat", PERMALINK, "--checkout", "/co"]
+        assert "--service" not in cmd
+
+    @pytest.mark.asyncio
+    async def test_preset_env_overrides_inherited(self, manager, captured, monkeypatch):
+        monkeypatch.setenv("LMER_LLM_NAME", "sonnet")
+        preset = Preset(name="m", env={"LMER_LLM_NAME": "opus"})
+        session = await manager.spawn("C1", "1.1", PERMALINK, preset=preset)
+        os.close(session.master_fd)
+
+        assert captured["kwargs"]["env"]["LMER_LLM_NAME"] == "opus"

@@ -416,10 +416,21 @@ def _make_main_mocks(captured_env: dict | None = None):
     ``captured_env`` — if provided, the mock for ``env_args`` stores the env
     dict that main() passes into it so tests can inspect the container env.
     """
+    import tempfile
     from contextlib import ExitStack
     from unittest.mock import MagicMock, patch
 
+    from slack_chat import registry as _slack_registry
+
     stack = ExitStack()
+
+    # --- session registry: point it at a throwaway dir so the on_session_start
+    # / on_session_end hooks (issue #74) that fire on the real claude-runner
+    # launch path never write to the host's ~/.lmer/slack-sessions during tests.
+    _tmp_registry = stack.enter_context(tempfile.TemporaryDirectory())
+    stack.enter_context(
+        patch.object(_slack_registry, "REGISTRY_DIR", _tmp_registry)
+    )
 
     # --- runtime / image ---
     stack.enter_context(
@@ -967,3 +978,87 @@ class TestMultiTypeRepolessAgreement:
             )
         assert rc == 0, f"All-supporting handlers must allow repo-less; rc={rc}"
         assert captured.get("LMER_NO_REPO") == "1"
+
+
+# ---------------------------------------------------------------------------
+# (g) Slack-session registration: a real `lmer chat <slack-url>` session
+#     announces its thread attachment via the SlackThreadTargets lifecycle
+#     hooks so the listener won't connect a second lmer to the same thread
+#     (issue #74). One-shot --exec/--no-task invocations are not interactive
+#     sessions and must NOT register.
+# ---------------------------------------------------------------------------
+
+
+class TestSlackSessionRegistration:
+    """The host-side lmer process registers/deregisters its Slack-thread
+    attachment around the container launch on the real session path only."""
+
+    def _run(self, argv, reg, dereg, *, resolve_fails=True):
+        """Run main() through the standard mock stack with the registry's
+        register/deregister patched to spies. ``resolve_fails`` triggers the
+        repo-less path (Slack URL as the sole target), matching the proven
+        ``_run_main_repoless`` shape that reaches the launch."""
+        from unittest.mock import patch as mpatch
+
+        from lmer_cli import resolve as resolve_mod
+
+        env_in = {**_BASE_ENV, "SLACK_BOT_TOKEN": "xoxb-test-bot-token"}
+        with patch.dict(os.environ, env_in, clear=True):
+            with _make_main_mocks():
+                resolve_ctx = (
+                    mpatch(
+                        "lmer_cli.cli.resolve.normalize_repo_url",
+                        side_effect=resolve_mod.ResolveError("no git origin"),
+                    )
+                    if resolve_fails
+                    else nullcontext()
+                )
+                with resolve_ctx, mpatch(
+                    "lmer_cli.targets.register", reg
+                ), mpatch("lmer_cli.targets.deregister", dereg):
+                    from lmer_cli.cli import main
+
+                    return main(argv)
+
+    def test_chat_session_registers_with_parsed_channel_and_thread(self):
+        """`lmer chat <slack-url>` (claude-runner path) registers the parsed
+        channel/thread_ts before launch."""
+        from unittest.mock import MagicMock
+
+        reg, dereg = MagicMock(), MagicMock()
+        rc = self._run(["chat", _SLACK_URL], reg, dereg)
+
+        assert rc == 0, f"expected the runner path to reach launch; rc={rc}"
+        reg.assert_called_once()
+        assert reg.call_args.args[0] == _EXPECTED_CHANNEL
+        assert reg.call_args.args[1] == _EXPECTED_THREAD_TS
+
+    def test_chat_session_deregisters_after_launch(self):
+        """The attachment is cleared when the session process exits (finally),
+        so a thread is reconnectable after its session ends."""
+        from unittest.mock import MagicMock
+
+        reg, dereg = MagicMock(), MagicMock()
+        self._run(["chat", _SLACK_URL], reg, dereg)
+
+        dereg.assert_called_once()
+        assert dereg.call_args.args[0] == _EXPECTED_CHANNEL
+        assert dereg.call_args.args[1] == _EXPECTED_THREAD_TS
+
+    def test_exec_oneshot_does_not_register(self):
+        """A `--no-task --exec` one-shot is not an interactive session and must
+        not announce a thread attachment."""
+        from unittest.mock import MagicMock
+
+        reg, dereg = MagicMock(), MagicMock()
+        # --no-task takes the non-runner path; default repo resolution is fine.
+        rc = self._run(
+            ["--no-task", "--exec", "true", _SLACK_URL],
+            reg,
+            dereg,
+            resolve_fails=False,
+        )
+
+        assert rc == 0
+        reg.assert_not_called()
+        dereg.assert_not_called()
