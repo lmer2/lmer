@@ -4,8 +4,11 @@ These helpers decide whether a test that shells out to the real `lmer`
 script (which in turn runs a container) is able to run in the current
 environment. Tests that require a live container runtime or a working
 lmer venv should gate themselves with the `requires_container` /
-`requires_lmer_venv` marks exported here.
+`requires_lmer_venv` marks exported here; tests whose assertions need the
+lmer run itself to succeed (not just start) also need `requires_work_repo`,
+since the host-side CLI refuses to run without LMER_WORK_REPO configured.
 """
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -58,4 +61,9 @@ requires_container = pytest.mark.skipif(
 requires_lmer_venv = pytest.mark.skipif(
     not has_lmer_venv(),
     reason="lmer requires a working virtual environment",
+)
+
+requires_work_repo = pytest.mark.skipif(
+    not os.environ.get("LMER_WORK_REPO"),
+    reason="LMER_WORK_REPO not set (the lmer CLI requires it host-side)",
 )
