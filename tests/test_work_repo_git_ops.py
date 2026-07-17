@@ -15,6 +15,7 @@ from work_repo.git_ops import (
     commit_work_path,
     push_napkin_if_separate,
     report_uncommitted_work_items,
+    run_dir_push_status,
     run_git_command,
 )
 
@@ -519,6 +520,85 @@ class TestReportUncommittedWorkItems:
         assert "more" not in out  # no overflow tail exactly at the cap
         item_lines = [ln for ln in out.splitlines() if ln.strip().startswith("??")]
         assert len(item_lines) == UNTRACKED_REPORT_CAP
+
+
+def _git(cwd, *args):
+    subprocess.run(
+        ["git", "-C", str(cwd),
+         "-c", "user.name=test", "-c", "user.email=test@example.com",
+         *args],
+        check=True, capture_output=True,
+    )
+
+
+def _clone_with_run_dir(tmp_path):
+    """Bare origin + clone holding a committed-and-pushed run dir — the same
+    harness shape as the Stop-hook guard tests whose trigger-2 predicate
+    run_dir_push_status mirrors."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
+    clone = tmp_path / "workrepo"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)],
+        check=True, capture_output=True,
+    )
+    run_dir = clone / "git.example.com" / "org/repo" / "runs" / "develop-issue-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "notes.md").write_text("artifact\n")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-q", "-m", "run dir")
+    _git(clone, "push", "-q", "-u", "origin", "main")
+    return clone, run_dir
+
+
+class TestRunDirPushStatus:
+    """The issue #100 phase-boundary predicate — trigger-2 semantics."""
+
+    def test_clean_and_pushed(self, tmp_path):
+        _, run_dir = _clone_with_run_dir(tmp_path)
+        assert run_dir_push_status(run_dir) == (False, False)
+
+    def test_dirty_run_dir(self, tmp_path):
+        _, run_dir = _clone_with_run_dir(tmp_path)
+        (run_dir / "scratch.md").write_text("uncommitted\n")
+        assert run_dir_push_status(run_dir) == (True, False)
+
+    def test_unpushed_commit(self, tmp_path):
+        clone, run_dir = _clone_with_run_dir(tmp_path)
+        (run_dir / "notes.md").write_text("amended\n")
+        _git(clone, "add", ".")
+        _git(clone, "commit", "-q", "-m", "local only")  # no push
+        assert run_dir_push_status(run_dir) == (False, True)
+
+    def test_dirt_outside_run_dir_does_not_count(self, tmp_path):
+        clone, run_dir = _clone_with_run_dir(tmp_path)
+        (clone / "elsewhere.md").write_text("other project\n")
+        assert run_dir_push_status(run_dir) == (False, False)
+
+    def test_missing_dir_fails_open(self, tmp_path):
+        assert run_dir_push_status(tmp_path / "absent") == (False, False)
+
+    def test_non_git_dir_fails_open(self, tmp_path):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "junk.md").write_text("dirty-looking but ungoverned\n")
+        assert run_dir_push_status(plain) == (False, False)
+
+    def test_no_upstream_reads_as_pushed(self, tmp_path):
+        # Local-only repo: ahead-of-upstream is unknowable — fail open, but
+        # the dirty half still works independently.
+        repo = tmp_path / "local"
+        repo.mkdir()
+        _git(repo, "init", "-q", "-b", "main")
+        (repo / "notes.md").write_text("artifact\n")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-q", "-m", "local only")
+        assert run_dir_push_status(repo) == (False, False)
+        (repo / "scratch.md").write_text("uncommitted\n")
+        assert run_dir_push_status(repo) == (True, False)
 
 
 def _git_init(path):

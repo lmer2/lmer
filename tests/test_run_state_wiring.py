@@ -209,6 +209,21 @@ class TestRunStateFragment:
         assert ('work goal "..." --estimate-sessions 2 --estimate-time "3h"'
                 in goal_bullet.group(0))
 
+    def test_phase_end_pushed_linked_deliverable_contract(self):
+        """Issue #100: every phase END is a pushed, linked deliverable —
+        `work commit` before the transition, web URL (never a container
+        path) cited in the report."""
+        out = self._render(None, {
+            "LMER_REPO_HOST": "h", "LMER_REPO_PROJECT": "p",
+        })
+        bullet = re.search(
+            r"- Every phase END.*?(?=\n- |\Z)", out, re.DOTALL)
+        assert bullet, "the phase-end deliverable contract bullet went missing"
+        assert "pushed, linked deliverable" in bullet.group(0)
+        assert "work commit" in bullet.group(0)
+        assert "web URL" in bullet.group(0)
+        assert "container path" in bullet.group(0)
+
     def test_run_naming_needs_no_confirmation(self):
         """Issue #94: the agent names the run itself — the fragment must
         teach `work name` directly, never routed through AskUserQuestion

@@ -198,6 +198,7 @@ The work repository uses the following directory structure:
 {host}/{project}/runs/{slug}/             # Run dir — the single home for run output
 {host}/{project}/runs/{slug}/log.yaml     # Logs
 {host}/{project}/runs/{slug}/reports/{YYMMDD-HH-MM-SS.md}  # Reports
+{host}/{project}/specs/                   # Central specs index (dated symlinks into runs/)
 ```
 
 **Example:**
@@ -214,6 +215,79 @@ the `work` CLI resolves runs by the `slug:`/`name:` recorded in
 `state.yaml`. Runs that predate the run-dir unification keep their
 log/report files at the legacy `{task_type}/{task_target}/` location,
 which `work log` still reads as a display fallback.
+
+## Specs index
+
+Specs land deep inside per-run dirs (`runs/<slug>/spec.md`, masterplan
+bundle files at `runs/<slug>/masterplan/<mp>/spec.md`), so
+`{host}/{project}/specs/` — a sibling of `info/` and `runs/` — keeps one
+dated entry per spec pointing back at where it landed:
+
+```
+specs/2026-07-15-gate-receipts-spec.md -> ../runs/develop-issue-88--gate-receipts/spec.md
+```
+
+- **Entry name**: `YYYY-MM-DD-<run>-<basename>` — the registration date,
+  the run's name (slug when unnamed), and the spec's own filename.
+- **Entry form**: a relative symlink to the spec's one canonical location —
+  never a copy (specs are never written in two places), and for masterplan
+  bundle specs the target is the bundle file itself, never the run-root
+  convenience symlink. There is deliberately no `README.md`/index file
+  beside the links: a directory listing IS the index (v1 is symlinks-only).
+- **Spec-class predicate**: a Markdown file whose stem is exactly `spec`,
+  starts with `spec` + separator, or ends with separator + `spec`
+  (`-`/`_`/`.`, case-insensitive) — `spec.md`, `spec-auth.md`,
+  `foo-spec.md`, `masterplan-spec.md` yes; `plan.md`, `spec.py`,
+  `specifics.md` no.
+
+Maintenance is automatic: `work artifact` upserts an entry when it registers
+a spec-class artifact, and the masterplan artifact sync (`work artifact
+--sync`, also run by `work commit`/session end) indexes bundle specs. Upserts
+are idempotent — re-registering the same spec re-points the same day's link,
+and a later-day re-registration replaces the older entry, so a spec never
+accumulates duplicate entries. All index maintenance is fail-soft: an index
+problem warns and never fails the registration that triggered it.
+
+For specs that predate the index, rebuild it from `runs/`:
+
+```bash
+# Backfill: scan runs/*/ (registered artifacts + run-root spec symlinks)
+# and rebuild every entry; entry dates come from the run's recorded
+# artifact_written events (file mtime as fallback)
+work specs-index --rebuild
+
+# List the index (read-only)
+work specs-index
+```
+
+`--rebuild` writes only — batch the push with `work commit` (archived runs
+and `.new-*` orphans stay unindexed).
+
+## Single canonical home
+
+**Rule (issue #103): the same file is never written in two places. Every
+artifact has exactly one canonical home; a second location is always a
+link, never a second write.** Duplicated content drifts — two copies of a
+spec that disagree lie to whoever reads the wrong one.
+
+Status of the known work-repo writers:
+
+- **`work artifact`** — compliant as of #103. A source already inside the
+  run dir is registered as a relative symlink to the canonical file; an
+  external source (e.g. `/tmp` scratch) is copied in because the original
+  would vanish with the container — that copy *becomes* the canonical
+  home, not a duplicate. A work-repo source outside the run dir is also
+  still copied (justified: the copy passes secret redaction and the
+  run-dir push does not stage the outside file — linking would trade a
+  redacted copy for an unredacted, possibly never-pushed target).
+- **`work report`** — timestamped copies **by design**. Reports are
+  point-in-time snapshots (`reports/{YYMMDD-HH-MM-SS.md}`); each copy is
+  its own canonical artifact, not a second home for a living file.
+- **Masterplan bundle sync** (`work artifact --sync`) — compliant. The
+  bundle file is canonical; the run-dir-root names are relative symlinks.
+- **Specs index** (#101) — compliant. `{host}/{project}/specs/` entries
+  are dated relative symlinks to each spec's canonical location (for
+  masterplan specs, the bundle file — never the run-root link).
 
 ## Web URLs
 
@@ -545,11 +619,31 @@ the full ledger — for hooks/scripts.
 
 ```bash
 work artifact spec.md --file /tmp/agreed-approach.md
+work artifact spec.md --file /work/.../runs/<slug>/masterplan/mp-a/spec.md
 ```
 
-Copies the file into the run dir (secrets redacted) under a plain filename
-(no paths, no leading dot), registers it in `state.artifacts`, and appends
-an `artifact_written` event.
+Registers the file in the run dir under a plain filename (no paths, no
+leading dot), records it in `state.artifacts`, and appends an
+`artifact_written` event.
+
+Where the bytes land follows the single-canonical-home rule (issue #103):
+
+- **Source outside the run dir** (e.g. `/tmp` scratch — it would vanish
+  with the container): copied into the run dir, secrets redacted. The
+  run-dir copy becomes the canonical file.
+- **Source already inside the run dir** (e.g. a masterplan bundle file):
+  the registered name becomes a **relative symlink** to it — never a
+  second copy that can drift. No redaction rewrite of the canonical file:
+  the run dir is pushed verbatim anyway, so redacting a copy of a run-dir
+  file never protected anything.
+- **Source IS the destination** (registering the canonical file in
+  place): the file is rewritten through redaction and registered — no
+  copy, no link.
+
+Re-registration is idempotent in both directions: an inside-run source
+replaces an older copy with the link (or re-points a stale link), and an
+external source replaces an existing link with a fresh copy — never
+writing through the link at its canonical target.
 
 ### Masterplan artifact links
 

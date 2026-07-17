@@ -68,6 +68,9 @@ the work, not optional bookkeeping:
 - Record each phase transition BEFORE starting the phase's work:
   `work state set --phase=<name>` — treat an unrecorded phase as not
   started.
+- Every phase END is a pushed, linked deliverable: run `work commit` before
+  the transition and cite the deliverable's web URL (the `Run dir:` link
+  from the resume brief) in your report — never a container path.
 - BEFORE stopping to ask the user a blocking question: record the question
   text too — `work state set --stop-reason=question --question "<the question>"`
   — then `work commit`, then END the session immediately. Never idle in-session

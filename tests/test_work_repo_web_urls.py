@@ -6,6 +6,7 @@ credentials STRIPPED — the tokenized remote the runner clones with must
 never leak into user-facing output — and the CLI wires it into every
 user-facing artifact print (artifact, report, log display, resume brief).
 """
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -244,3 +245,23 @@ class TestCliOutputsCarryWebUrls:
         out = capsys.readouterr().out
         assert "Run dir:" not in out
         assert TOKEN not in out
+
+    def test_resume_json_carries_run_dir_url(self, run_env, capsys):
+        # Issue #100: the guard's push nudge gets its clickable link from
+        # here — the URL is derived server-side, credentials stripped.
+        run_state.write_state(
+            run_env, run_state.seed_state("develop-issue-123", "develop", "t")
+        )
+        assert _main(["resume", "--json"]) == 0
+        decision = json.loads(capsys.readouterr().out)
+        assert decision["run_dir_url"] == f"{WEB_BASE}/-/tree/main/{RUN_REL}"
+
+    def test_resume_json_omits_run_dir_url_without_remote(self, run_env, tmp_path, capsys):
+        _git(tmp_path, "remote", "remove", "origin")
+        run_state.write_state(
+            run_env, run_state.seed_state("develop-issue-123", "develop", "t")
+        )
+        assert _main(["resume", "--json"]) == 0
+        decision = json.loads(capsys.readouterr().out)
+        assert "run_dir_url" not in decision
+        assert decision["run_dir"] == str(run_env)  # the path field stays
