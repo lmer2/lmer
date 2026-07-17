@@ -13,11 +13,19 @@ from unittest.mock import patch
 from lmer_cli.container import clone_and_exec
 
 
-_BASE_ENV = {
-    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-    "HOME": os.path.expanduser("~"),
-    "LMER_WORK_REPO": "https://github.com/example/work-repo.git",
-}
+_WORK_REPO_URL = "https://github.com/example/work-repo.git"
+
+
+def _base_env(home):
+    # HOME must be a scratch dir: main() runs setup_napkin_and_links, whose
+    # link_into_home() rmtrees an existing real $HOME/work before symlinking.
+    # With the real HOME this deleted /home/runner/work (the checkout itself)
+    # on GitHub-hosted runners (#125).
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(home),
+        "LMER_WORK_REPO": _WORK_REPO_URL,
+    }
 
 
 def _run_main(env, argv=None):
@@ -53,17 +61,17 @@ def _run_main(env, argv=None):
 
 
 class TestNoRepoMode:
-    def test_missing_repo_url_without_no_repo_is_fatal(self):
+    def test_missing_repo_url_without_no_repo_is_fatal(self, tmp_path):
         """Without LMER_NO_REPO (and not service mode), a missing
         LMER_REPO_URL must still exit 2 — existing behavior unchanged."""
-        rc, clone_calls, _ = _run_main({**_BASE_ENV})
+        rc, clone_calls, _ = _run_main(_base_env(tmp_path))
         assert rc == 2
         assert clone_calls == []
 
-    def test_no_repo_mode_skips_workspace_clone(self):
+    def test_no_repo_mode_skips_workspace_clone(self, tmp_path):
         """LMER_NO_REPO=1 with no LMER_REPO_URL must not error and must not
         clone anything into /workspace."""
-        rc, clone_calls, execv_calls = _run_main({**_BASE_ENV, "LMER_NO_REPO": "1"})
+        rc, clone_calls, execv_calls = _run_main({**_base_env(tmp_path), "LMER_NO_REPO": "1"})
         assert rc == 0
         workspace_clones = [c for c in clone_calls if c[0] == Path("/workspace")]
         assert workspace_clones == [], (
@@ -71,20 +79,20 @@ class TestNoRepoMode:
         )
         assert execv_calls, "claude-runner dispatch must still happen"
 
-    def test_no_repo_mode_still_clones_work_repo(self):
+    def test_no_repo_mode_still_clones_work_repo(self, tmp_path):
         """The work repository clone is unaffected by no-repo mode."""
-        rc, clone_calls, _ = _run_main({**_BASE_ENV, "LMER_NO_REPO": "1"})
+        rc, clone_calls, _ = _run_main({**_base_env(tmp_path), "LMER_NO_REPO": "1"})
         assert rc == 0
-        work_clones = [c for c in clone_calls if c[1] == _BASE_ENV["LMER_WORK_REPO"]]
+        work_clones = [c for c in clone_calls if c[1] == _WORK_REPO_URL]
         assert len(work_clones) == 1, (
             f"Expected exactly one work-repo clone; got {clone_calls}"
         )
 
-    def test_repo_url_present_wins_over_no_repo_flag(self):
+    def test_repo_url_present_wins_over_no_repo_flag(self, tmp_path):
         """Defensive: if both LMER_REPO_URL and LMER_NO_REPO are set, the
         repository is cloned normally."""
         env = {
-            **_BASE_ENV,
+            **_base_env(tmp_path),
             "LMER_NO_REPO": "1",
             "LMER_REPO_URL": "https://github.com/example/project.git",
         }
