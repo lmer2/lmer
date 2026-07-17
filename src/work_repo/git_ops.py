@@ -127,6 +127,45 @@ def web_url_for(path) -> Optional[str]:
         return None
 
 
+def run_dir_push_status(run_dir) -> tuple[bool, bool]:
+    """``(dirty, unpushed)`` for a run dir inside the work-repo checkout.
+
+    The minimal push-compliance predicate of the Stop-hook guard's trigger 2
+    (``hooks/run_state_guard.py`` — hooks import no project code, so the
+    check is mirrored here rather than imported from there): dirty when the
+    dir-scoped ``git status --porcelain -- .`` shows anything; unpushed when
+    commits touching the dir exist that the upstream lacks. Both commands
+    run from inside the run dir with a ``-- .`` pathspec, so a busy work
+    repo cannot trip the check on other projects' changes.
+
+    Fail-soft by contract: a missing dir, a non-git dir, no upstream, or any
+    other git problem reads as ``(False, False)`` — callers advise only on a
+    *certain* noncompliance, never on uncertainty. Never raises.
+    """
+    try:
+        run_dir = Path(run_dir)
+        if not run_dir.is_dir():
+            return (False, False)
+        rc, status = run_git_command(
+            ["status", "--porcelain", "--", "."], run_dir, check=False
+        )
+        dirty = rc == 0 and bool(status.strip())
+        rc, ahead = run_git_command(
+            ["rev-list", "--count", "@{upstream}..HEAD", "--", "."],
+            run_dir,
+            check=False,
+        )
+        unpushed = False
+        if rc == 0:
+            try:
+                unpushed = int(ahead.strip()) > 0
+            except ValueError:
+                unpushed = False
+        return (dirty, unpushed)
+    except Exception:
+        return (False, False)
+
+
 def _has_tracked_files(work_repo_path: Path, rel_path: str) -> bool:
     """True when git tracks anything under rel_path — even if it is gone
     from disk (pending deletions still need staging)."""

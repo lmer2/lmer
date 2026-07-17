@@ -351,7 +351,8 @@ class TestCmdCommitNapkin:
         """work commit must attempt the subdir-mode napkin capture (the
         work-repo commit paths never include {work_repo}/napkin/), and a
         failure there stays a warning."""
-        with patch("work_repo.cli.commit_work_changes", return_value=0), \
+        with patch("work_repo.cli._sync_masterplan_links", return_value=[]), \
+             patch("work_repo.cli.commit_work_changes", return_value=0), \
              patch("work_repo.cli.commit_napkin_if_subdir", return_value=1) as mock_subdir, \
              patch("work_repo.cli.push_napkin_if_separate", return_value=0):
             rc = cmd_commit("msg")

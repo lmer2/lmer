@@ -23,9 +23,10 @@ from .git_ops import (
     commit_work_path,
     push_napkin_if_separate,
     report_uncommitted_work_items,
+    run_dir_push_status,
     web_url_for,
 )
-from . import goals, plan_index, run_state
+from . import goals, plan_index, run_state, specs_index
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
 
@@ -372,15 +373,27 @@ Examples:
     # artifact command
     artifact_parser = subparsers.add_parser(
         "artifact",
-        help="Copy a file into the run dir and register it as a durable artifact",
+        help="Register a file as a durable run artifact (external sources are "
+             "copied in; a source already inside the run dir is linked — #103)",
     )
     artifact_parser.add_argument("name", nargs="?",
                                  help="Artifact filename (e.g. spec.md)")
     artifact_parser.add_argument("--file", "-f",
-                                 help="Source file to copy into the run dir")
+                                 help="Source file to register (copied into the "
+                                      "run dir, or linked when already there)")
     artifact_parser.add_argument(
         "--sync", action="store_true",
         help="Link masterplan bundle artifacts at the run-dir root (spec §6)",
+    )
+
+    # specs-index command (issue #101 — central specs directory)
+    specs_index_parser = subparsers.add_parser(
+        "specs-index",
+        help="List the central specs index ({host}/{project}/specs/) or rebuild it from runs/",
+    )
+    specs_index_parser.add_argument(
+        "--rebuild", action="store_true",
+        help="Rebuild the index from runs/ (backfill for specs that predate it)",
     )
 
     # session-start / session-end (hook plumbing — spec §4.4)
@@ -893,6 +906,34 @@ def _push_run_dir(
         print(f"⚠️  Warning: run-state push failed ({saved} saved locally)")
 
 
+def _advise_unpushed_phase_end(rdir: Path, old_phase: str, new_phase: str) -> None:
+    """Pushed-deliverable advisory at a phase boundary (issue #100).
+
+    A phase CHANGE ends a step, and every step must end with a pushed,
+    linkable deliverable. The durability push that accompanies the
+    transition normally guarantees that; this fires only when the run dir
+    is STILL dirty or ahead of its upstream afterwards (the push failed —
+    network down, rejected) — the same predicate the Stop-hook guard's
+    trigger 2 uses (git_ops.run_dir_push_status). Loud advisory only: the
+    exit code is untouched (fail-soft), and the run dir's web URL is
+    included when derivable so the fix ends with a citable link.
+    """
+    try:
+        dirty, unpushed = run_dir_push_status(rdir)
+        if not (dirty or unpushed):
+            return
+        print(
+            f"⚠️  phase '{old_phase}' ended with unpushed run-dir changes — "
+            f"run `work commit` so the step's deliverable is pushed and "
+            f"linkable before starting '{new_phase}'"
+        )
+        url = web_url_for(rdir)
+        if url:
+            print(f"   Run dir: {url}")
+    except Exception:
+        pass  # advisory only — never let it disturb the state mutation
+
+
 def _completion_actuals(rdir: Path) -> dict:
     """The run's actuals for the completion event (issue #99): sessions_used
     (count of `session_start` events), first_session_at (the first one's ts),
@@ -966,6 +1007,7 @@ def cmd_state(args) -> int:
 
     changed = {}
     phase_changed = False
+    old_phase = state.get("phase")  # the step the transition ends (issue #100)
     if args.phase and args.phase != state.get("phase"):
         state["phase"] = args.phase
         changed["phase"] = args.phase
@@ -1026,6 +1068,11 @@ def cmd_state(args) -> int:
     if phase_changed or args.status == "complete":
         detail = f"phase={args.phase}" if phase_changed else f"status={args.status}"
         _push_run_dir(state, detail, old_dir_name)
+    # Pushed-deliverable advisory (issue #100): checked AFTER the durability
+    # push, so it fires only when that push left the previous step's
+    # artifacts unpushed. A first phase set (no old phase) ends no step.
+    if phase_changed and old_phase:
+        _advise_unpushed_phase_end(rdir, old_phase, args.phase)
     return 0
 
 
@@ -1781,6 +1828,12 @@ def cmd_resume(as_json: bool = False) -> int:
         # e.g. the stop-hook guard's push check — need the resolved path,
         # not a slug-derived guess.
         decision["run_dir"] = str(rdir)
+        # The same consumers' human-facing half (issue #100): the guard's
+        # push nudge cites this clickable link instead of a container path.
+        # Fail-soft — no derivable URL simply omits the field.
+        run_dir_url = web_url_for(rdir)
+        if run_dir_url:
+            decision["run_dir_url"] = run_dir_url
     if as_json:
         print(json.dumps(decision, ensure_ascii=False))
     else:
@@ -1792,6 +1845,59 @@ def cmd_resume(as_json: bool = False) -> int:
             run_dir_url=web_url_for(rdir),
         ))
     return 0
+
+
+def _materialize_artifact(source: Path, dest: Path, rdir: Path) -> str | None:
+    """Materialize `source` at `dest` (link, copy+redact, or redact in place); return the relative link target when linked, else None."""
+    # Single canonical home (issue #103): a source that already lives inside
+    # the RUN DIR is the canonical file — the registered name becomes a
+    # RELATIVE symlink to it (exactly like the masterplan run-root links),
+    # never a second copy that can drift. No redaction pass on the link
+    # branch: everything under the run dir is pushed verbatim by this
+    # command's own durability push (`git add -A` on the run path), so
+    # redacting a copy of a run-dir file never protected anything. A
+    # work-repo source OUTSIDE the run dir keeps the copy+redact path: its
+    # canonical file is not staged by this command, and a file hand-written
+    # elsewhere in the checkout may never have passed through a redacting
+    # writer at all — linking it would trade a redacted copy for a raw one.
+    rdir_res = rdir.resolve()
+    canonical = source.resolve()
+    linked: str | None = None  # the relative link target when we link
+    if canonical == dest.resolve():
+        if dest.is_symlink():
+            # Re-registering an existing link (by its own path or by its
+            # canonical target): already the canonical-home shape — leave
+            # the link exactly as it is.
+            linked = os.readlink(dest)
+        else:
+            # Registering the canonical file in place: rewrite it through
+            # redaction, as the copy path always has (it IS the run-dir
+            # file that the durability push publishes).
+            dest.write_text(
+                redact_secrets(source.read_text(encoding="utf-8")),
+                encoding="utf-8",
+            )
+    elif canonical.is_file() and canonical.is_relative_to(rdir_res):
+        linked = os.path.relpath(canonical, rdir_res)
+        if dest.is_symlink() and os.readlink(dest) == linked:
+            pass  # already correct — idempotent re-registration
+        else:
+            if dest.is_symlink() or dest.exists():
+                # Replace an older copy (or re-point a stale link) — the
+                # in-run source is the one canonical home.
+                dest.unlink()
+            dest.symlink_to(linked)
+    else:
+        # External source (e.g. /tmp scratch — it would vanish with the
+        # container) or a work-repo file outside the run dir (see above):
+        # copy it in through secret redaction, exactly as before.
+        content = redact_secrets(source.read_text(encoding="utf-8"))
+        if dest.is_symlink():
+            # Never write THROUGH a stale link — that would clobber the
+            # canonical file it points at. Replace the link with the copy.
+            dest.unlink()
+        dest.write_text(content, encoding="utf-8")
+    return linked
 
 
 def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) -> int:
@@ -1842,26 +1948,80 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
     rdir, state = _require_run()
     if rdir is None:
         return 1
-    content = redact_secrets(source.read_text(encoding="utf-8"))
-    (rdir / name).write_text(content, encoding="utf-8")
+    dest = rdir / name
+    canonical = source.resolve()
+    linked = _materialize_artifact(source, dest, rdir)
     state.setdefault("artifacts", {})[Path(name).stem] = name
     run_state.write_state(rdir, state)
     run_state.append_event(rdir, "artifact_written", note=name)
-    print(f"✅ Artifact registered: {rdir / name}")
-    url = web_url_for(rdir / name)
+    if linked is not None:
+        print(f"✅ Artifact linked: {dest} → {linked}")
+    else:
+        print(f"✅ Artifact registered: {dest}")
+    url = web_url_for(canonical if linked is not None else dest)
     if url:
         print(f"   Web: {url}")
+
+    # Central specs index (issue #101): a spec-class artifact also gets a
+    # dated relative symlink under {host}/{project}/specs/. A linked
+    # registration indexes the CANONICAL file, never the run-root link
+    # (#103 — the index entry's basename stays the registered name via
+    # `alias`). Fail-soft by contract — an index problem never fails the
+    # registration.
+    spec_link = specs_index.upsert_spec_link(
+        canonical if linked is not None else dest,
+        specs_index.run_label(rdir, state),
+        alias=name,
+    )
+    if spec_link is not None:
+        print(f"   Specs index: {spec_link}")
 
     # Durability: artifacts are exactly what a dead session must not lose —
     # push the run dir now rather than waiting for session end (non-fatal).
     # Candidates (resolved + bare-slug dirs) so a rename whose own push
-    # failed still gets its old path's deletions staged here.
+    # failed still gets its old path's deletions staged here. The specs
+    # index rides along when this registration touched it.
+    stage_paths = run_state.run_rel_path_candidates()
+    if spec_link is not None and specs_index.specs_rel_path():
+        stage_paths.append(specs_index.specs_rel_path())
     rc = commit_work_path(
-        run_state.run_rel_path_candidates(),
+        stage_paths,
         f"run-state: {state['slug']} artifact {name}",
     )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (artifact saved locally)")
+    return 0
+
+
+def cmd_specs_index(rebuild: bool) -> int:
+    """Execute specs-index command (issue #101 — central specs directory).
+
+    Without flags, lists the index's entries (a directory listing IS the
+    index — v1 keeps no README/index file beside the symlinks). With
+    `--rebuild`, rebuilds the whole index from runs/ — the backfill path
+    for specs registered before the index existed. Rebuild writes only;
+    the caller batches the push with `work commit` (same discipline as
+    `work seed`).
+    """
+    if specs_index.specs_dir() is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+    if rebuild:
+        created = specs_index.rebuild()
+        if created:
+            print(f"✅ Specs index rebuilt: {len(created)} entries")
+            for link in created:
+                print(f"   {link.name} -> {os.readlink(link)}")
+            print("Run `work commit` to push the rebuilt index.")
+        else:
+            print("Specs index rebuilt: no specs found under runs/")
+        return 0
+    entries = specs_index.list_entries()
+    if not entries:
+        print("Specs index is empty (see `work specs-index --rebuild` to backfill)")
+        return 0
+    for link in entries:
+        print(f"{link.name} -> {os.readlink(link)}")
     return 0
 
 
@@ -2112,6 +2272,8 @@ def main() -> int:
         return cmd_resume(args.as_json)
     elif args.command == "artifact":
         return cmd_artifact(args.name, args.file, args.sync)
+    elif args.command == "specs-index":
+        return cmd_specs_index(args.rebuild)
     elif args.command == "seed":
         return cmd_seed(args)
     elif args.command == "session-start":

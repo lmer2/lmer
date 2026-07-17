@@ -223,6 +223,92 @@ class TestStateSet:
         assert "actuals" not in changed["data"]
 
 
+ADVISORY = "ended with unpushed run-dir changes"
+
+
+class TestPhaseEndAdvisory:
+    """Pushed-deliverable advisory at phase boundaries (issue #100)."""
+
+    @staticmethod
+    def _transition(status=(False, False), url=None):
+        """interview → execution, push predicate/URL seams injected for the
+        second (phase-changing) call."""
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["state", "set", "--phase=interview"]) == 0
+        with patch("work_repo.cli.commit_work_path", return_value=0), \
+             patch("work_repo.cli.run_dir_push_status", return_value=status), \
+             patch("work_repo.cli.web_url_for", return_value=url):
+            return _main(["state", "set", "--phase=execution"])
+
+    def test_dirty_run_dir_prints_advisory_exit_code_unchanged(self, run_env, capsys):
+        assert self._transition(status=(True, False)) == 0  # fail-soft
+        out = capsys.readouterr().out
+        assert ("⚠️  phase 'interview' ended with unpushed run-dir changes — "
+                "run `work commit` so the step's deliverable is pushed and "
+                "linkable before starting 'execution'") in out
+
+    def test_unpushed_commits_also_fire(self, run_env, capsys):
+        assert self._transition(status=(False, True)) == 0
+        assert ADVISORY in capsys.readouterr().out
+
+    def test_advisory_includes_web_url_when_derivable(self, run_env, capsys):
+        url = "https://git.example.com/agents/work/-/tree/main/runs/x"
+        assert self._transition(status=(True, False), url=url) == 0
+        assert f"Run dir: {url}" in capsys.readouterr().out
+
+    def test_no_url_line_when_underivable(self, run_env, capsys):
+        assert self._transition(status=(True, False), url=None) == 0
+        out = capsys.readouterr().out
+        assert ADVISORY in out
+        assert "Run dir:" not in out
+
+    def test_clean_transition_prints_nothing_new(self, run_env, capsys):
+        assert self._transition(status=(False, False)) == 0
+        assert ADVISORY not in capsys.readouterr().out
+
+    def test_first_phase_set_ends_no_step(self, run_env, capsys):
+        # No previous phase — nothing ended, nothing to advise about.
+        with patch("work_repo.cli.commit_work_path", return_value=0), \
+             patch("work_repo.cli.run_dir_push_status", return_value=(True, True)):
+            assert _main(["state", "set", "--phase=interview"]) == 0
+        assert ADVISORY not in capsys.readouterr().out
+
+    def test_same_phase_short_circuit_never_advises(self, run_env, capsys):
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["state", "set", "--phase=interview"]) == 0
+        with patch("work_repo.cli.commit_work_path", return_value=0), \
+             patch("work_repo.cli.run_dir_push_status", return_value=(True, True)):
+            assert _main(["state", "set", "--phase=interview"]) == 0
+        assert ADVISORY not in capsys.readouterr().out
+
+    def test_advisory_failure_is_swallowed(self, run_env, capsys):
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["state", "set", "--phase=interview"]) == 0
+        with patch("work_repo.cli.commit_work_path", return_value=0), \
+             patch("work_repo.cli.run_dir_push_status",
+                   side_effect=RuntimeError("boom")):
+            assert _main(["state", "set", "--phase=execution"]) == 0
+
+    def test_real_git_dirty_run_dir_after_failed_push(
+        self, run_env, tmp_path, monkeypatch, capsys
+    ):
+        # Integration: a real work-repo clone, the durability push forced to
+        # fail — the real predicate sees the untracked (dirty) run dir.
+        origin = tmp_path / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+                       check=True, capture_output=True)
+        clone = tmp_path / "clone"
+        subprocess.run(["git", "clone", "-q", str(origin), str(clone)],
+                       check=True, capture_output=True)
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["state", "set", "--phase=interview"]) == 0
+        with patch("work_repo.cli.commit_work_path", return_value=1):  # push fails
+            assert _main(["state", "set", "--phase=execution"]) == 0
+        out = capsys.readouterr().out
+        assert ADVISORY in out
+
+
 def _ask_question(run_env, question="sqlite or postgres?"):
     """Record a question stop on the run, the way a session would (#97)."""
     with patch("work_repo.cli.commit_work_path", return_value=0):
@@ -662,6 +748,149 @@ class TestArtifact:
         assert [e["type"] for e in events] == ["precious"]
 
 
+class TestArtifactCanonicalHome:
+    """Issue #103: a run-dir-resident source is linked, never copied twice."""
+
+    def _seed(self, run_env):
+        run_state.write_state(
+            run_env, run_state.seed_state("develop-issue-123", "develop", "t")
+        )
+
+    def test_inside_run_dir_source_linked(self, run_env, capsys):
+        self._seed(run_env)
+        bundle = run_env / "masterplan" / "mp-a"
+        bundle.mkdir(parents=True)
+        (bundle / "spec.md").write_text("# canonical\n")
+        assert _main(["artifact", "spec.md", "--file", str(bundle / "spec.md")]) == 0
+        dest = run_env / "spec.md"
+        assert dest.is_symlink()
+        assert os.readlink(dest) == "masterplan/mp-a/spec.md"
+        assert dest.read_text() == "# canonical\n"
+        # Registration/state/event behavior identical to the copy path.
+        assert run_state.load_state(run_env)["artifacts"]["spec"] == "spec.md"
+        events = run_state.read_events(run_env, last_n=0)
+        assert any(e["type"] == "artifact_written" and e["note"] == "spec.md" for e in events)
+        out = capsys.readouterr().out
+        assert "✅ Artifact linked" in out
+        assert "masterplan/mp-a/spec.md" in out
+
+    def test_linked_source_not_re_redacted(self, run_env, monkeypatch):
+        # The run dir is pushed verbatim either way; linking must not
+        # rewrite the canonical file through redaction.
+        monkeypatch.setenv("FAKE_API_TOKEN", "supersecretvalue123")
+        self._seed(run_env)
+        (run_env / "draft-spec.md").write_text("token is supersecretvalue123\n")
+        assert _main(["artifact", "spec.md", "--file", str(run_env / "draft-spec.md")]) == 0
+        assert (run_env / "spec.md").is_symlink()
+        assert (run_env / "draft-spec.md").read_text() == "token is supersecretvalue123\n"
+
+    def test_work_repo_source_outside_run_dir_still_copied(
+        self, run_env, tmp_path, monkeypatch
+    ):
+        # In-repo-but-outside-run-dir sources keep the redacting copy path:
+        # the registration push never stages the outside file, and a
+        # hand-written one may never have passed a redacting writer.
+        monkeypatch.setenv("FAKE_API_TOKEN", "supersecretvalue123")
+        src = tmp_path / "notes.md"  # work-repo ROOT — outside the run dir
+        src.write_text("token is supersecretvalue123\n")
+        assert _main(["artifact", "spec.md", "--file", str(src)]) == 0
+        dest = run_env / "spec.md"
+        assert not dest.is_symlink()
+        assert "supersecretvalue123" not in dest.read_text()
+
+    def test_outside_work_repo_source_copied(self, run_env, tmp_path, capsys):
+        src = tmp_path.parent / "scratch.md"  # outside the work repo entirely
+        src.write_text("external\n")
+        assert _main(["artifact", "spec.md", "--file", str(src)]) == 0
+        dest = run_env / "spec.md"
+        assert not dest.is_symlink()
+        assert dest.read_text() == "external\n"
+        assert "✅ Artifact registered" in capsys.readouterr().out
+
+    def test_reregistration_replaces_copy_with_link(self, run_env, tmp_path):
+        outside = tmp_path.parent / "outside.md"
+        outside.write_text("v1\n")
+        assert _main(["artifact", "spec.md", "--file", str(outside)]) == 0
+        assert not (run_env / "spec.md").is_symlink()
+        (run_env / "canonical-spec.md").write_text("v2\n")
+        assert _main(
+            ["artifact", "spec.md", "--file", str(run_env / "canonical-spec.md")]
+        ) == 0
+        dest = run_env / "spec.md"
+        assert dest.is_symlink()
+        assert os.readlink(dest) == "canonical-spec.md"
+        assert dest.read_text() == "v2\n"
+
+    def test_reregistration_replaces_link_with_copy(self, run_env, tmp_path):
+        self._seed(run_env)
+        canonical = run_env / "canonical-spec.md"
+        canonical.write_text("keep me\n")
+        assert _main(["artifact", "spec.md", "--file", str(canonical)]) == 0
+        assert (run_env / "spec.md").is_symlink()
+        outside = tmp_path.parent / "outside.md"
+        outside.write_text("external v2\n")
+        assert _main(["artifact", "spec.md", "--file", str(outside)]) == 0
+        dest = run_env / "spec.md"
+        assert not dest.is_symlink()
+        assert dest.read_text() == "external v2\n"
+        # The copy replaced the link — it never wrote THROUGH it.
+        assert canonical.read_text() == "keep me\n"
+
+    def test_link_reregistration_idempotent(self, run_env):
+        self._seed(run_env)
+        (run_env / "canonical-spec.md").write_text("x\n")
+        for _ in range(2):
+            assert _main(
+                ["artifact", "spec.md", "--file", str(run_env / "canonical-spec.md")]
+            ) == 0
+        dest = run_env / "spec.md"
+        assert dest.is_symlink()
+        assert os.readlink(dest) == "canonical-spec.md"
+
+    def test_stale_link_repointed(self, run_env):
+        self._seed(run_env)
+        (run_env / "old-spec.md").write_text("old\n")
+        (run_env / "new-spec.md").write_text("new\n")
+        (run_env / "spec.md").symlink_to("old-spec.md")
+        assert _main(["artifact", "spec.md", "--file", str(run_env / "new-spec.md")]) == 0
+        assert os.readlink(run_env / "spec.md") == "new-spec.md"
+
+    def test_in_place_registration_of_canonical_file(self, run_env, capsys):
+        self._seed(run_env)
+        dest = run_env / "spec.md"
+        dest.write_text("# already home\n")
+        assert _main(["artifact", "spec.md", "--file", str(dest)]) == 0
+        assert not dest.is_symlink()
+        assert dest.read_text() == "# already home\n"
+        assert run_state.load_state(run_env)["artifacts"]["spec"] == "spec.md"
+        events = run_state.read_events(run_env, last_n=0)
+        assert any(e["type"] == "artifact_written" and e["note"] == "spec.md" for e in events)
+        assert "✅ Artifact registered" in capsys.readouterr().out
+
+    def test_in_place_registration_redacts(self, run_env, monkeypatch):
+        # Registering the canonical file in place keeps today's
+        # redact-rewrite behavior (it IS the published run-dir file).
+        monkeypatch.setenv("FAKE_API_TOKEN", "supersecretvalue123")
+        self._seed(run_env)
+        dest = run_env / "retro.md"
+        dest.write_text("token is supersecretvalue123\n")
+        assert _main(["artifact", "retro.md", "--file", str(dest)]) == 0
+        assert "supersecretvalue123" not in dest.read_text()
+
+    def test_in_place_reregistration_of_existing_link(self, run_env, capsys):
+        # Re-registering a masterplan-style run-root link by its own path
+        # leaves the link untouched (and by its target's path likewise).
+        self._seed(run_env)
+        bundle = run_env / "masterplan" / "mp-a"
+        bundle.mkdir(parents=True)
+        (bundle / "spec.md").write_text("mp\n")
+        (run_env / "spec.md").symlink_to("masterplan/mp-a/spec.md")
+        assert _main(["artifact", "spec.md", "--file", str(run_env / "spec.md")]) == 0
+        assert os.readlink(run_env / "spec.md") == "masterplan/mp-a/spec.md"
+        assert run_state.load_state(run_env)["artifacts"]["spec"] == "spec.md"
+        assert "✅ Artifact linked" in capsys.readouterr().out
+
+
 class TestSessionStart:
     def test_no_context_soft_exit(self, capsys):
         assert _main(["session-start"]) == 0
@@ -963,8 +1192,13 @@ class TestArtifactProactivePush:
         src.write_text("# spec content here")
         with patch("work_repo.cli.commit_work_path", return_value=0) as push:
             assert _main(["artifact", "spec.md", "--file", str(src)]) == 0
+        # spec.md is spec-class, so its specs-index entry (issue #101)
+        # rides along with the run dir in the durability push.
         push.assert_called_once_with(
-            ["git.example.com/org/repo/runs/develop-issue-123"],
+            [
+                "git.example.com/org/repo/runs/develop-issue-123",
+                "git.example.com/org/repo/specs",
+            ],
             "run-state: develop-issue-123 artifact spec.md",
         )
 

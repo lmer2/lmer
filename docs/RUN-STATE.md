@@ -530,6 +530,16 @@ event, even when the value is identical to what's already recorded — and
 `--status=complete` triggers a work-repo push each time, so an idempotent
 retry of the close-out command re-pushes (harmless, but not silent).
 
+**Phase-transition advisory (issue #100):** a phase *change* is a step
+boundary, and every step must end with a pushed, linkable deliverable. The
+transition's own durability push normally guarantees that; when the run dir
+is still dirty or ahead of its upstream afterwards (the push failed),
+`work state set --phase=…` prints a loud ⚠️ advisory naming the phase that
+just ended and pointing at `work commit`, including the run dir's web URL
+when derivable. Advisory only — the exit code is unchanged (fail-soft). The
+Stop-hook guard's push-before-stop nudge cites the same web URL when
+`work resume --json` exposes it (the additive `run_dir_url` field).
+
 `work goal` (existing verb): when a run context exists
 (`LMER_REPO_HOST`/`LMER_REPO_PROJECT` set), setting a goal additionally
 records it into `state.yaml` and appends a `goal_set` event; the legacy

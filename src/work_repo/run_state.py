@@ -37,6 +37,7 @@ from typing import Optional
 
 import yaml
 
+from . import specs_index
 from .utils import _work_repo_base, redact_secrets, sanitize_task_target
 
 SCHEMA_VERSION = 1
@@ -908,9 +909,14 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
     skipped — this never raises, and a run without a masterplan/ dir is
     untouched (no state write).
 
+    Bundle specs also land in the project-level specs index (issue #101),
+    linked to the BUNDLE file — the one canonical target — never to the
+    run-root convenience symlink made here.
+
     Returns the list of link names now present at the run-dir root.
     """
     linked: list[str] = []
+    spec_files: list[tuple[Path, str]] = []  # (bundle file, run-root link name)
     try:
         mp_dir = rdir / MASTERPLAN_DIR
         if not mp_dir.is_dir():
@@ -924,6 +930,8 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
                 if not (bundle / name).is_file():
                     continue
                 link_name = f"{bundle.name}-{name}" if prefixed else name
+                if specs_index.is_spec_artifact(name):
+                    spec_files.append((bundle / name, link_name))
                 target = os.path.join(MASTERPLAN_DIR, bundle.name, name)
                 link_path = rdir / link_name
                 try:
@@ -966,6 +974,17 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
                         write_state(rdir, state)
             except Exception as exc:
                 print(f"⚠️  masterplan artifact sync: could not register in state: {exc}")
+        # Specs index (issue #101): each bundle spec gets a dated entry
+        # under {host}/{project}/specs/ pointing at the bundle file — the
+        # canonical target, never the run-root symlink made above. The
+        # entry basename is the run-root link name so multi-bundle specs
+        # stay distinct. upsert_spec_link is fail-soft on its own; the
+        # label lookup uses the best-effort sibling reader, so neither a
+        # corrupt state nor an index problem can fail the sync.
+        for spec_file, link_name in spec_files:
+            specs_index.upsert_spec_link(
+                spec_file, specs_index.run_label(rdir), alias=link_name
+            )
     except Exception as exc:
         print(f"⚠️  masterplan artifact sync skipped: {exc}")
     return linked

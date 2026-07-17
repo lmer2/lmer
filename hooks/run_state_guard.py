@@ -31,7 +31,9 @@ fires on EVERY non-compliant stop — capped at 3 per session via a counter
 file, so an environment where pushing genuinely fails (network down) cannot
 nag forever. The sentinel (once) and the counter (cap 3) live in separate
 ``/tmp`` files keyed by ``LMER_SESSION_ID`` so the two cadences never
-interfere.
+interfere. When ``work resume --json`` exposes the run dir's web URL
+(``run_dir_url``, issue #100 — derived server-side, hooks import no project
+code), the block message ends with that clickable deliverable link.
 
 Trigger 3 — ledger after commits (issue #89). If this session landed
 project-repo commits (``gate`` events carrying a ``commit_sha``, stamped by
@@ -237,6 +239,22 @@ def derive_run_dir(
     return base
 
 
+def derive_run_dir_url(decision: dict | None) -> str | None:
+    """The run dir's web URL, when ``work resume --json`` exposed one.
+
+    ``run_dir_url`` (issue #100) is derived server-side by the work CLI —
+    hooks import no project code — with credentials already stripped there.
+    Returns None when the field is absent/blank; the trigger-2 nudge then
+    falls back to the path-only message exactly as before.
+    """
+    if not isinstance(decision, dict):
+        return None
+    url = decision.get("run_dir_url")
+    if isinstance(url, str) and url.strip():
+        return url
+    return None
+
+
 def ledger_nudge_needed(events: list | None, session: str) -> bool:
     """
     Trigger-3 decision, given the run's parsed events and the session id.
@@ -291,15 +309,26 @@ def build_state_reason(missing: list[str]) -> str:
     )
 
 
-def build_push_reason(dirty: bool, unpushed: bool, run_dir: str | None = None) -> str:
-    """Trigger-2 block reason: the `work commit` nudge."""
+def build_push_reason(
+    dirty: bool,
+    unpushed: bool,
+    run_dir: str | None = None,
+    run_dir_url: str | None = None,
+) -> str:
+    """Trigger-2 block reason: the `work commit` nudge.
+
+    When ``work resume --json`` exposed the run dir's web URL (issue #100 —
+    the URL is derived server-side because hooks import no project code),
+    the nudge ends with the clickable link the pushed deliverable will live
+    at, instead of leaving only a container path.
+    """
     problems = []
     if dirty:
         problems.append("uncommitted changes")
     if unpushed:
         problems.append("local commits its upstream lacks")
     where = f" ({run_dir})" if run_dir else ""
-    return (
+    reason = (
         f"Push-before-stop check: the run dir{where} has "
         f"{' and '.join(problems)}. The reviewer works through the work repo "
         "— an unpushed artifact is invisible to the reviewer. Run `work commit` "
@@ -307,6 +336,9 @@ def build_push_reason(dirty: bool, unpushed: bool, run_dir: str | None = None) -
         "then stop again. (Capped at 3 nudges per session in case pushing "
         "genuinely cannot succeed.)"
     )
+    if run_dir_url:
+        reason += f"\nOnce pushed, the deliverable is linkable at: {run_dir_url}"
+    return reason
 
 
 def evaluate(
@@ -318,6 +350,7 @@ def evaluate(
     run_dir_unpushed: bool,
     push_nudge_count: int,
     run_dir: str | None = None,
+    run_dir_url: str | None = None,
     push_cap: int = PUSH_NUDGE_CAP,
     ledger_needed: bool = False,
     ledger_already_nudged: bool = True,
@@ -347,7 +380,9 @@ def evaluate(
 
     push_reason = None
     if (run_dir_dirty or run_dir_unpushed) and push_nudge_count < push_cap:
-        push_reason = build_push_reason(run_dir_dirty, run_dir_unpushed, run_dir)
+        push_reason = build_push_reason(
+            run_dir_dirty, run_dir_unpushed, run_dir, run_dir_url
+        )
 
     return {
         "state_reason": state_reason,
@@ -552,6 +587,7 @@ def main(argv: list[str] | None = None) -> int:
     # Trigger 2 inputs.
     work_repo_path = os.environ.get("LMER_WORK_REPO_PATH", "").strip() or DEFAULT_WORK_REPO_PATH
     run_dir = derive_run_dir(decision, host, project, work_repo_path)
+    run_dir_url = derive_run_dir_url(decision)
     dirty, unpushed = (False, False)
     if run_dir:
         try:
@@ -584,6 +620,7 @@ def main(argv: list[str] | None = None) -> int:
         run_dir_unpushed=unpushed,
         push_nudge_count=push_count,
         run_dir=run_dir,
+        run_dir_url=run_dir_url,
         ledger_needed=ledger_needed,
         ledger_already_nudged=ledger_already_nudged,
     )

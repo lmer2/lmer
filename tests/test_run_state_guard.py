@@ -19,6 +19,7 @@ from hooks.run_state_guard import (
     build_push_reason,
     build_state_reason,
     derive_run_dir,
+    derive_run_dir_url,
     detect_activity,
     env_flag,
     evaluate,
@@ -220,6 +221,23 @@ class TestDeriveRunDir:
         assert derive_run_dir(_decision(), host, project, "/w") is None
 
 
+class TestDeriveRunDirUrl:
+    def test_url_exposed_by_decision(self):
+        url = "https://git.example.com/agents/work/-/tree/main/runs/x"
+        assert derive_run_dir_url(_decision(run_dir_url=url)) == url
+
+    @pytest.mark.parametrize("decision", [
+        _decision(),                    # field absent (older work CLI)
+        _decision(run_dir_url=""),      # blank
+        _decision(run_dir_url="   "),   # whitespace only
+        _decision(run_dir_url=123),     # wrong type
+        None,                           # no decision at all
+        "not a dict",
+    ])
+    def test_absent_or_malformed_returns_none(self, decision):
+        assert derive_run_dir_url(decision) is None
+
+
 # ---- build_state_reason / build_push_reason --------------------------------------
 
 class TestBuildReasons:
@@ -251,6 +269,17 @@ class TestBuildReasons:
         reason = build_push_reason(True, True, "/w/runs/foo")
         assert "uncommitted changes and local commits" in reason
         assert "/w/runs/foo" in reason
+
+    def test_push_reason_ends_with_web_url_when_present(self):
+        url = "https://git.example.com/agents/work/-/tree/main/runs/foo"
+        reason = build_push_reason(True, False, "/w/runs/foo", url)
+        assert reason.endswith(url)
+        assert "linkable at" in reason
+
+    def test_push_reason_has_no_url_line_without_one(self):
+        reason = build_push_reason(True, False, "/w/runs/foo")
+        assert "linkable at" not in reason
+        assert "https://" not in reason
 
 
 # ---- evaluate --------------------------------------------------------------------
@@ -322,6 +351,11 @@ class TestEvaluatePushTrigger:
     def test_run_dir_included_in_reason(self):
         verdict = self._evaluate(dirty=True, run_dir="/w/runs/foo")
         assert "/w/runs/foo" in verdict["push_reason"]
+
+    def test_run_dir_url_included_in_reason(self):
+        url = "https://git.example.com/agents/work/-/tree/main/runs/foo"
+        verdict = self._evaluate(dirty=True, run_dir="/w/runs/foo", run_dir_url=url)
+        assert url in verdict["push_reason"]
 
     def test_fires_even_when_state_already_nudged(self):
         verdict = evaluate(
@@ -722,6 +756,29 @@ class TestMainPushTrigger:
         r = _run_hook({"cwd": str(tmp_path)}, self._env(tmp_path, session, work_repo))
         assert r.returncode == 0
         assert r.stdout.strip() == ""
+
+    def test_block_message_carries_run_dir_url_when_resume_exposes_it(
+        self, tmp_path, session
+    ):
+        # Issue #100: `work resume --json` derives the URL server-side; the
+        # guard just relays it as the deliverable's clickable link.
+        url = "https://git.example.com/agents/work/-/tree/main/runs/foo"
+        work_repo, run_dir = _make_work_repo(tmp_path)
+        (run_dir / "scratch.md").write_text("uncommitted\n")
+        env = self._env(tmp_path, session, work_repo,
+                        decision=_decision(run_dir_url=url))
+        r = _run_hook({"cwd": str(tmp_path)}, env)
+        out = json.loads(r.stdout)
+        assert out["decision"] == "block"
+        assert url in out["reason"]
+
+    def test_block_message_has_no_url_when_resume_omits_it(self, tmp_path, session):
+        work_repo, run_dir = _make_work_repo(tmp_path)
+        (run_dir / "scratch.md").write_text("uncommitted\n")
+        r = _run_hook({"cwd": str(tmp_path)}, self._env(tmp_path, session, work_repo))
+        out = json.loads(r.stdout)
+        assert out["decision"] == "block"
+        assert "https://" not in out["reason"]
 
     def test_both_triggers_combine_into_one_block(self, tmp_path, session):
         ws = _make_workspace(tmp_path, active=True)
