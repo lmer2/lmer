@@ -44,6 +44,14 @@ VERIFY_TAIL_BYTES = 64 * 1024
 WORKSPACE_ENV_FILE = Path("/tmp/lmer-workspace-env.sh")
 
 
+#: Overridable directory for LMER_ANSWER consume-once markers (mirrors the
+#: patchable ``slack_chat.registry.REGISTRY_DIR`` convention). ``None`` means
+#: /tmp — container-lifetime scoped, exactly like the env var itself. Tests
+#: point it at a temp dir so markers never leak between runs. Consumed by
+#: :func:`_answer_marker_path` (near ``cmd_session_start``).
+ANSWER_MARKER_DIR: str | None = None
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -2088,13 +2096,6 @@ def cmd_seed(args) -> int:
     print(f"✅ Run seeded: {rdir}")
     print("   Not pushed — run `work commit` to publish it.")
     return 0
-
-
-#: Overridable directory for LMER_ANSWER consume-once markers (mirrors the
-#: patchable ``slack_chat.registry.REGISTRY_DIR`` convention). ``None`` means
-#: /tmp — container-lifetime scoped, exactly like the env var itself. Tests
-#: point it at a temp dir so markers never leak between runs.
-ANSWER_MARKER_DIR: str | None = None
 
 
 def _answer_marker_path(answer: str) -> Path:
