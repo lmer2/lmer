@@ -4,8 +4,11 @@ These helpers decide whether a test that shells out to the real `lmer`
 script (which in turn runs a container) is able to run in the current
 environment. Tests that require a live container runtime or a working
 lmer venv should gate themselves with the `requires_container` /
-`requires_lmer_venv` marks exported here.
+`requires_lmer_venv` marks exported here; tests whose assertions need the
+lmer run itself to succeed (not just start) also need `requires_work_repo`,
+since the host-side CLI refuses to run without LMER_WORK_REPO configured.
 """
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -58,4 +61,30 @@ requires_container = pytest.mark.skipif(
 requires_lmer_venv = pytest.mark.skipif(
     not has_lmer_venv(),
     reason="lmer requires a working virtual environment",
+)
+
+def has_work_repo_configured() -> bool:
+    """Check LMER_WORK_REPO the way the host CLI resolves it.
+
+    Process env first, then ``~/.lmer/.env`` (the state-dir .env the CLI
+    always loads). cwd ``.env`` files deliberately don't count: the
+    integration helpers run lmer from a temp cwd, so one would never load.
+    """
+    if os.environ.get("LMER_WORK_REPO"):
+        return True
+    try:
+        from dotenv import dotenv_values
+
+        from lmer_cli.runtime import lmer_state_dir
+
+        env_file = lmer_state_dir() / ".env"
+        return bool(dotenv_values(dotenv_path=str(env_file)).get("LMER_WORK_REPO"))
+    except Exception:
+        return False
+
+
+requires_work_repo = pytest.mark.skipif(
+    not has_work_repo_configured(),
+    reason="LMER_WORK_REPO not set in env or ~/.lmer/.env "
+    "(the lmer CLI requires it host-side)",
 )
