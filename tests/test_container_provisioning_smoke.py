@@ -12,9 +12,11 @@ container filesystem by shelling out to the `lmer` binary with
   can import pytest inside the container.
 
 The whole module is gated with ``requires_container`` /
-``requires_lmer_venv`` so it skips cleanly without a runtime socket. Test B
-additionally skips when no napkin repo URL is present in the environment
-rather than hard-failing on missing credentials.
+``requires_lmer_venv`` / ``requires_work_repo`` so it skips cleanly without
+a runtime socket or a configured work repo (the host CLI refuses to run
+without LMER_WORK_REPO, e.g. on CI runners). Test B additionally skips when
+no napkin repo URL is present in the environment rather than hard-failing
+on missing credentials.
 """
 import os
 import subprocess
@@ -23,7 +25,11 @@ from pathlib import Path
 
 import pytest
 
-from tests._lmer_runtime import requires_container, requires_lmer_venv
+from tests._lmer_runtime import (
+    requires_container,
+    requires_lmer_venv,
+    requires_work_repo,
+)
 
 LMER = Path(__file__).parent.parent / "lmer"
 
@@ -44,6 +50,7 @@ def _run_lmer_exec(inner_cmd: str, extra_env: dict | None = None):
 
 @requires_container
 @requires_lmer_venv
+@requires_work_repo
 class TestContainerProvisioningSmoke:
     """Smoke-test the two provisioning fixes in a real container."""
 
