@@ -18,6 +18,7 @@ This project provides a FIPS 140-2 compliant development environment using Oracl
   - [SELinux Support](#selinux-support)
 - [Container Usage](#container-usage)
   - [Development Workflow](#development-workflow)
+  - [Status Line](#status-line)
   - [Volume Mounts](#volume-mounts)
   - [User ID and Permissions](#user-id-and-permissions)
     - [Build-Time User ID Handling](#build-time-user-id-handling)
@@ -195,6 +196,10 @@ hashlib.md5(b'test').hexdigest()
    make fips-check # Verify FIPS mode in the container
    ```
 
+### Status Line
+
+Every Claude Code session in an lmer container gets a status line automatically — no user setup. The provisioned `settings.json` points `statusLine` at `claude-status` (on `PATH` via `/Agents/global/bin`), which delegates to the stdlib-only renderer `hooks/statusline.py`. It reads Claude Code's JSON status payload from stdin and prints one line of the form `group/project @ feature/x | develop | ctx 42%`: the repo (`LMER_REPO_PROJECT`, falling back to the git toplevel's basename), the current branch (`git branch --show-current` at the session's cwd, short timeout), the lmer task (`LMER_TASK`), and the percentage of the context window used (from the payload's `context_window` fields). Which segments render — and in what order — is configurable via `LMER_STATUSLINE` (issue #121), a comma-separated segment list; beyond the four defaults it offers `model`, `cost`, `5h`/`7d` (subscription usage-limit windows), `effort`, `duration`, and `lines` — see the `LMER_STATUSLINE` entry in [LMER-CLI.md](./LMER-CLI.md#lmer-specific-environment-variables). Segments whose inputs are unavailable are simply omitted — the payload schema evolves and the renderer degrades instead of erroring — and the 📦 (container) / ⚡ (danger zone) indicators are appended. No network or expensive calls are made on render.
+
 ### Volume Mounts
 
 - **Project Files**: `/home/developer/Agents/global` (live editing)
@@ -312,6 +317,8 @@ Set via the host environment, `~/.lmer/.env`, or a project-local `.env` file:
 - `GITLAB_TOKEN_*`, `GITLAB_TOKEN` - GitLab tokens (host-specific via sanitized hostname suffix, plus generic fallback)
 - `GH_TOKEN`, `GITHUB_TOKEN` - GitHub tokens (consulted for `github.com`, `*.github.com`, `*.ghe.com` hosts)
 - `CLAUDE_API_KEY` - Claude API key (if needed)
+- `LMER_HARNESS` - Agent harness the session runs (`claude` default; `codex`, `pi` — all baked into the image; see [HARNESSES.md](./HARNESSES.md))
+- `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, ... - Provider API keys for non-claude harnesses (forwarded from `.env` like any other variable)
 
 ## Building for Production
 

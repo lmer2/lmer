@@ -1,6 +1,9 @@
 """Shared fixtures for tests."""
+import ast
+import inspect
 import os
 import subprocess
+import textwrap
 from pathlib import Path
 import pytest
 
@@ -17,6 +20,25 @@ def strip_lmer_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith("LMER_"):
             monkeypatch.delenv(key, raising=False)
+
+
+def ast_body_lines(fn):
+    """Unparse a function's body, minus its docstring, one statement per line.
+
+    Shared mechanic of the mirror-guard tests (hooks/start.py deliberately
+    does not import lmer_cli, so a few functions are mirrored rather than
+    shared): comparing two functions' ast_body_lines asserts their bodies are
+    semantically identical while ignoring docstrings and formatting.
+    """
+    src = textwrap.dedent(inspect.getsource(fn))
+    tree = ast.parse(src)
+    func = tree.body[0]
+    non_doc = [
+        node
+        for node in func.body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant))
+    ]
+    return [ast.unparse(node) for node in non_doc]
 
 
 def _work_repo_status_lines(work_repo_path):

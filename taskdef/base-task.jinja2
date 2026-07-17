@@ -1,0 +1,164 @@
+{#-
+  base-task.jinja2 — the shared spine every lmer taskdef extends.
+
+  A taskdef body contains only what makes it that task: it
+  `{% extends 'base-task.jinja2' %}` and overrides the blocks below.
+  Every block is individually overridable; `task_phases` is the required
+  per-task middle — a body that does not override it renders an empty
+  work section, so always provide it.
+
+  Block interface (ordered as rendered):
+    intro            — REQUIRED: H1 title + what the task is
+    service_mode     — service-mode partial (rarely overridden)
+    run_state        — durable run-state contract (rarely overridden)
+    branch_setup     — Phase -1 branch rules; suppress for read-only tasks
+    self_dev         — self-development mode rules (conditional partial)
+    phase0_tools     — Phase 0 tool orientation; contains provider_tooling
+    provider_tooling — nested: provider CLI guidance (github/gitlab)
+    project_info     — the mandatory `work read-project-info` contract
+    secrets          — secrets-in-logs policy (extend with `{{ super() }}`)
+    clean_gate       — Phase 0.5 clean-state gate-check
+    task_phases      — REQUIRED: the task's own phases/workflow
+    changelog        — changelog maintenance partial
+    phasic           — phasic work-mode partial
+    delivery         — After Pushing: MR/PR creation
+    close_out        — closing out the run
+    do_not           — the DO-NOT list; add rules via nested do_not_extra
+    do_not_extra     — nested: task-specific DO-NOT additions
+
+  Renaming or removing a block here is a schema bump (Jinja silently drops
+  child blocks whose name no longer exists in the parent) — see
+  docs/TASKDEFS.md, "Block-interface stability policy".
+-#}
+{% block intro %}{% endblock %}
+
+{% block service_mode %}{% include 'service-mode.jinja2' %}{% endblock %}
+
+{% block run_state %}{% include 'run-state.jinja2' ignore missing %}{% endblock %}
+
+{% block branch_setup %}
+## Phase -1: Branch Setup
+
+Record the phase: `work state set --phase=branch-setup`
+
+**NEVER develop directly on `main` (or the default branch).**
+
+If a branch or MR/PR was specified, you may have been checked out to a synthetic branch like `mr-<id>` / `pr-<id>`. Find the real source branch:
+
+{% if is_github %}```bash
+github-review <project> <pr_id> --info --json | jq -r .source_branch
+```
+{% else %}```bash
+gitlab-review <project> <mr_id> --host <hostname> --info
+```
+
+Look for the `Source:` field, then check out that branch:
+{% endif %}
+
+```bash
+git fetch origin
+git checkout <source-branch>
+```
+
+If a specific branch was named as the base to fork from (e.g., "fork from `develop`", "branch off `release/2.0`"), note that branch — it is the natural target branch for any merge request you create later.
+
+If no branch was specified, create a new feature branch before making any changes:
+
+```bash
+git checkout -b <branch-name>
+```
+
+Use a descriptive branch name based on the task (e.g., `fix/login-timeout`, `feature/add-dark-mode`, `refactor/auth-module`).
+
+Either way, verify you are on the correct branch and not on `main`:
+
+```bash
+git branch --show-current
+```
+{% endblock %}
+
+{% block self_dev %}{% include 'self-dev.jinja2' %}{% endblock %}
+
+{% block phase0_tools %}
+## Phase 0: Understand Your Tools
+
+- [ ] Run `bash /Agents/global/hooks/rgr.sh` to read and understand the global rules you must follow.
+- [ ] Run `bash /Agents/global/hooks/work-view-docs.sh` to familiarize yourself with the work tool for logging progress and retrieving project-specific information.
+
+### Provider tooling
+
+{% block provider_tooling %}{% include 'provider-tooling.jinja2' %}{% endblock %}
+
+Use the `work` command to log your actions and retrieve any project-specific information. At the end, use `work commit` to ensure your logs get pushed upstream.
+{% endblock %}
+
+{% block project_info %}
+MANDATORY: Before starting any task work, you MUST run `work read-project-info` to retrieve project-specific context for the current project. This context may include instructions, conventions, setup notes, known gotchas, or other information you need to do the work correctly. If project-specific instructions or conventions are provided, they MUST be followed in addition to these general task instructions. Prefer using the `work` command to retrieve this context rather than manually browsing the work repository directory — the CLI is the intended interface and should be your first choice. Skipping this check is not acceptable.
+{% endblock %}
+
+{% block secrets %}
+## Secrets in logs and reports
+
+NEVER include API tokens, passwords, or other secret values in `work log` messages, `work report` files, or any other output that gets committed to the work repository. The `work` CLI will automatically redact detected secrets, but do not rely on that as a primary safeguard — treat all credentials as sensitive and omit them from your output.
+{% endblock %}
+
+{% block clean_gate %}
+## Phase 0.5: Gate check on clean state
+
+Before making any changes, run `gate-check` to verify that the test suite passes on the untouched codebase. This confirms both that the test environment works and that there are no pre-existing failures that could be mistaken for regressions later.
+
+If gate-check fails, do NOT proceed with development. Report the failure to the user and let them decide whether to continue.
+{% endblock %}
+
+{% block task_phases %}{% endblock %}
+
+{% block changelog %}{% include 'changelog.jinja2' %}{% endblock %}
+
+{% block phasic %}{% include 'phasic.jinja2' %}{% endblock %}
+
+{% block delivery %}
+## After Pushing
+
+Record the phase: `work state set --phase=delivery`
+
+If you have pushed your branch and no merge/pull request exists yet, create one.
+
+When choosing the target branch:
+- If you forked from a specific branch (e.g., `develop`, `prep-release`), use **that branch** as the target — it is the natural merge target. This rule has NO exceptions by change type: release version bumps, changelog rolls, docs, and hotfixes all target the fork base like everything else.
+- Do NOT infer the target from repository history (e.g. old release branches merged straight to `main`) — history records superseded processes; the current process is what the rules and project info say.
+- If no specific base branch was given, default to `main`.
+
+{% if is_github %}```bash
+gh pr create --repo <project> --base <target-branch> --head <your-branch> --title "Your PR title" --body-file <path>
+```
+
+Run `gh pr create --help` if you need to review the available options.
+{% else %}```bash
+gitlab-review <project> --host <hostname> --create-mr --source-branch <your-branch> --target-branch <target-branch> --title "Your MR title"
+```
+
+Run `bash /Agents/global/hooks/gitlab-review-docs.sh` if you need to review the available options.
+{% endif %}
+{% endblock %}
+
+{% block close_out %}
+## Closing out the run
+
+When the work is delivered (MR created, or the task is otherwise complete):
+
+1. Write a short retrospective — what was done, key decisions, gotchas for
+   next time — and persist it: `work artifact retro.md --file <path>`.
+2. Mark the run complete: `work state set --status=complete --stop-reason=complete`.
+3. Run `work commit` as usual so logs and run state push together.
+{% endblock %}
+
+{% block do_not %}
+## DO NOT
+
+- HARD RULE: DO NOT make assumptions about requirements without asking
+- HARD RULE: DO NOT push to any repository without explicit permission
+- HARD RULE: DO NOT commit without explicit user approval or request
+- HARD RULE: DO NOT develop on `main` — always create a new branch first
+- HARD RULE: DO NOT add `Co-Authored-By`, `Signed-off-by`, or any self-reference tags to commit messages
+{% block do_not_extra %}{% endblock %}
+{% endblock %}

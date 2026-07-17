@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": 1,
+      "wave": 0,
+      "description": "Implement **Task 1: Host-side URL credentialing helper (tokens.py)** of the napkin/taskdef plan. The COMPLETE task \u2014 exact code, exact tests, step-by-step TDD \u2014 is in `docs/masterplan/napkin-taskdef-repos/plan.md` under the heading `### Task 1:`. Read that section AND the `## Global Constraints` section at the top of plan.md first, then implement every Step in order. Summary: add a `dedicated_env` keyword to `_get_gitlab_token` (checked first) and a new `_credential_repo_url(url, *, dedicated_env=None)` that bakes an oauth2 token into an SSH or HTTPS git URL, reusing `_prefer_ssh`/`urlparse`. All file paths in the plan are relative to your current working directory (the repo root). CRITICAL deviations from the plan text: (a) DO NOT run any `git add`/`git commit` step \u2014 the orchestrator commits after you finish; (b) DO NOT run the `make test` full-suite step \u2014 run ONLY the targeted verify command for this task; (c) stay strictly within your declared files. When done, `tests/test_lmer_cli_token_injection.py` must contain the new test classes and `src/lmer_cli/tokens.py` the new code, and the verify command must pass on real output.",
+      "files": [
+        "src/lmer_cli/tokens.py",
+        "tests/test_lmer_cli_token_injection.py"
+      ],
+      "verify_commands": [
+        ".venv/bin/python -m pytest tests/test_lmer_cli_token_injection.py -q"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": [
+        "43-62"
+      ]
+    },
+    {
+      "id": 2,
+      "wave": 1,
+      "description": "Implement **Task 2: Host CLI \u2014 resolve repos, compute napkin path, declare env vars (cli.py)** of the napkin/taskdef plan. The COMPLETE task \u2014 exact code, exact tests, step-by-step TDD \u2014 is in `docs/masterplan/napkin-taskdef-repos/plan.md` under the heading `### Task 2:`. Read that section AND the `## Global Constraints` section first, then implement every Step in order. Summary: import `_credential_repo_url`, add a module-level `_resolve_napkin_path(napkin_repo_url, work_repo_path)`, credential the optional napkin/taskdef URLs host-side in `main()`, compute the napkin path, append `/taskdef` to `container_taskdef_paths`, and declare `LMER_NAPKIN_REPO`/`LMER_NAPKIN_PATH`/`LMER_TASKDEF_REPO`/`LMER_TASKDEF_REF` in the inline env dict with the two `*_TOKEN` vars seeded `None` (so the .env merge cannot leak them). This task depends on Task 1's `_credential_repo_url` already existing. Insertion points cite line numbers in the plan \u2014 find the matching anchor code rather than trusting the exact line. All paths are relative to your cwd (repo root). CRITICAL: (a) NO git add/commit; (b) NO `make test` full-suite step \u2014 run ONLY the targeted verify; (c) stay within declared files. Verify must pass on real output.",
+      "files": [
+        "src/lmer_cli/cli.py",
+        "tests/test_lmer_cli_env_sources.py"
+      ],
+      "verify_commands": [
+        ".venv/bin/python -m pytest tests/test_lmer_cli_env_sources.py -q"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": [
+        "64-133"
+      ]
+    },
+    {
+      "id": 3,
+      "wave": 1,
+      "description": "Implement **Task 3: Container entrypoint \u2014 clone repos and create symlinks (clone_and_exec.py)** of the napkin/taskdef plan. The COMPLETE task \u2014 exact code, exact tests, step-by-step TDD \u2014 is in `docs/masterplan/napkin-taskdef-repos/plan.md` under the heading `### Task 3:`. Read that section AND the `## Global Constraints` section first, then implement every Step in order. Summary: add three stdlib-only helpers to the standalone `clone_and_exec.py` \u2014 `clone_aux_repos`, `link_into_home`, `setup_napkin_and_links` \u2014 and call them in `main()` after the `provision_documentation(...)` block and before the `# Dispatch` comment. Create the NEW test file `tests/test_clone_and_exec_aux_repos.py` exactly as written. The module must NOT import from `lmer_cli`/`work_repo` (stdlib only; `shutil` is already imported). All paths relative to your cwd (repo root). CRITICAL: (a) NO git add/commit; (b) NO `make test` full-suite step \u2014 run ONLY the targeted verify; (c) stay within declared files. Verify must pass on real output.",
+      "files": [
+        "src/lmer_cli/container/clone_and_exec.py",
+        "tests/test_clone_and_exec_aux_repos.py"
+      ],
+      "verify_commands": [
+        ".venv/bin/python -m pytest tests/test_clone_and_exec_aux_repos.py -q"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": [
+        "108-149"
+      ]
+    },
+    {
+      "id": 4,
+      "wave": 1,
+      "description": "Implement **Task 4: Napkin push in separate-repo mode (work_repo)** of the napkin/taskdef plan. The COMPLETE task \u2014 exact code, exact tests, step-by-step TDD \u2014 is in `docs/masterplan/napkin-taskdef-repos/plan.md` under the heading `### Task 4:`. Read that section AND the `## Global Constraints` section first, then implement every Step in order. Summary: add `push_napkin_if_separate(commit_message=None)` to `src/work_repo/git_ops.py` (fetch\u2192pull\u2192add\u2192commit\u2192push against the napkin repo, but only when `LMER_NAPKIN_PATH` is a git repo OUTSIDE `LMER_WORK_REPO_PATH`; best-effort), then wire it non-fatally into `cmd_commit` in `src/work_repo/cli.py` (extend the `from .git_ops import ...` line). Add the new test classes to `tests/test_work_repo_git_ops.py` and `tests/test_work_repo_cli.py`. All paths relative to your cwd (repo root). CRITICAL: (a) NO git add/commit; (b) NO `make test` full-suite step \u2014 run ONLY the targeted verify; (c) stay within declared files. Verify must pass on real output.",
+      "files": [
+        "src/work_repo/git_ops.py",
+        "src/work_repo/cli.py",
+        "tests/test_work_repo_git_ops.py",
+        "tests/test_work_repo_cli.py"
+      ],
+      "verify_commands": [
+        ".venv/bin/python -m pytest tests/test_work_repo_git_ops.py tests/test_work_repo_cli.py -q"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": [
+        "74-86",
+        "151-156"
+      ]
+    },
+    {
+      "id": 5,
+      "wave": 0,
+      "description": "Implement **Task 5: Document the new env vars (docs/LMER-CLI.md)** of the napkin/taskdef plan. The COMPLETE task \u2014 exact markdown bullets to add \u2014 is in `docs/masterplan/napkin-taskdef-repos/plan.md` under the heading `### Task 5:`. Read that section, then insert the six env-var bullets (`LMER_NAPKIN_REPO`, `LMER_NAPKIN_TOKEN`, `LMER_NAPKIN_PATH`, `LMER_TASKDEF_REPO`, `LMER_TASKDEF_TOKEN`, `LMER_TASKDEF_REF`) verbatim into `docs/LMER-CLI.md`, immediately after the `LMER_WORK_REPO_PATH` bullet in the `#### LMER-Specific Environment Variables` section. Documentation-only; no code, no tests. All paths relative to your cwd (repo root). CRITICAL: (a) NO git add/commit; (b) stay within the single declared file. Verify must pass on real output.",
+      "files": [
+        "docs/LMER-CLI.md"
+      ],
+      "verify_commands": [
+        "grep -q LMER_NAPKIN_REPO docs/LMER-CLI.md && grep -q LMER_TASKDEF_REF docs/LMER-CLI.md && grep -q LMER_NAPKIN_PATH docs/LMER-CLI.md"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": [
+        "157-163"
+      ]
+    },
+    {
+      "id": 6,
+      "wave": 0,
+      "description": "Implement **Task 6: New agent-facing napkin guide (lmer-docs/NAPKIN.md)** of the napkin/taskdef plan. The COMPLETE file content is in `docs/masterplan/napkin-taskdef-repos/plan.md` under the heading `### Task 6:`. Read that section, then create the NEW file `lmer-docs/NAPKIN.md` with exactly the content shown in the plan's Step 1 code block. Documentation-only; no code, no tests. All paths relative to your cwd (repo root). CRITICAL: (a) NO git add/commit; (b) create only the single declared file. Verify must pass on real output.",
+      "files": [
+        "lmer-docs/NAPKIN.md"
+      ],
+      "verify_commands": [
+        "test -f lmer-docs/NAPKIN.md && grep -q LMER_NAPKIN_PATH lmer-docs/NAPKIN.md && grep -q 'work commit' lmer-docs/NAPKIN.md"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": [
+        "165-174"
+      ]
+    }
+  ]
+}

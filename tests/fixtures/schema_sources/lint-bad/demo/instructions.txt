@@ -1,0 +1,3 @@
+{% extends 'base-task.jinja2' %}
+{% block intro %}# Lint-bad Task{% endblock %}
+{% block task_phasez %}A typo'd block name Jinja would silently drop.{% endblock %}

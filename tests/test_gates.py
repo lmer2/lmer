@@ -133,14 +133,29 @@ class TestGateSystem:
         assert "On main branch" in result.message
         assert not result.is_critical
 
+    @staticmethod
+    def _is_probe_call(cmd):
+        """True if `cmd` is an `_interpreter_can_import` probe (`-c 'import ...'`)."""
+        return "-c" in cmd and any(
+            isinstance(a, str) and a.startswith("import ") for a in cmd
+        )
+
+    @staticmethod
+    def _is_pytest_run(cmd):
+        """True if `cmd` is the actual pytest invocation (`-m pytest`)."""
+        return "-m" in cmd and "pytest" in cmd
+
     @patch('subprocess.run')
     def test_check_tests_pass(self, mock_run):
         """Test running tests when they pass"""
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="5 passed in 0.5s",
-            stderr=""
-        )
+        # The probe (`python -c 'import pytest'`) and the pytest run both hit
+        # subprocess.run; distinguish them via side_effect.
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="5 passed in 0.5s", stderr="")
+
+        mock_run.side_effect = side_effect
 
         result = self.gate.check_tests()
         assert result.status == CheckStatus.PASSED
@@ -152,11 +167,16 @@ class TestGateSystem:
     @patch('subprocess.run')
     def test_check_tests_fail(self, mock_run):
         """Test running tests when they fail"""
-        mock_run.return_value = MagicMock(
-            returncode=1,
-            stdout="FAILED tests/test_main.py::test_function",
-            stderr=""
-        )
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(
+                returncode=1,
+                stdout="FAILED tests/test_main.py::test_function",
+                stderr="",
+            )
+
+        mock_run.side_effect = side_effect
 
         result = self.gate.check_tests()
         assert result.status == CheckStatus.FAILED
@@ -165,6 +185,62 @@ class TestGateSystem:
         # from the log without re-running the suite.
         assert result.full_output is not None
         assert "FAILED tests/test_main.py::test_function" in result.full_output
+
+    @patch('subprocess.run')
+    def test_check_tests_uses_venv_python_when_importable(self, mock_run, tmp_path):
+        """Venv python that can import pytest is used for the pytest run."""
+        (tmp_path / "tests").mkdir()
+        venv_python = tmp_path / ".venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("#!/bin/sh\n")
+        self.gate.project_root = tmp_path
+
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                # Any interpreter probed reports pytest importable.
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="3 passed in 0.1s", stderr="")
+
+        mock_run.side_effect = side_effect
+
+        result = self.gate.check_tests()
+        assert result.status == CheckStatus.PASSED
+
+        pytest_calls = [
+            c for c in mock_run.call_args_list if self._is_pytest_run(c.args[0])
+        ]
+        assert len(pytest_calls) == 1
+        assert pytest_calls[0].args[0][0] == str(venv_python)
+
+    @patch('subprocess.run')
+    def test_check_tests_falls_back_when_venv_cannot_import(self, mock_run, tmp_path):
+        """Venv python that cannot import pytest falls back to a PATH interpreter."""
+        (tmp_path / "tests").mkdir()
+        venv_python = tmp_path / ".venv" / "bin" / "python"
+        venv_python.parent.mkdir(parents=True)
+        venv_python.write_text("#!/bin/sh\n")
+        self.gate.project_root = tmp_path
+
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                # The venv python cannot import pytest; PATH interpreters can.
+                if cmd[0] == str(venv_python):
+                    return MagicMock(returncode=1, stdout="", stderr="")
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="3 passed in 0.1s", stderr="")
+
+        mock_run.side_effect = side_effect
+
+        result = self.gate.check_tests()
+        assert result.status == CheckStatus.PASSED
+
+        pytest_calls = [
+            c for c in mock_run.call_args_list if self._is_pytest_run(c.args[0])
+        ]
+        assert len(pytest_calls) == 1
+        chosen = pytest_calls[0].args[0][0]
+        assert chosen != str(venv_python)
+        assert chosen in ("python3", "python")
 
     @patch('subprocess.run')
     def test_check_precommit_pass(self, mock_run):
@@ -530,7 +606,8 @@ class TestGateSystem:
         for attr in (
             "check_git_status", "check_staged_files", "check_branch",
             "check_precommit", "check_secrets", "check_code_quality",
-            "check_documentation", "check_changelog", "check_permissions",
+            "check_documentation", "check_changelog",
+            "check_deliverable_formats", "check_permissions",
         ):
             setattr(self.gate, attr, MagicMock(__name__=attr, return_value=passed))
         self.gate.check_tests = MagicMock(__name__="check_tests", return_value=passed)
@@ -554,7 +631,7 @@ class TestGateSystem:
             "check_git_status", "check_staged_files", "check_branch",
             "check_tests", "check_precommit", "check_secrets",
             "check_code_quality", "check_documentation", "check_changelog",
-            "check_permissions",
+            "check_deliverable_formats", "check_permissions",
         ):
             setattr(self.gate, attr, MagicMock(__name__=attr, return_value=passed))
 
@@ -744,7 +821,7 @@ class TestWriteLogFile:
             "check_git_status", "check_staged_files", "check_branch",
             "check_tests", "check_precommit", "check_secrets",
             "check_code_quality", "check_documentation", "check_changelog",
-            "check_permissions",
+            "check_deliverable_formats", "check_permissions",
         ):
             setattr(self.gate, attr, MagicMock(__name__=attr, return_value=passed))
 
@@ -875,6 +952,90 @@ class TestCheckChangelog:
         result = self.gate.check_changelog()
         assert result.status == CheckStatus.WARNING
         assert "Changelog not updated" in result.message
+
+
+class TestCheckDeliverableFormats:
+    """check_deliverable_formats(): spec-class deliverables are Markdown (#102)."""
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+
+    @patch('subprocess.run')
+    def test_staged_spec_docx_warns(self, mock_run):
+        """A staged spec.docx gets a warning naming the file and the md rule"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/spec.docx", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+        assert not result.is_critical
+        assert any("docs/spec.docx" in d for d in result.details)
+        assert any("Markdown (.md)" in d for d in result.details)
+
+    @patch('subprocess.run')
+    def test_staged_spec_md_passes(self, mock_run):
+        """A staged spec.md is the contract — no warning"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/spec.md", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.PASSED
+
+    @patch('subprocess.run')
+    def test_staged_report_pdf_warns(self, mock_run):
+        """A staged report.pdf matches the spec-class naming and warns"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="reports/q2-report.pdf", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+        assert not result.is_critical
+        assert any("reports/q2-report.pdf" in d for d in result.details)
+
+    @patch('subprocess.run')
+    def test_unrelated_pdf_passes(self, mock_run):
+        """Binary files outside spec/plan/report naming are out of scope"""
+        mock_run.return_value = MagicMock(
+            returncode=0,
+            stdout="docs/vendor-manual.pdf\nfixtures/inspect.pdf",
+            stderr=""
+        )
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.PASSED
+
+    @patch('subprocess.run')
+    def test_naming_matched_in_directory_component(self, mock_run):
+        """A spec-named directory flags binary documents inside it"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/specs/api.odt", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+
+    @patch('subprocess.run')
+    def test_leading_word_boundary_only(self, mock_run):
+        """'spec' inside a word (inspect) does not match; a leading match (specification) does"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/inspection.docx", stderr="")
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.PASSED
+
+        mock_run.return_value = MagicMock(returncode=0, stdout="docs/specification.docx", stderr="")
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+
+    @patch('subprocess.run')
+    def test_nothing_staged_passes(self, mock_run):
+        """An empty index has nothing to flag"""
+        mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.PASSED
+
+    @patch('subprocess.run')
+    def test_git_failure_is_noncritical_warning(self, mock_run):
+        """A git failure degrades to a non-critical warning, never a hard fail"""
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="boom")
+
+        result = self.gate.check_deliverable_formats()
+        assert result.status == CheckStatus.WARNING
+        assert not result.is_critical
 
 
 class TestGateCommands:

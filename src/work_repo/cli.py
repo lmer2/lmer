@@ -8,6 +8,7 @@ import hashlib
 import os
 import json
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -17,11 +18,15 @@ import yaml
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import (
+    commit_napkin_if_subdir,
     commit_work_changes,
     commit_work_path,
+    push_napkin_if_separate,
     report_uncommitted_work_items,
+    run_dir_push_status,
+    web_url_for,
 )
-from . import goals, plan_index, run_state
+from . import goals, plan_index, run_state, specs_index
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
 
@@ -31,6 +36,20 @@ from .utils import redact_secrets, task_target_dir
 # sha256 of exactly these bytes, so a receipt can be checked after the fact
 # without the work repo ever storing the output itself.
 VERIFY_TAIL_BYTES = 64 * 1024
+
+
+# Where setup-workspace writes the routing env vars for the session to source.
+# /tmp is container-local and session-scoped — never committed and never mounted
+# from the host — so it can't leak into the host's ~/.lmer or into other sessions.
+WORKSPACE_ENV_FILE = Path("/tmp/lmer-workspace-env.sh")
+
+
+#: Overridable directory for LMER_ANSWER consume-once markers (mirrors the
+#: patchable ``slack_chat.registry.REGISTRY_DIR`` convention). ``None`` means
+#: /tmp — container-lifetime scoped, exactly like the env var itself. Tests
+#: point it at a temp dir so markers never leak between runs. Consumed by
+#: :func:`_answer_marker_path` (near ``cmd_session_start``).
+ANSWER_MARKER_DIR: str | None = None
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -72,6 +91,9 @@ Examples:
 
   # Display current goal
   work goal
+
+  # Bootstrap /workspace for dev work in a chat-mode session
+  work setup-workspace https://git.example.com/group/project/-/issues/42
         """,
     )
 
@@ -155,6 +177,14 @@ Examples:
         nargs="?",
         help="Description of current goal (optional - if omitted, displays current goal)",
     )
+    goal_parser.add_argument(
+        "--estimate-sessions", dest="estimate_sessions", type=int, metavar="N",
+        help="Estimated sessions until solved, recorded with the goal (issue #99)",
+    )
+    goal_parser.add_argument(
+        "--estimate-time", dest="estimate_time", metavar="STR",
+        help='Estimated time until solved — free-form human string ("4h", "2d"), never parsed',
+    )
 
     # memory command
     memory_parser = subparsers.add_parser(
@@ -176,6 +206,26 @@ Examples:
         "--message",
         "-m",
         help="Commit message (defaults to auto-generated)",
+    )
+
+    # setup-workspace command
+    setup_ws_parser = subparsers.add_parser(
+        "setup-workspace",
+        help="Clone + provision /workspace for a task target (chat-mode dev bootstrap)",
+    )
+    setup_ws_parser.add_argument(
+        "target",
+        help="Task target: an MR/PR/issue/work_items URL, or a plain repository URL",
+    )
+    setup_ws_parser.add_argument(
+        "--task",
+        default="develop",
+        help="Task type for the work-repo layout / LMER_TASK (default: develop)",
+    )
+    setup_ws_parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="Skip dependency sync (uv sync); only clone + provision docs",
     )
 
     # state command (run-state kernel — spec §4.3)
@@ -200,6 +250,20 @@ Examples:
     state_parser.add_argument(
         "--critical-error", dest="critical_error",
         help='JSON object {"summary": ..., "detail": ...}; required with --stop-reason=critical_error',
+    )
+    state_parser.add_argument(
+        "--question",
+        help="The blocking question's text; only valid with (or after) --stop-reason=question",
+    )
+
+    # answer command (resume-on-answer — issue #98)
+    answer_parser = subparsers.add_parser(
+        "answer",
+        help="Record the human's answer to the run's recorded open question",
+    )
+    answer_parser.add_argument(
+        "text",
+        help="The answer's text (clears open_question and the question stop)",
     )
 
     # name command (run naming — spec §1)
@@ -317,15 +381,27 @@ Examples:
     # artifact command
     artifact_parser = subparsers.add_parser(
         "artifact",
-        help="Copy a file into the run dir and register it as a durable artifact",
+        help="Register a file as a durable run artifact (external sources are "
+             "copied in; a source already inside the run dir is linked — #103)",
     )
     artifact_parser.add_argument("name", nargs="?",
                                  help="Artifact filename (e.g. spec.md)")
     artifact_parser.add_argument("--file", "-f",
-                                 help="Source file to copy into the run dir")
+                                 help="Source file to register (copied into the "
+                                      "run dir, or linked when already there)")
     artifact_parser.add_argument(
         "--sync", action="store_true",
         help="Link masterplan bundle artifacts at the run-dir root (spec §6)",
+    )
+
+    # specs-index command (issue #101 — central specs directory)
+    specs_index_parser = subparsers.add_parser(
+        "specs-index",
+        help="List the central specs index ({host}/{project}/specs/) or rebuild it from runs/",
+    )
+    specs_index_parser.add_argument(
+        "--rebuild", action="store_true",
+        help="Rebuild the index from runs/ (backfill for specs that predate it)",
     )
 
     # session-start / session-end (hook plumbing — spec §4.4)
@@ -417,8 +493,12 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
                 if legacy_dir is not None and (legacy_dir / "log.yaml").exists():
                     log_file = legacy_dir / "log.yaml"
 
-            # Display log file location
+            # Display log file location, with its web URL when derivable
+            # (issue #104 — user-facing paths carry the clickable form).
             print(f"Log file: {log_file}")
+            url = web_url_for(log_file)
+            if url:
+                print(f"Web: {url}")
             print()
 
             return render_truncated_log(log_file)
@@ -480,22 +560,32 @@ def _sync_masterplan_links() -> list[str]:
 
 def cmd_commit(message: str | None) -> int:
     """
-    Execute commit command.
+    Execute commit command (work repo, plus napkin in either mode).
 
     Args:
         message: Optional commit message
 
     Returns:
-        Exit code
+        Exit code (the work-repo commit result; napkin capture is best-effort)
     """
     # Self-maintain masterplan artifact links before staging (spec §6) so
     # every push carries the run-dir-root links. Fail-soft: never changes
     # the commit's behavior or exit code.
     _sync_masterplan_links()
     rc = commit_work_changes(message)
+    # Napkin capture is best-effort in both modes and must never block the
+    # worklog commit: a failure is logged but does not change the exit code.
+    # Subdir mode needs its own staging pass — commit_work_changes stages only
+    # the task-target and run-dir paths, never {work_repo}/napkin/.
+    if commit_napkin_if_subdir(message) != 0:
+        print("⚠️  napkin subdir commit failed (continuing); work-repo commit was unaffected", file=sys.stderr)
+    if push_napkin_if_separate(message) != 0:
+        print("⚠️  napkin push failed (continuing); work-repo commit was unaffected", file=sys.stderr)
     # Flag any stray untracked/unstaged files left behind — `work commit`
     # stages only the run dir, so a new info file elsewhere would otherwise
-    # go unnoticed (issue #85). Fail-soft: the commit's exit code stands.
+    # go unnoticed (issue #85). Runs after the napkin subdir commit so files
+    # that pass just captured aren't flagged as strays. Fail-soft: the
+    # commit's exit code stands.
     report_uncommitted_work_items()
     return rc
 
@@ -552,13 +642,20 @@ def cmd_report(file_path: str) -> int:
         target_file.write_text(redacted_content, encoding="utf-8")
 
         print(f"✅ Copied report to: {target_file}")
+        url = web_url_for(target_file)
+        if url:
+            print(f"   Web: {url}")
         return 0
     except Exception as e:
         print(f"❌ Error copying report: {e}", file=sys.stderr)
         return 1
 
 
-def cmd_goal(description: str | None) -> int:
+def cmd_goal(
+    description: str | None,
+    estimate_sessions: int | None = None,
+    estimate_time: str | None = None,
+) -> int:
     """
     Execute goal command.
 
@@ -568,11 +665,27 @@ def cmd_goal(description: str | None) -> int:
     Args:
         description: Optional goal description. If provided, sets the goal.
                     If None, displays the current goal.
+        estimate_sessions: Optional sessions-until-solved estimate (issue #99).
+        estimate_time: Optional time-until-solved estimate — a free-form
+                    human string ("4h", "2d"), stored verbatim, never parsed.
 
     Returns:
         Exit code
     """
     try:
+        # Estimate flags (issue #99) only make sense while recording a goal,
+        # and land only in the run state below — validate them up front.
+        has_estimate = estimate_sessions is not None or estimate_time is not None
+        if has_estimate and not description:
+            print("❌ --estimate-sessions/--estimate-time require a goal description", file=sys.stderr)
+            return 1
+        if estimate_sessions is not None and estimate_sessions < 1:
+            print("❌ --estimate-sessions must be a positive integer", file=sys.stderr)
+            return 1
+        if estimate_time is not None and not estimate_time.strip():
+            print("❌ --estimate-time requires a non-empty string", file=sys.stderr)
+            return 1
+
         # Use a temporary file in /tmp for storing the goal
         # This persists across CLI invocations but is temporary (not permanent)
         goal_file = Path("/tmp") / "lmer_work_goal.txt"
@@ -581,17 +694,30 @@ def cmd_goal(description: str | None) -> int:
             # Set the goal
             goal_file.write_text(description, encoding="utf-8")
             print(f"✅ Goal set: {description}")
+            estimate = None
+            if has_estimate:
+                estimate = {"sessions": estimate_sessions, "time": estimate_time}
+                print(f"✅ Estimate: {run_state.format_estimate(estimate)}")
 
             # Also record the goal durably in the run state when a run
             # context exists (spec §5.5). Fails soft — the legacy goal file
             # above is already written, and a state-layer problem must not
-            # break `work goal`.
+            # break `work goal`. The estimate (issue #99) rides along in
+            # state.estimate and the goal_set event's data; a goal without
+            # one keeps today's behavior byte-for-byte (no data payload).
             try:
                 if run_state.run_dir() is not None:
                     rdir, state = run_state.ensure_run()
                     state["goal"] = description
+                    # The estimate belongs to the goal it was recorded with:
+                    # a new goal without estimate flags must not inherit the
+                    # previous goal's estimate into the resume brief.
+                    state["estimate"] = estimate
                     run_state.write_state(rdir, state)
-                    run_state.append_event(rdir, "goal_set", note=description)
+                    run_state.append_event(
+                        rdir, "goal_set", note=description,
+                        data={"estimate": estimate} if estimate else None,
+                    )
             except Exception:
                 pass
 
@@ -630,6 +756,122 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
     else:
         parser.print_help()
         return 1
+
+
+def _write_workspace_env(result: dict) -> Path:
+    """Write the derived LMER_* routing vars to a sourceable shell file.
+
+    These four vars are what ``lmer <verb> <target>`` sets at container launch;
+    a mid-session ``setup-workspace`` can't inject them into future shells, so
+    they are persisted here for the session to ``source``. None are secret
+    (host/project/task/target only — no tokens).
+    """
+    lines = [
+        "# lmer workspace routing env — written by `work setup-workspace`.",
+        "# Source this so `work log`/`commit`/`report` and gate-check's",
+        "# work-repo-aware features can find this project:",
+        f"#   source {WORKSPACE_ENV_FILE}",
+        f"export LMER_REPO_HOST={shlex.quote(result['host'])}",
+        f"export LMER_REPO_PROJECT={shlex.quote(result['project'])}",
+        f"export LMER_TASK={shlex.quote(result['task'])}",
+        f"export LMER_TASK_TARGET={shlex.quote(result['task_target'])}",
+    ]
+    WORKSPACE_ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return WORKSPACE_ENV_FILE
+
+
+def cmd_setup_workspace(target: str, task: str, sync_deps: bool) -> int:
+    """Execute setup-workspace command.
+
+    Bootstraps /workspace for a session that needs to do real dev work on a repo
+    it was not started with (the chat-mode case in issue #69): clone, work-repo
+    dirs, documentation provisioning, and dependency sync — the same setup a
+    repo-targeted ``lmer`` session gets at container startup. Then writes the
+    routing env vars for the session to source. Hard-errors if /workspace is
+    already set up.
+
+    Args:
+        target: Task target (resource URL or plain repo URL).
+        task: Task type for the work-repo layout / LMER_TASK.
+        sync_deps: Run dependency sync when True.
+
+    Returns:
+        Exit code (0 success, 1 on any setup failure including already-set-up).
+    """
+    # Lazy import: only setup-workspace needs lmer_cli. Plain `work log`/`commit`
+    # invocations should not pay to import the lmer_cli package.
+    try:
+        from lmer_cli.container.clone_and_exec import (
+            setup_workspace,
+            WorkspaceExistsError,
+        )
+    except ImportError as e:
+        print(f"❌ Could not load workspace setup support: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        result = setup_workspace(target, task=task, sync_deps=sync_deps)
+    except WorkspaceExistsError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        print(
+            "   Remove the existing /workspace contents first if you really "
+            "want to re-create it.",
+            file=sys.stderr,
+        )
+        return 1
+    except ValueError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"❌ Workspace setup failed: {e}", file=sys.stderr)
+        return 1
+
+    # Restore this project's persisted agent memory now that setup_workspace has
+    # set LMER_REPO_HOST/LMER_REPO_PROJECT in the environment. At normal container
+    # startup this is done by claude-runner via `work memory restore` *after* the
+    # entrypoint clones the repo; the chat->dev pivot never runs that runner step,
+    # so do it here. No-op unless LMER_PERSIST_AGENT_MEMORY is enabled; best-effort
+    # (the workspace is already set up, so a restore failure must not fail setup).
+    try:
+        restore_memory()
+    except Exception as e:
+        print(f"⚠️  Agent memory restore failed: {e}", file=sys.stderr)
+
+    env_file = _write_workspace_env(result)
+
+    provisioned = result.get("provisioned") or []
+    provisioned_str = (
+        ", ".join(provisioned) if provisioned else "none (project ships its own)"
+    )
+
+    print(f"✅ /workspace set up for {result['host']}/{result['project']}")
+    print(f"   Branch:            {result.get('branch') or '(detached/unknown)'}")
+    print(f"   Provisioned docs:  {provisioned_str}")
+    print(f"   Dependencies:      {result.get('deps_status')}")
+    print(f"   Task:              {result['task']}")
+    print()
+    print(
+        "Routing vars for `work log`/`commit`/`report` and gate-check were "
+        f"written to {env_file}."
+    )
+    print("Load them into your shell with:")
+    print(f"   source {env_file}")
+    print("Or export them directly:")
+    print(f"   export LMER_REPO_HOST={shlex.quote(result['host'])}")
+    print(f"   export LMER_REPO_PROJECT={shlex.quote(result['project'])}")
+    print(f"   export LMER_TASK={shlex.quote(result['task'])}")
+    print(f"   export LMER_TASK_TARGET={shlex.quote(result['task_target'])}")
+
+    if str(result.get("deps_status", "")).startswith("FAILED"):
+        # The workspace IS set up, so this is a warning rather than a failure
+        # (mirrors container startup treating sync/provisioning as best-effort).
+        print()
+        print(
+            "⚠️  Dependency sync failed — see the output above. The workspace "
+            "is set up, but gate-check tests may fail until deps install."
+        )
+
+    return 0
 
 
 def _require_run() -> tuple[Path, dict] | tuple[None, None]:
@@ -674,6 +916,57 @@ def _push_run_dir(
         print(f"⚠️  Warning: run-state push failed ({saved} saved locally)")
 
 
+def _advise_unpushed_phase_end(rdir: Path, old_phase: str, new_phase: str) -> None:
+    """Pushed-deliverable advisory at a phase boundary (issue #100).
+
+    A phase CHANGE ends a step, and every step must end with a pushed,
+    linkable deliverable. The durability push that accompanies the
+    transition normally guarantees that; this fires only when the run dir
+    is STILL dirty or ahead of its upstream afterwards (the push failed —
+    network down, rejected) — the same predicate the Stop-hook guard's
+    trigger 2 uses (git_ops.run_dir_push_status). Loud advisory only: the
+    exit code is untouched (fail-soft), and the run dir's web URL is
+    included when derivable so the fix ends with a citable link.
+    """
+    try:
+        dirty, unpushed = run_dir_push_status(rdir)
+        if not (dirty or unpushed):
+            return
+        print(
+            f"⚠️  phase '{old_phase}' ended with unpushed run-dir changes — "
+            f"run `work commit` so the step's deliverable is pushed and "
+            f"linkable before starting '{new_phase}'"
+        )
+        url = web_url_for(rdir)
+        if url:
+            print(f"   Run dir: {url}")
+    except Exception:
+        pass  # advisory only — never let it disturb the state mutation
+
+
+def _completion_actuals(rdir: Path) -> dict:
+    """The run's actuals for the completion event (issue #99): sessions_used
+    (count of `session_start` events), first_session_at (the first one's ts),
+    and the completion stamp — computed by the tool process, never typed by
+    the model. Fail-soft: an events read problem nulls the event-derived
+    fields rather than blocking completion."""
+    sessions_used = None
+    first_session_at = None
+    try:
+        events = run_state.read_events(rdir, last_n=0)
+        sessions_used = run_state.count_session_starts(events)
+        first_session_at = next(
+            (e.get("ts") for e in events if e.get("type") == "session_start"), None
+        )
+    except Exception:
+        pass
+    return {
+        "sessions_used": sessions_used,
+        "first_session_at": first_session_at,
+        "completed_at": run_state.utc_now_iso(),
+    }
+
+
 def cmd_state(args) -> int:
     """Execute state / state set commands."""
     if args.action != "set":
@@ -693,11 +986,14 @@ def cmd_state(args) -> int:
         return 0
 
     # --- mutation path ---
-    if not any([args.phase, args.stop_reason, args.status, args.critical_error]):
-        print("❌ state set requires at least one of --phase/--stop-reason/--status", file=sys.stderr)
+    if not any([args.phase, args.stop_reason, args.status, args.critical_error, args.question]):
+        print("❌ state set requires at least one of --phase/--stop-reason/--status/--question", file=sys.stderr)
         return 1
     if args.stop_reason == "critical_error" and not args.critical_error:
         print("❌ --stop-reason=critical_error requires --critical-error JSON", file=sys.stderr)
+        return 1
+    if args.question and args.stop_reason not in (None, "question"):
+        print("❌ --question is only valid with --stop-reason=question", file=sys.stderr)
         return 1
     critical_error = None
     if args.critical_error:
@@ -713,9 +1009,15 @@ def cmd_state(args) -> int:
     rdir, state = _require_run()
     if rdir is None:
         return 1
+    # The "after" form (issue #97): a bare `--question` is only valid while
+    # the recorded stop reason is already `question`.
+    if args.question and not args.stop_reason and state.get("stop_reason") != "question":
+        print("❌ --question requires --stop-reason=question (pass both, or set it first)", file=sys.stderr)
+        return 1
 
     changed = {}
     phase_changed = False
+    old_phase = state.get("phase")  # the step the transition ends (issue #100)
     if args.phase and args.phase != state.get("phase"):
         state["phase"] = args.phase
         changed["phase"] = args.phase
@@ -725,6 +1027,14 @@ def cmd_state(args) -> int:
         changed["stop_reason"] = state["stop_reason"]
         if state["stop_reason"] != "critical_error":
             state["critical_error"] = None
+        # A stale question must not survive ANY new stop — even a fresh
+        # question-stop starts blank; `--question` below re-sets the text.
+        state["open_question"] = None
+    if args.question:
+        # Agent-typed free text landing in the (shared) work repo — redact
+        # like the other writers (log, ledger title/note, artifacts) do.
+        state["open_question"] = redact_secrets(args.question)
+        changed["open_question"] = state["open_question"]
     if critical_error is not None:
         state["critical_error"] = critical_error
         changed["critical_error"] = True
@@ -756,13 +1066,59 @@ def cmd_state(args) -> int:
     if phase_changed:
         run_state.append_event(rdir, "phase", note=args.phase)
     if set(changed) - {"phase"}:
-        run_state.append_event(rdir, "state_changed", data=changed)
+        event_data = dict(changed)
+        if args.status == "complete":
+            # Estimate-vs-actual raw data (issue #99): the completion event
+            # carries the actuals — no new state field needed.
+            event_data["actuals"] = _completion_actuals(rdir)
+        run_state.append_event(rdir, "state_changed", data=event_data)
     print(f"✅ State updated: {changed}")
 
     # Durability (spec §4.4): push on phase transitions and completion.
     if phase_changed or args.status == "complete":
         detail = f"phase={args.phase}" if phase_changed else f"status={args.status}"
         _push_run_dir(state, detail, old_dir_name)
+    # Pushed-deliverable advisory (issue #100): checked AFTER the durability
+    # push, so it fires only when that push left the previous step's
+    # artifacts unpushed. A first phase set (no old phase) ends no step.
+    if phase_changed and old_phase:
+        _advise_unpushed_phase_end(rdir, old_phase, args.phase)
+    return 0
+
+
+def cmd_answer(text: str) -> int:
+    """Execute answer command (issue #98 — resume-on-answer).
+
+    Applies a human's answer to the run's recorded open question through
+    run_state.answer_question (appends `question_answered`, clears
+    `open_question` + `stop_reason`; status untouched), then pushes the run
+    dir — the answer is exactly the record a fresh session resumes from, so
+    it must not stay local. Mutating-verb rules: no run context and no open
+    question recorded are errors (exit 1). No auto-seed: an answer can only
+    land on a run that already asked something.
+    """
+    if not text.strip():
+        print("❌ answer requires a non-empty text", file=sys.stderr)
+        return 1
+    rdir = run_state.run_dir()
+    if rdir is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+    try:
+        state = run_state.load_state(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    if state is None or not state.get("open_question"):
+        print("❌ No open question recorded — nothing to answer", file=sys.stderr)
+        return 1
+    try:
+        run_state.answer_question(rdir, state, text)
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    print("✅ Question answered — open question and question stop cleared")
+    _push_run_dir(state, "question answered", saved="answer")
     return 0
 
 
@@ -1461,7 +1817,9 @@ def cmd_resume(as_json: bool = False) -> int:
         return 0
     try:
         state = run_state.load_state(rdir)
-        events = run_state.read_events(rdir, last_n=5)
+        # All events, not just the brief's tail: the sessions-used count
+        # (issue #99) needs the whole log; the brief still shows the last 5.
+        all_events = run_state.read_events(rdir, last_n=0)
     except (run_state.RunStateError, OSError) as exc:
         print(f"⚠️  Run state unreadable — falling back to worklog. ({exc})")
         return 0
@@ -1472,18 +1830,84 @@ def cmd_resume(as_json: bool = False) -> int:
         ledger = None
         print(f"⚠️  ledger unreadable — brief omits it. ({exc})", file=sys.stderr)
     decision = run_state.decide(
-        state, events, run_state.current_session_id(), ledger=ledger
+        state, all_events[-5:], run_state.current_session_id(), ledger=ledger,
+        sessions_used=run_state.count_session_starts(all_events),
     )
     if decision.get("kind") == "run":
         # Dirs are renamed by the lifecycle (issue #87 D2), so consumers —
         # e.g. the stop-hook guard's push check — need the resolved path,
         # not a slug-derived guess.
         decision["run_dir"] = str(rdir)
+        # The same consumers' human-facing half (issue #100): the guard's
+        # push nudge cites this clickable link instead of a container path.
+        # Fail-soft — no derivable URL simply omits the field.
+        run_dir_url = web_url_for(rdir)
+        if run_dir_url:
+            decision["run_dir_url"] = run_dir_url
     if as_json:
         print(json.dumps(decision, ensure_ascii=False))
     else:
-        print(run_state.format_brief(decision))
+        print(run_state.format_brief(
+            decision,
+            seed=os.environ.get("LMER_START_PROMPT") or None,
+            # Web (tree) URL of the run dir (issue #104) — fail-soft None
+            # keeps the brief byte-identical when no URL is derivable.
+            run_dir_url=web_url_for(rdir),
+        ))
     return 0
+
+
+def _materialize_artifact(source: Path, dest: Path, rdir: Path) -> str | None:
+    """Materialize `source` at `dest` (link, copy+redact, or redact in place); return the relative link target when linked, else None."""
+    # Single canonical home (issue #103): a source that already lives inside
+    # the RUN DIR is the canonical file — the registered name becomes a
+    # RELATIVE symlink to it (exactly like the masterplan run-root links),
+    # never a second copy that can drift. No redaction pass on the link
+    # branch: everything under the run dir is pushed verbatim by this
+    # command's own durability push (`git add -A` on the run path), so
+    # redacting a copy of a run-dir file never protected anything. A
+    # work-repo source OUTSIDE the run dir keeps the copy+redact path: its
+    # canonical file is not staged by this command, and a file hand-written
+    # elsewhere in the checkout may never have passed through a redacting
+    # writer at all — linking it would trade a redacted copy for a raw one.
+    rdir_res = rdir.resolve()
+    canonical = source.resolve()
+    linked: str | None = None  # the relative link target when we link
+    if canonical == dest.resolve():
+        if dest.is_symlink():
+            # Re-registering an existing link (by its own path or by its
+            # canonical target): already the canonical-home shape — leave
+            # the link exactly as it is.
+            linked = os.readlink(dest)
+        else:
+            # Registering the canonical file in place: rewrite it through
+            # redaction, as the copy path always has (it IS the run-dir
+            # file that the durability push publishes).
+            dest.write_text(
+                redact_secrets(source.read_text(encoding="utf-8")),
+                encoding="utf-8",
+            )
+    elif canonical.is_file() and canonical.is_relative_to(rdir_res):
+        linked = os.path.relpath(canonical, rdir_res)
+        if dest.is_symlink() and os.readlink(dest) == linked:
+            pass  # already correct — idempotent re-registration
+        else:
+            if dest.is_symlink() or dest.exists():
+                # Replace an older copy (or re-point a stale link) — the
+                # in-run source is the one canonical home.
+                dest.unlink()
+            dest.symlink_to(linked)
+    else:
+        # External source (e.g. /tmp scratch — it would vanish with the
+        # container) or a work-repo file outside the run dir (see above):
+        # copy it in through secret redaction, exactly as before.
+        content = redact_secrets(source.read_text(encoding="utf-8"))
+        if dest.is_symlink():
+            # Never write THROUGH a stale link — that would clobber the
+            # canonical file it points at. Replace the link with the copy.
+            dest.unlink()
+        dest.write_text(content, encoding="utf-8")
+    return linked
 
 
 def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) -> int:
@@ -1534,23 +1958,80 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
     rdir, state = _require_run()
     if rdir is None:
         return 1
-    content = redact_secrets(source.read_text(encoding="utf-8"))
-    (rdir / name).write_text(content, encoding="utf-8")
+    dest = rdir / name
+    canonical = source.resolve()
+    linked = _materialize_artifact(source, dest, rdir)
     state.setdefault("artifacts", {})[Path(name).stem] = name
     run_state.write_state(rdir, state)
     run_state.append_event(rdir, "artifact_written", note=name)
-    print(f"✅ Artifact registered: {rdir / name}")
+    if linked is not None:
+        print(f"✅ Artifact linked: {dest} → {linked}")
+    else:
+        print(f"✅ Artifact registered: {dest}")
+    url = web_url_for(canonical if linked is not None else dest)
+    if url:
+        print(f"   Web: {url}")
+
+    # Central specs index (issue #101): a spec-class artifact also gets a
+    # dated relative symlink under {host}/{project}/specs/. A linked
+    # registration indexes the CANONICAL file, never the run-root link
+    # (#103 — the index entry's basename stays the registered name via
+    # `alias`). Fail-soft by contract — an index problem never fails the
+    # registration.
+    spec_link = specs_index.upsert_spec_link(
+        canonical if linked is not None else dest,
+        specs_index.run_label(rdir, state),
+        alias=name,
+    )
+    if spec_link is not None:
+        print(f"   Specs index: {spec_link}")
 
     # Durability: artifacts are exactly what a dead session must not lose —
     # push the run dir now rather than waiting for session end (non-fatal).
     # Candidates (resolved + bare-slug dirs) so a rename whose own push
-    # failed still gets its old path's deletions staged here.
+    # failed still gets its old path's deletions staged here. The specs
+    # index rides along when this registration touched it.
+    stage_paths = run_state.run_rel_path_candidates()
+    if spec_link is not None and specs_index.specs_rel_path():
+        stage_paths.append(specs_index.specs_rel_path())
     rc = commit_work_path(
-        run_state.run_rel_path_candidates(),
+        stage_paths,
         f"run-state: {state['slug']} artifact {name}",
     )
     if rc != 0:
         print("⚠️  Warning: run-state push failed (artifact saved locally)")
+    return 0
+
+
+def cmd_specs_index(rebuild: bool) -> int:
+    """Execute specs-index command (issue #101 — central specs directory).
+
+    Without flags, lists the index's entries (a directory listing IS the
+    index — v1 keeps no README/index file beside the symlinks). With
+    `--rebuild`, rebuilds the whole index from runs/ — the backfill path
+    for specs registered before the index existed. Rebuild writes only;
+    the caller batches the push with `work commit` (same discipline as
+    `work seed`).
+    """
+    if specs_index.specs_dir() is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+    if rebuild:
+        created = specs_index.rebuild()
+        if created:
+            print(f"✅ Specs index rebuilt: {len(created)} entries")
+            for link in created:
+                print(f"   {link.name} -> {os.readlink(link)}")
+            print("Run `work commit` to push the rebuilt index.")
+        else:
+            print("Specs index rebuilt: no specs found under runs/")
+        return 0
+    entries = specs_index.list_entries()
+    if not entries:
+        print("Specs index is empty (see `work specs-index --rebuild` to backfill)")
+        return 0
+    for link in entries:
+        print(f"{link.name} -> {os.readlink(link)}")
     return 0
 
 
@@ -1617,6 +2098,21 @@ def cmd_seed(args) -> int:
     return 0
 
 
+def _answer_marker_path(answer: str) -> Path:
+    """Consume-once marker for a pushed LMER_ANSWER (review on !126).
+
+    The env var lives for the whole container, but an answer belongs to the
+    one question it was pushed for: if the agent records a NEW question and
+    another `work session-start` runs in the same container (followup /
+    restart), the stale value must not be silently applied to a question it
+    was never given for. A /tmp marker keyed by the answer's hash shares the
+    container's lifetime — exactly the env var's — so "applied once in this
+    container" is the right scope.
+    """
+    digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()[:16]
+    return Path(ANSWER_MARKER_DIR or "/tmp") / f".lmer-answer-applied-{digest}"
+
+
 def cmd_session_start() -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
     ALWAYS exits 0 — a broken state layer must never break session start."""
@@ -1659,14 +2155,42 @@ def cmd_session_start() -> int:
                     os.environ.get("LMER_TASK_TARGET", ""),
                 )
 
+        # Resume-on-answer (issue #98): a pushed answer (LMER_ANSWER, set by
+        # `lmer --answer "<text>"` on the host) to the run's recorded open
+        # question is applied BEFORE deciding, so the brief leads with the
+        # answered pair instead of the stale question block. Fail-soft: a
+        # problem applying it degrades to the plain brief, never a failure.
+        answered = None
+        answer = (os.environ.get("LMER_ANSWER") or "").strip()
+        if (
+            answer
+            and state.get("stop_reason") == "question"
+            and state.get("open_question")
+            and not _answer_marker_path(answer).exists()
+        ):
+            try:
+                question = state.get("open_question")
+                state = run_state.answer_question(rdir, state, answer)
+                answered = {"question": question, "answer": redact_secrets(answer)}
+                try:
+                    _answer_marker_path(answer).touch()
+                except OSError:
+                    pass  # marker is best-effort; the answer still applied
+            except Exception as exc:
+                print(f"⚠️  LMER_ANSWER not applied (continuing): {exc}")
+
         # Decide BEFORE claiming so a foreign claim surfaces as a warning.
-        events = run_state.read_events(rdir, last_n=5)
+        # All events for the sessions-used count (issue #99) — this session's
+        # own session_start lands after the decide, so the count reads
+        # "sessions used so far"; the brief still shows the last 5.
+        all_events = run_state.read_events(rdir, last_n=0)
         try:
             ledger = run_state.load_ledger(rdir)
         except (run_state.RunStateError, OSError):
             ledger = None
         decision = run_state.decide(
-            state, events, run_state.current_session_id(), ledger=ledger
+            state, all_events[-5:], run_state.current_session_id(), ledger=ledger,
+            sessions_used=run_state.count_session_starts(all_events),
         )
 
         run_state.append_event(rdir, "session_start")
@@ -1678,7 +2202,12 @@ def cmd_session_start() -> int:
 
         if recovered:
             print("⚠️  Previous state.yaml was unreadable (backed up); recovered with a fresh seed.")
-        print(run_state.format_brief(decision))
+        print(run_state.format_brief(
+            decision,
+            seed=os.environ.get("LMER_START_PROMPT") or None,
+            answered=answered,
+            run_dir_url=web_url_for(rdir),
+        ))
     except Exception as exc:  # never break a session (spec §6)
         print(f"⚠️  run-state session-start failed (continuing): {exc}")
     return 0
@@ -1707,6 +2236,12 @@ def cmd_session_end() -> int:
             state["owner"] = None
         run_state.write_state(rdir, state)
         rels = run_state.run_rel_path_candidates()
+        # Masterplan-sync (and freeze-rename) specs-index entries ride along —
+        # this is the last push of the session, so leaving them unstaged
+        # strands them locally (review on !126).
+        specs_rel = specs_index.specs_rel_path()
+        if specs_rel and specs_rel not in rels:
+            rels.append(specs_rel)
         rc = commit_work_path(rels, f"run-state: session end {state['slug']}")
         if rc != 0:
             print("⚠️  Warning: run-state push failed at session end (state saved locally)")
@@ -1733,9 +2268,11 @@ def main() -> int:
     elif args.command == "report":
         return cmd_report(args.file)
     elif args.command == "goal":
-        return cmd_goal(args.description)
+        return cmd_goal(args.description, args.estimate_sessions, args.estimate_time)
     elif args.command == "memory":
         return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
+    elif args.command == "setup-workspace":
+        return cmd_setup_workspace(args.target, args.task, not args.no_sync)
     elif args.command == "state":
         return cmd_state(args)
     elif args.command == "verify":
@@ -1754,6 +2291,8 @@ def main() -> int:
         return cmd_verify(raw[1], raw[3:])
     elif args.command == "event":
         return cmd_event(args)
+    elif args.command == "answer":
+        return cmd_answer(args.text)
     elif args.command == "name":
         return cmd_name(args.value)
     elif args.command == "ledger":
@@ -1769,6 +2308,8 @@ def main() -> int:
         return cmd_resume(args.as_json)
     elif args.command == "artifact":
         return cmd_artifact(args.name, args.file, args.sync)
+    elif args.command == "specs-index":
+        return cmd_specs_index(args.rebuild)
     elif args.command == "seed":
         return cmd_seed(args)
     elif args.command == "session-start":

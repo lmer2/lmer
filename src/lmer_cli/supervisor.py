@@ -53,6 +53,8 @@ from typing import Callable, Iterable, Mapping, Optional
 
 from pydantic import BaseModel
 
+from .harness import UnknownHarnessError, resolve_harness
+
 
 DEFAULT_PORT_RANGE = (8700, 8799)
 DEFAULT_AUTO_START_DELAY = 1.5
@@ -76,6 +78,18 @@ AUTO_START_NUDGE_COUNT = 3
 # time to finish its startup chain before we send Enter.
 DEFAULT_AUTO_START_READY_MARKER = b"\xe2\x9d\xaf"  # "❯" — Claude's prompt char
 DEFAULT_AUTO_START_READY_TIMEOUT = 15.0
+
+# Text typed to begin the task once the TUI is ready. Claude Code's native
+# ``/start`` slash command is the historical default; other harnesses get
+# their profile's start command (see lmer_cli.harness.SupervisorProfile),
+# overridable via ``LMER_START_COMMAND``.
+DEFAULT_START_COMMAND = "/start"
+
+# Payloads written (with the shutdown chord gap between them) to make the
+# wrapped TUI exit cleanly — claude's quit chord, Ctrl-C twice. Other
+# harnesses get their profile's sequence, overridable via
+# ``LMER_QUIT_SEQUENCE`` (steps separated by ``|``, unicode-escape decoded).
+DEFAULT_QUIT_SEQUENCE = (b"\x03", b"\x03")
 # Small extra pause after the marker is observed: the prompt often renders
 # during a multi-screen-redraw sequence, and a short settle helps the input
 # box reach its steady, focused state before we type into it.
@@ -439,14 +453,58 @@ def _start_fastapi_server(
     return thread, shutdown
 
 
+def _parse_quit_sequence(raw: str) -> tuple[bytes, ...]:
+    """Parse an ``LMER_QUIT_SEQUENCE`` env value into quit-sequence steps.
+
+    Steps are separated by ``|``; each step is unicode-escape decoded so
+    control bytes can be spelled out (``\\x03|\\x03`` → two Ctrl-C presses,
+    ``/quit\\r`` → typed command + Enter). An empty value yields an empty
+    sequence, which disables the chord step entirely (shutdown escalates
+    straight to SIGTERM).
+    """
+    steps: list[bytes] = []
+    for part in raw.split("|"):
+        if not part:
+            continue
+        decoded = part.encode("utf-8").decode("unicode_escape")
+        try:
+            # latin-1 round-trips literal UTF-8 text (each raw byte came
+            # through unicode_escape as one ≤U+00FF codepoint)...
+            steps.append(decoded.encode("latin-1"))
+        except UnicodeEncodeError:
+            # ...but an explicit \uXXXX escape above U+00FF yields a real
+            # codepoint that latin-1 can't express — emit it as UTF-8 (what
+            # the TUI reads) instead of crashing the supervisor at startup.
+            steps.append(decoded.encode("utf-8"))
+    return tuple(steps)
+
+
+def _resolve_harness_profile():
+    """Look up the active harness's supervisor profile from ``LMER_HARNESS``.
+
+    Unknown names fall back to the claude profile with a warning rather than
+    crashing — inside the container a broken env var must not take the whole
+    session down, and claude's profile reproduces the historical behavior.
+    """
+    try:
+        return resolve_harness().supervisor
+    except UnknownHarnessError as exc:
+        sys.stderr.write(f"lmer-supervisor: {exc}; using claude supervisor profile\n")
+        return resolve_harness("claude").supervisor
+
+
 def _resolve_options(args: argparse.Namespace) -> dict:
     """Combine CLI args with environment variables to produce options.
 
-    CLI flags win over environment values. Boolean env vars accept
-    ``1/true/yes`` (case-insensitive).
+    CLI flags win over environment values, which win over the active
+    harness's supervisor profile (``LMER_HARNESS``), which wins over the
+    claude-shaped defaults. Boolean env vars accept ``1/true/yes``
+    (case-insensitive).
     """
     def env_bool(name: str) -> bool:
         return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+    profile = _resolve_harness_profile()
 
     fastapi_enabled = bool(args.fastapi) or env_bool("LMER_FASTAPI")
     manual_start = bool(args.manual_start) or env_bool("LMER_MANUAL_START")
@@ -472,24 +530,40 @@ def _resolve_options(args: argparse.Namespace) -> dict:
     ready_timeout_raw = args.auto_start_ready_timeout
     if ready_timeout_raw is None:
         ready_timeout_raw = os.environ.get("LMER_AUTO_START_READY_TIMEOUT")
-    auto_start_ready_timeout = (
-        float(ready_timeout_raw)
-        if ready_timeout_raw is not None
-        else DEFAULT_AUTO_START_READY_TIMEOUT
-    )
+    if ready_timeout_raw is not None:
+        auto_start_ready_timeout = float(ready_timeout_raw)
+    elif profile.ready_timeout is not None:
+        auto_start_ready_timeout = profile.ready_timeout
+    else:
+        auto_start_ready_timeout = DEFAULT_AUTO_START_READY_TIMEOUT
 
     settle_raw = os.environ.get("LMER_AUTO_START_SETTLE_DELAY")
     auto_start_settle_delay = (
         float(settle_raw) if settle_raw is not None else DEFAULT_AUTO_START_SETTLE_DELAY
     )
 
-    # Marker bytes are read as UTF-8 from env so a future claude UI change can
-    # be patched without a release. Setting it to the empty string disables
+    # Marker bytes are read as UTF-8 from env so a future TUI change can be
+    # patched without a release. Setting it to the empty string disables
     # marker gating (waits only on the initial + timeout-bounded delays).
+    # Default comes from the active harness's profile.
     marker_raw = os.environ.get("LMER_AUTO_START_READY_MARKER")
     auto_start_ready_marker = (
         marker_raw.encode("utf-8") if marker_raw is not None
-        else DEFAULT_AUTO_START_READY_MARKER
+        else profile.ready_marker
+    )
+
+    # Task start command typed once the TUI is ready; harness-profile default
+    # (claude: the native /start slash command), patchable via env.
+    start_command = os.environ.get("LMER_START_COMMAND")
+    if start_command is None:
+        start_command = profile.start_command
+
+    # TUI quit sequence used for SIGUSR1 self-shutdown; harness-profile
+    # default, patchable via env (see _parse_quit_sequence).
+    quit_raw = os.environ.get("LMER_QUIT_SEQUENCE")
+    quit_sequence = (
+        _parse_quit_sequence(quit_raw) if quit_raw is not None
+        else profile.quit_sequence
     )
 
     recheck_raw = os.environ.get("LMER_WINSIZE_RECHECK_DELAY")
@@ -525,6 +599,8 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         "auto_start_ready_timeout": auto_start_ready_timeout,
         "auto_start_settle_delay": auto_start_settle_delay,
         "winsize_recheck_delay": winsize_recheck_delay,
+        "start_command": start_command,
+        "quit_sequence": quit_sequence,
         "start_prompt": start_prompt,
         "start_prompt_delay": start_prompt_delay,
     }
@@ -660,6 +736,7 @@ def _start_auto_start_thread(
     ready_marker = options["auto_start_ready_marker"]
     ready_timeout = max(0.0, options["auto_start_ready_timeout"])
     settle_delay = max(0.0, options["auto_start_settle_delay"])
+    start_command = options.get("start_command", DEFAULT_START_COMMAND)
     start_prompt = options["start_prompt"]
     start_prompt_delay = max(0.0, options["start_prompt_delay"])
 
@@ -671,7 +748,7 @@ def _start_auto_start_thread(
             return
         if settle_delay > 0 and cancel.wait(settle_delay):
             return
-        _inject_auto_start(write, AUTO_START_NUDGE_COUNT, nudge_delay)
+        _inject_auto_start(write, AUTO_START_NUDGE_COUNT, nudge_delay, start_command)
         if start_prompt:
             # Pause so the follow-up doesn't interleave with the trailing CR
             # nudges (which would submit it prematurely or into a non-empty box)
@@ -708,22 +785,27 @@ def _inject_auto_start(
     write: Callable[[bytes], int],
     nudge_count: int,
     nudge_delay: float,
+    start_command: str = DEFAULT_START_COMMAND,
 ) -> None:
-    """Type ``/start`` and submit it, then send a few bare-CR nudges.
+    """Type the start command and submit it, then send a few bare-CR nudges.
 
-    CR (``\\r``), not LF (``\\n``): claude's TUI runs in raw mode where Enter
+    ``start_command`` is claude's native ``/start`` slash command by default;
+    other harnesses inject their profile's plain-text start instruction.
+
+    CR (``\\r``), not LF (``\\n``): the TUIs run in raw mode where Enter
     arrives as ``\\r``; ``\\n`` would be inserted as a literal newline in the
     input box and never trigger submission.
 
     The initial CR is sometimes swallowed during a startup re-render, leaving
-    ``/start`` typed but unsubmitted — the bug behind this nudge logic. Each
-    follow-up bare CR re-submits the already-typed ``/start``; once it has gone
+    the command typed but unsubmitted — the bug behind this nudge logic. Each
+    follow-up bare CR re-submits the already-typed command; once it has gone
     through, the prompt is empty and a bare CR is a harmless no-op. ``OSError``
     is suppressed so a closed PTY (child already exited) doesn't crash the
     timer thread this runs on.
     """
+    payload = _ensure_submit_cr(start_command).encode("utf-8")
     with contextlib.suppress(OSError):
-        write(b"/start\r")
+        write(payload)
     for _ in range(nudge_count):
         if nudge_delay > 0:
             time.sleep(nudge_delay)
@@ -767,24 +849,29 @@ def _inject_start_prompt(
             write(b"\r")
 
 
-def _inject_shutdown_chord(write: Callable[[bytes], int], gap: float) -> None:
-    """Send claude's quit chord — Ctrl-C (``\\x03``) twice with a short gap.
+def _inject_shutdown_chord(
+    write: Callable[[bytes], int],
+    gap: float,
+    sequence: tuple[bytes, ...] = DEFAULT_QUIT_SEQUENCE,
+) -> None:
+    """Send the harness's quit sequence with a short gap between steps.
 
-    This is the same chord the host-side session reaper writes in
+    The default is claude's quit chord — Ctrl-C (``\\x03``) twice — the same
+    chord the host-side session reaper writes in
     ``slack_chat.sessions.SessionManager.terminate`` to unwind the whole
-    claude/container stack gracefully. The gap gives claude time to render its
-    "Press Ctrl-C again to exit" state so the second press is interpreted as the
-    confirmation rather than coalesced into one. ``OSError`` is suppressed so a
-    PTY that has already closed (child exited under us) doesn't crash the daemon
-    thread this runs on. A non-positive ``gap`` never sleeps (so a negative value
-    can't raise ``ValueError`` out of ``time.sleep``).
+    claude/container stack gracefully. The gap gives the TUI time to react to
+    each step (e.g. render claude's "Press Ctrl-C again to exit" state so the
+    second press is interpreted as the confirmation rather than coalesced into
+    one). ``OSError`` is suppressed so a PTY that has already closed (child
+    exited under us) doesn't crash the daemon thread this runs on. A
+    non-positive ``gap`` never sleeps (so a negative value can't raise
+    ``ValueError`` out of ``time.sleep``).
     """
-    with contextlib.suppress(OSError):
-        write(b"\x03")
-    if gap > 0:
-        time.sleep(gap)
-    with contextlib.suppress(OSError):
-        write(b"\x03")
+    for i, step in enumerate(sequence):
+        if i > 0 and gap > 0:
+            time.sleep(gap)
+        with contextlib.suppress(OSError):
+            write(step)
 
 
 def _child_alive(pid: int) -> bool:
@@ -826,13 +913,15 @@ def _self_shutdown(
     *,
     chord_gap: float = DEFAULT_SHUTDOWN_CHORD_GAP,
     escalate_grace: float = DEFAULT_SHUTDOWN_ESCALATE_GRACE,
+    quit_sequence: tuple[bytes, ...] = DEFAULT_QUIT_SEQUENCE,
 ) -> None:
     """Quit the wrapped child on request, escalating until it actually exits.
 
     Ladder (mirrors the host-side reaper's ``terminate``):
 
-    1. Inject claude's quit chord (Ctrl-C twice). This lets claude — and the
-       docker/podman/claude stack under it — unwind normally and exit 0.
+    1. Inject the harness's quit sequence (claude: Ctrl-C twice). This lets
+       the agent — and the docker/podman stack under it — unwind normally and
+       exit 0.
     2. If the child is still alive after ``escalate_grace``, send it SIGTERM.
     3. If it is *still* alive after another ``escalate_grace``, send SIGKILL.
 
@@ -841,7 +930,7 @@ def _self_shutdown(
     only (not its group): the child is its own session/group leader (the fork
     path calls ``setsid``), and ``run_supervisor`` reaps it via ``waitpid``.
     """
-    _inject_shutdown_chord(write, chord_gap)
+    _inject_shutdown_chord(write, chord_gap, quit_sequence)
     if _wait_child_exit(child_pid, escalate_grace):
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
@@ -1001,6 +1090,7 @@ def run_supervisor(
         threading.Thread(
             target=_self_shutdown,
             args=(write_to_child, pid),
+            kwargs={"quit_sequence": options.get("quit_sequence", DEFAULT_QUIT_SEQUENCE)},
             name="lmer-supervisor-self-shutdown",
             daemon=True,
         ).start()

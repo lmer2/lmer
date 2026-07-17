@@ -212,19 +212,21 @@ if [ "$LMER_DANGER_ZONE" = "1" ]; then
 fi
 
 # Translate LMER_REASONING_EFFORT into claude's --effort flag.
-# Valid claude values: low, medium, high, max. Treat "auto" or unset as
-# "let claude decide" — pass no flag. Invalid values get a warning + skip.
-# Normalize to lowercase so HIGH/High/high all work.
+# Valid claude values: low, medium, high, xhigh, max. Treat "auto" or unset
+# as "let claude decide" — pass no flag. Invalid values get a warning + skip.
+# Normalize to lowercase so HIGH/High/high all work. The vocabulary matches
+# the per-lane dispatch efforts (LMER_DISPATCH_<LANE>) so the session and
+# lane surfaces accept the same set.
 if [ -n "$LMER_REASONING_EFFORT" ]; then
     effort_lower="${LMER_REASONING_EFFORT,,}"
     if [ "$effort_lower" != "auto" ]; then
         case "$effort_lower" in
-            low|medium|high|max)
+            low|medium|high|xhigh|max)
                 EXTRA_ARGS="$EXTRA_ARGS --effort $effort_lower"
                 echo "✅ Reasoning effort: $effort_lower"
                 ;;
             *)
-                echo "⚠️  Ignoring LMER_REASONING_EFFORT='$LMER_REASONING_EFFORT' (expected: low|medium|high|max|auto)"
+                echo "⚠️  Ignoring LMER_REASONING_EFFORT='$LMER_REASONING_EFFORT' (expected: low|medium|high|xhigh|max|auto)"
                 ;;
         esac
     fi
@@ -353,57 +355,25 @@ case "${LMER_PERSIST_AGENT_MEMORY,,}" in
 esac
 
 # ── Masterplan plugin provisioning ──
-# When the session runs the masterplan workflow (LMER_TASK=masterplan or a
-# truthy LMER_MASTERPLAN), install the masterplan plugin from the work-repo
-# mirror and point its bundle root into the current run dir. The gating and
-# run-dir computation live in lmer_cli.container.masterplan (get_bool_env +
-# work_repo.run_state) so this stays a thin wrapper. The helper's exit code is
-# the contract: 0 => print the bundle root, provision; 1 => not a masterplan
-# session (or import failure in the claude-runner unit tests) => skip silently;
-# 2 => masterplan was explicitly requested but the run dir is indeterminate
-# (e.g. no LMER_REPO_HOST/LMER_REPO_PROJECT) => skip but warn, so an opt-in that
-# silently did nothing is visible rather than mistaken for a plain session.
-# superpowers is baked into the image but left disabled (no enabledPlugins entry
-# after the image bake removes settings.json); `claude plugin install
-# masterplan@...` re-enables it automatically as masterplan's declared
-# dependency. masterplan comes from the local mirror at /work/mirrors/masterplan.
-# Every step is idempotent (service mode may re-enter this block) and non-fatal —
-# any failure warns and continues, never aborting the session (matches
-# run-state's logged-never-fatal contract).
-MASTERPLAN_RUNS_DIR="$("${LMER_PYTHON:-python3}" -m lmer_cli.container.masterplan 2>/dev/null)"
-masterplan_rc=$?
-if [ "$masterplan_rc" -eq 2 ]; then
-    echo "⚠️  masterplan: enabled but the run dir is indeterminate (LMER_REPO_HOST/LMER_REPO_PROJECT unset?); skipping provisioning"
-elif [ "$masterplan_rc" -eq 0 ] && [ -n "$MASTERPLAN_RUNS_DIR" ]; then
-    export MASTERPLAN_RUNS_DIR
-    echo "✅ Masterplan mode: bundles nest at $MASTERPLAN_RUNS_DIR"
-    if command -v claude >/dev/null 2>&1; then
-        # `claude plugin` calls persist enable-state into settings.json. If it is
-        # still a symlink to a read-only mount (i.e. no settings.local.json merge
-        # above materialized it), the write fails and the plugin never enables.
-        # Materialize a writable copy first (same concern the merge block handles
-        # at line ~196). This branch is live: with the image bake no longer
-        # leaving a settings.json behind, the runtime file starts as a symlink.
-        if [ -L "$SETTINGS_FILE" ]; then
-            # cp preserves the source's mode bits, so if the linked global
-            # settings is itself mode 0444 the copy would be read-only and the
-            # plugin writes below would still fail. Force owner-write after the
-            # copy so materialization always yields a writable regular file.
-            if cp --remove-destination "$(readlink -f "$SETTINGS_FILE")" "$SETTINGS_FILE" 2>/dev/null; then
-                chmod u+w "$SETTINGS_FILE" 2>/dev/null || true
-            else
-                echo "⚠️  masterplan: could not materialize settings.json (continuing)"
-            fi
-        fi
-        claude plugin marketplace add /work/mirrors/masterplan \
-            || echo "⚠️  masterplan: marketplace add failed (continuing)"
-        claude plugin install masterplan@rasatpetabit-masterplan \
-            || echo "⚠️  masterplan: plugin install failed (continuing)"
-        claude plugin enable masterplan \
-            || echo "⚠️  masterplan: plugin enable failed (continuing)"
-    else
-        echo "⚠️  masterplan: claude not on PATH; skipping plugin provisioning"
+# Delegated to masterplan-enable.sh — the single owner of the provisioning
+# steps, shared with mid-session on-demand enablement (its default, forced
+# mode). Gated mode keeps the launch contract: the session provisions only
+# when LMER_TASK=masterplan, a truthy LMER_MASTERPLAN, or a taskdef's
+# task.yaml declares `masterplan: true`. Script exit codes: 1 = not a
+# masterplan session (silent skip); 2 = enabled but the run dir is
+# indeterminate (the script already warned on stderr); 0 = provisioned,
+# bundle root on stdout — captured and exported so masterplan's tooling
+# nests bundles inside the lmer run dir. Mirror resolution, settings.json
+# materialization, and idempotence/non-fatality notes live in the script.
+# [ -x ] guard: on the legacy baked-copy path (claude-runner.sh alone at
+# /home/developer/, no sibling libexec/) the script is absent — keep the
+# non-fatality contract with a warning instead of a raw bash error.
+if [ -x "$(dirname "$0")/masterplan-enable.sh" ]; then
+    if MASTERPLAN_RUNS_DIR="$("$(dirname "$0")/masterplan-enable.sh" --gated)"; then
+        export MASTERPLAN_RUNS_DIR
     fi
+else
+    echo "⚠️  masterplan: masterplan-enable.sh not found beside claude-runner.sh; skipping provisioning" >&2
 fi
 
 # Run Claude through the lmer supervisor when available.

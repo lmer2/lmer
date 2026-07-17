@@ -2,6 +2,7 @@
 
 ## 🚨 Critical Documentation Rules
 - **ALWAYS** write documentation for new features and APIs
+- **ALWAYS** deliver specs, plans, and reports as Markdown (`.md`) — never docx/pdf/binary documents (unreviewable, undiffable, unlinkable at line level)
 
 ## Documentation Requirements
 - Write clear README files for new projects

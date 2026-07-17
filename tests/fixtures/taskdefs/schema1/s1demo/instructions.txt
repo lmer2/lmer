@@ -1,0 +1,11 @@
+# Schema-1 Matrix Demo
+
+A legacy include-style fixture body (manifest-less source root).
+
+## Provider tooling
+
+{% include 'provider-tooling.jinja2' %}
+
+{% include 'phasic.jinja2' %}
+
+{% if is_github %}Deliver with `gh pr create`.{% else %}Deliver with `gitlab-review --create-mr`.{% endif %}

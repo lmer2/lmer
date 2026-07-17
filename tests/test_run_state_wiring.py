@@ -137,6 +137,55 @@ class TestRunStateFragment:
         assert "green" in out.lower()
         assert "shared_files" in out
 
+    def test_completed_run_contract(self, monkeypatch):
+        """Issue #96: the brief block teaches the completed-run direction
+        contract — seed ⇒ record goal + reopen; no seed ⇒ ask new-target-
+        vs-continue; unanswered ⇒ stop_reason=question and stop."""
+        out = self._render(monkeypatch, {
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "org/repo",
+            "run_state_brief": "Run: develop-issue-123 (status: complete)",
+        })
+        assert "COMPLETED run" in out
+        assert "LMER_START_PROMPT" in out
+        assert 'work goal "<seed>"' in out
+        assert "work state set --status=in-progress --stop-reason=none" in out
+        assert 'work state set --stop-reason=question --question "<the question>"' in out
+        assert "proceed on a guess" in out
+        # The in-progress wording stays untouched beside it.
+        assert "you are RESUMING it" in out
+
+    def test_blocking_question_contract(self):
+        """Issue #97: the contract teaches recording the question TEXT, then
+        committing, then ending the session — no idle in-session waiting."""
+        out = self._render(None, {
+            "LMER_REPO_HOST": "h", "LMER_REPO_PROJECT": "p",
+        })
+        assert 'work state set --stop-reason=question --question "<the question>"' in out
+        bullet = re.search(
+            r"- BEFORE stopping to ask the user a blocking question.*?(?=\n- |\Z)",
+            out, re.DOTALL)
+        assert bullet, "the blocking-question contract bullet went missing"
+        assert "work commit" in bullet.group(0)
+        assert "END the session" in bullet.group(0)
+        assert "idle" in bullet.group(0)
+
+    def test_answer_delivery_contract(self):
+        """Issue #98: the question bullet teaches that answers arrive via a
+        FRESH session (`lmer --answer` / `work answer`) — the asking session
+        is never revived to wait for one."""
+        out = self._render(None, {
+            "LMER_REPO_HOST": "h", "LMER_REPO_PROJECT": "p",
+        })
+        bullet = re.search(
+            r"- BEFORE stopping to ask the user a blocking question.*?(?=\n- |\Z)",
+            out, re.DOTALL)
+        assert bullet, "the blocking-question contract bullet went missing"
+        assert 'lmer ... --answer "<text>"' in bullet.group(0)
+        assert 'work answer "<text>"' in bullet.group(0)
+        assert "FRESH session" in bullet.group(0)
+        assert "never revive" in bullet.group(0)
+
     def test_empty_without_project_context(self):
         out = self._render(None, {})
         assert out.strip() == ""
@@ -147,6 +196,33 @@ class TestRunStateFragment:
         })
         assert "work state set" in out             # contract still taught
         assert "read this first" not in out.lower()  # no brief block rendered
+
+    def test_goal_bullet_teaches_estimate_flags(self):
+        """Issue #99: where `work goal` is taught, the fragment includes an
+        estimate when direction is clear — sessions and time flags."""
+        out = self._render(None, {
+            "LMER_REPO_HOST": "h", "LMER_REPO_PROJECT": "p",
+        })
+        goal_bullet = re.search(
+            r"- \*\*Once direction is clear.*?(?=\n- |\Z)", out, re.DOTALL)
+        assert goal_bullet, "the record-the-goal ground rule went missing"
+        assert ('work goal "..." --estimate-sessions 2 --estimate-time "3h"'
+                in goal_bullet.group(0))
+
+    def test_phase_end_pushed_linked_deliverable_contract(self):
+        """Issue #100: every phase END is a pushed, linked deliverable —
+        `work commit` before the transition, web URL (never a container
+        path) cited in the report."""
+        out = self._render(None, {
+            "LMER_REPO_HOST": "h", "LMER_REPO_PROJECT": "p",
+        })
+        bullet = re.search(
+            r"- Every phase END.*?(?=\n- |\Z)", out, re.DOTALL)
+        assert bullet, "the phase-end deliverable contract bullet went missing"
+        assert "pushed, linked deliverable" in bullet.group(0)
+        assert "work commit" in bullet.group(0)
+        assert "web URL" in bullet.group(0)
+        assert "container path" in bullet.group(0)
 
     def test_run_naming_needs_no_confirmation(self):
         """Issue #94: the agent names the run itself — the fragment must
@@ -224,11 +300,13 @@ class TestAgentBriefs:
         assert "Write" not in text.split("---")[1]  # no Write tool in frontmatter
 
     def test_model_pins(self):
-        # Recon is mechanical: explorer is pinned to a cheaper tier. The
-        # adversarial reviewer must NOT be pinned — judgment work inherits
-        # the session model.
+        # No shipped agent def carries a hardcoded model pin: per-lane
+        # configuration (LMER_DISPATCH_<LANE>) is the only source of pins,
+        # and an unset lane inherits the session model. explorer's former
+        # `model: sonnet` pin was deliberately removed (dispatch-model-routing
+        # spec G3 — a documented behavior change).
         explorer_fm = (self.AGENTS_DIR / "explorer.md").read_text().split("---")[1]
-        assert "model: sonnet" in explorer_fm
+        assert "model:" not in explorer_fm, "explorer inherits the session model"
         reviewer_fm = (self.AGENTS_DIR / "adversarial-reviewer.md").read_text().split("---")[1]
         assert "model:" not in reviewer_fm, "reviewer inherits the session model"
 

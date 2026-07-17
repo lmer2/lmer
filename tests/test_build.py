@@ -327,14 +327,20 @@ class TestBuildImage:
         with patch("lmer_cli.build.image_exists", return_value=False), \
              patch("lmer_cli.build.build_image_local", return_value=0) as mock_build:
             build_image("docker", "img:v1", tmp_path)
-            mock_build.assert_called_once_with("docker", "img:v1", tmp_path, pull=True, update_claude=False)
+            mock_build.assert_called_once_with(
+                "docker", "img:v1", tmp_path, pull=True,
+                update_claude=False, update_harnesses=None,
+            )
 
     def test_passes_pull_false_through(self, tmp_path):
         (tmp_path / "Containerfile").touch()
         with patch("lmer_cli.build.image_exists", return_value=False), \
              patch("lmer_cli.build.build_image_local", return_value=0) as mock_build:
             build_image("docker", "img:v1", tmp_path, pull=False)
-            mock_build.assert_called_once_with("docker", "img:v1", tmp_path, pull=False, update_claude=False)
+            mock_build.assert_called_once_with(
+                "docker", "img:v1", tmp_path, pull=False,
+                update_claude=False, update_harnesses=None,
+            )
 
     def test_returns_false_when_no_containerfile(self, tmp_path):
         with patch("lmer_cli.build.image_exists", return_value=False):

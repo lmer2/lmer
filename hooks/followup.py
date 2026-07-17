@@ -19,6 +19,7 @@ if _HOOKS_PARENT not in sys.path:
     sys.path.insert(0, _HOOKS_PARENT)
 
 from hooks.start import (  # noqa: E402
+    TaskdefRenderError,
     check_task_context,
     find_taskdef_file,
     render_taskdef_template,
@@ -64,10 +65,14 @@ def read_and_display_followup(followup_file):
     print(f"📍 Location: {followup_file}")
     print("\n" + "=" * 60)
 
-    rendered = render_taskdef_template(
-        followup_file,
-        extra_context={"followup_file": str(followup_file)},
-    )
+    try:
+        rendered = render_taskdef_template(
+            followup_file,
+            extra_context={"followup_file": str(followup_file)},
+        )
+    except TaskdefRenderError as exc:
+        print(exc)
+        return False
     print(rendered)
     print("=" * 60 + "\n")
     return True

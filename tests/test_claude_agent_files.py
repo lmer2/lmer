@@ -17,20 +17,33 @@ from pathlib import Path
 
 import pytest
 
+from lmer_cli.container.dispatch_agents import ENV_PREFIX, LANE_AGENTS
+
 
 REPO_ROOT = Path(__file__).parent.parent
 HELPERS = REPO_ROOT / "libexec" / "claude-agent-files.sh"
 
 
-def _run_helper(func_name: str, *args: str) -> subprocess.CompletedProcess:
-    """Source the helpers file and call <func_name> with <args>."""
+def _run_helper(
+    func_name: str, *args: str, env: dict | None = None
+) -> subprocess.CompletedProcess:
+    """Source the helpers file and call <func_name> with <args>.
+
+    `env` entries overlay os.environ for the bash subprocess (used by the
+    dispatch-lane tests to plant LMER_DISPATCH_* and point PYTHONPATH at
+    the development tree).
+    """
     quoted = " ".join(f'"{a}"' for a in args)
     script = f'source "{HELPERS}"\n{func_name} {quoted}\n'
+    merged_env = None
+    if env is not None:
+        merged_env = {**os.environ, **env}
     return subprocess.run(
         ["bash", "-c", script],
         capture_output=True,
         text=True,
         timeout=30,
+        env=merged_env,
     )
 
 
@@ -193,6 +206,171 @@ class TestClaudeLinkAgentFiles:
         )
         assert result.returncode == 0, result.stderr
         assert (home_claude / "agents" / "explorer.md").read_text() == "work explorer"
+
+
+class TestClaudeRenderDispatchLanes:
+    """The post-link dispatch-lane render pass (LMER_DISPATCH_<LANE>).
+
+    claude_link_agent_files calls claude_render_dispatch_lanes at the end;
+    a configured lane's agent symlink becomes a real file with the
+    configured model/effort in its frontmatter, an unset lane keeps (or is
+    restored to) the bare symlink. The python side needs the development
+    tree on PYTHONPATH.
+    """
+
+    ENV = {"PYTHONPATH": str(REPO_ROOT / "src")}
+
+    def _lane_env(self, **lanes: str) -> dict:
+        env = dict(self.ENV)
+        # Explicitly blank every lane so ambient config can't leak in.
+        for lane in ("REVIEW", "DESIGN", "CODE", "MECHANICAL", "EXPLORE"):
+            env[f"LMER_DISPATCH_{lane}"] = lanes.get(lane, "")
+        return env
+
+    def _agents_tree(self, trees):
+        home_claude, global_src, work_src = trees
+        (global_src / "agents").mkdir(parents=True)
+        for stem in ("adversarial-reviewer", "designer", "coder",
+                     "mechanical", "explorer"):
+            (global_src / "agents" / f"{stem}.md").write_text(
+                f"---\nname: {stem}\ntools: Read\n---\n# {stem}\n"
+            )
+        return home_claude, global_src, work_src
+
+    def test_configured_lane_materializes_real_file(self, trees):
+        home_claude, global_src, _ = self._agents_tree(trees)
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), "",
+            env=self._lane_env(REVIEW="fable:high"),
+        )
+        assert result.returncode == 0, result.stderr
+        target = home_claude / "agents" / "adversarial-reviewer.md"
+        assert not target.is_symlink()
+        text = target.read_text()
+        assert "model: fable" in text
+        assert "effort: high" in text
+        assert "Dispatch lane REVIEW" in result.stdout
+
+    def test_unset_lanes_stay_symlinks(self, trees):
+        home_claude, global_src, _ = self._agents_tree(trees)
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), "",
+            env=self._lane_env(CODE="sonnet"),
+        )
+        assert result.returncode == 0, result.stderr
+        assert not (home_claude / "agents" / "coder.md").is_symlink()
+        for stem in ("adversarial-reviewer", "designer", "mechanical", "explorer"):
+            assert (home_claude / "agents" / f"{stem}.md").is_symlink(), stem
+
+    def test_no_config_is_pure_link_pass(self, trees):
+        home_claude, global_src, _ = self._agents_tree(trees)
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), "",
+            env=self._lane_env(),
+        )
+        assert result.returncode == 0, result.stderr
+        for stem in ("adversarial-reviewer", "designer", "coder",
+                     "mechanical", "explorer"):
+            assert (home_claude / "agents" / f"{stem}.md").is_symlink(), stem
+        assert "Dispatch lane" not in result.stdout
+
+    def test_set_then_unset_restores_symlink(self, trees):
+        """The staleness transition across two provisioning runs."""
+        home_claude, global_src, _ = self._agents_tree(trees)
+        _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), "",
+            env=self._lane_env(EXPLORE="haiku"),
+        )
+        target = home_claude / "agents" / "explorer.md"
+        assert not target.is_symlink()
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), "",
+            env=self._lane_env(),
+        )
+        assert result.returncode == 0, result.stderr
+        assert target.is_symlink()
+
+    def test_work_overlay_wins_as_render_source(self, trees):
+        home_claude, global_src, work_src = self._agents_tree(trees)
+        (work_src / "agents").mkdir(parents=True)
+        (work_src / "agents" / "explorer.md").write_text(
+            "---\nname: explorer\n---\n# overlay explorer\n"
+        )
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src),
+            str(work_src), env=self._lane_env(EXPLORE="sonnet:low"),
+        )
+        assert result.returncode == 0, result.stderr
+        text = (home_claude / "agents" / "explorer.md").read_text()
+        assert "# overlay explorer" in text
+        assert "model: sonnet" in text
+        assert "effort: low" in text
+
+    def test_explorer_effective_def_unpinned_when_unset(self, trees):
+        """G3: with EXPLORE unset the def explorer actually loads has no pin."""
+        home_claude, global_src, _ = self._agents_tree(trees)
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), "",
+            env=self._lane_env(),
+        )
+        assert result.returncode == 0, result.stderr
+        effective = (home_claude / "agents" / "explorer.md").read_text()
+        frontmatter = effective.split("---")[1]
+        assert "model:" not in frontmatter
+
+    def test_bash_stem_list_matches_lane_agents(self):
+        """Drift guard: the skip-gate's two bash-side copies of the lane
+        list in claude-agent-files.sh must match the python side's
+        LANE_AGENTS — a lane added to one but not the other silently loses
+        its staleness repair (stem loop) or, worse, has its configuration
+        silently ignored when it is the only lane set (env-var gate)."""
+        source = HELPERS.read_text()
+        match = re.search(r"for stem in ([^;]+); do", source)
+        assert match, "skip-gate stem loop not found in claude-agent-files.sh"
+        bash_stems = sorted(match.group(1).split())
+        assert bash_stems == sorted(LANE_AGENTS.values())
+
+        prefix = re.escape(ENV_PREFIX)
+        gate = re.search(
+            rf'if \[ -n "((?:\$\{{{prefix}[A-Z]+\}})+)" \]', source
+        )
+        assert gate, "env-var skip-gate not found in claude-agent-files.sh"
+        gate_lanes = sorted(re.findall(rf"{prefix}([A-Z]+)", gate.group(1)))
+        assert gate_lanes == sorted(LANE_AGENTS.keys())
+
+    def test_dangling_lane_symlink_triggers_repair(self, trees):
+        """A dangling lane symlink (overlay deleted between sessions) must
+        be repaired to the surviving source even with no lane configured."""
+        home_claude, global_src, work_src = self._agents_tree(trees)
+        (work_src / "agents").mkdir(parents=True)
+        overlay = work_src / "agents" / "explorer.md"
+        overlay.write_text("---\nname: explorer\n---\noverlay\n")
+        _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src),
+            str(work_src), env=self._lane_env(),
+        )
+        overlay.unlink()  # the overlay disappears; the link now dangles
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), "",
+            env=self._lane_env(),
+        )
+        assert result.returncode == 0, result.stderr
+        target = home_claude / "agents" / "explorer.md"
+        assert target.is_symlink()
+        assert target.resolve() == (global_src / "agents" / "explorer.md").resolve()
+
+    def test_render_failure_is_fail_soft(self, trees):
+        home_claude, global_src, _ = self._agents_tree(trees)
+        env = self._lane_env(REVIEW="fable")
+        env["LMER_PYTHON"] = "/nonexistent/python3"  # render pass cannot run
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), "",
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "Dispatch lane render failed" in result.stdout
+        # The linked layout still stands.
+        assert (home_claude / "agents" / "adversarial-reviewer.md").is_symlink()
 
 
 class TestClaudeMergeWorkSettings:

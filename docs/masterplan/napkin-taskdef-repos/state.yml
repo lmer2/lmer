@@ -1,0 +1,17 @@
+---
+schema_version: 8
+slug: napkin-taskdef-repos
+status: archived
+phase: execute
+topic: "Make napkin and taskdef optional separate repos with stable in-container paths and a napkin push step"
+complexity: null
+complexity_source: null
+autonomy: null
+created_at: 2026-06-23T17:19:09.216Z
+predecessor_transcript: null
+spec_path: /home/user/Agents/global/docs/masterplan/napkin-taskdef-repos/spec.md
+plan_path: /home/user/Agents/global/docs/masterplan/napkin-taskdef-repos/plan.md
+plan_index_path: /home/user/Agents/global/docs/masterplan/napkin-taskdef-repos/plan.index.json
+tasks: [{"id":1,"status":"done","wave":0,"files":["src/lmer_cli/tokens.py","tests/test_lmer_cli_token_injection.py"]},{"id":2,"status":"done","wave":1,"files":["src/lmer_cli/cli.py","tests/test_lmer_cli_env_sources.py"]},{"id":3,"status":"done","wave":1,"files":["src/lmer_cli/container/clone_and_exec.py","tests/test_clone_and_exec_aux_repos.py"]},{"id":4,"status":"done","wave":1,"files":["src/work_repo/git_ops.py","src/work_repo/cli.py","tests/test_work_repo_git_ops.py","tests/test_work_repo_cli.py"]},{"id":5,"status":"done","wave":0,"files":["docs/LMER-CLI.md"]},{"id":6,"status":"done","wave":0,"files":["lmer-docs/NAPKIN.md"]}]
+active_run: null
+pending_gate: null

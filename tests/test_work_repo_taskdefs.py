@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import hooks.start as start_hook
 from hooks.start import (
     find_taskdef_file,
     render_taskdef_template,
@@ -227,6 +228,39 @@ class TestRenderTaskdefTemplateWorkRepoIncludes:
 
         rendered = render_taskdef_template(template_file)
         assert rendered == "GLOBAL-SNIPPET"
+
+    def test_shared_partial_resolves_from_container_builtin(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression: an external taskdef repo (LMER_TASKDEF_PATHS) that
+        {% include %}s a shared partial it does not vendor must still render.
+
+        LMER_TASKDEF_ROOT points at a *host* path absent inside the container,
+        so include-resolution must fall back to the container-stable built-in
+        taskdef dir (where service-mode.jinja2 lives). Without the fallback this
+        crashed /start with TemplateNotFound.
+        """
+        # External taskdef repo: has the entrypoint, but NOT the partial.
+        external_repo = tmp_path / "core-tasks"
+        external_taskdef = _make_taskdef(external_repo, "chat", "unused")
+        template_file = external_taskdef / "instructions.txt"
+        template_file.write_text("A\n{% include 'service-mode.jinja2' %}\nB")
+
+        # Container-stable built-in dir owns the shared partial.
+        container_builtin = tmp_path / "install" / "taskdef"
+        container_builtin.mkdir(parents=True)
+        (container_builtin / "service-mode.jinja2").write_text("SHARED-PARTIAL")
+
+        # LMER_TASKDEF_ROOT is a host path that does not exist in-container.
+        monkeypatch.setenv("LMER_TASKDEF_ROOT", "/home/user/Agents/global/taskdef")
+        monkeypatch.setattr(
+            start_hook, "builtin_taskdef_root", lambda: container_builtin
+        )
+
+        rendered = render_taskdef_template(template_file)
+        assert "A" in rendered
+        assert "SHARED-PARTIAL" in rendered
+        assert "B" in rendered
 
 
 class TestCliUnknownTaskRelaxation:

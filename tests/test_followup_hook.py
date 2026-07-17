@@ -208,3 +208,40 @@ class TestFollowupHook:
         assert "header" in output
         assert "shared content" in output
         assert "footer" in output
+
+
+class TestFollowupSchemaAndBanner:
+    """followup.txt resolves independently — it gets the same schema gate
+    and `taskdef source:` banner as instructions.txt (spec: shadowing must
+    stay observable on the followup render path too)."""
+
+    def test_followup_render_prints_source_banner(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        (tmp_path / "taskdef.yaml").write_text("schema: 2\n")
+        taskdef = tmp_path / "develop"
+        taskdef.mkdir()
+        (taskdef / "followup.txt").write_text("follow up on {{ work_mode }}")
+        monkeypatch.setenv("LMER_TASK", "develop")
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(tmp_path))
+
+        ok = read_and_display_followup(taskdef / "followup.txt")
+        assert ok is True
+        output = capsys.readouterr().out
+        assert f"taskdef source: {tmp_path} (schema 2)" in output
+
+    def test_followup_fails_on_unsupported_schema(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        (tmp_path / "taskdef.yaml").write_text("schema: 42\n")
+        taskdef = tmp_path / "develop"
+        taskdef.mkdir()
+        (taskdef / "followup.txt").write_text("never rendered")
+        monkeypatch.setenv("LMER_TASK", "develop")
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(tmp_path))
+
+        ok = read_and_display_followup(taskdef / "followup.txt")
+        assert ok is False
+        output = capsys.readouterr().out
+        assert "schema 42" in output
+        assert "never rendered" not in output

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "slug": "container-provisioning-fixes",
+  "tasks": [
+    {
+      "id": 1,
+      "wave": 0,
+      "description": "Implement Task 1 (Pre-create /napkin + /taskdef in the image) from docs/masterplan/container-provisioning-fixes/plan.md. Read the '## Global Constraints' section AND the '### Task 1' section first, then do every Step. Summary: add '/napkin /taskdef' to both the 'mkdir -p' list and the final 'chown developer:developer' list in the RUN block at Containerfile line 109 (the block that already pre-creates /Agents/global /workspace /work); and add a regression test in tests/test_clone_and_exec_aux_repos.py asserting ensure_clone() populates a pre-existing empty dir from a local git source (and is a no-op on a second call). CRITICAL: (a) NO git add/commit; (b) verify ONLY with `python -m pytest tests/test_clone_and_exec_aux_repos.py -q` (bare python \u2014 NOT .venv/bin/python, which is the broken host venv); (c) stay within your two declared files. Verify must pass on real output.",
+      "files": [
+        "Containerfile",
+        "tests/test_clone_and_exec_aux_repos.py"
+      ],
+      "verify_commands": [
+        "python -m pytest tests/test_clone_and_exec_aux_repos.py -q"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": []
+    },
+    {
+      "id": 2,
+      "wave": 0,
+      "description": "Implement Task 2 (Harden gate test-interpreter selection) from docs/masterplan/container-provisioning-fixes/plan.md. Read '## Global Constraints' AND '### Task 2' first, then do every Step. Summary: add a GateChecker._interpreter_can_import(python_cmd, module='pytest') staticmethod near _venv_script_launchable in src/lmer_cli/gates.py; change check_tests() interpreter selection (currently gates.py:304-309) to use the project .venv/bin/python only if it exists AND can import pytest, else the first of python3/python on PATH that can, else fall back to 'python'; keep the PYTHONPATH src-prepend; add units in tests/test_gates.py covering can-import (venv used), cannot-import (falls back to a working PATH interpreter), and keep the existing test_check_tests_pass/fail green (they @patch subprocess.run globally \u2014 use side_effect to separate the import probe from the pytest run). CRITICAL: (a) NO git add/commit; (b) verify ONLY with `python -m pytest tests/test_gates.py -q` (bare python \u2014 NOT .venv/bin/python); (c) stay within your two declared files. Verify must pass on real output.",
+      "files": [
+        "src/lmer_cli/gates.py",
+        "tests/test_gates.py"
+      ],
+      "verify_commands": [
+        "python -m pytest tests/test_gates.py -q"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": []
+    },
+    {
+      "id": 3,
+      "wave": 1,
+      "description": "Implement Task 3 (container smoke test) from docs/masterplan/container-provisioning-fixes/plan.md. Read '## Global Constraints' AND '### Task 3' first. Summary: create tests/test_container_provisioning_smoke.py, a @requires_container smoke test using the tests/_lmer_runtime.py harness and the tests/test_lmer_integration.py subprocess pattern (`lmer --no-task --exec '<cmd>'`). Assert: (a) with LMER_NAPKIN_REPO set, `~/napkin/.git` exists in-container (skip/xfail cleanly if no napkin URL available \u2014 do not hard-fail on missing creds); (b) `python -c 'import pytest'` exits 0 in-container. Gate the module with @requires_container (+ requires_lmer_venv where it shells lmer) so it skips without a runtime socket. CRITICAL: (a) NO git add/commit; (b) verify with `python -m pytest tests/test_container_provisioning_smoke.py -q` (bare python) \u2014 a SKIPPED result is acceptable when no container runtime is present; (c) only create the one declared file. Depends on Tasks 1 and 2 being applied.",
+      "files": [
+        "tests/test_container_provisioning_smoke.py"
+      ],
+      "verify_commands": [
+        "python -m pytest tests/test_container_provisioning_smoke.py -q"
+      ],
+      "codex": "no",
+      "sensitive": false,
+      "spec_refs": []
+    }
+  ]
+}

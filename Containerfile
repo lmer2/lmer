@@ -95,8 +95,15 @@ ENV PYTHONHASHSEED=0
 ENV OPENSSL_CONF=/etc/pki/tls/openssl.cnf
 ENV OPENSSL_FIPS=1
 
-# Create working directory structure
+# Create working directory structure.
+# The per-harness config dirs must pre-exist owned by developer: credential
+# files are bind-mounted as individual files (mounts.py build_user_mounts),
+# and docker/podman would otherwise create the missing parent directories
+# root-owned — leaving the harness unable to write its own config/state next
+# to the mounted file.
 RUN mkdir -p /home/developer/.claude && \
+    mkdir -p /home/developer/.codex && \
+    mkdir -p /home/developer/.pi/agent && \
     mkdir -p /home/developer/.local/bin && \
     chown -R developer:developer /home/developer
 
@@ -106,12 +113,12 @@ RUN chown -R developer:developer /opt/tools
 # Create /Agents/global as the primary location for lmer tools
 # This is where host directories will be mounted at runtime
 # The .venv is built here and persists (not overwritten by mounts)
-RUN mkdir -p /Agents/global /workspace /work && \
+RUN mkdir -p /Agents/global /workspace /work /napkin /taskdef && \
     echo "CONTAINER_ENV=true" > /etc/container-environment && \
     echo "CONTAINER_TYPE=lmer" >> /etc/container-environment && \
     echo "RESOURCE_LIMITS=cpu:1,memory:2G,procs:512" >> /etc/container-environment && \
     chown -R developer:developer /Agents && \
-    chown developer:developer /workspace /work
+    chown developer:developer /workspace /work /napkin /taskdef
 
 # === DEVELOPER: uv + python deps (cached until pyproject.toml/uv.lock change) ===
 
@@ -185,6 +192,19 @@ RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN claude plugin marketplace add https://github.com/anthropics/claude-plugins-official && \
     claude plugin install superpowers@claude-plugins-official && \
     rm -f /home/developer/.claude/settings.json
+
+# === Alternative agent harnesses (all baked into the one image; selected at
+# run time via LMER_HARNESS / lmer --harness — see docs/HARNESSES.md) ===
+
+# Codex CLI (OpenAI). CODEX_CACHE_BUST busts this layer via
+# `lmer build --update-harness codex`.
+ARG CODEX_CACHE_BUST=0
+RUN mise exec -- npm install -g @openai/codex
+
+# pi (github.com/earendil-works/pi). --ignore-scripts per upstream install
+# guidance. PI_CACHE_BUST busts this layer via `lmer build --update-harness pi`.
+ARG PI_CACHE_BUST=0
+RUN mise exec -- npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
 # Install Playwright MCP and Browsers
 # We install globally to make the package available, and install browsers to user cache

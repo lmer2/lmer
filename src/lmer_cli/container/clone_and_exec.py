@@ -10,8 +10,19 @@ This script runs inside the container to:
 It is invoked by the host CLI with repository configuration passed via
 environment variables (LMER_REPO_URL, LMER_CHECKOUT_BRANCH, LMER_CHECKOUT_REF).
 
-Note: This script runs standalone (not as part of lmer_cli package) so it
-must not import from lmer_cli or work_repo modules.
+The same building blocks (ensure_clone, ensure_work_repo_directory,
+provision_documentation) are also re-used by ``setup_workspace()`` — the
+on-demand workspace bootstrap behind the ``work setup-workspace`` command,
+which lets a chat-mode session that started without a repository set
+``/workspace`` up the same way a repo-targeted session does at startup
+(issue #69).
+
+Note: This script's entrypoint path (``main()`` and the helpers it calls)
+runs standalone (not as part of the lmer_cli package) and must not import
+from lmer_cli or work_repo modules — it executes before the package is
+guaranteed importable. ``setup_workspace()`` is only ever invoked from the
+``work`` CLI (where the package *is* importable), but it too is kept
+stdlib-only here so all container-side setup logic lives in one place.
 """
 from __future__ import annotations
 
@@ -26,6 +37,34 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
+
+# Git config that disables the LFS smudge/process filters and marks them
+# non-required. Used when git-lfs is not installed so a target repo that
+# tracks files via LFS still checks out (as pointer files) instead of
+# aborting the checkout with ``git-lfs: command not found`` (exit 128).
+# Single source of truth for both the ``-c`` clone flags and the repo-local
+# persistence in _persist_lfs_skip_config.
+_LFS_SKIP_CONFIG = (
+    ("filter.lfs.smudge", ""),
+    ("filter.lfs.process", ""),
+    ("filter.lfs.required", "false"),
+)
+
+# The same settings as ``git -c`` flags. Must precede the ``clone`` subcommand
+# so they cover the clone's implicit checkout.
+_LFS_SKIP_FLAGS = [
+    arg for key, value in _LFS_SKIP_CONFIG for arg in ("-c", f"{key}={value}")
+]
+
+# Runner command tokens this entrypoint dispatches to a harness runner script.
+# NOTE: standalone copy of the names in lmer_cli.harness.HARNESSES (this module
+# runs inside the container without the lmer_cli import path — see header).
+# tests/test_harness_runners.py guards that the two stay in sync.
+KNOWN_HARNESS_RUNNERS = {
+    "claude-runner",
+    "codex-runner",
+    "pi-runner",
+}
 
 
 def run(cmd: list[str]) -> int:
@@ -71,6 +110,90 @@ def _scrub_credentials(text: str) -> str:
     return re.sub(r"(://)[^/\s]*@", r"\1", text)
 
 
+def _git_lfs_available() -> bool:
+    """True when the ``git-lfs`` binary is on PATH."""
+    return shutil.which("git-lfs") is not None
+
+
+# One warning per process: the bypass is otherwise silent, and an agent whose
+# LFS-tracked files checked out as pointer text would see confusing test
+# failures with nothing naming the cause.
+_lfs_bypass_warned = False
+
+
+def _warn_lfs_bypass() -> None:
+    global _lfs_bypass_warned
+    if _lfs_bypass_warned:
+        return
+    _lfs_bypass_warned = True
+    print(
+        "⚠️  git-lfs not installed — LFS-tracked files (if the repo has any) "
+        "are checked out as pointer files",
+        file=sys.stderr,
+    )
+
+
+def _lfs_safe_git(*args: str) -> list[str]:
+    """A ``git`` invocation carrying the LFS-skip ``-c`` flags when git-lfs is
+    unavailable (a plain ``["git", *args]`` when it is present).
+
+    The ``-c`` flags are process-scoped, so this is safe for git operations on
+    bind-mounted checkouts (service mode / ``--checkout``) where repo-local
+    persistence must never be written — nothing leaks into the user's repo.
+    """
+    cmd = ["git"]
+    if not _git_lfs_available():
+        _warn_lfs_bypass()
+        cmd += _LFS_SKIP_FLAGS
+    cmd += list(args)
+    return cmd
+
+
+def _clone_cmd(repo_url: str, workspace: Path) -> list[str]:
+    """Build the ``git clone`` command.
+
+    When git-lfs is unavailable, insert :data:`_LFS_SKIP_FLAGS` before the
+    ``clone`` subcommand so LFS-tracked repos degrade to pointer files rather
+    than failing the checkout. When git-lfs is present the clone is plain, so
+    LFS content is fetched normally.
+    """
+    return _lfs_safe_git("clone", repo_url, str(workspace))
+
+
+def _persist_lfs_skip_config(repo_dir: Path) -> None:
+    """Persist the LFS-skip settings into *repo_dir*'s local git config.
+
+    The failing ``filter.lfs.*`` config comes from the host ``~/.gitconfig``
+    mounted into the container (``git lfs install`` writes ``required = true``
+    globally), so the ``-c`` flags on the clone only protect the clone's own
+    implicit checkout. Every later operation that materializes LFS-tracked
+    files — the branch/ref checkout in ensure_clone, the GitLab MR
+    auto-checkout in main(), any in-session git use in the repo — would hit
+    the same ``git-lfs: command not found`` abort. Repo-local config overrides
+    the mounted global config and covers all of those.
+
+    Only ever called on a repo this script itself just cloned (never a
+    service-mode bind-mounted checkout), so the settings stay scoped to the
+    ephemeral clone and never disable LFS in a user's host repo. (A
+    secondary-MR repo cloned into a bind-mounted workspace outlives the
+    container together with this config, but the settings live in that
+    clone's own ``.git/config`` — still never the user's checkout's.)
+    Best-effort:
+    a config write failure warns rather than failing the clone — the repo may
+    not touch LFS-tracked files at all.
+    """
+    if _git_lfs_available():
+        return
+    for key, value in _LFS_SKIP_CONFIG:
+        try:
+            check_call(["git", "-C", str(repo_dir), "config", key, value])
+        except Exception as e:
+            print(
+                f"⚠️  Failed to persist {key} in {repo_dir}: {e}",
+                file=sys.stderr,
+            )
+
+
 def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Optional[str]) -> None:
     """
     Clone repository into workspace if not already present.
@@ -91,8 +214,8 @@ def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Opt
     if (workspace / ".git").exists():
         return
 
-    clone_cmd = ["git", "clone", repo_url, str(workspace)]
-    check_call(clone_cmd)
+    check_call(_clone_cmd(repo_url, workspace))
+    _persist_lfs_skip_config(workspace)
 
     # Configure safe.directory to avoid ownership complaints
     try:
@@ -110,26 +233,99 @@ def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Opt
             check_call(["git", "-C", str(workspace), "checkout", branch])
 
 
-def find_runner() -> str:
-    """
-    Locate Claude Code runner script in the container.
+def clone_aux_repos(
+    napkin_repo_url: "str | None",
+    taskdef_repo_url: "str | None",
+    taskdef_ref: "str | None",
+) -> None:
+    """Clone the optional napkin/taskdef repos.
 
-    Searches standard installation locations for claude-runner.sh.
+    The URLs already carry credentials (baked in host-side by the launching
+    CLI), so they clone as-is. Clone failures are non-fatal — warn and continue,
+    matching the secondary-MR clone behavior.
+    """
+    if napkin_repo_url:
+        try:
+            ensure_clone(Path("/napkin"), napkin_repo_url, None, None)
+        except Exception as e:
+            print(f"⚠️  napkin clone failed (continuing): {_scrub_credentials(str(e))}", file=sys.stderr)
+    if taskdef_repo_url:
+        try:
+            ensure_clone(Path("/taskdef"), taskdef_repo_url, None, taskdef_ref)
+        except Exception as e:
+            print(f"⚠️  taskdef clone failed (continuing): {_scrub_credentials(str(e))}", file=sys.stderr)
+
+
+def link_into_home(link: Path, target: Path) -> None:
+    """Idempotently point *link* at *target* (unlink-if-exists, then symlink).
+
+    Service mode can re-enter the entrypoint over a container's lifetime, so a
+    stale link/file/dir at *link* is removed first rather than letting
+    ``symlink_to`` raise ``FileExistsError``. Best-effort: failures warn.
+    """
+    try:
+        if link.is_symlink() or link.exists():
+            if link.is_symlink() or link.is_file():
+                link.unlink()
+            else:
+                shutil.rmtree(link)
+        link.symlink_to(target)
+    except OSError as e:
+        print(f"⚠️  Failed to link {link} -> {target}: {e}", file=sys.stderr)
+
+
+def setup_napkin_and_links(
+    work_repo_path: Path,
+    napkin_path: Path,
+    *,
+    napkin_is_separate: bool,
+    home: Path,
+) -> None:
+    """Ensure the napkin dir exists (subdir mode) and create stable home links.
+
+    - Subdir mode (napkin under the work repo): ``mkdir -p`` the napkin dir so
+      ``~/napkin`` is not a dangling link before the first write.
+    - Always: idempotent ``~/work`` -> work repo and ``~/napkin`` -> napkin path.
+    """
+    if not napkin_is_separate:
+        try:
+            napkin_path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"⚠️  Failed to create napkin dir {napkin_path}: {e}", file=sys.stderr)
+    link_into_home(home / "work", work_repo_path)
+    link_into_home(home / "napkin", napkin_path)
+
+
+def find_runner(harness: str = "claude") -> str | None:
+    """
+    Locate the harness runner script in the container.
+
+    Searches standard installation locations for ``<harness>-runner.sh``.
 
     Returns:
-        Path to runner script, or 'claude' as fallback
+        Path to the runner script; for claude, falls back to the plain
+        ``claude`` binary on PATH (legacy behavior). For other harnesses,
+        ``None`` when the image has no runner script for them.
     """
+    script = f"{harness}-runner.sh"
     # Prefer global install location inside container
     candidates = [
-        "/home/developer/.lmer/libexec/claude-runner.sh",
-        "/Agents/global/libexec/claude-runner.sh",
-        "/home/developer/claude-runner.sh",
+        f"/home/developer/.lmer/libexec/{script}",
+        f"/Agents/global/libexec/{script}",
     ]
+    if harness == "claude":
+        # Legacy image-baked copy (Containerfile copies only claude-runner.sh
+        # to /home/developer). Non-claude runners must not run from here:
+        # they source harness-common.sh relative to their own directory,
+        # which only exists under libexec/.
+        candidates.append(f"/home/developer/{script}")
     for p in candidates:
         if Path(p).exists():
             return p
-    # Fallback to plain claude on PATH
-    return "claude"
+    if harness == "claude":
+        # Fallback to plain claude on PATH
+        return "claude"
+    return None
 
 
 def sanitize_task_target(task_target: str) -> str:
@@ -334,6 +530,25 @@ def _parse_gitlab_mr_url(target: str) -> tuple[str | None, str | None, str | Non
     return host, project_path, mr_id
 
 
+def _fetch_and_checkout_mr(workspace: Path, mr_id: str, remote: str = "origin") -> None:
+    """Fetch a GitLab MR's head ref and check it out as a local ``mr-<id>`` branch.
+
+    Shared by the three sites that need an MR's source branch in a fresh
+    checkout: container startup (``main``), the secondary-MR clone
+    (``clone_secondary_mr``), and the on-demand ``setup_workspace`` bootstrap.
+
+    Raises:
+        subprocess.CalledProcessError: if the fetch or checkout fails. Callers
+            wrap this to print a context-specific warning.
+    """
+    # _lfs_safe_git: the workspace may be a bind-mounted --checkout (no
+    # repo-local LFS-skip config); process-scoped -c flags keep the
+    # checkout alive without touching the mounted repo's config.
+    check_call(_lfs_safe_git("-C", str(workspace), "fetch", remote,
+                             f"merge-requests/{mr_id}/head:mr-{mr_id}"))
+    check_call(_lfs_safe_git("-C", str(workspace), "checkout", f"mr-{mr_id}"))
+
+
 def clone_secondary_mr(target: str, workspace: Path) -> None:
     """
     Clone a secondary MR into a subdirectory of the workspace.
@@ -371,8 +586,8 @@ def clone_secondary_mr(target: str, workspace: Path) -> None:
 
     # Clone the repository
     print(f"📦 Cloning secondary MR into {target_dir}...", file=sys.stderr)
-    clone_cmd = ["git", "clone", repo_url, str(target_dir)]
-    check_call(clone_cmd)
+    check_call(_clone_cmd(repo_url, target_dir))
+    _persist_lfs_skip_config(target_dir)
 
     # Configure safe.directory
     try:
@@ -384,9 +599,7 @@ def clone_secondary_mr(target: str, workspace: Path) -> None:
     if gitlab_host and gitlab_project and mr_id:
         print(f"🔍 Attempting to fetch secondary MR {mr_id} branch from {gitlab_host}/{gitlab_project}...", file=sys.stderr)
         try:
-            check_call(["git", "-C", str(target_dir), "fetch", "origin",
-                        f"merge-requests/{mr_id}/head:mr-{mr_id}"])
-            check_call(["git", "-C", str(target_dir), "checkout", f"mr-{mr_id}"])
+            _fetch_and_checkout_mr(target_dir, mr_id)
             print(f"✅ Checked out secondary MR {mr_id} branch (mr-{mr_id}) in {target_dir}", file=sys.stderr)
         except subprocess.CalledProcessError as e:
             print(f"⚠️  Failed to checkout secondary MR {mr_id} branch: {e}", file=sys.stderr)
@@ -599,6 +812,376 @@ def provision_documentation(
     return provisioned
 
 
+class WorkspaceExistsError(Exception):
+    """Raised by setup_workspace when /workspace is already set up.
+
+    The ``work setup-workspace`` command turns this into a hard error (the
+    user explicitly asked for "hard error if /workspace is already set up")
+    rather than clobbering an existing checkout.
+    """
+
+
+def _parse_host_project(repo_url: str) -> tuple[str | None, str | None]:
+    """Extract (host, project_path) from a resolved repository clone URL.
+
+    Handles both HTTPS (with optional embedded credentials) and SSH forms:
+      - https://oauth2:TOKEN@git.example.com/group/project.git -> (git.example.com, group/project)
+      - git@github.com:owner/repo                              -> (github.com, owner/repo)
+
+    Returns (None, None) when the URL can't be parsed. Credentials are never
+    returned — only the bare hostname.
+    """
+    if not repo_url:
+        return None, None
+
+    # SSH form: git@host:path
+    if repo_url.startswith("git@"):
+        after_at = repo_url[4:]
+        if ":" not in after_at:
+            return None, None
+        host, path = after_at.split(":", 1)
+        path = re.sub(r"\.git$", "", path).strip("/")
+        return (host or None), (path or None)
+
+    # URL form (use hostname so any embedded credentials are dropped)
+    try:
+        parsed = urlparse(repo_url)
+    except Exception:
+        return None, None
+    host = parsed.hostname
+    path = parsed.path.strip("/")
+    # Defensive: if a raw GitLab resource URL slipped through, keep only the
+    # project part before the /-/ separator.
+    if "/-/" in path:
+        path = path.split("/-/")[0].strip("/")
+    path = re.sub(r"\.git$", "", path)
+    return (host or None), (path or None)
+
+
+def _inject_token_into_repo_url(url: str) -> str:
+    """Inject an oauth2 token into a plain repository URL when one is available.
+
+    Standalone mirror of ``lmer_cli.tokens._inject_gitlab_token_if_available``
+    (kept in sync alongside the standalone ``_get_gitlab_token`` copy above).
+    Only used by setup_workspace's clone-URL resolution. A URL that already
+    carries credentials is returned unchanged.
+
+    NOTE: the ``REPO_AUTH_PREFER_SSH`` handling of the original is intentionally
+    omitted. The original routes SSH inputs through
+    ``_convert_ssh_to_https_if_token_available`` -> ``_prefer_ssh()``, so with
+    ``REPO_AUTH_PREFER_SSH=1`` and a token present it keeps the SSH URL; this
+    copy always injects a token-HTTPS URL instead. That is the right behavior
+    inside the container (no SSH keys available), but it is a real divergence —
+    do not reintroduce the SSH preference when keeping this in sync with
+    tokens.py.
+    """
+    if not url:
+        return url
+
+    # SSH form -> HTTPS with token, if a token exists for the host
+    if url.startswith("git@"):
+        after_at = url[4:]
+        if ":" not in after_at:
+            return url
+        host, path = after_at.split(":", 1)
+        token = _get_gitlab_token(host)
+        if token:
+            if not path.endswith(".git"):
+                path = f"{path}.git"
+            return f"https://oauth2:{token}@{host}/{path}"
+        return url
+
+    if not url.startswith("https://"):
+        return url
+
+    try:
+        parsed = urlparse(url)
+        # Don't double-inject if credentials are already present.
+        if parsed.username or parsed.password:
+            return url
+        token = _get_gitlab_token(parsed.hostname)
+        if not token:
+            return url
+        path = parsed.path
+        if not path.endswith(".git"):
+            path = f"{path}.git"
+        return f"https://oauth2:{token}@{parsed.hostname}{path}"
+    except Exception:
+        return url
+
+
+def _resolve_clone_url(target: str) -> str | None:
+    """Resolve a clone URL (with token auth when available) from a task target.
+
+    ``target`` may be a resource URL (MR/PR/issue/work_items link) or a plain
+    repository URL (HTTPS or SSH). Returns None if nothing usable can be
+    derived.
+    """
+    if not target:
+        return None
+    derived = _derive_repo_url_from_task_target(target)
+    if derived:
+        # _derive_... returns SSH form for GitHub (and tokenless GitLab);
+        # upgrade to HTTPS+token when a token is available so the clone can
+        # authenticate without SSH keys inside the container.
+        return _inject_token_into_repo_url(derived)
+    if target.startswith(("https://", "http://", "git@")):
+        return _inject_token_into_repo_url(target)
+    return None
+
+
+def _detect_and_sync_deps(workspace: Path) -> str:
+    """Run ``uv sync`` when the workspace is a uv-managed Python project.
+
+    Detection is deliberately conservative (mirrors what the user asked for in
+    issue #69): a project is treated as uv-managed when it has a ``uv.lock`` or
+    a ``[tool.uv]`` table in ``pyproject.toml``. Anything else is skipped — we
+    don't guess at other ecosystems. ``uv sync`` creates the project ``.venv``
+    that gate-check's test step prefers, fixing the false "module not found"
+    failures a hand-bootstrapped chat workspace otherwise produces.
+
+    A sync failure is reported but is NOT fatal: the clone + provisioned docs
+    are still useful, and the agent sees the captured error so it can act.
+
+    Returns a short human-readable status string.
+    """
+    pyproject = workspace / "pyproject.toml"
+    uv_lock = workspace / "uv.lock"
+
+    is_uv = uv_lock.exists()
+    if not is_uv and pyproject.exists():
+        try:
+            if "[tool.uv]" in pyproject.read_text(encoding="utf-8", errors="ignore"):
+                is_uv = True
+        except OSError:
+            pass
+
+    if not is_uv:
+        return "skipped (no uv.lock or [tool.uv] in pyproject.toml)"
+
+    if shutil.which("uv") is None:
+        print("⚠️  uv not found on PATH; skipping dependency sync", file=sys.stderr)
+        return "skipped (uv not found on PATH)"
+
+    print("📦 Syncing dependencies with `uv sync`...", file=sys.stderr)
+    result = subprocess.run(
+        ["uv", "sync"],
+        cwd=str(workspace),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        print("✅ uv sync completed", file=sys.stderr)
+        return "synced (uv sync)"
+
+    tail = [
+        line
+        for line in (result.stdout + result.stderr).splitlines()
+        if line.strip()
+    ][-10:]
+    print(f"⚠️  uv sync failed (exit {result.returncode}):", file=sys.stderr)
+    for line in tail:
+        print(f"   {line}", file=sys.stderr)
+    return f"FAILED (uv sync exited {result.returncode})"
+
+
+def _trust_mise_config(ws: Path) -> None:
+    """Trust the workspace's ``.mise.toml`` when ``LMER_TRUST_MISE`` opts in.
+
+    Mirrors what the container entrypoint applies at startup so that a workspace
+    bootstrapped mid-session via :func:`setup_workspace` behaves the same as one
+    a repo-targeted session gets — without this, mise emits a "config not
+    trusted" error on every subsequent shell command and never applies the
+    repo's pinned tool versions / env.
+
+    Gated behind ``LMER_TRUST_MISE`` because auto-trusting a cloned repo's
+    ``.mise.toml`` could let an untrusted repo install arbitrary tools or run
+    hooks. No-op when the workspace has no ``.mise.toml``.
+    """
+    mise_toml = ws / ".mise.toml"
+    if not mise_toml.exists():
+        return
+    if os.environ.get("LMER_TRUST_MISE", "").lower() in ("1", "true", "yes"):
+        try:
+            run(["mise", "trust", str(mise_toml)])
+        except Exception:
+            pass
+    else:
+        print("⚠️  Workspace has .mise.toml but LMER_TRUST_MISE is not set", file=sys.stderr)
+        print("   Set LMER_TRUST_MISE=1 in your .env to auto-trust workspace mise configs", file=sys.stderr)
+
+
+def setup_workspace(
+    target: str,
+    *,
+    task: str = "develop",
+    workspace: Path | str | None = None,
+    work_repo_path: Path | str | None = None,
+    global_path: Path | str | None = None,
+    sync_deps: bool = True,
+) -> dict:
+    """Bootstrap ``/workspace`` for a task target the way container startup does.
+
+    This is the engine behind ``work setup-workspace``. It performs, in order:
+
+    1. Refuse (raise WorkspaceExistsError) if ``workspace`` already contains a
+       git checkout or is otherwise non-empty.
+    2. Resolve a clone URL (with token auth) and parse host/project from the
+       ``target`` (an MR/PR/issue/work_items URL or a plain repo URL).
+    3. Export LMER_REPO_HOST / LMER_REPO_PROJECT / LMER_TASK / LMER_TASK_TARGET
+       into ``os.environ`` so documentation provisioning (and the caller) pick
+       up the right work-repo project path. NOTE: this only affects the current
+       process and its children — see the ``work`` CLI for how the values are
+       surfaced to the rest of the session.
+    4. Clone the repository into ``workspace``.
+    5. For a GitLab MR target, fetch and check out the MR source branch (same
+       behavior the container entrypoint applies via GITLAB_MR_ID).
+    6. Trust the workspace ``.mise.toml`` (same as the container entrypoint),
+       gated behind ``LMER_TRUST_MISE``.
+    7. Ensure the work-repo directory structure exists for this project/task.
+    8. Provision missing documentation (AGENTS.md, rules/) from the work repo
+       or lmer defaults.
+    9. Sync dependencies (``uv sync``) when it's a uv project, unless disabled.
+
+    Args:
+        target: Task target — a resource URL or plain repository URL.
+        task: Task type used for the work-repo directory layout / LMER_TASK
+            (defaults to "develop", the typical chat-pivots-to-dev case).
+        workspace: Target checkout dir (defaults to /workspace).
+        work_repo_path: Work repo location (defaults to $LMER_WORK_REPO_PATH or /work).
+        global_path: lmer global dir for doc defaults (defaults to /Agents/global).
+        sync_deps: Run dependency sync when True (default).
+
+    Returns:
+        A dict with keys: host, project, task, task_target, branch,
+        provisioned (list), deps_status (str), repo_url (token stripped),
+        workspace (str).
+
+    Raises:
+        WorkspaceExistsError: workspace already set up.
+        ValueError: target can't be resolved to a host/project.
+    """
+    ws = Path(workspace).resolve() if workspace else Path("/workspace").resolve()
+    if work_repo_path:
+        work_repo_path = Path(work_repo_path).resolve()
+    else:
+        work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work")).resolve()
+    global_path = Path(global_path) if global_path else Path("/Agents/global")
+
+    # 1. Refuse to clobber an existing checkout — "hard error if already set up".
+    if ws.exists():
+        if (ws / ".git").exists():
+            raise WorkspaceExistsError(
+                f"{ws} already contains a git checkout — refusing to set it up again"
+            )
+        if any(ws.iterdir()):
+            raise WorkspaceExistsError(
+                f"{ws} is not empty — refusing to set up over existing files"
+            )
+
+    # 2. Resolve clone URL + host/project.
+    repo_url = _resolve_clone_url(target)
+    if not repo_url:
+        raise ValueError(
+            f"Could not derive a repository URL from target: {target!r}"
+        )
+    host, project = _parse_host_project(repo_url)
+    if not host or not project:
+        raise ValueError(
+            f"Could not parse host/project from the resolved repository URL "
+            f"for target: {target!r}"
+        )
+
+    # 3. Export routing env so provision_documentation (which reads os.environ)
+    #    finds the correct work-repo project path, and the caller can surface
+    #    them for the rest of the session.
+    os.environ["LMER_REPO_HOST"] = host
+    os.environ["LMER_REPO_PROJECT"] = project
+    os.environ["LMER_TASK"] = task
+    os.environ["LMER_TASK_TARGET"] = target
+
+    # 4. Clone. repo_url carries the live token, and a failing git command
+    #    surfaces it via str(CalledProcessError) (e.cmd includes the URL) —
+    #    scrub at the source so no caller can print the secret (the same bug
+    #    class !104 fixed on the entrypoint clone paths). Re-raised as
+    #    RuntimeError: the original exception's cmd/args would still hold the
+    #    token, so a scrubbed-message copy is the only safe thing to keep.
+    print(f"📦 Cloning {host}/{project} into {ws}...", file=sys.stderr)
+    try:
+        ensure_clone(ws, repo_url, None, None)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"clone failed: {_scrub_credentials(str(e))}") from None
+
+    # 5. GitLab MR source-branch checkout (mirrors container startup).
+    _, _, mr_id = _parse_gitlab_mr_url(target)
+    git_remote = os.environ.get("LMER_GIT_REMOTE", "origin")
+    if mr_id:
+        print(
+            f"🔍 Fetching GitLab MR {mr_id} source branch (remote: {git_remote})...",
+            file=sys.stderr,
+        )
+        try:
+            _fetch_and_checkout_mr(ws, mr_id, git_remote)
+            print(f"✅ Checked out MR {mr_id} branch (mr-{mr_id})", file=sys.stderr)
+        except subprocess.CalledProcessError as e:
+            # Defensive scrub: the fetch/checkout commands carry only the
+            # remote NAME today, but keep this print token-safe regardless.
+            print(
+                f"⚠️  Failed to checkout MR {mr_id} branch: {_scrub_credentials(str(e))}",
+                file=sys.stderr,
+            )
+
+    # 6. Trust workspace mise config (mirrors container startup's main()), so
+    #    mise-managed repos don't warn on every command and the pinned toolset
+    #    is applied. Must precede dependency sync, which may use mise tools.
+    _trust_mise_config(ws)
+
+    # 7. Work-repo directory structure.
+    try:
+        ensure_work_repo_directory(work_repo_path, host, project, task, target)
+    except OSError as e:
+        print(f"⚠️  Failed to create work repo directory structure: {e}", file=sys.stderr)
+
+    # 8. Provision documentation.
+    provisioned: list[str] = []
+    if (ws / ".git").exists() and global_path.exists():
+        try:
+            provisioned = provision_documentation(ws, work_repo_path, global_path)
+        except Exception as e:
+            print(f"⚠️  Failed to provision documentation: {e}", file=sys.stderr)
+
+    # 9. Dependency sync.
+    deps_status = "skipped (sync disabled)"
+    if sync_deps:
+        deps_status = _detect_and_sync_deps(ws)
+
+    # Record the resulting branch for the summary.
+    branch = None
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(ws), "branch", "--show-current"],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode == 0:
+            branch = r.stdout.strip() or None
+    except Exception:
+        pass
+
+    return {
+        "host": host,
+        "project": project,
+        "task": task,
+        "task_target": target,
+        "branch": branch,
+        "provisioned": provisioned,
+        "deps_status": deps_status,
+        # Token stripped so callers/logs never see the secret.
+        "repo_url": f"https://{host}/{project}",
+        "workspace": str(ws),
+    }
+
+
 def _forward_signals(proc: subprocess.Popen) -> None:
     """Forward SIGTERM/SIGINT to the runner child.
 
@@ -657,8 +1240,8 @@ def mint_session_id() -> None:
 
 
 def dispatch_runner(runner: str) -> int:
-    """Run claude-runner as a child (not execv) so post-session teardown can
-    run while the container is still alive. Returns the runner's exit code."""
+    """Run the harness runner as a child (not execv) so post-session teardown
+    can run while the container is still alive. Returns the runner's exit code."""
     mint_session_id()
     proc = subprocess.Popen([runner])
     _forward_signals(proc)
@@ -721,17 +1304,19 @@ def main(argv: list[str] | None = None) -> int:
             check_call(["git", "config", "--global", "--add", "safe.directory", str(ws)])
         except Exception:
             pass
-        # Checkout branch or ref if specified
+        # Checkout branch or ref if specified. _lfs_safe_git: the bind-mounted
+        # checkout must not get repo-local LFS-skip config, but the checkout
+        # still has to survive a missing git-lfs — process-scoped -c flags do.
         if ref:
             try:
-                check_call(["git", "-C", str(ws), "fetch", "--all", "--tags"])
-                check_call(["git", "-C", str(ws), "checkout", "--detach", ref])
+                check_call(_lfs_safe_git("-C", str(ws), "fetch", "--all", "--tags"))
+                check_call(_lfs_safe_git("-C", str(ws), "checkout", "--detach", ref))
             except subprocess.CalledProcessError as e:
                 print(f"⚠️  Failed to checkout ref {ref}: {e}", file=sys.stderr)
         elif branch:
-            rc = run(["git", "-C", str(ws), "switch", branch])
+            rc = run(_lfs_safe_git("-C", str(ws), "switch", branch))
             if rc != 0:
-                rc = run(["git", "-C", str(ws), "checkout", branch])
+                rc = run(_lfs_safe_git("-C", str(ws), "checkout", branch))
                 if rc != 0:
                     print(f"⚠️  Failed to checkout branch {branch}", file=sys.stderr)
     elif no_repo_mode and not repo_url:
@@ -749,19 +1334,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"❌ git operation failed: {_scrub_credentials(str(e))}", file=sys.stderr)
             return e.returncode or 1
 
-    # Trust workspace mise config if present and opt-in via LMER_TRUST_MISE.
-    # Gated behind an env var because auto-trusting .mise.toml from cloned repos
-    # could allow untrusted repos to install arbitrary tools or run hooks.
-    mise_toml = ws / ".mise.toml"
-    if mise_toml.exists():
-        if os.environ.get("LMER_TRUST_MISE", "").lower() in ("1", "true", "yes"):
-            try:
-                run(["mise", "trust", str(mise_toml)])
-            except Exception:
-                pass
-        else:
-            print(f"⚠️  Workspace has .mise.toml but LMER_TRUST_MISE is not set", file=sys.stderr)
-            print(f"   Set LMER_TRUST_MISE=1 in your .env to auto-trust workspace mise configs", file=sys.stderr)
+    # Trust workspace mise config (shared with setup_workspace) so mise-managed
+    # repos don't warn on every command; gated behind LMER_TRUST_MISE.
+    _trust_mise_config(ws)
 
     # For GitLab MRs, checkout the MR source branch if no explicit branch/ref was given.
     # Skip in service mode — the user's checkout is already set up and remote auth
@@ -772,9 +1347,7 @@ def main(argv: list[str] | None = None) -> int:
     if gitlab_mr_id and not branch and not ref and not service_mode:
         print(f"🔍 Detected GitLab MR {gitlab_mr_id}, attempting to fetch and checkout MR branch (remote: {git_remote})...", file=sys.stderr)
         try:
-            check_call(["git", "-C", str(ws), "fetch", git_remote,
-                        f"merge-requests/{gitlab_mr_id}/head:mr-{gitlab_mr_id}"])
-            check_call(["git", "-C", str(ws), "checkout", f"mr-{gitlab_mr_id}"])
+            _fetch_and_checkout_mr(ws, gitlab_mr_id, git_remote)
             print(f"✅ Checked out MR {gitlab_mr_id} branch (mr-{gitlab_mr_id})", file=sys.stderr)
         except subprocess.CalledProcessError as e:
             print(f"⚠️  Failed to checkout MR {gitlab_mr_id} branch: {e}", file=sys.stderr)
@@ -824,9 +1397,30 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as e:
             print(f"⚠️  Failed to provision documentation: {e}", file=sys.stderr)
 
+    # --- Optional napkin/taskdef auxiliary repos + stable home symlinks ---
+    napkin_repo_url = os.environ.get("LMER_NAPKIN_REPO")
+    taskdef_repo_url = os.environ.get("LMER_TASKDEF_REPO")
+    taskdef_ref = os.environ.get("LMER_TASKDEF_REF")
+    clone_aux_repos(napkin_repo_url, taskdef_repo_url, taskdef_ref)
+
+    napkin_path = Path(os.environ.get("LMER_NAPKIN_PATH", str(work_repo_path / "napkin")))
+    home = Path(os.environ.get("HOME", "/home/developer"))
+    setup_napkin_and_links(
+        work_repo_path, napkin_path, napkin_is_separate=bool(napkin_repo_url), home=home
+    )
+
     # Dispatch
-    if len(cmd_tokens) == 1 and cmd_tokens[0] == "claude-runner":
-        runner = find_runner()
+    if len(cmd_tokens) == 1 and cmd_tokens[0] in KNOWN_HARNESS_RUNNERS:
+        harness = cmd_tokens[0][: -len("-runner")]
+        runner = find_runner(harness)
+        if runner is None:
+            print(
+                f"❌ This image has no runner for harness '{harness}' "
+                f"({harness}-runner.sh not found). Rebuild the image with a "
+                f"lmer version that includes it: lmer build",
+                file=sys.stderr,
+            )
+            return 3
         return dispatch_runner(runner)
 
     # Otherwise, treat tokens as a command to exec via bash -lc

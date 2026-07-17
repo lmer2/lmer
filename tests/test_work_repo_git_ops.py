@@ -9,11 +9,14 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from work_repo.git_ops import (
-    run_git_command,
+    UNTRACKED_REPORT_CAP,
+    commit_napkin_if_subdir,
     commit_work_changes,
     commit_work_path,
+    push_napkin_if_separate,
     report_uncommitted_work_items,
-    UNTRACKED_REPORT_CAP,
+    run_dir_push_status,
+    run_git_command,
 )
 
 
@@ -388,6 +391,37 @@ class TestCommitWorkPathResilience:
                 ]]
 
 
+    def test_commit_work_changes_includes_specs_index(self, tmp_path):
+        """The specs index is staged when it exists (review on !126): entries
+        created by the masterplan sync, `specs-index --rebuild`, and the
+        freeze-rename re-point must reach the remote via `work commit`, not
+        only via `work artifact`."""
+        env_vars = {
+            "LMER_WORK_REPO_PATH": str(tmp_path),
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "grp/proj",
+            "LMER_TASK": "develop",
+            "LMER_TASK_TARGET": "https://git.example.com/grp/proj/-/issues/9",
+        }
+        task_dir = tmp_path / "git.example.com/grp/proj/develop/issue-9"
+        specs_dir = tmp_path / "git.example.com/grp/proj/specs"
+        task_dir.mkdir(parents=True)
+        specs_dir.mkdir(parents=True)
+
+        def side_effect(cmd, cwd, check=False):
+            if cmd[0] == "status":
+                return (0, "M  x\n")
+            return (0, "")
+
+        with patch.dict(os.environ, env_vars):
+            with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
+                assert commit_work_changes() == 0
+                add_calls = [call[0][0] for call in mock_git.call_args_list
+                             if call[0][0][:3] == ["add", "-A", "--"]]
+                assert len(add_calls) == 1
+                assert "git.example.com/grp/proj/specs" in add_calls[0]
+
+
 class TestReportUncommittedWorkItems:
     """report_uncommitted_work_items: the issue #85 stray-file reminder.
 
@@ -517,3 +551,279 @@ class TestReportUncommittedWorkItems:
         assert "more" not in out  # no overflow tail exactly at the cap
         item_lines = [ln for ln in out.splitlines() if ln.strip().startswith("??")]
         assert len(item_lines) == UNTRACKED_REPORT_CAP
+
+
+def _git(cwd, *args):
+    subprocess.run(
+        ["git", "-C", str(cwd),
+         "-c", "user.name=test", "-c", "user.email=test@example.com",
+         *args],
+        check=True, capture_output=True,
+    )
+
+
+def _clone_with_run_dir(tmp_path):
+    """Bare origin + clone holding a committed-and-pushed run dir — the same
+    harness shape as the Stop-hook guard tests whose trigger-2 predicate
+    run_dir_push_status mirrors."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
+    clone = tmp_path / "workrepo"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)],
+        check=True, capture_output=True,
+    )
+    run_dir = clone / "git.example.com" / "org/repo" / "runs" / "develop-issue-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "notes.md").write_text("artifact\n")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-q", "-m", "run dir")
+    _git(clone, "push", "-q", "-u", "origin", "main")
+    return clone, run_dir
+
+
+class TestRunDirPushStatus:
+    """The issue #100 phase-boundary predicate — trigger-2 semantics."""
+
+    def test_clean_and_pushed(self, tmp_path):
+        _, run_dir = _clone_with_run_dir(tmp_path)
+        assert run_dir_push_status(run_dir) == (False, False)
+
+    def test_dirty_run_dir(self, tmp_path):
+        _, run_dir = _clone_with_run_dir(tmp_path)
+        (run_dir / "scratch.md").write_text("uncommitted\n")
+        assert run_dir_push_status(run_dir) == (True, False)
+
+    def test_unpushed_commit(self, tmp_path):
+        clone, run_dir = _clone_with_run_dir(tmp_path)
+        (run_dir / "notes.md").write_text("amended\n")
+        _git(clone, "add", ".")
+        _git(clone, "commit", "-q", "-m", "local only")  # no push
+        assert run_dir_push_status(run_dir) == (False, True)
+
+    def test_dirt_outside_run_dir_does_not_count(self, tmp_path):
+        clone, run_dir = _clone_with_run_dir(tmp_path)
+        (clone / "elsewhere.md").write_text("other project\n")
+        assert run_dir_push_status(run_dir) == (False, False)
+
+    def test_missing_dir_fails_open(self, tmp_path):
+        assert run_dir_push_status(tmp_path / "absent") == (False, False)
+
+    def test_non_git_dir_fails_open(self, tmp_path):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "junk.md").write_text("dirty-looking but ungoverned\n")
+        assert run_dir_push_status(plain) == (False, False)
+
+    def test_no_upstream_reads_as_pushed(self, tmp_path):
+        # Local-only repo: ahead-of-upstream is unknowable — fail open, but
+        # the dirty half still works independently.
+        repo = tmp_path / "local"
+        repo.mkdir()
+        _git(repo, "init", "-q", "-b", "main")
+        (repo / "notes.md").write_text("artifact\n")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-q", "-m", "local only")
+        assert run_dir_push_status(repo) == (False, False)
+        (repo / "scratch.md").write_text("uncommitted\n")
+        assert run_dir_push_status(repo) == (True, False)
+
+
+def _git_init(path):
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+
+
+class TestCommitNapkinIfSubdir:
+    def test_no_napkin_path_is_noop(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert commit_napkin_if_subdir() == 0
+
+    def test_separate_repo_is_noop(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        napkin = tmp_path / "napkin"
+        _git_init(napkin)
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command") as mock_git:
+                assert commit_napkin_if_subdir() == 0
+                mock_git.assert_not_called()
+
+    def test_nested_git_repo_under_work_is_noop(self, tmp_path):
+        work = tmp_path / "work"
+        napkin = work / "napkin"
+        _git_init(napkin)  # its own repo — unreachable via the work repo's index
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command") as mock_git:
+                assert commit_napkin_if_subdir() == 0
+                mock_git.assert_not_called()
+
+    def test_missing_napkin_dir_is_noop(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        env = {"LMER_NAPKIN_PATH": str(work / "napkin"), "LMER_WORK_REPO_PATH": str(work)}
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command") as mock_git:
+                assert commit_napkin_if_subdir() == 0
+                mock_git.assert_not_called()
+
+    def test_subdir_notes_are_staged_committed_and_pushed(self, tmp_path):
+        """Regression: notes under {work_repo}/napkin/ must be captured by
+        work commit — commit_work_changes stages only the task-target and
+        run-dir paths, so without this pass subdir-mode notes were silently
+        lost when the ephemeral container exited."""
+        work = tmp_path / "work"
+        napkin = work / "napkin"
+        (napkin / "org-a").mkdir(parents=True)
+        (napkin / "org-a" / "note.md").write_text("finding")
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+        with patch.dict(os.environ, env, clear=True):
+            with patch(
+                "work_repo.git_ops.run_git_command",
+                return_value=(0, "A  napkin/org-a/note.md"),
+            ) as mock_git:
+                assert commit_napkin_if_subdir("msg") == 0
+        calls = [c.args[0] for c in mock_git.call_args_list]
+        assert ["add", "-A", "--", "napkin"] in calls
+        assert ["commit", "-m", "msg"] in calls
+        assert ["push"] in calls
+        # Everything runs against the work repo, not the napkin path.
+        assert all(c.args[1] == Path(str(work)) for c in mock_git.call_args_list)
+
+    def test_default_commit_message(self, tmp_path):
+        work = tmp_path / "work"
+        napkin = work / "napkin"
+        napkin.mkdir(parents=True)
+        (napkin / "note.md").write_text("x")
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+        with patch.dict(os.environ, env, clear=True):
+            with patch(
+                "work_repo.git_ops.run_git_command",
+                return_value=(0, "A  napkin/note.md"),
+            ) as mock_git:
+                assert commit_napkin_if_subdir() == 0
+        calls = [c.args[0] for c in mock_git.call_args_list]
+        assert ["commit", "-m", "Update napkin notes"] in calls
+
+
+class TestPushNapkinIfSeparate:
+    def test_no_napkin_path_is_noop(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert push_napkin_if_separate() == 0
+
+    def test_non_git_napkin_is_noop(self, tmp_path):
+        napkin = tmp_path / "napkin"
+        napkin.mkdir()
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(tmp_path / "work")}
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command") as mock_git:
+                assert push_napkin_if_separate() == 0
+                mock_git.assert_not_called()
+
+    def test_subdir_napkin_is_noop(self, tmp_path):
+        work = tmp_path / "work"
+        napkin = work / "napkin"
+        _git_init(napkin)  # even with a .git, being under work means skip
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command") as mock_git:
+                assert push_napkin_if_separate() == 0
+                mock_git.assert_not_called()
+
+    def test_separate_repo_runs_full_flow(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        napkin = tmp_path / "napkin"
+        _git_init(napkin)
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command", return_value=(0, " M note.md")) as mock_git:
+                rc = push_napkin_if_separate("msg")
+        assert rc == 0
+        commands = [c.args[0][0] for c in mock_git.call_args_list]
+        assert "push" in commands
+        assert "commit" in commands
+
+    def test_separate_repo_no_changes_skips_push(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        napkin = tmp_path / "napkin"
+        _git_init(napkin)
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+
+        def fake_git(cmd, cwd, check=False):
+            if cmd[0] == "status":
+                return (0, "")  # clean
+            return (0, "")
+
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command", side_effect=fake_git) as mock_git:
+                rc = push_napkin_if_separate()
+        assert rc == 0
+        commands = [c.args[0][0] for c in mock_git.call_args_list]
+        assert "push" not in commands
+
+    def test_push_failure_returns_nonzero(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        napkin = tmp_path / "napkin"
+        _git_init(napkin)
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+
+        def fake_git(cmd, cwd, check=False):
+            if cmd[0] == "status":
+                return (0, " M note.md")
+            if cmd[0] == "push":
+                return (1, "rejected")
+            return (0, "")
+
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command", side_effect=fake_git):
+                rc = push_napkin_if_separate()
+        assert rc == 1
+
+    def test_commit_first_then_rebase_and_push_retry(self, tmp_path):
+        """Dirty tree + moved remote: the napkin flow must commit FIRST (a
+        plain pull refuses on a dirty tree), integrate with pull --rebase,
+        and retry a rejected push with a rebase in between — same ordering
+        as commit_work_path, because a shared napkin repo has concurrent
+        writers by design."""
+        work = tmp_path / "work"
+        work.mkdir()
+        napkin = tmp_path / "napkin"
+        _git_init(napkin)
+        env = {"LMER_NAPKIN_PATH": str(napkin), "LMER_WORK_REPO_PATH": str(work)}
+        calls = []
+
+        def fake_git(cmd, cwd, check=False):
+            calls.append(cmd)
+            if cmd[0] == "status":
+                return (0, " M note.md")
+            if cmd == ["push"]:
+                # First push rejected (non-FF), second succeeds.
+                if [c for c in calls if c == ["push"]] == [["push"]]:
+                    return (1, "! [rejected] main -> main (fetch first)")
+                return (0, "")
+            return (0, "")
+
+        with patch.dict(os.environ, env, clear=True):
+            with patch("work_repo.git_ops.run_git_command", side_effect=fake_git):
+                assert push_napkin_if_separate("msg") == 0
+
+        commit_i = calls.index(["commit", "-m", "msg"])
+        first_rebase_i = next(i for i, c in enumerate(calls) if c == ["pull", "--rebase"])
+        assert commit_i < first_rebase_i, calls
+        # No plain (non-rebase) pull anywhere — it would refuse on dirty trees.
+        assert ["pull"] not in calls
+        push_indices = [i for i, c in enumerate(calls) if c == ["push"]]
+        assert len(push_indices) == 2
+        rebases_between = [
+            c for c in calls[push_indices[0] + 1:push_indices[1]]
+            if c == ["pull", "--rebase"]
+        ]
+        assert rebases_between, "must rebase between push attempts"

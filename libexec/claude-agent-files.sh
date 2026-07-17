@@ -65,6 +65,57 @@ claude_link_agent_files() {
             echo "✅ Linked $linked_work work-repo $subdir into $target"
         fi
     done
+
+    claude_render_dispatch_lanes "$home_claude" "$global_src" "$work_src"
+    return 0
+}
+
+# claude_render_dispatch_lanes <home_claude> <global_src> <work_src>
+#   Post-link render pass for the five dispatch lanes (LMER_DISPATCH_<LANE>,
+#   value model[:effort]). A configured lane's agent symlink is replaced by
+#   a real file whose frontmatter carries the configured model/effort; an
+#   unset lane is forced back to the bare symlink so a stale materialized
+#   copy never outlives its configuration. Parsing and rendering live in
+#   lmer_cli.container.dispatch_agents (the python side owns the lane→agent
+#   map; the stem list below is only the cheap skip-gate and must match it).
+#   Fail-soft: a render problem warns and leaves the linked defs standing.
+claude_render_dispatch_lanes() {
+    local home_claude="$1"
+    local global_src="$2"
+    local work_src="$3"
+    local agents_dir="$home_claude/agents"
+
+    [ -d "$agents_dir" ] || return 0
+
+    # Skip the python spawn when nothing is configured AND no lane file
+    # needs repair — a stale materialized real file from a previously
+    # configured lane, or a dangling symlink whose source went away (both
+    # sides of the invariant: correct layout regardless of pre-existing
+    # state).
+    local need_render=0 stem
+    if [ -n "${LMER_DISPATCH_REVIEW}${LMER_DISPATCH_DESIGN}${LMER_DISPATCH_CODE}${LMER_DISPATCH_MECHANICAL}${LMER_DISPATCH_EXPLORE}" ]; then
+        need_render=1
+    else
+        for stem in adversarial-reviewer designer coder mechanical explorer; do
+            if [ -e "$agents_dir/$stem.md" ] && [ ! -L "$agents_dir/$stem.md" ]; then
+                need_render=1
+                break
+            fi
+            if [ -L "$agents_dir/$stem.md" ] && [ ! -e "$agents_dir/$stem.md" ]; then
+                need_render=1
+                break
+            fi
+        done
+    fi
+    [ "$need_render" = "1" ] || return 0
+
+    local global_agents="" work_agents=""
+    [ -n "$global_src" ] && global_agents="$global_src/agents"
+    [ -n "$work_src" ] && work_agents="$work_src/agents"
+    if ! "${LMER_PYTHON:-python3}" -m lmer_cli.container.dispatch_agents \
+        "$agents_dir" --global-src "$global_agents" --work-src "$work_agents"; then
+        echo "⚠️  Dispatch lane render failed (lmer_cli.container.dispatch_agents) — agent defs left as linked"
+    fi
     return 0
 }
 

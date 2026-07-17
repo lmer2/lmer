@@ -37,6 +37,7 @@ from typing import Optional
 
 import yaml
 
+from . import specs_index
 from .utils import _work_repo_base, redact_secrets, sanitize_task_target
 
 SCHEMA_VERSION = 1
@@ -79,6 +80,8 @@ STATUSES = ("in-progress", "complete", "archived")
 # A foreign owner claim younger than this is treated as a live concurrent
 # session (warn loudly); older claims are reported as stale (likely a crash).
 STALE_CLAIM_MINUTES = 120
+# The one-line seed excerpt in the completed-run direction contract (#96).
+SEED_EXCERPT_MAX_LEN = 120
 
 
 class RunStateError(Exception):
@@ -258,7 +261,9 @@ def seed_state(slug: str, taskdef: str, target: str) -> dict:
         "phase": None,
         "stop_reason": None,
         "critical_error": None,
+        "open_question": None,
         "goal": None,
+        "estimate": None,
         "artifacts": {},
         "owner": None,
         "frozen": None,
@@ -411,6 +416,16 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
         append_event(rdir, "run_dir_renamed", note=f"runs/{old_name} -> runs/{final_name}")
     except OSError as exc:
         print(f"⚠️  run_dir_renamed event not recorded: {exc}")
+    # Specs-index entries are relative symlinks into runs/<dirname>/ — the
+    # rename would leave them dangling (and the label change from slug to
+    # name defeats upsert's stale-cleanup), so re-point them now. Fail-soft
+    # both here and inside (index maintenance never fails a freeze).
+    try:
+        specs_index.repoint_run_dir_entries(
+            old_name, final_name, specs_index.run_label(rdir, state)
+        )
+    except Exception as exc:
+        print(f"⚠️  specs index re-point failed (continuing): {exc}")
     return rdir, old_name
 
 
@@ -670,6 +685,56 @@ def format_ledger(ledger: Optional[dict]) -> str:
     return "\n".join(lines)
 
 
+def answer_question(rdir: Path, state: dict, answer: str) -> dict:
+    """Apply a human's answer to the run's recorded open question (issue #98).
+
+    Appends a `question_answered` event carrying both texts (secret-redacted
+    like every other free-text writer), clears `open_question`, and clears
+    `stop_reason` — the question stop is resolved. `status` is deliberately
+    left untouched: an in-progress run stays in-progress, and a COMPLETED
+    run is never flipped back silently — reopening goes through the #96
+    completed-run directive. Persists through the single writer
+    (write_state) and returns the updated state.
+    """
+    question = state.get("open_question")
+    if not question:
+        raise RunStateError("no open question recorded — nothing to answer")
+    data = {
+        "question": redact_secrets(str(question)),
+        "answer": redact_secrets(answer),
+    }
+    state["open_question"] = None
+    state["stop_reason"] = None
+    write_state(rdir, state)
+    append_event(rdir, "question_answered", note=data["answer"], data=data)
+    return state
+
+
+def count_session_starts(events: list[dict]) -> int:
+    """The run's sessions-used actual (issue #99): how many `session_start`
+    events are in `events` (pass read_events(rdir, last_n=0) for the whole
+    run). Pure — the caller owns reading events, like decide()'s inputs."""
+    return sum(
+        1 for e in events if isinstance(e, dict) and e.get("type") == "session_start"
+    )
+
+
+def format_estimate(estimate: Optional[dict]) -> Optional[str]:
+    """Human form of state.estimate (issue #99): `~3 sessions / 4h`, either
+    part alone when the other is unset. None when there is nothing usable —
+    an absent/malformed estimate (legacy or hand-edited state) must never
+    break the brief. `time` is a free-form human string, never parsed."""
+    if not isinstance(estimate, dict):
+        return None
+    parts = []
+    sessions = estimate.get("sessions")
+    if isinstance(sessions, int) and not isinstance(sessions, bool) and sessions > 0:
+        parts.append(f"~{sessions} session{'s' if sessions != 1 else ''}")
+    if estimate.get("time"):
+        parts.append(str(estimate["time"]))
+    return " / ".join(parts) if parts else None
+
+
 def _iso_to_minutes_apart(earlier: str, later: str) -> Optional[float]:
     """Minutes between two ISO-8601 Z timestamps; None if unparseable."""
     try:
@@ -686,6 +751,7 @@ def decide(
     session: str,
     now: Optional[str] = None,
     ledger: Optional[dict] = None,
+    sessions_used: Optional[int] = None,
 ) -> dict:
     """Pure resume decision (spec §4.3 `work resume`). No fs, no env reads —
     fully unit-testable; all inputs are passed in by the caller."""
@@ -710,10 +776,23 @@ def decide(
         "slug": state.get("slug"),
         "name": state.get("name"),
         "status": state.get("status"),
+        # Structural signal for guard JSON / brief consumers (issue #96):
+        # a finished run must never be silently resumed. `archived` counts —
+        # until the external cleaner moves the dir under runs/archive/ the
+        # slug still resolves here.
+        "completed_run": state.get("status") in ("complete", "archived"),
         "phase": state.get("phase"),
         "stop_reason": state.get("stop_reason"),
         "critical_error": state.get("critical_error"),
+        # The blocking question's text (issue #97): recorded alongside
+        # stop_reason=question so it survives the session that asked it.
+        "open_question": state.get("open_question"),
         "goal": state.get("goal"),
+        # Session estimate recorded with the goal (issue #99), plus the
+        # sessions-used actual — computed from events by the caller (this
+        # function stays IO-free) and None when the caller didn't count.
+        "estimate": state.get("estimate"),
+        "sessions_used": sessions_used,
         "artifacts": state.get("artifacts") or {},
         # Full ledger for --json consumers; the brief renders the one-line
         # summary from it (issue #89).
@@ -723,8 +802,21 @@ def decide(
     }
 
 
-def format_brief(decision: dict) -> str:
-    """Human-readable resume brief for prompt injection."""
+def format_brief(
+    decision: dict,
+    seed: str | None = None,
+    answered: Optional[dict] = None,
+    run_dir_url: Optional[str] = None,
+) -> str:
+    """Human-readable resume brief for prompt injection. `seed` is the
+    launch prompt (LMER_START_PROMPT), passed in by the caller — it selects
+    which direction line the completed-run directive renders (issue #96).
+    `answered` is a `{question, answer}` pair when a pushed answer was just
+    applied on the way in (issue #98: `lmer --answer` → LMER_ANSWER at
+    session start) — it leads the brief, since the answer IS the direction.
+    `run_dir_url` is the run dir's web (tree) URL, derived by the caller
+    (this function stays IO-free) and appended as the brief's final line
+    when derivable (issue #104)."""
     if decision.get("kind") != "run":
         return "No run state found — this is a fresh run."
     if decision.get("name"):
@@ -734,10 +826,34 @@ def format_brief(decision: dict) -> str:
         )
     else:
         header = f"Run: {decision['slug']} (status: {decision['status']})"
-    lines = [
+    lines = []
+    # A question answered on the way in (issue #98) leads everything: the
+    # previous session stopped on it, and the answer is the new direction.
+    if answered:
+        lines.append("✅ ANSWERED QUESTION (this run's blocking question has its answer):")
+        lines.append(f"Q: {answered.get('question')}")
+        lines.append(f"A: {answered.get('answer')}")
+        lines.append("Proceed accordingly — record the follow-up goal/phase as you go.")
+        lines.append("")
+    # A run stopped on a blocking question surfaces it FIRST (issue #97):
+    # the answer gates everything else the brief has to say.
+    if decision.get("stop_reason") == "question" and decision.get("open_question"):
+        lines.append("❓ OPEN QUESTION (answer before anything else):")
+        lines.append(str(decision["open_question"]))
+        lines.append("")
+    lines += [
         header,
         f"Phase: {decision['phase'] or '—'}   Stop reason: {decision['stop_reason'] or '—'}",
     ]
+    # Estimate recorded with the goal (issue #99), with the sessions-used
+    # actual beside it when the caller counted one.
+    estimate_text = format_estimate(decision.get("estimate"))
+    if estimate_text:
+        line = f"Estimate: {estimate_text}"
+        used = decision.get("sessions_used")
+        if used is not None:
+            line += f" — used: {used} session{'s' if used != 1 else ''}"
+        lines.append(line)
     if decision.get("critical_error"):
         crit = decision["critical_error"]
         summary = crit.get("summary", "?") if isinstance(crit, dict) else str(crit)
@@ -758,6 +874,29 @@ def format_brief(decision: dict) -> str:
         for event in events:
             note = f" — {event['note']}" if event.get("note") else ""
             lines.append(f"  {event.get('ts', '?')} [{event.get('type', '?')}]{note}")
+    if decision.get("completed_run"):
+        lines.append("")
+        lines.append("⚠️  COMPLETED RUN — direction contract:")
+        lines.append("This run is finished. Do NOT resume it or invent work.")
+        if seed:
+            seed = " ".join(seed.split())  # keep the brief field one-line
+            excerpt = (seed if len(seed) <= SEED_EXCERPT_MAX_LEN
+                       else seed[:SEED_EXCERPT_MAX_LEN] + "…")
+            lines.append(f"Seed provided (LMER_START_PROMPT): {excerpt}")
+            lines.append(
+                'Record it as the goal (`work goal "<seed>"`), reopen with '
+                "`work state set --status=in-progress --stop-reason=none`, "
+                "then proceed on the seed."
+            )
+        else:
+            lines.append(
+                "No seed — ask the user (new target vs continue this run). "
+                "If the question goes unanswered, record "
+                '`work state set --stop-reason=question --question "<text>"` '
+                "and end the session — never proceed on a guess."
+            )
+    if run_dir_url:
+        lines.append(f"Run dir: {run_dir_url}")
     return "\n".join(lines)
 
 
@@ -780,9 +919,14 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
     skipped — this never raises, and a run without a masterplan/ dir is
     untouched (no state write).
 
+    Bundle specs also land in the project-level specs index (issue #101),
+    linked to the BUNDLE file — the one canonical target — never to the
+    run-root convenience symlink made here.
+
     Returns the list of link names now present at the run-dir root.
     """
     linked: list[str] = []
+    spec_files: list[tuple[Path, str]] = []  # (bundle file, run-root link name)
     try:
         mp_dir = rdir / MASTERPLAN_DIR
         if not mp_dir.is_dir():
@@ -796,6 +940,8 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
                 if not (bundle / name).is_file():
                     continue
                 link_name = f"{bundle.name}-{name}" if prefixed else name
+                if specs_index.is_spec_artifact(name):
+                    spec_files.append((bundle / name, link_name))
                 target = os.path.join(MASTERPLAN_DIR, bundle.name, name)
                 link_path = rdir / link_name
                 try:
@@ -838,6 +984,17 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
                         write_state(rdir, state)
             except Exception as exc:
                 print(f"⚠️  masterplan artifact sync: could not register in state: {exc}")
+        # Specs index (issue #101): each bundle spec gets a dated entry
+        # under {host}/{project}/specs/ pointing at the bundle file — the
+        # canonical target, never the run-root symlink made above. The
+        # entry basename is the run-root link name so multi-bundle specs
+        # stay distinct. upsert_spec_link is fail-soft on its own; the
+        # label lookup uses the best-effort sibling reader, so neither a
+        # corrupt state nor an index problem can fail the sync.
+        for spec_file, link_name in spec_files:
+            specs_index.upsert_spec_link(
+                spec_file, specs_index.run_label(rdir), alias=link_name
+            )
     except Exception as exc:
         print(f"⚠️  masterplan artifact sync skipped: {exc}")
     return linked

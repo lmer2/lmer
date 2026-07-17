@@ -17,24 +17,87 @@ after the editable install is on ``sys.path``, so importing ``lmer_cli`` and
 """
 from __future__ import annotations
 
+import argparse
 import os
 from pathlib import Path
 from typing import Optional
 
-from lmer_cli.util import get_bool_env
+from lmer_cli.util import TRUTHY_VALUES, get_bool_env
+
+
+# Per-task manifest, resolved beside the taskdef's instructions.txt through
+# the same tier precedence as every other taskdef file.
+TASK_MANIFEST = "task.yaml"
+
+
+def taskdef_declares_masterplan() -> bool:
+    """True when the active taskdef ships a ``task.yaml`` declaring masterplan.
+
+    A taskdef whose instructions require the masterplan plugin (e.g. a
+    work-repo ``spec`` taskdef) declares that need in a per-task manifest
+    beside its ``instructions.txt``::
+
+        # taskdef/<name>/task.yaml
+        masterplan: true
+
+    The manifest resolves through the same tier precedence as the taskdef's
+    other files (work-repo project, work-repo global, LMER_TASKDEF_PATHS,
+    built-in) — the highest-precedence tier shipping a ``task.yaml`` wins, so
+    a work-repo override can flip the flag either way. An unreadable,
+    malformed, or non-mapping manifest counts as "not declared": provisioning
+    is logged-never-fatal and must not flip masterplan on (or the session
+    over) because of a bad YAML file.
+    """
+    task = os.environ.get("LMER_TASK")
+    if not task:
+        return False
+    # Deferred like the work_repo import below: keep masterplan_enabled()'s
+    # pure-env paths importable/testable without the search (or yaml) loaded.
+    from lmer_cli.container.taskdefs import find_taskdef_file
+
+    manifest = find_taskdef_file(TASK_MANIFEST, task)
+    if manifest is None:
+        return False
+    try:
+        import yaml
+
+        data = yaml.safe_load(manifest.read_text())
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    value = data.get("masterplan")
+    if value is None:
+        return False
+    # Same truthy set as get_bool_env, so `masterplan: "1"`/"yes"/"true" (and
+    # the YAML booleans, via str()) all read the same as the env toggle would.
+    return str(value).strip().lower() in TRUTHY_VALUES
 
 
 def masterplan_enabled() -> bool:
     """True when the session should run the masterplan workflow.
 
-    Active when the task is the dedicated ``masterplan`` taskdef, or the
+    Active when the task is the dedicated ``masterplan`` taskdef, the
     ``LMER_MASTERPLAN`` toggle is truthy (``get_bool_env``: ``1``/``true``/``yes``,
-    case-insensitive). Parsing goes through ``get_bool_env`` so ``=0``/``=false``
-    is an honest off-switch rather than a surprising "any non-empty value is on".
+    case-insensitive), or the active taskdef declares ``masterplan: true`` in
+    its ``task.yaml`` (see ``taskdef_declares_masterplan``). Parsing goes
+    through ``get_bool_env`` so ``=0``/``=false`` is an honest off-switch
+    rather than a surprising "any non-empty value is on" — for the toggle
+    itself: an explicit falsy toggle does not veto the taskdef-name or
+    taskdef-declared signals, the same way it never vetoed
+    ``LMER_TASK=masterplan``. A taskdef whose instructions require masterplan
+    stays provisioned.
     """
     if os.environ.get("LMER_TASK") == "masterplan":
         return True
-    return get_bool_env("LMER_MASTERPLAN")
+    if get_bool_env("LMER_MASTERPLAN"):
+        return True
+    try:
+        return taskdef_declares_masterplan()
+    except Exception:
+        # Same logged-never-fatal posture as the shell caller: a broken
+        # declaration lookup degrades to "plain session", never a crash.
+        return False
 
 
 def masterplan_runs_dir() -> Optional[Path]:
@@ -76,8 +139,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     An enabled-but-broken session must not fall through to exit 1: that is the
     silent "plain session" path, so any failure once masterplan is enabled maps
     to exit 2 so the warning still fires.
+
+    Flags (mid-session enablement, spec: masterplan-on-demand):
+      * ``--force`` — skip the launch-time gating and resolve the bundle root
+        unconditionally (exit 1 cannot occur under ``--force``);
+      * ``--repo-host`` / ``--repo-project`` — set ``LMER_REPO_HOST`` /
+        ``LMER_REPO_PROJECT`` for this resolution, so a session launched
+        without a repo target can be pointed at one. Flag-less invocation is
+        byte-identical to the pre-flag behavior.
     """
-    if not masterplan_enabled():
+    parser = argparse.ArgumentParser(prog="python3 -m lmer_cli.container.masterplan")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--repo-host")
+    parser.add_argument("--repo-project")
+    args = parser.parse_args(argv)
+    if args.repo_host:
+        os.environ["LMER_REPO_HOST"] = args.repo_host
+    if args.repo_project:
+        os.environ["LMER_REPO_PROJECT"] = args.repo_project
+    if not args.force and not masterplan_enabled():
         return 1
     try:
         rdir = masterplan_runs_dir()

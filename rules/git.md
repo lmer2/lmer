@@ -16,6 +16,9 @@ Gate commands run the full test suite and pre-commit hooks, and routinely take s
 ### `LMER_QUICK_GATE_COMMIT`: skip tests during `gate-commit`
 Setting `LMER_QUICK_GATE_COMMIT` to a truthy value (`1`, `true`, `yes`, case-insensitive) makes `gate-commit` skip the test suite (the slowest check) while still running pre-commit hooks, secret scans, and the other fast checks. Tests are still run by standalone `gate-check` and by `gate-push`, so coverage is preserved before code leaves the local repo. The flag only affects `gate-commit` — `gate-check` and `gate-push` ignore it. Set to `0`, `false`, `no`, or leave unset to keep tests running.
 
+### Deliverable format check
+The gate checks warn when a staged file that names a spec-class deliverable (any path component with a word starting `spec`, `plan`, or `report`) uses a binary document extension (`.docx`, `.doc`, `.pdf`, `.odt`, `.rtf`). Specs, plans, and reports deliver as Markdown (`.md`) — binary documents are unreviewable in GitLab (undiffable, unlinkable at line level). This is a WARNING, not a hard fail, because reports from external sources may legitimately be PDF; unrelated binary files (vendored manuals, fixtures) are not flagged.
+
 ## 🚨 Critical Git Rules
 - **NEVER** use `git add -A` or `git add .` - ONLY add specific files you've modified
 - **ALWAYS** use gate commands instead of direct git commit/push
@@ -62,6 +65,24 @@ By default, no repositories are auto-allowed for push.
 3. Request permission if not on allow list
 4. User must configure allow list via env var
 
+## 🚨 MR Target Policy — target the branch you forked from
+**CRITICAL**: An MR's target branch is ALWAYS the branch you forked from.
+There are no "special" changes that target elsewhere — release version
+bumps, changelog rolls, docs, and hotfixes all follow the same edge as
+feature work.
+
+In repos with a `prep-release` integration branch (this org's standard
+flow), that means:
+- Every MR you create targets `prep-release` — never `main`.
+- `main` only ever receives the standing `prep-release` → `main` release
+  MR, merged by a human as part of the release/deploy process.
+- Do NOT infer the target from repository history (e.g. old
+  `release/vX.Y.Z` branches merged straight to `main`) — history records
+  superseded processes; the rules and project info record the current one.
+
+If a change genuinely seems to require targeting `main` directly, STOP and
+ask the human — never create such an MR on your own judgment.
+
 ## 🚨 Merge Policy — review must be COMPLETE, not just quiet
 **CRITICAL**: Before merging any MR/PR (via UI, API, or a local merge pushed
 to the target branch), verify ALL of:
@@ -86,7 +107,7 @@ exists.
 
 ## Branch Management
 - Create descriptive branch names
-- Keep branches up to date with main
+- Keep branches up to date with the branch you forked from
 - Delete branches after merging
 
 ## Commit Messages
