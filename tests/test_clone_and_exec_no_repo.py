@@ -20,11 +20,13 @@ def _base_env(home):
     # HOME must be a scratch dir: main() runs setup_napkin_and_links, whose
     # link_into_home() rmtrees an existing real $HOME/work before symlinking.
     # With the real HOME this deleted /home/runner/work (the checkout itself)
-    # on GitHub-hosted runners (#125).
+    # on GitHub-hosted runners (#125). LMER_WORK_REPO_PATH likewise: without
+    # it, main() defaults to /work and mkdir-p's a real /work/napkin.
     return {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(home),
         "LMER_WORK_REPO": _WORK_REPO_URL,
+        "LMER_WORK_REPO_PATH": str(home / "work-repo"),
     }
 
 

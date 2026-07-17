@@ -63,7 +63,28 @@ requires_lmer_venv = pytest.mark.skipif(
     reason="lmer requires a working virtual environment",
 )
 
+def has_work_repo_configured() -> bool:
+    """Check LMER_WORK_REPO the way the host CLI resolves it.
+
+    Process env first, then ``~/.lmer/.env`` (the state-dir .env the CLI
+    always loads). cwd ``.env`` files deliberately don't count: the
+    integration helpers run lmer from a temp cwd, so one would never load.
+    """
+    if os.environ.get("LMER_WORK_REPO"):
+        return True
+    try:
+        from dotenv import dotenv_values
+
+        from lmer_cli.runtime import lmer_state_dir
+
+        env_file = lmer_state_dir() / ".env"
+        return bool(dotenv_values(dotenv_path=str(env_file)).get("LMER_WORK_REPO"))
+    except Exception:
+        return False
+
+
 requires_work_repo = pytest.mark.skipif(
-    not os.environ.get("LMER_WORK_REPO"),
-    reason="LMER_WORK_REPO not set (the lmer CLI requires it host-side)",
+    not has_work_repo_configured(),
+    reason="LMER_WORK_REPO not set in env or ~/.lmer/.env "
+    "(the lmer CLI requires it host-side)",
 )
