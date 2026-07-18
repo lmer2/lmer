@@ -27,8 +27,10 @@ from . import resolve
 from .container_home import ensure_container_home
 from .log import error, info, success, warning
 from .mounts import (
+    CONTAINER_CLONE_CACHE_DIR,
     FileMountSpec,
     build_checkout_mount,
+    build_clone_cache_mount,
     build_container_home_mounts,
     build_external_taskdef_mounts,
     build_file_mounts,
@@ -39,6 +41,7 @@ from .mounts import (
     build_user_mounts,
     build_workspace_mount,
     build_service_mode_mounts,
+    resolve_host_clone_cache_dir,
     resolve_host_uv_cache_dir,
 )
 from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
@@ -799,6 +802,34 @@ def _resolve_napkin_path(napkin_repo_url: str, work_repo_path: str) -> str:
     return f"{work_repo_path}/napkin"
 
 
+def _spawn_clone_cache_updater(urls: "list[str | None]") -> None:
+    """Fork the detached host-side clone-cache updater (lmer_cli.clone_cache).
+
+    The updater creates/refreshes the bare mirrors the container consumes
+    read-only. Detached (new session, no wait) so the launch never blocks on
+    cache maintenance, and stdin-fed so a tokenized URL never appears on a
+    host-visible argv. Fail-soft: a spawn problem is reported and ignored —
+    the session just runs with whatever mirrors already exist.
+    """
+    to_send = [u for u in urls if u]
+    if not to_send:
+        return
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "lmer_cli.clone_cache"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        proc.stdin.write(("\n".join(to_send) + "\n").encode())
+        proc.stdin.close()
+        # deliberately no wait(): the updater outlives this launch path
+    except OSError as e:
+        info(f"⚠️  clone-cache updater not started: {e}")
+
+
 def main(argv: list[str] | None = None) -> int:
     """
     Main entry point for the lmerpy CLI.
@@ -1137,6 +1168,24 @@ def main(argv: list[str] | None = None) -> int:
         else:
             info(f"⚠️  Host uv cache not found at {host_uv_cache}, skipping mount")
 
+    # Persistent git clone cache (#112): mount a host directory so the
+    # container's clone script keeps bare repo mirrors across sessions and
+    # later sessions fetch only what changed instead of re-cloning. On by
+    # default; LMER_CLONE_CACHE=0 disables. LMER_CLONE_CACHE_DIR overrides
+    # the host location (default ~/.lmer/clone-cache). Fail-soft: an
+    # unusable cache dir skips the mount and the container clones directly.
+    clone_cache_container_dir: str | None = None
+    if get_bool_env("LMER_CLONE_CACHE", default=True):
+        host_clone_cache = resolve_host_clone_cache_dir()
+        try:
+            host_clone_cache.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            info(f"⚠️  Clone cache dir unusable at {host_clone_cache} ({e}), skipping mount")
+        else:
+            run += build_clone_cache_mount(runtime, host_clone_cache)
+            clone_cache_container_dir = CONTAINER_CLONE_CACHE_DIR
+            success(f"✅ Mounting git clone cache: {host_clone_cache} → {CONTAINER_CLONE_CACHE_DIR}")
+
     # Workspace mount removed - using /workspace directory from image instead
     # This avoids root:root ownership issues with Docker/Podman mounts
     # run += build_workspace_mount(
@@ -1227,6 +1276,14 @@ def main(argv: list[str] | None = None) -> int:
     if taskdef_repo_url:
         taskdef_repo_url = _inject_gitlab_token_if_available(taskdef_repo_url, dedicated_env="LMER_TASKDEF_TOKEN")
 
+    # Host-side cache maintenance (#112): freshen/build the mirrors for every
+    # repo this session will clone, in a detached background updater. The
+    # session never waits on it; the container consumes the cache read-only.
+    if clone_cache_container_dir is not None:
+        _spawn_clone_cache_updater(
+            [repo_url, work_repo_url, napkin_repo_url, taskdef_repo_url]
+        )
+
     # Compute the in-container napkin path (separate repo -> /napkin, else a
     # subdir of the work repo). Always injected so agents can use it in any mode.
     container_work_repo_path = os.environ.get("LMER_WORK_REPO_PATH", "/work")
@@ -1315,6 +1372,12 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_REPO_URL": repo_url,
         "LMER_WORK_REPO": work_repo_url,
         "LMER_WORK_REPO_PATH": os.environ.get("LMER_WORK_REPO_PATH", "/work"),
+        # Container-side path of the persistent clone-cache mount, read by
+        # clone_and_exec.py (#112). None — i.e. not forwarded, and not
+        # overridable from a .env — when LMER_CLONE_CACHE=0 or the host
+        # cache dir is unusable. The host-side LMER_CLONE_CACHE /
+        # LMER_CLONE_CACHE_DIR settings themselves stay host-only.
+        "LMER_CLONE_CACHE_PATH": clone_cache_container_dir,
         # Optional napkin/taskdef auxiliary repos. The *credentialed* URLs are
         # forwarded (they carry their own auth); LMER_NAPKIN_PATH is always set
         # so agents can write in any mode. The raw *_TOKEN vars are seeded None
