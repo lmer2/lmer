@@ -199,7 +199,10 @@ expected to be — set with the goal via
 flag alone is fine; `time` is a free-form human string like `4h` or `2d`,
 stored verbatim and never parsed). The `goal_set` event echoes the estimate
 in its data; a goal recorded without the flags behaves exactly as before
-(no data payload). When an estimate exists, the resume brief renders
+(no data payload). An estimate is scoped to the goal it was recorded with:
+re-recording the goal without the flags clears any prior estimate back to
+null (only goal writes clear — displaying the goal touches nothing). When
+an estimate exists, the resume brief renders
 `Estimate: ~3 sessions / 4h — used: 2 sessions` — the used count is the
 run's `session_start` events so far (computed by the CLI callers that
 already read events; `decide()` stays IO-free and just carries it). At
