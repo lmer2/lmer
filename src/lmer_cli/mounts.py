@@ -21,6 +21,11 @@ EXTERNAL_TASKDEF_MOUNT_BASE = "/Agents/taskdefs"
 # (HOME=/home/developer + XDG default of $HOME/.cache/uv).
 CONTAINER_UV_CACHE_DIR = "/home/developer/.cache/uv"
 
+# Path inside the container where the persistent git clone cache is mounted.
+# The container clone script (clone_and_exec.py) receives it via
+# LMER_CLONE_CACHE_PATH and keeps one bare mirror per repo under it.
+CONTAINER_CLONE_CACHE_DIR = "/clone-cache"
+
 
 def selinux_opt(runtime: str) -> str:
     """
@@ -393,6 +398,48 @@ def build_host_uv_cache_mount(runtime: str, host_cache_dir: Path) -> List[str]:
     """
     se = selinux_opt(runtime)
     return ["-v", f"{host_cache_dir}:{CONTAINER_UV_CACHE_DIR}:rw{se}"]
+
+
+def resolve_host_clone_cache_dir() -> Path:
+    """
+    Resolve the host directory for the persistent git clone cache.
+
+    Honors `$LMER_CLONE_CACHE_DIR` first (with `~` expansion); an empty or
+    unset value falls back to `~/.lmer/clone-cache`. The returned path may
+    not exist on disk — the caller creates it before mounting.
+
+    Returns:
+        Path to the host clone-cache directory (existence not guaranteed)
+    """
+    explicit = os.environ.get("LMER_CLONE_CACHE_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.home() / ".lmer" / "clone-cache"
+
+
+def build_clone_cache_mount(runtime: str, host_cache_dir: Path) -> List[str]:
+    """
+    Build the read-only mount for the persistent git clone cache.
+
+    Mounts the host cache directory at the container's fixed clone-cache
+    location so the container's clone script (clone_and_exec.py) can borrow
+    objects from the host-maintained bare mirrors via ``--reference
+    <mirror> --dissociate``. All mirror maintenance is host-side
+    (lmer_cli.clone_cache, forked at launch); the container only ever
+    reads, so the mount is ``:ro`` — a session structurally cannot write a
+    token into, or corrupt, the shared cache. A stale or empty cache is
+    fine: the clone still talks to the real origin and fetches whatever the
+    mirror lacks.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        host_cache_dir: Path to the clone-cache directory on the host
+
+    Returns:
+        List of Docker/Podman arguments for the clone cache mount
+    """
+    se = selinux_opt(runtime)
+    return ["-v", f"{host_cache_dir}:{CONTAINER_CLONE_CACHE_DIR}:ro{se}"]
 
 
 def build_service_mode_mounts(runtime: str, checkout_path: Path) -> List[str]:

@@ -149,15 +149,120 @@ def _lfs_safe_git(*args: str) -> list[str]:
     return cmd
 
 
-def _clone_cmd(repo_url: str, workspace: Path) -> list[str]:
+def _clone_cmd(
+    repo_url: str, workspace: Path, extra_flags: "list[str] | None" = None
+) -> list[str]:
     """Build the ``git clone`` command.
 
     When git-lfs is unavailable, insert :data:`_LFS_SKIP_FLAGS` before the
     ``clone`` subcommand so LFS-tracked repos degrade to pointer files rather
     than failing the checkout. When git-lfs is present the clone is plain, so
-    LFS content is fetched normally.
+    LFS content is fetched normally. *extra_flags* (e.g. the clone-cache
+    ``--reference``/``--dissociate`` pair) are placed after ``clone`` and
+    before the positional URL/destination.
     """
-    return _lfs_safe_git("clone", repo_url, str(workspace))
+    return _lfs_safe_git("clone", *(extra_flags or []), repo_url, str(workspace))
+
+
+# --- Persistent clone cache (issue #112) ------------------------------------
+# The host CLI bind-mounts a persistent host directory (default
+# ~/.lmer/clone-cache, see LMER_CLONE_CACHE / LMER_CLONE_CACHE_DIR in
+# docs/LMER-CLI.md) **read-only** at the container path carried in
+# LMER_CLONE_CACHE_PATH. All mirror maintenance is host-side
+# (lmer_cli/clone_cache.py, forked detached at launch); this script is a
+# pure consumer: when a bare mirror (<host>/<project>.git) exists, working
+# clones are made with ``--reference <mirror> --dissociate`` — origin stays
+# the real remote (the branch/ref/MR-head fetch and push flows below are
+# untouched) while objects come from the local mirror, and --dissociate
+# repacks the clone so the workspace never depends on the cache afterwards.
+# A stale mirror is never wrong (the clone still talks to origin), a
+# missing one just means a direct clone, and any trouble at all — including
+# a corrupt mirror — degrades fail-soft to the direct clone.
+
+
+def _mirror_path(cache_root: Path, repo_url: str) -> "Path | None":
+    """Map a clone URL to its mirror path ``<cache_root>/<host>/<project>.git``.
+
+    Handles https(-with-credentials) URLs and scp-like SSH forms
+    (``git@host:group/project.git``). Returns None for URLs the cache doesn't
+    handle (local paths, unparseable forms) so the caller degrades to a
+    direct clone.
+    """
+    host = None
+    path = ""
+    if "://" in repo_url:
+        try:
+            parsed = urlparse(repo_url)
+        except Exception:
+            return None
+        host = parsed.hostname
+        path = (parsed.path or "").strip("/")
+    else:
+        # scp-like SSH form: [user@]host:group/project(.git)
+        m = re.match(r"^(?:[^@/:]+@)?([^:/@]+):(.+)$", repo_url)
+        if m:
+            host = m.group(1)
+            path = m.group(2).strip("/")
+    if not host or not path:
+        return None
+    path = re.sub(r"\.git$", "", path)
+    parts = [p for p in path.split("/") if p]
+    # A hostile path component must never escape the cache root.
+    if not parts or any(p in (".", "..") for p in parts):
+        return None
+    return cache_root.joinpath(host.lower(), *parts[:-1], parts[-1] + ".git")
+
+
+def _cache_reference_flags(repo_url: str) -> list[str]:
+    """The ``--reference <mirror> --dissociate`` flags for *repo_url* — or
+    ``[]`` when the cache is disabled (no LMER_CLONE_CACHE_PATH), doesn't
+    apply to this URL, or holds no mirror for it yet.
+
+    A pure read: the mount is read-only and all mirror maintenance is
+    host-side, so this never creates, fetches, or locks anything. A mirror
+    that turns out to be unusable is caught by the retry-direct fallback in
+    :func:`_clone_with_cache`; a surprising fs error here just degrades to
+    the direct clone (fail-soft)."""
+    cache_root = os.environ.get("LMER_CLONE_CACHE_PATH")
+    if not cache_root or not repo_url:
+        return []
+    try:
+        mirror = _mirror_path(Path(cache_root), repo_url)
+        if mirror is None or not (mirror / "HEAD").exists():
+            return []
+    except Exception as e:
+        print(
+            f"⚠️  clone cache unavailable (cloning directly): "
+            f"{_scrub_credentials(str(e))}",
+            file=sys.stderr,
+        )
+        return []
+    return ["--reference", str(mirror), "--dissociate"]
+
+
+def _clone_with_cache(repo_url: str, dest: Path) -> None:
+    """Clone *repo_url* into *dest*, borrowing objects from the cache mirror
+    when one is available.
+
+    A failed cache-referenced clone (e.g. a mirror corruption the fetch
+    didn't surface) is retried as a plain direct clone, so the cache can
+    never break a session — only the direct clone's failure propagates.
+    """
+    flags = _cache_reference_flags(repo_url)
+    if flags:
+        try:
+            check_call(_clone_cmd(repo_url, dest, flags))
+            return
+        except subprocess.CalledProcessError as e:
+            print(
+                f"⚠️  cache-referenced clone failed (retrying directly): "
+                f"{_scrub_credentials(str(e))}",
+                file=sys.stderr,
+            )
+            # git may leave a partial dest behind; clear it for the retry.
+            shutil.rmtree(dest, ignore_errors=True)
+            dest.mkdir(parents=True, exist_ok=True)
+    check_call(_clone_cmd(repo_url, dest))
 
 
 def _persist_lfs_skip_config(repo_dir: Path) -> None:
@@ -214,7 +319,7 @@ def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Opt
     if (workspace / ".git").exists():
         return
 
-    check_call(_clone_cmd(repo_url, workspace))
+    _clone_with_cache(repo_url, workspace)
     _persist_lfs_skip_config(workspace)
 
     # Configure safe.directory to avoid ownership complaints
@@ -586,7 +691,7 @@ def clone_secondary_mr(target: str, workspace: Path) -> None:
 
     # Clone the repository
     print(f"📦 Cloning secondary MR into {target_dir}...", file=sys.stderr)
-    check_call(_clone_cmd(repo_url, target_dir))
+    _clone_with_cache(repo_url, target_dir)
     _persist_lfs_skip_config(target_dir)
 
     # Configure safe.directory

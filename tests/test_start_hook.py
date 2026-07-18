@@ -438,10 +438,17 @@ class TestIncludeResolutionDefense:
         monkeypatch.setenv("LMER_TASKDEF_ROOT", "/home/nobody/Agents/global/taskdef")
         monkeypatch.delenv("LMER_TASKDEF_PATHS", raising=False)
         monkeypatch.delenv("LMER_WORK_REPO_PATH", raising=False)
-        # builtin_taskdef_root() falls back to cwd/taskdef on hosts without
-        # the container mounts — run from the repo root, where the real
-        # built-in fragments live.
-        monkeypatch.chdir(Path(__file__).parent.parent)
+        # builtin_taskdef_root() probes fixed ambient paths (a developer's
+        # /home/developer/.lmer — e.g. the #112 clone cache — satisfies the
+        # first probe and yields a taskdef-less root) before falling back to
+        # cwd/taskdef. Pin it to this checkout's taskdef/, where the real
+        # built-in fragments live (same isolation as _repo_builtin_root; the
+        # ambient search-chain behavior itself is issue #80's scope). The
+        # defense under test is unchanged: include resolution must reach the
+        # builtin root instead of trusting the bogus LMER_TASKDEF_ROOT.
+        monkeypatch.setattr(
+            "hooks.start.builtin_taskdef_root", lambda: REPO_TASKDEF
+        )
 
         out = render_taskdef_template(
             external / "instructions.txt", {"work_mode": "finish"}
