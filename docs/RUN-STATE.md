@@ -177,8 +177,10 @@ renders it FIRST, before the run header, as a
 **Answering (issue #98):** the answer arrives in a FRESH session — the
 asking session already ended (that is the #97 contract). Two delivery
 paths, one mechanism: `work answer "<text>"` in-container, or
-`lmer ... --answer "<text>"` on the host, which exports `LMER_ANSWER` so
-`work session-start` applies it automatically before printing the brief
+`lmer ... --answer "<text>"` on the host, which exports `LMER_ANSWER`
+(flag-only — a host-exported or `.env` value is never forwarded; answers
+are one-shot data, not standing configuration) so `work session-start`
+applies it automatically before printing the brief
 (only when the loaded state is actually stopped on a recorded question;
 fail-soft — a problem applying it degrades to the plain brief). Both go
 through `run_state.answer_question`: append a `question_answered` event

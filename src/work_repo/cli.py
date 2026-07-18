@@ -2113,6 +2113,36 @@ def _answer_marker_path(answer: str) -> Path:
     return Path(ANSWER_MARKER_DIR or "/tmp") / f".lmer-answer-applied-{digest}"
 
 
+def _apply_pushed_answer(rdir: Path, state: dict) -> tuple[dict, dict | None]:
+    """Apply a pushed LMER_ANSWER to the run's recorded open question (issue #98); returns (state, answered)."""
+    # Resume-on-answer: a pushed answer (LMER_ANSWER, set by
+    # `lmer --answer "<text>"` on the host) to the run's recorded open
+    # question is applied BEFORE deciding, so the brief leads with the
+    # answered pair instead of the stale question block. Fail-soft: a
+    # problem applying it degrades to the plain brief, never a failure.
+    # Consume-once: _answer_marker_path guards against the container-lived
+    # env var replaying into a later question (review on !126).
+    answered = None
+    answer = (os.environ.get("LMER_ANSWER") or "").strip()
+    if (
+        answer
+        and state.get("stop_reason") == "question"
+        and state.get("open_question")
+        and not _answer_marker_path(answer).exists()
+    ):
+        try:
+            question = state.get("open_question")
+            state = run_state.answer_question(rdir, state, answer)
+            answered = {"question": question, "answer": redact_secrets(answer)}
+            try:
+                _answer_marker_path(answer).touch()
+            except OSError:
+                pass  # marker is best-effort; the answer still applied
+        except Exception as exc:
+            print(f"⚠️  LMER_ANSWER not applied (continuing): {exc}")
+    return state, answered
+
+
 def cmd_session_start() -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
     ALWAYS exits 0 — a broken state layer must never break session start."""
@@ -2155,29 +2185,7 @@ def cmd_session_start() -> int:
                     os.environ.get("LMER_TASK_TARGET", ""),
                 )
 
-        # Resume-on-answer (issue #98): a pushed answer (LMER_ANSWER, set by
-        # `lmer --answer "<text>"` on the host) to the run's recorded open
-        # question is applied BEFORE deciding, so the brief leads with the
-        # answered pair instead of the stale question block. Fail-soft: a
-        # problem applying it degrades to the plain brief, never a failure.
-        answered = None
-        answer = (os.environ.get("LMER_ANSWER") or "").strip()
-        if (
-            answer
-            and state.get("stop_reason") == "question"
-            and state.get("open_question")
-            and not _answer_marker_path(answer).exists()
-        ):
-            try:
-                question = state.get("open_question")
-                state = run_state.answer_question(rdir, state, answer)
-                answered = {"question": question, "answer": redact_secrets(answer)}
-                try:
-                    _answer_marker_path(answer).touch()
-                except OSError:
-                    pass  # marker is best-effort; the answer still applied
-            except Exception as exc:
-                print(f"⚠️  LMER_ANSWER not applied (continuing): {exc}")
+        state, answered = _apply_pushed_answer(rdir, state)
 
         # Decide BEFORE claiming so a foreign claim surfaces as a warning.
         # All events for the sessions-used count (issue #99) — this session's

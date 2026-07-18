@@ -63,12 +63,27 @@ class TestAnswerFlag:
         """Guard against accidental removal of LMER_ANSWER from cli.py's env
         dict (source-level check, same pattern as
         test_lmer_reasoning_effort.py::test_cli_env_dict_declares_reasoning_effort):
-        the flag wins, a host-set LMER_ANSWER still passes through."""
+        the entry must be flag-only, mirroring LMER_START_PROMPT."""
         source = CLI_PY.read_text()
         pattern = re.compile(
-            r"""["']LMER_ANSWER["']\s*:\s*ns\.answer\s+or\s+os\.environ\.get\(\s*["']LMER_ANSWER["']\s*\)"""
+            r"""["']LMER_ANSWER["']\s*:\s*ns\.answer\s+if\s+ns\.answer\s+else\s+None"""
         )
         assert pattern.search(source), "LMER_ANSWER entry missing from cli.py env dict"
+
+    def test_host_env_answer_is_not_forwarded(self):
+        """A host-set LMER_ANSWER (exported or layered in via a .env) must
+        NEVER reach the container: answers are one-shot data, and an env
+        fallback would silently auto-answer every future question-stop with
+        stale text. Only the --answer flag sources the value, so the host
+        CLI must have no os.environ read of LMER_ANSWER at all (the dict
+        entry itself — None without the flag — blocks the .env merge)."""
+        source = CLI_PY.read_text()
+        pattern = re.compile(
+            r"""os\.environ\.get\(\s*["']LMER_ANSWER["']"""
+        )
+        assert not pattern.search(source), (
+            "LMER_ANSWER must be flag-only in the host CLI — no os.environ fallback"
+        )
 
     def test_answer_help_text_mentions_LMER_ANSWER(self, capsys):
         with patch.object(sys, "argv", ["lmer", "--help"]):
