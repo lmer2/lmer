@@ -1360,9 +1360,13 @@ def main(argv: list[str] | None = None) -> int:
         # --manual-start (the supervisor only injects it as part of auto-start).
         "LMER_START_PROMPT": ns.prompt if ns.prompt else None,
         # Answer to the run's recorded open question (issue #98). Sourced
-        # from --answer (the flag wins over a host-set LMER_ANSWER); applied
-        # in-container by `work session-start` before the brief prints.
-        "LMER_ANSWER": ns.answer or os.environ.get("LMER_ANSWER"),
+        # from --answer ONLY — no os.environ fallback, same deliberate
+        # flag-only pattern as LMER_START_PROMPT above: an answer is one-shot
+        # data, while .env is standing configuration, so a stale LMER_ANSWER
+        # left in a .env must never silently auto-answer every future
+        # question-stop. Applied in-container by `work session-start` before
+        # the brief prints.
+        "LMER_ANSWER": ns.answer if ns.answer else None,
         "LMER_DISABLE_SUPERVISOR": "1" if ns.no_supervisor else None,
         # Forward the initial auto-/start delay so a host-set value reaches
         # the supervisor running inside the container.
