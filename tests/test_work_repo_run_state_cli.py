@@ -1143,8 +1143,9 @@ class TestGoalEstimate:
             "sessions": None, "time": "2d"}
 
     def test_goal_without_estimate_unchanged(self, run_env):
-        # No flags: no estimate recorded, and the goal_set event stays
-        # byte-for-byte what it was before #99 (no data payload).
+        # No flags on a fresh run: no estimate recorded, and the goal_set
+        # event stays byte-for-byte what it was before #99 (no data payload).
+        # (Clearing a PRIOR estimate is the rewrite test below.)
         assert _main(["goal", "plain goal"]) == 0
         assert run_state.load_state(run_env)["estimate"] is None
         event = [e for e in run_state.read_events(run_env, last_n=0)
@@ -1162,6 +1163,15 @@ class TestGoalEstimate:
         state = run_state.load_state(run_env)
         assert state["goal"] == "second goal"
         assert state["estimate"] is None
+
+    def test_goal_display_does_not_clear_estimate(self, run_env, capsys):
+        # Only goal WRITES clear the estimate — displaying the goal
+        # (`work goal` with no text) must not touch run state.
+        _main(["goal", "fix it", "--estimate-sessions", "2"])
+        capsys.readouterr()
+        assert _main(["goal"]) == 0
+        assert run_state.load_state(run_env)["estimate"] == {
+            "sessions": 2, "time": None}
 
     def test_estimate_flags_require_description(self, run_env, capsys):
         assert _main(["goal", "--estimate-sessions", "2"]) == 1
