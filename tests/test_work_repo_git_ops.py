@@ -19,6 +19,11 @@ from work_repo.git_ops import (
     run_git_command,
 )
 
+# The Stop-hook guard's trigger-2 gatherer, which run_dir_push_status
+# deliberately mirrors (hooks import no project code) — imported here only
+# so the drift-guard tests can hold both copies to the same fixtures.
+from hooks.run_state_guard import gather_run_dir_status
+
 
 class TestRunGitCommand:
     """Test run_git_command function"""
@@ -390,6 +395,41 @@ class TestCommitWorkPathResilience:
                     "git.example.com/grp/proj/runs/develop-issue-9",
                 ]]
 
+    def test_commit_work_changes_includes_specs_index(self, tmp_path):
+        """MR !140 staging gap: entries written by `work specs-index
+        --rebuild` / the masterplan sync have no push of their own — the
+        batching `work commit` must stage specs/ too (skipped when the
+        dir doesn't exist, free when clean)."""
+        env_vars = {
+            "LMER_WORK_REPO_PATH": str(tmp_path),
+            "LMER_REPO_HOST": "git.example.com",
+            "LMER_REPO_PROJECT": "grp/proj",
+            "LMER_TASK": "develop",
+            "LMER_TASK_TARGET": "issue-9",
+        }
+        task_dir = tmp_path / "git.example.com/grp/proj/develop/issue-9"
+        runs_dir = tmp_path / "git.example.com/grp/proj/runs/develop-issue-9"
+        specs_dir = tmp_path / "git.example.com/grp/proj/specs"
+        for d in (task_dir, runs_dir, specs_dir):
+            d.mkdir(parents=True)
+
+        def side_effect(cmd, cwd, check=False):
+            if cmd[0] == "status":
+                return (0, "M  x\n")
+            return (0, "")
+
+        with patch.dict(os.environ, env_vars):
+            with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
+                assert commit_work_changes() == 0
+                add_calls = [call[0][0] for call in mock_git.call_args_list
+                             if call[0][0][:3] == ["add", "-A", "--"]]
+                assert add_calls == [[
+                    "add", "-A", "--",
+                    "git.example.com/grp/proj/develop/issue-9",
+                    "git.example.com/grp/proj/runs/develop-issue-9",
+                    "git.example.com/grp/proj/specs",
+                ]]
+
 
     def test_commit_work_changes_includes_specs_index(self, tmp_path):
         """The specs index is staged when it exists (review on !126): entries
@@ -630,6 +670,47 @@ class TestRunDirPushStatus:
         assert run_dir_push_status(repo) == (False, False)
         (repo / "scratch.md").write_text("uncommitted\n")
         assert run_dir_push_status(repo) == (True, False)
+
+
+class TestRunDirPushStatusMirrorsHook:
+    """Drift guard for the deliberate mirror: run_dir_push_status duplicates
+    the Stop-hook guard's trigger-2 gatherer (hooks/run_state_guard.py's
+    gather_run_dir_status) rather than importing it, since hooks import no
+    project code. Run both copies against the same fixture repos so they
+    cannot silently diverge."""
+
+    def _both(self, run_dir):
+        """Assert the hook and git_ops copies agree; return the verdict."""
+        hook_verdict = gather_run_dir_status(str(run_dir))
+        ops_verdict = run_dir_push_status(run_dir)
+        assert hook_verdict == ops_verdict, (
+            "hooks.run_state_guard.gather_run_dir_status and "
+            "work_repo.git_ops.run_dir_push_status diverged on the same "
+            f"fixture: hook={hook_verdict} git_ops={ops_verdict}"
+        )
+        return ops_verdict
+
+    def test_clean_and_pushed_agree(self, tmp_path):
+        _, run_dir = _clone_with_run_dir(tmp_path)
+        assert self._both(run_dir) == (False, False)
+
+    def test_dirty_run_dir_agree(self, tmp_path):
+        _, run_dir = _clone_with_run_dir(tmp_path)
+        (run_dir / "scratch.md").write_text("uncommitted\n")
+        assert self._both(run_dir) == (True, False)
+
+    def test_unpushed_commit_agree(self, tmp_path):
+        clone, run_dir = _clone_with_run_dir(tmp_path)
+        (run_dir / "notes.md").write_text("amended\n")
+        _git(clone, "add", ".")
+        _git(clone, "commit", "-q", "-m", "local only")  # no push
+        assert self._both(run_dir) == (False, True)
+
+    def test_non_git_dir_fails_open_in_both(self, tmp_path):
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "junk.md").write_text("dirty-looking but ungoverned\n")
+        assert self._both(plain) == (False, False)
 
 
 def _git_init(path):

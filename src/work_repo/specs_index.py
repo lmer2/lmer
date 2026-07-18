@@ -8,9 +8,15 @@ dated RELATIVE symlinks pointing at each spec's canonical location: a
 plain directory listing IS the index, so no README/index file is
 maintained beside the links (v1 is symlinks-only by design).
 
-Entry shape: `YYYY-MM-DD-<run>-<basename>` — the registration date, the
-run's name (state.name, slug fallback) to disambiguate, and the spec's
-own filename. Entry form: relative symlink (`../runs/<dir>/…`) to the
+Entry shape: `YYYY-MM-DD-<run>--<basename>` — the registration date, the
+run's name (state.name, slug fallback) to disambiguate, then the spec's
+own filename after a RESERVED `--` separator. The separator keeps
+distinct (run, spec) pairs distinct — with a single `-`, (`a`,
+`b-spec.md`) and (`a-b`, `spec.md`) would collide — and to keep the
+first post-date `--` unambiguous the run-label component itself never
+contains one: runs of hyphens in a label are collapsed to a single `-`
+(dir-name fallback labels can be `slug--name` shaped).
+Entry form: relative symlink (`../runs/<dir>/…`) to the
 one canonical file — never a copy (the charter's "never write the same
 file in two places" rule, #103) and, for masterplan bundle specs, never
 the run-root convenience symlink (the bundle file is the single target).
@@ -50,11 +56,14 @@ SPECS_DIR = "specs"
 
 # Spec-class filename stems (see module docstring for the rationale).
 _SPEC_STEM_RE = re.compile(r"^spec$|^spec[-_.]|[-_.]spec$", re.IGNORECASE)
-# Entry names this module owns: date prefix + label + basename.
+# Entry names this module owns: date prefix + label + `--` + basename.
 _DATE_PREFIX = "%Y-%m-%d"
 # Run labels come from state.name/slug (already slug-shaped); anything
 # else is squashed so an entry name is always a plain filename.
 _UNSAFE_LABEL_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# `--` is the reserved label/basename separator — labels never contain it
+# (see _safe_label), so the first post-date `--` splits unambiguously.
+_HYPHEN_RUN_RE = re.compile(r"-{2,}")
 
 
 def is_spec_artifact(name: str) -> bool:
@@ -94,10 +103,17 @@ def run_label(rdir: Path, state: Optional[dict] = None) -> str:
     return rdir.name
 
 
+def _safe_label(label: str) -> str:
+    """The label component of an entry name: unsafe chars squashed AND runs
+    of hyphens collapsed, so a label can never contain the reserved `--`
+    separator (dir-name fallback labels are `slug--name` shaped) and the
+    first `--` after the date is always the label/basename boundary."""
+    return _HYPHEN_RUN_RE.sub("-", _UNSAFE_LABEL_RE.sub("-", label)).strip("-") or "run"
+
+
 def _entry_name(label: str, basename: str, when: Optional[datetime]) -> str:
     when = when or datetime.now(timezone.utc)
-    safe = _UNSAFE_LABEL_RE.sub("-", label).strip("-") or "run"
-    return f"{when.strftime(_DATE_PREFIX)}-{safe}-{basename}"
+    return f"{when.strftime(_DATE_PREFIX)}-{_safe_label(label)}--{basename}"
 
 
 def upsert_spec_link(
@@ -119,8 +135,10 @@ def upsert_spec_link(
     triggered it.
 
     Idempotent per (label, basename): the same day's entry is re-pointed
-    in place, and stale entries for the same pair under other dates are
-    removed, so re-registration never accumulates duplicates.
+    in place, and stale entries for the same pair under other dates —
+    including ones in the legacy `<date>-<label>-<basename>` format that
+    predates the reserved `--` separator — are removed, so
+    re-registration never accumulates duplicates.
 
     Returns the entry path, or None when nothing was indexed.
     """
@@ -136,9 +154,18 @@ def upsert_spec_link(
         sdir.mkdir(parents=True, exist_ok=True)
         entry = _entry_name(label, basename, when)
         # One entry per (run, spec file): drop same-pair entries under
-        # other dates before (re-)pointing today's.
-        safe = entry[len("YYYY-MM-DD-"):]
-        stale_re = re.compile(rf"^\d{{4}}-\d{{2}}-\d{{2}}-{re.escape(safe)}$")
+        # other dates before (re-)pointing today's. Same-pair entries in
+        # the legacy pre-`--` name format are cleaned up too — but only
+        # when the legacy label is itself `--`-free, since a `--`-bearing
+        # legacy pattern could match a current-format entry of a DIFFERENT
+        # pair (`--rebuild` regenerates whatever this skips).
+        alternatives = [re.escape(entry[len("YYYY-MM-DD-"):])]
+        legacy_label = _UNSAFE_LABEL_RE.sub("-", label).strip("-") or "run"
+        if "--" not in legacy_label:
+            alternatives.append(re.escape(f"{legacy_label}-{basename}"))
+        stale_re = re.compile(
+            rf"^\d{{4}}-\d{{2}}-\d{{2}}-(?:{'|'.join(alternatives)})$"
+        )
         for sibling in sdir.iterdir():
             if sibling.name != entry and stale_re.match(sibling.name):
                 if sibling.is_symlink():
@@ -192,10 +219,11 @@ def repoint_run_dir_entries(
             # Keep the entry's registration date and its basename. The
             # basename may be an alias (a masterplan run-root link name like
             # `mp-a-spec.md`) rather than the target's own filename, so it
-            # is parsed out of the entry name (YYYY-MM-DD-<label>-<base>)
-            # by stripping the label the entry was created under — the
-            # pre-rename dir name (slug), or the run's name when it was set
-            # before the freeze. Fallback: the target's filename.
+            # is parsed out of the entry name (`YYYY-MM-DD-<label>--<base>`;
+            # pre-`--` entries used a single dash) by stripping the label
+            # the entry was created under — the pre-rename dir name (slug),
+            # or the run's name when it was set before the freeze.
+            # Fallback: the target's filename.
             m = re.match(r"^(\d{4}-\d{2}-\d{2})-(.+)$", entry.name)
             if not m:
                 continue
@@ -204,11 +232,26 @@ def repoint_run_dir_entries(
             )
             rest = m.group(2)
             basename = None
-            for candidate in (old_dirname, new_label):
-                safe = _UNSAFE_LABEL_RE.sub("-", str(candidate)).strip("-")
-                if safe and rest.startswith(f"{safe}-"):
-                    basename = rest[len(safe) + 1:]
-                    break
+            # _safe_label collapses hyphen runs, so in a new-format entry the
+            # first post-date `--` is always the label/basename boundary.
+            # Sanitize candidates with the SAME helper the entry was created
+            # with, and verify the label half against them BEFORE any legacy
+            # single-dash stripping — a candidate that is a dash-prefix of
+            # the created label (or a legacy basename containing `--`) must
+            # not mis-split the name.
+            safe_candidates = [
+                _safe_label(str(c)) for c in (old_dirname, new_label) if str(c)
+            ]
+            if "--" in rest:
+                label_part, _, base_part = rest.partition("--")
+                if label_part in safe_candidates and base_part:
+                    basename = base_part
+            if not basename:
+                # Legacy entries created before `--` existed: `<label>-<base>`.
+                for safe in safe_candidates:
+                    if rest.startswith(f"{safe}-") and not rest.startswith(f"{safe}--"):
+                        basename = rest[len(safe) + 1:]
+                        break
             if not basename:
                 canonical_name = Path(target).name
                 basename = (
