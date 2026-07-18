@@ -279,11 +279,15 @@ bundle files at `runs/<slug>/masterplan/<mp>/spec.md`), so
 dated entry per spec pointing back at where it landed:
 
 ```
-specs/2026-07-15-gate-receipts-spec.md -> ../runs/develop-issue-88--gate-receipts/spec.md
+specs/2026-07-15-gate-receipts--spec.md -> ../runs/develop-issue-88--gate-receipts/spec.md
 ```
 
-- **Entry name**: `YYYY-MM-DD-<run>-<basename>` — the registration date,
-  the run's name (slug when unnamed), and the spec's own filename.
+- **Entry name**: `YYYY-MM-DD-<run>--<basename>` — the registration date,
+  the run's name (slug when unnamed), then the spec's own filename after a
+  reserved `--` separator. The run-name component never contains `--`
+  (runs of hyphens collapse to one), so the first `--` after the date
+  always splits name from filename and distinct (run, spec) pairs never
+  collide.
 - **Entry form**: a relative symlink to the spec's one canonical location —
   never a copy (specs are never written in two places), and for masterplan
   bundle specs the target is the bundle file itself, never the run-root
@@ -315,7 +319,9 @@ work specs-index --rebuild
 work specs-index
 ```
 
-`--rebuild` writes only — batch the push with `work commit` (archived runs
+`--rebuild` writes only — batch the push with `work commit`, which stages
+`specs/` alongside the run dir (as does the session-end push), so entries
+written by the rebuild or the masterplan sync always land (archived runs
 and `.new-*` orphans stay unindexed).
 
 ## Single canonical home
