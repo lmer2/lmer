@@ -258,11 +258,7 @@ class SessionManager:
         cmd += ["chat", permalink]
         # Preset options are `chat` subcommand flags / args, appended after.
         if preset is not None:
-            if preset.checkout:
-                cmd += ["--checkout", preset.checkout]
-            if preset.service:
-                cmd += ["--service", preset.service]
-            cmd += preset.args
+            cmd += preset.cli_tokens()
             env.update(preset.env)
 
         # Spawn under a PTY: lmer only allocates an interactive container

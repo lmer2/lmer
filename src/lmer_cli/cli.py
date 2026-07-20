@@ -46,6 +46,7 @@ from .mounts import (
 )
 from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
 from .harness import HARNESSES, UnknownHarnessError, get_harness, resolve_harness_selection
+from .presets import PRESET_ENV, PRESETS_FILE_ENV, load_presets
 from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
 from .service import ServiceError, resolve_container, inspect_container_workdir
 from .tokens import (
@@ -217,6 +218,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--show-env", dest="show_env", action="store_true", help="Display LMER environment variable configuration on startup")
     parser.add_argument("--mount-file", dest="mount_file", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a single host file into the container at an explicit destination (repeatable). HOST supports ~ and $VAR expansion and must be an existing file; CONTAINER must be an absolute path; MODE is ro (default) or rw. Invalid entries abort the run. (env: LMER_MOUNT_FILES, comma-separated entries)")
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
+    parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_PRESET; the flag wins). The preset's checkout/service/env/args are applied as defaults: flags and exported environment variables in the actual invocation override them.")
+    parser.add_argument("--list-presets", dest="list_presets", action="store_true", help="List the presets available from LMER_PRESETS_FILE and exit")
 
     # Use parse_known_args so we can capture the command after --exec
     parser.add_argument("--no-task", dest="no_task", action="store_true", help="Run without selecting a task (exec mode only)")
@@ -726,6 +729,162 @@ def _display_env_config_cli(
     print("---")
 
 
+def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
+    """Validate mutually exclusive / dependent options on a parsed namespace.
+
+    Returns an exit code on failure, or None when the namespace is valid.
+    Runs after preset application so preset-supplied args are validated the
+    same as explicit ones.
+    """
+    if ns.branch and ns.ref:
+        error("Cannot specify both --branch and --ref")
+        return 2
+    if ns.workspace_volume and ns.workspace_bind:
+        error("Cannot specify both --workspace-volume and --workspace-bind")
+        return 2
+    if ns.no_clone and not ns.exec_mode:
+        error("--no-clone requires --exec mode")
+        return 2
+    if ns.user and ns.match_uid:
+        error("Cannot specify both --user and --match-uid")
+        return 2
+    if ns.no_task and not ns.exec_mode:
+        error("--no-task requires --exec mode")
+        return 2
+    if not ns.no_task and not ns.task and not ns.show_env:
+        error("Task type is required unless --no-task is specified")
+        return 2
+    if ns.service and not ns.checkout:
+        error("--service requires --checkout (path to local source checkout)")
+        return 2
+    return None
+
+
+def _display_presets_cli() -> int:
+    """Handle --list-presets: print the configured presets and exit code.
+
+    Env values are shown as key names only — a preset may carry credentials
+    (same reason --show-env redacts), and the keys are what identify it.
+    """
+    presets_file = os.environ.get(PRESETS_FILE_ENV, "").strip()
+    presets = load_presets()
+    # Direct print (not the verbose-gated info()): the listing IS the
+    # command's output, mirroring _display_env_config_cli.
+    if not presets:
+        if presets_file:
+            print(f"No presets loaded from {presets_file} (missing file or no valid entries).")
+        else:
+            print(f"No presets configured ({PRESETS_FILE_ENV} is not set).")
+        return 0
+    print(f"🎛️  Presets ({presets_file}):")
+    for name in sorted(presets):
+        preset = presets[name]
+        parts = []
+        if preset.checkout:
+            parts.append(f"checkout={preset.checkout}")
+        if preset.service:
+            parts.append(f"service={preset.service}")
+        if preset.env:
+            parts.append("env=" + ",".join(sorted(preset.env)))
+        if preset.args:
+            parts.append("args=" + shlex.join(preset.args))
+        print(f"  {name}" + (f"  [{' '.join(parts)}]" if parts else ""))
+    return 0
+
+
+def _resolve_and_apply_preset(
+    ns: argparse.Namespace,
+    rest: list[str],
+    argv: list[str],
+    early_env_file_sources: dict[str, str],
+) -> tuple[argparse.Namespace, list[str], dict[str, str]] | int:
+    """Resolve the selected startup preset and apply it to the invocation.
+
+    Selection is ``--preset`` > ``LMER_PRESET`` (matching the
+    --harness/LMER_HARNESS convention). Must run after the early .env load
+    (so LMER_PRESET/LMER_PRESETS_FILE from .env files work) and before
+    argument validation / harness resolution (so preset args and env take
+    full effect). The explicit invocation always wins over the preset:
+    preset tokens are PREPENDED to argv (argparse last-wins), and preset env
+    is only applied over keys that are unset or .env-sourced — never over
+    exported shell environment.
+
+    Returns the (possibly re-parsed) ``(ns, rest, applied_env)`` on success —
+    ``applied_env`` being the preset env entries that actually won host-side,
+    for the caller to seed into the container env dict — or an exit code on
+    failure. No preset selected returns the inputs unchanged.
+    """
+    preset_name = ns.preset or os.environ.get(PRESET_ENV) or None
+    applied_env: dict[str, str] = {}
+    if not preset_name:
+        return ns, rest, applied_env
+
+    presets = load_presets()
+    preset = presets.get(preset_name)
+    if preset is None:
+        available = ", ".join(sorted(presets)) or "(none)"
+        error(f"❌ Unknown preset '{preset_name}'. Available presets: {available}")
+        if not os.environ.get(PRESETS_FILE_ENV, "").strip():
+            error(f"   ({PRESETS_FILE_ENV} is not set, so no presets can load)")
+        return 2
+
+    # Preset args must be tokens the lmer parser fully recognizes as flags on
+    # a CLI invocation: a bare positional would silently bind as the task
+    # (demoting the user's own task to a target), a literal `--` would
+    # truncate parsing there and dump the rest of the command line into exec
+    # args, and an unknown/typo'd flag would fall through to `rest` — silently
+    # dropped, or prepended to the exec command under --exec. (The Slack spawn
+    # path instead appends args to a fixed `lmer chat <permalink>` command,
+    # where extra tokens are meaningful.)
+    if "--" in preset.args:
+        error(f"❌ Preset '{preset.name}' args may not contain '--' on a CLI invocation")
+        return 2
+    probe_ns, probe_rest = parse_args(list(preset.args))
+    # Unknown-token check first: a typo'd flag's value binds as a positional
+    # too, and the unknown flag is the actionable half of that message.
+    if probe_rest:
+        error(
+            f"❌ Preset '{preset.name}' args contain tokens lmer does not "
+            f"recognize ({shlex.join(probe_rest)}) — preset args must be "
+            f"known lmer flags on a CLI invocation"
+        )
+        return 2
+    leaked = ([probe_ns.task] if probe_ns.task else []) + list(probe_ns.target)
+    if leaked:
+        error(
+            f"❌ Preset '{preset.name}' args contain positional tokens "
+            f"({shlex.join(leaked)}) — preset args must be flags on a CLI invocation"
+        )
+        return 2
+
+    preset_tokens = preset.cli_tokens()
+    if preset_tokens:
+        original_env_file = ns.env_file
+        ns, rest = parse_args(preset_tokens + argv)
+        if ns.verbose or ns.debug:
+            os.environ["LMER_VERBOSE"] = "1"
+        # The caller's early .env load already ran off the command line's
+        # --env-file; honoring one smuggled in via preset args would require
+        # re-running it with murky precedence, so reject it.
+        if ns.env_file != original_env_file:
+            warning(
+                "⚠️  --env-file inside preset args is ignored — "
+                "pass it on the lmer command line instead"
+            )
+            ns.env_file = original_env_file
+
+    for key, value in preset.env.items():
+        if key not in os.environ or key in early_env_file_sources:
+            os.environ[key] = value
+            early_env_file_sources[key] = f"preset ({preset.name})"
+            applied_env[key] = value
+    info(
+        f"🎛️  Preset: {preset.name}"
+        + (f" (env: {', '.join(sorted(applied_env))})" if applied_env else "")
+    )
+    return ns, rest, applied_env
+
+
 def _resolve_afk_timeout_ms(explicit_value: str | None, slack_bridged: bool) -> str | None:
     """Resolve the CLAUDE_AFK_TIMEOUT_MS value forwarded into the container.
 
@@ -861,39 +1020,6 @@ def main(argv: list[str] | None = None) -> int:
     if ns.verbose or ns.debug:
         os.environ["LMER_VERBOSE"] = "1"
 
-    # Validate mutually exclusive options
-    if ns.branch and ns.ref:
-        error("Cannot specify both --branch and --ref")
-        return 2
-    if ns.workspace_volume and ns.workspace_bind:
-        error("Cannot specify both --workspace-volume and --workspace-bind")
-        return 2
-    if ns.no_clone and not ns.exec_mode:
-        error("--no-clone requires --exec mode")
-        return 2
-    if ns.user and ns.match_uid:
-        error("Cannot specify both --user and --match-uid")
-        return 2
-    if ns.no_task and not ns.exec_mode:
-        error("--no-task requires --exec mode")
-        return 2
-    if not ns.no_task and not ns.task and not ns.show_env:
-        error("Task type is required unless --no-task is specified")
-        return 2
-    if ns.service and not ns.checkout:
-        error("--service requires --checkout (path to local source checkout)")
-        return 2
-
-    # Determine container user
-    if ns.match_uid:
-        uid = os.getuid()
-        gid = os.getgid()
-        container_user = f"{uid}:{gid}"
-    elif ns.user:
-        container_user = ns.user
-    else:
-        container_user = os.environ.get("LMER_CONTAINER_USER", "developer")
-
     # Discover tasks from filesystem and validate provided task
     repo_root = repo_root_path()  # None in installed mode
     state_dir = lmer_state_dir()  # Always ~/.lmer/
@@ -943,6 +1069,36 @@ def main(argv: list[str] | None = None) -> int:
                 if key not in os.environ and value is not None:
                     os.environ[key] = value
                     early_env_file_sources[key] = f".env ({location})"
+
+    # Handle --list-presets: a pure query, so it runs before any preset is
+    # resolved or a task is required — but after the early .env load so an
+    # LMER_PRESETS_FILE defined in a .env file is honored.
+    if ns.list_presets:
+        return _display_presets_cli()
+
+    # Resolve and apply a named startup preset (--preset > LMER_PRESET;
+    # issue #127). Runs after the early .env load so LMER_PRESET/
+    # LMER_PRESETS_FILE from .env files work, and before argument validation
+    # and harness resolution so preset args and env take full effect.
+    preset_result = _resolve_and_apply_preset(ns, rest, argv, early_env_file_sources)
+    if isinstance(preset_result, int):
+        return preset_result
+    ns, rest, preset_applied_env = preset_result
+
+    # Validate the (possibly preset-augmented) arguments
+    validation_error = _validate_parsed_args(ns)
+    if validation_error is not None:
+        return validation_error
+
+    # Determine container user
+    if ns.match_uid:
+        uid = os.getuid()
+        gid = os.getgid()
+        container_user = f"{uid}:{gid}"
+    elif ns.user:
+        container_user = ns.user
+    else:
+        container_user = os.environ.get("LMER_CONTAINER_USER", "developer")
 
     # Resolve the agent harness (--harness > LMER_HARNESS > LMER_LLM_NAME
     # model hint > claude). Must run AFTER the early .env load above so
@@ -1481,6 +1637,18 @@ def main(argv: list[str] | None = None) -> int:
         env["CLAUDE_AFK_TIMEOUT_MS"],
         any(isinstance(handler, SlackThreadTargets) for handler in special_targets),
     )
+
+    # Preset env entries applied host-side are seeded into the container env
+    # dict so keys with no hardcoded passthrough above still reach the
+    # container, keeping the documented precedence over .env-file values (the
+    # merge below never overrides a key already present unless a previous
+    # .env set it). Skip keys the dict already carries: hardcoded passthrough
+    # keys read the preset's value from os.environ above, and the
+    # deliberately-None token guards (e.g. LMER_NAPKIN_TOKEN) must stay
+    # unforwardable.
+    for key, value in preset_applied_env.items():
+        if key not in env:
+            env[key] = value
 
     # Merge all variables from .env file into container env dict
     # Check state dir (~/.lmer/) and cwd for .env files
