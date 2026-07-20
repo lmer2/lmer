@@ -7,8 +7,11 @@
 # https://github.com/lmer2/lmer/issues.
 
 unreleased:
-  added: []
-  changed: []
+  added:
+    - "Startup presets can now be applied to direct CLI invocations (#127): `lmer <task> <target> --preset <name>` or `LMER_PRESET=<name> lmer …` (the flag wins, matching `--harness`/`LMER_HARNESS`; the env var also layers through `.env` files, so a project directory can pin a default preset). The preset — same operator-defined `LMER_PRESETS_FILE` JSON the Slack listener uses — supplies defaults only: explicit flags override preset `args` (and its `checkout`/`service`), exported environment variables override preset `env` entries (which in turn beat `.env`-file values both host-side and in the container env, where applied preset entries are forwarded even without a hardcoded passthrough; deliberately unlike Slack-selected presets, where the preset wins over the listener's inherited env), and the merged argument set is re-validated normally. Preset `args` must be known lmer flags on a CLI invocation — a positional, a literal `--`, or an unrecognized token fails fast instead of silently rebinding the command line. `--show-env` attributes preset-applied variables to `preset (<name>)`, an unknown name fails fast (exit 2) listing the available presets, and a new `lmer --list-presets` prints the configured presets (env shown as key names only, since preset env may carry credentials). See docs/PRESETS.md and the 'Startup presets' section in docs/LMER-CLI.md"
+    - "docs/PRESETS.md: dedicated guide for the startup-preset system as a whole — the `LMER_PRESETS_FILE` JSON format and field reference, loading/validation rules, trust model, per-consumer merge semantics (Slack-selected vs. CLI-selected, and why their precedence differs), a contributor checklist for adding a preset field, and troubleshooting. The preset sections in docs/LMER-CLI.md now cover only consumer-specific behavior and point here for the shared system"
+  changed:
+    - "`LMER_CONTAINER_USER` set in a `.env` file (cwd, `~/.lmer/.env`, or `--env-file`) is now honored when choosing the container user; previously only an exported environment variable took effect, because the container-user decision ran before the early `.env` load (reordered for CLI preset support, #127). An exported variable still wins over `.env` values, and `--user`/`--match-uid` win over both"
   fixed: []
   deprecated: []
   removed: []

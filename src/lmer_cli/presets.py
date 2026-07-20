@@ -4,9 +4,10 @@ A *preset* is an operator-defined, named startup configuration - a local
 checkout to mount, a running service container to target (service mode), extra
 environment variables, and extra ``lmer`` CLI flags - that a spawner can layer
 onto an ``lmer`` invocation by name. Presets live in core lmer so they are not
-tied to any single spawner; the host-side Slack listener
+tied to any single spawner; current consumers are the host-side Slack listener
 (:mod:`slack_chat.listener`), which spawns a repo-less ``lmer chat`` session
-per mention/DM, is currently the only consumer.
+per mention/DM, and the ``lmer`` CLI itself (``--preset <name>`` /
+``LMER_PRESET``, issue #127).
 
 This is deliberately **not** a raw passthrough of ``--service`` / ``--checkout``.
 A caller (e.g. a Slack user) only *selects* one of the operator-defined presets
@@ -27,11 +28,12 @@ Presets are defined in a JSON file pointed at by ``LMER_PRESETS_FILE``::
       }
     }
 
-A preset is selected by name via a ``$preset:<name>`` token embedded in a
+A preset is selected by name: via a ``$preset:<name>`` token embedded in a
 message, e.g. ``Hey @lmer $preset:my_service please do X`` (the Slack listener
-scans the triggering message for it). Preset names must use the selector
-charset (``[A-Za-z0-9_-]``); a name with other characters is logged and
-skipped at load time, since the token could never select it.
+scans the triggering message for it), or via ``lmer --preset <name>`` /
+``LMER_PRESET=<name>`` on a direct CLI invocation. Preset names must use the
+selector charset (``[A-Za-z0-9_-]``); a name with other characters is logged
+and skipped at load time, since the token could never select it.
 
 All fields are optional, with one rule mirrored from the lmer CLI: a preset
 that sets ``service`` must also set ``checkout`` (``--service`` requires
@@ -39,6 +41,9 @@ that sets ``service`` must also set ``checkout`` (``--service`` requires
 file yields no presets, and a single invalid entry is logged and skipped so it
 cannot disable the others. A caller that then selects a preset that did not
 load gets the consumer's normal "unknown preset" rejection.
+
+The user-facing guide — file format, trust model, and the per-consumer merge
+semantics — is ``docs/PRESETS.md``.
 """
 
 import json
@@ -50,10 +55,18 @@ from pathlib import Path
 
 logger = logging.getLogger("lmer_cli.presets")
 
-# Env var naming the JSON presets file. Read host-side by the listener only;
-# it never needs to reach inside a container (the preset's effects do, as the
-# --checkout/--service flags and env vars the spawned lmer already forwards).
+# Env var naming the JSON presets file. Read host-side only (by the Slack
+# listener and the lmer CLI); it never needs to reach inside a container (the
+# preset's effects do, as the --checkout/--service flags and env vars the
+# spawned lmer already forwards).
 PRESETS_FILE_ENV = "LMER_PRESETS_FILE"
+
+# Env var selecting a preset by name for a CLI invocation (the --preset flag
+# wins over it, matching --harness/LMER_HARNESS). Read host-side only, before
+# the container starts; also honored from .env files, so a project directory
+# can pin a default preset. The Slack listener selects via the $preset:<name>
+# message token instead and never reads this.
+PRESET_ENV = "LMER_PRESET"
 
 # Charset a preset name may use. Shared between the selector token and the
 # load-time name check so a name that loads is always one the token can select.
@@ -75,20 +88,26 @@ _KNOWN_KEYS = frozenset({"checkout", "service", "env", "args"})
 
 @dataclass
 class Preset:
-    """A named startup configuration for an lmer chat session.
+    """A named startup configuration for an lmer session.
 
     Attributes:
         name: The preset's key in the presets file (what ``$preset:<name>``
-            selects).
+            or ``--preset <name>`` / ``LMER_PRESET`` selects).
         checkout: Host path to a local source checkout, passed as
             ``--checkout``. Required whenever ``service`` is set.
         service: Docker/Compose service or container name to target, passed
             as ``--service`` (service mode).
-        env: Extra environment variables merged into the spawned process's
-            environment, overriding inherited values. Use for "other startup
-            variables" such as ``LMER_LLM_NAME`` or ``LMER_REASONING_EFFORT``.
-        args: Extra CLI tokens appended verbatim to the ``lmer chat`` command
-            (e.g. ``["--ports", "2"]``).
+        env: Extra environment variables. How they merge is the consumer's
+            contract: the Slack listener applies them over the spawned
+            process's inherited environment (the preset wins on conflict),
+            while a direct CLI invocation applies them as defaults (exported
+            environment variables win; ``.env``-file values lose). Use for
+            "other startup variables" such as ``LMER_LLM_NAME`` or
+            ``LMER_REASONING_EFFORT``.
+        args: Extra CLI tokens (e.g. ``["--ports", "2"]``). The Slack
+            listener appends them verbatim to the spawned ``lmer chat``
+            command; a direct CLI invocation applies them as overridable
+            defaults and requires them to be flag tokens only.
     """
 
     name: str
@@ -96,6 +115,21 @@ class Preset:
     service: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
+
+    def cli_tokens(self) -> list[str]:
+        """The lmer CLI tokens this preset contributes.
+
+        The single home of the field→flag mapping (``checkout`` →
+        ``--checkout``, ``service`` → ``--service``, then ``args`` verbatim),
+        shared by every spawner so a future preset field only needs wiring
+        here.
+        """
+        tokens: list[str] = []
+        if self.checkout:
+            tokens += ["--checkout", self.checkout]
+        if self.service:
+            tokens += ["--service", self.service]
+        return tokens + list(self.args)
 
 
 def parse_preset_token(text: str | None) -> str | None:

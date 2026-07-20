@@ -13,6 +13,7 @@ Python-first CLI for running LMER with a repository target, cloning inside the c
   - [Starting Your Task](#starting-your-task)
 - [Building the Container Image](#building-the-container-image)
 - [Command-Line Options](#command-line-options)
+  - [Startup presets (`--preset` / `LMER_PRESET`)](#startup-presets---preset--lmer_preset)
 - [Troubleshooting](#troubleshooting)
 
 ### Prerequisites
@@ -215,7 +216,9 @@ The following environment variables control LMER behavior:
 
 - **`LMER_SLACK_LOG_LEVEL`** - Read **host-side by `lmer-slack-listener`**: Python logging level for the listener (default `INFO`). Overridden by the `--log-level` flag.
 
-- **`LMER_PRESETS_FILE`** - Read **host-side by `lmer-slack-listener`**: path to a JSON file of named startup presets a Slack user can select with a `$preset:<name>` token in the triggering message. Unset (the default) disables the feature. Each preset may set `checkout` (mounted via `--checkout`), `service` (a running container/Compose service targeted via `--service`; requires `checkout`), `env` (extra environment variables merged over the inherited environment), and `args` (extra `lmer` CLI tokens appended verbatim). Presets are **operator-defined on the listener host** — a user only selects one by name, never supplies a path or flag — so access to use them is the same as access to reach the bot (channel membership / `LMER_SLACK_DM_ALLOWED_USERS`); there is no separate preset gate. A malformed file or invalid entry is logged and skipped (the entry, or the whole file, simply does not load), and selecting a name that did not load is rejected with a thread reply. See [Spawning sessions automatically (`lmer-slack-listener`)](#spawning-sessions-automatically-lmer-slack-listener).
+- **`LMER_PRESETS_FILE`** - Read **host-side** (by `lmer-slack-listener` and the `lmer` CLI): path to a JSON file of named startup presets — operator-defined bundles of `checkout`/`service`/`env`/`args` selectable with a `$preset:<name>` token in a Slack triggering message or with `lmer --preset <name>` / `LMER_PRESET` on a direct CLI invocation. Unset (the default) disables the feature. File format, field reference, validation rules, trust model, and per-consumer merge semantics: [docs/PRESETS.md](./PRESETS.md).
+
+- **`LMER_PRESET`** - Read **host-side by the `lmer` CLI**: name of a preset from `LMER_PRESETS_FILE` to apply to the invocation, e.g. `LMER_PRESET=my-preset lmer develop <url>`. The `--preset` flag wins over it (matching `--harness`/`LMER_HARNESS`). Also honored from `.env` files (cwd, `~/.lmer/.env`, `--env-file`), so a project directory can pin a default preset. The explicit invocation always wins over the preset, and an unknown name fails fast (exit 2) listing the available presets. Never needs to reach inside the container — the preset's *effects* (flags, forwarded env vars) do instead. See [Startup presets](#startup-presets---preset--lmer_preset) and [docs/PRESETS.md](./PRESETS.md).
 
 - **`LMER_SLACK_CHANNEL`** / **`LMER_SLACK_THREAD_TS`** - Set **by lmer inside the container** (not host inputs): the channel ID and thread timestamp parsed from the first Slack thread permalink target given to `lmer chat`. Their presence switches the `chat` taskdef into Slack conversation mode and supplies the default channel/thread for `lmer-slack` invocations (overridable per-invocation with `--permalink`). Empty/unset when no Slack target was given.
 
@@ -478,42 +481,20 @@ It must run **on a host** (not inside a container): lmer launches a container pe
 
 ##### Service-mode presets (`$preset:<name>`)
 
-By default every spawned session is a generic, repo-less `lmer chat`. **Presets** let the operator pre-define named startup configurations that a Slack user can opt into — for example to start a session in **service mode** (`--service` + `--checkout`) against a specific running stack — without ever exposing raw paths or flags to Slack. The user picks a configuration *by name*; the operator controls what each name maps to.
+By default every spawned session is a generic, repo-less `lmer chat`. **Startup presets** let the operator pre-define named startup configurations that a Slack user can opt into — for example to start a session in **service mode** (`--service` + `--checkout`) against a specific running stack — without ever exposing raw paths or flags to Slack. The user picks a configuration *by name*; the operator controls what each name maps to.
 
-Point `LMER_PRESETS_FILE` at a JSON file on the listener host:
+The preset system (the `LMER_PRESETS_FILE` JSON file, field reference, validation rules, and trust model) is shared with direct CLI invocations and documented in [docs/PRESETS.md](./PRESETS.md). Slack-specific behavior:
 
-```json
-{
-  "my_service": {
-    "checkout": "/srv/my-service",
-    "service": "mysvc",
-    "env": { "LMER_LLM_NAME": "opus" },
-    "args": ["--ports", "2"]
-  }
-}
-```
+- A user selects a preset with a `$preset:<name>` token anywhere in the message that **starts** the session:
 
-Each preset's fields are all optional:
+  ```
+  @lmer-bot $preset:my_service can you check why the worker queue is backed up?
+  ```
 
-- **`checkout`** — host path to a local source checkout, passed as `--checkout` (mounted as `/workspace`). Required whenever `service` is set.
-- **`service`** — a running container / Compose service to target, passed as `--service` (service mode; the agent can then run commands in that container via `target-exec`).
-- **`env`** — extra environment variables merged over the inherited environment (the preset wins on conflict). Use for "other startup variables" such as `LMER_LLM_NAME` or `LMER_REASONING_EFFORT`.
-- **`args`** — extra `lmer` CLI tokens appended verbatim to the spawned `lmer chat <permalink>` command.
-
-A user selects a preset with a `$preset:<name>` token anywhere in the message that starts the session:
-
-```
-@lmer-bot $preset:my_service can you check why the worker queue is backed up?
-```
-
-The listener then spawns, e.g., `lmer chat <permalink> --checkout /srv/my-service --service mysvc --ports 2` with `LMER_LLM_NAME=opus` in its environment, and the connecting ack names the applied preset.
-
-Notes:
-
-- **Trust boundary.** Presets live in a file on the listener host, writable only by whoever runs the listener; a Slack user can only *select* a name, never supply a path/flag. Using a preset therefore requires no permission beyond reaching the bot (channel membership / `LMER_SLACK_DM_ALLOWED_USERS`) — there is no separate preset allowlist.
+  The listener then spawns, e.g., `lmer chat <permalink> --checkout /srv/my-service --service mysvc --ports 2` with the preset's `env` in its environment, and the connecting ack names the applied preset.
+- **The preset wins** on env conflicts: its `env` is merged over the listener's inherited environment, and its `args` are appended verbatim to the spawned `lmer chat <permalink>` command. (On the CLI path the precedence is reversed — the explicit invocation wins; see [Merge semantics per consumer](./PRESETS.md#merge-semantics-per-consumer).)
 - **Unknown name** → the listener rejects it with a thread reply listing the available presets and does not spawn.
 - **Already-connected thread** → the token is moot (the live session handles the new message), so a `$preset:` token only takes effect on the message that *starts* a session.
-- **Validation is forgiving** — a missing/unreadable/malformed file, or an individual invalid entry (e.g. `service` without `checkout`, which mirrors the `--service requires --checkout` CLI rule, or a name outside the `$preset:` selector charset `[A-Za-z0-9_-]` that could never be picked), is logged and skipped rather than crashing the listener.
 
 ##### Slack app setup for the listener
 
@@ -580,8 +561,32 @@ lmer build --local /path/to/agents/global
 - `--ports <N>` - Allocate `N` free host ports and publish them into the container so a service Claude starts inside (e.g. a dev web server) is reachable from the host. The host CLI picks `N` currently-free ports from `--port-pool` before the container starts, publishes each on the host (loopback `127.0.0.1` by default, override with `--port-bind`) with the same port number inside and out, and exports the list to the container as `LMER_PORTS`. Startup aborts if `N` free ports can't be found. Also settable via `LMER_PORT_COUNT` (the flag wins). Bind services to `0.0.0.0` inside the container so the published mapping works. See [Port Passthrough](#port-passthrough)
 - `--port-pool LOW-HIGH` - Inclusive port pool the `--ports` ports are picked from (default `8800-8899`, distinct from the FastAPI range so both features coexist). Also settable via `LMER_PORT_POOL` (the flag wins)
 - `--port-bind <addr>` - Host bind address used when publishing the allocated `--ports` mappings (default `127.0.0.1`). Pass `0.0.0.0` to expose the ports on every host interface (so other machines on the LAN can reach a service Claude starts inside), or a specific IP to publish only on that interface. The address is also used to probe for free ports in the pool, so the picked ports are guaranteed bindable there. Also settable via `LMER_PORT_BIND` (the flag wins). The default is loopback for a reason — only widen it when you trust both the network and what the agent is running
+- `--preset <name>` - Apply a named startup preset from `LMER_PRESETS_FILE` to this invocation. Also settable via `LMER_PRESET` (the flag wins). See [Startup presets](#startup-presets---preset--lmer_preset)
+- `--list-presets` - List the presets available from `LMER_PRESETS_FILE` (name plus a summary of each preset's fields; env is shown as key names only) and exit
 
 **Note**: `--workspace-volume` and `--workspace-bind` options are currently not functional. The workspace uses the `/workspace` directory from the container image instead.
+
+### Startup presets (`--preset` / `LMER_PRESET`)
+
+Named startup presets — a local checkout to mount, a service container to target, extra environment variables, extra CLI flags — are defined once by the operator in the JSON file named by `LMER_PRESETS_FILE`; the same file serves Slack-selected and CLI-selected presets, and the format, validation rules, and trust model are documented in [docs/PRESETS.md](./PRESETS.md). A CLI invocation applies one by name:
+
+```bash
+# Flag form
+lmer develop https://gitlab.example.com/group/project/-/issues/12 --preset my_service
+
+# Env var form (the flag wins when both are given)
+LMER_PRESET=my_service lmer develop https://gitlab.example.com/group/project/-/issues/12
+
+# A project directory can pin a default preset via its .env
+echo "LMER_PRESET=my_service" >> .env
+
+# See what's available
+lmer --list-presets
+```
+
+The preset supplies **defaults; the explicit invocation always wins**: explicit flags override preset `args` (and the `--checkout`/`--service` derived from the preset's fields; repeatable flags like `--mount-file` accumulate from both), and exported environment variables override preset `env` entries, which in turn beat `.env`-file values — both host-side and in the container environment. The combined argument set is re-validated normally, and `--show-env` attributes preset-applied variables to `preset (<name>)`. This precedence deliberately differs from Slack-selected presets, where the preset wins — see [Merge semantics per consumer](./PRESETS.md#merge-semantics-per-consumer).
+
+Guard rails: an unknown name fails fast (exit 2) listing the available presets; preset `args` must be known lmer flags — a bare positional, a literal `--`, or an unrecognized token fails fast (exit 2) rather than silently rebinding your command line; and a preset-supplied `--env-file` never loads (ignored with a warning — pass it on the command line instead). Details: [CLI-selected presets in docs/PRESETS.md](./PRESETS.md#cli-selected-presets).
 
 ### Supervisor and FastAPI Endpoint
 
