@@ -201,6 +201,66 @@ The lmer container is the security boundary (resource limits,
   passes `--dangerously-bypass-approvals-and-sandbox`.
 - **pi** — no tool-call prompts at all (see matrix note 5).
 
+## Non-interactive exec mode (`spawn-harness`)
+
+Besides driving each harness's TUI, the registry also knows how to run every
+harness as a **non-interactive child process** — the mechanism behind the
+`--agents` fan-out (issue #130): the orchestrating session's agent runs
+`spawn-harness <agent-name>` to fan a task out to additional
+harness/model configurations and consolidate the results itself.
+
+```bash
+# Names resolved from --agents at launch (spawn-harness --list shows them)
+spawn-harness sol-review --prompt-file prompt.md \
+    --env LMER_REVIEW_ON_MR=0 --output agents/sol-review.md --timeout 1800
+```
+
+Each `ExecProfile` in the registry (`src/lmer_cli/harness.py`) carries the
+harness's exec invocation; `spawn-harness`
+(`lmer_cli.container.spawn_harness`, wrapper in `bin/`) selects the child's
+harness as: `LMER_HARNESS` set by the agent's own config (preset env /
+`--env` pairs) > the model hint from the agent's own `LMER_LLM_NAME` > the
+orchestrating session's inherited harness > claude — the inherited harness
+never shadows a model-only agent preset, and conversely the session's
+inherited model never re-routes an agent that configures nothing (the
+operator's explicit `--harness` already beat that hint at launch). It then
+maps `LMER_LLM_NAME` / `LMER_REASONING_EFFORT` to the harness's flags (same
+tier semantics as the interactive runners: `max` → the harness's top tier;
+an inherited model whose family implies a different harness than the
+child's is dropped rather than handed to a cross-harness child as a foreign
+`--model`), appends the prompt as the final argument, and mirrors the
+child's exit code (a signal death maps to `128+N`; 124 on `--timeout`
+expiry, which kills the child's whole process group — as does interrupting
+`spawn-harness` itself with SIGINT/SIGTERM, so a cancelled fan-out never
+leaves a detached child running). Liveness and failure
+are observable without watching the exit code: a heartbeat line is printed
+to stderr while the child runs (`--heartbeat`, default 60s, 0 disables —
+harnesses buffer their final answer, so an empty output file says nothing
+about progress), and when a child dies its `--output` file gets a
+`[spawn-harness] child FAILED` footer carrying the exit reason and the
+stderr tail, so a failed agent's output explains itself.
+
+| | claude | codex | pi |
+|---|---|---|---|
+| Invocation | `claude -p` | `codex exec` | `pi -p` |
+| Permission posture | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--no-approve` (pi never prompts) |
+| Statelessness | `--no-session-persistence` | `--ephemeral` | `--no-session` |
+| Model / effort | `--model` / `--effort` (accepts `max`) | `--model` / `-c model_reasoning_effort=` (`max`→`xhigh`) | `--model` / `--thinking` (`max`→`xhigh`, matching the interactive runner) |
+| Prompt safety | `--` before the prompt | `--` before the prompt | no `--` support — a prompt starting with `-` is rejected |
+
+Children cannot answer permission prompts, so every profile carries its
+harness's bypass posture — the lmer container is the security boundary, the
+same doctrine pi applies to interactive sessions. The bypass flags live in
+the profile's dedicated `permission_bypass_args` field and are appended only
+for `build_exec_argv(..., unattended=True)` (which `spawn-harness` passes):
+a future consumer of the exec profiles must opt into permission-free
+children explicitly, never inherit them from neutral registry data.
+Children are also barred
+from fanning out further: `spawn-harness` strips `LMER_AGENTS` /
+`LMER_AGENTS_CONFIG` from the child environment (no grandchildren,
+structurally). How agents are configured and selected at launch:
+[Fan-out agents in docs/PRESETS.md](./PRESETS.md#fan-out-agents---agents--lmer_agents).
+
 ## Architecture
 
 ```

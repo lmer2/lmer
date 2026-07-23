@@ -13,6 +13,7 @@ any single spawner. Current consumers:
 |---|---|---|
 | `lmer-slack-listener` (spawns a session per mention/DM) | `$preset:<name>` token in the triggering Slack message | [Slack-selected presets](#slack-selected-presets) |
 | The `lmer` CLI (direct invocations) | `--preset <name>` flag or `LMER_PRESET` env var | [CLI-selected presets](#cli-selected-presets) |
+| Agent fan-out (`spawn-harness` children, issue #130) | `--agents <name,...>` flag or `LMER_AGENTS` env var at launch | [Fan-out agents](#fan-out-agents---agents--lmer_agents) |
 
 The file format, validation rules, and trust model below are shared by every
 consumer. How a preset *combines* with the rest of the invocation is each
@@ -162,6 +163,83 @@ Guard rails:
 
 CLI quick reference: [Startup presets in docs/LMER-CLI.md](./LMER-CLI.md#startup-presets---preset--lmer_preset).
 
+## Fan-out agents (`--agents` / `LMER_AGENTS`)
+
+`lmer <task> <target> --agents=sol-review,opus-review` (or `LMER_AGENTS=…`;
+the flag wins) names the presets the session's agent may fan a task out to
+with the in-container `spawn-harness` tool — e.g. a review taskdef running
+the same review through several harness/model configurations and
+consolidating the results (issue #130).
+
+For this consumer a preset is an **agent configuration, not a session
+launch**: children run as non-interactive harness subprocesses inside the
+orchestrating session's container. What a selected preset contributes:
+
+- **`env`** — the child's overlay (typically `LMER_HARNESS`,
+  `LMER_LLM_NAME`, `LMER_REASONING_EFFORT`).
+- **`args` `--harness <name>`** — folded into the overlay as
+  `LMER_HARNESS` (winning over a preset-env value, mirroring the CLI
+  consumer's flag-beats-env rule), so a dual-use preset configures its
+  harness once and works with both `--preset` and `--agents`.
+- **`args` `--prompt <text>`** — carried as the agent's prompt *preamble*:
+  `spawn-harness` prepends it to the prompt the orchestrator supplies, or
+  uses it alone when none is given — a canned persona (e.g. "second review
+  pass from scratch") can live in the preset.
+- Everything else (`checkout`, `service`, remaining args) is ignored with
+  a warning.
+
+A name that matches no preset falls back to the **model route**: when the
+name is a model whose family implies a harness (the same
+`MODEL_HARNESS_HINTS` matching as `LMER_LLM_NAME` autoselection — `fable`
+→ claude, `gpt-5.6-sol` → codex), it resolves to a synthesized model-only
+agent, so `--agents=fable,sol-review` works without defining a `fable`
+preset. The fallback is announced at launch; note a typo'd preset name
+containing a model word resolves this way and only fails when the harness
+rejects the model. Preset names are case-sensitive — a case-variant of a
+defined preset (`--agents=Fable` with a `fable` preset) is rejected with a
+did-you-mean rather than silently taking the model route.
+
+The trust model is preserved by resolving at launch: names are validated
+against `LMER_PRESETS_FILE` on the host — a name that is neither a preset
+nor a routable model fails fast (exit 2) listing the available presets, a
+duplicate warns and keeps the first occurrence — and only the resolved
+config crosses into the container, as `LMER_AGENTS` (names) plus
+`LMER_AGENTS_CONFIG` (JSON `{name: {"env": {...}, "prompt": "..."?}}`).
+The presets file never enters the container, so the agent can only spawn
+what was named at launch. Inside the session:
+
+```bash
+spawn-harness --list
+spawn-harness sol-review --prompt-file prompt.md \
+    --env LMER_REVIEW_ON_MR=0 --output agents/sol-review.md
+```
+
+Credentials follow the children (issue #131): because each agent's implied
+harness is known host-side before the container starts, the launcher mounts
+the credential files of **every implied child harness** alongside the
+session harness's (e.g. `~/.codex/auth.json` for a codex-routed child of a
+claude session — same skip-missing-files rule as the session mounts). An
+implied child harness with no mountable credential file on the host warns
+at launch naming the agent, the harness, and the missing path; it never
+errors, since a keys-via-env harness (pi) can authenticate without the
+mount — and conversely a mounted file is no promise of working auth. The
+launch-time computation only sees launch-configured routing: a child
+rerouted at spawn time (`spawn-harness … --env LMER_HARNESS=…`) may select
+a harness whose credentials were never mounted — `spawn-harness` prints
+the same may-fail-to-authenticate warning in-container when that happens.
+
+One `spawn-harness` invocation runs one child and blocks until it exits
+(mirroring the child's exit code); the orchestrating agent parallelizes
+with its own background-shell tooling. While a child runs, heartbeat lines
+on stderr distinguish a healthy long run from a hung one, and a failed
+child's `--output` file carries a failure footer with the stderr tail
+instead of being silently empty. Children run permission-free (the
+lmer container is the security boundary), stateless (no run dirs, no
+work-repo writes), and cannot fan out further — `LMER_AGENTS` /
+`LMER_AGENTS_CONFIG` are stripped from the child environment, so there are
+no grandchildren. Per-harness invocation details:
+[Non-interactive exec mode in docs/HARNESSES.md](./HARNESSES.md#non-interactive-exec-mode-spawn-harness).
+
 ## Merge semantics per consumer
 
 How a preset combines with the rest of the invocation is each consumer's
@@ -177,6 +255,14 @@ The env asymmetry is deliberate: a Slack user has no way to express
 per-invocation intent beyond the message text, so the operator's preset is
 authoritative; a CLI user can type flags and export variables, so their
 explicit invocation always wins.
+
+The fan-out consumer ([`--agents`](#fan-out-agents---agents--lmer_agents))
+contributes its `env` overlay plus `--harness`/`--prompt` folded from
+`args` (other launch-shaping fields are ignored with a warning — see the
+fan-out section above), and has its own child-side merge: the child
+inherits the orchestrating session's environment, the preset's `env`
+overlays it, and explicit `spawn-harness --env KEY=VAL` pairs win over
+both.
 
 ## Adding a preset field
 

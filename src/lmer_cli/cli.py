@@ -13,6 +13,7 @@ The CLI supports both interactive Claude Code sessions and arbitrary command exe
 """
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -45,8 +46,24 @@ from .mounts import (
     resolve_host_uv_cache_dir,
 )
 from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
-from .harness import HARNESSES, UnknownHarnessError, get_harness, resolve_harness_selection
-from .presets import PRESET_ENV, PRESETS_FILE_ENV, load_presets
+from .harness import (
+    HARNESS_ENV,
+    HARNESSES,
+    LLM_NAME_ENV,
+    Harness,
+    UnknownHarnessError,
+    get_harness,
+    implied_harness_name,
+    missing_credential_mounts,
+    resolve_harness_selection,
+)
+from .presets import (
+    AGENTS_ENV,
+    PRESET_ENV,
+    PRESETS_FILE_ENV,
+    load_presets,
+    resolve_agent_presets,
+)
 from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
 from .service import ServiceError, resolve_container, inspect_container_workdir
 from .tokens import (
@@ -220,6 +237,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
     parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_PRESET; the flag wins). The preset's checkout/service/env/args are applied as defaults: flags and exported environment variables in the actual invocation override them.")
     parser.add_argument("--list-presets", dest="list_presets", action="store_true", help="List the presets available from LMER_PRESETS_FILE and exit")
+    parser.add_argument("--agents", dest="agents", help="Comma-delimited preset names the session's agent may fan a task out to via spawn-harness (env: LMER_AGENTS; the flag wins). Names are resolved against LMER_PRESETS_FILE host-side (unknown names fail fast); each preset contributes its env overlay plus --harness/--prompt folded from its args — the remaining launch-shaping fields (checkout/service/other args) are ignored with a warning — and only that resolved config is forwarded into the container.")
 
     # Use parse_known_args so we can capture the command after --exec
     parser.add_argument("--no-task", dest="no_task", action="store_true", help="Run without selecting a task (exec mode only)")
@@ -885,6 +903,90 @@ def _resolve_and_apply_preset(
     return ns, rest, applied_env
 
 
+def _resolve_agents_cli(ns: argparse.Namespace) -> dict[str, dict] | None | int:
+    """Resolve the ``--agents``/``LMER_AGENTS`` fan-out selection (issue #130).
+
+    Selection is ``--agents`` > ``LMER_AGENTS`` (matching --preset/
+    LMER_PRESET). Must run after the early .env load and preset application
+    so an LMER_AGENTS from a .env file or a preset's env is honored. Names
+    are resolved host-side against LMER_PRESETS_FILE — the trust model keeps
+    the presets file itself out of the container; the session's agent can
+    only spawn what was named at launch.
+
+    Returns the resolved ``{name: {"env": {...}, "prompt": ...?}}`` mapping
+    (the ``LMER_AGENTS_CONFIG`` shape, selection-ordered), ``None`` when no
+    selection was made, or an exit code on failure (unknown name / empty
+    selection — spawning fewer agents than asked is never silent).
+    """
+    selection = ns.agents or os.environ.get(AGENTS_ENV) or ""
+    if not selection.strip():
+        return None
+    resolved, agent_warnings, agents_error = resolve_agent_presets(selection, load_presets())
+    for note in agent_warnings:
+        warning(f"⚠️  --agents: {note}")
+    if agents_error is not None:
+        error(f"❌ --agents: {agents_error}")
+        if not os.environ.get(PRESETS_FILE_ENV, "").strip():
+            error(f"   ({PRESETS_FILE_ENV} is not set, so no presets can load)")
+        return 2
+    info(f"🤖 Agents: {','.join(resolved)}")
+    return resolved
+
+
+def _agents_child_harnesses(
+    resolved: dict[str, dict], session_harness: Harness
+) -> list[Harness]:
+    """The extra harnesses the ``--agents`` fan-out children imply (issue #131).
+
+    Mirrors spawn-harness's in-container selection host-side, before the
+    container starts (the same fail-early rationale as
+    ``resolve_agent_presets``): for each resolved agent, the overlay merged
+    over the session's effective ``LMER_HARNESS``/``LMER_LLM_NAME`` feeds
+    :func:`lmer_cli.harness.implied_harness_name`. Credential mounts are
+    keyed to the session harness only, so a child routed elsewhere needs its
+    harness's credential files mounted too — the returned (deduplicated,
+    selection-ordered) non-session harnesses union into
+    ``build_user_mounts``.
+
+    Also warns when an implied non-session child harness has no mountable
+    credential file on the host at all — the child may fail to authenticate.
+    A warning, never an error: a mount is no promise of working auth, and
+    keys-via-env harnesses (pi) can authenticate without one. The session's
+    own harness is exempt, mirroring ``warn_missing_credentials``'s
+    spawn-time exemption: its credential state IS the session's (a plain
+    launch never warns about it, and a same-harness child authenticates
+    exactly as well as the session).
+    """
+    inherited = {
+        HARNESS_ENV: session_harness.name,
+        LLM_NAME_ENV: os.environ.get(LLM_NAME_ENV) or "",
+    }
+    home = Path.home()
+    extra: dict[str, Harness] = {}
+    for agent_name, entry in resolved.items():
+        overlay = entry.get("env") or {}
+        name = implied_harness_name(overlay, {**inherited, **overlay})
+        if name not in HARNESSES:
+            # resolve_agent_presets already rejects unknown explicit names;
+            # unreachable in practice, but a mount union must never crash.
+            continue
+        if name == session_harness.name:
+            continue
+        child = HARNESSES[name]
+        missing = missing_credential_mounts(
+            child, lambda cred: (home / cred.host_path).exists()
+        )
+        if missing:
+            paths = " / ".join(f"~/{cred.host_path}" for cred in missing)
+            warning(
+                f"⚠️  --agents: agent '{agent_name}' routes to {name} but "
+                f"{paths} does not exist on the host — "
+                "the child may fail to authenticate"
+            )
+        extra.setdefault(name, child)
+    return list(extra.values())
+
+
 def _resolve_afk_timeout_ms(explicit_value: str | None, slack_bridged: bool) -> str | None:
     """Resolve the CLAUDE_AFK_TIMEOUT_MS value forwarded into the container.
 
@@ -1085,6 +1187,16 @@ def main(argv: list[str] | None = None) -> int:
         return preset_result
     ns, rest, preset_applied_env = preset_result
 
+    # Resolve the --agents/LMER_AGENTS fan-out selection (issue #130). Runs
+    # after preset application so a preset's env can carry LMER_AGENTS, and
+    # early enough that an unknown name fails fast before any container work.
+    agents_result = _resolve_agents_cli(ns)
+    if isinstance(agents_result, int):
+        return agents_result
+    resolved_agents = agents_result
+    agents_csv = ",".join(resolved_agents) if resolved_agents else None
+    agents_config_json = json.dumps(resolved_agents) if resolved_agents else None
+
     # Validate the (possibly preset-augmented) arguments
     validation_error = _validate_parsed_args(ns)
     if validation_error is not None:
@@ -1126,6 +1238,14 @@ def main(argv: list[str] | None = None) -> int:
             f"if the session fails with '{harness.runner_command}: command not found', "
             f"rebuild with: lmer build)"
         )
+
+    # Harnesses the --agents fan-out children imply beyond the session's
+    # (issue #131): their credential files union into build_user_mounts
+    # below, and a child harness with no host credential file warns here,
+    # at launch — not hours later when spawn-harness runs.
+    agent_extra_harnesses = (
+        _agents_child_harnesses(resolved_agents, harness) if resolved_agents else []
+    )
 
     # Handle --show-env: display env config table
     if ns.show_env:
@@ -1291,7 +1411,7 @@ def main(argv: list[str] | None = None) -> int:
     run += build_container_home_mounts(runtime, container_home)
 
     # Build user mounts and check for SSH agent
-    user_mounts, ssh_agent_enabled = build_user_mounts(runtime, harness)
+    user_mounts, ssh_agent_enabled = build_user_mounts(runtime, harness, agent_extra_harnesses)
     run += user_mounts
     if ssh_agent_enabled:
         success("✅ SSH agent forwarding enabled")
@@ -1499,6 +1619,12 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_DISPATCH_CODE": os.environ.get("LMER_DISPATCH_CODE"),
         "LMER_DISPATCH_MECHANICAL": os.environ.get("LMER_DISPATCH_MECHANICAL"),
         "LMER_DISPATCH_EXPLORE": os.environ.get("LMER_DISPATCH_EXPLORE"),
+        # Agent fan-out (issue #130): the resolved --agents/LMER_AGENTS preset
+        # names and their env overlays (JSON {name: {"env": {...}}}), consumed
+        # in-container by spawn-harness. Host-resolved — the presets file
+        # itself never enters the container.
+        "LMER_AGENTS": agents_csv,
+        "LMER_AGENTS_CONFIG": agents_config_json,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         # Statusline segment list (issue #121), consumed in-container by
         # hooks/statusline.py; unset keeps the default repo,branch,task,ctx.

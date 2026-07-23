@@ -50,8 +50,11 @@ import json
 import logging
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .harness import HARNESS_ENV, HARNESSES, LLM_NAME_ENV, harness_for_model
 
 logger = logging.getLogger("lmer_cli.presets")
 
@@ -67,6 +70,21 @@ PRESETS_FILE_ENV = "LMER_PRESETS_FILE"
 # can pin a default preset. The Slack listener selects via the $preset:<name>
 # message token instead and never reads this.
 PRESET_ENV = "LMER_PRESET"
+
+# Env var selecting the agent fan-out presets for a CLI invocation, as a
+# comma-delimited list of preset names (the --agents flag wins over it,
+# matching --preset/LMER_PRESET). Read host-side only: the names are resolved
+# against the presets file before the container starts, and only the resolved
+# env overlays are forwarded inside (as LMER_AGENTS + LMER_AGENTS_CONFIG, for
+# spawn-harness) — the presets file itself never crosses the boundary.
+AGENTS_ENV = "LMER_AGENTS"
+
+# Container env var carrying the resolved per-agent config as JSON
+# (``{name: {"env": {...}}}``), written by the host CLI and consumed by
+# spawn-harness. Defined beside AGENTS_ENV because the two are halves of one
+# contract (host writes both, spawn-harness strips both from children) —
+# every consumer must import them from here so a rename can't split them.
+AGENTS_CONFIG_ENV = "LMER_AGENTS_CONFIG"
 
 # Charset a preset name may use. Shared between the selector token and the
 # load-time name check so a name that loads is always one the token can select.
@@ -195,6 +213,138 @@ def load_presets(path: str | None = None) -> dict[str, Preset]:
         ",".join(sorted(presets)) or "(none)",
     )
     return presets
+
+
+def _extract_arg_flag(args: list[str], flag: str) -> tuple[str | None, list[str]]:
+    """Pull ``flag <value>`` / ``flag=<value>`` out of a preset args list.
+
+    Returns ``(value, remaining_tokens)``; the last occurrence wins
+    (argparse semantics). A trailing flag with no value is left in the
+    remaining tokens for the caller's ignored-args warning.
+    """
+    value: str | None = None
+    remaining: list[str] = []
+    i = 0
+    while i < len(args):
+        token = args[i]
+        if token == flag and i + 1 < len(args):
+            value = args[i + 1]
+            i += 2
+            continue
+        if token.startswith(flag + "="):
+            value = token.split("=", 1)[1]
+            i += 1
+            continue
+        remaining.append(token)
+        i += 1
+    return value, remaining
+
+
+def resolve_agent_presets(
+    selection: str, presets: dict[str, Preset]
+) -> tuple[dict[str, dict] | None, list[str], str | None]:
+    """Resolve a comma-delimited ``--agents``/``LMER_AGENTS`` selection.
+
+    For the fan-out consumer a preset is an agent configuration, not a
+    session launch: the children are in-container subprocesses. What a
+    selected preset contributes:
+
+    - ``env`` — forwarded as the child's overlay.
+    - ``args`` ``--harness <name>`` — folded into the overlay as
+      ``LMER_HARNESS`` (winning over a preset-env value, mirroring the CLI
+      consumer's flag-beats-env precedence), so a dual-use preset
+      configures its harness once and works with both ``--preset`` and
+      ``--agents``.
+    - ``args`` ``--prompt <text>`` — carried as the agent's ``prompt``
+      preamble; ``spawn-harness`` prepends it to the orchestrator-supplied
+      prompt (or uses it alone when none is given).
+    - everything else (``checkout``/``service``, remaining args) is
+      surfaced as a warning and ignored.
+
+    A name that matches no preset falls back to the **model route**: when
+    the name is a model whose family implies a harness
+    (:func:`harness_for_model` — e.g. ``fable`` → claude), it resolves to a
+    synthesized ``{"env": {"LMER_LLM_NAME": <name>}}`` agent, so common
+    model names need no preset entry (``--agents=fable,sol-review``). The
+    fallback is surfaced as a note-level warning — a typo'd preset name
+    that happens to contain a model word resolves this way and only fails
+    at spawn time when the harness rejects the model.
+
+    Duplicate names warn and keep the first occurrence; selection order is
+    preserved.
+
+    Returns ``(resolved, warnings, error)``: ``resolved`` maps name → the
+    agent's config entry (``{"env": {...}}`` plus optional ``"prompt"`` —
+    the exact ``LMER_AGENTS_CONFIG`` shape) and is ``None`` when ``error``
+    is set (an empty selection, any unknown name — unknown must fail the
+    invocation, mirroring the ``--preset`` UX, never silently spawn fewer
+    agents — or an unknown harness, which would otherwise only surface
+    hours later when spawn-harness runs inside the session).
+    """
+    names = [name.strip() for name in selection.split(",") if name.strip()]
+    warnings: list[str] = []
+    if not names:
+        return None, warnings, "no agent names given"
+    resolved: dict[str, dict] = {}
+    for name in names:
+        if name in resolved:
+            warnings.append(f"duplicate agent '{name}' ignored")
+            continue
+        preset = presets.get(name)
+        if preset is None:
+            # A case-variant of a defined preset must not silently take the
+            # model route (preset lookup is exact-case, the model hint is
+            # case-insensitive — '--agents=Fable' with a 'fable' preset
+            # would otherwise drop the preset's env without a sound).
+            case_match = next(
+                (key for key in presets if key.lower() == name.lower()), None
+            )
+            if case_match is not None:
+                return None, warnings, (
+                    f"Unknown agent '{name}' — did you mean '{case_match}'? "
+                    "(preset names are case-sensitive)"
+                )
+            hinted = harness_for_model(name)
+            if hinted is not None:
+                warnings.append(
+                    f"agent '{name}': no matching preset — "
+                    f"using the model route ({name} → {hinted})"
+                )
+                resolved[name] = {"env": {LLM_NAME_ENV: name}}
+                continue
+            available = ", ".join(sorted(presets)) or "(none)"
+            return None, warnings, (
+                f"Unknown agent '{name}': not a preset (available: {available}) "
+                "and not a model name that routes to a harness"
+            )
+        harness_arg, leftover_args = _extract_arg_flag(preset.args, "--harness")
+        prompt_arg, leftover_args = _extract_arg_flag(leftover_args, "--prompt")
+        env = dict(preset.env)
+        if harness_arg:
+            env[HARNESS_ENV] = harness_arg.strip().lower()
+        harness_name = (env.get(HARNESS_ENV) or "").strip().lower()
+        if harness_name and harness_name not in HARNESSES:
+            known = ", ".join(sorted(HARNESSES))
+            return None, warnings, (
+                f"agent '{name}': unknown harness '{harness_name}' "
+                f"(known harnesses: {known})"
+            )
+        ignored = [f for f in ("checkout", "service") if getattr(preset, f)]
+        if ignored:
+            warnings.append(
+                f"agent '{name}': preset field(s) {', '.join(ignored)} ignored — "
+                "they configure a session launch, not a spawned child"
+            )
+        if leftover_args:
+            warnings.append(
+                f"agent '{name}': preset args {shlex.join(leftover_args)} ignored — "
+                "only --harness and --prompt fold into spawned children"
+            )
+        entry: dict = {"env": env}
+        if prompt_arg:
+            entry["prompt"] = prompt_arg
+        resolved[name] = entry
+    return resolved, warnings, None
 
 
 def _build_preset(name: str, spec: object) -> Preset | None:

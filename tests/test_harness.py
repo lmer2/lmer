@@ -28,6 +28,8 @@ from lmer_cli.harness import (
     UnknownHarnessError,
     get_harness,
     harness_for_model,
+    implied_harness_name,
+    missing_credential_mounts,
     resolve_harness,
     resolve_harness_name,
     resolve_harness_selection,
@@ -218,6 +220,68 @@ class TestModelHintAutoselect:
         assert resolve_harness_name() == DEFAULT_HARNESS
 
 
+class TestImpliedHarnessName:
+    """The shared fan-out precedence (issue #131): overlay LMER_HARNESS >
+    model hint from the overlay's own LMER_LLM_NAME > inherited
+    LMER_HARNESS > default. Shared between spawn-harness's select_harness
+    and the host CLI's credential-mount computation."""
+
+    def test_overlay_harness_wins_over_everything(self):
+        overlay = {"LMER_HARNESS": "pi", "LMER_LLM_NAME": "gpt-5.6-sol"}
+        merged = {**{"LMER_HARNESS": "claude"}, **overlay}
+        assert implied_harness_name(overlay, merged) == "pi"
+
+    def test_overlay_model_hint_beats_inherited_harness(self):
+        # No overlay harness: the agent's own LLM name routes the child away
+        # from the session.
+        overlay = {"LMER_LLM_NAME": "gpt-5.6-sol"}
+        merged = {"LMER_HARNESS": "claude", "LMER_LLM_NAME": "gpt-5.6-sol"}
+        assert implied_harness_name(overlay, merged) == "codex"
+
+    def test_inherited_model_never_outranks_inherited_harness(self):
+        # An empty overlay runs the session's own harness. The inherited
+        # LMER_LLM_NAME must NOT re-route it: at launch time the operator's
+        # explicit harness beat that very model hint (--harness pi with
+        # LMER_LLM_NAME=sonnet is a legitimate keys-via-API setup), and the
+        # child inherits that settled choice, not a re-litigated one.
+        merged = {"LMER_HARNESS": "pi", "LMER_LLM_NAME": "sonnet"}
+        assert implied_harness_name({}, merged) == "pi"
+
+    def test_inherited_harness_when_no_hint(self):
+        merged = {"LMER_HARNESS": "pi", "LMER_LLM_NAME": "mystery-model"}
+        assert implied_harness_name({}, merged) == "pi"
+
+    def test_default_when_nothing_set(self):
+        assert implied_harness_name({}, {}) == DEFAULT_HARNESS
+
+    def test_overlay_name_normalized_but_not_validated(self):
+        # Callers own validation — an unknown explicit name passes through
+        # so each caller can fail in its own way.
+        assert implied_harness_name({"LMER_HARNESS": " Codx "}, {}) == "codx"
+
+
+class TestMissingCredentialMounts:
+    """The warn-iff-ALL-missing policy is single-homed in
+    missing_credential_mounts, shared by the launch-time (host) and
+    spawn-time (container) credential warnings (issue #131)."""
+
+    def test_all_missing_returns_every_mount(self):
+        codex = get_harness("codex")
+        missing = missing_credential_mounts(codex, lambda cred: False)
+        assert missing == codex.credential_mounts
+
+    def test_partial_credential_set_returns_empty(self):
+        # pi's models.json is optional config — one present file silences.
+        pi = get_harness("pi")
+        missing = missing_credential_mounts(
+            pi, lambda cred: cred.host_path == ".pi/agent/auth.json"
+        )
+        assert missing == ()
+
+    def test_none_missing_returns_empty(self):
+        assert missing_credential_mounts(get_harness("claude"), lambda cred: True) == ()
+
+
 class TestCredentialMounts:
     def _fake_home(self, tmp_path, monkeypatch, files):
         for rel in files:
@@ -278,6 +342,46 @@ class TestCredentialMounts:
             ".pi/agent/auth.json:/home/developer/.pi/agent/auth.json:rw" in a
             for a in args
         )
+
+    def test_extra_harnesses_union_credential_mounts(self, tmp_path, monkeypatch):
+        # --agents fan-out (issue #131): a codex-routed child from a claude
+        # session needs ~/.codex/auth.json mounted alongside the session
+        # harness's credentials.
+        self._fake_home(
+            tmp_path, monkeypatch,
+            [".claude/.credentials.json", ".claude.json", ".codex/auth.json"],
+        )
+        args, _ = build_user_mounts(
+            "docker", get_harness("claude"), [get_harness("codex")]
+        )
+        joined = " ".join(args)
+        assert ".claude/.credentials.json:/home/developer/.claude/.credentials.json" in joined
+        assert ".codex/auth.json:/home/developer/.codex/auth.json" in joined
+
+    def test_extra_harnesses_missing_host_files_skipped(self, tmp_path, monkeypatch):
+        self._fake_home(tmp_path, monkeypatch, [".claude/.credentials.json"])
+        args, _ = build_user_mounts(
+            "docker", get_harness("claude"), [get_harness("codex")]
+        )
+        joined = " ".join(args)
+        assert ".claude/.credentials.json" in joined
+        assert ".codex" not in joined
+
+    def test_duplicate_harness_mounts_credentials_once(self, tmp_path, monkeypatch):
+        self._fake_home(tmp_path, monkeypatch, [".codex/auth.json"])
+        codex = get_harness("codex")
+        args, _ = build_user_mounts("docker", codex, [codex, codex])
+        assert len([a for a in args if ".codex/auth.json" in a]) == 1
+
+    def test_no_extra_harnesses_matches_session_only_behavior(self, tmp_path, monkeypatch):
+        self._fake_home(
+            tmp_path, monkeypatch,
+            [".claude/.credentials.json", ".claude.json", ".codex/auth.json"],
+        )
+        baseline, _ = build_user_mounts("docker", get_harness("claude"))
+        with_empty_extra, _ = build_user_mounts("docker", get_harness("claude"), [])
+        assert with_empty_extra == baseline
+        assert ".codex" not in " ".join(baseline)
 
 
 class TestSupervisorProfileResolution:
@@ -535,3 +639,187 @@ class TestHandleBuildUpdateHarnessCli:
 
         assert rc == 0
         assert build.call_args.kwargs["update_harnesses"] == ["claude"]
+
+
+class TestExecProfile:
+    """Non-interactive exec profiles (spawn-harness child invocations)."""
+
+    @pytest.mark.parametrize("name", sorted(HARNESSES))
+    def test_every_harness_has_exec_profile(self, name):
+        profile = HARNESSES[name].exec_profile
+        assert profile is not None
+        assert profile.base_args
+        # Placeholders must be present so the builder can substitute values.
+        if profile.model_args:
+            assert any("{model}" in arg for arg in profile.model_args)
+        if profile.effort_args:
+            assert any("{effort}" in arg for arg in profile.effort_args)
+        assert profile.effort_max_value in ("max", *harness_mod.EXEC_EFFORT_TIERS)
+
+    def test_unattended_children_can_run_permission_free(self):
+        # Unattended children cannot answer prompts; each profile must carry
+        # its harness's bypass posture (container is the boundary) — in the
+        # dedicated permission_bypass_args field, NOT base_args, so only an
+        # explicit build_exec_argv(unattended=True) caller gets it.
+        assert HARNESSES["claude"].exec_profile.permission_bypass_args == (
+            "--dangerously-skip-permissions",
+        )
+        assert HARNESSES["codex"].exec_profile.permission_bypass_args == (
+            "--dangerously-bypass-approvals-and-sandbox",
+        )
+        assert HARNESSES["pi"].exec_profile.permission_bypass_args == ("--no-approve",)
+
+    @pytest.mark.parametrize("name", sorted(HARNESSES))
+    def test_no_bypass_flags_hide_in_base_args(self, name):
+        # The security-posture decision must never ride in neutral registry
+        # data a future consumer inherits silently.
+        for arg in HARNESSES[name].exec_profile.base_args:
+            assert "dangerous" not in arg
+            assert arg != "--no-approve"
+
+    def test_children_are_non_interactive(self):
+        assert "-p" in HARNESSES["claude"].exec_profile.base_args
+        assert HARNESSES["codex"].exec_profile.base_args[0] == "exec"
+        assert "-p" in HARNESSES["pi"].exec_profile.base_args
+
+    def test_stateless_children_leave_no_sessions(self):
+        assert "--no-session-persistence" in HARNESSES["claude"].exec_profile.base_args
+        assert "--ephemeral" in HARNESSES["codex"].exec_profile.base_args
+        assert "--no-session" in HARNESSES["pi"].exec_profile.base_args
+
+
+class TestMapExecEffort:
+    @pytest.mark.parametrize("name", sorted(HARNESSES))
+    @pytest.mark.parametrize("effort", [None, "", "auto", "AUTO"])
+    def test_auto_and_unset_yield_no_value(self, name, effort):
+        value, warning = harness_mod.map_exec_effort(HARNESSES[name], effort)
+        assert value is None
+        assert warning is None
+
+    @pytest.mark.parametrize("name", sorted(HARNESSES))
+    @pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh"])
+    def test_shared_tiers_pass_through(self, name, effort):
+        value, warning = harness_mod.map_exec_effort(HARNESSES[name], effort)
+        assert value == effort
+        assert warning is None
+
+    def test_max_maps_per_harness(self):
+        # claude accepts max natively; codex tops out at xhigh; pi mirrors
+        # its interactive runner's conservative max→xhigh mapping.
+        assert harness_mod.map_exec_effort(HARNESSES["claude"], "max") == ("max", None)
+        assert harness_mod.map_exec_effort(HARNESSES["pi"], "max") == ("xhigh", None)
+        assert harness_mod.map_exec_effort(HARNESSES["codex"], "max") == ("xhigh", None)
+
+    def test_case_and_whitespace_normalized(self):
+        value, warning = harness_mod.map_exec_effort(HARNESSES["claude"], "  HIGH ")
+        assert value == "high"
+        assert warning is None
+
+    @pytest.mark.parametrize("name", sorted(HARNESSES))
+    def test_unknown_tier_warns_and_skips(self, name):
+        value, warning = harness_mod.map_exec_effort(HARNESSES[name], "turbo")
+        assert value is None
+        assert "turbo" in warning
+        assert "low|medium|high|xhigh|max|auto" in warning
+
+
+class TestBuildExecArgv:
+    def test_claude_full_invocation(self):
+        argv, warnings = harness_mod.build_exec_argv(
+            HARNESSES["claude"], "review this", model="opus", effort="max",
+            unattended=True,
+        )
+        assert argv == [
+            "claude",
+            "-p",
+            "--no-session-persistence",
+            "--dangerously-skip-permissions",
+            "--model",
+            "opus",
+            "--effort",
+            "max",
+            "--",
+            "review this",
+        ]
+        assert warnings == []
+
+    def test_codex_full_invocation(self):
+        argv, warnings = harness_mod.build_exec_argv(
+            HARNESSES["codex"], "review this", model="gpt-5.2", effort="max",
+            unattended=True,
+        )
+        assert argv == [
+            "codex",
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--model",
+            "gpt-5.2",
+            "-c",
+            "model_reasoning_effort=xhigh",
+            "--",
+            "review this",
+        ]
+        assert warnings == []
+
+    def test_pi_full_invocation(self):
+        argv, warnings = harness_mod.build_exec_argv(
+            HARNESSES["pi"], "review this", model="sonnet", effort="high",
+            unattended=True,
+        )
+        assert argv == [
+            "pi",
+            "-p",
+            "--no-session",
+            "--no-approve",
+            "--model",
+            "sonnet",
+            "--thinking",
+            "high",
+            "review this",
+        ]
+        assert warnings == []
+
+    @pytest.mark.parametrize("name", sorted(HARNESSES))
+    def test_attended_default_omits_permission_bypass(self, name):
+        # unattended=True is an explicit opt-in: without it, no bypass flag
+        # may appear — a future consumer must choose permission-free
+        # children knowingly, never inherit them from the profile.
+        h = HARNESSES[name]
+        argv, _ = harness_mod.build_exec_argv(h, "p", model="m", effort="low")
+        for flag in h.exec_profile.permission_bypass_args:
+            assert flag not in argv
+
+    @pytest.mark.parametrize("name", sorted(HARNESSES))
+    def test_prompt_is_always_last(self, name):
+        argv, _ = harness_mod.build_exec_argv(
+            HARNESSES[name], "the prompt", model="m", effort="low"
+        )
+        assert argv[-1] == "the prompt"
+
+    @pytest.mark.parametrize("name", sorted(HARNESSES))
+    def test_bare_invocation_omits_model_and_effort(self, name):
+        h = HARNESSES[name]
+        argv, warnings = harness_mod.build_exec_argv(h, "p")
+        sentinel = ["--"] if h.exec_profile.dashdash_before_prompt else []
+        assert argv == [h.binary, *h.exec_profile.base_args, *sentinel, "p"]
+        assert warnings == []
+
+    def test_unknown_effort_warns_but_still_builds(self):
+        h = HARNESSES["claude"]
+        argv, warnings = harness_mod.build_exec_argv(h, "p", effort="turbo")
+        assert argv == [h.binary, *h.exec_profile.base_args, "--", "p"]
+        assert len(warnings) == 1 and "turbo" in warnings[0]
+
+    @pytest.mark.parametrize("name", ["claude", "codex"])
+    def test_dash_prompt_protected_by_sentinel(self, name):
+        # A prompt starting with '-' must never be parsed as child flags.
+        argv, _ = harness_mod.build_exec_argv(HARNESSES[name], "--version")
+        assert argv[-2:] == ["--", "--version"]
+
+    def test_dash_prompt_rejected_without_sentinel(self):
+        # pi's parser has no documented '--' handling; fail instead of
+        # letting the prompt rebind the child's command line.
+        with pytest.raises(ValueError, match="starts with '-'"):
+            harness_mod.build_exec_argv(HARNESSES["pi"], "  --version")
