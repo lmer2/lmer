@@ -211,7 +211,7 @@ def build_container_home_mounts(runtime: str, container_home: Path) -> List[str]
     return args
 
 
-def build_user_mounts(runtime: str, harness=None) -> Tuple[List[str], bool]:
+def build_user_mounts(runtime: str, harness=None, extra_harnesses=()) -> Tuple[List[str], bool]:
     """
     Build mounts for user configuration files and SSH agent.
 
@@ -224,6 +224,11 @@ def build_user_mounts(runtime: str, harness=None) -> Tuple[List[str], bool]:
         runtime: Container runtime ('docker' or 'podman')
         harness: Harness registry entry whose credential files to mount;
             defaults to claude (the historical behavior)
+        extra_harnesses: Additional harness registry entries whose credential
+            files to mount as well — the harnesses implied by the ``--agents``
+            fan-out selection, so a child routed to a non-session harness can
+            authenticate (issue #131). Duplicate credential entries are
+            mounted once; missing host files are skipped as usual.
 
     Returns:
         Tuple of (mount arguments, ssh_agent_enabled flag)
@@ -236,10 +241,15 @@ def build_user_mounts(runtime: str, harness=None) -> Tuple[List[str], bool]:
     home = Path.home()
     ssh_agent_enabled = False
 
-    for cred in harness.credential_mounts:
-        host_file = home / cred.host_path
-        if host_file.exists():
-            args += ["-v", f"{host_file}:{cred.container_path}:{cred.mode}{se}"]
+    seen = set()
+    for entry in (harness, *extra_harnesses):
+        for cred in entry.credential_mounts:
+            if cred in seen:
+                continue
+            seen.add(cred)
+            host_file = home / cred.host_path
+            if host_file.exists():
+                args += ["-v", f"{host_file}:{cred.container_path}:{cred.mode}{se}"]
 
     # SSH agent
     ssh_sock = os.environ.get("SSH_AUTH_SOCK")
