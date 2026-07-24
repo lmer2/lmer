@@ -1,2 +1,0 @@
-changed:
-- "specs-index entry names now use a reserved `--` separator between the run label and the spec basename (`YYYY-MM-DD-<run>--<basename>`; a run label never contains `--`), so distinct run+spec pairs can never collide on an entry name (#101)"

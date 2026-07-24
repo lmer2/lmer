@@ -1,2 +1,0 @@
-fixed:
-- "`lmer --answer` is now strictly flag-only: a host-exported or `.env` `LMER_ANSWER` is never forwarded into the container — answers are one-shot data for the run's recorded open question, not standing configuration that could replay a stale answer into later sessions (#98)"
