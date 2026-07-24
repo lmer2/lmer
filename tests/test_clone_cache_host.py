@@ -19,11 +19,13 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
 from lmer_cli import clone_cache
 from lmer_cli.clone_cache import (
+    _git_env,
     _split_credentials,
     mirror_path,
     update_mirrors,
@@ -108,6 +110,34 @@ class TestMirrorPathReuse:
         assert mirror_path(tmp_path, url) is None
         assert _mirror_path(tmp_path, url) is None
 
+    def test_distinct_ports_get_distinct_mirrors(self, tmp_path):
+        """Review on !154: two servers can share a hostname on different ports.
+        Collapsing them into one mirror crossed their stamps and let a clone
+        borrow objects from the wrong server."""
+        plain = mirror_path(tmp_path, "https://git.example.com/grp/proj")
+        ported = mirror_path(tmp_path, "https://git.example.com:8443/grp/proj")
+        assert plain == tmp_path / "git.example.com/grp/proj.git"
+        assert ported == tmp_path / "git.example.com_8443/grp/proj.git"
+        assert plain != ported
+        # host and container sides must agree, or the container looks in the
+        # wrong place for what the updater built
+        assert ported == _mirror_path(tmp_path, "https://git.example.com:8443/grp/proj")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://git.example.com:443/grp/proj",
+            "http://git.example.com:80/grp/proj",
+            "ssh://git@git.example.com:22/grp/proj",
+        ],
+    )
+    def test_default_ports_do_not_split_the_namespace(self, tmp_path, url):
+        # An explicit default port names the same server as the bare form, so
+        # mirrors built before the port distinction keep being found.
+        scheme_host = urlparse(url).hostname
+        assert mirror_path(tmp_path, url) == tmp_path / scheme_host / "grp/proj.git"
+        assert mirror_path(tmp_path, url) == _mirror_path(tmp_path, url)
+
 
 class TestSplitCredentials:
     def test_https_userinfo_becomes_auth_header_env(self):
@@ -125,6 +155,42 @@ class TestSplitCredentials:
             scrubbed, env = _split_credentials(url)
             assert scrubbed == url
             assert not any(k.startswith("GIT_CONFIG_KEY_") for k in env)
+
+    def test_indices_default_to_zero_when_nothing_inherited(self, monkeypatch):
+        monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+        _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
+        assert env["GIT_CONFIG_COUNT"] == "2"
+        assert env["GIT_CONFIG_KEY_0"].endswith(".extraHeader")
+        assert env["GIT_CONFIG_KEY_1"] == "credential.helper"
+
+    def test_inherited_numbered_config_is_appended_to(self, monkeypatch):
+        """Review on !154: _git_env merges over os.environ, so hardcoding
+        GIT_CONFIG_COUNT=2 silently dropped a caller's numbered git config (CI,
+        a loaded .env) by overwriting indices 0 and 1."""
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "user.name")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", "CI Bot")
+        monkeypatch.setenv("GIT_CONFIG_KEY_1", "core.sshCommand")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_1", "ssh -i /keys/ci")
+        _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
+        assert env["GIT_CONFIG_COUNT"] == "4"
+        assert env["GIT_CONFIG_KEY_2"].endswith(".extraHeader")
+        assert env["GIT_CONFIG_KEY_3"] == "credential.helper"
+        # the inherited pairs are untouched — they survive the merge in _git_env
+        assert "GIT_CONFIG_KEY_0" not in env
+        assert "GIT_CONFIG_KEY_1" not in env
+        merged = _git_env(env)
+        assert merged["GIT_CONFIG_KEY_0"] == "user.name"
+        assert merged["GIT_CONFIG_KEY_1"] == "core.sshCommand"
+        assert merged["GIT_CONFIG_COUNT"] == "4"
+
+    @pytest.mark.parametrize("bogus", ["", "  ", "not-a-number", "-3", "0"])
+    def test_unparseable_inherited_count_falls_back_to_zero(self, monkeypatch, bogus):
+        # Same reading git itself applies to an invalid value: nothing inherited.
+        monkeypatch.setenv("GIT_CONFIG_COUNT", bogus)
+        _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
+        assert env["GIT_CONFIG_COUNT"] == "2"
+        assert env["GIT_CONFIG_KEY_0"].endswith(".extraHeader")
 
 
 class TestMirrorCreate:

@@ -259,6 +259,25 @@ class TestResolveOptions:
         opts = supervisor._resolve_options(self._ns())
         assert opts["auto_start_ready_marker"] == b""
 
+    def test_malformed_ready_marker_falls_back_to_profile(self, monkeypatch, capsys):
+        """Review on !154: the marker decode moved from `.encode("utf-8")`
+        (never raises) to decode_escape_bytes, which raises UnicodeDecodeError
+        on a lone trailing backslash — that must not kill the supervisor at
+        startup, it must degrade to the harness default."""
+        monkeypatch.setenv("LMER_AUTO_START_READY_MARKER", "ready\\")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["auto_start_ready_marker"] == supervisor.DEFAULT_AUTO_START_READY_MARKER
+        err = capsys.readouterr().err
+        assert "LMER_AUTO_START_READY_MARKER" in err
+        assert "cannot decode" in err
+
+    def test_malformed_quit_sequence_falls_back_to_profile(self, monkeypatch, capsys):
+        # Same shared decode, same hazard: LMER_QUIT_SEQUENCE must degrade too.
+        monkeypatch.setenv("LMER_QUIT_SEQUENCE", "\\x03|/quit\\")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["quit_sequence"] == supervisor._resolve_harness_profile().quit_sequence
+        assert "LMER_QUIT_SEQUENCE" in capsys.readouterr().err
+
     def test_env_enables_fastapi(self, monkeypatch):
         monkeypatch.setenv("LMER_FASTAPI", "1")
         monkeypatch.setenv("LMER_MANUAL_START", "true")

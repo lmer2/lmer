@@ -397,7 +397,8 @@ treat harness directories with the same care as presets, and note that
 other lmer settings. Guardrails: directories are refused at mount time
 (files only, unlike the manifest-free built-ins this is enforced), and every
 user-harness credential mount is announced in the launch output (`🔑 …`) so
-an unexpected entry is visible before the session starts. The manifest's
+an unexpected entry is visible before the session starts — unconditionally,
+not only under `--verbose`/`LMER_VERBOSE`. The manifest's
 `permission_bypass_args` keep the built-in registry's opt-in gate: they
 apply only to unattended `spawn-harness` children, never by default.
 

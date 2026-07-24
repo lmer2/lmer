@@ -561,13 +561,43 @@ def resolve_host_clone_cache_dir() -> Path:
     unset value falls back to `~/.lmer/clone-cache`. The returned path may
     not exist on disk — the caller creates it before mounting.
 
+    The value is validated because both halves of the feature read it and a
+    bad value splits them apart or over-shares (review on !154):
+
+    - A **relative** path is refused: the container mount string
+      (`cache:/clone-cache:ro`) would be read by Docker/Podman as a *named
+      volume* while the host-side updater created and populated a real
+      `./cache` directory — the container would never see the mirrors.
+    - An obviously **broad root** (`/`, `$HOME`) is refused: the whole cache
+      root is bind-mounted into the container, so pointing it at a home
+      directory would mount that entire tree (read-only, but readable).
+
+    Either case warns and falls back to the default, which is always safe:
+    a fresh cache costs one direct clone, never correctness.
+
     Returns:
         Path to the host clone-cache directory (existence not guaranteed)
     """
+    default = Path.home() / ".lmer" / "clone-cache"
     explicit = os.environ.get("LMER_CLONE_CACHE_DIR", "").strip()
-    if explicit:
-        return Path(explicit).expanduser()
-    return Path.home() / ".lmer" / "clone-cache"
+    if not explicit:
+        return default
+    candidate = Path(explicit).expanduser()
+    if not candidate.is_absolute():
+        print(
+            f"⚠️  LMER_CLONE_CACHE_DIR must be an absolute path (got {explicit!r}); "
+            f"using {default}",
+            file=sys.stderr,
+        )
+        return default
+    if candidate == Path(candidate.anchor) or candidate == Path.home():
+        print(
+            f"⚠️  LMER_CLONE_CACHE_DIR is too broad to bind-mount ({candidate}); "
+            f"using {default}",
+            file=sys.stderr,
+        )
+        return default
+    return candidate
 
 
 def build_clone_cache_mount(runtime: str, host_cache_dir: Path) -> List[str]:

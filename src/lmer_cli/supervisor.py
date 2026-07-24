@@ -470,6 +470,26 @@ def _parse_quit_sequence(raw: str) -> tuple[bytes, ...]:
     )
 
 
+def _decode_env_bytes(raw: str, fallback: bytes, what: str) -> bytes:
+    """Decode a byte-valued env override, falling back on a malformed escape.
+
+    ``decode_escape_bytes`` raises ``UnicodeDecodeError`` on an undecodable
+    escape (a value ending in a lone backslash, say), and this runs during
+    supervisor startup — so an unluckily-shaped value that used to be taken as
+    literal bytes would kill the in-container supervisor outright (review on
+    !154). Degrade the way the user-harness manifest path does: warn, keep the
+    harness profile's default.
+    """
+    try:
+        return decode_escape_bytes(raw)
+    except UnicodeDecodeError as exc:
+        sys.stderr.write(
+            f"lmer-supervisor: cannot decode {what} {raw!r}: {exc}; "
+            f"using the harness profile default\n"
+        )
+        return fallback
+
+
 def _resolve_harness_profile():
     """Look up the active harness's supervisor profile from ``LMER_HARNESS``.
 
@@ -542,7 +562,10 @@ def _resolve_options(args: argparse.Namespace) -> dict:
     # timeout-bounded delays). Default comes from the harness's profile.
     marker_raw = os.environ.get("LMER_AUTO_START_READY_MARKER")
     auto_start_ready_marker = (
-        decode_escape_bytes(marker_raw) if marker_raw is not None
+        _decode_env_bytes(
+            marker_raw, profile.ready_marker, "LMER_AUTO_START_READY_MARKER"
+        )
+        if marker_raw is not None
         else profile.ready_marker
     )
 
@@ -555,10 +578,17 @@ def _resolve_options(args: argparse.Namespace) -> dict:
     # TUI quit sequence used for SIGUSR1 self-shutdown; harness-profile
     # default, patchable via env (see _parse_quit_sequence).
     quit_raw = os.environ.get("LMER_QUIT_SEQUENCE")
-    quit_sequence = (
-        _parse_quit_sequence(quit_raw) if quit_raw is not None
-        else profile.quit_sequence
-    )
+    quit_sequence = profile.quit_sequence
+    if quit_raw is not None:
+        try:
+            quit_sequence = _parse_quit_sequence(quit_raw)
+        except UnicodeDecodeError as exc:
+            # Same hazard as the ready marker below: an undecodable escape must
+            # degrade to the harness default, not take the supervisor down.
+            sys.stderr.write(
+                f"lmer-supervisor: cannot decode LMER_QUIT_SEQUENCE {quit_raw!r}: "
+                f"{exc}; using the harness profile default\n"
+            )
 
     recheck_raw = os.environ.get("LMER_WINSIZE_RECHECK_DELAY")
     winsize_recheck_delay = (
