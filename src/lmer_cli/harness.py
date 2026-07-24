@@ -26,6 +26,13 @@ version: add a :class:`Harness` entry to :data:`HARNESSES` here, add a
 ``libexec/<name>-runner.sh`` runner script, add an ``agent-files/<name>/``
 config tree, install the CLI in the Containerfile behind a
 ``<NAME>_CACHE_BUST`` build-arg, and document the capability tier.
+
+Users can also install harnesses without touching this registry: a drop-in
+directory under ``~/.lmer/harnesses/`` carrying a declarative manifest and a
+runner script (:mod:`lmer_cli.user_harnesses`, issue #132). :data:`HARNESSES`
+stays built-ins-only; every lookup/resolution helper here consults the merged
+view (:func:`known_harnesses`), and user definitions can never shadow a
+built-in name.
 """
 
 from __future__ import annotations
@@ -81,10 +88,10 @@ GENERIC_START_COMMAND = (
 
 
 class UnknownHarnessError(ValueError):
-    """Raised when a harness name is not in the registry."""
+    """Raised when a harness name is not in the registry (incl. user harnesses)."""
 
     def __init__(self, name: str):
-        known = ", ".join(sorted(HARNESSES))
+        known = ", ".join(sorted(known_harnesses()))
         super().__init__(f"Unknown harness {name!r} (known harnesses: {known})")
         self.name = name
 
@@ -198,6 +205,15 @@ class Harness:
     #: Extra fixed environment for the container when this harness is active.
     #: (e.g. disable self-updates inside ephemeral containers)
     extra_env: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
+    #: For user-installed harnesses (lmer_cli.user_harnesses): the host
+    #: directory the definition was loaded from. ``None`` for built-ins —
+    #: the "is this a user harness" discriminator.
+    source_dir: Optional[str] = None
+    #: Extra word-bounded model-name hints this harness contributes to
+    #: autoselection, checked after :data:`MODEL_HARNESS_HINTS` (a user
+    #: harness can never steal a built-in family name). Built-ins keep
+    #: their hints in :data:`MODEL_HARNESS_HINTS` for match-order control.
+    model_hints: Tuple[str, ...] = field(default_factory=tuple)
 
 
 HARNESSES: dict[str, Harness] = {
@@ -322,8 +338,21 @@ HARNESSES: dict[str, Harness] = {
 }
 
 
+def known_harnesses() -> dict[str, Harness]:
+    """The full registry view: built-ins merged with user-installed harnesses.
+
+    Built-ins win on collision (the user-harness loader already refuses to
+    load a shadowing name, this is belt-and-braces). The user side comes
+    from :mod:`lmer_cli.user_harnesses`, imported lazily — that module
+    imports this one's dataclasses.
+    """
+    from .user_harnesses import load_user_harnesses
+
+    return {**load_user_harnesses(), **HARNESSES}
+
+
 def get_harness(name: str) -> Harness:
-    """Return the registry entry for ``name``.
+    """Return the registry entry for ``name`` (built-in or user-installed).
 
     Raises:
         UnknownHarnessError: if ``name`` is not a known harness.
@@ -331,7 +360,11 @@ def get_harness(name: str) -> Harness:
     try:
         return HARNESSES[name]
     except KeyError:
-        raise UnknownHarnessError(name) from None
+        pass
+    entry = known_harnesses().get(name)
+    if entry is None:
+        raise UnknownHarnessError(name)
+    return entry
 
 
 def harness_for_model(model: Optional[str]) -> Optional[str]:
@@ -339,13 +372,20 @@ def harness_for_model(model: Optional[str]) -> Optional[str]:
 
     Matching is word-bounded and case-insensitive (:data:`MODEL_HARNESS_HINTS`):
     ``anthropic/claude-sonnet-5`` matches ``sonnet``, ``gpt-5.2`` matches
-    ``gpt``, but ``chatgpt-like`` matches nothing. An unrecognized model yields
-    ``None`` — no error, since lmer never validates model names (the harness
-    itself rejects unknown models).
+    ``gpt``, but ``chatgpt-like`` matches nothing. User-installed harnesses'
+    ``model_hints`` are checked after every built-in hint, in load order. An
+    unrecognized model yields ``None`` — no error, since lmer never validates
+    model names (the harness itself rejects unknown models).
     """
     if not model:
         return None
-    for word, harness_name in MODEL_HARNESS_HINTS:
+    user_hints = tuple(
+        (word, harness.name)
+        for harness in known_harnesses().values()
+        if harness.source_dir is not None
+        for word in harness.model_hints
+    )
+    for word, harness_name in (*MODEL_HARNESS_HINTS, *user_hints):
         if re.search(rf"\b{re.escape(word)}\b", model, re.IGNORECASE):
             return harness_name
     return None
@@ -426,7 +466,7 @@ def resolve_harness_selection(explicit: Optional[str] = None) -> Tuple[str, str]
             name, source = hinted, "model"
         else:
             name, source = DEFAULT_HARNESS, "default"
-    if name not in HARNESSES:
+    if name not in known_harnesses():
         raise UnknownHarnessError(name)
     return name, source
 
@@ -447,7 +487,7 @@ def resolve_harness_name(explicit: Optional[str] = None) -> str:
     """
     raw = explicit if explicit is not None else os.environ.get(HARNESS_ENV, "")
     name = (raw or "").strip().lower() or DEFAULT_HARNESS
-    if name not in HARNESSES:
+    if name not in known_harnesses():
         raise UnknownHarnessError(name)
     return name
 
@@ -512,14 +552,36 @@ def build_exec_argv(
     argv = [harness.binary, *profile.base_args]
     if unattended:
         argv += profile.permission_bypass_args
-    if model:
-        argv += [arg.format(model=model) for arg in profile.model_args]
     warnings = []
+    if model:
+        if profile.model_args:
+            argv += [arg.format(model=model) for arg in profile.model_args]
+        else:
+            # A profile with no model_args carries no CLI flag for the model.
+            # This is EXPECTED for env-configured harnesses (the documented
+            # wrapper pattern: the binary/wrapper reads LMER_LLM_NAME from the
+            # child env), so the note is informational — it names the model
+            # not added to argv rather than claiming it was lost, since a
+            # correctly-wired wrapper still delivers it via the environment.
+            warnings.append(
+                f"{harness.name}: model {model!r} not added to the child argv "
+                f"(exec profile defines no model flag). Expected for an "
+                f"env-configured harness whose binary/wrapper reads "
+                f"LMER_LLM_NAME; otherwise the child runs its default model."
+            )
     effort_value, warning = map_exec_effort(harness, effort)
     if warning:
         warnings.append(warning)
     if effort_value:
-        argv += [arg.format(effort=effort_value) for arg in profile.effort_args]
+        if profile.effort_args:
+            argv += [arg.format(effort=effort_value) for arg in profile.effort_args]
+        else:
+            warnings.append(
+                f"{harness.name}: reasoning effort {effort_value!r} not added "
+                f"to the child argv (exec profile defines no effort flag). "
+                f"Expected for an env-configured harness reading "
+                f"LMER_REASONING_EFFORT; otherwise the child uses its default."
+            )
     if profile.dashdash_before_prompt:
         argv.append("--")
     elif prompt.lstrip().startswith("-"):

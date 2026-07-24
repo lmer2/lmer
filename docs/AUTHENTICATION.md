@@ -405,6 +405,10 @@ for cred in harness.credential_mounts:      # claude: ~/.claude/.credentials.jso
   provider/model registry, e.g. local llama.cpp endpoints). Provider API
   keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …) can be supplied via
   `.env` instead. See [HARNESSES.md](./HARNESSES.md#authentication).
+- User-installed harnesses declare their credential files in their
+  manifest's `credential_mounts` (home-relative host paths, mounted through
+  the same mechanism). See
+  [HARNESSES.md](./HARNESSES.md#user-installed-harnesses).
 
 #### Docker Compose Implementation
 

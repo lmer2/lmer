@@ -26,6 +26,7 @@ from lmer_cli.container.spawn_harness import (
     resolve_agent,
     select_harness,
 )
+from lmer_cli.harness import HARNESSES
 
 BIN_WRAPPER = Path(__file__).parent.parent / "bin" / "spawn-harness"
 
@@ -231,7 +232,7 @@ class TestWarnMissingCredentials:
     def test_rerouted_child_with_no_mounted_creds_warns(self, monkeypatch, capsys):
         self._exists(monkeypatch, set())
         spawn_harness.warn_missing_credentials(
-            "sol", spawn_harness.HARNESSES["codex"], {"LMER_HARNESS": "claude"}
+            "sol", HARNESSES["codex"], {"LMER_HARNESS": "claude"}
         )
         err = capsys.readouterr().err
         assert "agent 'sol' runs on codex" in err
@@ -241,14 +242,14 @@ class TestWarnMissingCredentials:
     def test_session_harness_child_is_exempt(self, monkeypatch, capsys):
         self._exists(monkeypatch, set())
         spawn_harness.warn_missing_credentials(
-            "opus-review", spawn_harness.HARNESSES["claude"], {"LMER_HARNESS": "claude"}
+            "opus-review", HARNESSES["claude"], {"LMER_HARNESS": "claude"}
         )
         assert capsys.readouterr().err == ""
 
     def test_any_mounted_cred_file_silences(self, monkeypatch, capsys):
         self._exists(monkeypatch, {"/home/developer/.pi/agent/auth.json"})
         spawn_harness.warn_missing_credentials(
-            "pi-agent", spawn_harness.HARNESSES["pi"], {"LMER_HARNESS": "claude"}
+            "pi-agent", HARNESSES["pi"], {"LMER_HARNESS": "claude"}
         )
         assert capsys.readouterr().err == ""
 

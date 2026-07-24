@@ -3,7 +3,8 @@
 lmer runs an *agent harness* — the AI coding-agent CLI — inside each session
 container. Claude Code is the default and most fully integrated harness;
 Codex and pi are supported at the **core tier** (see the capability matrix
-below).
+below). Additional harnesses can be installed without forking lmer — see
+[User-installed harnesses](#user-installed-harnesses).
 
 ## Selecting a harness
 
@@ -306,7 +307,9 @@ registry and every field has an env override for patching without a release:
 
 `LMER_QUIT_SEQUENCE` steps are separated by `|` and unicode-escape decoded
 (e.g. `\x03|\x03`, or `/quit\r`); an empty value disables the chord step so a
-self-shutdown escalates straight to SIGTERM.
+self-shutdown escalates straight to SIGTERM. `LMER_AUTO_START_READY_MARKER`
+uses the same escape decoding (plain text like `❯` passes through
+byte-for-byte; an empty value disables marker gating).
 
 ## Adding a new harness
 
@@ -351,3 +354,245 @@ Conventions that keep this cheap: the runner token/script MUST be named
 `<name>-runner` / `<name>-runner.sh`, the cache-bust arg `<NAME>_CACHE_BUST`,
 and `LMER_REASONING_EFFORT` accepts `low|medium|high|xhigh|max|auto` — map
 `max` to the harness's top tier and warn-and-skip anything unknown.
+
+## User-installed harnesses
+
+A harness can also be installed **without forking lmer** (issue #132): a
+drop-in directory holding a declarative manifest plus the runner script that
+launches the harness inside the session container. For a complete, paste-ready
+real-CLI setup see the
+[opencode walkthrough](./USER-HARNESS-OPENCODE.md); the sections below are
+the reference.
+
+```
+~/.lmer/harnesses/<name>/
+├── harness.json     # serialized registry entry (schema 1)
+├── runner.sh        # in-container runner; installs its CLI if missing
+└── agent-files/     # optional base config the runner provisions
+```
+
+The directory name is the harness name (lowercase `[a-z][a-z0-9_-]*`, max 64
+chars); `LMER_HARNESSES_DIR` overrides the location. Definitions merge into
+the registry at resolution time — `lmer --harness <name>`, `LMER_HARNESS`,
+preset `--harness` folding, and `spawn-harness` fan-out selection all accept
+user harnesses exactly like built-ins, and `lmer --harness` announces one
+with a `[user-installed]` tag. A user harness can never shadow a built-in
+name (a colliding directory is skipped with a warning), and its optional
+`model_hints` are consulted only after every built-in hint, so it can never
+steal `gpt-*` from codex.
+
+Loading degrades gracefully, mirroring presets: a broken entry (malformed
+JSON, unsupported schema, invalid name) is warned about and skipped so it
+cannot break sessions that don't select it, while *selecting* a skipped or
+missing harness fails with the normal unknown-harness error.
+
+**Trust model** — the same as presets: the directory lives on the host and
+is writable only by whoever runs lmer. The runner script is
+operator-authored code that runs inside the container, which is already true
+of the target repo itself; the container remains the security boundary. Be
+aware of what the manifest can reach: `credential_mounts` can bind **any
+regular file under the host home** into the container (rw by default) — so
+treat harness directories with the same care as presets, and note that
+`LMER_HARNESSES_DIR`/`LMER_HARNESS` are steerable from a cwd `.env` like
+other lmer settings. Guardrails: directories are refused at mount time
+(files only, unlike the manifest-free built-ins this is enforced), and every
+user-harness credential mount is announced in the launch output (`🔑 …`) so
+an unexpected entry is visible before the session starts. The manifest's
+`permission_bypass_args` keep the built-in registry's opt-in gate: they
+apply only to unattended `spawn-harness` children, never by default.
+
+### Manifest (`harness.json`, schema 1)
+
+Only `schema` and `binary` are required; everything else defaults to the
+safest behavior (no ready-marker gating, the generic start instruction, no
+quit chord, no credential mounts, empty exec profile).
+
+```json
+{
+  "schema": 1,
+  "description": "ACME agent CLI",
+  "binary": "acme",
+  "credential_mounts": [
+    {"host_path": ".acme/auth.json", "container_path": "/home/developer/.acme/auth.json"},
+    {"host_path": ".acme/models.json", "container_path": "/home/developer/.acme/models.json", "mode": "ro"}
+  ],
+  "supervisor": {
+    "ready_marker": "\\u276f",
+    "start_command": "",
+    "quit_sequence": ["\\x03", "\\x03"],
+    "ready_timeout": 60
+  },
+  "exec": {
+    "base_args": ["-p"],
+    "permission_bypass_args": ["--yolo"],
+    "model_args": ["--model", "{model}"],
+    "effort_args": ["--effort", "{effort}"],
+    "effort_max_value": "xhigh",
+    "dashdash_before_prompt": true
+  },
+  "model_hints": ["acme"],
+  "extra_env": {"ACME_NO_UPDATE": "1"}
+}
+```
+
+Field semantics match the built-in registry dataclasses in
+`src/lmer_cli/harness.py` (`CredentialMount`, `SupervisorProfile`,
+`ExecProfile`); `credential_mounts[].host_path` is home-relative,
+`mode` defaults to `rw`. The byte-valued supervisor fields (`ready_marker`,
+`quit_sequence` steps) are unicode-escape decoded — the same encoding as
+their runtime env overrides (`LMER_AUTO_START_READY_MARKER`,
+`LMER_QUIT_SEQUENCE`), which remain available for debugging a user harness
+without editing the manifest. An empty `start_command` means the generic
+start instruction (see `GENERIC_START_COMMAND`); set it only if the harness
+has a native way to load the task instructions. `exec` powers `spawn-harness`
+fan-out children (see the exec-mode section above); leave it minimal if the
+harness won't be used as a fan-out child.
+
+### Runner script (`runner.sh`)
+
+The runner owns two things a built-in harness gets from the image: **CLI
+availability** (install-if-missing at session start — there is no
+Containerfile layer for user harnesses) and config provisioning. lmer mounts
+a persistent cache volume and exposes it as `LMER_HARNESS_CACHE`
+(`/lmer-harness-cache/<name>`) so only the first session pays the install
+cost; `lmer build --update-harness` does not apply — wipe
+`~/.lmer/harness-cache/<name>` on the host to force a reinstall.
+
+A complete example, following the same shape as `codex-runner.sh` /
+`pi-runner.sh`:
+
+```bash
+#!/bin/bash
+# ~/.lmer/harnesses/acme/runner.sh
+HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source /Agents/global/libexec/harness-common.sh
+harness_init
+
+# Install-if-missing into the persistent cache volume.
+export LMER_HARNESS_CACHE="${LMER_HARNESS_CACHE:-$HOME/.cache/lmer-harness/acme}"
+export PATH="$LMER_HARNESS_CACHE/bin:$PATH"
+if ! command -v acme >/dev/null 2>&1; then
+    echo "📦 Installing acme CLI (first session with this cache)..."
+    npm install -g --prefix "$LMER_HARNESS_CACHE" acme-cli || {
+        echo "❌ acme CLI install failed"; exit 1; }
+fi
+
+# Credentials arrive via the manifest's credential_mounts (or env/.env).
+[ -f "$HOME/.acme/auth.json" ] || echo "⚠️  No acme credentials found — the session may fail to authenticate"
+
+# Base config: work-repo agent-files override, then the copy shipped in
+# this harness directory (the optional third argument).
+harness_provision_config "acme/settings.json" "$HOME/.acme/settings.json" \
+    "$HARNESS_DIR/agent-files/settings.json"
+harness_render_global_context "$HOME/.acme/AGENTS.md"
+harness_render_prompt_templates "$HOME/.acme/prompts"
+harness_restore_memory
+
+EXTRA_ARGS=""
+[ -n "$LMER_LLM_NAME" ] && EXTRA_ARGS="--model $LMER_LLM_NAME"
+effort="$(harness_map_effort)"
+[ -n "$effort" ] && EXTRA_ARGS="$EXTRA_ARGS --effort $effort"
+
+harness_exec acme $EXTRA_ARGS "$@"
+```
+
+The helpers deliver the core tier automatically: `harness_render_global_context`
+(user AGENTS.md + human identity + memory contract),
+`harness_render_prompt_templates` (lmer's slash commands converted to the
+harness's prompt-template format, if it loads one from a directory),
+`harness_restore_memory`, `harness_map_effort` (shared tier semantics), and
+`harness_exec` (runs through `lmer-supervisor` using the manifest's
+supervisor profile). The runner is executed via `bash` inside the container,
+so the host file needs no exec bit.
+
+### How it works / limitations
+
+The host mounts `~/.lmer/harnesses` read-only at `/lmer-harnesses` and
+forwards the mount point as `LMER_HARNESSES_DIR`, so the host CLI,
+`lmer-supervisor`, and `spawn-harness` all resolve the same definitions from
+the same files; the container entrypoint dispatches `<name>-runner` tokens
+it doesn't recognize as built-ins to `<dir>/<name>/runner.sh` purely by file
+existence.
+
+- "No Containerfile changes" ≠ "no rebuild" for every install: the
+  in-container dispatch pieces resolve from `/Agents/global`, which is
+  live-mounted from a source checkout when lmer runs from one, but comes
+  from the baked image copy otherwise — on such installs, run `lmer build`
+  once after upgrading to a user-harness-aware lmer before a user harness
+  will dispatch in-container.
+
+- User harnesses run at the **core capability tier** (same as codex/pi —
+  see the matrix above); the claude-only features are out of reach
+  regardless of how the harness is installed.
+- A user harness works as a `spawn-harness` **fan-out child** only if its
+  binary is already installed — children run the exec profile directly,
+  never `runner.sh`. `spawn-harness` prepends the child harness's cache bin
+  directory (`/lmer-harness-cache/<name>/bin`) to the child PATH, so:
+  same-harness children always work (the session's runner installed the
+  CLI), and a *different* user harness as a child works when a previous
+  session installed its CLI at that conventional location; otherwise the
+  child fails with a clear `command not found`.
+- The empirically fragile bits of TUI driving are the ready marker and quit
+  sequence; use the env overrides to iterate, and `--no-supervisor` as the
+  escape hatch.
+
+### When the CLI doesn't fit the flag model
+
+The [opencode walkthrough](./USER-HARNESS-OPENCODE.md) is the happy path: a
+CLI whose model, effort, and credentials map 1:1 onto flags and a mounted
+auth file. The manifest+runner shape has absorbed CLIs that *don't* fit that
+mould without any change to lmer — but a few recurring frictions are worth
+knowing before you write the manifest. (These generalize from field-testing
+a second, env-configured CLI against the same mechanism.)
+
+- **The exec profile assumes flags carry the config.** `model_args` /
+  `effort_args` only help a CLI that accepts a model/effort *as a flag*. A
+  CLI configured purely through the environment (an API key and model id in
+  its own env vars, no `--model`) can express none of that in the manifest,
+  and `build_exec_argv` now **warns** rather than silently dropping a
+  supplied model when `model_args` is empty. The escape hatch: point
+  `binary` at a small **wrapper script your `runner.sh` writes into the
+  cache bin dir** (`$LMER_HARNESS_CACHE/bin`), translating
+  `LMER_LLM_NAME`/`LMER_REASONING_EFFORT` into whatever env the CLI wants.
+  This is also the **only** way fan-out children get per-child model/effort,
+  since children exec `binary` directly and never run `runner.sh`.
+- **The prompt is always the last argv token.** `build_exec_argv` appends
+  the prompt last, so a CLI where the prompt is itself a *flag value* (e.g.
+  `mycli -p <prompt>`) cannot also take `model_args`/`effort_args` after it
+  — they would be swallowed as the prompt flag's value. Put such flags in
+  `base_args` with fixed values, or handle them in the wrapper. (A positional
+  prompt, like opencode's, sidesteps this entirely.)
+- **Credential filenames aren't always mountable.** `credential_mounts`
+  rejects paths containing `:`/`,`/whitespace (they would corrupt the `-v`
+  spec), so a harness that stores its token in a file whose name is derived
+  from a provider id (e.g. `credentials/managed:some-provider.json`, note
+  the colon) simply can't be mounted. Fall back to env-key auth: put the
+  provider key in your `.env` and let the harness read it from the
+  environment.
+- **Permission posture does not port** — and copying one can backfire.
+  Translating claude's `settings.json` allowlist into another CLI's config
+  format is mechanical but treacherous: allow/ask precedence, glob
+  semantics, and chain ordering differ per CLI, and a mistranslation can
+  leave a catch-all `ask` outranking both your allowlist and the
+  danger-zone bypass. Since the container is the security boundary and lmer
+  is typically run in danger zone anyway, the honest default for a new
+  harness is **no permission rules at all** (let the CLI/danger-zone run
+  unprompted) rather than a half-ported allowlist.
+- **Slash-command portability is format-deep, not behavior-deep.** The
+  `harness_render_prompt_templates` output (frontmatter `description` +
+  `$ARGUMENTS`) is accepted by more than the codex/pi prompt-template
+  directories — a CLI whose "commands" are flat *skills* can consume the
+  same files. But watch the semantics: if that CLI's skills are
+  model-invocable, the rendered commands need whatever opt-out keeps them
+  operator-only (e.g. a `disableModelInvocation: true` frontmatter key) so
+  the model doesn't auto-run `/gate-commit`. Format compatibility ≠
+  behavioral compatibility.
+- **Auto-start can hang silently on a strict submit heuristic.** The
+  supervisor types the start instruction followed by CR. A TUI with a
+  paste-burst heuristic (treating typed-text-plus-`\r` in one write as a
+  paste, not a submit) needs the supervisor's follow-up CR nudges to
+  actually submit; a CLI with a stricter heuristic can sit at the ready
+  marker with the instruction typed but never sent, and no error. If
+  auto-start hangs with your instruction visible but unsent, that's the
+  cause — iterate the quit/start behavior with `--no-supervisor` and the
+  supervisor env overrides.

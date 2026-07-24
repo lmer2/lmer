@@ -436,6 +436,18 @@ class TestSupervisorProfileResolution:
         assert opts["quit_sequence"] == (b"\x03", b"\x03")
         assert opts["auto_start_ready_timeout"] == 3.5
 
+    def test_ready_marker_override_decodes_escapes(self, monkeypatch):
+        # The marker override shares decode_escape_bytes with
+        # LMER_QUIT_SEQUENCE and the user-harness manifest fields: escapes
+        # spell control bytes, plain UTF-8 text passes byte-for-byte.
+        monkeypatch.setenv("LMER_HARNESS", "codex")
+        monkeypatch.setenv("LMER_AUTO_START_READY_MARKER", r"\x1b[?25h")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["auto_start_ready_marker"] == b"\x1b[?25h"
+        monkeypatch.setenv("LMER_AUTO_START_READY_MARKER", "❯")
+        opts = supervisor._resolve_options(self._ns())
+        assert opts["auto_start_ready_marker"] == b"\xe2\x9d\xaf"
+
     def test_cli_flag_beats_profile_ready_timeout(self, monkeypatch):
         monkeypatch.setenv("LMER_HARNESS", "pi")
         monkeypatch.delenv("LMER_AUTO_START_READY_TIMEOUT", raising=False)

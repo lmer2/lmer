@@ -59,8 +59,21 @@ supported harnesses (Claude Code, Codex, pi):
 - Authentication per harness and sandbox/approval posture
 - Architecture (registry, runner scripts, supervisor profiles)
 - Step-by-step checklist for adding support for a new harness
+- User-installed harnesses (`~/.lmer/harnesses/` drop-in, no fork required)
 
 **Best for**: Running lmer sessions on Codex/pi, understanding what works where, and adding support for additional harnesses.
+
+---
+
+### [USER-HARNESS-OPENCODE.md](./USER-HARNESS-OPENCODE.md)
+**Worked example: opencode as a user-installed harness**
+
+A complete, paste-ready setup of opencode via the user-harness mechanism —
+manifest, runner script, base permission config, host-side login flow, and
+troubleshooting. Verified against opencode 1.18.4.
+
+**Best for**: Setting up your first user-installed harness, or a template to
+adapt for any other agent CLI.
 
 ---
 

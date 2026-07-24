@@ -376,3 +376,61 @@ class TestPiRunner:
         record = _stub_work_cli(tmp_path)
         run_harness_runner("pi", tmp_path)
         assert not record.exists()
+
+
+class TestProvisionConfigFallback:
+    """harness_provision_config's optional third argument: the
+    lowest-priority fallback source a user-installed harness's runner passes
+    for the base config shipped in its own directory (issue #132)."""
+
+    def _provision(self, tmp_path, work_root, global_dir, fallback):
+        target = tmp_path / "target" / "settings.json"
+        script = (
+            f'source "{LIBEXEC}/harness-common.sh"\n'
+            "harness_find_global_dir\n"
+            f'harness_provision_config "acme/settings.json" "{target}" "{fallback}"\n'
+        )
+        subprocess.run(
+            ["bash", "-c", script],
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "LMER_WORK_AGENT_FILES_ROOT": str(work_root),
+                "LMER_GLOBAL_DIR": str(global_dir),
+            },
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        return target
+
+    def test_fallback_used_when_no_other_source(self, tmp_path):
+        fallback = tmp_path / "acme" / "agent-files" / "settings.json"
+        fallback.parent.mkdir(parents=True)
+        fallback.write_text('{"from": "fallback"}')
+        target = self._provision(
+            tmp_path, tmp_path / "no-work", tmp_path / "no-global", fallback
+        )
+        assert target.read_text() == '{"from": "fallback"}'
+
+    def test_work_repo_overrides_fallback(self, tmp_path):
+        fallback = tmp_path / "acme" / "agent-files" / "settings.json"
+        fallback.parent.mkdir(parents=True)
+        fallback.write_text('{"from": "fallback"}')
+        work_root = tmp_path / "work-agent-files"
+        override = work_root / "acme" / "settings.json"
+        override.parent.mkdir(parents=True)
+        override.write_text('{"from": "work"}')
+        target = self._provision(tmp_path, work_root, tmp_path / "no-global", fallback)
+        assert target.read_text() == '{"from": "work"}'
+
+    def test_existing_target_wins_over_fallback(self, tmp_path):
+        fallback = tmp_path / "acme" / "agent-files" / "settings.json"
+        fallback.parent.mkdir(parents=True)
+        fallback.write_text('{"from": "fallback"}')
+        target = tmp_path / "target" / "settings.json"
+        target.parent.mkdir(parents=True)
+        target.write_text('{"from": "session"}')
+        self._provision(tmp_path, tmp_path / "no-work", tmp_path / "no-global", fallback)
+        assert target.read_text() == '{"from": "session"}'

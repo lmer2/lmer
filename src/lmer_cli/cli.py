@@ -39,8 +39,10 @@ from .mounts import (
     build_host_repo_ro_mount,
     build_host_uv_cache_mount,
     build_lmer_docs_mount,
+    build_user_harness_mounts,
     build_user_mounts,
     build_workspace_mount,
+    plan_credential_mounts,
     build_service_mode_mounts,
     resolve_host_clone_cache_dir,
     resolve_host_uv_cache_dir,
@@ -54,8 +56,15 @@ from .harness import (
     UnknownHarnessError,
     get_harness,
     implied_harness_name,
+    known_harnesses,
     missing_credential_mounts,
     resolve_harness_selection,
+)
+from .user_harnesses import (
+    CONTAINER_HARNESS_CACHE_DIR,
+    CONTAINER_HARNESSES_DIR,
+    DEFAULT_HARNESS_CACHE_DIR,
+    load_user_harnesses,
 )
 from .presets import (
     AGENTS_ENV,
@@ -248,7 +257,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. (env: LMER_ANSWER)")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
-    parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(HARNESSES))}")
+    parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
     parser.add_argument("--fastapi-host", dest="fastapi_host", help="Host for the FastAPI endpoint to bind (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", dest="fastapi_token", help="Bearer token for the FastAPI endpoint (auto-generated if omitted)")
@@ -963,16 +972,17 @@ def _agents_child_harnesses(
     }
     home = Path.home()
     extra: dict[str, Harness] = {}
+    registry = known_harnesses()
     for agent_name, entry in resolved.items():
         overlay = entry.get("env") or {}
         name = implied_harness_name(overlay, {**inherited, **overlay})
-        if name not in HARNESSES:
+        if name not in registry:
             # resolve_agent_presets already rejects unknown explicit names;
             # unreachable in practice, but a mount union must never crash.
             continue
         if name == session_harness.name:
             continue
-        child = HARNESSES[name]
+        child = registry[name]
         missing = missing_credential_mounts(
             child, lambda cred: (home / cred.host_path).exists()
         )
@@ -1020,15 +1030,28 @@ def _handle_build(argv: list[str]) -> int:
     parser.add_argument("--update-harness", action="append", metavar="NAME", dest="update_harness", help=f"Force re-install of a harness CLI (bust Docker cache for its install layer). Repeatable. Known: {', '.join(sorted(HARNESSES))}, or 'all'")
     args = parser.parse_args(argv)
 
+    # Validate the names as REQUESTED before expanding 'all' — otherwise
+    # `--update-harness all --update-harness <typo-or-user-name>` would be
+    # silently swallowed by the expansion instead of rejected.
     update_harnesses = set(args.update_harness or [])
+    unknown = update_harnesses - set(HARNESSES) - {"all"}
+    if unknown:
+        # User-installed harnesses have no Containerfile install layer to
+        # bust — their runner owns the CLI install (wipe the cache instead).
+        user_named = unknown & set(load_user_harnesses())
+        if user_named:
+            error(
+                f"❌ --update-harness does not apply to user-installed harness(es) "
+                f"{', '.join(sorted(user_named))}: their runner installs the CLI at "
+                f"session start — clear {DEFAULT_HARNESS_CACHE_DIR}/<name> to force a reinstall"
+            )
+            return 2
+        error(f"❌ Unknown harness(es) for --update-harness: {', '.join(sorted(unknown))} (known: {', '.join(sorted(HARNESSES))}, or 'all')")
+        return 2
     if "all" in update_harnesses:
         update_harnesses = set(HARNESSES)
     if args.update_claude:
         update_harnesses.add("claude")
-    unknown = update_harnesses - set(HARNESSES)
-    if unknown:
-        error(f"❌ Unknown harness(es) for --update-harness: {', '.join(sorted(unknown))} (known: {', '.join(sorted(HARNESSES))}, or 'all')")
-        return 2
 
     try:
         runtime = detect_runtime()
@@ -1228,11 +1251,14 @@ def main(argv: list[str] | None = None) -> int:
             _display_env_config_cli(host_lmer_vars, early_env_file_sources)
         error(f"❌ {e}")
         return 2
+    user_tag = " [user-installed]" if harness.source_dir is not None else ""
     if harness_source == "model":
-        info(f"🤖 Harness: {harness.name} (auto-selected from LMER_LLM_NAME={os.environ.get('LMER_LLM_NAME')})")
+        info(f"🤖 Harness: {harness.name}{user_tag} (auto-selected from LMER_LLM_NAME={os.environ.get('LMER_LLM_NAME')})")
     elif harness.name != "claude":
-        info(f"🤖 Harness: {harness.name}")
-    if harness.name != "claude":
+        info(f"🤖 Harness: {harness.name}{user_tag}")
+    if harness.source_dir is not None:
+        info(f"   (definition: {harness.source_dir}; runner-owned CLI install)")
+    elif harness.name != "claude":
         info(
             f"   (requires an image that ships {harness.runner_script}; "
             f"if the session fails with '{harness.runner_command}: command not found', "
@@ -1410,11 +1436,33 @@ def main(argv: list[str] | None = None) -> int:
     container_home = ensure_container_home(container_home_base)
     run += build_container_home_mounts(runtime, container_home)
 
-    # Build user mounts and check for SSH agent
-    user_mounts, ssh_agent_enabled = build_user_mounts(runtime, harness, agent_extra_harnesses)
+    # Build user mounts and check for SSH agent. Compute the credential plan
+    # ONCE and thread it through both the mounter and the 🔑 announce below,
+    # so what is shown is literally what was bound (one evaluation, not two).
+    cred_plan = plan_credential_mounts(harness, agent_extra_harnesses)
+    user_mounts, ssh_agent_enabled = build_user_mounts(
+        runtime, harness, agent_extra_harnesses, plan=cred_plan
+    )
     run += user_mounts
     if ssh_agent_enabled:
         success("✅ SSH agent forwarding enabled")
+
+    # User-installed harness definitions (~/.lmer/harnesses, issue #132) plus
+    # the install-cache volume when a user harness is active this session.
+    harness_dir_mounts, harness_cache_mounted = build_user_harness_mounts(
+        runtime, harness, agent_extra_harnesses
+    )
+    run += harness_dir_mounts
+
+    # Announce every user-harness credential mount: manifests are
+    # operator-authored config, so an unexpected entry (say, a private key
+    # file) must be visible at launch, not discovered inside the container.
+    # Announce from the SAME computed plan build_user_mounts just bound from
+    # (cred_plan above), so what is shown is exactly what was bound.
+    planned_creds, _ = cred_plan
+    for m in planned_creds:
+        if m.is_user:
+            info(f"🔑 User harness {m.harness_name}: mounting ~/{m.host_path} ({m.mode})")
 
     # Check SSH setup and warn if not configured
     _check_ssh_setup(container_home, ssh_agent_enabled)
@@ -1626,6 +1674,18 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_AGENTS": agents_csv,
         "LMER_AGENTS_CONFIG": agents_config_json,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
+        # User-installed harnesses (issue #132): where the host mounted
+        # ~/.lmer/harnesses inside the container (consumed by
+        # clone_and_exec.py runner dispatch, lmer-supervisor, and
+        # spawn-harness — deliberately the container path, never the host
+        # one), and — when the session harness is user-installed — the
+        # runner's persistent install-cache directory on the rw cache mount.
+        "LMER_HARNESSES_DIR": CONTAINER_HARNESSES_DIR if harness_dir_mounts else None,
+        "LMER_HARNESS_CACHE": (
+            f"{CONTAINER_HARNESS_CACHE_DIR}/{harness.name}"
+            if harness.source_dir is not None and harness_cache_mounted
+            else None
+        ),
         # Statusline segment list (issue #121), consumed in-container by
         # hooks/statusline.py; unset keeps the default repo,branch,task,ctx.
         "LMER_STATUSLINE": os.environ.get("LMER_STATUSLINE"),
