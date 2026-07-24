@@ -1,2 +1,0 @@
-fixed:
-- "re-recording a goal without estimate flags now clears any prior estimate — an estimate is scoped to the goal it sized, so a new goal must not inherit the old goal's estimate into the resume brief (#99)"
