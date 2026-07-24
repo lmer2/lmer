@@ -94,3 +94,17 @@ class TestAnswerFlag:
         help_text = capsys.readouterr().out
         assert "--answer" in help_text
         assert "LMER_ANSWER" in help_text
+
+    def test_answer_help_does_not_claim_env_seeding(self, capsys):
+        """Review on !154: the help text must not carry the `(env: VAR)`
+        convention this file uses everywhere else to mean "the env var seeds
+        the flag" — for --answer it deliberately does not (see
+        test_host_env_answer_is_not_forwarded). LMER_ANSWER may only be
+        described as the container-side export."""
+        with patch.object(sys, "argv", ["lmer", "--help"]):
+            try:
+                parse_args(["--help"])
+            except SystemExit:
+                pass
+        help_text = capsys.readouterr().out
+        assert "(env: LMER_ANSWER" not in help_text

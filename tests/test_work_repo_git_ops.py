@@ -395,11 +395,16 @@ class TestCommitWorkPathResilience:
                     "git.example.com/grp/proj/runs/develop-issue-9",
                 ]]
 
-    def test_commit_work_changes_includes_specs_index(self, tmp_path):
+    def test_commit_work_changes_stages_task_runs_and_specs_in_order(self, tmp_path):
         """MR !140 staging gap: entries written by `work specs-index
         --rebuild` / the masterplan sync have no push of their own — the
         batching `work commit` must stage specs/ too (skipped when the
-        dir doesn't exist, free when clean)."""
+        dir doesn't exist, free when clean).
+
+        Distinct name from the !126 test below on purpose: they shared one
+        method name until the review on !154, and Python silently kept only
+        the later definition — dropping this stricter argv/order assertion.
+        """
         env_vars = {
             "LMER_WORK_REPO_PATH": str(tmp_path),
             "LMER_REPO_HOST": "git.example.com",

@@ -180,6 +180,11 @@ def _clone_cmd(
 # a corrupt mirror — degrades fail-soft to the direct clone.
 
 
+# Ports that carry no information in a mirror name — a URL naming one maps to
+# the same mirror as a URL that omits it.
+_DEFAULT_PORTS = {"https": 443, "http": 80, "ssh": 22, "git": 9418}
+
+
 def _mirror_path(cache_root: Path, repo_url: str) -> "Path | None":
     """Map a clone URL to its mirror path ``<cache_root>/<host>/<project>.git``.
 
@@ -187,15 +192,24 @@ def _mirror_path(cache_root: Path, repo_url: str) -> "Path | None":
     (``git@host:group/project.git``). Returns None for URLs the cache doesn't
     handle (local paths, unparseable forms) so the caller degrades to a
     direct clone.
+
+    A **non-default** port joins the host namespace (``host_8443``): two
+    servers can share a hostname on different ports, and collapsing them into
+    one mirror would cross-wire their stamps and let a clone borrow objects
+    from the wrong server (review on !154). Default ports stay unsuffixed, so
+    mirrors built before this distinction keep being found.
     """
     host = None
     path = ""
     if "://" in repo_url:
         try:
             parsed = urlparse(repo_url)
+            port = parsed.port  # raises ValueError on a malformed port
         except Exception:
             return None
         host = parsed.hostname
+        if host and port and port != _DEFAULT_PORTS.get((parsed.scheme or "").lower()):
+            host = f"{host}_{port}"
         path = (parsed.path or "").strip("/")
     else:
         # scp-like SSH form: [user@]host:group/project(.git)

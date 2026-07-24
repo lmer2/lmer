@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 import re
-from typing import Mapping
+from typing import Iterable, Mapping
 from dotenv import dotenv_values
 
 from . import resolve
@@ -30,6 +30,7 @@ from .log import error, info, success, warning
 from .mounts import (
     CONTAINER_CLONE_CACHE_DIR,
     FileMountSpec,
+    PlannedCredentialMount,
     build_checkout_mount,
     build_clone_cache_mount,
     build_container_home_mounts,
@@ -255,7 +256,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--fastapi", dest="fastapi", action="store_true", help="Expose a FastAPI endpoint to read/write the claude process (POST /input, GET /output)")
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
-    parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. (env: LMER_ANSWER)")
+    parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
     parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
@@ -1086,6 +1087,47 @@ def _resolve_napkin_path(napkin_repo_url: str, work_repo_path: str) -> str:
     return f"{work_repo_path}/napkin"
 
 
+def _announce_user_credential_mounts(planned: "Iterable[PlannedCredentialMount]") -> None:
+    """Announce every user-harness credential mount at launch.
+
+    Manifests are operator-authored config, so an unexpected entry (say, a
+    private key file) must be visible at launch, not discovered inside the
+    container — which means the notice cannot be verbosity-gated: it goes
+    through ``warning()`` (unconditional), not ``info()`` (LMER_VERBOSE only).
+    Built-in harnesses are skipped: their credential lists are fixed in-tree,
+    so there is nothing an operator could be surprised by.
+    """
+    for m in planned:
+        if m.is_user:
+            warning(f"🔑 User harness {m.harness_name}: mounting ~/{m.host_path} ({m.mode})")
+
+
+def _updater_child_env() -> "dict[str, str]":
+    """Environment for the detached host-side clone-cache updater.
+
+    Unlike every other execution vector in lmer, this child runs **on the
+    host**, so its Python import path must not be attacker-controllable:
+    ``PYTHONPATH`` is pinned to the directory lmer's own package was imported
+    from (keeps ``-m lmer_cli.clone_cache`` working for venv *and*
+    source-checkout installs) and ``PYTHONSAFEPATH`` keeps the cwd off
+    ``sys.path``, so neither a stray ``lmer_cli/`` directory in the launch cwd
+    nor a ``PYTHONPATH`` picked up from a cwd ``.env`` can inject host code.
+    ``PYTHONHOME``/``PYTHONSTARTUP`` are dropped for the same reason.
+
+    The rest of the environment is inherited deliberately: git needs it (an
+    ssh-URL mirror can require the caller's ``GIT_SSH_COMMAND``), and .env is
+    trusted standing configuration everywhere else in lmer.
+    """
+    env = dict(os.environ)
+    # Directory holding the `lmer_cli` package (…/src for a checkout,
+    # …/site-packages for an installed venv).
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONSAFEPATH"] = "1"
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONSTARTUP", None)
+    return env
+
+
 def _spawn_clone_cache_updater(urls: "list[str | None]") -> None:
     """Fork the detached host-side clone-cache updater (lmer_cli.clone_cache).
 
@@ -1100,12 +1142,19 @@ def _spawn_clone_cache_updater(urls: "list[str | None]") -> None:
         return
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "lmer_cli.clone_cache"],
+            # -P (PYTHONSAFEPATH): never prepend the cwd to sys.path. This
+            # child runs on the *host*, so a `lmer_cli/` directory in whatever
+            # cwd lmer was launched from must not become importable code.
+            [sys.executable, "-P", "-m", "lmer_cli.clone_cache"],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
+            # A trusted, always-present cwd instead of the caller's (which may
+            # be untrusted, or deleted out from under a detached child).
+            cwd=str(Path.home()),
+            env=_updater_child_env(),
         )
         proc.stdin.write(("\n".join(to_send) + "\n").encode())
         proc.stdin.close()
@@ -1454,15 +1503,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     run += harness_dir_mounts
 
-    # Announce every user-harness credential mount: manifests are
-    # operator-authored config, so an unexpected entry (say, a private key
-    # file) must be visible at launch, not discovered inside the container.
-    # Announce from the SAME computed plan build_user_mounts just bound from
-    # (cred_plan above), so what is shown is exactly what was bound.
+    # Announce every user-harness credential mount from the SAME computed plan
+    # build_user_mounts just bound from (cred_plan above), so what is shown is
+    # exactly what was bound.
     planned_creds, _ = cred_plan
-    for m in planned_creds:
-        if m.is_user:
-            info(f"🔑 User harness {m.harness_name}: mounting ~/{m.host_path} ({m.mode})")
+    _announce_user_credential_mounts(planned_creds)
 
     # Check SSH setup and warn if not configured
     _check_ssh_setup(container_home, ssh_agent_enabled)

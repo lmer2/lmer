@@ -828,6 +828,59 @@ class TestOpencodeWalkthroughDoc:
         assert "harness_render_prompt_templates" in text
 
 
+class TestCredentialMountAnnounce:
+    """The launch-time 🔑 announce is a security guardrail, so it must print on
+    the DEFAULT path — review on !154: it used to go through `info()`, which
+    only prints under LMER_VERBOSE, so a normal launch bound user-harness
+    credential files (rw by default) with no notice at all."""
+
+    def _plan(self):
+        return [
+            PlannedCredentialMount(
+                harness_name="acme",
+                is_user=True,
+                host_path=".acme/auth.json",
+                host_file=Path("/home/u/.acme/auth.json"),
+                container_path="/home/developer/.acme/auth.json",
+                mode="rw",
+            ),
+            PlannedCredentialMount(
+                harness_name="claude",
+                is_user=False,
+                host_path=".claude.json",
+                host_file=Path("/home/u/.claude.json"),
+                container_path="/home/developer/.claude.json",
+                mode="rw",
+            ),
+        ]
+
+    def test_announced_without_verbose(self, monkeypatch, capsys):
+        from lmer_cli.cli import _announce_user_credential_mounts
+
+        monkeypatch.delenv("LMER_VERBOSE", raising=False)
+        _announce_user_credential_mounts(self._plan())
+        out = capsys.readouterr().out
+        assert "🔑 User harness acme: mounting ~/.acme/auth.json (rw)" in out
+
+    def test_builtin_credentials_not_announced(self, monkeypatch, capsys):
+        from lmer_cli.cli import _announce_user_credential_mounts
+
+        monkeypatch.delenv("LMER_VERBOSE", raising=False)
+        _announce_user_credential_mounts(self._plan())
+        out = capsys.readouterr().out
+        # Built-in credential lists are fixed in-tree: nothing to be surprised by.
+        assert ".claude.json" not in out
+        assert out.count("🔑") == 1
+
+    def test_not_routed_through_verbosity_gate(self):
+        # Guard the regression itself: the 🔑 line must be emitted through the
+        # unconditional sink, never through the LMER_VERBOSE-gated info().
+        source = CLI_PY.read_text()
+        emit = [ln.strip() for ln in source.splitlines() if "🔑 User harness" in ln]
+        assert emit, "🔑 user-harness credential announce vanished from cli.py"
+        assert all(ln.startswith("warning(") for ln in emit), emit
+
+
 class TestCliSourceGuards:
     """Source guards against removal of the container passthrough entries
     (same pattern as the LMER_HARNESS guard in test_harness.py)."""

@@ -331,6 +331,48 @@ class TestHostSideMount:
         monkeypatch.setenv("LMER_CLONE_CACHE_DIR", "~/my-clone-cache")
         assert not str(resolve_host_clone_cache_dir()).startswith("~")
 
+    def test_relative_path_refused(self, monkeypatch, tmp_path, capsys):
+        """Review on !154: a relative value splits the feature in two — the
+        mount string `cache:/clone-cache:ro` reads as a *named volume* to
+        Docker/Podman while the host updater populates a real ./cache, so the
+        container never sees the mirrors."""
+        monkeypatch.setenv("LMER_CLONE_CACHE_DIR", "cache")
+        monkeypatch.setattr(
+            "lmer_cli.mounts.Path.home", classmethod(lambda cls: tmp_path)
+        )
+        resolved = resolve_host_clone_cache_dir()
+        assert resolved == tmp_path / ".lmer" / "clone-cache"
+        err = capsys.readouterr().err
+        assert "absolute path" in err
+        assert "'cache'" in err
+
+    @pytest.mark.parametrize("broad", ["/", "~", "~/"])
+    def test_broad_root_refused(self, monkeypatch, tmp_path, broad):
+        # The whole cache root is bind-mounted into the container, so `~` would
+        # expose the entire home tree (read-only, but readable).
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("LMER_CLONE_CACHE_DIR", broad)
+        assert resolve_host_clone_cache_dir() == home / ".lmer" / "clone-cache"
+
+    def test_broad_root_warns(self, monkeypatch, tmp_path, capsys):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("LMER_CLONE_CACHE_DIR", "~")
+        resolve_host_clone_cache_dir()
+        assert "too broad to bind-mount" in capsys.readouterr().err
+
+    def test_absolute_subdir_of_home_still_allowed(self, monkeypatch, tmp_path):
+        # Only the home directory *itself* is refused — a dedicated subdir is
+        # the normal configuration.
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("LMER_CLONE_CACHE_DIR", "~/mirrors")
+        assert resolve_host_clone_cache_dir() == home / "mirrors"
+
     def test_mount_arg_shape_is_read_only(self):
         # The container only consumes the cache (--reference --dissociate);
         # all maintenance is host-side, so the mount is structurally :ro —
@@ -421,6 +463,36 @@ class TestUpdaterSpawn:
         monkeypatch.setattr(cli_mod.subprocess, "Popen", fake_popen)
         cli_mod._spawn_clone_cache_updater(urls)
         return calls, proc
+
+    def test_host_side_python_path_is_not_caller_controlled(self, monkeypatch, tmp_path):
+        """Review on !154: this child runs on the HOST, so `python -m` must not
+        pick code up from the launch cwd (a stray `lmer_cli/` package there) or
+        from an inherited PYTHONPATH (a cwd `.env` lands in os.environ)."""
+        monkeypatch.setenv("PYTHONPATH", "/tmp/attacker")
+        monkeypatch.setenv("PYTHONHOME", "/tmp/attacker-home")
+        monkeypatch.setenv("PYTHONSTARTUP", "/tmp/attacker-startup.py")
+        calls, _ = self._spawn(monkeypatch, ["https://x/y.git"])
+        # -P (PYTHONSAFEPATH) keeps the cwd off sys.path
+        assert calls["cmd"][1] == "-P"
+        assert calls["cmd"][-2:] == ["-m", "lmer_cli.clone_cache"]
+        env = calls["kwargs"]["env"]
+        # PYTHONPATH is pinned to lmer's own package dir, not the caller's
+        import lmer_cli
+
+        assert env["PYTHONPATH"] == str(Path(lmer_cli.__file__).resolve().parent.parent)
+        assert env["PYTHONSAFEPATH"] == "1"
+        assert "PYTHONHOME" not in env
+        assert "PYTHONSTARTUP" not in env
+        # cwd is a trusted directory, not whatever the caller was sitting in
+        assert calls["kwargs"]["cwd"] == str(Path.home())
+
+    def test_updater_env_keeps_git_ssh_command(self, monkeypatch):
+        # ssh-URL mirrors can need the caller's key selection; .env is trusted
+        # standing configuration everywhere else in lmer, so this is inherited
+        # on purpose (deliberate scope of the !154 hardening).
+        monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -i ~/.ssh/mirror_key")
+        calls, _ = self._spawn(monkeypatch, ["git@git.example.com:a/b.git"])
+        assert calls["kwargs"]["env"]["GIT_SSH_COMMAND"] == "ssh -i ~/.ssh/mirror_key"
 
     def test_detached_stdin_fed_no_wait(self, monkeypatch):
         calls, proc = self._spawn(

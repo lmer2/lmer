@@ -77,6 +77,24 @@ def _log(message: str) -> None:
         pass
 
 
+def _inherited_git_config_count() -> int:
+    """How many ``GIT_CONFIG_KEY_n`` entries the environment already carries.
+
+    The updater's own entries are appended *after* these (see
+    :func:`_split_credentials`): ``_git_env`` merges over ``os.environ``, so
+    hardcoding ``GIT_CONFIG_COUNT=2`` would silently drop a caller's numbered
+    git config (CI, a loaded ``.env``) by overwriting indices 0 and 1. A
+    missing or unparseable count means "nothing inherited" — same reading git
+    itself would apply to an invalid value.
+    """
+    raw = (os.environ.get("GIT_CONFIG_COUNT") or "").strip()
+    try:
+        count = int(raw)
+    except ValueError:
+        return 0
+    return count if count > 0 else 0
+
+
 def _split_credentials(repo_url: str) -> "tuple[str, dict[str, str]]":
     """Split an http(s) URL into (scrubbed URL, ephemeral git-config env).
 
@@ -84,6 +102,9 @@ def _split_credentials(repo_url: str) -> "tuple[str, dict[str, str]]":
     so the token reaches git without ever appearing on an argv (host ``ps``
     shows every command line for the full duration of an initial mirror
     build). Non-http URLs and URLs without userinfo pass through untouched.
+
+    The entries land at the next free ``GIT_CONFIG_*`` indices so inherited
+    numbered git config survives (see :func:`_inherited_git_config_count`).
     """
     if "://" not in repo_url:
         return repo_url, {}
@@ -99,14 +120,15 @@ def _split_credentials(repo_url: str) -> "tuple[str, dict[str, str]]":
     scrubbed = f"{parsed.scheme}://{host}{parsed.path or ''}"
     userinfo = f"{unquote(parsed.username or '')}:{unquote(parsed.password or '')}"
     token = base64.b64encode(userinfo.encode()).decode()
+    base = _inherited_git_config_count()
     env = {
-        "GIT_CONFIG_COUNT": "2",
-        "GIT_CONFIG_KEY_0": f"http.{scrubbed}.extraHeader",
-        "GIT_CONFIG_VALUE_0": f"Authorization: Basic {token}",
+        "GIT_CONFIG_COUNT": str(base + 2),
+        f"GIT_CONFIG_KEY_{base}": f"http.{scrubbed}.extraHeader",
+        f"GIT_CONFIG_VALUE_{base}": f"Authorization: Basic {token}",
         # reset any inherited credential helpers: nothing may prompt or
         # substitute other credentials under a detached updater
-        "GIT_CONFIG_KEY_1": "credential.helper",
-        "GIT_CONFIG_VALUE_1": "",
+        f"GIT_CONFIG_KEY_{base + 1}": "credential.helper",
+        f"GIT_CONFIG_VALUE_{base + 1}": "",
     }
     return scrubbed, env
 
