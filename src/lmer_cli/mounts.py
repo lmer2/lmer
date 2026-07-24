@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Iterable, List, NamedTuple, Optional, Tuple
 
+from lmer_cli import user_harnesses
 from lmer_cli.harness import get_harness
 from lmer_cli.runtime import _is_selinux_enforcing
 
@@ -20,6 +21,11 @@ EXTERNAL_TASKDEF_MOUNT_BASE = "/Agents/taskdefs"
 # Path inside the container where uv looks for its cache by default
 # (HOME=/home/developer + XDG default of $HOME/.cache/uv).
 CONTAINER_UV_CACHE_DIR = "/home/developer/.cache/uv"
+
+# Path inside the container where the persistent git clone cache is mounted.
+# The container clone script (clone_and_exec.py) receives it via
+# LMER_CLONE_CACHE_PATH and keeps one bare mirror per repo under it.
+CONTAINER_CLONE_CACHE_DIR = "/clone-cache"
 
 
 def selinux_opt(runtime: str) -> str:
@@ -206,7 +212,80 @@ def build_container_home_mounts(runtime: str, container_home: Path) -> List[str]
     return args
 
 
-def build_user_mounts(runtime: str, harness=None) -> Tuple[List[str], bool]:
+class PlannedCredentialMount(NamedTuple):
+    """One credential mount the planner decided to bind.
+
+    ``is_user`` marks a mount contributed by a user-installed harness (the
+    launch-time 🔑 announce shows only these); ``harness_name`` and the
+    ``CredentialMount`` fields drive both the ``-v`` arg and the announce.
+    """
+
+    harness_name: str
+    is_user: bool
+    host_path: str  # home-relative, for display (e.g. ".acme/auth.json")
+    host_file: Path
+    container_path: str
+    mode: str
+
+
+def plan_credential_mounts(
+    harness, extra_harnesses=()
+) -> Tuple[List[PlannedCredentialMount], List[Tuple[str, str]]]:
+    """Decide which harness credential files to bind — the single predicate.
+
+    Returns ``(to_mount, skipped)``: ``to_mount`` is the deduplicated list of
+    credentials that exist on the host and (for user harnesses) pass the
+    regular-file-under-home guard; ``skipped`` is the ``(harness_name,
+    host_path)`` pairs a user-harness guard rejected, for the caller to warn
+    about. **Pure** (filesystem reads only, no printing) so both the mounter
+    (:func:`build_user_mounts`) and the launch-time announce
+    (``cli.py``) can call it without double-warning or drifting on the rule.
+
+    User-harness credential mounts must be a **regular file whose resolved
+    path stays under the host home**: ``.ssh`` (a directory) and a symlink
+    pointing outside ``$HOME`` are both rejected, keeping the mount surface
+    to the "any regular file under the host home" boundary the docs state.
+    Built-in harnesses keep the historical exists-only behavior (their
+    registry entries are all fixed in-tree, not manifest-supplied).
+    """
+    home = Path.home()
+    home_resolved = home.resolve()
+    to_mount: List[PlannedCredentialMount] = []
+    skipped: List[Tuple[str, str]] = []
+    seen = set()
+    for entry in (harness, *extra_harnesses):
+        for cred in entry.credential_mounts:
+            if cred in seen:
+                continue
+            seen.add(cred)
+            host_file = home / cred.host_path
+            if not host_file.exists():
+                continue
+            if entry.source_dir is not None:
+                # is_file() follows symlinks, so also require the resolved
+                # target to stay under the resolved home — a home-relative
+                # symlink to a file outside $HOME must not widen the surface.
+                if not host_file.is_file() or not host_file.resolve().is_relative_to(
+                    home_resolved
+                ):
+                    skipped.append((entry.name, cred.host_path))
+                    continue
+            to_mount.append(
+                PlannedCredentialMount(
+                    entry.name,
+                    entry.source_dir is not None,
+                    cred.host_path,
+                    host_file,
+                    cred.container_path,
+                    cred.mode,
+                )
+            )
+    return to_mount, skipped
+
+
+def build_user_mounts(
+    runtime: str, harness=None, extra_harnesses=(), *, plan=None
+) -> Tuple[List[str], bool]:
     """
     Build mounts for user configuration files and SSH agent.
 
@@ -219,6 +298,17 @@ def build_user_mounts(runtime: str, harness=None) -> Tuple[List[str], bool]:
         runtime: Container runtime ('docker' or 'podman')
         harness: Harness registry entry whose credential files to mount;
             defaults to claude (the historical behavior)
+        extra_harnesses: Additional harness registry entries whose credential
+            files to mount as well — the harnesses implied by the ``--agents``
+            fan-out selection, so a child routed to a non-session harness can
+            authenticate (issue #131). Duplicate credential entries are
+            mounted once; missing host files are skipped as usual.
+        plan: A pre-computed ``plan_credential_mounts(...)`` result to consume
+            instead of recomputing. The caller passes this to bind and
+            announce (``cli.py``) from the *same* evaluation, so what is
+            shown can never diverge from what is bound (not merely the same
+            logic, the same computed plan); also avoids a redundant stat
+            walk. ``None`` computes it here (all other callers).
 
     Returns:
         Tuple of (mount arguments, ssh_agent_enabled flag)
@@ -228,13 +318,20 @@ def build_user_mounts(runtime: str, harness=None) -> Tuple[List[str], bool]:
 
     args: List[str] = []
     se = selinux_opt(runtime)
-    home = Path.home()
     ssh_agent_enabled = False
 
-    for cred in harness.credential_mounts:
-        host_file = home / cred.host_path
-        if host_file.exists():
-            args += ["-v", f"{host_file}:{cred.container_path}:{cred.mode}{se}"]
+    to_mount, skipped = plan if plan is not None else plan_credential_mounts(
+        harness, extra_harnesses
+    )
+    for name, host_path in skipped:
+        print(
+            f"⚠️  User harness {name!r}: credential mount ~/{host_path} is not "
+            "a regular file under the host home — skipped (directories and "
+            "out-of-home symlinks cannot be mounted via credential_mounts)",
+            file=sys.stderr,
+        )
+    for m in to_mount:
+        args += ["-v", f"{m.host_file}:{m.container_path}:{m.mode}{se}"]
 
     # SSH agent
     ssh_sock = os.environ.get("SSH_AUTH_SOCK")
@@ -242,6 +339,67 @@ def build_user_mounts(runtime: str, harness=None) -> Tuple[List[str], bool]:
         args += ["-v", f"{ssh_sock}:/ssh-agent:ro{se}", "-e", "SSH_AUTH_SOCK=/ssh-agent"]
         ssh_agent_enabled = True
     return args, ssh_agent_enabled
+
+
+def build_user_harness_mounts(
+    runtime: str, harness, extra_harnesses=()
+) -> Tuple[List[str], bool]:
+    """
+    Build mounts for user-installed harness definitions (issue #132).
+
+    When the host user-harness directory exists, it is mounted read-only at
+    ``CONTAINER_HARNESSES_DIR`` so every in-container consumer — the runner
+    dispatch in ``clone_and_exec.py``, ``lmer-supervisor``, ``spawn-harness``
+    — resolves the same definitions the host CLI loaded (the host also
+    forwards the mount point as ``LMER_HARNESSES_DIR``; see the env dict in
+    ``cli.py``).
+
+    When the session harness or any ``--agents``-implied child harness is
+    user-installed, a read-write install-cache volume is mounted at
+    ``CONTAINER_HARNESS_CACHE_DIR`` (host side created on demand) so a
+    runner's install-if-missing step survives across sessions.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        harness: The session's Harness registry entry
+        extra_harnesses: Harnesses implied by the ``--agents`` fan-out
+
+    Returns:
+        Tuple of (mount arguments, cache_mounted flag). The flag drives the
+        ``LMER_HARNESS_CACHE`` env decision in ``cli.py`` — the variable is
+        documented as persistent, so it must only be set when the persistent
+        mount actually happened.
+    """
+    args: List[str] = []
+    se = selinux_opt(runtime)
+    cache_mounted = False
+    # absolute(): a relative LMER_HARNESSES_DIR would otherwise reach the
+    # runtime's -v as a bare name and be parsed as an (empty) named volume.
+    harnesses_dir = user_harnesses.user_harnesses_dir().absolute()
+    if harnesses_dir.is_dir():
+        args += [
+            "-v",
+            f"{harnesses_dir}:{user_harnesses.CONTAINER_HARNESSES_DIR}:ro{se}",
+        ]
+    if any(h.source_dir is not None for h in (harness, *extra_harnesses)):
+        # Module-attribute reference (not a from-import) so tests can
+        # repoint the cache location on the user_harnesses module itself.
+        cache_dir = user_harnesses.DEFAULT_HARNESS_CACHE_DIR
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"⚠️  Cannot create harness cache dir {cache_dir}: {exc} — "
+                "the runner will reinstall its CLI each session",
+                file=sys.stderr,
+            )
+        else:
+            args += [
+                "-v",
+                f"{cache_dir}:{user_harnesses.CONTAINER_HARNESS_CACHE_DIR}:rw{se}",
+            ]
+            cache_mounted = True
+    return args, cache_mounted
 
 
 class FileMountSpec(NamedTuple):
@@ -393,6 +551,78 @@ def build_host_uv_cache_mount(runtime: str, host_cache_dir: Path) -> List[str]:
     """
     se = selinux_opt(runtime)
     return ["-v", f"{host_cache_dir}:{CONTAINER_UV_CACHE_DIR}:rw{se}"]
+
+
+def resolve_host_clone_cache_dir() -> Path:
+    """
+    Resolve the host directory for the persistent git clone cache.
+
+    Honors `$LMER_CLONE_CACHE_DIR` first (with `~` expansion); an empty or
+    unset value falls back to `~/.lmer/clone-cache`. The returned path may
+    not exist on disk — the caller creates it before mounting.
+
+    The value is validated because both halves of the feature read it and a
+    bad value splits them apart or over-shares (review on !154):
+
+    - A **relative** path is refused: the container mount string
+      (`cache:/clone-cache:ro`) would be read by Docker/Podman as a *named
+      volume* while the host-side updater created and populated a real
+      `./cache` directory — the container would never see the mirrors.
+    - An obviously **broad root** (`/`, `$HOME`) is refused: the whole cache
+      root is bind-mounted into the container, so pointing it at a home
+      directory would mount that entire tree (read-only, but readable).
+
+    Either case warns and falls back to the default, which is always safe:
+    a fresh cache costs one direct clone, never correctness.
+
+    Returns:
+        Path to the host clone-cache directory (existence not guaranteed)
+    """
+    default = Path.home() / ".lmer" / "clone-cache"
+    explicit = os.environ.get("LMER_CLONE_CACHE_DIR", "").strip()
+    if not explicit:
+        return default
+    candidate = Path(explicit).expanduser()
+    if not candidate.is_absolute():
+        print(
+            f"⚠️  LMER_CLONE_CACHE_DIR must be an absolute path (got {explicit!r}); "
+            f"using {default}",
+            file=sys.stderr,
+        )
+        return default
+    if candidate == Path(candidate.anchor) or candidate == Path.home():
+        print(
+            f"⚠️  LMER_CLONE_CACHE_DIR is too broad to bind-mount ({candidate}); "
+            f"using {default}",
+            file=sys.stderr,
+        )
+        return default
+    return candidate
+
+
+def build_clone_cache_mount(runtime: str, host_cache_dir: Path) -> List[str]:
+    """
+    Build the read-only mount for the persistent git clone cache.
+
+    Mounts the host cache directory at the container's fixed clone-cache
+    location so the container's clone script (clone_and_exec.py) can borrow
+    objects from the host-maintained bare mirrors via ``--reference
+    <mirror> --dissociate``. All mirror maintenance is host-side
+    (lmer_cli.clone_cache, forked at launch); the container only ever
+    reads, so the mount is ``:ro`` — a session structurally cannot write a
+    token into, or corrupt, the shared cache. A stale or empty cache is
+    fine: the clone still talks to the real origin and fetches whatever the
+    mirror lacks.
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        host_cache_dir: Path to the clone-cache directory on the host
+
+    Returns:
+        List of Docker/Podman arguments for the clone cache mount
+    """
+    se = selinux_opt(runtime)
+    return ["-v", f"{host_cache_dir}:{CONTAINER_CLONE_CACHE_DIR}:ro{se}"]
 
 
 def build_service_mode_mounts(runtime: str, checkout_path: Path) -> List[str]:

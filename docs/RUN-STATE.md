@@ -177,8 +177,10 @@ renders it FIRST, before the run header, as a
 **Answering (issue #98):** the answer arrives in a FRESH session — the
 asking session already ended (that is the #97 contract). Two delivery
 paths, one mechanism: `work answer "<text>"` in-container, or
-`lmer ... --answer "<text>"` on the host, which exports `LMER_ANSWER` so
-`work session-start` applies it automatically before printing the brief
+`lmer ... --answer "<text>"` on the host, which exports `LMER_ANSWER`
+(flag-only — a host-exported or `.env` value is never forwarded; answers
+are one-shot data, not standing configuration) so `work session-start`
+applies it automatically before printing the brief
 (only when the loaded state is actually stopped on a recorded question;
 fail-soft — a problem applying it degrades to the plain brief). Both go
 through `run_state.answer_question`: append a `question_answered` event
@@ -197,7 +199,10 @@ expected to be — set with the goal via
 flag alone is fine; `time` is a free-form human string like `4h` or `2d`,
 stored verbatim and never parsed). The `goal_set` event echoes the estimate
 in its data; a goal recorded without the flags behaves exactly as before
-(no data payload). When an estimate exists, the resume brief renders
+(no data payload). An estimate is scoped to the goal it was recorded with:
+re-recording the goal without the flags clears any prior estimate back to
+null (only goal writes clear — displaying the goal touches nothing). When
+an estimate exists, the resume brief renders
 `Estimate: ~3 sessions / 4h — used: 2 sessions` — the used count is the
 run's `session_start` events so far (computed by the CLI callers that
 already read events; `decide()` stays IO-free and just carries it). At

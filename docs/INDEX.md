@@ -59,8 +59,21 @@ supported harnesses (Claude Code, Codex, pi):
 - Authentication per harness and sandbox/approval posture
 - Architecture (registry, runner scripts, supervisor profiles)
 - Step-by-step checklist for adding support for a new harness
+- User-installed harnesses (`~/.lmer/harnesses/` drop-in, no fork required)
 
 **Best for**: Running lmer sessions on Codex/pi, understanding what works where, and adding support for additional harnesses.
+
+---
+
+### [USER-HARNESS-OPENCODE.md](./USER-HARNESS-OPENCODE.md)
+**Worked example: opencode as a user-installed harness**
+
+A complete, paste-ready setup of opencode via the user-harness mechanism —
+manifest, runner script, base permission config, host-side login flow, and
+troubleshooting. Verified against opencode 1.18.4.
+
+**Best for**: Setting up your first user-installed harness, or a template to
+adapt for any other agent CLI.
 
 ---
 
@@ -117,6 +130,19 @@ Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume b
 How `--service` and `--checkout` let lmer run against an already-running containerized project (Docker Compose stack, Podman pod, etc.) by `docker exec`-ing into the project's container instead of cloning a fresh copy.
 
 **Best for**: Working with projects whose tests require their own runtime environment (database fixtures, Django settings, etc.).
+
+---
+
+### [PRESETS.md](./PRESETS.md)
+**Startup Presets**
+
+Named, operator-defined startup configurations (`LMER_PRESETS_FILE`) that a session starter selects by name — via a `$preset:<name>` Slack token or `lmer --preset` / `LMER_PRESET` on the CLI:
+- The presets file: JSON format, field reference (`checkout`, `service`, `env`, `args`)
+- Loading and validation rules (forgiving by design) and the trust model
+- Per-consumer merge semantics (Slack listener vs. direct CLI) and why they differ
+- Contributor checklist for adding a preset field, and troubleshooting
+
+**Best for**: Defining reusable startup configurations (e.g. service-mode stacks), and understanding exactly how a preset combines with an explicit invocation.
 
 ---
 

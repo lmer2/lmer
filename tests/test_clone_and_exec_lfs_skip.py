@@ -17,6 +17,8 @@ the later branch/ref checkout, the MR auto-checkout, and in-session git use.
 
 from pathlib import Path
 
+import pytest
+
 from lmer_cli.container import clone_and_exec
 from lmer_cli.container.clone_and_exec import (
     _clone_cmd,
@@ -26,6 +28,15 @@ from lmer_cli.container.clone_and_exec import (
 )
 
 REPO_URL = "https://host/org/repo.git"
+
+
+@pytest.fixture(autouse=True)
+def _no_clone_cache(monkeypatch):
+    """Keep the clone path cache-free: when the suite itself runs inside an
+    lmer container the host CLI sets LMER_CLONE_CACHE_PATH, and ensure_clone
+    would try real mirror maintenance for REPO_URL (clone-cache tests live in
+    tests/test_clone_cache.py)."""
+    monkeypatch.delenv("LMER_CLONE_CACHE_PATH", raising=False)
 
 
 def _record_check_calls(monkeypatch) -> list[list[str]]:

@@ -13,6 +13,7 @@ The CLI supports both interactive Claude Code sessions and arbitrary command exe
 """
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -20,15 +21,18 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 import re
-from typing import Mapping
+from typing import Iterable, Mapping
 from dotenv import dotenv_values
 
 from . import resolve
 from .container_home import ensure_container_home
 from .log import error, info, success, warning
 from .mounts import (
+    CONTAINER_CLONE_CACHE_DIR,
     FileMountSpec,
+    PlannedCredentialMount,
     build_checkout_mount,
+    build_clone_cache_mount,
     build_container_home_mounts,
     build_external_taskdef_mounts,
     build_file_mounts,
@@ -36,13 +40,40 @@ from .mounts import (
     build_host_repo_ro_mount,
     build_host_uv_cache_mount,
     build_lmer_docs_mount,
+    build_user_harness_mounts,
     build_user_mounts,
     build_workspace_mount,
+    plan_credential_mounts,
     build_service_mode_mounts,
+    resolve_host_clone_cache_dir,
     resolve_host_uv_cache_dir,
 )
 from .build import DEFAULT_IMAGE, checkout_commit, ensure_image, build_image, resolve_image_tag
-from .harness import HARNESSES, UnknownHarnessError, get_harness, resolve_harness_selection
+from .harness import (
+    HARNESS_ENV,
+    HARNESSES,
+    LLM_NAME_ENV,
+    Harness,
+    UnknownHarnessError,
+    get_harness,
+    implied_harness_name,
+    known_harnesses,
+    missing_credential_mounts,
+    resolve_harness_selection,
+)
+from .user_harnesses import (
+    CONTAINER_HARNESS_CACHE_DIR,
+    CONTAINER_HARNESSES_DIR,
+    DEFAULT_HARNESS_CACHE_DIR,
+    load_user_harnesses,
+)
+from .presets import (
+    AGENTS_ENV,
+    PRESET_ENV,
+    PRESETS_FILE_ENV,
+    load_presets,
+    resolve_agent_presets,
+)
 from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
 from .service import ServiceError, resolve_container, inspect_container_workdir
 from .tokens import (
@@ -214,6 +245,9 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--show-env", dest="show_env", action="store_true", help="Display LMER environment variable configuration on startup")
     parser.add_argument("--mount-file", dest="mount_file", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a single host file into the container at an explicit destination (repeatable). HOST supports ~ and $VAR expansion and must be an existing file; CONTAINER must be an absolute path; MODE is ro (default) or rw. Invalid entries abort the run. (env: LMER_MOUNT_FILES, comma-separated entries)")
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
+    parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_PRESET; the flag wins). The preset's checkout/service/env/args are applied as defaults: flags and exported environment variables in the actual invocation override them.")
+    parser.add_argument("--list-presets", dest="list_presets", action="store_true", help="List the presets available from LMER_PRESETS_FILE and exit")
+    parser.add_argument("--agents", dest="agents", help="Comma-delimited preset names the session's agent may fan a task out to via spawn-harness (env: LMER_AGENTS; the flag wins). Names are resolved against LMER_PRESETS_FILE host-side (unknown names fail fast); each preset contributes its env overlay plus --harness/--prompt folded from its args — the remaining launch-shaping fields (checkout/service/other args) are ignored with a warning — and only that resolved config is forwarded into the container.")
 
     # Use parse_known_args so we can capture the command after --exec
     parser.add_argument("--no-task", dest="no_task", action="store_true", help="Run without selecting a task (exec mode only)")
@@ -222,9 +256,9 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--fastapi", dest="fastapi", action="store_true", help="Expose a FastAPI endpoint to read/write the claude process (POST /input, GET /output)")
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
-    parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. (env: LMER_ANSWER)")
+    parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
-    parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(HARNESSES))}")
+    parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
     parser.add_argument("--fastapi-host", dest="fastapi_host", help="Host for the FastAPI endpoint to bind (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", dest="fastapi_token", help="Bearer token for the FastAPI endpoint (auto-generated if omitted)")
@@ -723,6 +757,247 @@ def _display_env_config_cli(
     print("---")
 
 
+def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
+    """Validate mutually exclusive / dependent options on a parsed namespace.
+
+    Returns an exit code on failure, or None when the namespace is valid.
+    Runs after preset application so preset-supplied args are validated the
+    same as explicit ones.
+    """
+    if ns.branch and ns.ref:
+        error("Cannot specify both --branch and --ref")
+        return 2
+    if ns.workspace_volume and ns.workspace_bind:
+        error("Cannot specify both --workspace-volume and --workspace-bind")
+        return 2
+    if ns.no_clone and not ns.exec_mode:
+        error("--no-clone requires --exec mode")
+        return 2
+    if ns.user and ns.match_uid:
+        error("Cannot specify both --user and --match-uid")
+        return 2
+    if ns.no_task and not ns.exec_mode:
+        error("--no-task requires --exec mode")
+        return 2
+    if not ns.no_task and not ns.task and not ns.show_env:
+        error("Task type is required unless --no-task is specified")
+        return 2
+    if ns.service and not ns.checkout:
+        error("--service requires --checkout (path to local source checkout)")
+        return 2
+    return None
+
+
+def _display_presets_cli() -> int:
+    """Handle --list-presets: print the configured presets and exit code.
+
+    Env values are shown as key names only — a preset may carry credentials
+    (same reason --show-env redacts), and the keys are what identify it.
+    """
+    presets_file = os.environ.get(PRESETS_FILE_ENV, "").strip()
+    presets = load_presets()
+    # Direct print (not the verbose-gated info()): the listing IS the
+    # command's output, mirroring _display_env_config_cli.
+    if not presets:
+        if presets_file:
+            print(f"No presets loaded from {presets_file} (missing file or no valid entries).")
+        else:
+            print(f"No presets configured ({PRESETS_FILE_ENV} is not set).")
+        return 0
+    print(f"🎛️  Presets ({presets_file}):")
+    for name in sorted(presets):
+        preset = presets[name]
+        parts = []
+        if preset.checkout:
+            parts.append(f"checkout={preset.checkout}")
+        if preset.service:
+            parts.append(f"service={preset.service}")
+        if preset.env:
+            parts.append("env=" + ",".join(sorted(preset.env)))
+        if preset.args:
+            parts.append("args=" + shlex.join(preset.args))
+        print(f"  {name}" + (f"  [{' '.join(parts)}]" if parts else ""))
+    return 0
+
+
+def _resolve_and_apply_preset(
+    ns: argparse.Namespace,
+    rest: list[str],
+    argv: list[str],
+    early_env_file_sources: dict[str, str],
+) -> tuple[argparse.Namespace, list[str], dict[str, str]] | int:
+    """Resolve the selected startup preset and apply it to the invocation.
+
+    Selection is ``--preset`` > ``LMER_PRESET`` (matching the
+    --harness/LMER_HARNESS convention). Must run after the early .env load
+    (so LMER_PRESET/LMER_PRESETS_FILE from .env files work) and before
+    argument validation / harness resolution (so preset args and env take
+    full effect). The explicit invocation always wins over the preset:
+    preset tokens are PREPENDED to argv (argparse last-wins), and preset env
+    is only applied over keys that are unset or .env-sourced — never over
+    exported shell environment.
+
+    Returns the (possibly re-parsed) ``(ns, rest, applied_env)`` on success —
+    ``applied_env`` being the preset env entries that actually won host-side,
+    for the caller to seed into the container env dict — or an exit code on
+    failure. No preset selected returns the inputs unchanged.
+    """
+    preset_name = ns.preset or os.environ.get(PRESET_ENV) or None
+    applied_env: dict[str, str] = {}
+    if not preset_name:
+        return ns, rest, applied_env
+
+    presets = load_presets()
+    preset = presets.get(preset_name)
+    if preset is None:
+        available = ", ".join(sorted(presets)) or "(none)"
+        error(f"❌ Unknown preset '{preset_name}'. Available presets: {available}")
+        if not os.environ.get(PRESETS_FILE_ENV, "").strip():
+            error(f"   ({PRESETS_FILE_ENV} is not set, so no presets can load)")
+        return 2
+
+    # Preset args must be tokens the lmer parser fully recognizes as flags on
+    # a CLI invocation: a bare positional would silently bind as the task
+    # (demoting the user's own task to a target), a literal `--` would
+    # truncate parsing there and dump the rest of the command line into exec
+    # args, and an unknown/typo'd flag would fall through to `rest` — silently
+    # dropped, or prepended to the exec command under --exec. (The Slack spawn
+    # path instead appends args to a fixed `lmer chat <permalink>` command,
+    # where extra tokens are meaningful.)
+    if "--" in preset.args:
+        error(f"❌ Preset '{preset.name}' args may not contain '--' on a CLI invocation")
+        return 2
+    probe_ns, probe_rest = parse_args(list(preset.args))
+    # Unknown-token check first: a typo'd flag's value binds as a positional
+    # too, and the unknown flag is the actionable half of that message.
+    if probe_rest:
+        error(
+            f"❌ Preset '{preset.name}' args contain tokens lmer does not "
+            f"recognize ({shlex.join(probe_rest)}) — preset args must be "
+            f"known lmer flags on a CLI invocation"
+        )
+        return 2
+    leaked = ([probe_ns.task] if probe_ns.task else []) + list(probe_ns.target)
+    if leaked:
+        error(
+            f"❌ Preset '{preset.name}' args contain positional tokens "
+            f"({shlex.join(leaked)}) — preset args must be flags on a CLI invocation"
+        )
+        return 2
+
+    preset_tokens = preset.cli_tokens()
+    if preset_tokens:
+        original_env_file = ns.env_file
+        ns, rest = parse_args(preset_tokens + argv)
+        if ns.verbose or ns.debug:
+            os.environ["LMER_VERBOSE"] = "1"
+        # The caller's early .env load already ran off the command line's
+        # --env-file; honoring one smuggled in via preset args would require
+        # re-running it with murky precedence, so reject it.
+        if ns.env_file != original_env_file:
+            warning(
+                "⚠️  --env-file inside preset args is ignored — "
+                "pass it on the lmer command line instead"
+            )
+            ns.env_file = original_env_file
+
+    for key, value in preset.env.items():
+        if key not in os.environ or key in early_env_file_sources:
+            os.environ[key] = value
+            early_env_file_sources[key] = f"preset ({preset.name})"
+            applied_env[key] = value
+    info(
+        f"🎛️  Preset: {preset.name}"
+        + (f" (env: {', '.join(sorted(applied_env))})" if applied_env else "")
+    )
+    return ns, rest, applied_env
+
+
+def _resolve_agents_cli(ns: argparse.Namespace) -> dict[str, dict] | None | int:
+    """Resolve the ``--agents``/``LMER_AGENTS`` fan-out selection (issue #130).
+
+    Selection is ``--agents`` > ``LMER_AGENTS`` (matching --preset/
+    LMER_PRESET). Must run after the early .env load and preset application
+    so an LMER_AGENTS from a .env file or a preset's env is honored. Names
+    are resolved host-side against LMER_PRESETS_FILE — the trust model keeps
+    the presets file itself out of the container; the session's agent can
+    only spawn what was named at launch.
+
+    Returns the resolved ``{name: {"env": {...}, "prompt": ...?}}`` mapping
+    (the ``LMER_AGENTS_CONFIG`` shape, selection-ordered), ``None`` when no
+    selection was made, or an exit code on failure (unknown name / empty
+    selection — spawning fewer agents than asked is never silent).
+    """
+    selection = ns.agents or os.environ.get(AGENTS_ENV) or ""
+    if not selection.strip():
+        return None
+    resolved, agent_warnings, agents_error = resolve_agent_presets(selection, load_presets())
+    for note in agent_warnings:
+        warning(f"⚠️  --agents: {note}")
+    if agents_error is not None:
+        error(f"❌ --agents: {agents_error}")
+        if not os.environ.get(PRESETS_FILE_ENV, "").strip():
+            error(f"   ({PRESETS_FILE_ENV} is not set, so no presets can load)")
+        return 2
+    info(f"🤖 Agents: {','.join(resolved)}")
+    return resolved
+
+
+def _agents_child_harnesses(
+    resolved: dict[str, dict], session_harness: Harness
+) -> list[Harness]:
+    """The extra harnesses the ``--agents`` fan-out children imply (issue #131).
+
+    Mirrors spawn-harness's in-container selection host-side, before the
+    container starts (the same fail-early rationale as
+    ``resolve_agent_presets``): for each resolved agent, the overlay merged
+    over the session's effective ``LMER_HARNESS``/``LMER_LLM_NAME`` feeds
+    :func:`lmer_cli.harness.implied_harness_name`. Credential mounts are
+    keyed to the session harness only, so a child routed elsewhere needs its
+    harness's credential files mounted too — the returned (deduplicated,
+    selection-ordered) non-session harnesses union into
+    ``build_user_mounts``.
+
+    Also warns when an implied non-session child harness has no mountable
+    credential file on the host at all — the child may fail to authenticate.
+    A warning, never an error: a mount is no promise of working auth, and
+    keys-via-env harnesses (pi) can authenticate without one. The session's
+    own harness is exempt, mirroring ``warn_missing_credentials``'s
+    spawn-time exemption: its credential state IS the session's (a plain
+    launch never warns about it, and a same-harness child authenticates
+    exactly as well as the session).
+    """
+    inherited = {
+        HARNESS_ENV: session_harness.name,
+        LLM_NAME_ENV: os.environ.get(LLM_NAME_ENV) or "",
+    }
+    home = Path.home()
+    extra: dict[str, Harness] = {}
+    registry = known_harnesses()
+    for agent_name, entry in resolved.items():
+        overlay = entry.get("env") or {}
+        name = implied_harness_name(overlay, {**inherited, **overlay})
+        if name not in registry:
+            # resolve_agent_presets already rejects unknown explicit names;
+            # unreachable in practice, but a mount union must never crash.
+            continue
+        if name == session_harness.name:
+            continue
+        child = registry[name]
+        missing = missing_credential_mounts(
+            child, lambda cred: (home / cred.host_path).exists()
+        )
+        if missing:
+            paths = " / ".join(f"~/{cred.host_path}" for cred in missing)
+            warning(
+                f"⚠️  --agents: agent '{agent_name}' routes to {name} but "
+                f"{paths} does not exist on the host — "
+                "the child may fail to authenticate"
+            )
+        extra.setdefault(name, child)
+    return list(extra.values())
+
+
 def _resolve_afk_timeout_ms(explicit_value: str | None, slack_bridged: bool) -> str | None:
     """Resolve the CLAUDE_AFK_TIMEOUT_MS value forwarded into the container.
 
@@ -756,15 +1031,28 @@ def _handle_build(argv: list[str]) -> int:
     parser.add_argument("--update-harness", action="append", metavar="NAME", dest="update_harness", help=f"Force re-install of a harness CLI (bust Docker cache for its install layer). Repeatable. Known: {', '.join(sorted(HARNESSES))}, or 'all'")
     args = parser.parse_args(argv)
 
+    # Validate the names as REQUESTED before expanding 'all' — otherwise
+    # `--update-harness all --update-harness <typo-or-user-name>` would be
+    # silently swallowed by the expansion instead of rejected.
     update_harnesses = set(args.update_harness or [])
+    unknown = update_harnesses - set(HARNESSES) - {"all"}
+    if unknown:
+        # User-installed harnesses have no Containerfile install layer to
+        # bust — their runner owns the CLI install (wipe the cache instead).
+        user_named = unknown & set(load_user_harnesses())
+        if user_named:
+            error(
+                f"❌ --update-harness does not apply to user-installed harness(es) "
+                f"{', '.join(sorted(user_named))}: their runner installs the CLI at "
+                f"session start — clear {DEFAULT_HARNESS_CACHE_DIR}/<name> to force a reinstall"
+            )
+            return 2
+        error(f"❌ Unknown harness(es) for --update-harness: {', '.join(sorted(unknown))} (known: {', '.join(sorted(HARNESSES))}, or 'all')")
+        return 2
     if "all" in update_harnesses:
         update_harnesses = set(HARNESSES)
     if args.update_claude:
         update_harnesses.add("claude")
-    unknown = update_harnesses - set(HARNESSES)
-    if unknown:
-        error(f"❌ Unknown harness(es) for --update-harness: {', '.join(sorted(unknown))} (known: {', '.join(sorted(HARNESSES))}, or 'all')")
-        return 2
 
     try:
         runtime = detect_runtime()
@@ -799,6 +1087,82 @@ def _resolve_napkin_path(napkin_repo_url: str, work_repo_path: str) -> str:
     return f"{work_repo_path}/napkin"
 
 
+def _announce_user_credential_mounts(planned: "Iterable[PlannedCredentialMount]") -> None:
+    """Announce every user-harness credential mount at launch.
+
+    Manifests are operator-authored config, so an unexpected entry (say, a
+    private key file) must be visible at launch, not discovered inside the
+    container — which means the notice cannot be verbosity-gated: it goes
+    through ``warning()`` (unconditional), not ``info()`` (LMER_VERBOSE only).
+    Built-in harnesses are skipped: their credential lists are fixed in-tree,
+    so there is nothing an operator could be surprised by.
+    """
+    for m in planned:
+        if m.is_user:
+            warning(f"🔑 User harness {m.harness_name}: mounting ~/{m.host_path} ({m.mode})")
+
+
+def _updater_child_env() -> "dict[str, str]":
+    """Environment for the detached host-side clone-cache updater.
+
+    Unlike every other execution vector in lmer, this child runs **on the
+    host**, so its Python import path must not be attacker-controllable:
+    ``PYTHONPATH`` is pinned to the directory lmer's own package was imported
+    from (keeps ``-m lmer_cli.clone_cache`` working for venv *and*
+    source-checkout installs) and ``PYTHONSAFEPATH`` keeps the cwd off
+    ``sys.path``, so neither a stray ``lmer_cli/`` directory in the launch cwd
+    nor a ``PYTHONPATH`` picked up from a cwd ``.env`` can inject host code.
+    ``PYTHONHOME``/``PYTHONSTARTUP`` are dropped for the same reason.
+
+    The rest of the environment is inherited deliberately: git needs it (an
+    ssh-URL mirror can require the caller's ``GIT_SSH_COMMAND``), and .env is
+    trusted standing configuration everywhere else in lmer.
+    """
+    env = dict(os.environ)
+    # Directory holding the `lmer_cli` package (…/src for a checkout,
+    # …/site-packages for an installed venv).
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONSAFEPATH"] = "1"
+    env.pop("PYTHONHOME", None)
+    env.pop("PYTHONSTARTUP", None)
+    return env
+
+
+def _spawn_clone_cache_updater(urls: "list[str | None]") -> None:
+    """Fork the detached host-side clone-cache updater (lmer_cli.clone_cache).
+
+    The updater creates/refreshes the bare mirrors the container consumes
+    read-only. Detached (new session, no wait) so the launch never blocks on
+    cache maintenance, and stdin-fed so a tokenized URL never appears on a
+    host-visible argv. Fail-soft: a spawn problem is reported and ignored —
+    the session just runs with whatever mirrors already exist.
+    """
+    to_send = [u for u in urls if u]
+    if not to_send:
+        return
+    try:
+        proc = subprocess.Popen(
+            # -P (PYTHONSAFEPATH): never prepend the cwd to sys.path. This
+            # child runs on the *host*, so a `lmer_cli/` directory in whatever
+            # cwd lmer was launched from must not become importable code.
+            [sys.executable, "-P", "-m", "lmer_cli.clone_cache"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            # A trusted, always-present cwd instead of the caller's (which may
+            # be untrusted, or deleted out from under a detached child).
+            cwd=str(Path.home()),
+            env=_updater_child_env(),
+        )
+        proc.stdin.write(("\n".join(to_send) + "\n").encode())
+        proc.stdin.close()
+        # deliberately no wait(): the updater outlives this launch path
+    except OSError as e:
+        info(f"⚠️  clone-cache updater not started: {e}")
+
+
 def main(argv: list[str] | None = None) -> int:
     """
     Main entry point for the lmerpy CLI.
@@ -829,39 +1193,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if ns.verbose or ns.debug:
         os.environ["LMER_VERBOSE"] = "1"
-
-    # Validate mutually exclusive options
-    if ns.branch and ns.ref:
-        error("Cannot specify both --branch and --ref")
-        return 2
-    if ns.workspace_volume and ns.workspace_bind:
-        error("Cannot specify both --workspace-volume and --workspace-bind")
-        return 2
-    if ns.no_clone and not ns.exec_mode:
-        error("--no-clone requires --exec mode")
-        return 2
-    if ns.user and ns.match_uid:
-        error("Cannot specify both --user and --match-uid")
-        return 2
-    if ns.no_task and not ns.exec_mode:
-        error("--no-task requires --exec mode")
-        return 2
-    if not ns.no_task and not ns.task and not ns.show_env:
-        error("Task type is required unless --no-task is specified")
-        return 2
-    if ns.service and not ns.checkout:
-        error("--service requires --checkout (path to local source checkout)")
-        return 2
-
-    # Determine container user
-    if ns.match_uid:
-        uid = os.getuid()
-        gid = os.getgid()
-        container_user = f"{uid}:{gid}"
-    elif ns.user:
-        container_user = ns.user
-    else:
-        container_user = os.environ.get("LMER_CONTAINER_USER", "developer")
 
     # Discover tasks from filesystem and validate provided task
     repo_root = repo_root_path()  # None in installed mode
@@ -913,6 +1244,46 @@ def main(argv: list[str] | None = None) -> int:
                     os.environ[key] = value
                     early_env_file_sources[key] = f".env ({location})"
 
+    # Handle --list-presets: a pure query, so it runs before any preset is
+    # resolved or a task is required — but after the early .env load so an
+    # LMER_PRESETS_FILE defined in a .env file is honored.
+    if ns.list_presets:
+        return _display_presets_cli()
+
+    # Resolve and apply a named startup preset (--preset > LMER_PRESET;
+    # issue #127). Runs after the early .env load so LMER_PRESET/
+    # LMER_PRESETS_FILE from .env files work, and before argument validation
+    # and harness resolution so preset args and env take full effect.
+    preset_result = _resolve_and_apply_preset(ns, rest, argv, early_env_file_sources)
+    if isinstance(preset_result, int):
+        return preset_result
+    ns, rest, preset_applied_env = preset_result
+
+    # Resolve the --agents/LMER_AGENTS fan-out selection (issue #130). Runs
+    # after preset application so a preset's env can carry LMER_AGENTS, and
+    # early enough that an unknown name fails fast before any container work.
+    agents_result = _resolve_agents_cli(ns)
+    if isinstance(agents_result, int):
+        return agents_result
+    resolved_agents = agents_result
+    agents_csv = ",".join(resolved_agents) if resolved_agents else None
+    agents_config_json = json.dumps(resolved_agents) if resolved_agents else None
+
+    # Validate the (possibly preset-augmented) arguments
+    validation_error = _validate_parsed_args(ns)
+    if validation_error is not None:
+        return validation_error
+
+    # Determine container user
+    if ns.match_uid:
+        uid = os.getuid()
+        gid = os.getgid()
+        container_user = f"{uid}:{gid}"
+    elif ns.user:
+        container_user = ns.user
+    else:
+        container_user = os.environ.get("LMER_CONTAINER_USER", "developer")
+
     # Resolve the agent harness (--harness > LMER_HARNESS > LMER_LLM_NAME
     # model hint > claude). Must run AFTER the early .env load above so
     # LMER_HARNESS/LMER_LLM_NAME from a .env file are honored (docs promise
@@ -929,16 +1300,27 @@ def main(argv: list[str] | None = None) -> int:
             _display_env_config_cli(host_lmer_vars, early_env_file_sources)
         error(f"❌ {e}")
         return 2
+    user_tag = " [user-installed]" if harness.source_dir is not None else ""
     if harness_source == "model":
-        info(f"🤖 Harness: {harness.name} (auto-selected from LMER_LLM_NAME={os.environ.get('LMER_LLM_NAME')})")
+        info(f"🤖 Harness: {harness.name}{user_tag} (auto-selected from LMER_LLM_NAME={os.environ.get('LMER_LLM_NAME')})")
     elif harness.name != "claude":
-        info(f"🤖 Harness: {harness.name}")
-    if harness.name != "claude":
+        info(f"🤖 Harness: {harness.name}{user_tag}")
+    if harness.source_dir is not None:
+        info(f"   (definition: {harness.source_dir}; runner-owned CLI install)")
+    elif harness.name != "claude":
         info(
             f"   (requires an image that ships {harness.runner_script}; "
             f"if the session fails with '{harness.runner_command}: command not found', "
             f"rebuild with: lmer build)"
         )
+
+    # Harnesses the --agents fan-out children imply beyond the session's
+    # (issue #131): their credential files union into build_user_mounts
+    # below, and a child harness with no host credential file warns here,
+    # at launch — not hours later when spawn-harness runs.
+    agent_extra_harnesses = (
+        _agents_child_harnesses(resolved_agents, harness) if resolved_agents else []
+    )
 
     # Handle --show-env: display env config table
     if ns.show_env:
@@ -1103,11 +1485,29 @@ def main(argv: list[str] | None = None) -> int:
     container_home = ensure_container_home(container_home_base)
     run += build_container_home_mounts(runtime, container_home)
 
-    # Build user mounts and check for SSH agent
-    user_mounts, ssh_agent_enabled = build_user_mounts(runtime, harness)
+    # Build user mounts and check for SSH agent. Compute the credential plan
+    # ONCE and thread it through both the mounter and the 🔑 announce below,
+    # so what is shown is literally what was bound (one evaluation, not two).
+    cred_plan = plan_credential_mounts(harness, agent_extra_harnesses)
+    user_mounts, ssh_agent_enabled = build_user_mounts(
+        runtime, harness, agent_extra_harnesses, plan=cred_plan
+    )
     run += user_mounts
     if ssh_agent_enabled:
         success("✅ SSH agent forwarding enabled")
+
+    # User-installed harness definitions (~/.lmer/harnesses, issue #132) plus
+    # the install-cache volume when a user harness is active this session.
+    harness_dir_mounts, harness_cache_mounted = build_user_harness_mounts(
+        runtime, harness, agent_extra_harnesses
+    )
+    run += harness_dir_mounts
+
+    # Announce every user-harness credential mount from the SAME computed plan
+    # build_user_mounts just bound from (cred_plan above), so what is shown is
+    # exactly what was bound.
+    planned_creds, _ = cred_plan
+    _announce_user_credential_mounts(planned_creds)
 
     # Check SSH setup and warn if not configured
     _check_ssh_setup(container_home, ssh_agent_enabled)
@@ -1136,6 +1536,24 @@ def main(argv: list[str] | None = None) -> int:
             success(f"✅ Mounting host uv cache: {host_uv_cache} → /home/developer/.cache/uv")
         else:
             info(f"⚠️  Host uv cache not found at {host_uv_cache}, skipping mount")
+
+    # Persistent git clone cache (#112): mount a host directory so the
+    # container's clone script keeps bare repo mirrors across sessions and
+    # later sessions fetch only what changed instead of re-cloning. On by
+    # default; LMER_CLONE_CACHE=0 disables. LMER_CLONE_CACHE_DIR overrides
+    # the host location (default ~/.lmer/clone-cache). Fail-soft: an
+    # unusable cache dir skips the mount and the container clones directly.
+    clone_cache_container_dir: str | None = None
+    if get_bool_env("LMER_CLONE_CACHE", default=True):
+        host_clone_cache = resolve_host_clone_cache_dir()
+        try:
+            host_clone_cache.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            info(f"⚠️  Clone cache dir unusable at {host_clone_cache} ({e}), skipping mount")
+        else:
+            run += build_clone_cache_mount(runtime, host_clone_cache)
+            clone_cache_container_dir = CONTAINER_CLONE_CACHE_DIR
+            success(f"✅ Mounting git clone cache: {host_clone_cache} → {CONTAINER_CLONE_CACHE_DIR}")
 
     # Workspace mount removed - using /workspace directory from image instead
     # This avoids root:root ownership issues with Docker/Podman mounts
@@ -1227,6 +1645,14 @@ def main(argv: list[str] | None = None) -> int:
     if taskdef_repo_url:
         taskdef_repo_url = _inject_gitlab_token_if_available(taskdef_repo_url, dedicated_env="LMER_TASKDEF_TOKEN")
 
+    # Host-side cache maintenance (#112): freshen/build the mirrors for every
+    # repo this session will clone, in a detached background updater. The
+    # session never waits on it; the container consumes the cache read-only.
+    if clone_cache_container_dir is not None:
+        _spawn_clone_cache_updater(
+            [repo_url, work_repo_url, napkin_repo_url, taskdef_repo_url]
+        )
+
     # Compute the in-container napkin path (separate repo -> /napkin, else a
     # subdir of the work repo). Always injected so agents can use it in any mode.
     container_work_repo_path = os.environ.get("LMER_WORK_REPO_PATH", "/work")
@@ -1286,7 +1712,25 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_DISPATCH_CODE": os.environ.get("LMER_DISPATCH_CODE"),
         "LMER_DISPATCH_MECHANICAL": os.environ.get("LMER_DISPATCH_MECHANICAL"),
         "LMER_DISPATCH_EXPLORE": os.environ.get("LMER_DISPATCH_EXPLORE"),
+        # Agent fan-out (issue #130): the resolved --agents/LMER_AGENTS preset
+        # names and their env overlays (JSON {name: {"env": {...}}}), consumed
+        # in-container by spawn-harness. Host-resolved — the presets file
+        # itself never enters the container.
+        "LMER_AGENTS": agents_csv,
+        "LMER_AGENTS_CONFIG": agents_config_json,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
+        # User-installed harnesses (issue #132): where the host mounted
+        # ~/.lmer/harnesses inside the container (consumed by
+        # clone_and_exec.py runner dispatch, lmer-supervisor, and
+        # spawn-harness — deliberately the container path, never the host
+        # one), and — when the session harness is user-installed — the
+        # runner's persistent install-cache directory on the rw cache mount.
+        "LMER_HARNESSES_DIR": CONTAINER_HARNESSES_DIR if harness_dir_mounts else None,
+        "LMER_HARNESS_CACHE": (
+            f"{CONTAINER_HARNESS_CACHE_DIR}/{harness.name}"
+            if harness.source_dir is not None and harness_cache_mounted
+            else None
+        ),
         # Statusline segment list (issue #121), consumed in-container by
         # hooks/statusline.py; unset keeps the default repo,branch,task,ctx.
         "LMER_STATUSLINE": os.environ.get("LMER_STATUSLINE"),
@@ -1315,6 +1759,12 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_REPO_URL": repo_url,
         "LMER_WORK_REPO": work_repo_url,
         "LMER_WORK_REPO_PATH": os.environ.get("LMER_WORK_REPO_PATH", "/work"),
+        # Container-side path of the persistent clone-cache mount, read by
+        # clone_and_exec.py (#112). None — i.e. not forwarded, and not
+        # overridable from a .env — when LMER_CLONE_CACHE=0 or the host
+        # cache dir is unusable. The host-side LMER_CLONE_CACHE /
+        # LMER_CLONE_CACHE_DIR settings themselves stay host-only.
+        "LMER_CLONE_CACHE_PATH": clone_cache_container_dir,
         # Optional napkin/taskdef auxiliary repos. The *credentialed* URLs are
         # forwarded (they carry their own auth); LMER_NAPKIN_PATH is always set
         # so agents can write in any mode. The raw *_TOKEN vars are seeded None
@@ -1360,9 +1810,13 @@ def main(argv: list[str] | None = None) -> int:
         # --manual-start (the supervisor only injects it as part of auto-start).
         "LMER_START_PROMPT": ns.prompt if ns.prompt else None,
         # Answer to the run's recorded open question (issue #98). Sourced
-        # from --answer (the flag wins over a host-set LMER_ANSWER); applied
-        # in-container by `work session-start` before the brief prints.
-        "LMER_ANSWER": ns.answer or os.environ.get("LMER_ANSWER"),
+        # from --answer ONLY — no os.environ fallback, same deliberate
+        # flag-only pattern as LMER_START_PROMPT above: an answer is one-shot
+        # data, while .env is standing configuration, so a stale LMER_ANSWER
+        # left in a .env must never silently auto-answer every future
+        # question-stop. Applied in-container by `work session-start` before
+        # the brief prints.
+        "LMER_ANSWER": ns.answer if ns.answer else None,
         "LMER_DISABLE_SUPERVISOR": "1" if ns.no_supervisor else None,
         # Forward the initial auto-/start delay so a host-set value reaches
         # the supervisor running inside the container.
@@ -1414,6 +1868,18 @@ def main(argv: list[str] | None = None) -> int:
         env["CLAUDE_AFK_TIMEOUT_MS"],
         any(isinstance(handler, SlackThreadTargets) for handler in special_targets),
     )
+
+    # Preset env entries applied host-side are seeded into the container env
+    # dict so keys with no hardcoded passthrough above still reach the
+    # container, keeping the documented precedence over .env-file values (the
+    # merge below never overrides a key already present unless a previous
+    # .env set it). Skip keys the dict already carries: hardcoded passthrough
+    # keys read the preset's value from os.environ above, and the
+    # deliberately-None token guards (e.g. LMER_NAPKIN_TOKEN) must stay
+    # unforwardable.
+    for key, value in preset_applied_env.items():
+        if key not in env:
+            env[key] = value
 
     # Merge all variables from .env file into container env dict
     # Check state dir (~/.lmer/) and cwd for .env files

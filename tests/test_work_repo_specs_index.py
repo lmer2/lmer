@@ -1,14 +1,16 @@
 """Tests for the central specs index (issue #101).
 
 `{host}/{project}/specs/` (sibling of info/ and runs/) holds one dated
-relative symlink per spec-class artifact — `YYYY-MM-DD-<run>-<basename>`
-pointing at the spec's canonical location. Maintained by `work artifact`
+relative symlink per spec-class artifact — `YYYY-MM-DD-<run>--<basename>`,
+with `--` the reserved label/basename separator (labels never contain one)
+— pointing at the spec's canonical location. Maintained by `work artifact`
 registration and the masterplan bundle sync (which links the BUNDLE file,
 never the run-root symlink); `work specs-index --rebuild` is the backfill
 path. Symlinks-only by design (a dir listing IS the index), and always
 fail-soft — index trouble never fails a registration.
 """
 import os
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -78,7 +80,7 @@ class TestArtifactRegistrationIndexes:
         self, run_env, tmp_path, capsys
     ):
         assert _register(tmp_path, "spec.md") == 0
-        entry = _specs_dir(tmp_path) / f"{_today()}-develop-issue-101-spec.md"
+        entry = _specs_dir(tmp_path) / f"{_today()}-develop-issue-101--spec.md"
         assert entry.is_symlink()
         assert os.readlink(entry) == "../runs/develop-issue-101/spec.md"
         assert entry.read_text() == "# spec\n"
@@ -89,7 +91,7 @@ class TestArtifactRegistrationIndexes:
         state["name"] = "specs-index"
         run_state.write_state(run_env, state)
         assert _register(tmp_path, "spec.md") == 0
-        entry = _specs_dir(tmp_path) / f"{_today()}-specs-index-spec.md"
+        entry = _specs_dir(tmp_path) / f"{_today()}-specs-index--spec.md"
         assert entry.is_symlink()
 
     def test_non_spec_artifact_not_indexed(self, run_env, tmp_path):
@@ -128,7 +130,7 @@ class TestArtifactRegistrationIndexes:
                 ["artifact", "spec.md", "--file", str(bundle / "spec.md")]
             ) == 0
         assert (run_env / "spec.md").is_symlink()
-        entry = _specs_dir(tmp_path) / f"{_today()}-develop-issue-101-spec.md"
+        entry = _specs_dir(tmp_path) / f"{_today()}-develop-issue-101--spec.md"
         assert entry.is_symlink()
         assert os.readlink(entry) == (
             "../runs/develop-issue-101/masterplan/mp-a/spec.md"
@@ -157,9 +159,9 @@ class TestUpsertSpecLink:
             run_env / "spec.md", "issue-101",
             when=datetime(2026, 7, 1, tzinfo=timezone.utc),
         )
-        assert old is not None and old.name == "2026-07-01-issue-101-spec.md"
+        assert old is not None and old.name == "2026-07-01-issue-101--spec.md"
         new = specs_index.upsert_spec_link(run_env / "spec.md", "issue-101")
-        assert new.name == f"{_today()}-issue-101-spec.md"
+        assert new.name == f"{_today()}-issue-101--spec.md"
         assert not old.exists()  # one entry per (run, spec file) — no duplicates
         assert [p.name for p in specs_index.list_entries()] == [new.name]
 
@@ -174,12 +176,74 @@ class TestUpsertSpecLink:
         mine = specs_index.upsert_spec_link(run_env / "spec.md", "run")
         assert other.exists() and mine.exists()
 
+    def test_reserved_separator_keeps_distinct_pairs_distinct(
+        self, run_env, tmp_path
+    ):
+        # With a single `-`, (label `a`, `b-spec.md`) and (label `a-b`,
+        # `spec.md`) would both name `…-a-b-spec.md` — colliding, and the
+        # stale cleanup would clobber one pair's entry with the other's.
+        # The reserved `--` separator keeps them apart in BOTH directions.
+        run_env.mkdir(parents=True)
+        (run_env / "b-spec.md").write_text("x")
+        (run_env / "spec.md").write_text("y")
+        one = specs_index.upsert_spec_link(
+            run_env / "b-spec.md", "a",
+            when=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        two = specs_index.upsert_spec_link(run_env / "spec.md", "a-b")
+        assert one.name == "2026-07-01-a--b-spec.md"
+        assert two.name == f"{_today()}-a-b--spec.md"
+        assert one.exists() and two.exists()  # neither clobbered the other
+
+    def test_label_hyphen_runs_collapsed(self, run_env, tmp_path):
+        # Dir-name fallback labels can be `slug--name` shaped; runs of
+        # hyphens collapse so the label component never contains the
+        # reserved `--` and the first post-date `--` splits unambiguously.
+        run_env.mkdir(parents=True)
+        (run_env / "spec.md").write_text("x")
+        link = specs_index.upsert_spec_link(
+            run_env / "spec.md", "develop-issue-101--nice-name"
+        )
+        assert link.name == f"{_today()}-develop-issue-101-nice-name--spec.md"
+
+    def test_legacy_single_hyphen_entry_cleaned_up(self, run_env, tmp_path):
+        # Entries written before the reserved `--` separator existed
+        # (`<date>-<label>-<basename>`) count as stale for the same pair.
+        run_env.mkdir(parents=True)
+        (run_env / "spec.md").write_text("x")
+        sdir = _specs_dir(tmp_path)
+        sdir.mkdir(parents=True)
+        legacy = sdir / "2026-07-01-issue-101-spec.md"
+        legacy.symlink_to("../runs/develop-issue-101/spec.md")
+        new = specs_index.upsert_spec_link(run_env / "spec.md", "issue-101")
+        assert new.name == f"{_today()}-issue-101--spec.md"
+        assert not legacy.exists()
+        assert [p.name for p in specs_index.list_entries()] == [new.name]
+
+    def test_legacy_cleanup_skipped_for_double_hyphen_label(
+        self, run_env, tmp_path
+    ):
+        # A `--`-bearing label's legacy pattern (`a--b-spec.md`) would match
+        # the CURRENT-format entry of a different pair (label `a`,
+        # `b-spec.md`), so legacy cleanup is skipped for such labels —
+        # `--rebuild` covers whatever this leaves behind.
+        run_env.mkdir(parents=True)
+        (run_env / "b-spec.md").write_text("x")
+        (run_env / "spec.md").write_text("y")
+        other = specs_index.upsert_spec_link(
+            run_env / "b-spec.md", "a",
+            when=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        mine = specs_index.upsert_spec_link(run_env / "spec.md", "a--b")
+        assert mine.name == f"{_today()}-a-b--spec.md"  # collapsed label
+        assert other.exists() and mine.exists()
+
     def test_wrong_symlink_repointed(self, run_env, tmp_path):
         run_env.mkdir(parents=True)
         (run_env / "spec.md").write_text("x")
         sdir = _specs_dir(tmp_path)
         sdir.mkdir(parents=True)
-        entry = sdir / f"{_today()}-issue-101-spec.md"
+        entry = sdir / f"{_today()}-issue-101--spec.md"
         entry.symlink_to("somewhere/else.md")
         specs_index.upsert_spec_link(run_env / "spec.md", "issue-101")
         assert os.readlink(entry) == "../runs/develop-issue-101/spec.md"
@@ -214,7 +278,7 @@ class TestMasterplanSyncIndexes:
         self._seed_run(run_env)
         self._bundle(run_env, "mp-a", "spec.md", "plan.md")
         run_state.sync_masterplan_artifacts(run_env)
-        entry = _specs_dir(tmp_path) / f"{_today()}-develop-issue-101-spec.md"
+        entry = _specs_dir(tmp_path) / f"{_today()}-develop-issue-101--spec.md"
         assert entry.is_symlink()
         # Canonical target is the BUNDLE file, not the run-root symlink.
         assert os.readlink(entry) == (
@@ -233,8 +297,8 @@ class TestMasterplanSyncIndexes:
         # bundles' spec.md files stay distinct, each at its own bundle.
         entries = specs_index.list_entries()
         assert [p.name for p in entries] == [
-            f"{_today()}-specs-index-mp-a-spec.md",
-            f"{_today()}-specs-index-mp-b-spec.md",
+            f"{_today()}-specs-index--mp-a-spec.md",
+            f"{_today()}-specs-index--mp-b-spec.md",
         ]
         assert os.readlink(entries[0]) == (
             "../runs/develop-issue-101/masterplan/mp-a/spec.md"
@@ -285,7 +349,7 @@ class TestFreezeRenameRepointsIndex:
         assert rdir.name == "develop-issue-101--specs-index"
         assert old_name == "develop-issue-101"
         entries = specs_index.list_entries()
-        assert [p.name for p in entries] == ["2026-07-01-specs-index-spec.md"]
+        assert [p.name for p in entries] == ["2026-07-01-specs-index--spec.md"]
         entry = entries[0]
         assert os.readlink(entry) == (
             "../runs/develop-issue-101--specs-index/spec.md"
@@ -307,10 +371,62 @@ class TestFreezeRenameRepointsIndex:
         run_state.freeze_run_dir(run_env, state)
 
         entries = specs_index.list_entries()
-        assert [p.name for p in entries] == ["2026-07-02-specs-index-mp-a-spec.md"]
+        assert [p.name for p in entries] == ["2026-07-02-specs-index--mp-a-spec.md"]
         assert os.readlink(entries[0]) == (
             "../runs/develop-issue-101--specs-index/masterplan/mp-a/spec.md"
         )
+
+    def test_prefix_label_does_not_missplit_new_format_entry(
+        self, run_env, tmp_path
+    ):
+        # The old slug being a dash-prefix of the entry's created label must
+        # not shear the label mid-way (review on !156 followup): a legacy
+        # `<candidate>-` strip tried before the `--` split would turn
+        # `…-develop-issue-101--spec.md` parsed with old slug
+        # `develop-issue` into basename `101--spec.md`.
+        # Post-rename layout: repoint_run_dir_entries runs AFTER the dir move.
+        new_dir = run_env.parent / "develop-issue--specs-index"
+        new_dir.mkdir(parents=True)
+        state = run_state.seed_state("develop-issue", "develop", "issue")
+        state["name"] = "specs-index"
+        run_state.write_state(new_dir, state)
+        (new_dir / "spec.md").write_text("# spec\n")
+        # Entry created under a label the old slug prefixes, still pointing
+        # into the OLD dir.
+        sdir = _specs_dir(tmp_path)
+        sdir.mkdir(parents=True)
+        entry = sdir / "2026-07-01-develop-issue-101--spec.md"
+        entry.symlink_to("../runs/develop-issue/spec.md")
+
+        specs_index.repoint_run_dir_entries(
+            "develop-issue", "develop-issue--specs-index",
+            "develop-issue-101",
+        )
+
+        names = [p.name for p in specs_index.list_entries()]
+        assert names == ["2026-07-01-develop-issue-101--spec.md"]
+        assert os.readlink(sdir / names[0]) == (
+            "../runs/develop-issue--specs-index/spec.md"
+        )
+
+    def test_legacy_single_dash_entry_repoints_to_new_format(
+        self, run_env, tmp_path
+    ):
+        # Entries created before the `--` separator existed use
+        # `<label>-<base>`; the re-point must still parse them and rewrite
+        # under the new `--` naming.
+        state = self._seed_named_run(run_env)
+        (run_env / "spec.md").write_text("# spec\n")
+        sdir = _specs_dir(tmp_path)
+        sdir.mkdir(parents=True)
+        legacy = sdir / "2026-07-01-develop-issue-101-spec.md"
+        legacy.symlink_to("../runs/develop-issue-101/spec.md")
+
+        run_state.freeze_run_dir(run_env, state)
+
+        names = [p.name for p in specs_index.list_entries()]
+        assert names == ["2026-07-01-specs-index--spec.md"]
+        assert not legacy.exists()
 
     def test_other_runs_entries_untouched(self, run_env, tmp_path):
         state = self._seed_named_run(run_env)
@@ -367,7 +483,7 @@ class TestSpecsIndexVerb:
         assert _main(["specs-index"]) == 0
         out = capsys.readouterr().out
         assert (
-            f"{_today()}-develop-issue-101-spec.md -> "
+            f"{_today()}-develop-issue-101--spec.md -> "
             "../runs/develop-issue-101/spec.md" in out
         )
 
@@ -384,7 +500,7 @@ class TestSpecsIndexVerb:
         assert _main(["specs-index", "--rebuild"]) == 0
         out = capsys.readouterr().out
         assert "Specs index rebuilt: 1 entries" in out
-        entry = _specs_dir(tmp_path) / f"{_today()}-develop-issue-101-spec.md"
+        entry = _specs_dir(tmp_path) / f"{_today()}-develop-issue-101--spec.md"
         assert entry.is_symlink()
         assert os.readlink(entry) == "../runs/develop-issue-101/spec.md"
 
@@ -398,7 +514,7 @@ class TestSpecsIndexVerb:
             ' "note": "spec.md"}\n'
         )
         assert _main(["specs-index", "--rebuild"]) == 0
-        entry = _specs_dir(tmp_path) / "2026-07-01-develop-issue-101-spec.md"
+        entry = _specs_dir(tmp_path) / "2026-07-01-develop-issue-101--spec.md"
         assert entry.is_symlink()
 
     def test_rebuild_follows_run_root_symlink_to_bundle(
@@ -435,3 +551,79 @@ class TestSpecsIndexVerb:
             (d / "spec.md").write_text("hidden\n")
         assert _main(["specs-index", "--rebuild"]) == 0
         assert specs_index.list_entries() == []
+
+
+def _git(cwd, *args):
+    subprocess.run(
+        ["git", "-C", str(cwd),
+         "-c", "user.name=test", "-c", "user.email=test@example.com",
+         *args],
+        check=True, capture_output=True,
+    )
+
+
+@pytest.fixture
+def git_work_repo(run_env, monkeypatch, tmp_path):
+    """A real work-repo clone with a bare origin, pointed at by the env —
+    the staging-gap regression needs actual `git add` semantics."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+        check=True, capture_output=True,
+    )
+    clone = tmp_path / "workrepo"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)],
+        check=True, capture_output=True,
+    )
+    _git(clone, "config", "user.name", "test")
+    _git(clone, "config", "user.email", "test@example.com")
+    _git(clone, "commit", "-q", "--allow-empty", "-m", "init")
+    _git(clone, "push", "-q", "-u", "origin", "main")
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(clone))
+    return clone
+
+
+class TestIndexEntriesPushed:
+    """The !140 staging gap: index entries written without a push of their
+    own (`--rebuild`, the masterplan sync) sat untracked forever because
+    `work commit` never staged specs/ — these prove they actually land."""
+
+    def _origin_files(self, clone):
+        out = subprocess.run(
+            ["git", "-C", str(clone),
+             "ls-tree", "-r", "--name-only", "origin/main"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        return out.splitlines()
+
+    def test_rebuild_then_commit_pushes_entries(self, git_work_repo):
+        clone = git_work_repo
+        rdir = clone / "git.example.com" / "org/repo" / "runs" / "develop-issue-101"
+        state = run_state.seed_state("develop-issue-101", "develop", "issue-101")
+        state["artifacts"] = {"spec": "spec.md"}
+        run_state.write_state(rdir, state)
+        (rdir / "spec.md").write_text("# spec\n")
+        assert _main(["specs-index", "--rebuild"]) == 0
+        assert _main(["commit"]) == 0
+        assert (
+            f"git.example.com/org/repo/specs/{_today()}-develop-issue-101--spec.md"
+            in self._origin_files(clone)
+        )
+
+    def test_masterplan_sync_entries_pushed_by_work_commit(self, git_work_repo):
+        clone = git_work_repo
+        rdir = clone / "git.example.com" / "org/repo" / "runs" / "develop-issue-101"
+        run_state.write_state(
+            rdir, run_state.seed_state("develop-issue-101", "develop", "issue-101")
+        )
+        bundle = rdir / "masterplan" / "mp-a"
+        bundle.mkdir(parents=True)
+        (bundle / "spec.md").write_text("mp-a:spec.md\n")
+        # `work commit` runs the masterplan sync itself and must then stage
+        # the index entries the sync just wrote.
+        assert _main(["commit"]) == 0
+        assert (
+            f"git.example.com/org/repo/specs/{_today()}-develop-issue-101--spec.md"
+            in self._origin_files(clone)
+        )

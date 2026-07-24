@@ -149,15 +149,134 @@ def _lfs_safe_git(*args: str) -> list[str]:
     return cmd
 
 
-def _clone_cmd(repo_url: str, workspace: Path) -> list[str]:
+def _clone_cmd(
+    repo_url: str, workspace: Path, extra_flags: "list[str] | None" = None
+) -> list[str]:
     """Build the ``git clone`` command.
 
     When git-lfs is unavailable, insert :data:`_LFS_SKIP_FLAGS` before the
     ``clone`` subcommand so LFS-tracked repos degrade to pointer files rather
     than failing the checkout. When git-lfs is present the clone is plain, so
-    LFS content is fetched normally.
+    LFS content is fetched normally. *extra_flags* (e.g. the clone-cache
+    ``--reference``/``--dissociate`` pair) are placed after ``clone`` and
+    before the positional URL/destination.
     """
-    return _lfs_safe_git("clone", repo_url, str(workspace))
+    return _lfs_safe_git("clone", *(extra_flags or []), repo_url, str(workspace))
+
+
+# --- Persistent clone cache (issue #112) ------------------------------------
+# The host CLI bind-mounts a persistent host directory (default
+# ~/.lmer/clone-cache, see LMER_CLONE_CACHE / LMER_CLONE_CACHE_DIR in
+# docs/LMER-CLI.md) **read-only** at the container path carried in
+# LMER_CLONE_CACHE_PATH. All mirror maintenance is host-side
+# (lmer_cli/clone_cache.py, forked detached at launch); this script is a
+# pure consumer: when a bare mirror (<host>/<project>.git) exists, working
+# clones are made with ``--reference <mirror> --dissociate`` — origin stays
+# the real remote (the branch/ref/MR-head fetch and push flows below are
+# untouched) while objects come from the local mirror, and --dissociate
+# repacks the clone so the workspace never depends on the cache afterwards.
+# A stale mirror is never wrong (the clone still talks to origin), a
+# missing one just means a direct clone, and any trouble at all — including
+# a corrupt mirror — degrades fail-soft to the direct clone.
+
+
+# Ports that carry no information in a mirror name — a URL naming one maps to
+# the same mirror as a URL that omits it.
+_DEFAULT_PORTS = {"https": 443, "http": 80, "ssh": 22, "git": 9418}
+
+
+def _mirror_path(cache_root: Path, repo_url: str) -> "Path | None":
+    """Map a clone URL to its mirror path ``<cache_root>/<host>/<project>.git``.
+
+    Handles https(-with-credentials) URLs and scp-like SSH forms
+    (``git@host:group/project.git``). Returns None for URLs the cache doesn't
+    handle (local paths, unparseable forms) so the caller degrades to a
+    direct clone.
+
+    A **non-default** port joins the host namespace (``host_8443``): two
+    servers can share a hostname on different ports, and collapsing them into
+    one mirror would cross-wire their stamps and let a clone borrow objects
+    from the wrong server (review on !154). Default ports stay unsuffixed, so
+    mirrors built before this distinction keep being found.
+    """
+    host = None
+    path = ""
+    if "://" in repo_url:
+        try:
+            parsed = urlparse(repo_url)
+            port = parsed.port  # raises ValueError on a malformed port
+        except Exception:
+            return None
+        host = parsed.hostname
+        if host and port and port != _DEFAULT_PORTS.get((parsed.scheme or "").lower()):
+            host = f"{host}_{port}"
+        path = (parsed.path or "").strip("/")
+    else:
+        # scp-like SSH form: [user@]host:group/project(.git)
+        m = re.match(r"^(?:[^@/:]+@)?([^:/@]+):(.+)$", repo_url)
+        if m:
+            host = m.group(1)
+            path = m.group(2).strip("/")
+    if not host or not path:
+        return None
+    path = re.sub(r"\.git$", "", path)
+    parts = [p for p in path.split("/") if p]
+    # A hostile path component must never escape the cache root.
+    if not parts or any(p in (".", "..") for p in parts):
+        return None
+    return cache_root.joinpath(host.lower(), *parts[:-1], parts[-1] + ".git")
+
+
+def _cache_reference_flags(repo_url: str) -> list[str]:
+    """The ``--reference <mirror> --dissociate`` flags for *repo_url* — or
+    ``[]`` when the cache is disabled (no LMER_CLONE_CACHE_PATH), doesn't
+    apply to this URL, or holds no mirror for it yet.
+
+    A pure read: the mount is read-only and all mirror maintenance is
+    host-side, so this never creates, fetches, or locks anything. A mirror
+    that turns out to be unusable is caught by the retry-direct fallback in
+    :func:`_clone_with_cache`; a surprising fs error here just degrades to
+    the direct clone (fail-soft)."""
+    cache_root = os.environ.get("LMER_CLONE_CACHE_PATH")
+    if not cache_root or not repo_url:
+        return []
+    try:
+        mirror = _mirror_path(Path(cache_root), repo_url)
+        if mirror is None or not (mirror / "HEAD").exists():
+            return []
+    except Exception as e:
+        print(
+            f"⚠️  clone cache unavailable (cloning directly): "
+            f"{_scrub_credentials(str(e))}",
+            file=sys.stderr,
+        )
+        return []
+    return ["--reference", str(mirror), "--dissociate"]
+
+
+def _clone_with_cache(repo_url: str, dest: Path) -> None:
+    """Clone *repo_url* into *dest*, borrowing objects from the cache mirror
+    when one is available.
+
+    A failed cache-referenced clone (e.g. a mirror corruption the fetch
+    didn't surface) is retried as a plain direct clone, so the cache can
+    never break a session — only the direct clone's failure propagates.
+    """
+    flags = _cache_reference_flags(repo_url)
+    if flags:
+        try:
+            check_call(_clone_cmd(repo_url, dest, flags))
+            return
+        except subprocess.CalledProcessError as e:
+            print(
+                f"⚠️  cache-referenced clone failed (retrying directly): "
+                f"{_scrub_credentials(str(e))}",
+                file=sys.stderr,
+            )
+            # git may leave a partial dest behind; clear it for the retry.
+            shutil.rmtree(dest, ignore_errors=True)
+            dest.mkdir(parents=True, exist_ok=True)
+    check_call(_clone_cmd(repo_url, dest))
 
 
 def _persist_lfs_skip_config(repo_dir: Path) -> None:
@@ -214,7 +333,7 @@ def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Opt
     if (workspace / ".git").exists():
         return
 
-    check_call(_clone_cmd(repo_url, workspace))
+    _clone_with_cache(repo_url, workspace)
     _persist_lfs_skip_config(workspace)
 
     # Configure safe.directory to avoid ownership complaints
@@ -325,6 +444,23 @@ def find_runner(harness: str = "claude") -> str | None:
     if harness == "claude":
         # Fallback to plain claude on PATH
         return "claude"
+    return None
+
+
+def find_user_runner(harness: str) -> str | None:
+    """Locate a user-installed harness's runner script (issue #132).
+
+    The host mounts the user-harness directory read-only (default mount
+    point ``/lmer-harnesses``) and forwards its container path as
+    ``LMER_HARNESSES_DIR``. A user harness ``<name>`` carries its runner at
+    ``<dir>/<name>/runner.sh``. Dispatch is purely file-existence based —
+    this module runs without the ``lmer_cli`` import path, so it never
+    parses the manifest itself (the host CLI already validated it).
+    """
+    root = os.environ.get("LMER_HARNESSES_DIR", "/lmer-harnesses")
+    runner = Path(root) / harness / "runner.sh"
+    if runner.is_file():
+        return str(runner)
     return None
 
 
@@ -586,7 +722,7 @@ def clone_secondary_mr(target: str, workspace: Path) -> None:
 
     # Clone the repository
     print(f"📦 Cloning secondary MR into {target_dir}...", file=sys.stderr)
-    check_call(_clone_cmd(repo_url, target_dir))
+    _clone_with_cache(repo_url, target_dir)
     _persist_lfs_skip_config(target_dir)
 
     # Configure safe.directory
@@ -1239,11 +1375,14 @@ def mint_session_id() -> None:
     )
 
 
-def dispatch_runner(runner: str) -> int:
+def dispatch_runner(runner) -> int:
     """Run the harness runner as a child (not execv) so post-session teardown
-    can run while the container is still alive. Returns the runner's exit code."""
+    can run while the container is still alive. Returns the runner's exit code.
+    Accepts a command string or an argv list (user runners run via ``bash`` —
+    a read-only mount preserves host permissions, so the exec bit may be
+    missing)."""
     mint_session_id()
-    proc = subprocess.Popen([runner])
+    proc = subprocess.Popen(runner if isinstance(runner, list) else [runner])
     _forward_signals(proc)
     rc = proc.wait()
     run_state_session_end()
@@ -1409,19 +1548,39 @@ def main(argv: list[str] | None = None) -> int:
         work_repo_path, napkin_path, napkin_is_separate=bool(napkin_repo_url), home=home
     )
 
-    # Dispatch
-    if len(cmd_tokens) == 1 and cmd_tokens[0] in KNOWN_HARNESS_RUNNERS:
+    # Dispatch. Built-in runner tokens resolve through find_runner. Beyond
+    # those, a single <name>-runner token is intercepted as a user-installed
+    # harness dispatch (issue #132) ONLY when it names the harness the host
+    # actually selected (LMER_HARNESS) — a missing/unmounted user runner
+    # then fails loudly instead of as a bash 'command not found', while an
+    # arbitrary exec command that merely ends in -runner (e.g. a repo's own
+    # `test-runner` binary) still falls through to the bash path below.
+    if len(cmd_tokens) == 1 and cmd_tokens[0].endswith("-runner"):
         harness = cmd_tokens[0][: -len("-runner")]
-        runner = find_runner(harness)
-        if runner is None:
-            print(
-                f"❌ This image has no runner for harness '{harness}' "
-                f"({harness}-runner.sh not found). Rebuild the image with a "
-                f"lmer version that includes it: lmer build",
-                file=sys.stderr,
-            )
-            return 3
-        return dispatch_runner(runner)
+        if cmd_tokens[0] in KNOWN_HARNESS_RUNNERS:
+            runner = find_runner(harness)
+            if runner is None:
+                print(
+                    f"❌ This image has no runner for harness '{harness}' "
+                    f"({harness}-runner.sh not found). Rebuild the image with a "
+                    f"lmer version that includes it: lmer build",
+                    file=sys.stderr,
+                )
+                return 3
+            return dispatch_runner(runner)
+        if harness == (os.environ.get("LMER_HARNESS") or "").strip().lower():
+            runner = find_user_runner(harness)
+            if runner is None:
+                root = os.environ.get("LMER_HARNESSES_DIR", "/lmer-harnesses")
+                print(
+                    f"❌ No runner for harness '{harness}': not a built-in, and "
+                    f"no runner.sh at {root}/{harness}/ — is the user-harness "
+                    "directory present on the host (~/.lmer/harnesses) and its "
+                    "manifest valid?",
+                    file=sys.stderr,
+                )
+                return 3
+            return dispatch_runner(["bash", runner])
 
     # Otherwise, treat tokens as a command to exec via bash -lc
     cmd_str = " ".join(shlex.quote(t) for t in cmd_tokens)

@@ -471,6 +471,21 @@ def _make_main_mocks(captured_env: dict | None = None):
     stack.enter_context(
         patch("lmer_cli.cli.build_host_uv_cache_mount", return_value=[])
     )
+    # Clone cache (#112) is on by default and its resolver targets the REAL
+    # ~/.lmer/clone-cache, which cmd_run mkdir()s — a MagicMock path makes
+    # that a no-op so running main() here never writes the developer's home
+    # (a stray ~/.lmer flips hooks/start.py's taskdef search chain, issue #80).
+    stack.enter_context(
+        patch("lmer_cli.cli.resolve_host_clone_cache_dir", return_value=MagicMock())
+    )
+    stack.enter_context(
+        patch("lmer_cli.cli.build_clone_cache_mount", return_value=[])
+    )
+    # The host-side cache updater forks a detached real process; never let a
+    # test run spawn it (its child would resolve and write the REAL cache).
+    stack.enter_context(
+        patch("lmer_cli.cli._spawn_clone_cache_updater", return_value=None)
+    )
     stack.enter_context(
         patch("lmer_cli.cli.build_external_taskdef_mounts", return_value=[])
     )

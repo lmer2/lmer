@@ -7,6 +7,8 @@ import textwrap
 from pathlib import Path
 import pytest
 
+from lmer_cli import user_harnesses
+
 
 def strip_lmer_env(monkeypatch):
     """Remove every LMER_* env var from the environment.
@@ -133,6 +135,26 @@ def _work_repo_leak_guard():
             "concurrent writer changed the work repo mid-run.",
             pytrace=False,
         )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_user_harnesses(tmp_path_factory):
+    """Point user-harness resolution away from the real ~/.lmer/harnesses.
+
+    The harness resolution helpers (get_harness, resolve_harness_*,
+    harness_for_model, UnknownHarnessError) consult user-installed harness
+    definitions (issue #132), and DEFAULT_HARNESSES_DIR is Path.home()-based
+    — so a dev/CI machine with harnesses installed would otherwise change
+    hint-resolution results and unknown-harness listings in unrelated tests
+    (same spirit as the work-repo leak guard above). Tests that want user
+    harnesses set LMER_HARNESSES_DIR / pass an explicit root themselves.
+    """
+    os.environ.pop(user_harnesses.HARNESSES_DIR_ENV, None)
+    empty = tmp_path_factory.mktemp("no-user-harnesses")
+    original = user_harnesses.DEFAULT_HARNESSES_DIR
+    user_harnesses.DEFAULT_HARNESSES_DIR = empty
+    yield
+    user_harnesses.DEFAULT_HARNESSES_DIR = original
 
 
 @pytest.fixture
