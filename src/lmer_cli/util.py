@@ -95,3 +95,24 @@ def get_bool_env(var_name: str, default: bool = False) -> bool:
     else:
         # Invalid value, return default
         return default
+
+
+def decode_escape_bytes(value: str) -> bytes:
+    """Decode a config/env string into raw bytes, unicode-escape style.
+
+    The shared decode for byte-valued harness knobs — the supervisor's
+    LMER_QUIT_SEQUENCE / LMER_AUTO_START_READY_MARKER env overrides and the
+    user-harness manifest's supervisor fields (single source so the two
+    encodings cannot drift): escapes spell out control bytes (``\\x03``),
+    literal text passes through byte-for-byte (latin-1 round-trips raw UTF-8
+    that came through unicode_escape as ≤U+00FF codepoints), and an explicit
+    ``\\uXXXX`` escape above U+00FF lands as UTF-8 — what the TUI reads.
+
+    Raises:
+        UnicodeDecodeError: on an undecodable escape sequence.
+    """
+    decoded = value.encode("utf-8").decode("unicode_escape")
+    try:
+        return decoded.encode("latin-1")
+    except UnicodeEncodeError:
+        return decoded.encode("utf-8")

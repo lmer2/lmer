@@ -54,7 +54,7 @@ import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .harness import HARNESS_ENV, HARNESSES, LLM_NAME_ENV, harness_for_model
+from .harness import HARNESS_ENV, LLM_NAME_ENV, harness_for_model, known_harnesses
 
 logger = logging.getLogger("lmer_cli.presets")
 
@@ -323,8 +323,8 @@ def resolve_agent_presets(
         if harness_arg:
             env[HARNESS_ENV] = harness_arg.strip().lower()
         harness_name = (env.get(HARNESS_ENV) or "").strip().lower()
-        if harness_name and harness_name not in HARNESSES:
-            known = ", ".join(sorted(HARNESSES))
+        if harness_name and harness_name not in known_harnesses():
+            known = ", ".join(sorted(known_harnesses()))
             return None, warnings, (
                 f"agent '{name}': unknown harness '{harness_name}' "
                 f"(known harnesses: {known})"

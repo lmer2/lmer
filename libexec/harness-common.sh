@@ -188,13 +188,20 @@ harness_render_global_context() {
 # Copy a config file from the global agent-files tree (work repo overrides
 # global on collision) to the harness's expected location, unless the target
 # already exists — an existing file is user/session state and wins.
-#   harness_provision_config <relative-path-under-agent-files> <target-path>
+# The optional third argument is a lowest-priority fallback source file —
+# how a user-installed harness's runner provisions the base config shipped
+# in its own directory while still letting the work repo override it:
+#   harness_provision_config "acme/settings.json" "$HOME/.acme/settings.json" \
+#       "$HARNESS_DIR/agent-files/settings.json"
+#   harness_provision_config <relative-path-under-agent-files> <target-path> [fallback-source]
 harness_provision_config() {
-    local rel="$1" target="$2" source=""
+    local rel="$1" target="$2" fallback="${3:-}" source=""
     if [ -n "$WORK_AGENT_FILES_ROOT" ] && [ -f "$WORK_AGENT_FILES_ROOT/$rel" ]; then
         source="$WORK_AGENT_FILES_ROOT/$rel"
     elif [ -n "$HARNESS_GLOBAL_DIR" ] && [ -f "$HARNESS_GLOBAL_DIR/agent-files/$rel" ]; then
         source="$HARNESS_GLOBAL_DIR/agent-files/$rel"
+    elif [ -n "$fallback" ] && [ -f "$fallback" ]; then
+        source="$fallback"
     fi
     if [ -n "$source" ] && [ ! -e "$target" ]; then
         if mkdir -p "$(dirname "$target")" && cp "$source" "$target"; then

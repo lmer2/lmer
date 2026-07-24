@@ -49,18 +49,19 @@ from typing import Dict, Optional
 
 from lmer_cli.harness import (
     HARNESS_ENV,
-    HARNESSES,
     LLM_NAME_ENV,
     Harness,
     build_exec_argv,
     harness_for_model,
     implied_harness_name,
+    known_harnesses,
     missing_credential_mounts,
 )
 
 # Both halves of the fan-out env contract live in lmer_cli.presets (the
 # host-side writer) so the writer and this consumer can never drift apart.
 from lmer_cli.presets import AGENTS_CONFIG_ENV, AGENTS_ENV
+from lmer_cli.user_harnesses import CONTAINER_HARNESS_CACHE_DIR
 
 #: Exit code for a child killed by ``--timeout`` (the coreutils convention).
 TIMEOUT_EXIT_CODE = 124
@@ -180,8 +181,9 @@ def select_harness(
     of its own — real callers pass the parent environment.
     """
     name = implied_harness_name(overlay_env, child_env)
-    if name not in HARNESSES:
-        known = ", ".join(sorted(HARNESSES))
+    registry = known_harnesses()
+    if name not in registry:
+        known = ", ".join(sorted(registry))
         raise _fail(f"Unknown harness {name!r} for agent (known harnesses: {known})")
     if not (overlay_env.get(LLM_NAME_ENV) or "").strip():
         inherited_model = child_env.get(LLM_NAME_ENV)
@@ -199,7 +201,41 @@ def select_harness(
         ):
             child_env.pop(LLM_NAME_ENV, None)
     child_env[HARNESS_ENV] = name
-    return HARNESSES[name]
+    return registry[name]
+
+
+def apply_harness_extra_env(child_env: Dict[str, str], harness: Harness) -> None:
+    """Merge the selected harness's fixed environment into the child env.
+
+    ``Harness.extra_env`` is the harness's *fixed environment* (e.g. pi's
+    ``PI_SKIP_VERSION_CHECK``, a user manifest's ``extra_env``). At session
+    launch ``cli.py`` applies it for the session harness only — a fan-out
+    child routed to a *different* harness execs the binary directly (no
+    runner script to export it), so it must be merged here. ``setdefault``
+    keeps the same lose-to-existing precedence as the launch-time env dict:
+    an inherited/overlay/``--env`` value wins over the registry default.
+    """
+    for key, value in harness.extra_env:
+        child_env.setdefault(key, value)
+
+
+def prepend_user_harness_path(child_env: Dict[str, str], harness: Harness) -> None:
+    """Put a user-installed child harness's install cache on the child PATH.
+
+    Fan-out children run the harness binary directly — ``runner.sh`` (which
+    owns install-if-missing for user harnesses) never runs for them. The
+    documented cache convention is binaries under
+    ``/lmer-harness-cache/<name>/bin`` (docs/HARNESSES.md), so prepending
+    that directory makes a previously-installed user harness reachable as a
+    child. If nothing is installed there the child still fails with a clear
+    'command not found'. No-op for built-ins (baked into the image).
+    """
+    if harness.source_dir is None:
+        return
+    cache_bin = f"{CONTAINER_HARNESS_CACHE_DIR}/{harness.name}/bin"
+    path = child_env.get("PATH", "")
+    if cache_bin not in path.split(":"):
+        child_env["PATH"] = f"{cache_bin}:{path}" if path else cache_bin
 
 
 def warn_missing_credentials(
@@ -488,6 +524,8 @@ def main(argv: Optional[list] = None) -> None:
     child_env = build_child_env(dict(os.environ), agent_env, extra_env)
     harness = select_harness(child_env, {**agent_env, **extra_env}, dict(os.environ))
     warn_missing_credentials(ns.agent, harness, dict(os.environ))
+    apply_harness_extra_env(child_env, harness)
+    prepend_user_harness_path(child_env, harness)
 
     try:
         child_argv, warnings = build_exec_argv(

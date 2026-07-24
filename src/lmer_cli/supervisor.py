@@ -54,6 +54,7 @@ from typing import Callable, Iterable, Mapping, Optional
 from pydantic import BaseModel
 
 from .harness import UnknownHarnessError, resolve_harness
+from .util import decode_escape_bytes
 
 
 DEFAULT_PORT_RANGE = (8700, 8799)
@@ -458,25 +459,15 @@ def _parse_quit_sequence(raw: str) -> tuple[bytes, ...]:
 
     Steps are separated by ``|``; each step is unicode-escape decoded so
     control bytes can be spelled out (``\\x03|\\x03`` → two Ctrl-C presses,
-    ``/quit\\r`` → typed command + Enter). An empty value yields an empty
-    sequence, which disables the chord step entirely (shutdown escalates
-    straight to SIGTERM).
+    ``/quit\\r`` → typed command + Enter) — the shared
+    :func:`lmer_cli.util.decode_escape_bytes` semantics, also used by the
+    user-harness manifest fields. An empty value yields an empty sequence,
+    which disables the chord step entirely (shutdown escalates straight to
+    SIGTERM).
     """
-    steps: list[bytes] = []
-    for part in raw.split("|"):
-        if not part:
-            continue
-        decoded = part.encode("utf-8").decode("unicode_escape")
-        try:
-            # latin-1 round-trips literal UTF-8 text (each raw byte came
-            # through unicode_escape as one ≤U+00FF codepoint)...
-            steps.append(decoded.encode("latin-1"))
-        except UnicodeEncodeError:
-            # ...but an explicit \uXXXX escape above U+00FF yields a real
-            # codepoint that latin-1 can't express — emit it as UTF-8 (what
-            # the TUI reads) instead of crashing the supervisor at startup.
-            steps.append(decoded.encode("utf-8"))
-    return tuple(steps)
+    return tuple(
+        decode_escape_bytes(part) for part in raw.split("|") if part
+    )
 
 
 def _resolve_harness_profile():
@@ -542,13 +533,16 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         float(settle_raw) if settle_raw is not None else DEFAULT_AUTO_START_SETTLE_DELAY
     )
 
-    # Marker bytes are read as UTF-8 from env so a future TUI change can be
-    # patched without a release. Setting it to the empty string disables
-    # marker gating (waits only on the initial + timeout-bounded delays).
-    # Default comes from the active harness's profile.
+    # Marker bytes come from env so a future TUI change can be patched
+    # without a release, decoded with the shared escape semantics
+    # (decode_escape_bytes — same encoding as LMER_QUIT_SEQUENCE and the
+    # user-harness manifest fields; plain text like "❯" passes through
+    # byte-for-byte, so pre-escape values keep working). Setting it to the
+    # empty string disables marker gating (waits only on the initial +
+    # timeout-bounded delays). Default comes from the harness's profile.
     marker_raw = os.environ.get("LMER_AUTO_START_READY_MARKER")
     auto_start_ready_marker = (
-        marker_raw.encode("utf-8") if marker_raw is not None
+        decode_escape_bytes(marker_raw) if marker_raw is not None
         else profile.ready_marker
     )
 

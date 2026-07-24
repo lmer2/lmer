@@ -433,6 +433,23 @@ def find_runner(harness: str = "claude") -> str | None:
     return None
 
 
+def find_user_runner(harness: str) -> str | None:
+    """Locate a user-installed harness's runner script (issue #132).
+
+    The host mounts the user-harness directory read-only (default mount
+    point ``/lmer-harnesses``) and forwards its container path as
+    ``LMER_HARNESSES_DIR``. A user harness ``<name>`` carries its runner at
+    ``<dir>/<name>/runner.sh``. Dispatch is purely file-existence based —
+    this module runs without the ``lmer_cli`` import path, so it never
+    parses the manifest itself (the host CLI already validated it).
+    """
+    root = os.environ.get("LMER_HARNESSES_DIR", "/lmer-harnesses")
+    runner = Path(root) / harness / "runner.sh"
+    if runner.is_file():
+        return str(runner)
+    return None
+
+
 def sanitize_task_target(task_target: str) -> str:
     """
     Sanitize task target for use in filesystem paths.
@@ -1344,11 +1361,14 @@ def mint_session_id() -> None:
     )
 
 
-def dispatch_runner(runner: str) -> int:
+def dispatch_runner(runner) -> int:
     """Run the harness runner as a child (not execv) so post-session teardown
-    can run while the container is still alive. Returns the runner's exit code."""
+    can run while the container is still alive. Returns the runner's exit code.
+    Accepts a command string or an argv list (user runners run via ``bash`` —
+    a read-only mount preserves host permissions, so the exec bit may be
+    missing)."""
     mint_session_id()
-    proc = subprocess.Popen([runner])
+    proc = subprocess.Popen(runner if isinstance(runner, list) else [runner])
     _forward_signals(proc)
     rc = proc.wait()
     run_state_session_end()
@@ -1514,19 +1534,39 @@ def main(argv: list[str] | None = None) -> int:
         work_repo_path, napkin_path, napkin_is_separate=bool(napkin_repo_url), home=home
     )
 
-    # Dispatch
-    if len(cmd_tokens) == 1 and cmd_tokens[0] in KNOWN_HARNESS_RUNNERS:
+    # Dispatch. Built-in runner tokens resolve through find_runner. Beyond
+    # those, a single <name>-runner token is intercepted as a user-installed
+    # harness dispatch (issue #132) ONLY when it names the harness the host
+    # actually selected (LMER_HARNESS) — a missing/unmounted user runner
+    # then fails loudly instead of as a bash 'command not found', while an
+    # arbitrary exec command that merely ends in -runner (e.g. a repo's own
+    # `test-runner` binary) still falls through to the bash path below.
+    if len(cmd_tokens) == 1 and cmd_tokens[0].endswith("-runner"):
         harness = cmd_tokens[0][: -len("-runner")]
-        runner = find_runner(harness)
-        if runner is None:
-            print(
-                f"❌ This image has no runner for harness '{harness}' "
-                f"({harness}-runner.sh not found). Rebuild the image with a "
-                f"lmer version that includes it: lmer build",
-                file=sys.stderr,
-            )
-            return 3
-        return dispatch_runner(runner)
+        if cmd_tokens[0] in KNOWN_HARNESS_RUNNERS:
+            runner = find_runner(harness)
+            if runner is None:
+                print(
+                    f"❌ This image has no runner for harness '{harness}' "
+                    f"({harness}-runner.sh not found). Rebuild the image with a "
+                    f"lmer version that includes it: lmer build",
+                    file=sys.stderr,
+                )
+                return 3
+            return dispatch_runner(runner)
+        if harness == (os.environ.get("LMER_HARNESS") or "").strip().lower():
+            runner = find_user_runner(harness)
+            if runner is None:
+                root = os.environ.get("LMER_HARNESSES_DIR", "/lmer-harnesses")
+                print(
+                    f"❌ No runner for harness '{harness}': not a built-in, and "
+                    f"no runner.sh at {root}/{harness}/ — is the user-harness "
+                    "directory present on the host (~/.lmer/harnesses) and its "
+                    "manifest valid?",
+                    file=sys.stderr,
+                )
+                return 3
+            return dispatch_runner(["bash", runner])
 
     # Otherwise, treat tokens as a command to exec via bash -lc
     cmd_str = " ".join(shlex.quote(t) for t in cmd_tokens)
