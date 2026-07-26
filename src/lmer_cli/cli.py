@@ -72,7 +72,10 @@ from .presets import (
     PRESET_ENV,
     PRESETS_FILE_ENV,
     load_presets,
+    preset_env_value,
     resolve_agent_presets,
+    select_preset_name,
+    task_preset_env_name,
 )
 from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
 from .service import ServiceError, resolve_container, inspect_container_workdir
@@ -245,7 +248,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--show-env", dest="show_env", action="store_true", help="Display LMER environment variable configuration on startup")
     parser.add_argument("--mount-file", dest="mount_file", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a single host file into the container at an explicit destination (repeatable). HOST supports ~ and $VAR expansion and must be an existing file; CONTAINER must be an absolute path; MODE is ro (default) or rw. Invalid entries abort the run. (env: LMER_MOUNT_FILES, comma-separated entries)")
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
-    parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_PRESET; the flag wins). The preset's checkout/service/env/args are applied as defaults: flags and exported environment variables in the actual invocation override them.")
+    parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_<TASK>_PRESET for one taskdef, e.g. LMER_REVIEW_PRESET, then LMER_PRESET for any task; the flag wins over both). The preset's checkout/service/env/args are applied as defaults: flags and exported environment variables in the actual invocation override them.")
     parser.add_argument("--list-presets", dest="list_presets", action="store_true", help="List the presets available from LMER_PRESETS_FILE and exit")
     parser.add_argument("--agents", dest="agents", help="Comma-delimited preset names the session's agent may fan a task out to via spawn-harness (env: LMER_AGENTS; the flag wins). Names are resolved against LMER_PRESETS_FILE host-side (unknown names fail fast); each preset contributes its env overlay plus --harness/--prompt folded from its args — the remaining launch-shaping fields (checkout/service/other args) are ignored with a warning — and only that resolved config is forwarded into the container.")
 
@@ -820,6 +823,59 @@ def _display_presets_cli() -> int:
     return 0
 
 
+def _selected_task_id(ns: argparse.Namespace) -> str | None:
+    """The taskdef id this invocation selected, or ``None`` under --no-task.
+
+    One home for the ``ns.task`` / ``ns.no_task`` pairing: under ``--no-task``
+    argparse still binds a positional to ``ns.task`` (with ``--exec true`` the
+    task is literally ``"true"``), so every consumer must gate on ``no_task``
+    rather than reading ``ns.task`` alone.
+    """
+    return ns.task if not ns.no_task else None
+
+
+def _warn_on_scoped_preset_tier_override(
+    preset_source: str | None,
+    task_id: str | None,
+    early_env_file_sources: dict[str, str],
+) -> None:
+    """Warn when a file-sourced scoped var outranks an *exported* LMER_PRESET.
+
+    Selection is by specificity, not by source tier: ``LMER_<TASK>_PRESET``
+    beats ``LMER_PRESET`` wherever each came from. That is the intended
+    contract (a per-task override in ``~/.lmer/.env`` is the feature), but it
+    has one genuinely surprising case — a scoped var sitting in a ``.env``
+    file silently outranking a ``LMER_PRESET`` the operator exported on this
+    very command line. Everywhere else lmer resolves file-vs-export in the
+    export's favor, so that case gets a warning naming both sides and the
+    per-invocation escape hatch.
+
+    Deliberately narrow: nothing is said when both selectors come from the
+    same tier (the documented "global default + per-task override in one
+    .env" setup would otherwise warn on every run), nor when the scoped var
+    is itself exported (an export outranking an export is unsurprising).
+    """
+    scoped_var = task_preset_env_name(task_id)
+    if not scoped_var or preset_source != scoped_var:
+        return
+    # Via preset_env_value so the blank-is-unset rule has exactly one home —
+    # a whitespace-only LMER_PRESET must not warn about being "overridden"
+    # when the selector itself reads it as unset.
+    generic = preset_env_value(PRESET_ENV)
+    if not generic:
+        return
+    scoped_from_file = early_env_file_sources.get(scoped_var)
+    generic_from_file = PRESET_ENV in early_env_file_sources
+    if not scoped_from_file or generic_from_file:
+        return
+    warning(
+        f"⚠️  {scoped_var} (from {scoped_from_file}) overrides the exported "
+        f"{PRESET_ENV}={generic} for this task — taskdef-scoped selection wins "
+        f"regardless of where each value came from. Use --preset to choose "
+        f"per invocation."
+    )
+
+
 def _resolve_and_apply_preset(
     ns: argparse.Namespace,
     rest: list[str],
@@ -828,30 +884,51 @@ def _resolve_and_apply_preset(
 ) -> tuple[argparse.Namespace, list[str], dict[str, str]] | int:
     """Resolve the selected startup preset and apply it to the invocation.
 
-    Selection is ``--preset`` > ``LMER_PRESET`` (matching the
-    --harness/LMER_HARNESS convention). Must run after the early .env load
-    (so LMER_PRESET/LMER_PRESETS_FILE from .env files work) and before
-    argument validation / harness resolution (so preset args and env take
-    full effect). The explicit invocation always wins over the preset:
-    preset tokens are PREPENDED to argv (argparse last-wins), and preset env
-    is only applied over keys that are unset or .env-sourced — never over
-    exported shell environment.
+    Selection is ``--preset`` > ``LMER_<TASK>_PRESET`` > ``LMER_PRESET``
+    (flag-beats-env matching the --harness/LMER_HARNESS convention; the
+    taskdef-scoped var beats the generic one because it is the more specific
+    selector — issue #140). Specificity, not source tier: a .env-sourced
+    LMER_<TASK>_PRESET outranks even an exported LMER_PRESET, which is the
+    point of a per-task default but is warned about (see
+    _warn_on_scoped_preset_tier_override) because it is the one case where
+    file-beats-export contradicts the rest of the CLI. Must run after the
+    early .env load (so
+    LMER_PRESET/LMER_<TASK>_PRESET/LMER_PRESETS_FILE from .env files work)
+    and before argument validation / harness resolution (so preset args and
+    env take full effect). ``ns.task`` is already parsed here and a preset
+    cannot change it (preset args reject positional tokens below), so the
+    taskdef id the lookup uses is stable. The explicit invocation always
+    wins over the preset: preset tokens are PREPENDED to argv (argparse
+    last-wins), and preset env is only applied over keys that are unset or
+    .env-sourced — never over exported shell environment.
 
     Returns the (possibly re-parsed) ``(ns, rest, applied_env)`` on success —
     ``applied_env`` being the preset env entries that actually won host-side,
     for the caller to seed into the container env dict — or an exit code on
     failure. No preset selected returns the inputs unchanged.
     """
-    preset_name = ns.preset or os.environ.get(PRESET_ENV) or None
+    # --no-task runs have no taskdef id, so only the flag and LMER_PRESET can
+    # select for them.
+    task_id = _selected_task_id(ns)
+    preset_name, preset_source = select_preset_name(ns.preset, task_id)
     applied_env: dict[str, str] = {}
     if not preset_name:
         return ns, rest, applied_env
+
+    _warn_on_scoped_preset_tier_override(
+        preset_source, task_id, early_env_file_sources
+    )
 
     presets = load_presets()
     preset = presets.get(preset_name)
     if preset is None:
         available = ", ".join(sorted(presets)) or "(none)"
-        error(f"❌ Unknown preset '{preset_name}'. Available presets: {available}")
+        # Name the selector: a stale LMER_REVIEW_PRESET in ~/.lmer/.env is
+        # otherwise indistinguishable from a mistyped flag.
+        error(
+            f"❌ Unknown preset '{preset_name}' (selected by {preset_source}). "
+            f"Available presets: {available}"
+        )
         if not os.environ.get(PRESETS_FILE_ENV, "").strip():
             error(f"   ({PRESETS_FILE_ENV} is not set, so no presets can load)")
         return 2
@@ -906,9 +983,16 @@ def _resolve_and_apply_preset(
             os.environ[key] = value
             early_env_file_sources[key] = f"preset ({preset.name})"
             applied_env[key] = value
+    details = []
+    # The flag is visible in the command line the operator just typed; an env
+    # var (especially a .env-sourced one) is not, so attribute those.
+    if preset_source and preset_source != "--preset":
+        details.append(f"via {preset_source}")
+    if applied_env:
+        details.append(f"env: {', '.join(sorted(applied_env))}")
     info(
         f"🎛️  Preset: {preset.name}"
-        + (f" (env: {', '.join(sorted(applied_env))})" if applied_env else "")
+        + (f" ({'; '.join(details)})" if details else "")
     )
     return ns, rest, applied_env
 
@@ -1329,7 +1413,7 @@ def main(argv: list[str] | None = None) -> int:
         if not ns.task and not ns.no_task:
             return 0
 
-    task_id = ns.task if not ns.no_task else None
+    task_id = _selected_task_id(ns)
     # Handle multiple targets: first is primary, rest are secondary.
     # ns.target is always a list with nargs="*" (possibly empty).
     # Partition special target types (e.g. Slack thread URLs) out before

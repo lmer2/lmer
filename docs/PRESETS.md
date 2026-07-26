@@ -12,7 +12,7 @@ any single spawner. Current consumers:
 | Consumer | How a preset is selected | Details |
 |---|---|---|
 | `lmer-slack-listener` (spawns a session per mention/DM) | `$preset:<name>` token in the triggering Slack message | [Slack-selected presets](#slack-selected-presets) |
-| The `lmer` CLI (direct invocations) | `--preset <name>` flag or `LMER_PRESET` env var | [CLI-selected presets](#cli-selected-presets) |
+| The `lmer` CLI (direct invocations) | `--preset <name>` flag, `LMER_<TASK>_PRESET` (one taskdef) or `LMER_PRESET` (all) env var | [CLI-selected presets](#cli-selected-presets) |
 | Agent fan-out (`spawn-harness` children, issue #130) | `--agents <name,...>` flag or `LMER_AGENTS` env var at launch | [Fan-out agents](#fan-out-agents---agents--lmer_agents) |
 
 The file format, validation rules, and trust model below are shared by every
@@ -45,6 +45,9 @@ Then select the preset by name:
 # From the CLI — flag or env var (the flag wins)
 lmer develop https://gitlab.example.com/group/project/-/issues/12 --preset my_service
 LMER_PRESET=my_service lmer develop https://gitlab.example.com/group/project/-/issues/12
+
+# ...or scoped to one taskdef: LMER_<TASK>_PRESET applies to that task only
+LMER_DEVELOP_PRESET=my_service lmer develop https://gitlab.example.com/group/project/-/issues/12
 
 # See what's available
 lmer --list-presets
@@ -146,14 +149,26 @@ preset:
 echo "LMER_PRESET=my_service" >> .env
 ```
 
+A preset can also be pinned for **one taskdef** with `LMER_<TASK>_PRESET` —
+see [Per-taskdef presets](#per-taskdef-presets-lmer_task_preset) below.
+
 On the CLI the preset supplies **defaults; the explicit invocation always
 wins** (see the merge table below). The combined argument set is re-validated
 normally, and `--show-env` attributes preset-applied variables to
 `preset (<name>)`.
 
-Guard rails:
+Guard rails (these apply to every CLI selector — `--preset`,
+`LMER_<TASK>_PRESET` and `LMER_PRESET` alike):
 
-- An unknown name fails fast (exit 2) listing the available presets.
+- An unknown name fails fast (exit 2) listing the available presets and
+  naming the selector that chose it (`--preset`, `LMER_<TASK>_PRESET`, or
+  `LMER_PRESET`) — a typo'd taskdef-scoped variable never silently falls back
+  to `LMER_PRESET`, and a `--verbose` run names the selector in the
+  `🎛️  Preset:` line as well.
+- A **blank** selector counts as unset and falls through to the next one:
+  `LMER_REVIEW_PRESET= lmer review …` drops back to `LMER_PRESET`, and
+  `LMER_PRESET= lmer develop …` runs with no preset. Values are stripped, so
+  `--preset " demo "` and `LMER_PRESET=" demo "` behave identically.
 - Preset `args` must be known lmer flags — a bare positional, a literal `--`,
   or an unrecognized token fails fast (exit 2) rather than silently rebinding
   your command line.
@@ -162,6 +177,68 @@ Guard rails:
   command line instead.
 
 CLI quick reference: [Startup presets in docs/LMER-CLI.md](./LMER-CLI.md#startup-presets---preset--lmer_preset).
+
+### Per-taskdef presets (`LMER_<TASK>_PRESET`)
+
+A preset can be pinned for **one taskdef** instead of all of them (issue
+#140). The variable name derives from the taskdef id — uppercased, with every
+non-alphanumeric character folded to an underscore:
+
+| Invocation | Taskdef-scoped variable |
+| --- | --- |
+| `lmer review <mr-url>` | `LMER_REVIEW_PRESET` |
+| `lmer develop <issue-url>` | `LMER_DEVELOP_PRESET` |
+| `lmer code-review <mr-url>` | `LMER_CODE_REVIEW_PRESET` |
+
+The derivation is mechanical, so work-repo taskdefs and ones from
+`LMER_TASKDEF_PATHS` get a scoped variable too — nothing has to be registered.
+Two consequences of that, both invisible when they bite:
+
+- It is **many-to-one**. `code-review`, `code_review` and `code.review` all
+  fold to `LMER_CODE_REVIEW_PRESET`, so two separator-variant taskdefs on the
+  search path would share one selector. No current taskdef set does.
+- An id with no ASCII alphanumerics (e.g. a non-Latin name) folds to nothing
+  and therefore has **no** scoped selector; use `LMER_PRESET` or `--preset`
+  for it.
+
+Selection order, most specific first:
+
+1. `--preset <name>` — the flag always wins.
+2. `LMER_<TASK>_PRESET` — applies to that taskdef only.
+3. `LMER_PRESET` — the default for every other taskdef.
+
+So a global default and per-task overrides can coexist:
+
+```bash
+# ~/.lmer/.env
+LMER_PRESET=default_config        # every task
+LMER_REVIEW_PRESET=sol_review     # except review, which uses this
+```
+
+`lmer develop <url>` gets `default_config`, `lmer review <url>` gets
+`sol_review`, and `lmer review <url> --preset other` gets `other`. A
+`--no-task` invocation has no taskdef id, so only `--preset`/`LMER_PRESET`
+apply to it.
+
+**The order is by specificity, not by source tier.** A scoped variable beats
+`LMER_PRESET` no matter where each value came from — including a
+`LMER_REVIEW_PRESET` in `~/.lmer/.env` beating a `LMER_PRESET` you exported on
+the command line. That is deliberate (a per-task default that an unrelated
+export could silently disable would be useless), and it is the one place where
+lmer resolves file-versus-export in the file's favor, so that specific
+combination prints a warning naming both sides:
+
+```
+⚠️  LMER_REVIEW_PRESET (from .env (lmer state dir)) overrides the exported
+    LMER_PRESET=safe for this task — taskdef-scoped selection wins regardless
+    of where each value came from. Use --preset to choose per invocation.
+```
+
+`--preset` is the per-invocation override: it wins over both variables from
+any source. The warning is deliberately narrow — it stays quiet when both
+selectors come from the same tier (the global-default-plus-override `.env`
+above would otherwise warn on every run) and when the scoped variable is
+itself exported.
 
 ## Fan-out agents (`--agents` / `LMER_AGENTS`)
 
