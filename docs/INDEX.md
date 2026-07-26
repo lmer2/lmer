@@ -136,7 +136,7 @@ How `--service` and `--checkout` let lmer run against an already-running contain
 ### [PRESETS.md](./PRESETS.md)
 **Startup Presets**
 
-Named, operator-defined startup configurations (`LMER_PRESETS_FILE`) that a session starter selects by name — via a `$preset:<name>` Slack token or `lmer --preset` / `LMER_PRESET` on the CLI:
+Named, operator-defined startup configurations (`LMER_PRESETS_FILE`) that a session starter selects by name — via a `$preset:<name>` Slack token or `lmer --preset` / `LMER_<TASK>_PRESET` / `LMER_PRESET` on the CLI:
 - The presets file: JSON format, field reference (`checkout`, `service`, `env`, `args`)
 - Loading and validation rules (forgiving by design) and the trust model
 - Per-consumer merge semantics (Slack listener vs. direct CLI) and why they differ
