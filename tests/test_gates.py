@@ -953,6 +953,182 @@ class TestCheckChangelog:
         assert result.status == CheckStatus.WARNING
         assert "Changelog not updated" in result.message
 
+    def test_fragment_staged_with_changelog(self, tmp_path, monkeypatch):
+        """Test pass when a changelog.d fragment is staged (changelog present)"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "changelog.d" / "20260718-foo.yaml").write_text("added:\n  - foo\n")
+        subprocess.run(["git", "add", "changelog.d/20260718-foo.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.PASSED
+        assert "changelog.d/20260718-foo.yaml" in result.message
+
+    def test_fragment_staged_without_changelog_file(self, tmp_path, monkeypatch):
+        """Test pass when a fragment is staged and no changelog file exists"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "changelog.d" / "20260718-foo.yaml").write_text("added:\n  - foo\n")
+        subprocess.run(["git", "add", "changelog.d/20260718-foo.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.PASSED
+        assert "changelog.d/20260718-foo.yaml" in result.message
+
+    def test_fragment_only_repo_nothing_staged(self, tmp_path, monkeypatch):
+        """Fragment-only repo (changelog.d/, no changelog file): the
+        no-changelog warning points at the fragment convention"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "main.py").write_text("print('hello')")
+        subprocess.run(["git", "add", "main.py"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "No changelog file found" in result.message
+        assert any("changelog.d/YYYYMMDD-<topic>.yaml" in d for d in result.details)
+        assert not result.is_critical
+
+    def test_changelog_d_present_nothing_staged(self, tmp_path, monkeypatch):
+        """Test warning details point at fragment authoring when changelog.d exists"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "main.py").write_text("print('hello')")
+        subprocess.run(["git", "add", "main.py"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+        assert any("changelog.d/YYYYMMDD-<topic>.yaml" in d for d in result.details)
+        assert not result.is_critical
+
+    def test_no_changelog_d_warning_unchanged(self, tmp_path, monkeypatch):
+        """Regression: without changelog.d/, warning behavior is unchanged"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "main.py").write_text("print('hello')")
+        subprocess.run(["git", "add", "main.py"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+        assert result.details == ["Update the changelog if this commit includes user-facing changes"]
+
+    def test_non_yaml_fragment_does_not_count(self, tmp_path, monkeypatch):
+        """Test that a staged non-YAML file under changelog.d/ is not a fragment"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "changelog.d" / "README.md").write_text("# Fragments\n")
+        subprocess.run(["git", "add", "changelog.d/README.md"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+
+    def test_changelog_staged_with_changelog_d_present(self, tmp_path, monkeypatch):
+        """Test pass when CHANGELOG.yaml itself is staged and changelog.d exists"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        subprocess.run(["git", "add", "CHANGELOG.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.PASSED
+        assert "Changelog updated" in result.message
+
+    def test_staged_fragment_deletion_does_not_count(self, tmp_path, monkeypatch):
+        """A staged DELETION of a fragment is not a changelog update"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        frag = tmp_path / "changelog.d" / "20260718-old.yaml"
+        frag.write_text("added:\n- x\n")
+        subprocess.run(["git", "add", "changelog.d/20260718-old.yaml"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "seed"], check=True, capture_output=True)
+        subprocess.run(["git", "rm", "changelog.d/20260718-old.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+
+    def test_nested_fragment_does_not_count(self, tmp_path, monkeypatch):
+        """Only files directly under changelog.d/ count as fragments"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d" / "sub").mkdir(parents=True)
+        (tmp_path / "changelog.d" / "sub" / "20260718-x.yaml").write_text("added:\n- x\n")
+        subprocess.run(["git", "add", "changelog.d/sub/20260718-x.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+
+    def test_non_yaml_fragment_counts_in_non_ctl_repo(self, tmp_path, monkeypatch):
+        """changelog.d beside a non-YAML changelog is another tool's
+        convention — any staged fragment file counts, and the warning hint
+        does not prescribe the ctl YAML format"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.md").write_text("# Changelog\n")
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "changelog.d" / "123.feature.rst").write_text("Added a thing.\n")
+        subprocess.run(["git", "add", "changelog.d/123.feature.rst"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.PASSED
+        assert "123.feature.rst" in result.message
+
+        # And with nothing staged, the hint is convention-neutral.
+        subprocess.run(["git", "reset"], check=True, capture_output=True)
+        (tmp_path / "main.py").write_text("print('hello')")
+        subprocess.run(["git", "add", "main.py"], check=True, capture_output=True)
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert any("this repo's fragment convention" in d for d in result.details)
+        assert not any("YYYYMMDD-<topic>.yaml" in d for d in result.details)
+
 
 class TestCheckDeliverableFormats:
     """check_deliverable_formats(): spec-class deliverables are Markdown (#102)."""
