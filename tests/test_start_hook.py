@@ -495,6 +495,10 @@ class TestTaskdefSchemaVersioning:
         # Inherited spine from base-task.jinja2:
         assert "## Phase -1: Branch Setup" in out
         assert "DO NOT be used outside tests" in out
+        # This fixture does not override do_not_branch_rule, so it pins the
+        # default path: emptying the block body base-side would silently drop
+        # the branch-discipline HARD RULE from every inheriting taskdef.
+        assert "always create a new branch first" in out
         banner = capsys.readouterr().out
         assert (
             f"taskdef source: {FIXTURES / 'schema2'} (schema 2)" in banner

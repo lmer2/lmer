@@ -105,14 +105,16 @@ as ordered, individually overridable Jinja blocks: `intro` → `service_mode`
 → `run_state` → `branch_setup` → `self_dev` → `phase0_tools` (containing
 `provider_tooling`) → `project_info` → `secrets` → `clean_gate` →
 `task_phases` → `changelog` → `phasic` → `delivery` → `close_out` →
-`do_not` (containing `do_not_extra`).
+`do_not` (containing `do_not_branch_rule` and `do_not_extra`).
 
 A schema-2 body extends the base and overrides only what makes it that
 task. `intro` and `task_phases` are the required per-task pieces —
 `task_phases` is the task's own workflow and renders empty if not
 overridden. Add task-specific HARD RULES via `do_not_extra` instead of
-replacing the whole `do_not` list; extend a block while keeping its base
-content with `{% raw %}{{ super() }}{% endraw %}`.
+replacing the whole `do_not` list; a task that continues on an existing
+branch instead of creating one (e.g. `followup`) overrides just the
+branch-discipline rule via `do_not_branch_rule`; extend a block while
+keeping its base content with `{% raw %}{{ super() }}{% endraw %}`.
 
 ## Schema versioning
 
