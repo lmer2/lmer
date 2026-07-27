@@ -148,6 +148,12 @@ class TestRenderMatrix:
             assert "## Phase 1: Matrix demo work" in out
             assert "## Phase -1: Branch Setup" in out
             assert "DO NOT leave the render matrix" in out
+            # The nested do_not_branch_rule block is part of the block
+            # interface (docs/TASKDEFS.md) — the fixture overrides it, so
+            # removing or renaming it base-side fails here, not only in
+            # the external-source matrix.
+            assert "the matrix continues on an existing one" in out
+            assert "always create a new branch first" not in out
             assert (
                 f"taskdef source (base-task.jinja2): {REPO_TASKDEF} "
                 "(schema 1)" in banner
@@ -202,6 +208,7 @@ class TestTierShadowing:
             "{% block intro %}{% endblock %}\n"
             "WORKREPO-BASE-MARKER\n"
             "{% block task_phases %}{% endblock %}\n"
+            "{% block do_not_branch_rule %}{% endblock %}\n"
             "{% block do_not_extra %}{% endblock %}\n"
         )
         monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))

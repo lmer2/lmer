@@ -24,6 +24,9 @@
     delivery         — After Pushing: MR/PR creation
     close_out        — closing out the run
     do_not           — the DO-NOT list; add rules via nested do_not_extra
+    do_not_branch_rule — nested: the branch-discipline HARD RULE alone;
+                       override for tasks that continue on an existing
+                       branch (e.g. followup) instead of creating one
     do_not_extra     — nested: task-specific DO-NOT additions
 
   Renaming or removing a block here is a schema bump (Jinja silently drops
@@ -158,7 +161,7 @@ When the work is delivered (MR created, or the task is otherwise complete):
 - HARD RULE: DO NOT make assumptions about requirements without asking
 - HARD RULE: DO NOT push to any repository without explicit permission
 - HARD RULE: DO NOT commit without explicit user approval or request
-- HARD RULE: DO NOT develop on `main` — always create a new branch first
+{% block do_not_branch_rule %}- HARD RULE: DO NOT develop on `main` — always create a new branch first{% endblock %}
 - HARD RULE: DO NOT add `Co-Authored-By`, `Signed-off-by`, or any self-reference tags to commit messages
 {% block do_not_extra %}{% endblock %}
 {% endblock %}
