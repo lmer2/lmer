@@ -67,6 +67,12 @@ DELIVERABLE_NAME_RE = re.compile(r"\b(?:spec|plan|report)", re.IGNORECASE)
 # unreviewable in GitLab (undiffable, unlinkable at line level).
 BINARY_DOC_EXTENSIONS = {".docx", ".doc", ".pdf", ".odt", ".rtf"}
 
+# check_changelog() warning hints for repos with a changelog.d/ directory
+CTL_FRAGMENT_HINT = "Or stage a fragment: changelog.d/YYYYMMDD-<topic>.yaml"
+OTHER_TOOL_FRAGMENT_HINT = (
+    "Or stage a changelog.d/ fragment in this repo's fragment convention"
+)
+
 
 def receipt_argv() -> List[str]:
     """The invocation as run, with the interpreter-resolved path reduced to
@@ -733,6 +739,33 @@ class GateSystem:
             message="All documentation present"
         )
 
+    def _staged_changelog_fragments(self, ctl_fragment_mode: bool) -> List[str]:
+        """Return staged changelog.d/ fragment files.
+
+        Only files directly under changelog.d/ count; dotfiles and README
+        are never fragments. In ctl mode only *.yaml/*.yml files count; in
+        other-tool mode (towncrier/scriv) any extension counts.
+        --diff-filter=ACMR: a staged DELETION of a fragment (e.g. a revert,
+        or a release commit removing rolled fragments) is not itself a
+        changelog update.
+        """
+        code, stdout, _ = self.run_command(
+            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"]
+        )
+        if code != 0:
+            return []
+        staged_files = stdout.strip().split('\n') if stdout.strip() else []
+        return [
+            f for f in staged_files
+            if Path(f).parent == Path("changelog.d")
+            and not Path(f).name.startswith(".")
+            and Path(f).stem.upper() != "README"
+            and (
+                not ctl_fragment_mode
+                or Path(f).suffix.lower() in (".yaml", ".yml")
+            )
+        ]
+
     def check_changelog(self) -> CheckResult:
         """Check if a changelog file exists and has been updated in staged changes."""
         # Common changelog file patterns (case-insensitive matching via .upper())
@@ -751,12 +784,43 @@ class GateSystem:
                     existing_changelogs.append(item.name)
                     break
 
+        # changelog.d fragment support: a staged fragment counts as a
+        # changelog update. Mode follows the changelog file: with a YAML
+        # changelog (or none at all — a fragment-only project pre first
+        # release) the repo is ctl-style and only *.yaml/*.yml fragments
+        # count; with a non-YAML changelog (CHANGELOG.md etc.) the
+        # changelog.d/ convention belongs to another tool (towncrier/scriv)
+        # and any staged fragment file counts, whatever its extension.
+        # Checked before the "no changelog file" early return so
+        # fragment-only projects still pass. Known limitation: only the
+        # default layout (a root-level changelog.d/ beside the changelog) is
+        # implemented; ctl's configurable fragments_dir is not consulted.
+        changelog_d = self.project_root / "changelog.d"
+        ctl_fragment_mode = not existing_changelogs or any(
+            Path(f).suffix.lower() in (".yaml", ".yml") for f in existing_changelogs
+        )
+        if changelog_d.is_dir():
+            staged_fragments = self._staged_changelog_fragments(ctl_fragment_mode)
+            if staged_fragments:
+                return CheckResult(
+                    name="Changelog",
+                    status=CheckStatus.PASSED,
+                    message=f"Changelog fragment staged: {', '.join(staged_fragments)}"
+                )
+
         if not existing_changelogs:
+            details = ["Consider adding a changelog to communicate changes to users"]
+            if changelog_d.is_dir():
+                # Fragment-only repo (changelog file materializes at first
+                # release): point at the repo's own convention. No changelog
+                # file means ctl_fragment_mode is True by construction, so
+                # the ctl-style hint is always the right one here.
+                details.append(CTL_FRAGMENT_HINT)
             return CheckResult(
                 name="Changelog",
                 status=CheckStatus.WARNING,
                 message="No changelog file found (e.g., CHANGELOG.yaml, CHANGES.md)",
-                details=["Consider adding a changelog to communicate changes to users"],
+                details=details,
                 is_critical=False
             )
 
@@ -774,11 +838,16 @@ class GateSystem:
         staged_changelogs = [f for f in staged_files if f in existing_changelogs]
 
         if not staged_changelogs:
+            details = ["Update the changelog if this commit includes user-facing changes"]
+            if changelog_d.is_dir():
+                details.append(
+                    CTL_FRAGMENT_HINT if ctl_fragment_mode else OTHER_TOOL_FRAGMENT_HINT
+                )
             return CheckResult(
                 name="Changelog",
                 status=CheckStatus.WARNING,
                 message=f"Changelog not updated (found: {', '.join(existing_changelogs)})",
-                details=["Update the changelog if this commit includes user-facing changes"],
+                details=details,
                 is_critical=False
             )
 

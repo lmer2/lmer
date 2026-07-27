@@ -1,0 +1,5 @@
+added:
+- "changelog.d/ fragment directory: unreleased changelog entries now ship as per-branch YAML fragments (rolled into CHANGELOG.yaml at release via ctl's fragment support), eliminating the cross-MR CHANGELOG.yaml merge-conflict class; format and conventions documented in changelog.d/README.md and docs/DEVELOPMENT.md (#126)"
+- "gate-check's Changelog check recognizes staged changelog.d/*.yaml fragments as changelog updates (including in repos that have no changelog file yet) and points at fragment authoring in its not-updated warning when changelog.d/ exists (#126)"
+changed:
+- "the provisioned changelog taskdef instructions teach fragment mode: in a repo with both changelog.d/ and CHANGELOG.yaml, agents write a uniquely-named changelog.d/YYYYMMDD-<branch-slug>.yaml fragment instead of editing the unreleased section (#126)"

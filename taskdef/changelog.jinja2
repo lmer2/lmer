@@ -2,7 +2,35 @@
 
 This project tracks changes in a changelog file. You must update it as part of your work.
 
-### Locating the Changelog
+### Fragment mode (changelog.d/) — check this FIRST
+
+If the project root contains BOTH a `changelog.d/` directory AND a
+`CHANGELOG.yaml`, the project uses ctl-style changelog fragments. In that
+case do NOT edit the changelog file's `unreleased:` section — add a new
+uniquely-named fragment file instead:
+
+- Path: `changelog.d/YYYYMMDD-<topic>.yaml`, where `<topic>` is your branch
+  slug (e.g. branch `fix/login-timeout` → `changelog.d/20260718-login-timeout.yaml`).
+  One fragment per branch/task; never edit or reuse another branch's fragment.
+- Content: a mapping of section name → list of entry strings, using the same
+  categories as below (lowercase, case-sensitive):
+
+  ```yaml
+  fixed:
+  - "Fixed login timeout when using SSO"
+  ```
+
+- The what-to-include rules below apply unchanged. Fragments are rolled into
+  `CHANGELOG.yaml` at release time; you never do that roll yourself.
+
+A `changelog.d/` directory beside a NON-YAML changelog (e.g. `CHANGELOG.md`)
+is some other tool's fragment convention (towncrier/scriv) — follow that
+project's own documented format instead of writing YAML fragments. A
+`changelog.d/` with no changelog file at all is a fragment-only project:
+match the format of its existing fragments (`.yaml` fragments → the
+ctl-style format above).
+
+### Locating the Changelog (no fragment mode)
 
 Look for an existing changelog file in the project root. Common names include:
 - `CHANGELOG.yaml`, `CHANGELOG.md`, `CHANGELOG.rst`, `CHANGELOG.txt`
@@ -51,7 +79,7 @@ The changelog communicates changes **to users of the project**. Write entries fr
 ### When to Update
 
 - Update the changelog when your changes include user-facing additions, fixes, removals, or behavior changes.
-- Place entries under the `unreleased:` section.
+- Place entries under the `unreleased:` section (or, in fragment mode, in your branch's `changelog.d/` fragment).
 - Do NOT update the changelog for purely internal changes (refactors, test improvements, CI config).
 - If the project uses a different changelog format than YAML, follow the existing format and conventions.
 

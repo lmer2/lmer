@@ -1,5 +1,7 @@
 # lmer change log
 #
+# New unreleased entries go in per-branch fragments under changelog.d/
+# (see changelog.d/README.md) — do not append to `unreleased:` here.
 # Entries under `unreleased` accumulate between releases. Issue numbers
 # referenced in older entries (e.g. `#19`–`#36`) are from the project's
 # pre-open-source GitLab tracker and are kept here for historical context;
