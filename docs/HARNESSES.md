@@ -241,6 +241,14 @@ about progress), and when a child dies its `--output` file gets a
 `[spawn-harness] child FAILED` footer carrying the exit reason and the
 stderr tail, so a failed agent's output explains itself.
 
+The mirrored exit code outranks the footer: once the child has run, a footer
+`spawn-harness` cannot write — a full or read-only filesystem — warns on stderr
+(`cannot append the failure footer to <path>`) and leaves the code alone, rather
+than replacing the 124 or the child's own status with a traceback from the
+wrapper (issue #151). Closing the captured output is guarded the same way, since
+a buffered write can succeed and only surface its `ENOSPC` when the buffer
+drains.
+
 A child that *succeeds while saying nothing at all* is the failure the exit
 code cannot express — the shape behind issue #137, where a child ended its
 turn on `Shall I proceed with this fix? (yes/no)` and exited 0, so the

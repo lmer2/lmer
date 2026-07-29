@@ -768,6 +768,148 @@ class TestDegenerateOutputEndToEnd:
         assert "no usable output" in err
         assert "cannot append the no-usable-output footer" in err
 
+
+class _UnwritableOutput:
+    """An output handle that fails the way a full filesystem does.
+
+    ``fileno`` stays real — the child's stdout is redirected to the fd, so the
+    subprocess must still receive a genuine file — while *our* footer writes
+    (``fail_writes``) or the final ``close`` (``fail_close``) raise. That is
+    what ``run_child`` sees on a full or read-only filesystem, without a
+    ``chmod`` a root-run suite would ignore.
+    """
+
+    def __init__(self, handle, fail_writes=True, fail_close=False):
+        self._handle = handle
+        self._fail_writes = fail_writes
+        self._fail_close = fail_close
+
+    def fileno(self):
+        return self._handle.fileno()
+
+    def write(self, *args):
+        if self._fail_writes:
+            raise OSError("No space left on device")
+        return self._handle.write(*args)
+
+    def writelines(self, *args):
+        if self._fail_writes:
+            raise OSError("No space left on device")
+        return self._handle.writelines(*args)
+
+    def flush(self):
+        if self._fail_writes:
+            raise OSError("No space left on device")
+        return self._handle.flush()
+
+    def close(self):
+        self._handle.close()
+        if self._fail_close:
+            raise OSError("No space left on device")
+
+
+def _unwritable_output(monkeypatch, output, **kwargs):
+    """Hand run_child an output handle that cannot be written (or closed)."""
+    real_open = builtins.open
+
+    def wrap(path, mode="r", *args, **more):
+        handle = real_open(path, mode, *args, **more)
+        if str(path) == str(output) and "w" in mode:
+            return _UnwritableOutput(handle, **kwargs)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", wrap)
+
+
+class TestFooterWriteFailuresKeepTheExitCode:
+    """The mirrored exit code is the one contract spawn-harness promises its
+    callers, and a fan-out caller needs it most on the paths where the child
+    died. Our own inability to append a footer must therefore warn and get out
+    of the way, never replace the code with a traceback (issue #151)."""
+
+    def test_failed_child_keeps_its_own_code(self, tmp_path, capsys, monkeypatch):
+        out = tmp_path / "result.md"
+        _unwritable_output(monkeypatch, out)
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out)],
+            exit_code=3,
+            stderr_text="No API key found for kimi-coding",
+        )
+        assert code == 3
+        assert "cannot append the failure footer" in capsys.readouterr().err
+
+    def test_timed_out_child_still_reports_124(self, tmp_path, capsys, monkeypatch):
+        out = tmp_path / "result.md"
+        _unwritable_output(monkeypatch, out)
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out), "--timeout", "0.2"],
+            sleep=30,
+        )
+        assert code == spawn_harness.TIMEOUT_EXIT_CODE
+        assert "cannot append the failure footer" in capsys.readouterr().err
+
+    def test_interrupt_still_maps_to_128_plus_sigint(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        # The guard here wraps only the footer write: the KeyboardInterrupt
+        # still has to unwind into SystemExit(128 + SIGINT), so a swallowed
+        # interrupt would show up as a 0/3 exit instead of 130.
+        out = tmp_path / "result.md"
+        _unwritable_output(monkeypatch, out)
+        real_wait = subprocess.Popen.wait
+        interrupted = []
+
+        def interrupt_first_wait(self, timeout=None):
+            if not interrupted:
+                interrupted.append(True)
+                raise KeyboardInterrupt
+            return real_wait(self, timeout=timeout)
+
+        monkeypatch.setattr(subprocess.Popen, "wait", interrupt_first_wait)
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out)],
+            sleep=30,
+        )
+        assert code == 128 + signal.SIGINT
+        err = capsys.readouterr().err
+        assert "interrupted — child killed" in err
+        assert "cannot append the failure footer" in err
+
+    def test_close_failure_after_a_footer_keeps_the_childs_code(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        # A buffered handle can hold a doomed write until close() drains it, so
+        # the close is guarded too — otherwise the same ENOSPC clobbers the
+        # exit code one line past the footer guard.
+        out = tmp_path / "result.md"
+        _unwritable_output(monkeypatch, out, fail_writes=False, fail_close=True)
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out)],
+            exit_code=3,
+        )
+        assert code == 3
+        assert "cannot close --output" in capsys.readouterr().err
+        # The footer itself wrote fine — only the close failed.
+        assert "[spawn-harness] child FAILED: exit code 3" in out.read_text()
+
+    def test_close_failure_on_the_success_path_keeps_zero(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        out = tmp_path / "result.md"
+        _unwritable_output(monkeypatch, out, fail_writes=False, fail_close=True)
+        code, _, _ = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p", "--output", str(out)]
+        )
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "cannot close --output" in err
+        assert "no usable output" not in err
+
+
 class TestMainValidation:
     def _main(self, args, environ):
         with pytest.MonkeyPatch.context() as mp:

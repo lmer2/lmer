@@ -343,6 +343,55 @@ def _failure_footer(handle, reason: str, tail: "deque") -> None:
         handle.writelines(tail)
 
 
+def _write_failure_footer(
+    handle, reason: str, tail: "deque", output: Optional[str] = None
+) -> None:
+    """Write the failure footer, warning instead of raising when it cannot.
+
+    Every caller is past the child's exit, and :func:`run_child` mirrors that
+    exit code — the one contract ``spawn-harness`` promises its callers. On a
+    full or read-only filesystem, letting our own inability to write a note
+    escape would replace the code the caller needs (a timeout's
+    :data:`TIMEOUT_EXIT_CODE`, a failed child's own code) with a traceback from
+    the harness, on exactly the paths where an accurate code matters most
+    (issue #151). So the failure is reported the same way
+    :func:`warn_degenerate_output` reports its own: a stderr warning, which the
+    orchestrating agent's background shell surfaces, and an unchanged exit code.
+
+    The ``flush()`` is part of the guard, not an afterthought: writes into a
+    buffered handle frequently succeed while the filesystem is full, and the
+    ``ENOSPC`` surfaces only when the buffer drains. Flushing here catches it
+    where it can still be absorbed.
+    """
+    try:
+        _failure_footer(handle, reason, tail)
+        handle.flush()
+    except OSError as exc:
+        where = f" to {output}" if output else ""
+        print(
+            f"⚠️  spawn-harness: cannot append the failure footer{where}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def _close_output(handle, output: Optional[str] = None) -> None:
+    """Close the captured-output handle, warning instead of raising.
+
+    The tail end of :func:`_write_failure_footer`'s reasoning: a buffered
+    handle can hold a doomed write until ``close()`` flushes it, so an
+    unguarded close would clobber the mirrored exit code one line after the
+    footer guard saved it.
+    """
+    try:
+        handle.close()
+    except OSError as exc:
+        where = f" {output}" if output else ""
+        print(
+            f"⚠️  spawn-harness: cannot close --output{where}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def classify_degenerate_output(content: str) -> Optional[str]:
     """Return why ``content`` is unusable as a child's answer, else ``None``.
 
@@ -438,8 +487,9 @@ def warn_degenerate_output(agent_name: str, output: str) -> Optional[str]:
     )
     # Guarded rather than left to propagate: the child has already exited 0 and
     # run_child mirrors that code, so failing to write a note must not become a
-    # changed exit status. _failure_footer still lacks this guard on the failure
-    # and timeout paths — pre-existing (#130 / !159), tracked as issue #151.
+    # changed exit status. Same contract as _write_failure_footer, reached
+    # through its own `with open(...)` because this footer appends by path
+    # rather than through run_child's still-open handle.
     try:
         with open(output, "a", encoding="utf-8") as handle:
             _degenerate_footer(handle, reason)
@@ -497,7 +547,9 @@ def run_child(
     natural completion, still writing an output file the orchestrator
     believes is final. An unwritable output path, a missing harness binary,
     or an oversized argv fail loudly (exit 2) like every other
-    configuration problem.
+    configuration problem — but once the child has run, the mirrored code
+    wins over our own I/O trouble: a footer or close we cannot complete
+    warns and leaves the code alone (:func:`_write_failure_footer`).
     """
     try:
         stdout = open(output, "w") if output else None
@@ -553,7 +605,12 @@ def run_child(
             pump.join(timeout=5)
             print("❌ spawn-harness interrupted — child killed", file=sys.stderr)
             if stdout:
-                _failure_footer(stdout, "spawn-harness interrupted", stderr_tail)
+                # Narrow on purpose: only the footer write is guarded, so the
+                # OSError it may raise is absorbed while the interrupt itself
+                # keeps unwinding below.
+                _write_failure_footer(
+                    stdout, "spawn-harness interrupted", stderr_tail, output
+                )
             if isinstance(exc, KeyboardInterrupt):
                 raise SystemExit(128 + signal.SIGINT) from None
             raise
@@ -566,24 +623,26 @@ def run_child(
         pump.join(timeout=5)
         if timed_out:
             if stdout:
-                _failure_footer(stdout, f"timed out after {timeout:g}s", stderr_tail)
+                _write_failure_footer(
+                    stdout, f"timed out after {timeout:g}s", stderr_tail, output
+                )
             return TIMEOUT_EXIT_CODE
         code = code if code >= 0 else 128 - code
         if stdout:
             if code != 0:
-                _failure_footer(stdout, f"exit code {code}", stderr_tail)
+                _write_failure_footer(stdout, f"exit code {code}", stderr_tail, output)
             else:
                 # Close our write handle before the degenerate check re-reads
                 # and appends through a second handle — the child's own writes
                 # went straight to the fd, but interleaving two handles on one
                 # file is a trap not worth leaving open.
-                stdout.close()
+                _close_output(stdout, output)
                 stdout = None
                 warn_degenerate_output(agent_name, output)
         return code
     finally:
         if stdout:
-            stdout.close()
+            _close_output(stdout, output)
 
 
 def _list_agents(config: Dict[str, dict]) -> None:
