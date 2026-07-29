@@ -221,7 +221,8 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - Signing keypair, branch/tag protection, `pypi` environment tag-pattern policy, `RELEASE_ALLOWED_SIGNERS` variable
 - Production PAT issuance and provisioning, bot account signing key, PyPI trusted publisher, GitLab protected tags
 - Mirror PR/collaborator policy and the green-rehearsal gate
-- These receipts gate the first production (G4) release run — a release run must refuse leg 2 while any item is unchecked
+- Split into **gating** receipts and **hardening** items: a release run must refuse leg 2 while any gating item is unchecked; hardening is tracked separately so it neither blocks a release nor passes unnoticed
+- Rehearsal waivers for a given release are recorded here with rationale and accepted residual
 
 **Best for**: The operator completing (and auditors reviewing) the production setup checklist before the first release run.
 
