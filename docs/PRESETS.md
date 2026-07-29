@@ -310,7 +310,14 @@ One `spawn-harness` invocation runs one child and blocks until it exits
 with its own background-shell tooling. While a child runs, heartbeat lines
 on stderr distinguish a healthy long run from a hung one, and a failed
 child's `--output` file carries a failure footer with the stderr tail
-instead of being silently empty. Children run permission-free (the
+instead of being silently empty. A child that exits 0 having produced
+nothing at all — empty, whitespace-only or stub-length — is warned about on
+stderr and marked with a distinct `[spawn-harness] child produced NO USABLE
+OUTPUT` footer, so a silently dropped agent is visible at fan-out time
+instead of quietly shrinking the consolidation to N-1. Whether prose is a
+*complete* answer is not judged (the exit code stays the child's own —
+see [Non-interactive exec mode in docs/HARNESSES.md](./HARNESSES.md#non-interactive-exec-mode-spawn-harness)).
+Children run permission-free (the
 lmer container is the security boundary), stateless (no run dirs, no
 work-repo writes), and cannot fan out further — `LMER_AGENTS` /
 `LMER_AGENTS_CONFIG` are stripped from the child environment, so there are
