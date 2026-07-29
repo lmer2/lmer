@@ -241,6 +241,44 @@ about progress), and when a child dies its `--output` file gets a
 `[spawn-harness] child FAILED` footer carrying the exit reason and the
 stderr tail, so a failed agent's output explains itself.
 
+A child that *succeeds while saying nothing at all* is the failure the exit
+code cannot express — the shape behind issue #137, where a child ended its
+turn on `Shall I proceed with this fix? (yes/no)` and exited 0, so the
+orchestrator consolidated from N-1 agents with every signal looking healthy.
+After a child exits 0, `spawn-harness` therefore inspects the captured
+`--output` and flags three degenerate shapes (issue #139): an empty file,
+whitespace-only content, and content below a 10-character floor (low on
+purpose — a real `no findings` must survive; only stubs like `ok` and `n/a`
+are caught). A hit warns on stderr naming the agent, the reason and the path,
+and appends a `[spawn-harness] child produced NO USABLE OUTPUT` footer —
+deliberately a different marker from `child FAILED`, because the exit code
+genuinely was 0 and "the agent died" and "the agent returned nothing" call for
+different responses. **The mirrored exit code is unchanged**: this warns, it
+never turns a terse answer into a hard failure.
+
+All three signals are properties of the bytes. **Whether prose amounts to a
+complete answer is deliberately not judged here** — including #137's own
+halt-and-ask shape, which this check therefore does not catch. Earlier versions
+tried: matching approval phrases on the last line, accepting `(y/n)` spellings,
+requiring a terminal `?`, grading the response by output length. Each reduced to
+inferring intent from phrasing, and a child can halt for any number of reasons
+worded any number of ways — an open question with no yes/no framing, or no
+question at all. Nothing separates the classes structurally: `Do you want me to
+apply the patch?` (34 characters, a halt) and `Looks fine. Should we also check
+the retry path?` (47, a real answer) are the same shape at the same size. The
+harness's own result envelope does not settle it either, since a model that
+stops to ask still ends its turn normally and reports success. Reading a
+half-finished answer as half-finished is a judgment about content — a job for a
+model, not a heuristic. Issue #153 tracks what the harnesses *can* report
+structurally (turn-limit truncation, in-band errors); issue #138 covers the
+hook-side session signal for sessions that fire hooks, which `spawn-harness`
+children do not.
+
+One limitation worth knowing: without `--output` the child's stdout flows
+straight through and cannot be inspected, so the check is skipped (fan-out
+invocations are expected to capture, but nothing enforces it — in that mode a
+dropped result is as invisible as it was before this existed; issue #152).
+
 | | claude | codex | pi |
 |---|---|---|---|
 | Invocation | `claude -p` | `codex exec` | `pi -p` |

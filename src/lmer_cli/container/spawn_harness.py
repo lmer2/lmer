@@ -32,6 +32,13 @@ harness is dropped rather than passed through — see
 Unlike the fail-soft provisioning modules in this package, this is an
 explicitly invoked tool: configuration problems fail loudly (exit 2), the
 child's exit code is mirrored, and a ``--timeout`` expiry exits 124.
+
+A child that succeeds while producing *nothing* is the one failure the exit
+code cannot express: an empty, whitespace-only or stub-length ``--output``
+warns on stderr and gets its own footer, while the real (zero) exit code is
+still mirrored — see :func:`classify_degenerate_output` (issue #139). Whether
+prose amounts to a *complete* answer is deliberately not guessed at here; that
+function explains why.
 """
 
 from __future__ import annotations
@@ -71,6 +78,12 @@ DEFAULT_HEARTBEAT_SECONDS = 60.0
 
 #: How many trailing stderr lines the failure footer preserves.
 STDERR_TAIL_LINES = 40
+
+#: Below this many non-whitespace-padded characters, a successful child's
+#: output counts as degenerate. Deliberately low: a legitimately terse answer
+#: ("no findings", 11 characters) must survive, so the floor only catches
+#: stubs like "ok" or "n/a" (issue #139).
+DEGENERATE_MIN_CHARS = 10
 
 
 def _fail(message: str) -> "SystemExit":
@@ -330,6 +343,115 @@ def _failure_footer(handle, reason: str, tail: "deque") -> None:
         handle.writelines(tail)
 
 
+def classify_degenerate_output(content: str) -> Optional[str]:
+    """Return why ``content`` is unusable as a child's answer, else ``None``.
+
+    A child that *dies* announces itself through its exit code and the failure
+    footer. A child that exits 0 having produced nothing useful announces
+    nothing at all: the orchestrator consolidates from N-1 agents and only the
+    output file's size hints that a result went missing (issue #139, the shape
+    observed in #137). This classifier is the detection half of the warning —
+    pure, so the same signals can be asserted directly.
+
+    Three signals, cheapest first: an empty file, whitespace-only content, and
+    content below :data:`DEGENERATE_MIN_CHARS`. All three are properties of the
+    bytes, not of what the child meant — a file with nothing in it is missing an
+    answer whatever the child was thinking.
+
+    **Deliberately absent: any judgment of whether prose is a complete answer.**
+    #137's child halted by asking permission, and earlier versions of this
+    function tried to catch that shape by matching the last line (approval
+    phrases, ``(y/n)`` spellings, a terminal ``?``, graded by output length).
+    Every variant reduced to guessing intent from phrasing, and a child can halt
+    for any number of reasons, phrased any number of ways — an open question with
+    no yes/no framing, or no question at all. Nothing separates a halt from a
+    legitimately terse answer structurally: ``Do you want me to apply the
+    patch?`` (34 characters, a halt) and ``Looks fine. Should we also check the
+    retry path?`` (47, an answer) are the same shape at the same size. The
+    harness's own result envelope does not settle it either — a model that stops
+    to ask still ends its turn normally and reports success — so the question is
+    a judgment about content, which needs a model rather than a heuristic. See
+    issue #153; #138 covers the hook-side session signal.
+    """
+    if not content:
+        return "output file is empty"
+    stripped = content.strip()
+    if not stripped:
+        return "output file is whitespace only"
+    if len(stripped) < DEGENERATE_MIN_CHARS:
+        return (
+            f"output is {len(stripped)} characters, below the "
+            f"{DEGENERATE_MIN_CHARS}-character floor"
+        )
+    return None
+
+
+def _degenerate_footer(handle, reason: str) -> None:
+    """Append the exited-0-with-nothing-usable record to the output file.
+
+    A marker of its own: the child's exit code genuinely was 0, and an
+    orchestrator scanning for ``child FAILED`` must be able to tell "the agent
+    died" from "the agent returned nothing". No stderr tail either — a healthy
+    child's diagnostics say nothing about why its answer is missing, and the
+    footer's job is to keep the file readable, not to reprint noise.
+    """
+    handle.write(f"\n---\n[spawn-harness] child produced NO USABLE OUTPUT: {reason} — ")
+    handle.write("the child exited 0, so this is a dropped result, not a failure\n")
+
+
+def warn_degenerate_output(agent_name: str, output: str) -> Optional[str]:
+    """Warn when a successfully exited child's ``output`` file is degenerate.
+
+    Reads the captured file back, classifies it, and — on a hit — prints a
+    stderr warning in the same family as the heartbeat and credential lines
+    (the orchestrating agent's background shell surfaces stderr; a footer
+    alone would only be found by opening the file) and appends the footer.
+    Returns the reason, or ``None`` when the output looks usable. The exit code
+    is the caller's business and stays the child's own: a fan-out that treated
+    a terse answer as a hard failure would be worse than the bug this catches.
+
+    Only the byte-level signals in :func:`classify_degenerate_output` reach
+    here; a file with real content in it is left alone, however that content
+    reads. An unreadable output file is not a degenerate child either — that is
+    our own I/O problem, so it warns and returns ``None`` rather than accusing
+    the agent.
+    """
+    try:
+        with open(output, encoding="utf-8", errors="replace") as handle:
+            content = handle.read()
+    except OSError as exc:
+        print(
+            f"⚠️  spawn-harness: cannot re-read --output {output} to check "
+            f"agent {agent_name!r}'s result: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    reason = classify_degenerate_output(content)
+    if reason is None:
+        return None
+    print(
+        f"⚠️  spawn-harness: agent {agent_name!r} exited 0 but produced no "
+        f"usable output — {reason} ({output}); the result is missing, not empty "
+        "by choice — re-run the agent or drop it from the consolidation "
+        "explicitly",
+        file=sys.stderr,
+    )
+    # Guarded rather than left to propagate: the child has already exited 0 and
+    # run_child mirrors that code, so failing to write a note must not become a
+    # changed exit status. _failure_footer still lacks this guard on the failure
+    # and timeout paths — pre-existing (#130 / !159), tracked as issue #151.
+    try:
+        with open(output, "a", encoding="utf-8") as handle:
+            _degenerate_footer(handle, reason)
+    except OSError as exc:
+        print(
+            f"⚠️  spawn-harness: cannot append the no-usable-output footer to "
+            f"{output}: {exc}",
+            file=sys.stderr,
+        )
+    return reason
+
+
 def _kill_process_group(proc: "subprocess.Popen") -> None:
     """SIGKILL the child's whole process group and reap it."""
     try:
@@ -350,6 +472,7 @@ def run_child(
     output: Optional[str],
     timeout: Optional[float],
     heartbeat: float = DEFAULT_HEARTBEAT_SECONDS,
+    agent_name: str = "child",
 ) -> int:
     """Run the child process, capturing stdout to ``output`` when given.
 
@@ -359,7 +482,10 @@ def run_child(
     output file explains itself). While the child runs, a heartbeat line is
     printed to stderr every ``heartbeat`` seconds (0 disables) — harnesses
     buffer their final answer, so the output file staying empty says
-    nothing about liveness. Returns the child's exit code — a signal-killed
+    nothing about liveness. A child that exits 0 having written nothing
+    usable is warned about instead (see :func:`warn_degenerate_output`);
+    ``agent_name`` only names the child in that warning. Returns the
+    child's exit code — a signal-killed
     child maps to the shell convention ``128 + N``, a ``--timeout`` expiry
     to :data:`TIMEOUT_EXIT_CODE`. The child gets its own session so a
     timeout kill takes its whole process group down with it (a surviving
@@ -443,8 +569,17 @@ def run_child(
                 _failure_footer(stdout, f"timed out after {timeout:g}s", stderr_tail)
             return TIMEOUT_EXIT_CODE
         code = code if code >= 0 else 128 - code
-        if code != 0 and stdout:
-            _failure_footer(stdout, f"exit code {code}", stderr_tail)
+        if stdout:
+            if code != 0:
+                _failure_footer(stdout, f"exit code {code}", stderr_tail)
+            else:
+                # Close our write handle before the degenerate check re-reads
+                # and appends through a second handle — the child's own writes
+                # went straight to the fd, but interleaving two handles on one
+                # file is a trap not worth leaving open.
+                stdout.close()
+                stdout = None
+                warn_degenerate_output(agent_name, output)
         return code
     finally:
         if stdout:
@@ -548,7 +683,14 @@ def main(argv: Optional[list] = None) -> None:
         file=sys.stderr,
     )
     raise SystemExit(
-        run_child(child_argv, child_env, ns.output, ns.timeout, heartbeat=ns.heartbeat)
+        run_child(
+            child_argv,
+            child_env,
+            ns.output,
+            ns.timeout,
+            heartbeat=ns.heartbeat,
+            agent_name=ns.agent,
+        )
     )
 
 

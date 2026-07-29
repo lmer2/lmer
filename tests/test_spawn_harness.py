@@ -7,8 +7,10 @@ redirection, exit-code mirroring, timeout), and the bin/ wrapper.
 """
 
 import argparse
+import builtins
 import json
 import os
+import shlex
 import signal
 import stat
 import subprocess
@@ -299,19 +301,34 @@ class TestResolvePrompt:
         assert exc.value.code == 2
 
 
-def _make_stub(tmp_path, binary, exit_code=0, sleep=None, self_kill=None, stderr_text=None):
-    """Drop a stub harness binary recording argv/env, return its record files."""
+def _make_stub(
+    tmp_path,
+    binary,
+    exit_code=0,
+    sleep=None,
+    self_kill=None,
+    stderr_text=None,
+    stdout_text=None,
+):
+    """Drop a stub harness binary recording argv/env, return its record files.
+
+    ``stdout_text`` replaces the default ``"<binary> stdout"`` answer — the
+    degenerate-output tests need a child that prints nothing at all (``""``),
+    only whitespace, or a terse-but-real answer.
+    """
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(exist_ok=True)
     argv_file = tmp_path / f"{binary}-argv.txt"
     env_file = tmp_path / f"{binary}-env.txt"
     stub = fake_bin / binary
+    answer = f"{binary} stdout\n" if stdout_text is None else stdout_text
     lines = [
         "#!/bin/bash",
         f'printf "%s\\n" "$@" > "{argv_file}"',
         f'env > "{env_file}"',
-        f'echo "{binary} stdout"',
     ]
+    if answer:
+        lines.append(f'printf "%s" {shlex.quote(answer)}')
     if stderr_text:
         lines.append(f'echo "{stderr_text}" >&2')
     if sleep:
@@ -567,6 +584,189 @@ class TestMainEndToEnd:
         assert "--effort" not in argv_file.read_text().splitlines()
         assert "turbo" in capsys.readouterr().err
 
+
+class TestClassifyDegenerateOutput:
+    """The pure detection half (issue #139) — byte-level signals only."""
+
+    @pytest.mark.parametrize(
+        "content, expected_fragment",
+        [
+            ("", "empty"),
+            ("   \n\n\t\n", "whitespace only"),
+            ("ok\n", "below the"),
+            ("done.\n", "below the"),
+            ("n/a\n", "below the"),
+        ],
+    )
+    def test_degenerate_shapes_are_named(self, content, expected_fragment):
+        reason = spawn_harness.classify_degenerate_output(content)
+        assert reason is not None
+        assert expected_fragment in reason
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            # The floor exists to catch stubs, not terse answers: this is the
+            # canonical short-but-real review result and must survive.
+            "no findings\n",
+            "No findings.\n",
+            "LGTM — nothing blocking.\n",
+        ],
+    )
+    def test_usable_output_is_not_flagged(self, content):
+        assert spawn_harness.classify_degenerate_output(content) is None
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            # The #137 shape itself. Detecting it means deciding that prose is
+            # an incomplete answer, and nothing distinguishes these from a
+            # terse real answer without guessing at phrasing — a child can halt
+            # for any number of reasons, worded any number of ways. Left to
+            # #153 (harness result envelope) and #138 (hook-side session
+            # signal); asserted here so re-adding a prose heuristic is a
+            # deliberate act with a failing test, not a quiet drift back.
+            "I found a problem in auth.py.\n\nShall I proceed with this fix? (yes/no)\n",
+            "Analysis complete.\n\nDo you want me to apply the patch?\n",
+            "Report body.\n\n**Shall I proceed?**\n",
+            "Which of these should I prioritize?\n",
+            "Ready to deploy? (y/n)\n",
+            # ...and the terse real answers those heuristics collided with.
+            "Looks fine. Should we also check the retry path?\n",
+            "The remaining puzzle: why does the cache miss on retry?\n",
+            "Given the trade-offs above, should we proceed?\n",
+        ],
+    )
+    def test_prose_is_never_judged(self, content):
+        assert len(content.strip()) > spawn_harness.DEGENERATE_MIN_CHARS
+        assert spawn_harness.classify_degenerate_output(content) is None
+
+    def test_floor_spares_the_canonical_terse_answer(self):
+        # Guards the floor against being raised past the answer the issue
+        # names explicitly: "no findings" is 11 characters.
+        assert len("no findings") > spawn_harness.DEGENERATE_MIN_CHARS
+
+
+class TestDegenerateOutputEndToEnd:
+    """A child exiting 0 with nothing usable must not pass as success."""
+
+    def test_empty_output_warns_and_footers_without_changing_exit_code(
+        self, tmp_path, capsys
+    ):
+        out = tmp_path / "result.md"
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out)],
+            stdout_text="",
+        )
+        # Warn only — the child genuinely exited 0 and a fan-out that treated a
+        # terse answer as a hard failure would be worse than the bug.
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "opus-review" in err
+        assert "no usable output" in err
+        assert str(out) in err
+        content = out.read_text()
+        assert "[spawn-harness] child produced NO USABLE OUTPUT" in content
+        assert "empty" in content
+        # Distinguishable from a dead child: the orchestrator scans for the
+        # FAILED marker to tell "agent died" from "agent returned nothing".
+        assert "child FAILED" not in content
+
+    def test_whitespace_only_output_is_flagged(self, tmp_path, capsys):
+        out = tmp_path / "result.md"
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out)],
+            stdout_text="   \n\n\t\n",
+        )
+        assert code == 0
+        assert "whitespace only" in capsys.readouterr().err
+        assert "NO USABLE OUTPUT" in out.read_text()
+
+    def test_terse_but_valid_output_is_left_alone(self, tmp_path, capsys):
+        out = tmp_path / "result.md"
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out)],
+            stdout_text="no findings\n",
+        )
+        assert code == 0
+        assert "NO USABLE OUTPUT" not in capsys.readouterr().err
+        # Untouched: no footer, no reformatting of the agent's own answer.
+        assert out.read_text() == "no findings\n"
+
+    def test_halt_shaped_output_is_left_alone(self, tmp_path, capsys):
+        # #137's exact output, end to end: content above the floor is the
+        # child's business, so nothing warns and nothing is appended. The
+        # feature no longer claims to catch this — see #153 / #138.
+        halted = "Found one issue in auth.py.\n\nShall I proceed with this fix? (yes/no)\n"
+        out = tmp_path / "result.md"
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out)],
+            stdout_text=halted,
+        )
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "NO USABLE OUTPUT" not in err
+        assert "approval question" not in err
+        assert out.read_text() == halted
+
+    def test_failed_child_keeps_only_the_failure_footer(self, tmp_path, capsys):
+        # A dead child with an empty output file is a failure, not a
+        # degenerate success — one marker, not both.
+        out = tmp_path / "result.md"
+        code, _, _ = _run_main(
+            tmp_path,
+            ["opus-review", "--prompt", "p", "--output", str(out)],
+            exit_code=3,
+            stdout_text="",
+        )
+        assert code == 3
+        content = out.read_text()
+        assert "[spawn-harness] child FAILED: exit code 3" in content
+        assert "NO USABLE OUTPUT" not in content
+        assert "no usable output" not in capsys.readouterr().err
+
+    def test_without_output_file_nothing_is_checked(self, tmp_path, capsys):
+        # Stdout flows straight through to ours, so there is no captured file
+        # to inspect — documented limitation, not a silent failure.
+        code, _, _ = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p"], stdout_text=""
+        )
+        assert code == 0
+        assert "no usable output" not in capsys.readouterr().err
+
+    def test_unreadable_output_does_not_accuse_the_agent(self, tmp_path, capsys):
+        missing = tmp_path / "vanished.md"
+        assert spawn_harness.warn_degenerate_output("opus-review", str(missing)) is None
+        err = capsys.readouterr().err
+        assert "cannot re-read --output" in err
+        assert "no usable output" not in err
+
+    def test_footer_append_failure_warns_and_still_reports_the_reason(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        # The sibling of test_unreadable_output_...: if appending the footer
+        # raised, the exception would escape run_child after the child already
+        # exited 0 and change the mirrored exit code — the one contract this
+        # feature promises to leave alone.
+        out = tmp_path / "result.md"
+        out.write_text("")
+        real_open = builtins.open
+
+        def refuse_appends(path, mode="r", *args, **kwargs):
+            if "a" in mode:
+                raise OSError("read-only file system")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", refuse_appends)
+        reason = spawn_harness.warn_degenerate_output("opus-review", str(out))
+        assert reason is not None
+        err = capsys.readouterr().err
+        assert "no usable output" in err
+        assert "cannot append the no-usable-output footer" in err
 
 class TestMainValidation:
     def _main(self, args, environ):
