@@ -324,11 +324,16 @@ All of the following must hold before launching the run:
   files in `docs/rehearsal/` populated from real run data and passing
   their offline verifiers. The files ship as pending skeletons and are
   populated when the rig runs — a pending skeleton is not evidence.
-- **Operator receipts complete** — every item in
-  [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) ticked with date and
-  actor. The template ships unchecked; the operator completes it before
-  the release run, and a release run must refuse to proceed to Leg 2
-  while any item is unchecked.
+  Waiving this for a given release is possible but must be **recorded in
+  [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) with its rationale and
+  accepted residual** — an unrecorded skip is not a waiver.
+- **Gating operator receipts complete** — every item in the *gating*
+  section of [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) ticked with
+  date and actor. A release run must refuse to proceed to Leg 2 while any
+  gating item is unchecked. That file's **hardening** section does not
+  gate: those items close real holes but a release completes correctly
+  without them, and they are tracked separately so an open hardening task
+  cannot block a release — nor pass unnoticed.
 
 ### Procedure
 
