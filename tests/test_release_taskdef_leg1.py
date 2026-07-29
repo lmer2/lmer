@@ -102,9 +102,20 @@ class TestPinnedRefInstall:
     def test_install_uses_the_pinned_ref(self):
         leg1 = _leg1()
         assert (
-            'uv tool install "git+https://git.20c.com/20c/ctl'
+            'uv tool install "git+https://git.20c.com/gh/20c/ctl'
             "@${CTL_PINNED_REF}\"" in leg1
         )
+
+    def test_install_path_is_the_gh_namespace_not_the_stale_copy(self):
+        """The bare `20c/ctl` project is a stale copy without the pinned ref.
+
+        Installing from it fails with "upload-pack: not our ref", which
+        hard-stops leg 1 before any release work. Guard the namespace so the
+        path cannot regress to the copy that merely looks right.
+        """
+        leg1 = _leg1()
+        assert "git.20c.com/gh/20c/ctl" in leg1
+        assert "git.20c.com/20c/ctl" not in leg1
 
     def test_pin_is_a_full_commit_sha(self):
         """A branch name or short ref is not a pin."""
@@ -180,12 +191,12 @@ class TestChangelogModes:
     def test_legacy_mode_is_the_changelog_yaml_roll(self):
         leg1 = _squash(_leg1())
         assert "`legacy` — ctl rolls `CHANGELOG.yaml`" in leg1
-        assert "lmer's first release under this flow runs in this mode" in leg1
 
     def test_fragments_mode_is_changelog_d(self):
         leg1 = _squash(_leg1())
         assert "`fragments`" in leg1
         assert "`changelog.d/` fragment files" in leg1
+        assert "lmer's first release under this flow runs in this mode" in leg1
 
     def test_mode_comes_from_the_resolved_parameter(self):
         """The mechanism is the Phase 0.5 `release.changelog` value — the
