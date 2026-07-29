@@ -27,6 +27,14 @@ CONTAINER_UV_CACHE_DIR = "/home/developer/.cache/uv"
 # LMER_CLONE_CACHE_PATH and keeps one bare mirror per repo under it.
 CONTAINER_CLONE_CACHE_DIR = "/clone-cache"
 
+# Fixed path inside the container where the release SSH signing key is
+# mounted (release-taskdef sessions only; spec §4/§5 of the release-flow
+# bundle). The release session gate in cli.py forwards this path via
+# LMER_RELEASE_SIGNING_KEY so the taskdef can point git's user.signingKey
+# at it; every non-release session must receive neither the mount nor the
+# variable.
+CONTAINER_RELEASE_SIGNING_KEY_PATH = "/release-signing-key"
+
 
 def selinux_opt(runtime: str) -> str:
     """
@@ -623,6 +631,52 @@ def build_clone_cache_mount(runtime: str, host_cache_dir: Path) -> List[str]:
     """
     se = selinux_opt(runtime)
     return ["-v", f"{host_cache_dir}:{CONTAINER_CLONE_CACHE_DIR}:ro{se}"]
+
+
+def build_release_signing_key_mount(
+    runtime: str, host_key_path: Path
+) -> Tuple[List[str], Optional[str]]:
+    """
+    Build the read-only mount that delivers the release SSH signing key.
+
+    Binds the host private key at the fixed container location
+    ``CONTAINER_RELEASE_SIGNING_KEY_PATH`` so a release-taskdef session can
+    sign tags (``git tag -s`` with ``user.signingKey`` pointing at the
+    mount). The key is mounted as-is — never copied — and always ``:ro``.
+
+    Applies the same guard :func:`plan_credential_mounts` applies to
+    user-harness credentials: the key must be a **regular file whose
+    resolved path stays under the host home** — directories and symlinks
+    escaping ``$HOME`` are refused, missing files are refused. **Pure**
+    (filesystem reads only, no printing): a refusal is returned as
+    ``([], reason)`` so the caller decides whether it is fatal (for the
+    release session gate in cli.py it is — a session that cannot sign must
+    not start, matching the fail-fast LMER_MOUNT_FILES precedent).
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        host_key_path: Path to the release signing private key on the host
+
+    Returns:
+        ``(mount_args, None)`` on success, ``([], reason)`` when the key is
+        missing or rejected by the guard
+    """
+    # absolute(): a relative path would reach the runtime's -v as a bare
+    # name and be parsed as an (empty) named volume (see the harnesses-dir
+    # mount above).
+    key = host_key_path.expanduser().absolute()
+    if not key.exists():
+        return [], f"release signing key {host_key_path} does not exist"
+    # is_file() follows symlinks, so also require the resolved target to
+    # stay under the resolved home — same rule as plan_credential_mounts.
+    if not key.is_file():
+        return [], f"release signing key {host_key_path} is not a regular file"
+    if not key.resolve().is_relative_to(Path.home().resolve()):
+        return [], (
+            f"release signing key {host_key_path} resolves outside the host home"
+        )
+    se = selinux_opt(runtime)
+    return ["-v", f"{key}:{CONTAINER_RELEASE_SIGNING_KEY_PATH}:ro{se}"], None
 
 
 def build_service_mode_mounts(runtime: str, checkout_path: Path) -> List[str]:

@@ -1,0 +1,211 @@
+# Release
+
+This session performs a tracked, two-leg software release. Leg 1 prepares the
+version bump and changelog MR on the canonical GitLab repository. The gate is
+a human merging the release MR — that merge is the release approval. Leg 2
+creates the SSH-signed tag at the recorded merge SHA, pushes GitHub `main`
+first and then the tag (GitHub Actions publishes to PyPI via trusted
+publishing), and only after GitHub is green pushes the tag to GitLab. One
+release is ONE run with durable state; every step keys on state the run
+recorded, never on an earlier leg's memory.
+
+{% if LMER_REPO_URL %}
+The project under release is `{{ LMER_REPO_URL }}`.
+{% else %}
+No project repository is checked out for this session. The release flow
+cannot run without one — stop and report the misconfiguration. Do not
+improvise a checkout or pick a repository yourself.
+{% endif %}
+
+These instructions exist at `{{ instructions_file }}`.
+
+The current work mode is `{{ work_mode }}`.
+
+{% include 'run-state.jinja2' ignore missing %}
+
+## The release spine
+
+The whole sequence, in order — each stage's full contract lives in its own
+section below:
+
+1. **Leg 1 — prep (GitLab side).** Branch off `prep-release`, bump the
+   version and roll the changelog, open an MR targeting `prep-release`. Once
+   the bump MR lands, the standing `prep-release` → `main` MR is the release
+   MR. Record the release version and the bump-MR merge SHA in run state.
+2. **Gate — human merge.** Arm the watch on the release MR and idle with
+   pushed state. The human merging the protected-`main` release MR on the
+   canonical repository is the release approval. Watch is best-effort;
+   resume is the contract.
+3. **Leg 2 — ship.** Record the release MR's merge SHA; verify preconditions
+   (green GitLab pipeline, GitHub `main` ancestry); create the SSH-signed
+   tag at exactly the merge SHA; push GitHub `main` first, then the tag;
+   poll the Actions release run to completion; only after GitHub is green,
+   push the tag to GitLab. Record receipts and complete the run.
+
+A relaunch of this taskdef never starts over: it re-derives the current leg
+from run state and continues (see "Resuming an in-progress release").
+
+## Phase 0: Tools
+
+- [ ] Run `bash /Agents/global/hooks/rgr.sh` to read and understand the
+      global rules you must follow.
+- [ ] Run `bash /Agents/global/hooks/work-view-docs.sh` to familiarize
+      yourself with the `work` CLI — run state, receipts, and events are the
+      backbone of this flow.
+
+## Phase 0.25: Single-flight claim (consume it — never build your own)
+
+At most one active release run per repository. The lock is the run-state
+layer's atomic run claim (the `claim` block in the release run's
+`state.yaml` — deliberately NOT the per-session `owner` field — written
+only by the single-writer `work` CLI's claim-by-push CAS). This taskdef
+consumes that lock through one verb and obeys its exit code:
+
+- FIRST, before any release work: run `work release claim`. Exit 0 means
+  the claim is held — a fresh win, an idempotent refresh from the holding
+  session, a loud takeover of a stale claim (a relaunch resuming this same
+  run is exactly that case), or a fresh run seeded because the previous
+  release was still parked on this address (the claim rolls it aside and
+  says so). Proceed.
+- A non-zero exit means REFUSE to proceed. Either a live foreign claim
+  holds this release — the command prints the active run's pointer (slug,
+  run dir, holder session, claim age): report it — or the claim could not
+  be established (remote unreachable, push attempts exhausted): fail
+  closed. Never proceed unlocked; end the session.
+- Do NOT implement any lock of your own. No marker files, no "check whether
+  a release run exists, then create one" sequence — a check-then-create race
+  loses exactly when it matters (two simultaneous launches both pass the
+  check). The atomic claim in run state is the only lock; this taskdef only
+  consumes its verdict.
+
+## Phase 0.5: Resolve the release parameters (fail loudly, never default)
+
+Record the phase: `work state set --phase=release-parameters`
+
+Every repository adopting this flow supplies four parameters in a `task.yaml`
+manifest inside a `release` taskdef directory. The manifest resolves per-file
+through the standard taskdef tier precedence — first match wins:
+
+1. `<work repo>/<host>/<project>/taskdef/release/task.yaml` — the project
+   tier, the normal home for these values (this is what makes the flow
+   per-repository).
+2. `<work repo>/taskdef/release/task.yaml` — the work-global tier.
+3. `<dir>/release/task.yaml` for each LMER_TASKDEF_PATHS entry, in order.
+4. The built-in tier — whose `task.yaml` declares session needs only and
+   deliberately ships NO `release:` mapping, so a repository that has not
+   been onboarded has nothing to fall back to.
+
+Required shape:
+
+```yaml
+release:
+  github_target: <https URL of the GitHub mirror repository>
+  tag_prefix: <tag name prefix — must be exactly "v"; see the resolution
+    rules below>
+  signing_key: <reference to the provisioned release SSH signing key —
+    a filesystem path or key identifier, NEVER key material>
+  changelog: <exactly "fragments" or "legacy">
+```
+
+Resolution rules — all of them hard:
+
+- Use the FIRST `task.yaml` in precedence order that contains a `release:`
+  mapping. Do not merge values across tiers; one file wins whole.
+- Manifest missing at every tier, `release:` mapping absent, or any of the
+  four keys missing or empty → HARD STOP. Record it before ending the
+  session, naming the missing key and the expected project-tier path:
+  `work state set --stop-reason=critical_error --critical-error
+  '{"summary": "release parameters missing", "detail": "<key> not set; expected <work repo>/<host>/<project>/taskdef/release/task.yaml"}'`
+  then `work commit` and end the session.
+- `changelog` set to anything other than exactly `fragments` or `legacy` →
+  HARD STOP naming the offending value, same recording contract.
+- `tag_prefix` set to anything other than exactly `v` → HARD STOP naming
+  the offending value, same recording contract. The release kernel derives
+  tag names as `v<version>` (`work release record tag` refuses any other
+  name); supporting another prefix is a reviewed kernel change, not a
+  session decision.
+- NEVER default a parameter: do not derive `github_target` from git remotes,
+  do not guess `tag_prefix` from existing tags, do not infer the changelog
+  mechanism from the repository tree. A parameter this flow was not
+  explicitly given does not exist.
+- Do NOT write or edit a `task.yaml` to fill the gap yourself: onboarding a
+  repository (authoring its `release:` manifest) is the repository owner's
+  decision, made outside a release session.
+- Environment variables do not override the manifest; the manifest is the
+  single source for these four values.
+- Log the four resolved values with `work log` before proceeding (the
+  signing key REFERENCE only — never key material), so the receipts show
+  what the release ran with.
+
+## Phase 0.75: Project info
+
+MANDATORY: run `work read-project-info` before any release work. Whatever it
+returns — conventions, setup notes, known gotchas — is binding in addition
+to these instructions. It is prose context only: it does NOT substitute for
+the four release parameters above, and a release description found there
+does not relax the fail-loud rules.
+
+## Secrets
+
+NEVER include API tokens, the GitHub PAT, SSH key material, or any other
+secret value in `work log` messages, `work report` files, run-state fields,
+or anything else that gets committed. The `signing_key` parameter is a
+reference for exactly this reason. The `work` CLI redacts detected secrets,
+but do not rely on that — omit credentials from your output entirely.
+
+## Leg 1 — prep (GitLab side)
+
+{% include 'release-leg1.jinja2' %}
+
+## Gate — human merge
+
+{% include 'release-gate.jinja2' %}
+
+## Leg 2 — ship
+
+{% include 'release-leg2.jinja2' %}
+
+## Resuming an in-progress release
+
+{% include 'release-resume.jinja2' %}
+
+## Closing out the run
+
+When the release is complete (or explicitly aborted by the human):
+
+1. Write a short retrospective — what shipped, key decisions, gotchas for
+   next time — and persist it: `work artifact retro.md --file <path>`.
+2. Mark the run complete: `work state set --status=complete
+   --stop-reason=complete` (an abort is recorded as such instead, releasing
+   the single-flight claim).
+3. Run `work commit` so logs and run state push together.
+
+This run keeps its own address once it is complete — the version-bearing
+one it took when leg 1 recorded the version (`release-<repo>-v<X.Y.Z>`), so
+the receipts you cite stay resolvable. Do NOT move, archive, or clean it up:
+the next release seeds at the freed address by itself, and `work release
+claim` handles the case where a run never got that far.
+
+## HARD RULES
+
+- HARD RULE: NEVER force-push any ref on any remote. GitHub `main`
+  divergence (a non-fast-forward push) is a hard stop with a human
+  remediation decision — never an automatic force-push.
+- HARD RULE: NEVER delete or re-point an existing tag. A tag that exists but
+  points anywhere other than the recorded merge SHA is a hard error, not a
+  repair opportunity.
+- HARD RULE: NEVER re-sign an existing tag.
+- HARD RULE: NO fallback push path. A rejected push (e.g. a 403 from a
+  read-only credential) is a hard error naming the credential requirement —
+  never retry through an alternative remote, credential, or protocol.
+- HARD RULE: NO taskdef-side lock. Single-flight is enforced solely by the
+  run-state layer's atomic run claim; never check-then-create your own.
+- HARD RULE: NEVER default a missing or ambiguous release parameter — hard
+  stop per Phase 0.5.
+- HARD RULE: The tag name is always derived from `pyproject.toml` at the
+  tagged commit — never from an earlier leg's memory.
+- HARD RULE: Push ordering is fixed: GitHub `main`, then the GitHub tag,
+  then — only after the GitHub Actions release run is green — the GitLab
+  tag. Never reorder, never skip ahead.
+- HARD RULE: DO NOT add `Co-Authored-By`, `Signed-off-by`, or any
+  self-reference tags to commit messages.

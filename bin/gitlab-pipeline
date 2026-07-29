@@ -3,7 +3,7 @@
 GitLab Pipeline Monitor - Watch and debug CI/CD pipelines.
 
 Usage:
-    gitlab-pipeline <project> <pipeline_id|mr_id> [--mr] [--watch] [--trace JOB_ID]
+    gitlab-pipeline <project> <pipeline_id|mr_id> [--mr] [--watch] [--trace JOB_ID] [--expect-status STATUS]
 
 Examples:
     # Watch a pipeline
@@ -14,6 +14,9 @@ Examples:
 
     # Get trace for a specific job
     gitlab-pipeline group/project 921 --trace
+
+    # Exit non-zero unless the pipeline is green (receipt-friendly)
+    gitlab-pipeline group/project 229 --expect-status success
 
 Environment:
     GITLAB_HOST: GitLab instance hostname (e.g. gitlab.example.com)
@@ -31,10 +34,10 @@ src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, src_dir)
 
 from lmer_cli.gitlab_pipeline import (
-    DEFAULT_HOST,
     GitLabPipelineClient,
     GitLabPipelineError,
     ProjectNotFoundError,
+    check_expected_status,
     get_token,
     resolve_pipeline_id,
     show_status,
@@ -54,9 +57,22 @@ def main():
     parser.add_argument("--mr", action="store_true", help="ID is a merge request ID")
     parser.add_argument("--watch", "-w", action="store_true", help="Watch until complete")
     parser.add_argument("--trace", "-t", action="store_true", help="Get job trace (ID is job ID)")
-    parser.add_argument("--host", default=DEFAULT_HOST, help="GitLab host")
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("GITLAB_HOST"),
+        help="GitLab host (default: $GITLAB_HOST)",
+    )
+    parser.add_argument(
+        "--expect-status",
+        metavar="STATUS",
+        help="Exit non-zero unless the (final) pipeline status equals STATUS "
+        "(e.g. success); applies to status and --watch modes",
+    )
 
     args = parser.parse_args()
+
+    if not args.host:
+        parser.error("--host is required (or set GITLAB_HOST)")
 
     try:
         token = get_token(args.host)
@@ -77,9 +93,14 @@ def main():
 
         # Watch or show status
         if args.watch:
-            watch_pipeline(client, project_id, pipeline_id)
+            status = watch_pipeline(client, project_id, pipeline_id)
         else:
-            show_status(client, project_id, pipeline_id)
+            pipeline = show_status(client, project_id, pipeline_id)
+            status = pipeline.get("status")
+
+        # --expect-status: the exit code carries the verdict (raises a
+        # GitLabPipelineError on mismatch -> exit 1 below)
+        check_expected_status(status, args.expect_status)
 
     except GitLabPipelineError as e:
         print(f"Error: {e}", file=sys.stderr)

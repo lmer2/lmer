@@ -80,6 +80,25 @@ class TestPaths:
     def test_run_rel_path_none_without_context(self):
         assert run_state.run_rel_path() is None
 
+    def test_run_rel_for_dir_name(self, run_env):
+        """Staging a run dir by NAME — the vacated address a re-slug leaves
+        behind, which no resolver can name once the fresh run owns the slug."""
+        assert run_state.run_rel_for_dir_name("release-repo--declined") == \
+            "git.example.com/org/repo/runs/release-repo--declined"
+
+    def test_run_rel_for_dir_name_none_without_context(self):
+        assert run_state.run_rel_for_dir_name("anything") is None
+
+    def test_run_rel_path_candidates_is_built_on_it(self, run_env):
+        """One owner for the shape: the candidates are the same construction
+        applied to the resolved dir and the bare slug."""
+        assert run_state.run_rel_path_candidates() == [
+            run_state.run_rel_for_dir_name("develop-issue-123"),
+        ]
+
+    def test_run_rel_path_candidates_empty_without_context(self):
+        assert run_state.run_rel_path_candidates() == []
+
 
 class TestSessionId:
     def test_from_env(self, run_env):
@@ -358,6 +377,29 @@ class TestDecide:
         d = run_state.decide(_state(), [], "s-1")
         assert d["sessions_used"] is None
 
+    def test_claim_none_without_claim_block(self):
+        # Non-release runs never carry a claim block (RUN-STATE.md §7) —
+        # the additive `claim` key reads None and the owner branch above
+        # stays their only warning source (byte-identical semantics;
+        # the enforced-claim branch is covered in test_work_repo_run_claim).
+        d = run_state.decide(_state(), [], "s-1")
+        assert d["claim"] is None
+
+    def test_release_claim_verdict_carried(self):
+        state = _state(claim={"session_id": "s-other",
+                              "claimed_at": "2026-07-03T11:30:00Z"})
+        d = run_state.decide(state, [], "s-1", now="2026-07-03T12:00:00Z")
+        assert d["claim"]["verdict"] == run_state.CLAIM_FOREIGN_LIVE
+        assert any("release claim" in w for w in d["warnings"])
+
+    def test_release_record_none_without_release_run(self):
+        # Non-release runs never pass a record (release-flow §3) — the
+        # additive `release` key reads None and the brief renders no
+        # release block (byte-identity covered in
+        # test_work_repo_release_brief).
+        d = run_state.decide(_state(), [], "s-1")
+        assert d["release"] is None
+
 
 class TestCountSessionStarts:
     def test_counts_only_session_starts(self):
@@ -558,6 +600,12 @@ class TestFormatBrief:
         assert lines[1].startswith("Phase:")
         assert lines[2] == "Estimate: ~2 sessions"
         assert lines[3] == "Goal: ship it"
+
+    def test_no_release_block_for_non_release_run(self):
+        # No record passed in (every non-release run) → no release block;
+        # the byte-identity proof lives in test_work_repo_release_brief.
+        text = run_state.format_brief(run_state.decide(_state(), [], "s-1"))
+        assert "Release:" not in text
 
 
 class TestAnswerQuestion:
@@ -1028,7 +1076,12 @@ class TestGatePushReceipt:
 
     def _patched(self, monkeypatch, checks_rc=0, push_rc=0, branch="feature/x"):
         mod = _load_gate_bin("gate-push")
-        monkeypatch.setattr(mod, "push_gate", lambda *a, **k: checks_rc)
+        # gate-push authorizes via GateSystem.run_push_gate (ref/remote-aware);
+        # the old module-level push_gate wrapper is no longer called.
+        monkeypatch.setattr(
+            "lmer_cli.gates.GateSystem.run_push_gate",
+            lambda self, ref=None, remote="origin": checks_rc == 0,
+        )
 
         def fake_run(cmd, **kwargs):
             if cmd[:2] == ["git", "branch"]:

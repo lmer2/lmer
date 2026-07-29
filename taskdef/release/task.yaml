@@ -1,0 +1,49 @@
+# Built-in needs manifest for the `release` taskdef.
+#
+# Declares what a release session REQUIRES — nothing here provisions a
+# credential, embeds secret material, names a key-file path, or offers a
+# fallback that lets an unprovisioned session proceed. Needs are referenced
+# by stable need-names; their provisioning and scoping semantics (and the
+# names themselves) are owned by the credentials subsystem.
+#
+# This manifest deliberately carries NO `release:` parameter mapping. The
+# fail-loud parameter contract (Phase 0.5 of instructions.txt) keys on the
+# FIRST task.yaml in tier precedence that CONTAINS a `release:` mapping, so
+# a needs-only built-in manifest gives an un-onboarded repository nothing
+# to fall back to — the hard-stop semantics are unchanged by this file
+# existing.
+
+# The release flow's durable state is `work` run state, not the masterplan
+# plugin.
+masterplan: false
+
+# The `needs:` block below is DOCUMENTATION-ONLY: nothing in src/ parses
+# it. Credential scoping deliberately keys on the resolved task id (the
+# `release` taskdef id the operator selected at launch), not on this
+# manifest — the block records what a release session requires so
+# provisioning stays reviewable, it does not drive it.
+needs:
+  # Release credentials, by need-name. Delivered to release-taskdef
+  # sessions only (the negative guarantee: no other taskdef's sessions
+  # receive them).
+  credentials:
+    # GitHub fine-grained PAT: contents:write + workflows:write on the
+    # single mirror repo.
+    - release_github_pat
+    # Release SSH signing key for tag signing — always a reference, never
+    # key material.
+    - release_signing_key
+  # Push-allow targets the session's push gate must be opened for. These
+  # are roles, not URLs: the concrete repositories are per-adopter
+  # parameters (the `release:` mapping in an onboarded tier), never
+  # defaulted here.
+  push_allow:
+    # The adopter's GitHub mirror: `main` first, then the release tag.
+    - target: github_mirror
+      refs:
+        - refs/heads/main
+        - refs/tags/*
+    # The canonical GitLab repo: the tag push, only after GitHub is green.
+    - target: gitlab_origin
+      refs:
+        - refs/tags/*

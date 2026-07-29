@@ -8,8 +8,51 @@ permissions:
   contents: read
 
 jobs:
+  verify-tag-signature:
+    name: Verify tag signature and main head
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Checkout pinned to `main`, NOT github.ref: the verification code
+      # must never come from the pushed tag's own tree, or whoever can push
+      # a tag also supplies the code that verifies it. fetch-depth 0 +
+      # fetch-tags brings the pushed tag object in for verification.
+      # Residual (documented in RELEASE-FLOW.md's threat model): the
+      # WORKFLOW DEFINITION itself still rides the tag ref on tag-push
+      # triggers — the boundary for that is the tag ruleset + PAT scoping,
+      # not this file; pinning the script trims the attack surface to the
+      # workflow text alone.
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+
+      # `fetch-tags` works by leaving git's default tag AUTO-FOLLOWING on,
+      # which brings a tag down only when its object is reachable from the
+      # refs actually fetched. A tag pointing at a commit on no branch —
+      # exactly the "tag off main head" case this job exists to block —
+      # may therefore be absent from the checkout, and verification would
+      # exit at "tag not found" without ever reaching the main-HEAD
+      # comparison. It fails closed either way, but the evidence would be
+      # wrong: the rehearsal's not-main-head case would be proving the
+      # tag-missing branch. Fetching the ref explicitly makes the question
+      # moot.
+      - name: Fetch the pushed tag explicitly
+        run: |
+          git fetch --no-tags origin \
+            "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
+      - name: Verify tag signature
+        env:
+          RELEASE_ALLOWED_SIGNERS: ${{ vars.RELEASE_ALLOWED_SIGNERS }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/scripts/verify-tag-signature.sh
+
   verify-version:
     name: Verify tag matches pyproject version
+    needs: verify-tag-signature
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -74,14 +117,50 @@ jobs:
     permissions:
       id-token: write
     steps:
+      # The gate script is checked out from `main`, NOT from the pushed
+      # tag: this job holds id-token: write, so code running here must
+      # never come from the tree being published — the same rule the
+      # verify-tag-signature job's checkout follows. Sparse: the scripts
+      # directory is all this job needs. It runs BEFORE the artifact
+      # download because checkout cleans the workspace it lands in.
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          sparse-checkout: .github/scripts
+
       - name: Download dist artifact
         uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
 
+      # skip-existing (below) converges leg-2 re-entry silently — this gate
+      # makes version reuse an explicit, admin-authorized act instead:
+      # foreign artifacts under the version fail the run, and an
+      # already-published version fails too unless the
+      # RELEASE_RESUME_VERSION Actions variable names it. Filenames are a
+      # pure function of (name, version), so "published is a subset of
+      # built" cannot separate a resume from a republish of different code
+      # — the reasoning lives in the script's module docstring. Tag/tree
+      # integrity is verify-tag-signature's job, re-checked in THIS run.
+      - name: Gate version reuse
+        env:
+          # Same shape as the environment url above; the rehearsal
+          # transform (Ctl/rehearsal/derive-workflow.py) rewrites this to
+          # the TestPyPI project url.
+          PYPI_PROJECT_URL: https://pypi.org/project/lmer/
+          # Admin-controlled Actions repository variable, never repo
+          # content: set to the exact version being resumed, then cleared.
+          RELEASE_RESUME_VERSION: ${{ vars.RELEASE_RESUME_VERSION }}
+        run: .github/scripts/gate-version-reuse.py
+
+      # Pinned to an exact commit SHA (convention: SHA pin + version comment;
+      # bump deliberately by updating both). v1.12.x emits PEP 740
+      # attestations by default.
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # v1.12.4
+        with:
+          skip-existing: true
 
   github-release:
     name: Create GitHub Release

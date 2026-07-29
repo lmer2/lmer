@@ -12,9 +12,12 @@ The CLI also owns the DIRECTORY lifecycle (issue #87): runs are created as
 `.new-*` temp dirs and atomically renamed to `runs/<slug>/` once seeded
 (seed_run_dir), then renamed exactly once more to `runs/<slug>--<name>/`
 at the pre-execution freeze gate when the run is named (freeze_run_dir).
-Because dirs can be renamed, a directory name is never a valid address:
-every lookup goes through find_run_dir(), which matches on state.yaml
-content (slug, then name).
+A release run takes one further, deliberate move when it records its
+version (reslug_run: `release-<repo>` → `release-<repo>-v0.6.0`), which is
+what frees the bare address for the NEXT release. Because dirs can be
+renamed, a directory name is never a valid address: every lookup goes
+through find_run_dir(), which matches on state.yaml content (slug, then
+name), with find_successor_run_dir() covering the re-slug case.
 
 Legacy runs that predate the state-file rename still hold state.yml:
 load_state() reads it when state.yaml is absent, and the first
@@ -30,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,17 +79,45 @@ _FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 # artifacts get relative symlinks at the run-dir root when present (spec §6).
 MASTERPLAN_DIR = "masterplan"
 MASTERPLAN_ARTIFACTS = ("spec.md", "goals.md", "plan.md", "plan.html", "retro.md")
-STOP_REASONS = ("question", "yield", "complete", "critical_error")
+# `aborted` is the release-run terminal (abort_run): it rides the
+# descriptive stop_reason axis, NEVER a fourth STATUSES value — see the
+# design comment on abort_run for why the status enum stays closed.
+STOP_REASONS = ("question", "yield", "complete", "critical_error", "aborted")
 STATUSES = ("in-progress", "complete", "archived")
 # A foreign owner claim younger than this is treated as a live concurrent
 # session (warn loudly); older claims are reported as stale (likely a crash).
 STALE_CLAIM_MINUTES = 120
+# The single-flight release claim's staleness threshold (RUN-STATE.md §7) —
+# deliberately its OWN constant: unlike STALE_CLAIM_MINUTES (advisory,
+# aimed at humans coordinating), this one is ENFORCED — a live foreign
+# claim is a hard refusal, and a claim past this age is taken over
+# automatically (and loudly) by the next claimant, normally the unattended
+# scheduled relaunch. Default matches STALE_CLAIM_MINUTES; the watch loop's
+# refresh cadence must sit well inside it.
+RELEASE_CLAIM_STALE_MINUTES = 120
+# claim_status() verdicts on the release claim block.
+CLAIM_UNCLAIMED = "unclaimed"
+CLAIM_OURS = "ours"
+CLAIM_FOREIGN_LIVE = "foreign-live"
+CLAIM_FOREIGN_STALE = "foreign-stale"
 # The one-line seed excerpt in the completed-run direction contract (#96).
 SEED_EXCERPT_MAX_LEN = 120
 
 
 class RunStateError(Exception):
     """Raised when run state cannot be read or written safely."""
+
+
+class ClaimRefusedError(RunStateError):
+    """A foreign claim holds the run — hard refusal, never a warning
+    (RUN-STATE.md §7). Carries the loser's pointer: everything needed to
+    find the active release without archaeology (slug, run dir, holder
+    session, claimed_at/age, status/phase). The CLI adds the run dir's web
+    URL via git_ops.web_url_for — this kernel stays git-unaware."""
+
+    def __init__(self, message: str, pointer: dict):
+        super().__init__(message)
+        self.pointer = pointer
 
 
 def utc_now_iso() -> str:
@@ -104,7 +136,10 @@ def derive_slug(taskdef: Optional[str] = None, target: Optional[str] = None) -> 
     ``{task_type}/{target}/`` path builders keep the full form so read-side
     fallback still matches pre-unification dirs on disk. Legacy full-SHA
     runs keep their recorded slug: the resolver matches recorded
-    ``state.slug`` exactly, with no aliasing between the two forms.
+    ``state.slug`` exactly, with no aliasing between the two forms. The
+    re-slug successor fallback does not weaken that — it matches addresses a
+    run RECORDS having vacated (``reslugged_from``), which a legacy run never
+    has, rather than re-deriving identity through this function.
     """
     taskdef = taskdef or os.environ.get("LMER_TASK", "default")
     if target is None:
@@ -184,6 +219,115 @@ def find_run_dir(
     return name_match
 
 
+def slug_available(
+    slug: str, base: Optional[Path] = None, exclude: Optional[Path] = None
+) -> bool:
+    """True when `slug` is free for a run to move to — no sibling RECORDS it
+    and no sibling dir ADDRESSES it.
+
+    `exclude` is the run doing the asking; it never counts as occupying the
+    address it is trying to take. That matters for the crash window a
+    re-slug can be interrupted in — dir renamed, `state.slug` not yet
+    written — where the run is already SITTING at the address it wants and
+    the next record verb has to be able to finish the move rather than
+    conclude the address is taken and drift to a fresh one.
+
+    Two distinct resources have to be free, and checking only one of them is
+    the iteration-6 defect. A run's identity is its recorded `state.slug`
+    (`find_run_dir` matches on that alone), while the paths that address it
+    are `runs/<slug>` and `runs/<slug>--<name>`. They come apart in both
+    directions:
+
+    - an UNNAMED terminal run occupies `runs/<slug>`, so the path is taken
+      while nothing would stop a second run recording the slug;
+    - a NAMED run lives at `runs/<slug>--<name>`, so the SLUG is taken while
+      `runs/<slug>` is free — and two runs recording one slug make every
+      lookup a coin flip decided by directory sort order.
+
+    Callers that need an address they can definitely take should compute one
+    that satisfies this (release_run.unique_release_slug) rather than give up
+    when it is False: an address that cannot be freed is what wedges a
+    repository.
+    """
+    if base is None:
+        base = runs_base()
+    if base is None:
+        return False
+    recorded = find_run_dir(slug, base)
+    if recorded is not None and recorded != exclude:
+        return False
+    try:
+        bare = base / slug
+        if bare.exists() and bare != exclude:
+            return False
+        return not any(d for d in base.glob(f"{slug}--*") if d != exclude)
+    except OSError:
+        return False
+
+
+def find_successor_run_dir(identifier: str, base: Optional[Path] = None) -> Optional[Path]:
+    """The LIVE run carrying this slug's identity after a re-slug.
+
+    A release run re-slugs itself the moment leg 1 records the version
+    (`release-<repo>` → `release-<repo>-v0.6.0`, reslug_run), so the address
+    a session derives stops matching any recorded slug.
+
+    The match is on `reslugged_from` — the addresses a run has actually
+    VACATED, recorded by reslug_run itself. Nothing else knows that fact, so
+    nothing else can be mistaken for it. Deriving the identity instead
+    (`derive_slug(taskdef, target) == identifier`) looks equivalent and is
+    not: derive_slug truncates a 40-hex target to 12 chars, so a legacy
+    full-SHA run would answer to the truncated slug and a `develop` session
+    would adopt a pre-#87 run it had never touched — the aliasing
+    derive_slug's own contract rules out. Runs that never re-slugged carry
+    no `reslugged_from` and are excluded by construction.
+
+    Only IN-PROGRESS runs qualify, and that is the whole point of the
+    version-bearing slug: a terminal run has given its address up, so the
+    next release seeds fresh at the bare address instead of resolving a
+    finished run and being refused forever. (It is also what keeps a
+    declined release and its successor apart — both vacated the same seed
+    address, but only one of them is live.)
+
+    Ties are not expected (single-flight allows one live release per repo)
+    but resolve deterministically: newest `created`, then dir name.
+    """
+    if base is None:
+        base = runs_base()
+    if base is None:
+        return None
+    matches: list[tuple[str, str, Path]] = []
+    try:
+        children = sorted(base.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        try:
+            if not child.is_dir() or child.name.startswith(".") or child.name == ARCHIVE_DIR:
+                continue
+            state = _read_sibling_state(child)
+        except OSError:
+            continue
+        if not isinstance(state, dict) or state.get("status") != "in-progress":
+            continue
+        vacated = state.get("reslugged_from")
+        if not isinstance(vacated, list) or identifier not in vacated:
+            continue
+        matches.append((str(state.get("created") or ""), child.name, child))
+    if not matches:
+        return None
+    return max(matches)[2]
+
+
+def resolve_run_dir(slug: str, base: Optional[Path] = None) -> Optional[Path]:
+    """The run dir addressed by `slug`: the run recording it, else the live
+    run that re-slugged away from it. None when neither exists."""
+    found = find_run_dir(slug, base)
+    if found is not None:
+        return found
+    return find_successor_run_dir(slug, base)
+
+
 def _unreadable_state_candidate(base: Path, slug: str) -> Optional[Path]:
     """A conventionally-named dir for `slug` whose state file exists but
     cannot be read. The content resolver can't match it, but preferring it
@@ -213,7 +357,7 @@ def run_dir(slug: Optional[str] = None) -> Optional[Path]:
     if base is None:
         return None
     slug = slug or derive_slug()
-    found = find_run_dir(slug, base)
+    found = resolve_run_dir(slug, base)
     if found is not None:
         return found
     corrupt = _unreadable_state_candidate(base, slug)
@@ -228,21 +372,40 @@ def run_rel_path(slug: Optional[str] = None) -> Optional[str]:
     return rels[0] if rels else None
 
 
+def run_rel_for_dir_name(dir_name: str) -> Optional[str]:
+    """The work-repo-relative path of a run dir by NAME:
+    `{host}/{project}/runs/<dir_name>`, or None when the repo identity is
+    not in the environment.
+
+    One owner for the shape. Callers that stage a run dir for commit build
+    this path, and every copy of it also copies the host/project fallback —
+    so it lives here, beside run_rel_path_candidates, which is built on it.
+    """
+    host = os.environ.get("LMER_REPO_HOST")
+    project = os.environ.get("LMER_REPO_PROJECT")
+    if not host or not project:
+        return None
+    return f"{host}/{project}/runs/{dir_name}"
+
+
 def run_rel_path_candidates(slug: Optional[str] = None) -> list[str]:
     """Work-repo-relative paths worth staging for the run: the resolved dir
     first, then the bare-slug dir when it differs. Staging both lets a
     commit after a dir rename pick up the old path's deletions even when
-    the rename-time push failed (commit_work_path skips clean paths)."""
-    host = os.environ.get("LMER_REPO_HOST")
-    project = os.environ.get("LMER_REPO_PROJECT")
-    if not host or not project:
-        return []
+    the rename-time push failed (commit_work_path skips clean paths) — the
+    naming freeze's rename and the release re-slug's alike, since the bare
+    slug is exactly the address a re-slugged run vacated."""
     slug = slug or derive_slug()
     rels = []
-    found = find_run_dir(slug)
+    found = resolve_run_dir(slug)
     if found is not None:
-        rels.append(f"{host}/{project}/runs/{found.name}")
-    bare = f"{host}/{project}/runs/{slug}"
+        resolved = run_rel_for_dir_name(found.name)
+        if resolved is None:
+            return []
+        rels.append(resolved)
+    bare = run_rel_for_dir_name(slug)
+    if bare is None:
+        return []
     if bare not in rels:
         rels.append(bare)
     return rels
@@ -427,6 +590,104 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     except Exception as exc:
         print(f"⚠️  specs index re-point failed (continuing): {exc}")
     return rdir, old_name
+
+
+def reslug_run(
+    rdir: Path, state: dict, new_slug: str
+) -> tuple[Path, dict, Optional[str]]:
+    """Move a run to a new identity — the release run taking its
+    version-bearing slug (`release-<repo>` → `release-<repo>-v0.6.0`).
+
+    Run identity is deterministic per `(taskdef, target)`, so without this
+    every release of a repository resolved to ONE run dir: the second
+    release found the first one's finished run and `work release claim`
+    refused it forever. Recording the version moves the run to an address
+    of its own and frees the bare one for the next release.
+
+    ORDER IS LOAD-BEARING: the dir is renamed FIRST, then `state.slug` is
+    written. The directory is the resource that must never be
+    double-booked — `seed_run_dir` creates at `runs/<slug>`, so a slug that
+    moved while the dir did not would let the next release's seed land on
+    top of this run and adopt it. Both crash windows are recoverable:
+
+    - crashed after the rename, before the slug write → the run still
+      resolves (resolution is by content, never by dir name) and the next
+      release-record verb completes the re-slug;
+    - the rename could not happen (target taken, fs error) → loud warning,
+      slug UNCHANGED, run continues at the bare address. `work release
+      claim` heals it on the next release rather than dead-ending.
+
+    A name-bearing dir stays name-bearing (`<new-slug>--<name>`); this is a
+    distinct lifecycle event from the freeze gate's one-shot naming rename
+    (issue #87 D2), which is untouched.
+
+    Returns (possibly-renamed rdir, state, previous dir name when a rename
+    happened, else None) — the caller stages the previous path so the old
+    path's deletion lands in the same commit.
+    """
+    old_slug = state.get("slug")
+    if not new_slug or new_slug == old_slug:
+        return rdir, state, None
+    name = state.get("name")
+    target_name = f"{new_slug}--{name}" if name else new_slug
+    old_dir_name: Optional[str] = None
+    if rdir.name != target_name:
+        target = rdir.parent / target_name
+        if not slug_available(new_slug, rdir.parent, exclude=rdir):
+            # The guard is on the SLUG, not on the path: a named run holds
+            # `<new_slug>--<name>` while leaving `runs/<new_slug>` free, and
+            # letting the move through there would leave two runs recording
+            # one `state.slug` for `find_run_dir` to pick between by sort
+            # order. Callers compute an address that is actually available
+            # (release_run.unique_release_slug), so this is the net rather
+            # than the mechanism — reaching it means the run keeps its
+            # current identity, which is safe but not free of consequence.
+            #
+            # stderr for every warning on this path: it runs inside
+            # `work release claim`, whose --json form parses stdout.
+            print(f"⚠️  re-slug skipped: '{new_slug}' is already taken "
+                  f"(run stays at runs/{rdir.name})", file=sys.stderr)
+            return rdir, state, None
+        old_dir_name = rdir.name
+        try:
+            rdir = rdir.rename(target)
+        except OSError as exc:
+            print(f"⚠️  re-slug rename failed (continuing at "
+                  f"runs/{old_dir_name}): {exc}", file=sys.stderr)
+            return rdir, state, None
+    # The rename has happened — from here the caller MUST get the new path
+    # back even if a bookkeeping step fails, or its next write would
+    # recreate the old dir and fork the run.
+    #
+    # The vacated address is RECORDED, not merely left behind: it is what
+    # `find_successor_run_dir` matches on, so a session deriving the old
+    # address still lands on this run. Append-only and de-duplicated — a run
+    # that moves twice must stay reachable from every address it has held,
+    # and re-running the tail of an interrupted re-slug must not double it.
+    # An optional field: runs that never re-slugged simply do not have it,
+    # which is exactly what excludes them from successor matching.
+    vacated = state.get("reslugged_from")
+    vacated = list(vacated) if isinstance(vacated, list) else []
+    if old_slug and old_slug not in vacated:
+        vacated.append(old_slug)
+    state["reslugged_from"] = vacated
+    state["slug"] = new_slug
+    write_state(rdir, state)
+    try:
+        append_event(rdir, "run_reslugged", note=f"{old_slug} -> {new_slug}")
+    except OSError as exc:
+        print(f"⚠️  run_reslugged event not recorded: {exc}", file=sys.stderr)
+    if old_dir_name is not None:
+        # Index entries are relative symlinks into runs/<dirname>/ — same
+        # re-point the freeze rename does, fail-soft for the same reason.
+        try:
+            specs_index.repoint_run_dir_entries(
+                old_dir_name, target_name, specs_index.run_label(rdir, state)
+            )
+        except Exception as exc:
+            print(f"⚠️  specs index re-point failed (continuing): {exc}",
+                  file=sys.stderr)
+    return rdir, state, old_dir_name
 
 
 def _backup_bad_state(path: Path, reason: str) -> "RunStateError":
@@ -745,6 +1006,296 @@ def _iso_to_minutes_apart(earlier: str, later: str) -> Optional[float]:
         return None
 
 
+def claim_status(
+    state: Optional[dict],
+    session: str,
+    now: Optional[str] = None,
+) -> dict:
+    """Pure verdict on the run's single-flight release claim (RUN-STATE.md §7).
+
+    The claim is the dedicated `claim` block in state.yaml —
+    `{session_id, claimed_at}` — deliberately NOT the per-session `owner`
+    field (cleared at every session end, warn-only semantics). No fs, no
+    env reads: decide() and the CLI both call this on state they already
+    hold, like decide()'s other inputs.
+
+    Verdicts: CLAIM_UNCLAIMED (no block, or the run is no longer
+    in-progress — completing or aborting the run releases the lock with no
+    separate CAS write), CLAIM_OURS (held by `session`; re-claiming is an
+    idempotent refresh), CLAIM_FOREIGN_LIVE (age under
+    RELEASE_CLAIM_STALE_MINUTES — hard refusal territory), or
+    CLAIM_FOREIGN_STALE (past the threshold, or claimed_at unparseable —
+    the holder crashed or was reaped; the next claimant takes over loudly).
+    `holder`/`claimed_at`/`age_minutes` are reported whenever a block
+    exists, even when the verdict reads unclaimed.
+    """
+    verdict = {
+        "verdict": CLAIM_UNCLAIMED,
+        "holder": None,
+        "claimed_at": None,
+        "age_minutes": None,
+    }
+    if not isinstance(state, dict):
+        return verdict
+    claim = state.get("claim")
+    if not isinstance(claim, dict) or not claim.get("session_id"):
+        return verdict
+    verdict["holder"] = claim.get("session_id")
+    verdict["claimed_at"] = claim.get("claimed_at")
+    verdict["age_minutes"] = _iso_to_minutes_apart(
+        str(claim.get("claimed_at") or ""), now or utc_now_iso()
+    )
+    if state.get("status") != "in-progress":
+        return verdict  # the claim is valid only while the run is live
+    if verdict["holder"] == session:
+        verdict["verdict"] = CLAIM_OURS
+    elif (
+        verdict["age_minutes"] is not None
+        and abs(verdict["age_minutes"]) < RELEASE_CLAIM_STALE_MINUTES
+    ):
+        # abs(): the threshold bounds clock skew in BOTH directions. A
+        # plain `age < threshold` reads a future-dated claimed_at (holder
+        # clock fast by hours, then crashed) as live until the skew itself
+        # elapses; a plain `0 <= age` flips small negative skew into an
+        # instant takeover of a genuinely live holder. Beyond the threshold
+        # either way, the claimed_at cannot be trusted — stale.
+        verdict["verdict"] = CLAIM_FOREIGN_LIVE
+    else:
+        verdict["verdict"] = CLAIM_FOREIGN_STALE
+    return verdict
+
+
+def is_claimed_by_other(
+    state: Optional[dict],
+    session: str,
+    now: Optional[str] = None,
+) -> bool:
+    """True exactly when a LIVE foreign claim holds the run — the hard-refusal
+    predicate (§7). A stale foreign claim reads False: it is takeover
+    territory, not refusal territory."""
+    return claim_status(state, session, now)["verdict"] == CLAIM_FOREIGN_LIVE
+
+
+def _claim_pointer(rdir: Path, state: dict, status: dict) -> dict:
+    """The loser's pointer (§7): enough to find the active release without
+    archaeology. The CLI adds the web URL (git_ops.web_url_for)."""
+    return {
+        "slug": state.get("slug"),
+        "run_dir": str(rdir),
+        "holder": status["holder"],
+        "claimed_at": status["claimed_at"],
+        "age_minutes": status["age_minutes"],
+        "status": state.get("status"),
+        "phase": state.get("phase"),
+    }
+
+
+def claim_pointer(
+    rdir: Path,
+    state: dict,
+    session: Optional[str] = None,
+    now: Optional[str] = None,
+) -> dict:
+    """The loser's pointer (§7) for a caller that refuses BEFORE reaching a
+    kernel verb — `work release abort`'s live-foreign-claim guard has to run
+    ahead of record_abort, so it cannot get the pointer off a
+    ClaimRefusedError the way the claim/unclaim paths do."""
+    return _claim_pointer(
+        rdir, state, claim_status(state, session or current_session_id(), now)
+    )
+
+
+def claim_run(
+    rdir: Path,
+    state: dict,
+    session: Optional[str] = None,
+    now: Optional[str] = None,
+) -> dict:
+    """Write the LOCAL half of the single-flight release claim (§7).
+
+    Evaluates the claim in `state` — which the CLI feeds from the REMOTE
+    head after a fetch, composing this with git_ops.claim_push_once (whose
+    non-fast-forward rejection closes the fetch→push race window; this
+    kernel owns only the state write, never the push):
+
+    - unclaimed → take the claim.
+    - ours → idempotent refresh of `claimed_at` (how the holder keeps the
+      claim live; the watch loop re-claims well inside the threshold).
+    - foreign + live → HARD refusal: ClaimRefusedError carrying the loser's
+      pointer. Never a warning — the party being refused is normally an
+      unattended second launch.
+    - foreign + stale → automatic LOUD takeover: the `claim` event records
+      the displaced session and the claim's age. Automatic because the next
+      claimant is normally the unattended scheduled relaunch; safe because
+      takeover resumes the SAME run — it can never start a second parallel
+      release.
+
+    Writes through the single writer (write_state), appends a `claim`
+    audit event, and returns the updated state.
+    """
+    session = session or current_session_id()
+    now = now or utc_now_iso()
+    status = claim_status(state, session, now)
+    if status["verdict"] == CLAIM_FOREIGN_LIVE:
+        raise ClaimRefusedError(
+            f"run '{state.get('slug')}' is claimed by session {status['holder']} "
+            f"({int(status['age_minutes'])} min ago) — refusing while the "
+            f"claim is live",
+            _claim_pointer(rdir, state, status),
+        )
+    state["claim"] = {"session_id": session, "claimed_at": now}
+    write_state(rdir, state)
+    data: dict = {"session_id": session, "claimed_at": now}
+    if status["verdict"] == CLAIM_FOREIGN_STALE:
+        age = status["age_minutes"]
+        age_text = f"{int(age)} min old" if age is not None else "unreadable claimed_at"
+        note = (
+            f"stale-claim takeover: displaced session {status['holder']} ({age_text})"
+        )
+        data["action"] = "takeover"
+        data["displaced_session"] = status["holder"]
+        data["displaced_claimed_at"] = status["claimed_at"]
+        data["displaced_age_minutes"] = age
+    elif status["verdict"] == CLAIM_OURS:
+        note = "claim refreshed"
+        data["action"] = "refresh"
+    else:
+        note = "claim taken"
+        data["action"] = "claim"
+    append_event(rdir, "claim", note=note, data=data)
+    return state
+
+
+def unclaim_run(
+    rdir: Path,
+    state: dict,
+    session: Optional[str] = None,
+    force: bool = False,
+) -> dict:
+    """Clear the single-flight release claim (§7 `work release unclaim`).
+
+    Clears only OUR claim: a foreign holder refuses (ClaimRefusedError)
+    unless `force` — the human runbook (abort path, stranded-claim cleanup).
+    The holder check is on the raw block, not liveness: staleness gates
+    takeover-by-claim, never silent removal. No claim recorded is an
+    idempotent no-op success — no write, no event. Returns the state.
+    """
+    session = session or current_session_id()
+    claim = state.get("claim")
+    if not isinstance(claim, dict) or not claim.get("session_id"):
+        return state
+    holder = claim.get("session_id")
+    if holder != session and not force:
+        status = claim_status(state, session)
+        raise ClaimRefusedError(
+            f"claim on '{state.get('slug')}' is held by session {holder} — "
+            f"refusing to unclaim a foreign claim (force overrides)",
+            _claim_pointer(rdir, state, status),
+        )
+    state["claim"] = None
+    write_state(rdir, state)
+    data = {"action": "unclaim", "holder": holder}
+    if holder != session:
+        data["forced"] = True
+        note = f"claim force-released (was held by session {holder})"
+    else:
+        note = "claim released"
+    append_event(rdir, "claim", note=note, data=data)
+    return state
+
+
+def abort_run(
+    rdir: Path,
+    state: dict,
+    reason: Optional[str] = None,
+    session: Optional[str] = None,
+    force: bool = False,
+) -> dict:
+    """Terminal abort of a release run (`work release abort` — release-flow
+    spec §7's abandoned release: the bump merged, the human declined the
+    release MR).
+
+    DESIGN DECISION — abort is a terminal `stop_reason: aborted` on a
+    `status: complete` run, NOT a fourth STATUSES value. `status` is the
+    closed enum external consumers switch on without knowing releases
+    exist: the external cleaner archives runs that are `complete`
+    (RUN-STATE.md §6 — a new `aborted` status would sit outside its
+    "complete or stale" rule until every deployed cleaner learned the
+    value), decide()'s completed-run policy (issue #96) already refuses to
+    silently resume `complete`/`archived` runs — exactly the
+    no-resurrection guard an aborted run needs, for free — and
+    claim_status() (§7) already reads any claim on a non-`in-progress` run
+    as unclaimed, so the lock releases by the existing rule. `stop_reason`
+    is the descriptive "why it stopped" axis that nothing switches on, so
+    extending STOP_REASONS with `aborted` is additive and the
+    schema-stays-1 promise holds.
+
+    ONE atomic state write (the single writer) lands all three facts
+    together — status → complete, stop_reason → aborted, claim → None —
+    so no observer ever sees an aborted run still holding the lock. The
+    claim is cleared outright rather than left as an inert block (§7 would
+    read it unclaimed anyway) so `claim-status` never reports stranded
+    "inactive claim block" noise.
+
+    A LIVE FOREIGN claim REFUSES unless `force` — the same knob and wording
+    as unclaim_run. Abort is the human's terminal decline, but "the human
+    declined" and "another session is mid-release right now" are different
+    facts, and only the caller knows which one holds. Without the guard,
+    session B — correctly refused at `work release claim` — could follow
+    the decline path and mark A's in-flight release terminal, freeing A's
+    lock remotely so a third session drives the same release. A STALE
+    foreign claim (crashed/reaped holder) still clears without `force`:
+    staleness is exactly the takeover case. Our own claim, and a run with
+    no claim, need no force.
+
+    Aborting an already-aborted run is an idempotent no-op (no write, no
+    event); a run that finished any other way refuses — aborting it would
+    falsify its recorded outcome. The release.yaml half of the abort is
+    release_run.record_abort's; pushing is the caller's business (the
+    CLI's CAS push, like the claim verbs).
+    """
+    if state.get("status") != "in-progress":
+        if state.get("stop_reason") == "aborted":
+            return state  # already terminal — a re-abort converges
+        raise RunStateError(
+            f"run '{state.get('slug')}' is already {state.get('status')} "
+            f"(stop_reason: {state.get('stop_reason')}) — nothing to abort"
+        )
+    session = session or current_session_id()
+    status = claim_status(state, session)
+    if status["verdict"] == CLAIM_FOREIGN_LIVE and not force:
+        raise ClaimRefusedError(
+            f"run '{state.get('slug')}' is claimed by session "
+            f"{status['holder']} ({int(status['age_minutes'])} min ago) — "
+            f"refusing to abort a release another session is driving "
+            f"(--force overrides)",
+            _claim_pointer(rdir, state, status),
+        )
+    claim = state.get("claim")
+    holder = claim.get("session_id") if isinstance(claim, dict) else None
+    state["status"] = "complete"
+    state["stop_reason"] = "aborted"
+    state["claim"] = None
+    write_state(rdir, state)
+    data: dict = {}
+    note = "release run aborted"
+    if reason is not None:
+        # Free-text lands in the (shared) work repo — redact like the
+        # other agent-typed writers do.
+        data["reason"] = redact_secrets(reason)
+        note = f"release run aborted: {data['reason']}"
+    if holder is not None:
+        data["cleared_claim_holder"] = holder
+        if holder != session:
+            # A forced abort over a live holder, or a stale-claim clear —
+            # either way the displaced session must be findable in the audit
+            # trail, not just named in a message that scrolled past.
+            data["forced"] = force
+            data["cleared_claim_verdict"] = status["verdict"]
+    append_event(rdir, "run_aborted", note=note, data=data)
+    return state
+
+
 def decide(
     state: Optional[dict],
     events: list[dict],
@@ -752,25 +1303,84 @@ def decide(
     now: Optional[str] = None,
     ledger: Optional[dict] = None,
     sessions_used: Optional[int] = None,
+    release: Optional[dict] = None,
 ) -> dict:
     """Pure resume decision (spec §4.3 `work resume`). No fs, no env reads —
-    fully unit-testable; all inputs are passed in by the caller."""
+    fully unit-testable; all inputs are passed in by the caller. `release`
+    is the loaded release.yaml record (release-flow §3) — the caller loads
+    it only for release runs, exactly like ledger/sessions_used, so every
+    non-release run passes None and its output stays byte-identical."""
     if state is None:
         return {"kind": "none"}
     warnings: list[str] = []
-    owner = state.get("owner")
-    if isinstance(owner, dict) and owner.get("session_id") not in (None, session):
-        age = _iso_to_minutes_apart(owner.get("claimed_at", ""), now or utc_now_iso())
-        if age is not None and age < STALE_CLAIM_MINUTES:
+    claim_info: Optional[dict] = None
+    claim = state.get("claim")
+    if isinstance(claim, dict) and claim.get("session_id"):
+        # Single-flight release claim (RUN-STATE.md §7): ENFORCED, not
+        # warn-only — this branch replaces the advisory owner branch below
+        # for release runs (only they carry a claim block; the claim verbs
+        # are its sole writers). Non-release runs never have the block, so
+        # their warn-only semantics stay byte-identical.
+        claim_info = claim_status(state, session, now=now)
+        if claim_info["verdict"] == CLAIM_FOREIGN_LIVE:
             warnings.append(
-                f"run is claimed by another live session "
-                f"({owner.get('session_id')}, {int(age)} min ago) — coordinate before writing"
+                f"release claim held by session {claim_info['holder']} "
+                f"({int(claim_info['age_minutes'])} min ago) — enforced "
+                f"single-flight: `work release claim` refuses while it is live"
             )
-        else:
+        elif claim_info["verdict"] == CLAIM_FOREIGN_STALE:
             warnings.append(
-                f"stale owner claim from session {owner.get('session_id')} — "
-                f"the previous session likely did not close cleanly"
+                f"stale release claim from session {claim_info['holder']} — "
+                f"past {RELEASE_CLAIM_STALE_MINUTES} min: the next "
+                f"`work release claim` takes over loudly"
             )
+    else:
+        owner = state.get("owner")
+        if isinstance(owner, dict) and owner.get("session_id") not in (None, session):
+            age = _iso_to_minutes_apart(owner.get("claimed_at", ""), now or utc_now_iso())
+            if age is not None and age < STALE_CLAIM_MINUTES:
+                warnings.append(
+                    f"run is claimed by another live session "
+                    f"({owner.get('session_id')}, {int(age)} min ago) — coordinate before writing"
+                )
+            else:
+                warnings.append(
+                    f"stale owner claim from session {owner.get('session_id')} — "
+                    f"the previous session likely did not close cleanly"
+                )
+    # Release-run position (release-flow §3: "relaunching the release taskdef
+    # re-derives the leg from run state and continues"): derived purely from
+    # the record the caller passed in — decide() stays IO-free.
+    release_info: Optional[dict] = None
+    if release is not None:
+        # Deferred import: release_run imports this module's shared YAML
+        # preamble at load time, so a top-level import here would be a cycle.
+        from .release_run import RECEIPT_NAMES, ReleaseRunError, derive_leg
+
+        tag = release.get("tag")
+        receipts = release.get("receipts")
+        receipts = receipts if isinstance(receipts, dict) else {}
+        release_info = {
+            "leg": None,
+            "next_step": None,
+            "version": release.get("version"),
+            "bump_mr_merge_sha": release.get("bump_mr_merge_sha"),
+            "release_mr_merge_sha": release.get("release_mr_merge_sha"),
+            "tag": tag.get("name") if isinstance(tag, dict) else None,
+            # Recorded receipts in ladder order — what has already shipped.
+            "receipts": [n for n in RECEIPT_NAMES if n in receipts],
+        }
+        try:
+            derived = derive_leg(release)
+            release_info["leg"] = derived["leg"]
+            release_info["next_step"] = derived["next_step"]
+        except ReleaseRunError as exc:
+            # derive_leg's hard stop (hand-edited/inconsistent record): the
+            # brief must still render — the raw fields above stay, the
+            # derived position reads unknown, and the stop text becomes a
+            # warning instead of breaking the session-start hook.
+            release_info["error"] = str(exc)
+            warnings.append(f"release record inconsistent: {exc}")
     return {
         "kind": "run",
         "slug": state.get("slug"),
@@ -794,6 +1404,13 @@ def decide(
         "estimate": state.get("estimate"),
         "sessions_used": sessions_used,
         "artifacts": state.get("artifacts") or {},
+        # The single-flight release claim's verdict (§7) — None for runs
+        # without a claim block (every non-release run). Additive key for
+        # --json consumers, so the CLI and hooks never re-derive it.
+        "claim": claim_info,
+        # Release-run position block (release-flow §3) — None for every
+        # non-release run, so their brief output stays byte-identical.
+        "release": release_info,
         # Full ledger for --json consumers; the brief renders the one-line
         # summary from it (issue #89).
         "ledger": ledger,
@@ -866,6 +1483,41 @@ def format_brief(
     ledger_line = format_ledger_line(summarize_ledger(decision.get("ledger")))
     if ledger_line:
         lines.append(ledger_line)
+    # Release-run position block (release-flow §3): the derived leg/next
+    # step, recorded identity (version, merge SHAs, tag), receipt set, and
+    # claim state — everything a relaunched session needs to resume at
+    # exactly one next action. Rendered only when decide() carried a
+    # release record; non-release briefs stay byte-identical.
+    release = decision.get("release")
+    if release:
+        if release.get("error"):
+            lines.append(
+                f"Release: {release.get('version') or '?'} — record "
+                f"inconsistent (hard stop; see warning below)"
+            )
+        else:
+            # An aborted record derives next_step None — nothing to advance.
+            lines.append(
+                f"Release: {release.get('version') or '?'} — "
+                f"{release.get('leg')} (next: {release.get('next_step') or '—'})"
+            )
+        lines.append(f"  bump-MR merge SHA     {release.get('bump_mr_merge_sha') or '—'}")
+        lines.append(f"  release-MR merge SHA  {release.get('release_mr_merge_sha') or '—'}")
+        lines.append(f"  tag                   {release.get('tag') or '—'}")
+        receipts = release.get("receipts") or []
+        lines.append(f"  receipts              {', '.join(receipts) if receipts else '—'}")
+        claim = decision.get("claim")
+        verdict = claim.get("verdict") if isinstance(claim, dict) else None
+        if verdict == CLAIM_OURS:
+            claim_text = f"ours (session {claim.get('holder')})"
+        elif verdict in (CLAIM_FOREIGN_LIVE, CLAIM_FOREIGN_STALE):
+            age = claim.get("age_minutes")
+            age_text = f"{int(age)} min ago" if age is not None else "unreadable claimed_at"
+            live = "LIVE" if verdict == CLAIM_FOREIGN_LIVE else "stale"
+            claim_text = f"foreign ({live}) — session {claim.get('holder')}, {age_text}"
+        else:
+            claim_text = "unclaimed"
+        lines.append(f"  claim                 {claim_text}")
     for warning in decision.get("warnings", []):
         lines.append(f"⚠️  {warning}")
     events = decision.get("recent_events") or []

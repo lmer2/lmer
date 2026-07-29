@@ -1,0 +1,158 @@
+{#-
+  Leg 1 — prep body. Included by taskdef/release/instructions.txt under its
+  "## Leg 1 — prep (GitLab side)" H2; headings here start at H3.
+-#}
+Record the phase: `work state set --phase=leg1-prep`
+
+Leg 1 produces exactly one thing: a version-bump + changelog-roll commit on
+a branch off `prep-release`, delivered through an MR targeting
+`prep-release`, with the bumped version and the bump-MR merge SHA recorded
+in run state. Nothing in this leg touches `main`, tags, or GitHub.
+
+Before starting, run `work release status`. A recorded release version AND
+bump-MR merge SHA mean leg 1 already completed — skip to the gate. A
+recorded version with no bump SHA means the bump commit was made and
+recorded — check how far it got (remote `prep-<X.Y.Z>` branch? open bump
+MR?) and pick up at the first missing step (6, 7, or 8), adopting whatever
+already exists per the adoption rule in step 6.
+
+### 1. Branch off `prep-release`
+
+```
+git fetch origin prep-release
+git switch -c release-bump origin/prep-release
+```
+
+Always branch off up-to-date `origin/prep-release` — never off `main`, and
+never commit to `prep-release` directly. The branch is renamed to its final
+`prep-<X.Y.Z>` name in step 4, once the dry run has confirmed the version.
+
+### 2. Install ctl at the pinned ref
+
+Until ctl itself ships through this flow, it installs from its canonical
+git.20c.com repository at a PINNED commit — never a branch, never HEAD:
+
+```
+# Pinned ctl commit. Bumping this pin is a reviewed edit to this taskdef,
+# never a session-time decision; the dry run below revalidates it.
+# Pin provenance: resolved from the GitHub mirror of 20c/ctl (a merge
+# commit on its main, 2026-07-18) because the authoring environment had no
+# git.20c.com credentials — the install still pulls from the canonical
+# host, and the dry run in step 3 is the gate that revalidates the pin.
+CTL_PINNED_REF=8a28e2e4d2754744a6a0c3a79d1f2d91f7f1d0d9
+uv tool install "git+https://git.20c.com/20c/ctl@${CTL_PINNED_REF}"
+```
+
+If the install fails, that is a hard stop: record it with `work state set
+--stop-reason=critical_error --critical-error '{"summary": "ctl install
+failed at pinned ref", "detail": "<ref and error>"}'`, `work commit`, and
+end the session. Do NOT fall back to PyPI, a floating branch, a different
+ref, or a hand-written bump script. The pin is human-owned: report the
+failure and leave moving it to a reviewed taskdef edit.
+
+### 3. Dry-run before committing anything
+
+The changelog mechanism is the resolved `release.changelog` parameter from
+Phase 0.5 — exactly one of:
+
+- `legacy` — ctl rolls `CHANGELOG.yaml`: the `unreleased:` section becomes
+  the new `X.Y.Z` section (lmer's first release under this flow runs in
+  this mode).
+- `fragments` — ctl compiles the `changelog.d/` fragment files into the
+  changelog and removes the consumed fragments.
+
+Run the version bump + changelog roll in dry-run mode FIRST — no writes, no
+commits (consult `ctl --help` at the pinned ref for the exact dry-run
+invocation). The dry run must show both:
+
+1. the target version `X.Y.Z` it would bump to, and
+2. a changelog roll in the configured mechanism — the `CHANGELOG.yaml`
+   section roll for `legacy`, fragment compilation for `fragments`.
+
+A dry run that fails, or that handles the changelog in any mechanism other
+than the configured one, means the pinned ref does not handle this
+repository: HARD STOP with the same critical-error recording contract,
+naming the pinned ref and the configured changelog mode. Do NOT bump the
+pin yourself and do NOT hand-edit the changelog to compensate — a human
+revalidates and moves the pin.
+
+Idempotency: when the dry run reports the version already bumped and the
+changelog already rolled on `prep-release` (a previous release run died
+after its bump MR merged), do NOT bump again. Record the version read from
+`pyproject.toml` on `prep-release` and the merge SHA of the bump MR that
+landed it (step 8's recording contract), then proceed to the gate — see
+"Resuming an in-progress release".
+
+### 4. Run the bump + changelog roll
+
+Run the same ctl invocation for real, then verify the working tree: the
+diff must contain exactly the version bump in `pyproject.toml` plus the
+changelog artifacts of the configured mechanism (a rolled `CHANGELOG.yaml`,
+or the compiled changelog plus deleted `changelog.d/` fragments) — nothing
+else. Anything unexpected in the diff is a stop-and-ask, not something to
+commit around.
+
+Rename the branch to its final name: `git branch -m prep-<X.Y.Z>`.
+
+### 5. Commit, then record the version — BEFORE anything is pushed
+
+- Commit through `gate-commit` — the standard commit gate; never raw
+  `git commit`. Commit message: `prep <X.Y.Z>`.
+- Record leg-1 state immediately — run state fields come from the
+  runstate subsystem; read and write them through the `work` CLI only,
+  never edit state files by hand and never invent a parallel record of
+  your own:
+  - `work release record version <X.Y.Z>` — the `pyproject.toml` version,
+    write-once, NO `v` prefix (the tag prefix is applied in leg 2). This
+    is also where the RUN takes its own address: recording the version
+    moves the run dir to `release-<repo>-v<X.Y.Z>` and frees the seed
+    address for the next release (the verb prints the new path). Cite that
+    path — not the seed one — in anything you write from here on; a URL to
+    the old path 404s. Nothing else changes: the run resolves by content,
+    so `work` verbs and a relaunch still find it.
+  - `work log` the bump branch name, so a relaunch finds the branch
+    without archaeology.
+  - `work commit` so the recorded state pushes now, not at session end.
+
+The ordering is load-bearing: the version is recorded before the branch
+leaves this machine, so a session dying mid-push resumes at
+`leg1-record-bump-merge` and adopts what exists — it never rolls a second
+bump against a branch that is already on the remote.
+
+### 6. Push the branch
+
+Adoption, never re-creation: check `git ls-remote origin
+refs/heads/prep-<X.Y.Z>` (and for an open bump MR titled `prep <X.Y.Z>`)
+FIRST. An existing remote branch or open bump MR matching the dry-run's
+target version means a previous session died between its push and its
+record landing — ADOPT it: fetch it, verify it carries exactly the bump
+(the version bump + changelog roll of step 4, nothing else), record the
+version if not yet recorded (step 5's recording contract), and pick up at
+step 7 or 8 as appropriate. NEVER re-create the branch and NEVER
+force-push over it.
+
+Otherwise push: `git push -u origin prep-<X.Y.Z>`. Never push
+`prep-release` or `main` directly.
+
+### 7. Open the bump MR targeting `prep-release` — then log its URL
+
+Open the MR from `prep-<X.Y.Z>` targeting `prep-release` — NEVER targeting
+`main`. The MR into `main` already exists: the standing `prep-release` →
+`main` MR, which becomes the release MR once this bump lands. Title the
+bump MR `prep <X.Y.Z>` and note the release run in its description.
+
+Then `work log` the bump-MR URL, so a relaunch finds the MR without
+archaeology, and `work commit`.
+
+### 8. The bump MR lands — record the merge SHA
+
+Once the bump MR is merged into `prep-release` (its pipeline green):
+
+- `work release record bump-sha <sha>` — the full 40-hex merge SHA on
+  `prep-release`.
+- `work commit`.
+
+With the version and bump SHA both recorded, leg 1 is complete and the
+standing `prep-release` → `main` MR IS the release MR — proceed to the
+gate. A relaunch decides whether the bump landed from these two recorded
+fields alone, never from an earlier session's memory.

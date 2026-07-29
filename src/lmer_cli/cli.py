@@ -29,10 +29,12 @@ from .container_home import ensure_container_home
 from .log import error, info, success, warning
 from .mounts import (
     CONTAINER_CLONE_CACHE_DIR,
+    CONTAINER_RELEASE_SIGNING_KEY_PATH,
     FileMountSpec,
     PlannedCredentialMount,
     build_checkout_mount,
     build_clone_cache_mount,
+    build_release_signing_key_mount,
     build_container_home_mounts,
     build_external_taskdef_mounts,
     build_file_mounts,
@@ -97,6 +99,52 @@ DEFAULT_PORT_POOL = "8800-8899"
 # published mapping is reachable from the host but not network-exposed.
 # Override with --port-bind / LMER_PORT_BIND (e.g. "0.0.0.0" for LAN access).
 DEFAULT_PORT_BIND = "127.0.0.1"
+
+# --- Release credential provisioning (release-flow spec §4/§5) --------------
+#
+# Gate mechanism decision: the production release credentials are scoped by
+# the **resolved task id** (the LMER_TASK value `_selected_task_id` returns).
+# The three mechanisms the codebase offers were weighed:
+#
+# - `task.yaml` manifest, read host-side from `resolved_taskdef_dir`: the
+#   dir is None whenever the taskdef resolves in-container (work-repo
+#   taskdefs are invisible host-side), and any taskdef in any tier could
+#   declare the flag — a self-claimed authorization is weaker than the
+#   thing it gates.
+# - Operator preset as authorization (`presets.py` env/args): routes the
+#   secret through `preset_applied_env`, which is one of the two leak paths
+#   this gate exists to close, and since any session may carry any preset
+#   the negative guarantee ("no other taskdef receives the credentials")
+#   would be structurally untestable.
+# - Resolved task id: the value the operator explicitly selected at launch,
+#   available host-side unconditionally, and literally the spec's own
+#   scoping unit ("release-taskdef sessions only"). Chosen.
+RELEASE_TASK_ID = "release"
+
+# Frozen production credential env var names — later release-flow tasks
+# (taskdef instructions, docs, wave-2 scoping tests) cite these:
+#
+# - LMER_RELEASE_GITHUB_TOKEN — the fine-grained GitHub PAT
+#   (`contents:write` + `workflows:write` on the single mirror repo,
+#   spec §5). Host value forwarded verbatim, release-taskdef sessions only.
+# - LMER_RELEASE_SIGNING_KEY — host side: path to the release SSH signing
+#   private key; container side: the fixed read-only bind path
+#   CONTAINER_RELEASE_SIGNING_KEY_PATH (the path is remapped, so the host
+#   location never leaks into the container env).
+RELEASE_GITHUB_TOKEN_ENV = "LMER_RELEASE_GITHUB_TOKEN"
+RELEASE_SIGNING_KEY_ENV = "LMER_RELEASE_SIGNING_KEY"
+
+# Rig-scoped rehearsal credentials (Ctl/rehearsal/README.md, credential
+# isolation): throwaway values with rig-only names, so no provisioning path
+# can reach for the production names. Deliberately provisioned to ANY
+# session — a rehearsal runs as a masterplan (non-release) task — and
+# env-borne only: the rehearsal signing key is a host-side path consumed by
+# the rig scripts, never delivered through the production key mount.
+REHEARSAL_CREDENTIAL_ENVS = (
+    "LMER_REHEARSAL_GITHUB_TOKEN",
+    "LMER_REHEARSAL_TESTPYPI_TOKEN",
+    "LMER_REHEARSAL_SIGNING_KEY",
+)
 
 
 def _resolve_requested_ports(
@@ -832,6 +880,50 @@ def _selected_task_id(ns: argparse.Namespace) -> str | None:
     rather than reading ``ns.task`` alone.
     """
     return ns.task if not ns.no_task else None
+
+
+def _release_credential_env(
+    runtime: str, task_id: str | None
+) -> tuple[dict[str, str | None], list[str], str | None]:
+    """The release credential scoping gate: env entries + signing-key mount.
+
+    Returns ``(env_entries, mount_args, fatal)``.
+
+    ``env_entries`` ALWAYS carries both production keys. For a release
+    session (``task_id == RELEASE_TASK_ID``) they hold the host PAT value
+    and the container key path; for every other session they are seeded
+    ``None``, which is load-bearing: a key already present in the container
+    env dict is skipped by both the .env merge and the preset seeding loop
+    in main() (the LMER_NAPKIN_TOKEN precedent), so a PAT sitting in a cwd
+    ``.env`` / ``~/.lmer/.env`` / ``--env-file`` or a preset's env can never
+    leak into a non-release container. The rig-scoped rehearsal variables
+    ride along unconditionally (any session, values from the host env —
+    the early .env load in main() already folded .env sources in).
+
+    ``fatal`` is a reason string when a *configured* signing key is
+    rejected by the mount guard — the caller must abort (a release session
+    that cannot sign must not start, the --mount-file fail-fast precedent).
+    Unconfigured credentials are not fatal: leg-1 release work (version
+    bump, MR) needs neither.
+    """
+    entries: dict[str, str | None] = {
+        # Rehearsal trio: plain passthrough to every session (env-borne
+        # only — no mount, even though the key var holds a path).
+        **{k: os.environ.get(k) for k in REHEARSAL_CREDENTIAL_ENVS},
+        RELEASE_GITHUB_TOKEN_ENV: None,
+        RELEASE_SIGNING_KEY_ENV: None,
+    }
+    if task_id != RELEASE_TASK_ID:
+        return entries, [], None
+    entries[RELEASE_GITHUB_TOKEN_ENV] = os.environ.get(RELEASE_GITHUB_TOKEN_ENV) or None
+    host_key = (os.environ.get(RELEASE_SIGNING_KEY_ENV) or "").strip()
+    if not host_key:
+        return entries, [], None
+    mount_args, skip_reason = build_release_signing_key_mount(runtime, Path(host_key))
+    if skip_reason:
+        return entries, [], skip_reason
+    entries[RELEASE_SIGNING_KEY_ENV] = CONTAINER_RELEASE_SIGNING_KEY_PATH
+    return entries, mount_args, None
 
 
 def _warn_on_scoped_preset_tier_override(
@@ -1610,6 +1702,28 @@ def main(argv: list[str] | None = None) -> int:
         for spec in file_mount_specs:
             success(f"✅ Mounting file: {spec.host} → {spec.container} ({spec.mode})")
 
+    # Release credential gate (release-flow spec §4/§5): production release
+    # credentials — the fine-grained GitHub PAT and the release SSH signing
+    # key — reach release-taskdef sessions ONLY, keyed on the resolved task
+    # id (see _release_credential_env for the mechanism decision). Every
+    # other session gets None seeds in the env dict below, closing both the
+    # .env-merge and preset-seeding leak paths. A configured key the mount
+    # guard rejects is fatal: a release session that cannot sign must not
+    # start (the --mount-file fail-fast precedent above).
+    release_env_entries, release_key_mount, release_fatal = _release_credential_env(
+        runtime, task_id
+    )
+    if release_fatal:
+        error(f"❌ {release_fatal}")
+        return 1
+    if release_key_mount:
+        run += release_key_mount
+        success(
+            f"✅ Mounting release signing key → {CONTAINER_RELEASE_SIGNING_KEY_PATH} (ro)"
+        )
+    if release_env_entries.get(RELEASE_GITHUB_TOKEN_ENV):
+        success("🔑 Release GitHub PAT provisioned (release-taskdef session)")
+
     # Optional: mount the host's uv cache so target-repo `uv sync` reuses
     # already-downloaded packages instead of re-fetching them each session.
     # Off by default; opt-in via LMER_MOUNT_UV_CACHE.
@@ -1859,6 +1973,15 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_TASKDEF_REPO": taskdef_repo_url or None,
         "LMER_TASKDEF_REF": os.environ.get("LMER_TASKDEF_REF"),
         "LMER_TASKDEF_TOKEN": None,
+        # Release-flow credentials (spec §5), resolved by the release gate
+        # above. Production pair (LMER_RELEASE_GITHUB_TOKEN /
+        # LMER_RELEASE_SIGNING_KEY): real values only in release-taskdef
+        # sessions; every other session carries None seeds so neither the
+        # .env merge below nor the preset seeding loop can forward them
+        # (the LMER_NAPKIN_TOKEN precedent above). Rehearsal trio
+        # (LMER_REHEARSAL_*): rig-scoped throwaways, deliberately
+        # provisioned to any session, env-borne only — never mounted.
+        **release_env_entries,
         # Task routing env
         "LMER_TASK": task_id if not ns.no_task else None,
         "LMER_TASK_TARGET": primary_target if not ns.no_task else None,

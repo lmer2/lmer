@@ -173,11 +173,66 @@ Design decisions and code conventions for working on lmer itself, recorded as da
 
 ---
 
+### [RELEASE-FLOW.md](./RELEASE-FLOW.md)
+**Release Flow — GitLab-Driven, Read-Only GitHub**
+
+Canonical explanation of how a public release ships, as a tracked lmer run with durable state and receipts:
+- Topology: canonical GitLab instance, GitHub as a read-only mirror/publish target, tokenless PyPI upload via trusted publishing (OIDC)
+- The two-leg release run (Leg 1 prep, human release-MR merge gate, Leg 2 ship) and the push ordering (GitHub green before any GitLab publish)
+- Watch/resume semantics, single-flight locking, and per-step idempotency keyed on the recorded merge SHA
+- The signing model (SSH-signed `v*` tags, `RELEASE_ALLOWED_SIGNERS` verification) and its honest residual-risk statement
+- `skip-existing` re-run drift, the version-reuse gate and its `RELEASE_RESUME_VERSION` resume switch, error paths, and the deferred first production release with its prerequisites
+
+**Best for**: Understanding the release flow end-to-end, cutting a release, and evaluating the signing/verification threat model.
+
+---
+
+### [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md)
+**Release Flow — Per-Repo Adoption Checklist & Runbooks**
+
+How a repository adopts the release flow (configuration plus prerequisites, never design changes):
+- The four-parameter surface (GitHub target URL, tag prefix, signing-key reference, changelog mechanism)
+- Prerequisite checklists: GitHub mirror controls, PyPI trusted publisher, GitLab protected tags, credentials
+- Rotation runbook for the fine-grained PAT and the release SSH signing key
+- Burned-version and GitHub `main` divergence remediation runbooks
+- The bootstrap sequence (lmer first, then ctl) and the pre-production rehearsal checklist
+
+**Best for**: Operators onboarding a new repository onto the release flow and running the credential-rotation or repair runbooks.
+
+---
+
+### [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md)
+**Release Rehearsal Rig — Runbook**
+
+Operator's runbook for the `Ctl/rehearsal/` scripts that exercise the full leg-2 release path in a scratch GitHub repo + TestPyPI before any production release:
+- Prerequisites, `rig.env` configuration, and the rehearsal-credential isolation rule (production targets and credentials are hard-refused)
+- Standing up the rig with `stand-up.sh` (drift guard, scratch repo, rulesets, throwaway signing key, environment, TestPyPI)
+- The G2 negative tag-verification tests (`unsigned-tag`, `wrong-signer`, `not-main-head`) and the leg-2 walk with idempotency re-entries
+- Evidence file format, offline `--verify-evidence` checks, teardown, and re-standing the rig for another adopter
+
+**Best for**: Running the mandatory rehearsal before a first production release and verifying its recorded evidence.
+
+---
+
+### [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md)
+**Production Release Setup — Operator Receipts**
+
+One-time, operator-performed production configuration receipts for the lmer release flow — each item ticked with date and actor (never a secret value):
+- Signing keypair, branch/tag protection, `pypi` environment tag-pattern policy, `RELEASE_ALLOWED_SIGNERS` variable
+- Production PAT issuance and provisioning, bot account signing key, PyPI trusted publisher, GitLab protected tags
+- Mirror PR/collaborator policy and the green-rehearsal gate
+- These receipts gate the first production (G4) release run — a release run must refuse leg 2 while any item is unchecked
+
+**Best for**: The operator completing (and auditors reviewing) the production setup checklist before the first release run.
+
+---
+
 ## Quick Navigation
 
 - **New to LMER?** Start with [LMER-CLI.md](./LMER-CLI.md) to learn how to use the tool
 - **Setting up containers?** See [CONTAINER.md](./CONTAINER.md) for Docker/Podman configuration
 - **Having auth issues?** Check [AUTHENTICATION.md](./AUTHENTICATION.md) for SSH and API setup
+- **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md), [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md), and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption, rehearsal, and operator setup
 - **Need to troubleshoot?** All documents include troubleshooting sections
 
 ---

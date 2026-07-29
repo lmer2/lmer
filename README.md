@@ -179,34 +179,38 @@ User-specific additions: create `~/.lmer/AGENTS.md` — the runner appends it af
 
 ## Releasing
 
-Releases to [PyPI](https://pypi.org/project/lmer/) are driven by git tags on `lmer2/lmer`. The full pipeline lives in `.github/workflows/release.yml`.
+Releases to [PyPI](https://pypi.org/project/lmer/) are driven by **SSH-signed** git tags on `lmer2/lmer`. The full pipeline lives in `.github/workflows/release.yml`; the full flow (topology, signing model, error paths) is documented in [docs/RELEASE-FLOW.md](docs/RELEASE-FLOW.md).
 
 To cut a release:
 
 1. Bump `version` in `pyproject.toml` (e.g. `0.1.0` → `0.1.1`).
 2. Update `CHANGELOG.yaml` with the release notes.
 3. Commit and merge to `main` through the normal PR flow.
-4. Tag the merge commit and push the tag:
+4. From an up-to-date `main`, create a **signed** tag at its head and push it:
 
    ```bash
    git switch main && git pull --ff-only
-   git tag v0.1.1
+   git -c gpg.format=ssh -c user.signingkey=<key> tag -s v0.1.1 <sha>
    git push origin v0.1.1
    ```
 
+   The tag must be signed by a key listed in `RELEASE_ALLOWED_SIGNERS`, and its commit must be exactly the current GitHub `main` head — never tag from a side branch or a stale checkout.
+
 5. Watch the `Release to PyPI` workflow in the Actions tab. It will:
+   - Verify the tag signature and that the tag sits at `main` head as reported by the GitHub API (`.github/scripts/verify-tag-signature.sh`) — an unsigned tag, an unlisted signer, or a tag off `main` head fails the pipeline before anything publishes.
    - Verify the tag version matches `pyproject.toml`.
    - Re-run `pre-commit` and `pytest`.
    - Build the wheel and sdist with `uv build`.
-   - Publish to PyPI using Trusted Publishing (no stored secrets).
+   - Publish to PyPI using Trusted Publishing (no stored secrets), with PEP 740 attestations. `skip-existing: true` makes a workflow re-run of an already-published version a no-op rather than a failure.
    - Create a GitHub Release with the artifacts attached.
 
 ### Prerequisites (one-time)
 
 - A PyPI **Trusted Publisher** binding must exist for project `lmer` pointing at workflow `release.yml` on `lmer2/lmer`, environment `pypi`. Configure at https://pypi.org/manage/project/lmer/settings/publishing/.
 - A GitHub **environment** named `pypi` must exist on `lmer2/lmer` (Settings → Environments).
+- An admin-controlled `RELEASE_ALLOWED_SIGNERS` Actions repository **variable** must exist on `lmer2/lmer` (Settings → Secrets and variables → Actions → Variables) containing the allowed-signers lines for the release signing keys. It is a variable, not a secret, and deliberately not a file in the repo — a tag push runs the workflow from the tag's own tree, so in-repo trust anchors could be rewritten by whoever pushes a tag.
 
-Both are set up by the maintainer; they don't need to be touched per release.
+All three are set up by the maintainer; they don't need to be touched per release.
 
 ## Documentation
 

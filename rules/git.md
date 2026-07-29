@@ -53,15 +53,39 @@ The gate checks warn when a staged file that names a spec-class deliverable (any
 
 **Repository Allow List**:
 The push allow list is configured via the `LMER_PUSH_ALLOW_LIST` environment variable.
-Set it to a comma-separated list of repository path patterns:
+Set it to a comma-separated list of entries, each either `repo` or `repo|refpattern`:
 ```bash
-LMER_PUSH_ALLOW_LIST="org/repo1,org/repo2"
+LMER_PUSH_ALLOW_LIST="org/repo1,org/repo2|refs/tags/*"
 ```
+- A bare `repo` entry is matched as a substring of the remote URL and authorizes
+  **branch refs only** (`refs/heads/*`) — bare entries never grant tag pushes.
+- A `repo|refpattern` entry matches `refpattern` (a glob) against the
+  fully-qualified target ref: `org/repo|refs/tags/*` grants tag pushes,
+  `org/repo|refs/heads/main` grants exactly one branch.
+- Malformed entries (empty half, more than one `|`) are ignored — the list
+  fails closed, never open.
+- The substring rule applies to **configured remotes**, whose URL the operator
+  set up. When git is handed a **URL** instead of a remote name, the match is
+  anchored on the parsed identity and the entry must name `host/path` or the
+  bare `host` — `org/repo` alone authorizes nothing there, because any forge
+  can serve that path.
+
 By default, no repositories are auto-allowed for push.
+
+**Pushing a release tag**:
+Release tags go through the same gate. `gate-push --tag NAME` pushes
+`refs/tags/NAME` (`--ref REFSPEC` pushes an explicit refspec instead; the two
+are mutually exclusive) to the remote named by `--remote NAME` (default
+`origin`). The tag ref must be covered by a `repo|refs/tags/*` allow-list
+entry — a bare entry does not authorize it.
+```bash
+gate-push --tag v1.2.3                  # refs/tags/v1.2.3 -> origin
+gate-push --tag v1.2.3 --remote github  # same tag -> the GitHub mirror remote
+```
 
 **Pre-push Checklist**:
 1. Use `gate-push` command
-2. Gate will verify repository against `LMER_PUSH_ALLOW_LIST`
+2. Gate will verify the remote URL AND the target ref against `LMER_PUSH_ALLOW_LIST`
 3. Request permission if not on allow list
 4. User must configure allow list via env var
 

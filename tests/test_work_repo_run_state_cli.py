@@ -929,6 +929,47 @@ class TestSessionStart:
         assert "claim" in out.lower()  # warning surfaced in the brief
         assert run_state.load_state(run_env)["owner"]["session_id"] == "s-cli-2"
 
+    @staticmethod
+    def _seed_release_claim(run_env, session, claimed_at):
+        """A run whose state carries a release claim block (RUN-STATE.md §7)."""
+        state = run_state.seed_state("develop-issue-123", "develop", "t")
+        state["claim"] = {"session_id": session, "claimed_at": claimed_at}
+        run_state.write_state(run_env, state)
+
+    def test_live_release_claim_not_stolen(self, run_env, capsys):
+        # RUN-STATE.md §7: the release claim is ENFORCED, not advisory — a
+        # session starting on a claimed release run must not silently steal
+        # the lock by writing itself in as owner (the old unconditional
+        # overwrite). Hook contract untouched: still exits 0.
+        self._seed_release_claim(run_env, "s-holder", run_state.utc_now_iso())
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "s-holder" in out
+        assert "owner not taken" in out
+        after = run_state.load_state(run_env)
+        assert after["owner"] is None  # NOT claimed by this session
+        assert after["claim"]["session_id"] == "s-holder"  # lock intact
+        events = [e["type"] for e in run_state.read_events(run_env, last_n=0)]
+        assert "session_start" in events  # the audit record still lands
+
+    def test_stale_release_claim_owner_still_taken(self, run_env):
+        # A STALE claim is takeover territory for `work release claim`,
+        # never a reason to withhold the advisory owner mark — and
+        # session-start itself never touches the claim block.
+        self._seed_release_claim(run_env, "s-dead", "2020-01-01T00:00:00Z")
+        assert _main(["session-start"]) == 0
+        after = run_state.load_state(run_env)
+        assert after["owner"]["session_id"] == "s-cli-1"
+        assert after["claim"]["session_id"] == "s-dead"  # claim-verb-only
+
+    def test_own_release_claim_owner_taken(self, run_env):
+        self._seed_release_claim(run_env, "s-cli-1", run_state.utc_now_iso())
+        after_rc = _main(["session-start"])
+        assert after_rc == 0
+        after = run_state.load_state(run_env)
+        assert after["owner"]["session_id"] == "s-cli-1"
+        assert after["claim"]["session_id"] == "s-cli-1"
+
     def test_corrupt_state_recovers_with_fresh_seed(self, run_env, capsys):
         run_env.mkdir(parents=True)
         (run_env / "state.yml").write_text("{ not: valid: yaml [")
