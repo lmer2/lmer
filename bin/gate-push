@@ -13,7 +13,7 @@ import time
 src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, src_dir)
 
-from lmer_cli.gates import GateSystem, push_gate, Colors, receipt_argv
+from lmer_cli.gates import GateSystem, Colors, receipt_argv
 
 try:
     from work_repo.run_state import emit_gate_event
@@ -22,16 +22,34 @@ except ImportError:  # run-state wiring must never break a gate
         pass
 
 
-def gate_push(verbose: bool = False):
+def gate_push(verbose: bool = False, tag: str = None, ref: str = None,
+              remote: str = "origin"):
     """Run gate checks and push if passed.
+
+    `tag` maps to ref refs/tags/<tag>; `ref` is any explicit refspec; with
+    neither, the current branch is pushed (the historical behavior). The
+    target ref and remote are passed through to the allow-list
+    authorization (run_push_gate), so a ref the allow list does not cover
+    is refused before any network operation.
 
     Emits exactly ONE gate receipt per invocation, at the end: `outcome`
     carries the check verdict, `exit_code` the whole command's result —
     a push that fails after passing checks is pass/exit_code!=0 (#88).
     """
     started = time.monotonic()
+
+    target_ref = f"refs/tags/{tag}" if tag else ref
+
     gate = GateSystem(verbose=verbose)
-    result = push_gate(verbose=verbose, gate=gate)
+    # gate.run_push_gate carries the extended allow-list authorization
+    # (repo|refpattern grammar); the module-level push_gate() wrapper has
+    # no ref/remote parameters, so it is bypassed here.
+    if gate.run_push_gate(ref=target_ref, remote=remote):
+        print(f"\n{Colors.GREEN}You may proceed with push.{Colors.NC}")
+        result = 0
+    else:
+        print(f"\n{Colors.RED}Push blocked. Fix issues first.{Colors.NC}")
+        result = 1
     outcome = "pass" if result == 0 else "fail"
 
     def emit(exit_code):
@@ -53,23 +71,32 @@ def gate_push(verbose: bool = False):
         emit(result)
         return result
 
-    # Get current branch
-    branch_result = subprocess.run(
-        ["git", "branch", "--show-current"],
-        capture_output=True, text=True, check=False
-    )
-    branch = branch_result.stdout.strip()
+    if target_ref is not None:
+        # Explicit ref (tag or refspec): push it verbatim, no upstream
+        # tracking involved.
+        print(f"{Colors.CYAN}Pushing ref: {target_ref} -> {remote}{Colors.NC}")
+        result = subprocess.run(
+            ["git", "push", remote, target_ref],
+            check=False
+        )
+    else:
+        # Get current branch
+        branch_result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            capture_output=True, text=True, check=False
+        )
+        branch = branch_result.stdout.strip()
 
-    if not branch:
-        print(f"{Colors.RED}❌ Could not determine current branch{Colors.NC}")
-        emit(1)
-        return 1
+        if not branch:
+            print(f"{Colors.RED}❌ Could not determine current branch{Colors.NC}")
+            emit(1)
+            return 1
 
-    print(f"{Colors.CYAN}Pushing branch: {branch}{Colors.NC}")
-    result = subprocess.run(
-        ["git", "push", "-u", "origin", branch],
-        check=False
-    )
+        print(f"{Colors.CYAN}Pushing branch: {branch}{Colors.NC}")
+        result = subprocess.run(
+            ["git", "push", "-u", remote, branch],
+            check=False
+        )
 
     if result.returncode == 0:
         print(f"{Colors.GREEN}✅ Push successful!{Colors.NC}")
@@ -83,7 +110,18 @@ def gate_push(verbose: bool = False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Gate push - enforces all rules before push")
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument('--tag', metavar='NAME',
+                        help='Push tag NAME (refs/tags/NAME) instead of the current branch')
+    target.add_argument('--ref', metavar='REFSPEC',
+                        help='Push an explicit refspec instead of the current '
+                             'branch. Must be fully qualified (refs/heads/..., '
+                             'refs/tags/...) or <src>:<dst> with a fully '
+                             'qualified dst; force (+), deletion (:<dst>) and '
+                             'glob refspecs are refused')
+    parser.add_argument('--remote', metavar='NAME', default='origin',
+                        help='Remote to push to (default: origin)')
 
     args = parser.parse_args()
 
-    sys.exit(gate_push(args.verbose))
+    sys.exit(gate_push(args.verbose, tag=args.tag, ref=args.ref, remote=args.remote))

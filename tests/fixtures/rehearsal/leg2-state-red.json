@@ -1,0 +1,5 @@
+{
+  "_fixture": "Test fixture for tests/test_rehearsal_leg2.py \u2014 invented leg-2 re-entry state, NOT recorded rehearsal evidence. Refs current but the release run completed non-green: the re-entry must derive the API re-dispatch (never a re-tag).",
+  "refs_current": true,
+  "run_conclusion": "failure"
+}

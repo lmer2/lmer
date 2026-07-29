@@ -1,0 +1,19 @@
+# Release — follow-up session
+
+You are re-entering an in-progress release run: a scheduled relaunch, a
+manual follow-up, or a recovery after a dead watcher session. The full
+release contract lives in the release instructions rendered at session
+start; a follow-up session has exactly ONE job — derive where the release
+stands from recorded run state and take the single next action. When there
+is nothing to advance (the derived step is still waiting on a human), exit
+immediately — that is the scheduled-relaunch contract.
+
+This follow-up document exists at `{{ followup_file }}`.
+
+## Resuming an in-progress release
+
+{% include 'release-resume.jinja2' %}
+
+If the derived step is `complete`, close out the run per the release
+instructions (retrospective, completion state, `work commit`) and end the
+session.

@@ -32,6 +32,7 @@ Layout, per project (`{host}/{project}/` already namespaces by project):
 ├── state.yaml     # Layer 1: authoritative run state (single writer: work CLI)
 ├── events.jsonl   # Layer 1: append-only session/audit log
 ├── ledger.yaml    # Layer 1: per-task execution ledger (single writer: work ledger set)
+├── release.yaml   # Layer 1: release-run record (release runs only; single writer: work release, §7)
 ├── log.yaml       # worklog (`work log`) — structural since the run-dir unification
 ├── reports/       # timestamped report files (`work report`)
 ├── spec.md        # Layer 2: agreed approach from the develop interview
@@ -141,7 +142,7 @@ taskdef: develop
 target: https://gitlab.example.com/org/proj/-/issues/123
 status: in-progress          # in-progress | complete | archived
 phase: interview             # free-form string, taskdef-defined; null for chat
-stop_reason: question        # null | question | yield | complete | critical_error
+stop_reason: question        # null | question | yield | complete | critical_error | aborted
 critical_error: null         # {summary, detail} — only when stop_reason=critical_error
 open_question: "sqlite or postgres for the cache?"  # only when stop_reason=question; null otherwise
 goal: "align on auth refactor approach"
@@ -151,7 +152,9 @@ estimate:                    # optional, recorded via `work goal --estimate-*`; 
 artifacts:                   # present only once registered via `work artifact`
   spec: spec.md
 owner: null                  # {session_id, claimed_at} while a session is live
+claim: null                  # {session_id, claimed_at} — single-flight release claim (§7); release runs only
 frozen: null                 # UTC stamp of the pre-execution freeze gate (§1); null until it fires
+reslugged_from: []           # addresses this run has vacated (§7); absent on runs that never re-slugged
 created: 2026-07-03T14:02:11Z
 updated: 2026-07-03T15:40:03Z
 ```
@@ -159,7 +162,10 @@ updated: 2026-07-03T15:40:03Z
 **Stop-reason semantics:** `question` = waiting on a human; `yield` =
 deliberate phase-end stop (phasic mode); `complete` = run finished;
 `critical_error` = actually broken, and *only* then — routine blockers are
-`question`, not `critical_error`. `taskdef` and `target` are set at seed time
+`question`, not `critical_error`; `aborted` = the release-run terminal
+(`work release abort`, §7) — recorded on a `status: complete` run, purely
+descriptive (nothing switches on it; the closed `status` enum is what
+external consumers key on). `taskdef` and `target` are set at seed time
 and treated as immutable.
 
 **Open question (issue #97):** `open_question` holds the blocking question's
@@ -212,10 +218,11 @@ the `state_changed` event's data as
 events by the tool process, fail-soft to null when events can't be read —
 so estimate vs. actual is comparable per run with no extra state field.
 
-`name`, `frozen`, `open_question`, and `estimate` are additive — **schema
-stays 1**, no migration: older readers ignore unknown keys (an old
+`name`, `frozen`, `open_question`, `estimate`, and `claim` are additive —
+**schema stays 1**, no migration: older readers ignore unknown keys (an old
 state.yaml without the key reads as null), and the schema guard only
-refuses *newer* schema numbers.
+refuses *newer* schema numbers. Extending `stop_reason` with `aborted` is
+additive on the same terms — `status` stays the closed three-value enum.
 
 **File rename, lazy migration:** the state file is `state.yaml` (lmer-owned
 YAML files standardize on `.yaml`). Run dirs written before the rename hold
@@ -233,7 +240,10 @@ carries the estimate-vs-actual `actuals`), `question_answered` (the recorded ope
 question plus its human answer, both secret-redacted), `goal_set`, `run_named`,
 `artifact_written`, `gate`, `verify`, `task` (every ledger mutation, §2),
 `run_dir_renamed` (the freeze-gate rename, §1), `goals_frozen`,
-`goal_amended`, `goals_assessed` (the goal-set lifecycle, §2). The type set
+`goal_amended`, `goals_assessed` (the goal-set lifecycle, §2), `claim`
+(every release-claim mutation — claim/refresh/takeover/unclaim, §7),
+`release` (every release.yaml mutation, §7 — prior receipt values live
+here), `run_aborted` (the release-run abort, §7). The type set
 is open-ended — later growth adds types without schema churn.
 
 ### Receipt events (`gate`, `verify`)
@@ -295,7 +305,7 @@ a `verify: <command or gate>` line per plan.md task (see the artifacts
 convention, §1) — and claiming a task complete requires a matching
 `verify`/`gate` receipt from the current session. v1 enforcement is soft:
 the finish/retro step compares claims to receipts; a guard-hook nudge is
-deliberately deferred (§7).
+deliberately deferred (§8).
 
 ### `ledger.yaml` — per-task execution ledger
 
@@ -390,7 +400,7 @@ migration:
 
 The lint stops deliberately at plan time: wave-based *execution*
 (dispatch, worktrees) and runtime write-scope enforcement stay out of
-scope — run-state is a state layer (§7).
+scope — run-state is a state layer (§8).
 
 ### `goals.md` — frozen goal-sets
 
@@ -454,7 +464,7 @@ Plan coverage: `work plan check` warns on active goals no task covers
 (§2, the `goals` field; plan.md mention as fallback). All of it is
 nudge-don't-block in v1 — fragment rules, not guard hooks; waivers,
 user-approval receipts, and anti-fabrication validators for assessments
-stay deferred (§7).
+stay deferred (§8).
 
 ## 3. Slug derivation
 
@@ -500,7 +510,7 @@ engagement seeds a fresh run.
 | `work answer "<text>"` | Record the human's answer to the run's recorded open question (§2): appends `question_answered` (`{question, answer}`, both secret-redacted), clears `open_question` and `stop_reason` (`status` untouched — a completed run stays complete), pushes the run dir. Errors (exit 1) without run context or when no open question is recorded; never auto-seeds. The same logic is applied automatically by `work session-start` when `LMER_ANSWER` is set (the host CLI's `--answer` flag). |
 | `work event <type> [--note "…"] [--data <json>]` | Append one event line. Auto-seeds the run if it doesn't exist yet. |
 | `work verify <name> -- <command …>` | Run the command (stderr merged into stdout), stream its output through, mirror its exit code, and append a `verify` receipt event (§2): `{name, argv, exit_code, duration_s, summary_line, output_tail_sha256}`. The `--` separator is required (a forgotten name must not silently become the command). A signal-killed command mirrors the shell convention `128+N` (receipt and observed exit code agree); a command that cannot start exits 127. Mutating-verb rules: without run context this errors *before* running the command. A receipt-append failure after the command ran is reported loudly on stderr but the exit code still mirrors the command. |
-| `work resume [--json]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, an `Estimate: ~3 sessions / 4h — used: 2 sessions` line when an estimate is recorded (§2), a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
+| `work resume [--json]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, an `Estimate: ~3 sessions / 4h — used: 2 sessions` line when an estimate is recorded (§2), a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. For release runs the brief additionally carries a `Release:` block — derived leg + next step, recorded SHAs/tag, receipt set, and the claim verdict (§7) — so a relaunched session resumes at exactly one next action; non-release briefs are byte-identical to before. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
 | `work ledger` | Print the execution ledger table (read-only): the summary line plus one row per task. With no ledger prints `No ledger`, exit 0. |
 | `work ledger set <task-id> --status <s> [--title …] [--commit <sha>] [--receipt <name>] [--note …]` | The only mutation path for `ledger.yaml` (§2): upserts the row (omitted fields preserved), stamps `updated`, appends a `task` event, pushes the run dir. `--status` is one of `pending\|in-progress\|done\|deferred\|dropped`; `done` with no `--commit` warns loudly but succeeds. |
 | `work plan check` | Read-only lint of the run's `plan.index.json` (§2). Errors (exit 1): invalid/newer schema, structural problems (non-string/duplicate ids, missing description), unknown `deps` ids, dependency cycles, file overlap between dependency-independent tasks not declared in `shared_files`, missing/invalid `session_scope`, `multi` without `scope_rationale`. Warnings (exit 0): plan.md checkbox count drifting from the index task count, empty `verify_commands`, `goals` refs that don't parse from goals.md (`## G<n>:` headings; skipped when goals.md is absent), active goals with no covering task (a `goals` ref, or a plan.md mention as fallback), stale/malformed `shared_files` entries. Findings print to stdout so the report can be pasted into the plan-approval request. No run context or no `plan.index.json` prints a message and exits 0 (chat/review taskdefs have no index); writes nothing — no event, no push. |
@@ -511,6 +521,7 @@ engagement seeds a fresh run.
 | `work name <kebab-case>` | Set the run's name (a label — the directory slug never changes). Normalizes to kebab-case (lowercase; spaces/underscores → `-`; strip other characters; collapse/trim `-`), printing the normalized form when it differs; errors if nothing survives. Names are **unique per project** — a name held by another run is rejected with an error citing the conflicting slug. Renaming is allowed anytime (same uniqueness check; appends another `run_named` event — history lives in the event log); re-setting the run's own current name is an idempotent no-op success. Bare `work name` prints the current name (or "No name set"), read-only, exit 0. |
 | `work artifact <name> --file <path>` | Copy the file into the run dir (secret-redacted), register it in `state.artifacts` (through the single writer, keyed by the artifact's filename stem), append `artifact_written`. `<name>` must be a plain filename (no path components, no leading dot). |
 | `work seed <taskdef> <target> [--goal …] [--name …]` | Out-of-session run creation: derives the slug from its args and creates a run for it through the same create-tmp → write-state → rename lifecycle, recording CLI-shaped events (`run_seeded`, then `goal_set` / `run_named` as given). Does **not** claim `owner` (seeding is not owning) and does **not** push — batch with `work commit`. An existing run for the slug (or a name conflict) is an error. |
+| `work release claim` / `claim-status` / `unclaim` / `record …` / `status` / `abort` | The release-run verbs (§7): the single-flight release claim (claim-by-push CAS — never the rebase-retry push path), the write-once release record (`release.yaml`), the derived-leg status view, and the terminal abort. Verb-by-verb tables, exit codes, and semantics live in §7. |
 | `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), apply a pushed `LMER_ANSWER` when the run is stopped on a recorded question (§2, fail-soft), decide the resume brief *before* claiming, append `session_start`, claim `owner`, print the brief (leading with the answered question+answer pair when one was just applied). Always exits 0. |
 | `work session-end` | Hook-facing. Append `session_end`, clear `owner` if it's ours, push the run-state path via `work commit`. Always exits 0. |
 
@@ -610,7 +621,421 @@ enum, `updated` timestamps, `owner` claims. Actions:
   the matching run dir — the CLI only ever falls back to them on read and
   never moves them itself.
 
-## 7. Deferred growth path
+## 7. Single-flight release claim (`work release`)
+
+The release flow (release-flow spec §2/§7) requires **single-flight**: at
+most one active release run per project, enforced by the run-state layer —
+a second launch refuses with a pointer to the active run. This section
+records how that claim is made *atomic*, because the obvious mechanism is
+broken by the repo topology.
+
+**The load-bearing constraint:** the work repo is a **per-container git
+clone** (`LMER_WORK_REPO` → `ensure_clone`), and every run-state push goes
+through `git_ops._push_with_rebase_retries` — which reacts to a rejected
+push by rebasing and pushing again. Writing `owner`/`claimed_at` into
+`state.yaml` locally therefore excludes nothing: two simultaneous launches
+each claim in their own clone, and the rebase-retry path integrates the
+loser's claim commit on top of the winner's and pushes it. Last writer
+wins; both proceed. Any claim written through the normal push path is
+check-then-act, not a lock.
+
+### Decision: claim-by-push compare-and-swap
+
+The claim verbs bypass the rebase-retry path and use the git remote itself
+as the CAS register:
+
+1. **Fetch** and evaluate the claim against the *remote* head only — never
+   against the local clone's possibly-stale view.
+2. A **live foreign claim** at that head → lost: exit non-zero, print the
+   active-run pointer (below). Nothing is written.
+3. Otherwise write the claim through the single writer, commit, and issue
+   **one plain `git push` — no `pull --rebase`, no rebase-retry.**
+4. Push accepted (fast-forward) → the claim landed atomically → won.
+5. **Non-fast-forward push rejection** → the remote advanced between fetch
+   and push. That is *not* automatically a lost race (the work repo has
+   many unrelated writers), so go to 1 and re-evaluate — bounded attempts
+   (3, `RELEASE_CLAIM_ATTEMPTS`). Exhausted, or remote unreachable →
+   **fail closed**: exit non-zero as "could not establish claim". A
+   release never proceeds unlocked.
+
+The invariant that makes this a compare-and-swap: **a claim commit is
+never rebased onto a remote head that has not been re-checked for a
+foreign claim.** The race window between fetch and push is exactly what
+the server's non-fast-forward rejection closes.
+
+**As shipped**, the protocol is split across two layers. The git leg is
+`git_ops.claim_push_once`: fetch, then ONE plain `git push`, returning
+`won` (fast-forward — the claim landed atomically), `lost-race`
+(non-fast-forward rejection — re-fetch and re-evaluate before any retry),
+or `error` (transport/auth/missing remote — callers fail closed; the
+up-front fetch makes a dead remote read as `error`, never as a lost race).
+The state leg is `run_state.claim_run`/`unclaim_run` (the local
+single-writer mutation, evaluated against the remote head the CLI just
+fetched). The CLI loop (`work release claim`/`unclaim`/`abort`) composes
+them: sync the remote head — a **local snapshot commit** of any pending
+run-dir changes first (the session hooks leave `state.yaml`/`events.jsonl`
+dirty by design, and a dirty tree makes `pull --rebase` refuse exactly on
+the re-entry path these verbs serve; the snapshot is an ordinary run-state
+commit, so rebasing it is the normal integration path), then
+`pull --rebase` (safe by construction: it runs only while no claim commit
+exists locally) — write + commit the claim locally, `claim_push_once`; on
+**any non-won outcome** the local claim commit is **dropped**
+(`reset --hard` to the pre-claim head, made safe by the snapshot: the
+dropped commit carries only what the verb itself wrote). On `lost-race`
+the commit is rebuilt from the re-fetched head each attempt, upholding the
+invariant; dropping on `error` too matters because a leftover claim commit
+would later be silently rebase-pushed onto an un-re-checked head by the
+next ordinary verb. Same-file racers on the state.yaml both CAS through
+this path, so the git server arbitrates.
+
+### Lock object and scope
+
+- **Scope: project + release taskdef** — the claim keys on the release
+  run's slug (same-taskdef-same-target ⇒ same slug, §3), not the whole
+  project. Every other run in the project is untouched.
+- The lock object is a dedicated **`claim` block in the release run's
+  `state.yaml`** — `{session_id, claimed_at}` — written *only* by the
+  `work release claim`/`unclaim` CAS path. It is deliberately **not** the
+  per-session `owner` field (cleared at every session end, warn-only
+  semantics) and **not** bare run existence (`work session-start`
+  auto-seeds runs fail-soft through the rebase-retry path, with no CAS
+  discipline). The release-flow spec's "an in-progress release run *is*
+  the lock" holds in effect: the claim is valid only while the run is
+  `status: in-progress`, so completing or aborting the run releases the
+  lock with no separate CAS write — a claim block on a `complete`/
+  `archived` run reads as unclaimed.
+
+### Stale-claim policy — enforced, not warn-only
+
+`decide()`'s `STALE_CLAIM_MINUTES` semantics are untouched: the
+per-session `owner` warning stays advisory ("coordinate before writing"),
+aimed at humans. The release claim is different in kind — the party that
+must be refused is an unattended second launch, and the party that must
+eventually get through is the unattended *scheduled relaunch* (release-flow
+spec §3: watch is best-effort, resume is the contract). So:
+
+- A **live** foreign claim (age < `RELEASE_CLAIM_STALE_MINUTES`, its own
+  constant — default 120 to match `STALE_CLAIM_MINUTES`, but enforced
+  rather than advisory) → `work release claim` refuses. Hard, exit
+  non-zero — never a warning.
+- The **holder keeps the claim live by re-claiming**: `work release claim`
+  from the holding session is an idempotent refresh of `claimed_at`. A
+  session idling on a blocking watch cannot refresh mid-block — that is
+  fine BECAUSE the release taskdef requires a re-claim on wake, before any
+  mutating action: whichever woken session wins the CAS drives on; the
+  other ends (single-flight holds at the action point, not across the
+  idle).
+- A **cleanly-ended holder releases its claim at session end**
+  (`work session-end` runs the same CAS discipline as `work release
+  unclaim`, best-effort/fail-soft) — the stale threshold exists for
+  CRASHED sessions, not clean exits, so a relaunch after a clean exit
+  claims immediately instead of waiting out the threshold or doing a
+  takeover.
+- A **stale claim** (age past the threshold — the holder session crashed
+  or was reaped without unclaiming) is **taken over automatically** by the
+  next `work release claim`, loudly: a claim event records the displaced
+  session and the claim's age. Automatic (not flag-gated) because the
+  next claimant is normally the scheduled relaunch with no human attached;
+  safe because takeover resumes the *same* run (same slug, resume
+  semantics re-derive the leg from run state) — it can never start a
+  second parallel release.
+
+A never-expiring claim was rejected: a crashed watcher would strand the
+release until a human intervened, breaking the "merged release MR never
+sits untagged longer than one schedule interval" contract.
+
+The pure verdict function is `run_state.claim_status`, returning one of
+`CLAIM_UNCLAIMED` (no block — or the run is no longer `in-progress`: the
+lock-releases-with-the-run rule above), `CLAIM_OURS` (held by this
+session; re-claiming is the idempotent refresh), `CLAIM_FOREIGN_LIVE`
+(under `RELEASE_CLAIM_STALE_MINUTES` — hard-refusal territory), or
+`CLAIM_FOREIGN_STALE` (past the threshold, or `claimed_at` unparseable —
+takeover territory). `decide()` carries the verdict as an additive `claim`
+key in `work resume --json` and the brief renders it in the release block,
+so hooks never re-derive it.
+
+### The loser's pointer
+
+A refused `work release claim` prints (and emits under `--json`) enough to
+find the active release without archaeology: the run **slug**, the **run
+dir** path, the run dir's **web URL** (via `git_ops.web_url_for`), the
+claim holder's **session id** and **claimed_at** (with age), and the run's
+current **status/phase**.
+
+### What the lock does NOT protect against
+
+Stated plainly — these are out of scope for this lock:
+
+- **Out-of-band manual pushes to the work repo.** The CAS disciplines the
+  claim verbs only; a human hand-editing `state.yaml` and pushing rewrites
+  the claim like any other file. Single-writer remains a convention the
+  lock strengthens, not a guarantee it creates.
+- **The release targets themselves.** The lock serializes release *runs*;
+  it does nothing about a manual tag or branch push to GitHub/GitLab that
+  bypasses the taskdef entirely (the release-flow spec's idempotency
+  checks are the layer that notices).
+- **A broken or unreachable remote.** No push means no claim — the
+  failure mode is fail-closed refusal, not unlocked progress. A
+  force-push/history rewrite of the work repo branch can likewise destroy
+  or resurrect a claim; neither is survivable by design.
+- **Clock skew** affects staleness judgments only (bounded by the
+  threshold **in both directions** — `claim_status` treats a claim as live
+  only while `abs(age) < RELEASE_CLAIM_STALE_MINUTES`, so a future-dated
+  `claimed_at` from a fast holder clock cannot pin the lock past the
+  threshold either), never the CAS itself — atomicity comes from the git
+  server, not from timestamps.
+
+### Rejected alternatives
+
+- **Claim via the normal single-writer + `_push_with_rebase_retries`
+  path** — the load-bearing constraint above: rebase-retry converts the
+  losing claim into a merge, last writer wins, both launches proceed.
+- **(b) Create-only lock ref** (e.g. `refs/locks/<project>-release`,
+  `--force-with-lease`-style CAS) — atomicity is equivalent, but the lock
+  leaves the run-state contract: invisible to normal clones and the
+  resolver, outside the `state.yaml` single-writer and the `events.jsonl`
+  audit trail, environment-dependent (GitLab restricts non-standard ref
+  namespaces), and needing bespoke cleanup tooling. Rejected for opacity,
+  not correctness.
+- **(c) `O_EXCL` lock file on a shared mount** — rejected outright:
+  `/work` is a per-container clone, not a shared mount. Two simultaneous
+  launches (possibly on different hosts) share no filesystem, so `O_EXCL`
+  excludes nothing. Do not revisit unless the work repo stops being
+  per-container.
+
+### Frozen claim verb names (R5)
+
+The claim verb names and flag surface below are **frozen verbatim** —
+wave-1 consumers (taskdef bodies) reference them by these exact names. All
+release verbs live under `work release <subverb>` (nested subparsers,
+matching `work plan check` / `work goals freeze`).
+
+| Verb | Flags | Behavior |
+|---|---|---|
+| `work release claim` | `[--json]` | Take the single-flight claim (CAS). Exit 0 = claim held (fresh win, holder refresh, or stale takeover). Exit non-zero = lost — prints the active-run pointer — or claim could not be established (push attempts exhausted / remote unreachable): fail closed, never proceed unlocked. |
+| `work release claim-status` | `[--json]` | Read-only: holder session, `claimed_at`, age, live/stale verdict — or `unclaimed`. Always exits 0 (read-only convention, like `work ledger`). |
+| `work release unclaim` | `[--force]` | Release our claim (CAS-pushed). A foreign claim refuses (exit 1) unless `--force` (human runbook: abort path, stranded-claim cleanup). No claim recorded is an idempotent no-op success. |
+
+#### Release-record verbs
+
+Frozen by the release-record kernel design and shipped: the kernel is
+`src/work_repo/release_run.py`, the CLI wiring lives in
+`src/work_repo/cli.py`. These names are the contract taskdef bodies cite:
+
+| Verb | Purpose | Flags |
+|---|---|---|
+| `work release record version <X.Y.Z>` | Record leg 1's release version (write-once; pyproject version, no `v` prefix — the tag adds it; a leading `v` is refused at record time) | — |
+| `work release record bump-sha <sha>` | Record the bump-MR merge SHA (leg 1 complete; full 40-hex; write-once; requires the version to be recorded first) | — |
+| `work release record merge-sha <sha> --version <observed-version>` | Record the release-MR merge SHA every leg-2 step keys on; hard stop when the observed version at that SHA disagrees with leg 1's recorded version (checked even on idempotent re-record) | `--version` (required) |
+| `work release record tag <vX.Y.Z> --sha <sha>` | Signed-tag creation receipt; hard stops: SHA must equal the recorded merge SHA and name must be exactly `v<version>` — never re-point, never re-sign | `--sha` (required) |
+| `work release record receipt <name> [--url <url>] [--note "…"]` | Push/upload receipts; `<name>` ∈ `github-main-push`, `github-tag-push`, `actions-run`, `pypi`, `gitlab-tag-push`; `--url` required for `actions-run`/`pypi` (records which run actually uploaded); receipts are re-recordable, history in events.jsonl; requires the tag to be recorded first (nothing can have been pushed yet otherwise) | `--url`, `--note` |
+| `work release status [--json]` | Read-only: recorded fields + derived leg + single next step (the resume decision for a scheduled relaunch). No run context / no record yet are normal (exit 0; the JSON form still derives `leg1-bump` from an empty record); an internally inconsistent record (hand-edited tag vs merge SHA) exits 1 with the kernel's hard-stop message | `--json` |
+| `work release abort [--reason "…"] [--force]` | Terminal abort — the human declined the release MR (release-flow spec §7). Marks release.yaml aborted, then flips state.yaml in one atomic write, CAS-pushed; a LIVE foreign claim refuses (exit 1) unless `--force`, same as `unclaim`; see abort semantics below | `--reason`, `--force` |
+
+Record verbs are mutating (no run context errors, exit 1; the run
+auto-seeds), and every actual write pushes the run dir immediately — the
+record is the crash-recovery contract, so durability is per-write, not
+per-session. A contradicted write-once field or a kernel hard stop exits 1
+with the kernel's message verbatim and writes nothing.
+
+#### `release.yaml` — the release record
+
+A dedicated single-writer sibling file in the release run's dir,
+deliberately NOT additive keys in state.yaml: state.yaml is the universal
+contract every taskdef writes, and its corrupt-file recovery reseeds IN
+PLACE — which would silently drop an embedded release record mid-release.
+The sibling file is crash-isolated, versions independently
+(`RELEASE_SCHEMA_VERSION` = schema 1), and follows ledger.yaml's
+precedent. Same safety contract exactly: only the `release_run` recorders
+write it (atomic tmp+rename), a corrupt file is backed up as
+`release.yaml.bad-<stamp>` before erroring, and a **newer** schema number
+is a read-only refusal (older readers never clobber a newer writer's
+file).
+
+```yaml
+schema: 1
+version: "0.5.0"                  # write-once; pyproject version, no v prefix
+bump_mr_merge_sha: <40-hex>       # write-once; leg 1 complete
+release_mr_merge_sha: <40-hex>    # write-once; every leg-2 step keys on it
+tag:                              # write-once; {name, sha, created}
+  name: v0.5.0
+  sha: <40-hex>
+receipts:                         # re-recordable; one row per RECEIPT_NAMES entry
+  github-main-push: {recorded: <ts>}
+  actions-run: {recorded: <ts>, url: <run URL>}
+aborted: {at: <ts>, reason: "…"}  # terminal; only via work release abort
+updated: <ts>
+```
+
+Identity fields (version, both SHAs, the tag) are **write-once**:
+re-recording the identical value is an idempotent no-op (re-entered legs
+converge), a different value is a hard stop — recorded release identity
+never silently moves. Receipts MAY be re-recorded (spec §7's re-run
+artifact drift: a re-dispatched Actions run must be able to replace the
+URL with the run that actually uploaded); prior values stay in the
+`release` audit events. Free text (`--note`, URLs) is secret-redacted
+before landing in the work repo.
+
+#### Derived leg ladder (`derive_leg` / `next_step`)
+
+Pure derivation from the record alone — no fs, no env, no remotes (spec
+§3: relaunching re-derives the leg from run state and continues). The
+ladder walks in spec order and stops at the FIRST missing record, so
+out-of-order receipts still converge. Frozen step names, in order:
+
+`leg1-bump` → `leg1-record-bump-merge` → `gate-await-release-merge` →
+`leg2-create-tag` → `leg2-push-github-main` → `leg2-push-github-tag` →
+`leg2-poll-actions` → `leg2-record-pypi` → `leg2-push-gitlab-tag` →
+`complete` (legs: `leg1`, `gate`, `leg2`, `complete`).
+
+Plus the terminal `aborted` leg — deliberately NOT a ladder entry (an
+aborted run is not a resume row): `derive_leg` reports it with
+`next_step: None`, "nothing to advance". An internally inconsistent
+record (tag SHA vs merge SHA, tag name vs version — only reachable by
+hand-editing, the recorders refuse to write it) is a hard stop: never
+converge over it. `work release status` and the resume brief's release
+block both render this derivation.
+
+#### Abort semantics (`work release abort`)
+
+Spec §7's abandoned release: the bump merged, the human declined the
+release MR. `work release abort [--reason]` composes two terminal writes
+plus one CAS push, in the crash-safe order:
+
+1. `release_run.record_abort` marks release.yaml terminal first — the
+   `aborted: {at, reason}` block and NOTHING else. Every recorded field
+   survives, above all the bump-MR merge SHA: the next release run's ctl
+   dry-run needs it to see the version already bumped on `prep-release`
+   and skip the bump. The bump commit stays; aborting never reverts
+   anything.
+2. `run_state.abort_run` lands all three state facts in ONE atomic write:
+   `status` → `complete`, `stop_reason` → `aborted`, `claim` → cleared —
+   so no observer ever sees an aborted run still holding the lock — and
+   appends a `run_aborted` event (reason redacted; any displaced claim
+   holder named, with `forced` recording which knob cleared it).
+
+A **live foreign** claim REFUSES the abort (exit 1) unless `--force`, and
+the check runs BEFORE step 1 so a refused abort leaves release.yaml
+untouched. "The human declined" and "another session is mid-release right
+now" are different facts, and only the caller knows which holds: without
+the guard a session correctly refused at `work release claim` could follow
+the decline path and mark another session's in-flight release terminal,
+freeing its lock remotely so a third session drives the same release. A
+**stale** foreign claim still clears without `--force` — staleness is the
+takeover case, not the refusal case.
+
+Dying between the two leaves an in-progress run whose record already says
+aborted; the re-run converges (record_abort no-ops, abort_run completes)
+— never a lock-free run whose record still asks for a next leg. Aborting
+an already-aborted run is an idempotent no-op success; a run that
+finished any other way refuses (exit 1) *before* either write — aborting
+it would falsify its recorded outcome. A held claim — even a foreign one
+— is cleared, not refused: the decline is the human's explicit terminal
+decision.
+
+**Why `status: complete` + `stop_reason: aborted`, not a fourth status:**
+`status` is the closed enum external consumers switch on without knowing
+releases exist. The §6 external cleaner archives runs that are `complete`
+— an aborted run is archived by the *existing* rule, unchanged; a new
+`aborted` status would sit outside "complete or stale" until every
+deployed cleaner learned the value. `decide()`'s completed-run policy
+(issue #96) already refuses to silently resume `complete`/`archived` runs
+— exactly the no-resurrection guard an aborted run needs, for free — and
+`claim_status` already reads any claim on a non-`in-progress` run as
+unclaimed, so the lock releases by the existing rule. `stop_reason` is
+the descriptive axis nothing switches on, so `aborted` there is additive
+and the schema-stays-1 promise holds.
+
+**An aborted run is TERMINAL and is never re-claimed as itself.** An
+exemption would hand out a lock with NO mutual exclusion: `claim_status`
+reads every claim on a non-`in-progress` run as unclaimed and `claim_run`
+never restores `in-progress`, so two sessions would both be told "claim
+taken" and both drive leg 1 — and the CAS push does not save it, since the
+loser re-syncs, still reads unclaimed, and wins the retry. The
+abandoned-release contract does not need one: `derive_leg` reports
+`next_step: None` for an aborted record permanently, and the resume is the
+NEXT release run, whose ctl dry-run detects the bump already on
+`prep-release` and skips it. Where that next run comes from is the
+version-bearing identity below.
+
+#### Release-run identity: the version is in the slug
+
+`derive_slug()` is a pure function of `(taskdef, target)`, so a release run
+that kept its derived slug forever meant **a repository could release
+exactly once**: the second release resolved to the first one's finished run,
+and a finished run is not claimable. Reopening it by hand does not help
+either — `release.yaml`'s `version` is write-once.
+
+A release run therefore takes an address of its own as soon as it knows one:
+
+```
+release-<repo>                  the seed address — one live release at a time
+release-<repo>-v0.6.0           from `work release record version 0.6.0` onward
+release-<repo>-v0.6.0-<stamp>   when that address is already taken (below)
+release-<repo>-<stamp>          terminal without a version ever recorded
+```
+
+**The invariant is that one slug names one run** — not that a directory is
+free. The two are different resources and they come apart in both
+directions: an unnamed run occupies `runs/<slug>` while leaving the slug
+recordable, and a *named* run lives at `runs/<slug>--<name>`, occupying the
+slug while `runs/<slug>` stays free. Guarding on the path alone gets both
+wrong, so `run_state.slug_available` checks the recorded slug **and** the
+dirs that address it.
+
+- **A version can repeat**, so the version-bearing address can already be
+  taken. `RELEASE-FLOW.md` §6 leaves a declined release's bump on
+  `prep-release`, so the successor's dry-run skips it and the successor
+  records the same `X.Y.Z` — while the declined run is still parked on
+  `-v<X.Y.Z>` (the decline happens at the release-MR gate, after leg 1 step
+  5). `release_run.unique_release_slug` mints the stamped variant in that
+  case. Giving up instead would leave the successor on the seed address it
+  was supposed to vacate and refuse the release after it forever.
+- **`run_state.reslug_run`** performs the move: it renames the dir FIRST,
+  then writes `state.slug` and the vacated address, appends a
+  `run_reslugged` event and re-points specs-index entries. The order is
+  load-bearing — the directory is what must never be double-booked, since
+  `seed_run_dir` creates at `runs/<slug>`. A rename that cannot happen
+  leaves the slug untouched (loud warning, both together) rather than
+  splitting identity from address. A name-bearing dir stays name-bearing.
+- **Resolution follows it.** `find_run_dir` still matches `state.slug`
+  exactly; when nothing does, `run_dir()` falls back to the newest
+  **in-progress** run that RECORDS having vacated the slug being looked up
+  (`state.reslugged_from`, written by the re-slug itself —
+  `find_successor_run_dir`). Matching a recorded fact rather than a
+  re-derived identity is what keeps the fallback to release runs that
+  actually moved: a run that never re-slugged has no `reslugged_from`, so
+  `derive_slug`'s "no aliasing between the two forms" still holds for
+  legacy full-SHA runs. A relaunch, scheduled or manual, therefore lands on
+  the in-flight release without any launch parameter carrying the version.
+- **Terminal runs never resolve through that fallback**, which is exactly
+  what frees the bare address for the next release.
+- **`work release claim` rolls a terminal run aside.** Some runs never
+  reach `record version` — a release aborted in leg 1, a session that died
+  after completing but before its re-slug pushed, a run closed out by hand.
+  A claim resolving such a run re-slugs it aside (an available `-v<version>`
+  when one was recorded, else the stamp) and seeds the successor at the
+  freed address, **in one CAS commit**, then claims that. It computes the
+  aside the same way `record version` does, so a taken version-bearing
+  address does not dead-end the roll-over. That commit carries **both ends
+  of the move** — the address vacated *and* the address moved to. The
+  destination is the half nothing else can supply: once the successor owns
+  the address the resolver names only it, so a commit staging just the
+  vacated path would publish the previous release run's `release.yaml`,
+  events and artifacts as a deletion and nothing would add them back. Single-flight is not weakened:
+  two racing sessions both roll over locally, one push wins, and the loser
+  re-syncs onto the winner's fresh run and refuses against its live claim.
+  A roll-over that cannot free the address falls back to the old refusal —
+  never a claim on a terminal run.
+- `work release abort` does **not** re-slug: it is a terminal write and
+  nothing else. Its successor arrives at the next claim.
+
+Known consequence, accepted: a run-dir URL cited for a release before its
+version was recorded 404s afterwards. Freeing the address is the point, and
+the version-bearing URL — the one every receipt cites — is stable from leg 1
+step 5 onward.
+
+## 8. Deferred growth path
 
 Recorded so the design can be worked into deliberately, not accidentally:
 

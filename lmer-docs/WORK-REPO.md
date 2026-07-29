@@ -455,9 +455,9 @@ skipped. Without a run context (`LMER_REPO_HOST`/`LMER_REPO_PROJECT`
 unset), the read-only and hook-facing verbs (`work state`, `work resume`,
 `work ledger`, `work session-start`, `work session-end`) print a "no run
 context" message and exit 0, but the mutating verbs (`work state set`,
-`work event`, `work verify`, `work artifact`, `work ledger set`) print an
-error to stderr and exit 1 — scripts chaining them under `set -e` should
-expect that.
+`work event`, `work verify`, `work artifact`, `work ledger set`, and the
+`work release` claim/record/abort verbs) print an error to stderr and
+exit 1 — scripts chaining them under `set -e` should expect that.
 
 ### Show current state
 
@@ -673,8 +673,163 @@ Reads state + recent events (+ ledger) and prints a human-readable brief
 (slug, status, phase, stop_reason, goal, a `Ledger: 4/7 done, in-flight:
 T3a, last commit 4a1f9c2` line when a ledger exists, last ~5 events,
 artifacts, and an owner-claim warning if another session has the run
-claimed). `--json` emits the same decision as machine-readable JSON — with
+claimed). For release runs the brief adds a `Release:` block — the
+derived leg and next step, the recorded merge SHAs and tag, the receipt
+set, and the single-flight claim verdict (see the release-runs section
+below). `--json` emits the same decision as machine-readable JSON — with
 the full ledger — for hooks/scripts.
+
+### Release runs: single-flight claim + release record
+
+Release runs (the `release` taskdef) add two things on top of the run
+state above: an **enforced single-flight claim** — at most one active
+release run per project; a second launch is refused, not warned — and a
+**release record** (`release.yaml` in the run dir, beside `state.yaml`)
+that a relaunched or scheduled session resumes from. All verbs live under
+`work release …`. Full design: docs/RUN-STATE.md §7.
+
+#### Take, hold, and release the claim
+
+```bash
+work release claim              # take (or refresh) the single-flight claim
+work release claim --json       # machine form: {"result": "won", "action": ...}
+work release claim-status       # read-only verdict — always exit 0
+work release unclaim            # release our claim; --force for a foreign one
+```
+
+`work release claim` is a compare-and-swap against the work-repo *remote*
+(fetch → evaluate the remote head → local claim write → one plain push;
+up to 3 attempts on non-fast-forward rejection) — never the ordinary
+rebase-retry push path. **The exit code is the contract:**
+
+- **exit 0** — the claim is held. Three flavors, all wins: a fresh claim
+  (`✅ Release claim taken: <slug> (session <id>)`), an idempotent refresh
+  from the holding session (re-claim periodically from the watch loop —
+  well inside the 120-minute staleness threshold), or a loud takeover of
+  a stale claim (`⚠️  stale-claim takeover: displaced session <id> (N min
+  old)` — the holder crashed; takeover resumes the *same* run, so it can
+  never start a second parallel release).
+- **exit 1** — lost or fail-closed. **Never proceed with a release after
+  a non-zero exit.**
+
+A refusal (a live foreign claim holds the run) prints the active-run
+pointer to stderr — everything needed to find the running release without
+archaeology:
+
+```
+❌ run 'release' is claimed by session 20260726-1402-ab12 (14 min ago) — refusing while the claim is live
+   Run:     release (status: in-progress, phase: leg2)
+   Run dir: /work/git.example.com/org/proj/runs/release
+   Web:     https://git.example.com/org/work/-/tree/main/git.example.com/org/proj/runs/release
+   Holder:  session 20260726-1402-ab12, claimed_at 2026-07-26T14:02:11Z (14 min ago)
+```
+
+With `--json` the same fields come as `{"result": "lost", "slug": …,
+"run_dir": …, "web_url": …, "holder": …, "claimed_at": …, "age_minutes":
+…, "status": …, "phase": …}`. A claim that could not be *established*
+(remote unreachable, push attempts exhausted) fails closed:
+`❌ Could not establish release claim (fail closed): <detail>` (`--json`:
+`{"result": "fail-closed", "detail": …}`) — also exit 1.
+
+Completing or aborting the run releases the lock automatically (a claim
+on a run that is no longer in-progress reads as unclaimed);
+`work release unclaim` is the explicit form. `--force` releases a
+*foreign* claim — human runbook only (stranded-claim cleanup).
+
+#### Record release facts
+
+Everything legs 1 and 2 produce is recorded into `release.yaml` through
+the single writer — **never edit the file by hand**:
+
+```bash
+# Leg 1: the bumped version, then the bump-MR merge SHA (both write-once;
+# version is the pyproject form — no v prefix, the tag name adds it)
+work release record version 0.5.0
+work release record bump-sha 4a1f9c2e8d7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f
+
+# Leg 2 entry: the release-MR merge SHA plus the version read from
+# pyproject.toml AT that SHA — disagreeing with leg 1's record is a hard
+# stop (a second bump or foreign commit landed; human decision required)
+work release record merge-sha 7b3d0a1c9e2f8b7a6c5d4e3f2a1b0c9d8e7f6a5b --version 0.5.0
+
+# The signed tag: name must be exactly v<recorded version>, --sha must
+# equal the recorded merge SHA — never re-point, never re-sign
+work release record tag v0.5.0 --sha 7b3d0a1c9e2f8b7a6c5d4e3f2a1b0c9d8e7f6a5b
+
+# Push/upload receipts, in ladder order (--url REQUIRED for actions-run
+# and pypi: the receipt must record which run actually uploaded)
+work release record receipt github-main-push
+work release record receipt github-tag-push
+work release record receipt actions-run --url https://github.com/org/proj/actions/runs/123456
+work release record receipt pypi --url https://pypi.org/project/proj/0.5.0/
+work release record receipt gitlab-tag-push
+```
+
+Identity fields (version, both merge SHAs, the tag) are **write-once**:
+re-recording the identical value is an idempotent no-op — re-entered legs
+converge — while a different value is refused with a hard-stop message
+(exit 1, nothing written). Receipts may be re-recorded (a re-dispatched
+Actions run replaces the URL); prior values stay in `events.jsonl` as
+`release` audit events. Every successful record prints the new derived
+position and pushes the run dir immediately (the record is the
+crash-recovery contract — durability is per-write):
+
+```
+✅ Release record: merge-sha 7b3d0a1c9e2f
+   Position: leg2 — next: leg2-create-tag
+```
+
+#### Read the derived leg
+
+```bash
+work release status
+work release status --json
+```
+
+Read-only: the recorded fields plus the derived leg and the SINGLE next
+step — derived from the record alone, so a relaunched session resumes at
+exactly one action without re-reading remotes:
+
+```
+Release: 0.5.0 — leg2 (next: leg2-create-tag)
+  version               0.5.0
+  bump-MR merge SHA     4a1f9c2e8d7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f
+  release-MR merge SHA  7b3d0a1c9e2f8b7a6c5d4e3f2a1b0c9d8e7f6a5b
+  tag                   —
+  receipts:
+    github-main-push   —
+    ...
+```
+
+The ladder, in order: `leg1-bump` → `leg1-record-bump-merge` →
+`gate-await-release-merge` → `leg2-create-tag` → `leg2-push-github-main`
+→ `leg2-push-github-tag` → `leg2-poll-actions` → `leg2-record-pypi` →
+`leg2-push-gitlab-tag` → `complete`. `--json` emits the full derivation
+(`{"leg": …, "next_step": …, "aborted": false, "version": …,
+"bump_merged": …, "release_merged": …, "merge_sha": …, "tag_created": …,
+"tag": …, "pushed": {…}, "actions_run_url": …, "pypi_url": …,
+"recorded": …}`); no record yet still derives `leg1-bump`, so the caller
+always gets a next step. An aborted run derives leg `aborted` with
+`next_step` null — nothing to advance; exit immediately. An internally
+inconsistent record (only possible by hand-editing) is a hard stop
+(exit 1) — never converge over it.
+
+#### Abort an abandoned release
+
+```bash
+work release abort --reason "human declined the release MR"
+```
+
+Terminal and explicit — the human declined the release MR after the bump
+merged. In crash-safe order: marks `release.yaml` aborted (every recorded
+field survives — the bump-MR merge SHA is what lets the next release run
+skip the already-done bump; the bump commit stays on `prep-release`),
+then flips `state.yaml` in one atomic write — `status: complete`,
+`stop_reason: aborted`, claim cleared (even a foreign claim: the decline
+is the human's terminal decision) — and CAS-pushes the pair. Re-aborting
+is an idempotent no-op success; a run that finished any other way refuses
+(exit 1). The freed claim means the next `work release claim` starts a
+fresh release run.
 
 ### Register a durable artifact
 

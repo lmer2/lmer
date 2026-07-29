@@ -1,0 +1,86 @@
+{#-
+  release-gate.jinja2 — the human-merge gate between leg 1 and leg 2.
+
+  Included by release/instructions.txt under its own "## Gate — human
+  merge" heading; this body starts at H3/prose and never emits an H2.
+  The `--check-updates --watch` primitive is the reviewer CLIs' watch
+  mode (#133 / !162) — an external dependency of this flow, consumed
+  here, not implemented here.
+-#}
+Leg 1 is complete only when run state carries the release version and the
+bump-MR merge SHA (`work release status` shows both). From that point the
+standing `prep-release` → `main` MR is the release MR, and the gate holds
+until a human merges it.
+
+**The human merging the protected-`main` release MR on the canonical
+GitLab repository IS the release approval.** There is no other approval
+artifact — no comment, no label, no out-of-band acknowledgement counts.
+NEVER merge the release MR yourself, never accept or approve it on the
+human's behalf, and never treat any signal short of the actual merge as
+the approval.
+
+### Arming the gate
+
+1. Record the transition BEFORE idling: `work state set --phase=gate`,
+   then `work commit`. The gate is not armed until the pushed run state
+   says so — a watcher idling on unpushed state is invisible to every
+   other launch.
+2. Arm the watch on the release MR:
+
+   ```bash
+   gitlab-review <project> <release-mr-iid> --host <hostname> --check-updates --watch --command "/followup"
+   ```
+
+   The `--check-updates --watch` primitive blocks on MR activity and
+   fires the follow-up command when the MR changes; the merge is the
+   activity this gate is waiting for.
+3. Idle. Do no other work while the gate is open — the run advances only
+   on the human's merge. A long idle will outlive the claim's stale
+   threshold; that is expected and safe BECAUSE of the wake-time re-claim
+   below, never a reason to hold the gate with a hand-rolled refresh loop.
+
+On merge detection:
+
+1. First, confirm the MR state is actually `merged`
+   (`gitlab-review <project> <release-mr-iid> --host <hostname> --info` —
+   a comment or pipeline event also wakes the watch).
+2. Re-run `work release claim` BEFORE any other action. The idle was long;
+   the claim this session took at start may have gone stale and been taken
+   over by a scheduled relaunch — on the human's merge BOTH sessions wake,
+   and without this re-arbitration they would race the tag creation. Exit 0
+   means this session drives Leg 2; non-zero means another session holds
+   the release — log it and end this session, exactly like the Phase 0.25
+   refusal.
+3. Proceed to Leg 2. Its FIRST action is recording the release MR's merge
+   SHA into run state.
+
+### Watch is best-effort; resume is the contract
+
+The watcher session can die — container reaped, host rebooted — and
+nothing is lost. Run state, not this session, is what holds the release
+open:
+
+- A merge that happens while nothing is watching is picked up at the
+  next launch: relaunching this taskdef re-derives the leg from run
+  state and continues (see "Resuming an in-progress release").
+- The relaunch is scheduled declaratively, outside this repository —
+  lmer ships no cron facility; the periodic launch of this taskdef while
+  a release run is in-progress is documented in `docs/RELEASE-FLOW.md`.
+  Manual relaunch works identically. Either way, a merged release MR
+  never sits untagged longer than one schedule interval.
+- If the installed `gitlab-review` does not support `--check-updates
+  --watch`, do NOT substitute a hand-rolled watcher: verify state is
+  pushed, log that the gate is held by state alone
+  (`work event gate --note "watch unavailable; resume carries the gate"`),
+  and end the session — the scheduled relaunch carries the gate.
+
+### No memory across the gate
+
+- NEVER hold the gate open with a polling loop that re-derives progress
+  from session memory. Every wake, every transition, every resumption
+  reads run state (`work release status`) before acting — the recorded
+  version and SHAs are the only carriers across the gate, never
+  variables this session happens to remember.
+- Push state at EVERY transition: `work commit` before arming the watch,
+  and again the moment merge detection records the merge SHA. Unpushed
+  state does not exist to the next session.

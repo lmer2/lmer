@@ -13,6 +13,7 @@ import fnmatch
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
+from urllib.parse import urlsplit
 from enum import Enum
 import hashlib
 import time
@@ -66,6 +67,15 @@ DELIVERABLE_NAME_RE = re.compile(r"\b(?:spec|plan|report)", re.IGNORECASE)
 # Binary/office document extensions that make a spec-class deliverable
 # unreviewable in GitLab (undiffable, unlinkable at line level).
 BINARY_DOC_EXTENSIONS = {".docx", ".doc", ".pdf", ".odt", ".rtf"}
+
+# Separator between the repo half and the ref half of an LMER_PUSH_ALLOW_LIST
+# entry (`repo|refpattern`). `:` is unusable because the repo half is itself a
+# URL fragment where `:` already appears (SSH remotes `git@host:group/proj`,
+# `https://host:port`), and `,` is the entry separator — same reasoning as
+# LMER_MOUNT_FILES picking a separator not claimed by its field grammar
+# (cli.py parse_file_mount_specs). `|` appears in neither git URLs nor any
+# refname in practice, so the split is unambiguous.
+PUSH_ALLOW_REF_DELIMITER = "|"
 
 # check_changelog() warning hints for repos with a changelog.d/ directory
 CTL_FRAGMENT_HINT = "Or stage a fragment: changelog.d/YYYYMMDD-<topic>.yaml"
@@ -1140,33 +1150,304 @@ class GateSystem:
         """Get the push allow list from LMER_PUSH_ALLOW_LIST env var.
 
         Returns an empty list if not configured (no repos auto-allowed).
-        The env var should be a comma-separated list of repo path patterns.
+        The env var is a comma-separated list of entries; each entry is
+        either a bare repo substring or ``repo|refpattern``:
+
+        - ``repo`` is matched as a substring of the remote URL (unchanged
+          from the original grammar).
+        - ``refpattern`` is an fnmatch pattern tested against the
+          fully-qualified target ref, e.g. ``refs/tags/*`` or
+          ``refs/heads/main``.
+        - The delimiter is ``|`` (PUSH_ALLOW_REF_DELIMITER): ``:`` is
+          already taken inside the repo half by SSH remote URLs
+          (``git@host:group/proj``) and by ``https://host:port``, and ``,``
+          separates entries, so ``|`` is the unambiguous choice.
+
+        Backward-compatibility rule: a BARE entry authorizes branch refs
+        only (``refs/heads/*``). Tag pushes must be granted explicitly with
+        ``repo|refs/tags/*`` — no pre-existing allow list silently gains
+        tag-push rights.
         """
         allow_list_str = os.environ.get("LMER_PUSH_ALLOW_LIST", "")
         if not allow_list_str.strip():
             return []
         return [repo.strip() for repo in allow_list_str.split(",") if repo.strip()]
 
-    def run_push_gate(self) -> bool:
-        """Run checks for push gate"""
-        # First check if we can push to this repo
-        code, stdout, _ = self.run_command(["git", "remote", "-v"])
+    def _parse_push_allow_entry(self, entry: str) -> Optional[Tuple[str, str]]:
+        """Parse one allow-list entry into (repo_substring, ref_pattern).
 
-        if code == 0:
-            allow_list = self._get_push_allow_list()
+        Bare entries get the branch-only default pattern ``refs/heads/*``
+        (see _get_push_allow_list). Malformed entries — empty repo half,
+        empty ref half, or more than one delimiter — return None and are
+        IGNORED by the caller: an unparseable grant must never fail open
+        and widen what is allowed.
+        """
+        if PUSH_ALLOW_REF_DELIMITER not in entry:
+            return (entry, "refs/heads/*")
+        parts = entry.split(PUSH_ALLOW_REF_DELIMITER)
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            return None
+        return parts[0].strip(), parts[1].strip()
 
+    def _normalize_remote_url(self, url: str) -> Optional[str]:
+        """``host/path`` for a git remote URL, or None when it is not one.
+
+        Anchored authorization (see _url_entry_authorizes) needs the two
+        identity components that a substring test blurs together. The three
+        forms git accepts are handled: ``scheme://[user[:pass]@]host[:port]/path``,
+        scp-like ``[user@]host:path``, and bare ``host/path``. A trailing
+        ``.git`` and surrounding slashes are dropped and the result is
+        lowercased — host case is meaningless (DNS) and a path differing
+        only in case is the same repository on every forge lmer targets,
+        so folding case here removes a footgun instead of adding one.
+
+        The parse is ANCHORED, and that is the whole point of this
+        function. Userinfo may be stripped only where it can legally
+        appear — inside the authority, i.e. before the first ``/`` of a
+        ``scheme://`` URL, and before the host of the scp-like form. A
+        naive ``rsplit("@", 1)`` over the whole string instead strips at
+        the LAST ``@`` anywhere, so an attacker-chosen host carrying the
+        allowed identity in its PATH normalizes to the allowed identity
+        while git dials the attacker's host::
+
+            https://evil.example.com/x@github.com/group/project
+            git@evil.invalid:x@github.com/group/project.git
+
+        Both must normalize to ``evil.example.com/…`` / ``evil.invalid/…``
+        and be refused. ``urlsplit`` (which parses the authority, not the
+        string) and the anchored scp regex — the same pair
+        ``work_repo.git_ops._web_base_from_remote`` already uses — get this
+        right by construction.
+
+        None (= refuse) for anything without both a host and a path: a
+        local filesystem path, a bare hostname, ``https://host/``, a URL
+        whose path is only a fragment (``https://host/#@other/repo``) —
+        none of them names a repository the allow-list grammar can
+        authorize.
+        """
+        rest = url.strip()
+        if "://" in rest:
+            try:
+                parts = urlsplit(rest)
+            except ValueError:
+                return None
+            # `hostname` reads the authority: userinfo (last `@` WITHIN the
+            # authority) and port are dropped by the parser, and a `#`/`?`
+            # never leaks into the path.
+            host, path = parts.hostname or "", parts.path
+        else:
+            # scp-like `[user@]host:path`: userinfo may contain neither `@`
+            # nor `/`, and the host neither `:` nor `/` — so the `@` and the
+            # `:` this matches are the real delimiters, never ones sitting
+            # inside the path.
+            match = re.match(r"^(?:[^@/]+@)?([^:/]+):(.+)$", rest)
+            if match is not None:
+                host, path = match.group(1), match.group(2)
+            else:
+                # Bare `host/path`. No userinfo is legal here, so a host
+                # carrying `@` or `:` is malformed — refuse rather than
+                # guess at which half was meant to be the identity.
+                host, _, path = rest.partition("/")
+                if not re.fullmatch(r"[^@/:]+", host):
+                    return None
+        path = path.strip("/")
+        if path.endswith(".git"):
+            path = path[:-len(".git")]
+        if not host or not path:
+            return None
+        return f"{host}/{path}".lower()
+
+    def _url_entry_authorizes(self, entry: str, remote_url: str) -> bool:
+        """Anchored allow-list match for a push-by-URL target.
+
+        The plain ``repo in remote_url`` substring rule is sound only for
+        OPERATOR-configured remotes. On the push-by-URL branch the string
+        being matched is whatever ``--remote`` carried on the command line,
+        and an unanchored substring then authorizes any host that merely
+        embeds the allowed path: ``agents/global`` would authorize
+        ``https://evil.example.com/mirror/agents/global.git``.
+
+        So the URL is parsed and the entry must name one of TWO anchored
+        identities, both of which pin the HOST: the full ``host/path``, or
+        the bare ``host``. A partial path component (``global``,
+        ``agents/gl``) authorizes nothing, and an unparseable URL refuses.
+
+        A path-only entry (``group/project``) deliberately does NOT
+        authorize here. Every forge lets anyone serve the same path, so
+        matching a bare path against an agent-supplied URL is the very
+        substring hole this function exists to close, only spelled with a
+        different prefix: ``group/project`` would authorize
+        ``https://evil.example.com/group/project.git``. Operators who want
+        a path-only grant still have one for CONFIGURED remotes (see
+        run_push_gate — that URL came from the operator's own git config);
+        for push-by-URL the entry must say which host.
+        """
+        normalized = self._normalize_remote_url(remote_url)
+        if normalized is None:
+            return False
+        candidate = entry.strip()
+        if "://" in candidate or "@" in candidate:
+            candidate = self._normalize_remote_url(candidate) or ""
+        else:
+            candidate = candidate.strip("/")
+            if candidate.endswith(".git"):
+                candidate = candidate[:-len(".git")]
+            candidate = candidate.lower()
+        if not candidate:
+            return False
+        host, _, _path = normalized.partition("/")
+        return candidate in (normalized, host)
+
+    def _resolve_push_target_ref(self, ref: str) -> Optional[str]:
+        """The fully-qualified ref an explicit refspec lands on, or None.
+
+        Authorization must key on what the push CHANGES on the remote — the
+        ``<dst>`` side of a ``<src>:<dst>`` refspec — never on the whole
+        refspec string: fnmatch's ``*`` crosses ``:`` and ``/``, so matching
+        the raw refspec lets a branch-only grant (``refs/heads/*``) authorize
+        ``refs/heads/main:refs/tags/v9.9``, which creates a remote TAG.
+        Fail-closed rules (None = refuse, with the caller printing why):
+
+        - a leading ``+`` (force push) is never authorized by the gate;
+        - an EMPTY ``<src>`` (``:refs/heads/main``, ``:refs/tags/v0.5.0``)
+          is a DELETION refspec and is never authorized: deleting a remote
+          ref is at least as destructive as the force push refused above,
+          and the release flow declares published tags immutable (never
+          deleted, never re-pointed). Deleting a ref stays a human
+          decision, made with plain git;
+        - the dst side must be fully qualified (``refs/...``): a short name
+          is resolved by git against the remote's refs (a short ``v1.2.3``
+          becomes ``refs/tags/v1.2.3`` when such a tag exists), so
+          normalizing it to ``refs/heads/<name>`` here would authorize the
+          wrong ref class;
+        - glob characters in the ref are refused — the gate cannot soundly
+          match a pattern against a pattern.
+
+        Only ``ref=None`` (the current-branch default, resolved from
+        ``git branch --show-current`` by the caller) may be normalized with
+        ``refs/heads/`` — there the branch identity is authoritative.
+        """
+        if ref.startswith("+"):
+            return None
+        if any(ch in ref for ch in "*?["):
+            return None
+        if ":" in ref:
+            src, _, dst = ref.partition(":")
+            if ":" in dst or not dst or not src.strip():
+                return None
+            ref = dst
+        if not ref.startswith("refs/"):
+            return None
+        return ref
+
+    def run_push_gate(self, ref: Optional[str] = None, remote: str = "origin") -> bool:
+        """Run checks for push gate.
+
+        ``ref`` is the ref being pushed. ``None`` means the current branch
+        (normalized to ``refs/heads/<name>`` — the one safe normalization,
+        since ``git branch --show-current`` is authoritative about being a
+        branch; an EMPTY current branch, i.e. detached HEAD, resolves to
+        nothing and refuses). An explicit ref must be fully qualified
+        (``refs/heads/...``, ``refs/tags/...``) or a ``<src>:<dst>`` refspec
+        with a fully qualified dst — the authorization keys on the dst side
+        (see _resolve_push_target_ref). ``remote`` names the remote whose
+        PUSH url (``get-url --push``, which is what git will actually dial)
+        is checked against the allow list, so a mirror-repo entry authorizes
+        pushes to that remote only. A ``remote`` git cannot resolve as a
+        configured remote but that looks like a URL is gated against the URL
+        itself, with an ANCHORED match (_url_entry_authorizes) rather than
+        the substring rule the configured-remote branch keeps.
+
+        Frozen flag names for bin/gate-push (R5): ``--tag NAME`` maps to
+        ``ref="refs/tags/NAME"`` and ``--remote NAME`` maps to
+        ``remote=NAME``.
+        """
+        # `--push`, NOT the bare form: `git remote get-url <remote>` returns
+        # the FETCH url, while `git push <remote>` uses
+        # `remote.<name>.pushurl` whenever it is configured. Gating the
+        # fetch url would authorize one repository and push to another —
+        # one `git config remote.origin.pushurl <url>` in a target-repo
+        # checkout would be enough to send a signed release tag elsewhere
+        # with the gate green. `--push` falls back to the fetch url when no
+        # pushurl is set, so this is the same answer git itself will use.
+        code, stdout, _ = self.run_command(
+            ["git", "remote", "get-url", "--push", remote])
+        by_url = False
+
+        if code == 0 and stdout.strip():
             remote_url = stdout.strip()
-            allowed = any(repo in remote_url for repo in allow_list) if allow_list else False
+        elif any(marker in remote for marker in ("://", "@", "/")):
+            # Push-by-URL (`gate-push --remote https://...`): gate on the URL
+            # itself, so a raw-URL push faces exactly the same allow list as
+            # a named remote instead of skipping it. The match is ANCHORED
+            # here (_url_entry_authorizes) — this URL is agent-supplied, and
+            # a substring rule written for operator-configured remotes would
+            # authorize any host embedding the allowed path.
+            remote_url = remote
+            by_url = True
+        else:
+            # A named remote git cannot resolve: FAIL CLOSED. The previous
+            # behavior (skip the allow-list check and let the push surface
+            # git's error) let `--remote <anything>` bypass the list.
+            print(f"{Colors.RED}❌ Cannot resolve remote '{remote}' — "
+                  f"refusing to push (fail closed){Colors.NC}")
+            return False
 
-            if not allowed:
-                print(f"{Colors.RED}❌ Push not allowed to this repository{Colors.NC}")
-                print(f"Repository: {remote_url}")
-                if allow_list:
-                    print(f"Allow list: {', '.join(allow_list)}")
-                else:
-                    print("No repositories in allow list. Set LMER_PUSH_ALLOW_LIST env var.")
-                print("Get explicit permission before pushing.")
+        target_ref = ref
+        if target_ref is None:
+            bcode, bout, _ = self.run_command(["git", "branch", "--show-current"])
+            branch = bout.strip() if bcode == 0 else ""
+            if not branch:
+                # Detached HEAD: `git branch --show-current` exits 0 with
+                # EMPTY stdout. Interpolating that yields the literal
+                # "refs/heads/", and fnmatch("refs/heads/", "refs/heads/*")
+                # is True — `*` matches empty — so any bare allow-list entry
+                # would authorize a ref that names no branch at all. There
+                # is nothing to authorize here: refuse, exactly as for a
+                # non-zero exit.
+                print(f"{Colors.RED}❌ Cannot resolve the current branch "
+                      f"(detached HEAD?) — refusing to push (fail "
+                      f"closed){Colors.NC}")
+                print("Push an explicit fully-qualified ref instead "
+                      "(gate-push --ref refs/heads/<name>).")
                 return False
+            target_ref = f"refs/heads/{branch}"
+        else:
+            resolved = self._resolve_push_target_ref(target_ref)
+            if resolved is None:
+                print(f"{Colors.RED}❌ Refusing to authorize ref "
+                      f"'{target_ref}'{Colors.NC}")
+                print("The gate authorizes only fully-qualified refs "
+                      "(refs/heads/..., refs/tags/...) or <src>:<dst> "
+                      "refspecs with a fully-qualified dst; force-push (+), "
+                      "deletion (:<dst>) and glob refspecs are never "
+                      "authorized.")
+                return False
+            target_ref = resolved
+
+        allow_list = self._get_push_allow_list()
+        entries = [self._parse_push_allow_entry(e) for e in allow_list]
+
+        def repo_matches(repo: str) -> bool:
+            if by_url:
+                return self._url_entry_authorizes(repo, remote_url)
+            return repo in remote_url
+
+        allowed = any(
+            repo_matches(repo) and fnmatch.fnmatch(target_ref, ref_pattern)
+            for repo, ref_pattern in (e for e in entries if e is not None)
+        )
+
+        if not allowed:
+            print(f"{Colors.RED}❌ Push not allowed to this repository{Colors.NC}")
+            print(f"Repository: {remote_url}")
+            print(f"Target ref: {target_ref}")
+            if allow_list:
+                print(f"Allow list: {', '.join(allow_list)}")
+            else:
+                print("No repositories in allow list. Set LMER_PUSH_ALLOW_LIST env var.")
+            print("Get explicit permission before pushing.")
+            return False
 
         # Run commit gate checks first
         return self.run_commit_gate()

@@ -3,6 +3,7 @@
 
 import json
 import os
+import runpy
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -17,7 +18,9 @@ from lmer_cli.gitlab_pipeline import (
     ProjectNotFoundError,
     TokenNotFoundError,
     TraceNotFoundError,
+    UnexpectedStatusError,
     _sanitize_hostname,
+    check_expected_status,
     format_job_status,
     get_token,
     resolve_pipeline_id,
@@ -91,6 +94,14 @@ class TestExceptions:
         assert "789" in str(error)
         assert error.job_id == 789
 
+    def test_unexpected_status_error(self):
+        """Test UnexpectedStatusError message"""
+        error = UnexpectedStatusError("failed", "success")
+        assert "failed" in str(error)
+        assert "success" in str(error)
+        assert error.status == "failed"
+        assert error.expected == "success"
+
     def test_exceptions_inherit_from_base(self):
         """Test all exceptions inherit from GitLabPipelineError"""
         assert issubclass(TokenNotFoundError, GitLabPipelineError)
@@ -98,6 +109,7 @@ class TestExceptions:
         assert issubclass(PipelineNotFoundError, GitLabPipelineError)
         assert issubclass(MRPipelineNotFoundError, GitLabPipelineError)
         assert issubclass(TraceNotFoundError, GitLabPipelineError)
+        assert issubclass(UnexpectedStatusError, GitLabPipelineError)
 
 
 class TestGetToken:
@@ -412,6 +424,153 @@ class TestShowTrace:
         with pytest.raises(TraceNotFoundError) as exc_info:
             show_trace(client, 123, 789)
         assert exc_info.value.job_id == 789
+
+
+class TestCheckExpectedStatus:
+    """Test check_expected_status function (--expect-status support)"""
+
+    def test_no_expectation_is_a_noop(self):
+        """Test no expected status skips the check entirely"""
+        check_expected_status("failed", None)
+        check_expected_status(None, None)
+
+    def test_matching_status_passes(self):
+        """Test matching status does not raise"""
+        check_expected_status("success", "success")
+
+    def test_mismatched_status_raises(self):
+        """Test mismatched status raises UnexpectedStatusError"""
+        with pytest.raises(UnexpectedStatusError) as exc_info:
+            check_expected_status("failed", "success")
+        assert exc_info.value.status == "failed"
+        assert exc_info.value.expected == "success"
+
+    def test_running_status_is_a_mismatch(self):
+        """Test a still-running pipeline fails an expect-success check"""
+        with pytest.raises(UnexpectedStatusError):
+            check_expected_status("running", "success")
+
+    def test_missing_status_is_a_mismatch(self):
+        """Test a pipeline without a status fails the check"""
+        with pytest.raises(UnexpectedStatusError):
+            check_expected_status(None, "success")
+
+
+class TestCliExpectStatus:
+    """End-to-end through bin/gitlab-pipeline: --expect-status turns the
+    pipeline verdict into the exit code — the receipt contract the release
+    taskdef's `work verify gitlab-main-pipeline` step relies on (a red
+    pipeline must never exit 0 when success was expected)."""
+
+    BIN = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "bin",
+        "gitlab-pipeline",
+    )
+
+    @staticmethod
+    def _response(payload):
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.read.return_value = json.dumps(payload).encode()
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        return mock_response
+
+    def _run_cli(self, argv, payloads):
+        """Run bin/gitlab-pipeline with API responses mocked in call order;
+        return the exit code."""
+        responses = [self._response(p) for p in payloads]
+        with patch.dict(
+            os.environ, {"GITLAB_TOKEN": "test-token"}, clear=True
+        ), patch("urllib.request.urlopen", side_effect=responses), patch(
+            "sys.argv", ["gitlab-pipeline"] + argv
+        ):
+            try:
+                runpy.run_path(self.BIN, run_name="__main__")
+            except SystemExit as exc:
+                return exc.code if exc.code is not None else 0
+        return 0
+
+    def _status_payloads(self, status):
+        """Responses for status mode: project lookup, pipeline, jobs."""
+        return [
+            {"id": 123},
+            {"id": 456, "status": status, "web_url": "http://x/456"},
+            [],
+        ]
+
+    def test_expect_status_match_exits_zero(self, capsys):
+        code = self._run_cli(
+            ["g/p", "456", "--host", "gitlab.example.com",
+             "--expect-status", "success"],
+            self._status_payloads("success"),
+        )
+        assert code == 0
+
+    def test_expect_status_mismatch_exits_nonzero(self, capsys):
+        code = self._run_cli(
+            ["g/p", "456", "--host", "gitlab.example.com",
+             "--expect-status", "success"],
+            self._status_payloads("failed"),
+        )
+        assert code == 1
+        assert "does not match expected" in capsys.readouterr().err
+
+    def test_expect_status_running_exits_nonzero(self, capsys):
+        """A still-running pipeline is not a green receipt."""
+        code = self._run_cli(
+            ["g/p", "456", "--host", "gitlab.example.com",
+             "--expect-status", "success"],
+            self._status_payloads("running"),
+        )
+        assert code == 1
+
+    def test_without_expect_status_red_pipeline_still_exits_zero(self, capsys):
+        """The flag is opt-in: plain status mode keeps its report-only
+        behavior."""
+        code = self._run_cli(
+            ["g/p", "456", "--host", "gitlab.example.com"],
+            self._status_payloads("failed"),
+        )
+        assert code == 0
+
+    def test_expect_status_applies_to_watch_mode_final_status(self, capsys):
+        """--watch: the check runs against the final watched status."""
+        # watch: project lookup, pipeline (terminal), jobs for the status
+        # print, jobs again for the failed-trace pass.
+        payloads = [
+            {"id": 123},
+            {"id": 456, "status": "failed", "web_url": "http://x/456"},
+            [],
+            [],
+        ]
+        code = self._run_cli(
+            ["g/p", "456", "--host", "gitlab.example.com", "--watch",
+             "--expect-status", "success"],
+            payloads,
+        )
+        assert code == 1
+
+    def test_watch_mode_match_exits_zero(self, capsys):
+        payloads = [
+            {"id": 123},
+            {"id": 456, "status": "success", "web_url": "http://x/456"},
+            [],
+        ]
+        code = self._run_cli(
+            ["g/p", "456", "--host", "gitlab.example.com", "--watch",
+             "--expect-status", "success"],
+            payloads,
+        )
+        assert code == 0
+
+    def test_missing_host_is_a_usage_error(self, capsys):
+        """No --host and no GITLAB_HOST: argparse usage error (exit 2) —
+        and the import surface itself is exercised (regression: the script
+        must not import names the module no longer exports)."""
+        code = self._run_cli(["g/p", "456"], [])
+        assert code == 2
 
 
 class TestWatchPipeline:

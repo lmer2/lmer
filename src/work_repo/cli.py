@@ -18,15 +18,21 @@ import yaml
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import (
+    CLAIM_PUSH_ERROR,
+    CLAIM_PUSH_LOST_RACE,
+    CLAIM_PUSH_WON,
+    claim_push_once,
     commit_napkin_if_subdir,
     commit_work_changes,
     commit_work_path,
     push_napkin_if_separate,
     report_uncommitted_work_items,
     run_dir_push_status,
+    run_git_command,
+    stageable_paths,
     web_url_for,
 )
-from . import goals, plan_index, run_state, specs_index
+from . import goals, plan_index, release_run, run_state, specs_index
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
 
@@ -42,6 +48,13 @@ VERIFY_TAIL_BYTES = 64 * 1024
 # /tmp is container-local and session-scoped — never committed and never mounted
 # from the host — so it can't leak into the host's ~/.lmer or into other sessions.
 WORKSPACE_ENV_FILE = Path("/tmp/lmer-workspace-env.sh")
+
+
+# Bounded attempts for the claim-by-push CAS loop (RUN-STATE.md §7 step 5):
+# a non-fast-forward rejection means the remote advanced between fetch and
+# push — NOT automatically a lost race (the work repo has many unrelated
+# writers) — so re-fetch and re-evaluate, a few times, then fail closed.
+RELEASE_CLAIM_ATTEMPTS = 3
 
 
 #: Overridable directory for LMER_ANSWER consume-once markers (mirrors the
@@ -402,6 +415,137 @@ Examples:
     specs_index_parser.add_argument(
         "--rebuild", action="store_true",
         help="Rebuild the index from runs/ (backfill for specs that predate it)",
+    )
+
+    # release command (single-flight release claim — RUN-STATE.md §7).
+    # Verb names and flags are FROZEN verbatim (§7 R5): taskdef bodies
+    # reference them by these exact names.
+    release_parser = subparsers.add_parser(
+        "release",
+        help="Release-run verbs: the single-flight release claim (RUN-STATE.md §7)",
+    )
+    release_subparsers = release_parser.add_subparsers(
+        dest="release_action", help="Release action to perform"
+    )
+    release_claim_parser = release_subparsers.add_parser(
+        "claim",
+        help="Take the single-flight release claim (claim-by-push CAS; "
+             "non-zero exit = lost or could not establish — fail closed)",
+    )
+    release_claim_parser.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the outcome (won / lost pointer / fail-closed) as JSON",
+    )
+    release_claim_status_parser = release_subparsers.add_parser(
+        "claim-status",
+        help="Show the release claim: holder, claimed_at, age, live/stale "
+             "verdict — or unclaimed (read-only, always exit 0)",
+    )
+    release_claim_status_parser.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the claim verdict as JSON",
+    )
+    release_unclaim_parser = release_subparsers.add_parser(
+        "unclaim",
+        help="Release our claim (CAS-pushed); a foreign claim refuses "
+             "without --force; no claim recorded is a no-op success",
+    )
+    release_unclaim_parser.add_argument(
+        "--force", action="store_true",
+        help="Release a FOREIGN claim (human runbook: abort path, "
+             "stranded-claim cleanup)",
+    )
+    release_abort_parser = release_subparsers.add_parser(
+        "abort",
+        help="Explicitly abort the release run (human declined the release "
+             "MR): terminal stop + claim cleared in one state write, "
+             "release record marked terminal, CAS-pushed",
+    )
+    release_abort_parser.add_argument(
+        "--reason",
+        help="Why the release was declined (free text; redacted before landing)",
+    )
+    release_abort_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Abort even while a LIVE foreign claim holds the run (another "
+             "session is mid-release); without it such a run refuses, same "
+             "as `release unclaim`",
+    )
+    release_record_parser = release_subparsers.add_parser(
+        "record",
+        help="Record a release-run fact into release.yaml (single writer; "
+             "identity fields write-once, receipts re-recordable)",
+    )
+    record_subparsers = release_record_parser.add_subparsers(
+        dest="record_field", help="Release fact to record"
+    )
+    record_version_parser = record_subparsers.add_parser(
+        "version",
+        help="Record leg 1's release version (pyproject version, no 'v' "
+             "prefix — the tag name adds it; write-once)",
+    )
+    record_version_parser.add_argument(
+        "value", metavar="X.Y.Z", help="Release version, e.g. 0.5.0"
+    )
+    record_bump_parser = record_subparsers.add_parser(
+        "bump-sha",
+        help="Record the bump-MR merge SHA — leg 1 complete "
+             "(full 40-hex; write-once)",
+    )
+    record_bump_parser.add_argument(
+        "value", metavar="sha", help="Full 40-hex bump-MR merge SHA"
+    )
+    record_merge_parser = record_subparsers.add_parser(
+        "merge-sha",
+        help="Record the release-MR merge SHA every leg-2 step keys on; "
+             "hard stop when --version disagrees with leg 1's record",
+    )
+    record_merge_parser.add_argument(
+        "value", metavar="sha", help="Full 40-hex release-MR merge SHA"
+    )
+    record_merge_parser.add_argument(
+        "--version", required=True, dest="observed_version",
+        help="Version read from pyproject.toml AT that SHA "
+             "(re-proved on every record, even an idempotent one)",
+    )
+    record_tag_parser = record_subparsers.add_parser(
+        "tag",
+        help="Record the signed-tag creation receipt; hard stops on "
+             "name/SHA drift — never re-point, never re-sign",
+    )
+    record_tag_parser.add_argument(
+        "value", metavar="vX.Y.Z", help="Tag name (exactly v<recorded version>)"
+    )
+    record_tag_parser.add_argument(
+        "--sha", required=True,
+        help="The tagged commit (must equal the recorded merge SHA)",
+    )
+    record_receipt_parser = record_subparsers.add_parser(
+        "receipt",
+        help="Record a push/upload receipt: github-main-push, "
+             "github-tag-push, actions-run, pypi, gitlab-tag-push; "
+             "re-recordable (prior values stay in events.jsonl)",
+    )
+    record_receipt_parser.add_argument(
+        "value", metavar="name", help="Receipt name (leg-2 ladder order)"
+    )
+    record_receipt_parser.add_argument(
+        "--url",
+        help="The run/URL that actually uploaded "
+             "(REQUIRED for actions-run and pypi)",
+    )
+    record_receipt_parser.add_argument(
+        "--note", help="Free-text note (redacted before landing)"
+    )
+    release_status_parser = release_subparsers.add_parser(
+        "status",
+        help="Recorded release fields + derived leg and single next step "
+             "(read-only; the resume decision for a scheduled relaunch)",
+    )
+    release_status_parser.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit the derived position (leg, next_step, receipts) as JSON",
     )
 
     # session-start / session-end (hook plumbing — spec §4.4)
@@ -906,10 +1050,8 @@ def _push_run_dir(
     warning when the push fails."""
     rels = run_state.run_rel_path_candidates()
     if old_dir_name:
-        host = os.environ.get("LMER_REPO_HOST")
-        project = os.environ.get("LMER_REPO_PROJECT")
-        old_rel = f"{host}/{project}/runs/{old_dir_name}"
-        if old_rel not in rels:
+        old_rel = run_state.run_rel_for_dir_name(old_dir_name)
+        if old_rel and old_rel not in rels:
             rels.append(old_rel)
     rc = commit_work_path(rels, f"run-state: {state['slug']} {detail}")
     if rc != 0:
@@ -1809,6 +1951,23 @@ def cmd_goals(args) -> int:
     return _cmd_goals_status()
 
 
+def _release_record_for_brief(rdir: Path, state) -> dict | None:
+    """Release record for the resume brief (release-flow §3), or None.
+
+    Loaded only for release runs — every other run passes None into
+    decide() and its brief stays byte-identical. An absent release.yaml is
+    a fresh release run: the seed still derives a position (leg1-bump).
+    Read-only and fail-soft: an unreadable record just drops out of the
+    brief, like the ledger."""
+    if not isinstance(state, dict) or state.get("taskdef") != "release":
+        return None
+    try:
+        return release_run.load_release(rdir) or release_run.seed_release()
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"⚠️  release record unreadable — brief omits it. ({exc})", file=sys.stderr)
+        return None
+
+
 def cmd_resume(as_json: bool = False) -> int:
     """Execute resume command. Read-only; never breaks a session (always 0)."""
     rdir = run_state.run_dir()
@@ -1832,6 +1991,7 @@ def cmd_resume(as_json: bool = False) -> int:
     decision = run_state.decide(
         state, all_events[-5:], run_state.current_session_id(), ledger=ledger,
         sessions_used=run_state.count_session_starts(all_events),
+        release=_release_record_for_brief(rdir, state),
     )
     if decision.get("kind") == "run":
         # Dirs are renamed by the lifecycle (issue #87 D2), so consumers —
@@ -2098,6 +2258,776 @@ def cmd_seed(args) -> int:
     return 0
 
 
+def _work_repo_root() -> Path:
+    """The work-repo checkout the claim verbs run their git plumbing in."""
+    return Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
+
+
+def _cas_stage_rels(extra_rels: list[str] | None = None) -> list[str]:
+    """The work-repo-relative paths the CAS verbs stage, filtered to what
+    ``git add`` accepts (a stale bare-slug candidate left behind by a
+    run-dir rename would otherwise make ``git add`` exit 128 and fail every
+    claim/unclaim/abort attempt outright). `extra_rels` carries paths the
+    resolver cannot name — above all the dir a terminal run was rolled
+    aside to, which must land in the SAME commit as the fresh run that took
+    its address. The specs-index file rides along for the same reason it
+    does at session end: a dirty tracked file anywhere in the staged set
+    would make ``pull --rebase`` refuse."""
+    rels = run_state.run_rel_path_candidates()
+    for extra in extra_rels or []:
+        if extra not in rels:
+            rels.append(extra)
+    specs_rel = specs_index.specs_rel_path()
+    if specs_rel and specs_rel not in rels:
+        rels.append(specs_rel)
+    return stageable_paths(_work_repo_root(), rels)
+
+
+def _sync_remote_head() -> tuple[bool, str]:
+    """Fetch and integrate the remote head (claim protocol step 1, §7).
+
+    The claim is evaluated against the REMOTE head only — never the
+    clone's possibly-stale view — so every CAS attempt starts by fetching
+    and fast-forwarding/rebasing the local branch onto it. Local run-dir
+    changes are snapshot-committed FIRST (commit-first ordering, same as
+    commit_work_path): the session hooks routinely leave state.yaml /
+    events.jsonl dirty (session-start writes owner without committing), and
+    a dirty tracked tree makes ``pull --rebase`` refuse outright — exactly
+    on the re-entry path the claim verbs exist for. The snapshot is an
+    ordinary run-state commit, not a claim commit, so rebasing it onto the
+    remote head is the normal integration path; the §7 invariant (a CLAIM
+    commit is never rebased onto an unchecked head) is preserved because
+    the rebase runs only while no claim commit exists locally (the
+    lost-race path drops ours before looping back). The snapshot also makes
+    the lost-race ``reset --hard`` genuinely safe: every pre-existing file
+    — tracked or previously untracked (e.g. an uncommitted retro.md) — is
+    committed BEFORE the pre-claim head is captured, so dropping the claim
+    commit can never destroy anything the verb did not itself write.
+    """
+    repo = _work_repo_root()
+    ok, detail = _commit_claim_write(
+        "run-state: local snapshot before release CAS sync"
+    )
+    if not ok:
+        return False, f"pre-sync snapshot failed: {detail}"
+    rc, output = run_git_command(["fetch"], repo, check=False)
+    if rc != 0:
+        return False, f"git fetch failed: {output}"
+    rc, output = run_git_command(["pull", "--rebase"], repo, check=False)
+    if rc != 0:
+        # Leave nothing half-rebased behind — a stranded rebase would block
+        # every later work-repo write in this session.
+        run_git_command(["rebase", "--abort"], repo, check=False)
+        return False, f"git pull --rebase failed: {output}"
+    return True, ""
+
+
+def _git_head() -> str:
+    """Local HEAD sha, or "" when it cannot be resolved."""
+    rc, output = run_git_command(["rev-parse", "HEAD"], _work_repo_root(), check=False)
+    return output.strip() if rc == 0 else ""
+
+
+def _commit_claim_write(
+    message: str, extra_rels: list[str] | None = None
+) -> tuple[bool, str]:
+    """Stage and commit the run dir locally — commit ONLY, never a push.
+
+    The push half of the CAS belongs to git_ops.claim_push_once; routing
+    this through commit_work_path would re-enter the rebase-retry push
+    path that §7 exists to bypass.
+    """
+    repo = _work_repo_root()
+    rels = _cas_stage_rels(extra_rels)
+    if not rels:
+        return True, ""
+    rc, output = run_git_command(["add", "-A", "--", *rels], repo, check=False)
+    if rc != 0:
+        return False, f"git add failed: {output}"
+    rc, output = run_git_command(
+        ["status", "--porcelain", "--", *rels], repo, check=False
+    )
+    if not output.strip():
+        # Content already committed (e.g. a same-second refresh) — the CAS
+        # push still arbitrates below; nothing to commit is not a failure.
+        return True, ""
+    rc, output = run_git_command(["commit", "-m", message], repo, check=False)
+    if rc != 0:
+        return False, f"git commit failed: {output}"
+    return True, ""
+
+
+def _drop_claim_commit(pre_head: str) -> None:
+    """Roll the local claim commit back after a failed CAS push (§7).
+
+    The invariant: a claim commit is NEVER rebased onto a remote head that
+    has not been re-checked for a foreign claim — so the loop discards the
+    commit and rebuilds the claim from the re-fetched head each attempt.
+    ``reset --hard`` is safe exactly here: _sync_remote_head snapshot-
+    committed every pre-existing change (tracked AND untracked) before
+    ``pre_head`` was captured, so the dropped commit carries only what this
+    verb itself just wrote.
+    """
+    if pre_head:
+        run_git_command(["reset", "--hard", pre_head], _work_repo_root(), check=False)
+
+
+def _cas_commit_and_push(
+    message: str, extra_rels: list[str] | None = None
+) -> tuple[str, str]:
+    """The commit+push leg of one CAS attempt, shared by claim/unclaim/
+    abort (and the session-end release): commit the verb's write, issue the
+    single arbitration push, and on ANY non-won outcome drop the local
+    claim commit before returning.
+
+    Dropping on CLAIM_PUSH_ERROR — not just on the lost race — matters:
+    a claim commit left behind after a transport/auth failure would be
+    silently rebase-pushed onto an un-re-checked head by the next ordinary
+    verb's _push_with_rebase_retries, installing a dead session's claim
+    over whatever landed remotely in between (the exact §7 invariant the
+    CAS exists to enforce).
+
+    Returns claim_push_once's ``(outcome, detail)``; a failed local commit
+    reports as (CLAIM_PUSH_ERROR, detail) so callers fail closed on it the
+    same way.
+    """
+    pre_head = _git_head()
+    ok, detail = _commit_claim_write(message, extra_rels)
+    if not ok:
+        return CLAIM_PUSH_ERROR, detail
+    outcome, detail = claim_push_once(_work_repo_root())
+    if outcome != CLAIM_PUSH_WON:
+        _drop_claim_commit(pre_head)
+    return outcome, detail
+
+
+def _pointer_with_url(pointer: dict) -> dict:
+    """The loser's pointer plus the run dir's web URL (§7 — the kernel
+    stays git-unaware, so the CLI adds the clickable form here)."""
+    pointer = dict(pointer)
+    run_dir_path = pointer.get("run_dir")
+    pointer["web_url"] = web_url_for(run_dir_path) if run_dir_path else None
+    return pointer
+
+
+def _print_claim_pointer(pointer: dict) -> None:
+    """Print the loser's pointer (§7) to stderr: everything needed to find
+    the active release without archaeology."""
+    age = pointer.get("age_minutes")
+    age_text = f" ({int(age)} min ago)" if age is not None else ""
+    print(f"   Run:     {pointer.get('slug')} (status: {pointer.get('status')}, "
+          f"phase: {pointer.get('phase')})", file=sys.stderr)
+    print(f"   Run dir: {pointer.get('run_dir')}", file=sys.stderr)
+    if pointer.get("web_url"):
+        print(f"   Web:     {pointer['web_url']}", file=sys.stderr)
+    print(f"   Holder:  session {pointer.get('holder')}, "
+          f"claimed_at {pointer.get('claimed_at')}{age_text}", file=sys.stderr)
+
+
+def _claim_fail_closed(detail: str, as_json: bool = False) -> int:
+    """Fail-closed refusal (§7): the claim could not be established — a
+    release never proceeds unlocked. Always non-zero."""
+    if as_json:
+        print(json.dumps({"result": "fail-closed", "detail": detail},
+                         ensure_ascii=False))
+    print(f"❌ Could not establish release claim (fail closed): {detail}",
+          file=sys.stderr)
+    return 1
+
+
+def _report_claim_lost(pointer: dict, as_json: bool, message: str) -> int:
+    """Report a refused claim: the active-run pointer, exit non-zero —
+    the exit code the release taskdef's refusal keys on."""
+    pointer = _pointer_with_url(pointer)
+    if as_json:
+        print(json.dumps({"result": "lost", **pointer}, ensure_ascii=False))
+    print(f"❌ {message}", file=sys.stderr)
+    _print_claim_pointer(pointer)
+    return 1
+
+
+def _roll_over_terminal_release(
+    rdir: Path, state: dict
+) -> tuple[Path, dict, tuple[str, ...]]:
+    """Move a FINISHED release run off the bare address and seed the next
+    release run there — the claim-side half of version-in-slug.
+
+    `work release record` normally gives a release run its version-bearing
+    address while leg 1 is still running, but some runs never get there: a
+    release aborted before the version was recorded, a session that died
+    after completing but before its re-slug pushed, a run closed out by
+    hand with `work state set --status=complete`. Each leaves a terminal run
+    sitting at the address the NEXT release derives — and a terminal run is
+    refused forever (correctly: it holds no live lock). This is the step
+    that makes "the next release is a NEW run" true by construction rather
+    than by prose (RUN-STATE.md §7, release-resume).
+
+    The aside slug names the version when one was recorded, else takes the
+    compact-UTC stamp (release_run.release_slug). Both writes stay inside
+    the caller's CAS attempt so the roll-over and the fresh claim land in
+    ONE commit: two racing sessions cannot both win, and the loser re-syncs
+    onto the winner's fresh run and refuses against its live claim exactly
+    as before.
+
+    Returns the run to claim plus BOTH ends of the move as dir names for the
+    caller to stage — the address vacated and the address moved TO. The
+    destination is the load-bearing half: once the fresh run owns the
+    address, `run_rel_path_candidates()` resolves the SUCCESSOR, so no
+    resolver can name the aside dir and staging only the vacated path would
+    make the commit a pure deletion of the previous release run's record.
+    A roll-over that cannot free the address returns the original run
+    unchanged and nothing to stage, and the caller refuses as it always did.
+    """
+    base = state.get("slug") or run_state.derive_slug()
+    try:
+        release = release_run.load_release(rdir)
+    except (run_state.RunStateError, OSError):
+        release = None  # unreadable record: the stamped form still frees it
+    version = release.get("version") if isinstance(release, dict) else None
+    # Uniquified, not merely version-bearing: a declined release parks a
+    # terminal run on `<base>-v<X.Y.Z>` and its successor re-uses that same
+    # version (RELEASE-FLOW.md §6), so the obvious aside is exactly the one
+    # already taken. Computing an address that is free by construction is
+    # what keeps this roll-over from dead-ending in the refusal below.
+    try:
+        aside = release_run.unique_release_slug(base, version, rdir.parent, rdir)
+    except release_run.ReleaseRunError as exc:
+        # No free address exists (pathological runs/ tree). Fail closed: the
+        # caller refuses rather than claiming a terminal run.
+        print(f"⚠️  roll-over skipped: {exc}", file=sys.stderr)
+        return rdir, state, ()
+    moved, moved_state, old_dir_name = run_state.reslug_run(rdir, state, aside)
+    if moved_state.get("slug") != aside:
+        return rdir, state, ()  # address not freed — caller refuses
+    fresh_rdir, fresh_state = run_state.seed_run_dir(
+        base,
+        os.environ.get("LMER_TASK", "default"),
+        os.environ.get("LMER_TASK_TARGET", ""),
+        note=f"successor of {aside} ({state.get('stop_reason') or 'finished'})",
+    )
+    # stderr: --json callers parse stdout, and this is a warning either way.
+    print(f"⚠️  previous release run '{base}' is "
+          f"{state.get('status')} — rolled aside to '{aside}'; "
+          f"claiming a fresh run at '{base}'", file=sys.stderr)
+    # The destination goes back unconditionally, the vacated path only when a
+    # rename actually happened: a re-slug interrupted between its rename and
+    # its slug write is completed here from the dir it already sits in, which
+    # vacates nothing but still writes state the resolver cannot name.
+    moved_names = tuple(n for n in (old_dir_name, moved.name) if n)
+    return fresh_rdir, fresh_state, moved_names
+
+
+def cmd_release_claim(as_json: bool = False) -> int:
+    """Execute `work release claim` (RUN-STATE.md §7 — frozen verb table).
+
+    The single-flight release claim, made atomic by the claim-by-push CAS:
+    fetch and evaluate the REMOTE head, write the claim through the single
+    writer (run_state.claim_run), commit, then ONE plain push
+    (git_ops.claim_push_once — never the rebase-retry path). A
+    non-fast-forward rejection re-fetches and re-evaluates, bounded to
+    RELEASE_CLAIM_ATTEMPTS.
+
+    A resolved run that is already FINISHED is not refused: it is the
+    previous release, parked on the address this one derives, so it is
+    rolled aside to its version-bearing slug and a fresh run is seeded and
+    claimed in the same CAS commit (_roll_over_terminal_release). That is
+    what makes a second release of a repository possible at all.
+
+    Exit 0 = claim held: fresh win, holder refresh, loud stale-claim
+    takeover, or a claim on the successor of a rolled-over run. Exit
+    non-zero = a live foreign claim holds the run (the loser's pointer
+    prints — slug, run dir, web URL, holder session, claimed_at/age), a
+    finished run whose address could not be freed (nothing claimed, nothing
+    written), or the claim could not be established (remote unreachable /
+    attempts exhausted): fail closed, never proceed unlocked.
+    """
+    if run_state.run_dir() is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+    session = run_state.current_session_id()
+    last_detail = "no push attempted"
+    for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
+        ok, detail = _sync_remote_head()
+        if not ok:
+            return _claim_fail_closed(detail, as_json)
+        # The remote head was just integrated — this load IS the remote
+        # view (auto-seeds a fresh release run, mutating-verb style).
+        rdir, state = _require_run()
+        if rdir is None:
+            return 1
+        rolled_aside: str | None = None
+        extra_rels: list[str] | None = None
+        if state.get("status") != "in-progress":
+            # A terminal run at this address is not this release — it is the
+            # PREVIOUS one, still parked on an address run identity derives
+            # deterministically. Roll it aside and seed the successor here,
+            # inside this CAS attempt, so the next release is a new run
+            # instead of a permanent refusal (version-in-slug).
+            finished_slug = state.get("slug")
+            rdir, state, moved_names = _roll_over_terminal_release(rdir, state)
+            if state.get("status") == "in-progress":
+                rolled_aside = finished_slug
+                # BOTH ends of the move ride in this commit: the vacated path
+                # so its deletion is recorded, and the dir the run moved TO —
+                # which the resolver cannot name now that the successor holds
+                # the address, so nothing else would ever add it back.
+                rels = [run_state.run_rel_for_dir_name(n) for n in moved_names]
+                extra_rels = [rel for rel in rels if rel] or None
+        if state.get("status") != "in-progress":
+            # The roll-over could not free the address (rename refused, fs
+            # error). A finished run has released the lock by rule (§7 —
+            # claim_status reads any claim on a non-in-progress run as
+            # unclaimed), so a claim written here would be an inert block and
+            # "claim taken" would misreport a live lock on a dead release.
+            # Refuse WITHOUT writing, with a message the resuming session can
+            # tell apart from the live-holder refusal.
+            #
+            # ABORTED RUNS ARE NOT EXEMPT, here or above. Re-claiming a
+            # terminal run AS ITSELF would hand out a lock with NO MUTUAL
+            # EXCLUSION: claim_run cannot refuse on a run whose status is not
+            # in-progress (claim_status reads every claim on it as unclaimed)
+            # and never restores in-progress, so two sessions would both be
+            # told "claim taken" and both drive leg 1 — the CAS push does not
+            # save it, since the loser re-syncs, still reads unclaimed, and
+            # wins the retry. The roll-over above needs no exemption either:
+            # it claims a FRESH in-progress run, so claim_run arbitrates
+            # normally. An aborted run stays terminal (release_run.derive_leg
+            # reports next_step None for it permanently) and its successor's
+            # ctl dry-run detects the bump already on prep-release and skips
+            # it (RELEASE-FLOW.md §6).
+            aborted = state.get("stop_reason") == "aborted"
+            detail = ("run was aborted — a later release is a NEW run"
+                      if aborted else "run is complete — nothing to claim")
+            if as_json:
+                print(json.dumps({
+                    "result": "not-live",
+                    "detail": detail,
+                    "slug": state.get("slug"),
+                    "status": state.get("status"),
+                    "stop_reason": state.get("stop_reason"),
+                    "run_dir": str(rdir),
+                    "web_url": web_url_for(rdir),
+                }, ensure_ascii=False))
+            # `detail` is a full sentence (the --json form carries it on its
+            # own), so the run is named alongside it rather than in front of
+            # it — "run 'X' is run is complete" was the operator-facing text
+            # on the fail-closed path.
+            print(f"❌ {detail} (run '{state.get('slug')}'; no live session "
+                  f"holds this release; nothing was written)", file=sys.stderr)
+            if aborted:
+                print("   The bump commit stays on prep-release; the next "
+                      "release run's dry-run detects and skips it.",
+                      file=sys.stderr)
+            return 1
+        prior = run_state.claim_status(state, session)
+        try:
+            state = run_state.claim_run(rdir, state, session)
+        except run_state.ClaimRefusedError as exc:
+            return _report_claim_lost(exc.pointer, as_json, str(exc))
+        except (run_state.RunStateError, OSError) as exc:
+            return _claim_fail_closed(str(exc), as_json)
+        outcome, detail = _cas_commit_and_push(
+            f"run-state: {state['slug']} release claim", extra_rels
+        )
+        if outcome == CLAIM_PUSH_WON:
+            action = {
+                run_state.CLAIM_OURS: "refresh",
+                run_state.CLAIM_FOREIGN_STALE: "takeover",
+            }.get(prior["verdict"], "claim")
+            claim = state.get("claim") or {}
+            if as_json:
+                payload = {
+                    "result": "won",
+                    "action": action,
+                    "slug": state.get("slug"),
+                    "session_id": claim.get("session_id"),
+                    "claimed_at": claim.get("claimed_at"),
+                    "run_dir": str(rdir),
+                    "web_url": web_url_for(rdir),
+                }
+                if action == "takeover":
+                    payload["displaced_session"] = prior["holder"]
+                if rolled_aside:
+                    payload["rolled_over"] = rolled_aside
+                print(json.dumps(payload, ensure_ascii=False))
+                return 0
+            if action == "takeover":
+                # Loud by contract (§7): the displaced session is named.
+                age = prior["age_minutes"]
+                age_text = (f"{int(age)} min old" if age is not None
+                            else "unreadable claimed_at")
+                print(f"⚠️  stale-claim takeover: displaced session "
+                      f"{prior['holder']} ({age_text})")
+            verb = "refreshed" if action == "refresh" else "taken"
+            print(f"✅ Release claim {verb}: {state.get('slug')} "
+                  f"(session {claim.get('session_id')})")
+            return 0
+        if outcome != CLAIM_PUSH_LOST_RACE:
+            return _claim_fail_closed(f"claim push failed: {detail}", as_json)
+        # Non-fast-forward rejection: the remote advanced between fetch and
+        # push. The claim commit is already dropped (never rebase it onto
+        # an unchecked head) — go re-evaluate the new head (§7 step 5).
+        last_detail = detail
+    return _claim_fail_closed(
+        f"push attempts exhausted after {RELEASE_CLAIM_ATTEMPTS} "
+        f"non-fast-forward rejections: {last_detail}",
+        as_json,
+    )
+
+
+def cmd_release_claim_status(as_json: bool = False) -> int:
+    """Execute `work release claim-status` (§7 frozen verb table).
+
+    Read-only: the claim verdict on the LOCAL state — holder session,
+    claimed_at, age, live/stale — or unclaimed. ALWAYS exits 0 (read-only
+    convention, like `work ledger`); a broken state layer degrades to a
+    warning, never a failure.
+    """
+    rdir = run_state.run_dir()
+    if rdir is None:
+        if as_json:
+            print(json.dumps({"verdict": None, "detail": "no run context"}))
+        else:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    try:
+        state = run_state.load_state(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"⚠️  {exc}", file=sys.stderr)
+        return 0
+    status = run_state.claim_status(state, run_state.current_session_id())
+    if as_json:
+        payload = dict(status)
+        payload["slug"] = state.get("slug") if isinstance(state, dict) else None
+        payload["run_dir"] = str(rdir)
+        payload["web_url"] = web_url_for(rdir)
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
+    if status["verdict"] == run_state.CLAIM_UNCLAIMED:
+        print("Release claim: unclaimed")
+        if status["holder"]:
+            # A claim block on a run that is no longer in-progress reads as
+            # unclaimed (§7) — surface the inert block for the runbook.
+            print(f"  (inactive claim block: session {status['holder']}, "
+                  f"claimed_at {status['claimed_at']} — run not in-progress)")
+        return 0
+    age = status["age_minutes"]
+    age_text = f"{int(age)} min ago" if age is not None else "age unknown"
+    print(f"Release claim: {status['verdict']} — session {status['holder']}, "
+          f"claimed_at {status['claimed_at']} ({age_text})")
+    if status["verdict"] == run_state.CLAIM_FOREIGN_LIVE:
+        print("  Enforced single-flight: `work release claim` refuses while "
+              "this claim is live.")
+    elif status["verdict"] == run_state.CLAIM_FOREIGN_STALE:
+        print(f"  Past {run_state.RELEASE_CLAIM_STALE_MINUTES} min — the next "
+              "`work release claim` takes over loudly.")
+    return 0
+
+
+def cmd_release_unclaim(force: bool = False) -> int:
+    """Execute `work release unclaim` (§7 frozen verb table).
+
+    Releases our claim through the same CAS-push discipline as taking it
+    (the unclaim write must land atomically on the remote too). A foreign
+    claim refuses (exit 1) unless --force — the human runbook: abort path,
+    stranded-claim cleanup. No claim recorded is an idempotent no-op
+    success. Mutating-verb rules: no run context is an error (exit 1).
+    """
+    if run_state.run_dir() is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+    session = run_state.current_session_id()
+    last_detail = "no push attempted"
+    for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
+        ok, detail = _sync_remote_head()
+        if not ok:
+            return _claim_fail_closed(detail)
+        rdir = run_state.run_dir()
+        try:
+            state = run_state.load_state(rdir)
+        except (run_state.RunStateError, OSError) as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+        claim = state.get("claim") if isinstance(state, dict) else None
+        if not isinstance(claim, dict) or not claim.get("session_id"):
+            print("✅ No release claim recorded — nothing to release")
+            return 0
+        holder = claim.get("session_id")
+        try:
+            state = run_state.unclaim_run(rdir, state, session, force=force)
+        except run_state.ClaimRefusedError as exc:
+            return _report_claim_lost(exc.pointer, False, str(exc))
+        except (run_state.RunStateError, OSError) as exc:
+            return _claim_fail_closed(str(exc))
+        outcome, detail = _cas_commit_and_push(
+            f"run-state: {state['slug']} release unclaim"
+        )
+        if outcome == CLAIM_PUSH_WON:
+            if holder != session:
+                print(f"✅ Release claim force-released "
+                      f"(was held by session {holder})")
+            else:
+                print(f"✅ Release claim released: {state.get('slug')}")
+            return 0
+        if outcome != CLAIM_PUSH_LOST_RACE:
+            return _claim_fail_closed(f"unclaim push failed: {detail}")
+        last_detail = detail
+    return _claim_fail_closed(
+        f"push attempts exhausted after {RELEASE_CLAIM_ATTEMPTS} "
+        f"non-fast-forward rejections: {last_detail}"
+    )
+
+
+def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
+    """Execute `work release abort [--reason] [--force]` (release-flow spec §7: the
+    abandoned release — bump merged, human declines the release MR).
+
+    Composes the two terminal writes plus one CAS push:
+
+    - release_run.record_abort marks release.yaml terminal FIRST (every
+      recorded field survives — the bump-MR merge SHA is what lets the
+      next run's ctl dry-run skip the already-done bump), then
+    - run_state.abort_run flips status/stop_reason/claim in ONE atomic
+      state write — the write that releases the single-flight lock (§7:
+      a claim is valid only while the run is in-progress).
+
+    That order is the crash-safe one: dying in between leaves an
+    in-progress run whose record already says aborted, and the re-run
+    converges (record_abort no-ops, abort_run completes) — never a
+    lock-free run whose record still asks for a next leg. The pair lands
+    on the remote through the same CAS-push discipline as claim/unclaim
+    (the lock transition must land atomically there too). Already aborted
+    is an idempotent no-op success (nothing written or pushed); a run
+    that finished any other way refuses (exit 1) BEFORE either write —
+    aborting it would falsify its recorded outcome.
+
+    A LIVE FOREIGN claim refuses (exit 1) unless `--force`, and the check
+    runs BEFORE record_abort so a refused abort never marks the release
+    record terminal. Without it, a session correctly refused at
+    `work release claim` could take the decline path and mark another
+    session's in-flight release terminal — freeing its lock remotely. A
+    stale foreign claim still clears without `--force` (that is the
+    takeover case). The bump commit stays on `prep-release`; aborting
+    never reverts anything.
+    """
+    if run_state.run_dir() is None:
+        print("❌ No run context: LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+        return 1
+    last_detail = "no push attempted"
+    for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
+        ok, detail = _sync_remote_head()
+        if not ok:
+            return _claim_fail_closed(detail)
+        rdir = run_state.run_dir()
+        try:
+            state = run_state.load_state(rdir)
+        except (run_state.RunStateError, OSError) as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+        if state is None:
+            print("❌ No release run recorded — nothing to abort", file=sys.stderr)
+            return 1
+        if state.get("status") != "in-progress":
+            # The abort_run guard, checked here BEFORE record_abort so a
+            # refused abort never marks the release record terminal.
+            if state.get("stop_reason") == "aborted":
+                print(f"✅ Release run already aborted: {state.get('slug')} "
+                      f"— nothing to do")
+                return 0
+            print(f"❌ run '{state.get('slug')}' is already "
+                  f"{state.get('status')} (stop_reason: "
+                  f"{state.get('stop_reason')}) — nothing to abort",
+                  file=sys.stderr)
+            return 1
+        claim = state.get("claim")
+        holder = claim.get("session_id") if isinstance(claim, dict) else None
+        session = run_state.current_session_id()
+        # Evaluated BEFORE record_abort: a refused abort must leave the
+        # release record untouched.
+        if run_state.is_claimed_by_other(state, session) and not force:
+            status = run_state.claim_status(state, session)
+            return _report_claim_lost(
+                run_state.claim_pointer(rdir, state, session),
+                False,
+                f"run '{state.get('slug')}' is claimed by session "
+                f"{status['holder']} ({int(status['age_minutes'])} min ago) — "
+                f"refusing to abort a release another session is driving "
+                f"(pass --force if that session is known dead)",
+            )
+        try:
+            release_run.record_abort(rdir, reason=reason)
+            state = run_state.abort_run(
+                rdir, state, reason=reason, session=session, force=force)
+        except (run_state.RunStateError, run_state.ClaimRefusedError, OSError) as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+        outcome, detail = _cas_commit_and_push(
+            f"run-state: {state['slug']} release abort"
+        )
+        if outcome == CLAIM_PUSH_WON:
+            cleared = f" (claim cleared: session {holder})" if holder else ""
+            print(f"✅ Release run aborted: {state.get('slug')}{cleared}")
+            # Precise about WHERE the next release goes: this run keeps its
+            # address until the next `work release claim` rolls it aside —
+            # the abort is a terminal write and nothing else.
+            print("   Bump commit stays on prep-release; the next "
+                  "`work release claim` rolls this run aside and starts the "
+                  "next release run.")
+            return 0
+        if outcome != CLAIM_PUSH_LOST_RACE:
+            return _claim_fail_closed(f"abort push failed: {detail}")
+        last_detail = detail
+    return _claim_fail_closed(
+        f"push attempts exhausted after {RELEASE_CLAIM_ATTEMPTS} "
+        f"non-fast-forward rejections: {last_detail}"
+    )
+
+
+def _ensure_release_slug(
+    rdir: Path, state: dict, release: dict | None
+) -> tuple[Path, dict, str | None]:
+    """Move a release run to its version-bearing address once the version is
+    recorded (spec: version-in-slug; run_state.reslug_run).
+
+    Run identity is deterministic per `(taskdef, target)`, so a release run
+    that kept the derived slug forever meant the SECOND release of a
+    repository resolved to the first one's finished run and was refused
+    permanently. Leg 1 records the version before the bump branch leaves the
+    machine, so that is the earliest point the run can be given an address of
+    its own — and the bare address is free from then on.
+
+    Called after EVERY release-record verb, not just `record version`: the
+    re-slug can fail (target taken, fs error) or be interrupted between its
+    rename and its slug write, and retrying at the next leg-1 step heals it
+    instead of carrying a stale address to the end of the release. Already
+    at the target slug is a no-op. The base is derived from the run's OWN
+    recorded taskdef/target rather than the ambient env, so the address a
+    run moves to never depends on who invoked the verb.
+    """
+    version = release.get("version") if isinstance(release, dict) else None
+    if not version:
+        return rdir, state, None
+    base = run_state.derive_slug(state.get("taskdef"), state.get("target"))
+    # "Already moved?" is asked of the VERSION, not of one exact string: the
+    # address may be a uniquified variant (a re-used version — §6's declined
+    # release), and comparing against the canonical form would make this run
+    # look un-moved and re-slug it to a fresh address at every record verb.
+    if release_run.names_version(state.get("slug"), base, version):
+        return rdir, state, None
+    try:
+        target = release_run.unique_release_slug(base, version, rdir.parent, rdir)
+    except release_run.ReleaseRunError as exc:
+        # No address is free (pathological runs/ tree). Same fallback a failed
+        # rename takes: the record itself already landed, so warn and leave the
+        # run where it is — the next record verb retries the move.
+        print(f"⚠️  re-slug skipped: {exc}", file=sys.stderr)
+        return rdir, state, None
+    return run_state.reslug_run(rdir, state, target)
+
+
+def cmd_release_record(args) -> int:
+    """Execute `work release record <field>` (§7 frozen verb table —
+    release-flow spec §3).
+
+    Every mutation goes through the release.yaml single writer (the
+    release_run recorders): identity fields (version, merge SHAs, tag) are
+    write-once — re-recording the identical value is an idempotent no-op so
+    re-entered legs converge, while a value that contradicts the record is
+    refused with the kernel's hard-stop message (exit 1; recorded release
+    identity never silently moves). Receipts may be re-recorded (a
+    re-dispatched Actions run replaces the URL). Every actual write appends
+    a `release` audit event in the kernel, and the run dir is pushed after
+    the verb (durability, non-fatal) — the record is exactly what a
+    relaunched or scheduled session resumes from. Mutating-verb rules:
+    no run context is an error (exit 1); the run auto-seeds.
+    """
+    field = args.record_field
+    if field is None:
+        print("❌ release record requires a field: version | bump-sha | "
+              "merge-sha | tag | receipt", file=sys.stderr)
+        return 1
+    rdir, state = _require_run()
+    if rdir is None:
+        return 1
+    try:
+        if field == "version":
+            release = release_run.record_version(rdir, args.value)
+            noun = f"version {release['version']}"
+        elif field == "bump-sha":
+            release = release_run.record_bump_merge(rdir, args.value)
+            noun = f"bump-sha {release['bump_mr_merge_sha'][:12]}"
+        elif field == "merge-sha":
+            release = release_run.record_release_merge(
+                rdir, args.value, args.observed_version
+            )
+            noun = f"merge-sha {release['release_mr_merge_sha'][:12]}"
+        elif field == "tag":
+            release = release_run.record_tag(rdir, args.value, args.sha)
+            noun = f"tag {release['tag']['name']}"
+        else:  # receipt
+            release = release_run.record_receipt(
+                rdir, args.value, url=args.url, note=args.note
+            )
+            noun = f"receipt {args.value}"
+        derived = release_run.derive_leg(release)
+    except (run_state.RunStateError, OSError) as exc:
+        # ReleaseRunError included — the kernel's hard-stop message prints
+        # verbatim (version mismatch at the merge SHA, tag drift, a
+        # contradicted write-once field) and nothing was overwritten.
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    # The run takes its version-bearing address the moment the version is
+    # recorded — this is what makes the NEXT release a new run rather than a
+    # permanent refusal on this one.
+    rdir, state, old_dir_name = _ensure_release_slug(rdir, state, release)
+    print(f"✅ Release record: {noun}")
+    print(f"   Position: {derived['leg']} — next: {derived['next_step']}")
+    if old_dir_name:
+        print(f"   Run dir:  {rdir} (run is now '{state['slug']}'; cite the "
+              f"new path — the old one is free for the next release)")
+    # Durability: the record is the crash-recovery contract (spec §3 —
+    # resume is the contract) — push now, not at session end. An idempotent
+    # no-op stages nothing and commit_work_path skips the empty commit. The
+    # pre-rename path rides along so a re-slug's deletion lands too.
+    _push_run_dir(state, f"release record {noun}", old_dir_name,
+                  saved="release record")
+    return 0
+
+
+def cmd_release_status(as_json: bool = False) -> int:
+    """Execute `work release status` (§7 frozen verb table).
+
+    Read-only: the recorded fields plus the derived leg and the SINGLE next
+    step — the decision a relaunched or scheduled session keys on (spec §3:
+    exit immediately when there is nothing to advance). No run context and
+    no release recorded yet are both normal (exit 0); the JSON form still
+    derives a position from an empty record (leg1-bump) so the caller
+    always gets a next_step. An unreadable record or an internally
+    inconsistent one (hand-edited tag vs merge SHA) exits 1 with the
+    kernel's hard-stop message — never converge over it.
+    """
+    rdir = run_state.run_dir()
+    if rdir is None:
+        if as_json:
+            print(json.dumps({"leg": None, "next_step": None,
+                              "detail": "no run context"}))
+        else:
+            print("No run context (LMER_REPO_HOST/LMER_REPO_PROJECT unset)")
+        return 0
+    try:
+        release = release_run.load_release(rdir)
+        if as_json:
+            payload = release_run.derive_leg(release)
+            payload["recorded"] = release is not None
+            print(json.dumps(payload, ensure_ascii=False))
+        else:
+            print(release_run.format_release_status(release))
+        return 0
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+
+
 def _answer_marker_path(answer: str) -> Path:
     """Consume-once marker for a pushed LMER_ANSWER (review on !126).
 
@@ -2199,14 +3129,26 @@ def cmd_session_start() -> int:
         decision = run_state.decide(
             state, all_events[-5:], run_state.current_session_id(), ledger=ledger,
             sessions_used=run_state.count_session_starts(all_events),
+            release=_release_record_for_brief(rdir, state),
         )
 
         run_state.append_event(rdir, "session_start")
-        state["owner"] = {
-            "session_id": run_state.current_session_id(),
-            "claimed_at": run_state.utc_now_iso(),
-        }
-        run_state.write_state(rdir, state)
+        if run_state.is_claimed_by_other(state, run_state.current_session_id()):
+            # A LIVE foreign release claim (RUN-STATE.md §7) is enforced,
+            # not advisory: a session starting on a claimed release run
+            # must not silently steal the lock by writing itself in as
+            # owner. The brief below already carries the enforced-claim
+            # warning; `work release claim` is the only arbitration path.
+            holder = (state.get("claim") or {}).get("session_id")
+            print(f"⚠️  release claim held by session {holder} — owner not "
+                  f"taken (enforced single-flight; `work release claim` "
+                  f"arbitrates)")
+        else:
+            state["owner"] = {
+                "session_id": run_state.current_session_id(),
+                "claimed_at": run_state.utc_now_iso(),
+            }
+            run_state.write_state(rdir, state)
 
         if recovered:
             print("⚠️  Previous state.yaml was unreadable (backed up); recovered with a fresh seed.")
@@ -2221,8 +3163,52 @@ def cmd_session_start() -> int:
     return 0
 
 
+def _release_claim_at_session_end(rdir) -> None:
+    """Release a release claim THIS session holds, at clean session end (§7).
+
+    Without this, a cleanly-ended holder strands a live-looking claim that
+    blocks legitimate relaunches for up to RELEASE_CLAIM_STALE_MINUTES —
+    the stale threshold exists for CRASHED sessions, not clean exits. Runs
+    the same CAS discipline as `work release unclaim` (sync the remote
+    head, re-check the claim is still ours on THAT head — a takeover may
+    have displaced us — write, one arbitration push), but strictly
+    best-effort and quiet: session-end is a hook (always exits 0), so any
+    failure degrades to a warning and the stale threshold remains the
+    backstop.
+    """
+    session = run_state.current_session_id()
+    for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
+        ok, detail = _sync_remote_head()
+        if not ok:
+            print(f"⚠️  session-end claim release skipped: {detail}")
+            return
+        try:
+            state = run_state.load_state(rdir)
+        except (run_state.RunStateError, OSError):
+            return
+        if run_state.claim_status(state, session)["verdict"] != run_state.CLAIM_OURS:
+            return  # nothing of ours to release on the remote head
+        try:
+            state = run_state.unclaim_run(rdir, state, session)
+        except (run_state.ClaimRefusedError, run_state.RunStateError, OSError) as exc:
+            print(f"⚠️  session-end claim release failed: {exc}")
+            return
+        outcome, detail = _cas_commit_and_push(
+            f"run-state: {state['slug']} release unclaim (session end)"
+        )
+        if outcome == CLAIM_PUSH_WON:
+            print(f"✅ Release claim released at session end: {state.get('slug')}")
+            return
+        if outcome != CLAIM_PUSH_LOST_RACE:
+            print(f"⚠️  session-end claim release push failed: {detail}")
+            return
+    print("⚠️  session-end claim release lost the CAS race repeatedly; "
+          "leaving the claim to the stale threshold")
+
+
 def cmd_session_end() -> int:
-    """Record session end and release our claim. Hook-facing: ALWAYS exits 0."""
+    """Record session end, release a claim we hold, and push the run dir.
+    Hook-facing: ALWAYS exits 0."""
     rdir = run_state.run_dir()
     if rdir is None:
         return 0
@@ -2243,6 +3229,13 @@ def cmd_session_end() -> int:
         if isinstance(owner, dict) and owner.get("session_id") == run_state.current_session_id():
             state["owner"] = None
         run_state.write_state(rdir, state)
+        # The single-flight release claim (§7) is a separate lock from
+        # `owner` and must be released through the CAS path, not a plain
+        # state write — check on the LOCAL view first so non-release
+        # sessions never pay the git round-trips.
+        if (run_state.claim_status(state, run_state.current_session_id())
+                ["verdict"] == run_state.CLAIM_OURS):
+            _release_claim_at_session_end(rdir)
         rels = run_state.run_rel_path_candidates()
         # Masterplan-sync (and freeze-rename) specs-index entries ride along —
         # this is the last push of the session, so leaving them unstaged
@@ -2320,6 +3313,21 @@ def main() -> int:
         return cmd_specs_index(args.rebuild)
     elif args.command == "seed":
         return cmd_seed(args)
+    elif args.command == "release":
+        if args.release_action == "claim":
+            return cmd_release_claim(args.as_json)
+        elif args.release_action == "claim-status":
+            return cmd_release_claim_status(args.as_json)
+        elif args.release_action == "unclaim":
+            return cmd_release_unclaim(args.force)
+        elif args.release_action == "abort":
+            return cmd_release_abort(args.reason, force=args.force)
+        elif args.release_action == "record":
+            return cmd_release_record(args)
+        elif args.release_action == "status":
+            return cmd_release_status(args.as_json)
+        parser.print_help()
+        return 1
     elif args.command == "session-start":
         return cmd_session_start()
     elif args.command == "session-end":

@@ -1,0 +1,93 @@
+Watch is best-effort; RESUME is the contract. A relaunched session —
+scheduled relaunch, manual re-entry, or a watcher that died and came back —
+NEVER starts over and NEVER reconstructs progress from memory, remotes, or
+conversation history: the recorded run state is the single source of truth,
+and it lands on exactly ONE next action.
+
+Re-entry holds the same single-flight lock: run `work release claim` first.
+From the resuming party that is an idempotent refresh or a loud takeover of
+a stale claim — safe, because it resumes this SAME run, never a second
+release. A non-zero exit means a live session is already driving this
+release: end without touching anything.
+
+Then run `work release status` (add `--json` when scripting). It prints
+the recorded fields — release version, bump-MR merge SHA, release-MR merge
+SHA, tag, push/upload receipts — plus the derived leg and the single next
+step. Trust that derivation over anything a remote appears to show: remotes
+are consulted only to PERFORM the derived step (idempotently, per the leg
+contracts in the release instructions), never to decide what the step is.
+
+### The decision table
+
+The derivation walks the ladder in order and stops at the FIRST missing
+record, so partial or out-of-order state still lands on exactly one row
+(e.g. a `gitlab-tag-push` receipt recorded without an `actions-run` receipt
+derives to `leg2-poll-actions`, not past it). First matching row from the
+top wins:
+
+| Recorded run state (first gap wins) | Leg | Next step |
+| --- | --- | --- |
+| No release version recorded | leg1 | `leg1-bump` — run leg 1 from the top; the ctl dry-run detects an already-bumped branch and skips the bump (this is the abandoned-release re-entry), and an existing remote `prep-<X.Y.Z>` branch or open bump MR matching the dry-run's target version is ADOPTED per leg 1's step-6 rule — never re-created, never force-pushed. |
+| Version recorded, no bump-MR merge SHA (bump not merged) | leg1 | `leg1-record-bump-merge` — the bump MR is open or landed unrecorded (adopt an existing branch/MR, per leg 1's step-6 rule): merged → record its merge SHA; still open → in a full release session wait for the merge; in a follow-up session exit immediately — the scheduled relaunch picks the merge up. |
+| Bump merged, no release-MR merge SHA (release MR not merged, or merged while nothing watched) | gate | `gate-await-release-merge` — check the release MR NOW: merged → record the merge SHA (verifying the version at that SHA) and continue; still open → in a full release session re-arm the watch and idle with pushed state; in a follow-up session exit immediately — the scheduled relaunch IS the re-arm. |
+| Release MR merged (merge SHA recorded), no tag | leg2 | `leg2-create-tag` — verify preconditions, create the SSH-signed tag at exactly the recorded merge SHA. |
+| Tag created, no `github-main-push` receipt | leg2 | `leg2-push-github-main` — push GitHub `main` (never force). |
+| GitHub `main` pushed, no `github-tag-push` receipt | leg2 | `leg2-push-github-tag` — push the tag to GitHub (this triggers the Actions release workflow). |
+| Tag pushed to GitHub, Actions not green (`actions-run` receipt missing) | leg2 | `leg2-poll-actions` — poll the Actions run; already green for the tag → record which run actually uploaded; red with refs current → re-dispatch keyed on the recorded SHA. |
+| Actions green, no `pypi` receipt | leg2 | `leg2-record-pypi` — record the PyPI URL receipt. |
+| PyPI recorded, no `gitlab-tag-push` receipt | leg2 | `leg2-push-gitlab-tag` — only now, push the tag to GitLab origin. |
+| All receipts recorded | complete | `complete` — close out the run (retro, completion state, `work commit`). |
+
+The table names derived steps only. Leg 2's `leg2-record-merge` and
+`leg2-preconditions` phase names never appear as a derived next step — the
+derivation folds them into the rows above: the merge SHA is recorded on the
+gate row's merged → continue path (and idempotently re-recorded on every
+leg-2 entry), and the preconditions run inside `leg2-create-tag`.
+
+Re-entry stays idempotent because every step re-checks against the recorded
+merge SHA and version before acting: a tag that already exists must point at
+exactly the recorded SHA with a valid signature (anywhere else is a hard
+error — never re-point, never re-sign); refs already current → skip the
+push; Actions already green for the tag → skip the poll. A merge that
+happened while nothing was watching is simply picked up here — nothing is
+lost by a dead watcher.
+
+### The abandoned release (bump merged, human declines)
+
+`gate-await-release-merge` has a second exit: the human explicitly DECLINES
+the release MR (the bump merged to `prep-release`, but the release is not
+wanted). That is an explicit abort — NEVER a run left idling forever on a
+claim it will not use:
+
+- The decline must be the human's explicit decision. A release MR that is
+  merely still unmerged is `gate-await-release-merge` — keep waiting.
+- Run `work release abort --reason "<why>"` — the one verb that marks the
+  run aborted, marks the release record terminal, and releases the
+  single-flight claim (subsuming a manual `work release unclaim`). A
+  stalled claim blocks every future release of this repository; releasing
+  it is the point of aborting explicitly.
+- If abort REFUSES because a live foreign claim holds the run, another
+  session is driving this release right now: that is not your abort to
+  make. Report the printed pointer and end the session. `--force` exists
+  for the human runbook (a holder known dead), not for a session that was
+  refused at `work release claim`.
+- An aborted run is TERMINAL: never re-claim it, and never hand-edit it
+  back to `in-progress`. The resume is a NEW release run, and `work release
+  claim` is what creates it — resolving the aborted run, it rolls that run
+  aside to its own address and seeds the successor in the same atomic
+  commit. Just run the claim; its dry-run then finds the bump already on
+  `prep-release` and skips it, exactly as below.
+- The bump commit STAYS on `prep-release` — never revert it. Leg 1 is
+  idempotent against that state: the next release run's ctl dry-run detects
+  the version already bumped and the changelog already rolled, skips the
+  bump, and resumes from the release-MR/watch step.
+
+### The burned version (runbook — read before attempting any repair)
+
+PyPI filenames are permanent: once an upload succeeds for a version, that
+version is SPENT even if yanked. A bad or partially-shipped release is
+repaired by yanking on PyPI (when warranted) and shipping a NEW patch
+version through this same flow from `leg1-bump` — NEVER by deleting a tag,
+NEVER by re-pointing a tag, NEVER by re-signing. A tag pointing anywhere
+other than the recorded merge SHA is a hard error to report, not a repair
+opportunity.
