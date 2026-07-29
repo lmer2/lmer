@@ -35,12 +35,15 @@ git.20c.com repository at a PINNED commit — never a branch, never HEAD:
 ```
 # Pinned ctl commit. Bumping this pin is a reviewed edit to this taskdef,
 # never a session-time decision; the dry run below revalidates it.
-# Pin provenance: resolved from the GitHub mirror of 20c/ctl (a merge
-# commit on its main, 2026-07-18) because the authoring environment had no
-# git.20c.com credentials — the install still pulls from the canonical
-# host, and the dry run in step 3 is the gate that revalidates the pin.
-CTL_PINNED_REF=8a28e2e4d2754744a6a0c3a79d1f2d91f7f1d0d9
-uv tool install "git+https://git.20c.com/20c/ctl@${CTL_PINNED_REF}"
+# Pin provenance: the `feature/changelog-d` merge on the canonical repo's
+# main, verified against that repo directly — both the path and the commit
+# were resolved with credentials, not inferred from the GitHub mirror.
+# NOTE ON THE PATH: the canonical ctl lives under the `gh/` namespace.
+# There is a same-named `20c/ctl` project on the instance which is a STALE
+# copy (no `main` branch) and does NOT contain this commit — pointing the
+# install there fails with "upload-pack: not our ref".
+CTL_PINNED_REF=a27f0654f3837fce697390e1b5a6753d60ce5f74
+uv tool install "git+https://git.20c.com/gh/20c/ctl@${CTL_PINNED_REF}"
 ```
 
 If the install fails, that is a hard stop: record it with `work state set
@@ -56,10 +59,12 @@ The changelog mechanism is the resolved `release.changelog` parameter from
 Phase 0.5 — exactly one of:
 
 - `legacy` — ctl rolls `CHANGELOG.yaml`: the `unreleased:` section becomes
-  the new `X.Y.Z` section (lmer's first release under this flow runs in
-  this mode).
+  the new `X.Y.Z` section.
 - `fragments` — ctl compiles the `changelog.d/` fragment files into the
-  changelog and removes the consumed fragments.
+  changelog and removes the consumed fragments (lmer's first release under
+  this flow runs in this mode: the pinned ctl carries fragment support, and
+  lmer already accumulates its unreleased entries as fragments, so a legacy
+  roll would silently leave them behind).
 
 Run the version bump + changelog roll in dry-run mode FIRST — no writes, no
 commits (consult `ctl --help` at the pinned ref for the exact dry-run
