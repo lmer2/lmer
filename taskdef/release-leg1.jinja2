@@ -30,21 +30,41 @@ never commit to `prep-release` directly. The branch is renamed to its final
 ### 2. Install ctl at the pinned ref
 
 Until ctl itself ships through this flow, it installs from its canonical
-git.20c.com repository at a PINNED commit — never a branch, never HEAD:
+git.20c.com repository at a PINNED commit — never a branch, never HEAD.
+
+The container carries NO credential helper for `git.20c.com`, and
+`~/.gitconfig` is a read-only mount, so one cannot be added persistently. A
+bare `uv tool install` from that host therefore fails with `could not read
+Username for 'https://git.20c.com': terminal prompts disabled`. Supply the
+session's token through git's numbered-config environment instead — it
+lives only in this process, never in a file and never on a command line:
 
 ```
 # Pinned ctl commit. Bumping this pin is a reviewed edit to this taskdef,
 # never a session-time decision; the dry run below revalidates it.
-# Pin provenance: the `feature/changelog-d` merge on the canonical repo's
-# main, verified against that repo directly — both the path and the commit
-# were resolved with credentials, not inferred from the GitHub mirror.
+# Pin provenance: the `feature/release-flow-fixes` merge (MR !11) on the
+# canonical repo's main, verified against that repo directly — both the
+# path and the commit were resolved with credentials, not inferred from
+# the GitHub mirror. That MR is what makes this leg work at all: it fixed
+# the case-insensitive residual changelog key and added the version write
+# with no git side effects that step 4 uses.
 # NOTE ON THE PATH: the canonical ctl lives under the `gh/` namespace.
 # There is a same-named `20c/ctl` project on the instance which is a STALE
 # copy (no `main` branch) and does NOT contain this commit — pointing the
 # install there fails with "upload-pack: not our ref".
-CTL_PINNED_REF=a27f0654f3837fce697390e1b5a6753d60ce5f74
-uv tool install "git+https://git.20c.com/gh/20c/ctl@${CTL_PINNED_REF}"
+CTL_PINNED_REF=5af16ceaa103095f53594fe6aa33246d05f72ba7
+
+# If this session already inherits numbered git config, use the next free
+# index instead of 0 and raise GIT_CONFIG_COUNT rather than overwrite it.
+GIT_CONFIG_COUNT=1 \
+  GIT_CONFIG_KEY_0="url.https://oauth2:${GITLAB_TOKEN_git_20c_com}@git.20c.com/.insteadOf" \
+  GIT_CONFIG_VALUE_0="https://git.20c.com/" \
+  uv tool install "git+https://git.20c.com/gh/20c/ctl@${CTL_PINNED_REF}"
 ```
+
+ctl needs no `Ctl/config.yml` in the target repository — the operations
+below dispatch by plugin type. `ctl --help` listing no configured
+operations is expected and is NOT a sign the install is broken.
 
 If the install fails, that is a hard stop: record it with `work state set
 --stop-reason=critical_error --critical-error '{"summary": "ctl install
@@ -67,12 +87,34 @@ Phase 0.5 — exactly one of:
   roll would silently leave them behind).
 
 Run the version bump + changelog roll in dry-run mode FIRST — no writes, no
-commits (consult `ctl --help` at the pinned ref for the exact dry-run
-invocation). The dry run must show both:
+commits to the real tree.
 
-1. the target version `X.Y.Z` it would bump to, and
+ctl has NO dry-run flag at this pin: every operation below writes in place.
+The dry run is therefore step 4's commands run for real against a THROWAWAY
+CLONE, never against the working checkout:
+
+```
+DRYRUN="$(mktemp -d)/dryrun"
+git clone --quiet --no-hardlinks --branch release-bump . "$DRYRUN"
+cd "$DRYRUN"
+```
+
+Run step 4's commands there, then read `git status --short` and
+`git diff`. Discard the directory afterwards — nothing from it is ever
+copied back into the working checkout.
+
+The dry run must show all three:
+
+1. the target version `X.Y.Z` in `pyproject.toml`,
 2. a changelog roll in the configured mechanism — the `CHANGELOG.yaml`
-   section roll for `legacy`, fragment compilation for `fragments`.
+   section roll for `legacy`, fragment compilation for `fragments`, and
+3. the diff shape step 4 requires, with nothing outside it.
+
+Read the changelog result by PARSING it, not by reading the diff: the roll
+rewrites the whole file (see step 4), so a wrong or partial roll does not
+stand out visually. Confirm the new `X.Y.Z` section carries the entries you
+expect, that the residual section is reset to empty lists, and that the
+historical sections are semantically unchanged.
 
 A dry run that fails, or that handles the changelog in any mechanism other
 than the configured one, means the pinned ref does not handle this
@@ -81,26 +123,88 @@ naming the pinned ref and the configured changelog mode. Do NOT bump the
 pin yourself and do NOT hand-edit the changelog to compensate — a human
 revalidates and moves the pin.
 
-Idempotency: when the dry run reports the version already bumped and the
-changelog already rolled on `prep-release` (a previous release run died
-after its bump MR merged), do NOT bump again. Record the version read from
-`pyproject.toml` on `prep-release` and the merge SHA of the bump MR that
-landed it (step 8's recording contract), then proceed to the gate — see
-"Resuming an in-progress release".
+Idempotency — check this BEFORE reading a failure as a pin problem. When a
+previous release run died after its bump MR merged, `prep-release` already
+carries the bump, and the dry run fails on the ALREADY-DONE work rather
+than on the pin: `ctl changelog release` reports the release version
+already exists in the changelog, and `pyproject.toml` on `prep-release`
+already reads `X.Y.Z`. That is a resumable state, NOT a hard stop. Do NOT
+bump again: record the version read from `pyproject.toml` on `prep-release`
+and the merge SHA of the bump MR that landed it (step 8's recording
+contract), then proceed to the gate — see "Resuming an in-progress
+release".
+
+The hard stop above is for a dry run that fails with the version NOT yet
+bumped on `prep-release`, or that handles the changelog in the wrong
+mechanism. Distinguish the two by reading the version on `prep-release`
+before concluding anything.
 
 ### 4. Run the bump + changelog roll
 
-Run the same ctl invocation for real, then verify the working tree: the
-diff must contain exactly the version bump in `pyproject.toml` plus the
-changelog artifacts of the configured mechanism (a rolled `CHANGELOG.yaml`,
-or the compiled changelog plus deleted `changelog.d/` fragments) — nothing
-else. Anything unexpected in the diff is a stop-and-ask, not something to
-commit around.
+Three commands, in this order, from the repository root:
+
+```
+ctl version set <X.Y.Z> .        # writes the version field in pyproject.toml
+ctl changelog release <X.Y.Z>    # rolls the changelog, consumes fragments
+uv lock                          # refreshes the project's version in uv.lock
+```
+
+- `ctl version set` performs NO git operations at all — no pull, no commit,
+  no tag, no push. That is why it is the operation used here: the commit is
+  `gate-commit`'s job and the tag is leg 2's.
+- The trailing `.` is required. Without a repository argument ctl has no
+  target and fails.
+- Do NOT pass `--init`. It creates an untracked `Ctl/VERSION` file, which
+  is an unexpected entry in the diff below. A repository whose version
+  lives only in `pyproject.toml` is a valid target without it.
+- `uv lock` runs last because it reads the version `ctl version set` wrote.
+
+FORBIDDEN — these commit, tag and push from inside ctl, bypassing the
+commit gate and creating an unsigned tag that is leg 2's job under a name
+leg 2 does not use:
+
+- `ctl version bump <segment>` without `--no-git`
+- `ctl version tag <X.Y.Z>`
+
+When the run was given a bump SEGMENT rather than an exact version, use
+`ctl version bump <segment> --no-git .` in place of `ctl version set`. It
+validates the changelog first, so it must run AFTER `ctl changelog release`
+— `ctl version set` has no such ordering constraint, which is why it is the
+default form here.
+
+Then verify the working tree. The diff must contain exactly:
+
+- `pyproject.toml` — the version field, one line
+- `uv.lock` — the project's OWN `version` line, one line. This entry is
+  expected and does not violate the "nothing else" rule; a `uv.lock` diff
+  that touches anything beyond the project's own version line means
+  dependencies moved and IS a stop-and-ask.
+- `CHANGELOG.yaml` — the roll
+- `changelog.d/*.yaml` — the consumed fragments, deleted (fragments mode)
+- `CHANGELOG.md` — regenerated by the roll. `git add` it; on a repository
+  releasing through this flow for the first time it is untracked and would
+  otherwise be left out of the commit.
+
+Anything outside that set is a stop-and-ask, not something to commit
+around.
+
+KNOWN AND EXPECTED — do not stop for these:
+
+- The roll rewrites the WHOLE `CHANGELOG.yaml`, not just the new section:
+  list indentation, long-string wrapping and non-ASCII escaping all change,
+  so the diff is far larger than the entries added. Confirm the content by
+  parsing (step 3), not by reading the diff.
+- The rewrite DROPS every comment in `CHANGELOG.yaml` — YAML round-trip
+  does not preserve them. Known ctl limitation, accepted for now, tracked
+  as ctl issue #32; do not hand-restore them in this commit.
 
 Rename the branch to its final name: `git branch -m prep-<X.Y.Z>`.
 
 ### 5. Commit, then record the version — BEFORE anything is pushed
 
+- Stage every path from step 4's expected diff — including the deleted
+  fragments and the regenerated `CHANGELOG.md`, which is untracked on a
+  first release and would otherwise be silently left out.
 - Commit through `gate-commit` — the standard commit gate; never raw
   `git commit`. Commit message: `prep <X.Y.Z>`.
 - Record leg-1 state immediately — run state fields come from the
