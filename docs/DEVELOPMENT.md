@@ -38,3 +38,31 @@ Existing dataclass record sites: `lmer_cli/harness.py`, `lmer_cli/gates.py`,
 those modules. Reach for a pydantic model only when data crosses a validated
 wire boundary — a FastAPI endpoint, or a future surface that parses untrusted
 payloads.
+
+## Changelog entries: changelog.d fragments, never the unreleased block
+
+**Decision (2026-07-18):** unreleased changelog entries are written as
+per-branch YAML fragments under `changelog.d/` (format and naming in
+[`changelog.d/README.md`](../changelog.d/README.md)), not appended to
+`CHANGELOG.yaml`'s `unreleased:` lists. `ctl changelog release` rolls
+fragments into the version section at release time (requires ctl with
+fragment support — the `feature/changelog-d` branch of
+[20c/ctl](https://github.com/20c/ctl); not yet in a released ctl version).
+
+Rationale:
+
+- **`unreleased:` was the single most conflict-prone spot in the repo.**
+  Every concurrent branch appended to the same lines, so every merge
+  re-conflicted the rest of the MR queue. Fragments are one file per
+  branch — the conflict class is structurally gone.
+- **The YAML-canonical model is preserved.** Fragments use the same section
+  vocabulary (`added`/`fixed`/`changed`/`deprecated`/`removed`/`security`)
+  and roll into `CHANGELOG.yaml`, which remains the source of truth;
+  text renderers like towncrier/scriv were rejected upstream for breaking
+  that model.
+
+**How to apply:** one fragment per branch, `changelog.d/YYYYMMDD-<branch-slug>.yaml`,
+mapping section → list of entry strings. Entry-quality rules unchanged
+(user-facing perspective; skip internal refactors/test-only/CI changes).
+The gate-check Changelog check accepts a staged fragment as the changelog
+update; release commits that rewrite `CHANGELOG.yaml` itself still pass.

@@ -14,6 +14,18 @@ from .utils import sanitize_task_target
 
 PUSH_RETRIES = 3
 
+# Outcomes of :func:`claim_push_once` — the claim-by-push compare-and-swap
+# leg (docs/RUN-STATE.md §7). String constants rather than an enum so the
+# values read literally in logs and test output.
+CLAIM_PUSH_WON = "won"
+CLAIM_PUSH_LOST_RACE = "lost-race"
+CLAIM_PUSH_ERROR = "error"
+
+# Markers git prints on a push the server refused because the remote ref
+# advanced (non-fast-forward). Anything else on a failed push — transport,
+# auth, missing remote — is a genuine error, never a lost race.
+_NON_FAST_FORWARD_MARKERS = ("[rejected]", "non-fast-forward", "fetch first")
+
 # Cap on how many stray entries ``report_uncommitted_work_items`` lists before
 # collapsing the rest into a "... and N more" line, so a large dirty tree can
 # never flood ``work commit``'s output.
@@ -33,12 +45,17 @@ def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int,
         Tuple of (exit_code, output)
     """
     try:
+        # LC_ALL=C pins git's message locale: claim_push_once classifies CAS
+        # outcomes by substring-matching English output, and a localized
+        # "non-fast-forward" would misread as CLAIM_PUSH_ERROR (fail-closed
+        # direction, but it would break the bounded re-evaluate loop).
         result = subprocess.run(
             ["git"] + cmd,
             cwd=str(cwd),
             capture_output=True,
             text=True,
             check=check,
+            env={**os.environ, "LC_ALL": "C"},
         )
         if result.returncode == 0:
             return result.returncode, result.stdout
@@ -176,6 +193,23 @@ def _has_tracked_files(work_repo_path: Path, rel_path: str) -> bool:
     return rc == 0 and bool(output.strip())
 
 
+def stageable_paths(work_repo_path: Path, paths: list[str]) -> list[str]:
+    """The subset of paths `git add` can be pointed at without erroring.
+
+    A path that neither exists on disk nor holds tracked files makes
+    ``git add -A -- <path>`` exit 128 ("pathspec did not match any files"),
+    which would fail every caller outright — e.g. the stale bare-slug
+    candidate from run_rel_path_candidates() after a run-dir rename. A
+    tracked path missing from disk is KEPT so pending deletions still get
+    staged (a rename lands as a move, not a duplicate).
+    """
+    return [
+        p
+        for p in paths
+        if (work_repo_path / p).exists() or _has_tracked_files(work_repo_path, p)
+    ]
+
+
 def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
     """
     Sync one or more paths in the work repo: add -> commit -> rebase -> push.
@@ -214,11 +248,7 @@ def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
         return 1
 
     all_paths = [target_path] if isinstance(target_path, str) else list(target_path)
-    paths = [
-        p
-        for p in all_paths
-        if (work_repo_path / p).exists() or _has_tracked_files(work_repo_path, p)
-    ]
+    paths = stageable_paths(work_repo_path, all_paths)
     if not paths:
         print("✅ No existing paths to commit in work repository")
         return 0
@@ -287,6 +317,50 @@ def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
 
     print(f"❌ git push failed after {PUSH_RETRIES} attempts ({label}): {output}", file=sys.stderr)
     return rc
+
+
+def claim_push_once(repo_path: Path, label: str = "work repo") -> tuple[str, str]:
+    """Fetch, then issue ONE plain ``git push`` — the claim-by-push CAS leg.
+
+    The git-level arbitration path for the single-flight release claim
+    (docs/RUN-STATE.md §7). Deliberately NOT :func:`_push_with_rebase_retries`:
+    that path reacts to a rejected push by rebasing the local commit onto the
+    new remote head and pushing again — which would silently stack two
+    competing claim commits on top of each other (last writer wins; both
+    launches proceed). Here the server's non-fast-forward rejection IS the
+    answer: the remote advanced between the caller's fetch-and-evaluate and
+    this push, so the claim commit must not land until the new head has been
+    re-checked for a foreign claim. The bounded re-fetch/re-evaluate loop
+    lives in the caller, never in this helper.
+
+    The commit to push must already exist locally. The fetch up front makes
+    an unreachable remote read as ERROR before any push is attempted — a
+    release must fail closed, not mistake a dead remote for a lost race.
+
+    Returns:
+        ``(outcome, detail)`` where outcome is one of
+        :data:`CLAIM_PUSH_WON` (push fast-forwarded the remote — the claim
+        landed atomically), :data:`CLAIM_PUSH_LOST_RACE` (non-fast-forward
+        rejection — the remote moved; re-fetch and re-evaluate before any
+        retry), or :data:`CLAIM_PUSH_ERROR` (fetch or push failed for any
+        other reason — transport, auth, missing remote; callers fail
+        closed). ``detail`` is git's output for the deciding command.
+    """
+    rc, output = run_git_command(["fetch"], repo_path, check=False)
+    if rc != 0:
+        print(f"❌ git fetch failed ({label}): {output}", file=sys.stderr)
+        return CLAIM_PUSH_ERROR, output
+
+    rc, output = run_git_command(["push"], repo_path, check=False)
+    if rc == 0:
+        return CLAIM_PUSH_WON, output
+
+    lowered = output.lower()
+    if any(marker in lowered for marker in _NON_FAST_FORWARD_MARKERS):
+        return CLAIM_PUSH_LOST_RACE, output
+
+    print(f"❌ git push failed ({label}): {output}", file=sys.stderr)
+    return CLAIM_PUSH_ERROR, output
 
 
 def commit_work_changes(commit_message: Optional[str] = None) -> int:

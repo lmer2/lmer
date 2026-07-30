@@ -31,7 +31,9 @@ Presets are defined in a JSON file pointed at by ``LMER_PRESETS_FILE``::
 A preset is selected by name: via a ``$preset:<name>`` token embedded in a
 message, e.g. ``Hey @lmer $preset:my_service please do X`` (the Slack listener
 scans the triggering message for it), or via ``lmer --preset <name>`` /
-``LMER_PRESET=<name>`` on a direct CLI invocation. Preset names must use the
+``LMER_PRESET=<name>`` on a direct CLI invocation (or, scoped to one taskdef,
+``LMER_<TASK>_PRESET=<name>`` — e.g. ``LMER_REVIEW_PRESET`` applies to
+``lmer review`` only, issue #140). Preset names must use the
 selector charset (``[A-Za-z0-9_-]``); a name with other characters is logged
 and skipped at load time, since the token could never select it.
 
@@ -51,6 +53,7 @@ import logging
 import os
 import re
 import shlex
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -70,6 +73,17 @@ PRESETS_FILE_ENV = "LMER_PRESETS_FILE"
 # can pin a default preset. The Slack listener selects via the $preset:<name>
 # message token instead and never reads this.
 PRESET_ENV = "LMER_PRESET"
+
+# Template for the taskdef-scoped variant of PRESET_ENV (issue #140):
+# LMER_REVIEW_PRESET selects the preset for `lmer review …` only, so an
+# operator can pin a per-task default in ~/.lmer/.env without it bleeding
+# into every other task. Read host-side alongside PRESET_ENV.
+TASK_PRESET_ENV_TEMPLATE = "LMER_{task}_PRESET"
+
+# Characters a taskdef id may contribute to an env-var name; everything else
+# (dashes, dots) becomes an underscore so `code-review` can be selected as
+# LMER_CODE_REVIEW_PRESET.
+_ENV_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9]")
 
 # Env var selecting the agent fan-out presets for a CLI invocation, as a
 # comma-delimited list of preset names (the --agents flag wins over it,
@@ -162,6 +176,102 @@ def parse_preset_token(text: str | None) -> str | None:
         return None
     match = _PRESET_TOKEN_RE.search(text)
     return match.group(1) if match else None
+
+
+def task_preset_env_name(task_id: str | None) -> str | None:
+    """Return the taskdef-scoped preset env var name for *task_id*.
+
+    The single home of the taskdef-id → env-var mapping (issue #140):
+    ``review`` → ``LMER_REVIEW_PRESET``, ``code-review`` →
+    ``LMER_CODE_REVIEW_PRESET``. Taskdef ids are directory names from the
+    taskdef search path (including work-repo and ``LMER_TASKDEF_PATHS``
+    ones), so the derivation cannot assume the built-in set: everything
+    outside ``[A-Za-z0-9]`` collapses to an underscore.
+
+    The mapping is therefore **many-to-one**: ``code-review``,
+    ``code_review`` and ``code.review`` all derive
+    ``LMER_CODE_REVIEW_PRESET``, so two separator-variant taskdefs
+    coexisting on the search path would share one selector (no current
+    taskdef set does; there is nothing to disambiguate against here, since
+    this function deliberately knows nothing about which taskdefs exist).
+
+    Returns ``None`` when *task_id* is empty or normalizes to nothing —
+    an id of only separators (``"-"``), or one with no ASCII alphanumerics
+    at all (``"レビュー"``) — leaving that taskdef with no taskdef-scoped
+    selector; ``LMER_PRESET`` still works for it. A digit can safely lead
+    the suffix: the ``LMER_`` prefix keeps the full name a legal env-var
+    identifier (``2fa`` → ``LMER_2FA_PRESET``).
+    """
+    if not task_id or not task_id.strip():
+        return None
+    suffix = _ENV_NAME_SAFE_RE.sub("_", task_id.strip()).strip("_").upper()
+    if not suffix:
+        return None
+    return TASK_PRESET_ENV_TEMPLATE.format(task=suffix)
+
+
+def preset_env_value(
+    var: str, environ: Mapping[str, str] | None = None
+) -> str:
+    """Read a preset selector variable under the blank-is-unset rule.
+
+    The one home for that normalization: the value is stripped, and a blank
+    one (empty or whitespace-only) reads as ``""`` — i.e. unset. Shared by
+    :func:`select_preset_name` and the CLI's tier-override warning so the two
+    can never disagree about whether a given value selects anything.
+
+    Args:
+        var: Environment variable name to read.
+        environ: Environment mapping; defaults to ``os.environ``.
+    """
+    env = os.environ if environ is None else environ
+    return (env.get(var) or "").strip()
+
+
+def select_preset_name(
+    flag: str | None,
+    task_id: str | None,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve which preset a CLI invocation selects, and via what.
+
+    Precedence (issue #140), most specific first:
+
+    1. ``--preset`` — the explicit flag always wins.
+    2. ``LMER_<TASK>_PRESET`` — the taskdef-scoped var for *task_id*, so a
+       per-task default in ``~/.lmer/.env`` applies to that task only.
+    3. ``LMER_PRESET`` — the generic default for every other task.
+
+    Args:
+        flag: The ``--preset`` value, or ``None``.
+        task_id: The selected taskdef id, or ``None`` (``--no-task``), in
+            which case only the flag and ``LMER_PRESET`` can select.
+        environ: Environment mapping to read; defaults to ``os.environ``.
+
+    Every candidate is whitespace-stripped, and a blank one (empty or
+    whitespace-only) counts as **unset**: it falls through to the next
+    candidate instead of selecting a preset named ``""``. So
+    ``LMER_REVIEW_PRESET= lmer review …`` drops back to ``LMER_PRESET``, and
+    ``LMER_PRESET= lmer develop …`` runs with no preset. Stripping applies to
+    the flag too, so ``--preset " demo "`` and ``LMER_PRESET=" demo "`` agree
+    (before this was asymmetric: only env values were stripped).
+
+    Returns:
+        ``(name, source)`` — the selected preset name and a human-readable
+        label for what selected it (``"--preset"`` or the env var's name),
+        for the announce line and the unknown-name error. ``(None, None)``
+        when nothing selects a preset.
+    """
+    stripped_flag = (flag or "").strip()
+    if stripped_flag:
+        return stripped_flag, "--preset"
+    task_env = task_preset_env_name(task_id)
+    candidates = ([task_env] if task_env else []) + [PRESET_ENV]
+    for var in candidates:
+        value = preset_env_value(var, environ)
+        if value:
+            return value, var
+    return None, None
 
 
 def load_presets(path: str | None = None) -> dict[str, Preset]:

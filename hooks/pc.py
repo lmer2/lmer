@@ -3,12 +3,51 @@
 Hook for pc (Please Commit) command.
 Enforces that commit gate was passed before allowing commit.
 """
+import fnmatch
 import os
 import sys
 import subprocess
 import time
 from pathlib import Path
 from datetime import datetime
+
+
+# LMER_PUSH_ALLOW_LIST extended grammar — DUPLICATED implementation.
+#
+# Decision (see also the pre-push heredoc in hooks/install.sh): this hook
+# runs standalone in-container and cannot import lmer_cli (same constraint
+# as container/clone_and_exec.py, cf. lmer_cli/tokens.py), so instead of
+# delegating to `gate-push` it mirrors the allow-list check from
+# lmer_cli.gates.GateSystem.run_push_gate / _parse_push_allow_entry.
+# Keep the bodies in sync; the mirror is guarded by
+# tests/test_push_allow_grammar_parity.py (#116).
+def push_allowed(remote_url, ref, allow_list_str=None):
+    """True if the allow list authorizes pushing `ref` to `remote_url`.
+
+    Grammar (authoritative docs live in lmer_cli/gates.py): comma-separated
+    entries, each either `repo` (substring of the remote URL, branch refs
+    ONLY) or `repo|refpattern` (fnmatch against the fully-qualified ref,
+    e.g. refs/tags/*). Malformed entries — empty half, more than one `|` —
+    are IGNORED: an unparseable grant must never fail open.
+    """
+    if allow_list_str is None:
+        allow_list_str = os.environ.get("LMER_PUSH_ALLOW_LIST", "")
+    if not ref.startswith("refs/"):
+        ref = f"refs/heads/{ref}"
+    for entry in allow_list_str.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "|" not in entry:
+            repo, ref_pattern = entry, "refs/heads/*"
+        else:
+            parts = entry.split("|")
+            if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+                continue
+            repo, ref_pattern = parts[0].strip(), parts[1].strip()
+        if repo in remote_url and fnmatch.fnmatch(ref, ref_pattern):
+            return True
+    return False
 
 
 def check_gate_passage():
@@ -182,26 +221,43 @@ def main():
     if not create_commit():
         sys.exit(1)
 
-    # Check if we should push (if on allow list)
-    result = subprocess.run(["git", "remote", "-v"], capture_output=True, text=True)
-    if result.stdout:
-        allow_list_str = os.environ.get("LMER_PUSH_ALLOW_LIST", "")
-        allowed_repos = [r.strip() for r in allow_list_str.split(",") if r.strip()]
-        current_repo = None
+    # Check if we should push (if on allow list). Authorization matches
+    # gate-push: the remote URL comes from `git remote get-url --push
+    # origin` — the PUSH url, since that is where git sends refs when
+    # `remote.origin.pushurl` is set — and the ref is the current branch.
+    # See push_allowed() above for the grammar and the mirrored-logic note.
+    result = subprocess.run(
+        ["git", "remote", "get-url", "--push", "origin"],
+        capture_output=True, text=True
+    )
+    remote_url = result.stdout.strip()
+    if result.returncode == 0 and remote_url:
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"], capture_output=True, text=True
+        ).stdout.strip()
 
-        for line in result.stdout.split('\n'):
-            for repo in allowed_repos:
-                if repo in line:
-                    current_repo = repo
-                    break
-
-        if current_repo:
-            print(f"\n📍 Repository '{current_repo}' is on the allow list")
+        # Detached HEAD: `--show-current` exits 0 with EMPTY stdout, and
+        # push_allowed() would qualify that to the bare "refs/heads/",
+        # which fnmatch matches against "refs/heads/*" (`*` matches empty)
+        # — i.e. any bare allow-list entry would authorize a ref naming no
+        # branch. There is nothing to authorize: say so and offer nothing.
+        if not branch:
+            print("\n⚠️  Cannot resolve the current branch (detached HEAD?)")
+            print("   Not offering a push — check out a branch first")
+        elif push_allowed(remote_url, branch):
+            print(f"\n📍 Repository '{remote_url}' is on the allow list for this ref")
             response = input("Push to remote? (yes/no): ")
             if response.lower() == 'yes':
-                subprocess.run(["git", "push"])
+                # Push exactly what was authorized. A bare `git push`
+                # resolves its remote through branch.<name>.pushRemote →
+                # remote.pushDefault → branch.<name>.remote, so either of
+                # the first two would send the commit to a remote the
+                # allow-list check above never looked at — the same
+                # authorize-one-target-dial-another shape as reading the
+                # fetch url instead of the push url.
+                subprocess.run(["git", "push", "origin", branch])
         else:
-            print("\n⚠️  This repository is not on the push allow list")
+            print("\n⚠️  This repository/ref is not on the push allow list")
             print("   Get explicit permission before pushing")
 
 

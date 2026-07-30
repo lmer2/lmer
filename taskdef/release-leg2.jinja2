@@ -1,0 +1,230 @@
+{#-
+  Leg 2 — ship. Included by taskdef/release/instructions.txt under its
+  "## Leg 2 — ship" heading, so this body starts at H3. The four release
+  parameters (release.github_target, release.tag_prefix, release.signing_key,
+  release.changelog) were resolved in Phase 0.5; leg 2 consumes the first
+  three. Step names extend the derived-step vocabulary of the resume
+  decision table in release-resume.jinja2.
+-#}
+Entry condition: the human merged the release MR (`prep-release` → `main`)
+on GitLab — or a relaunch derived a leg-2 step from run state. Everything in
+this leg keys on ONE fact: the release-MR merge SHA recorded in run state.
+No step acts on an earlier leg's memory, the working tree, or a branch tip
+that could move — a step either verifies its target against the recorded
+merge SHA or it does not run.
+
+On entry (and on every re-entry) run `work release status` first: it prints
+the recorded fields, the derived leg, and the single next step. Record each
+step's phase before starting it (`work state set --phase=<step name>`, using
+the step names below). Two of these names — `leg2-record-merge` and
+`leg2-preconditions` — extend the resume decision table's derived-step
+vocabulary without ever appearing as a derived next step: `work release
+status` folds them into its rows. A derivation of `leg2-create-tag`
+therefore runs steps 1 through 3: step 1 as an idempotent re-record (its
+mismatch check runs every time, even when the gate already recorded the
+merge SHA), then step 2's preconditions, then the tag.
+
+Credentials are provisioned, never fetched: the GitHub fine-grained PAT
+arrives through this session's credential env, and the release SSH signing
+key is mounted read-only at `/release-signing-key` (the path is also
+exported as `LMER_RELEASE_SIGNING_KEY`); `release.signing_key` is the
+REFERENCE resolved in Phase 0.5. Consume these deliveries as-is — do NOT
+hunt for keys elsewhere, generate one, or re-implement provisioning. A
+missing or rejected credential is a hard error naming the credential
+requirement (see HARD RULES), never a workaround.
+
+### Step 1 — `leg2-record-merge` — record the merge SHA
+
+The anchor for every later step. Skipping it or reordering it breaks the
+whole ladder.
+
+- [ ] Read the release MR's merge SHA from GitLab (`gitlab-review` on the
+      release MR — the merge commit on `main`). Full 40-hex, never
+      abbreviated.
+- [ ] Re-read the version AT THAT SHA — never the working tree, never leg
+      1's memory: `git fetch origin` then
+      `git show <merge-sha>:pyproject.toml`, extracting `project.version`
+      from that exact blob.
+- [ ] Record both together:
+      `work release record merge-sha <merge-sha> --version <observed-version>`
+
+The recorder HARD STOPS when the observed version disagrees with leg 1's
+recorded version. That mismatch means a second bump or a foreign commit
+landed on `main` — a human decision is required, not a repair attempt.
+Record it before ending the session:
+`work state set --stop-reason=critical_error --critical-error
+'{"summary": "version mismatch at merge SHA", "detail": "leg 1 recorded <recorded> but pyproject.toml at <merge-sha> says <observed>"}'`
+then `work commit` and end the session. Re-recording the same SHA and
+version on a resume is safe — the mismatch check runs even on an idempotent
+re-record.
+
+### Step 2 — `leg2-preconditions` — preconditions, each a receipt
+
+Both checks run through `work verify` so a receipt exists, not just prose:
+
+- [ ] GitLab `main` pipeline at the merge SHA is green. Resolve the
+      pipeline FOR the merge SHA first (GitLab API
+      `/projects/<id>/pipelines?sha=<merge-sha>` — always pinned to the
+      merge SHA, never "latest on main"), then record the receipt:
+      `work verify gitlab-main-pipeline -- gitlab-pipeline <project> <pipeline-id> --host <hostname> --expect-status success`
+      (`--expect-status success` makes the exit code carry the verdict — a
+      red or still-running pipeline exits non-zero, so the receipt can
+      never record a green checkmark for a red pipeline.)
+      Red or still running → do not proceed; wait or investigate.
+- [ ] GitHub `main` is an ancestor of the merge SHA. Add the mirror remote
+      once (`git remote add github <release.github_target>` — skip if
+      already present), fetch it, then:
+      `work verify github-ancestry -- git merge-base --is-ancestor <github-main-sha> <merge-sha>`
+      where `<github-main-sha>` is `git rev-parse github/main` after the
+      fetch.
+
+GitHub `main` holding any commit that is NOT an ancestor of the merge SHA is
+divergence — a HARD STOP with a documented remediation path, NEVER a
+force-push. Record a critical error naming both SHAs and the fork point
+(`git merge-base github/main <merge-sha>`), `work commit`, end the session.
+The remediation path is a human one: inspect what landed on the mirror
+out-of-band, remove or merge it deliberately on the canonical GitLab side,
+and relaunch the release — leg 2 re-derives from run state and re-checks.
+
+### Step 3 — `leg2-create-tag` — the SSH-signed tag, at exactly the merge SHA
+
+The tag name is `release.tag_prefix` + the version re-read in step 1 at the
+merge SHA — and Phase 0.5 pins `tag_prefix` to exactly `"v"`, so the name is
+always `v<version>` (the kernel's `work release record tag` accepts nothing
+else) — never a name remembered from leg 1.
+
+- [ ] Idempotency check FIRST — does the tag already exist? Check locally
+      and on both remotes (`git ls-remote origin refs/tags/<tag>`,
+      `git ls-remote github refs/tags/<tag>`). If it exists:
+      - pointing at exactly the recorded merge SHA AND carrying a valid
+        signature (verification below) → creation is DONE; record
+        `work release record tag <tag> --sha <merge-sha>` if not yet
+        recorded and continue to step 4.
+      - pointing ANYWHERE else, or unsigned, or the signature does not
+        verify → HARD ERROR. Never re-point, never re-sign, never delete.
+        Record a critical error naming the tag, the SHA it points at, and
+        the recorded merge SHA; `work commit`; end the session. (The burned
+        version runbook in the resume section is the human's repair path.)
+- [ ] Create the tag, signed with the provisioned key:
+
+      ```
+      git -c gpg.format=ssh -c user.signingkey=/release-signing-key \
+          tag -s <tag> <merge-sha> -m "Release <version>"
+      ```
+- [ ] Verify before recording — the signature against the provisioned key's
+      public half, and the target commit against the recorded merge SHA:
+      `echo "* $(ssh-keygen -y -f /release-signing-key)" > /tmp/allowed-signers`
+      then
+      `git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=/tmp/allowed-signers tag -v <tag>`
+      and `git rev-parse <tag>^{commit}` must print the merge SHA.
+- [ ] Record it: `work release record tag <tag> --sha <merge-sha>`. The
+      recorder itself hard-stops unless the SHA equals the recorded merge
+      SHA and the name is exactly `v<version>` — a refusal here means the
+      tag is wrong: treat it as the hard error above, do not argue with it.
+
+### Step 4 — `leg2-push-github-main` / `leg2-push-github-tag` — GitHub: `main` first, THEN the tag
+
+The ordering is load-bearing: the tag push triggers `release.yml`, and its
+verify job asserts the tag equals GitHub `main` HEAD — `main` must land
+before the trigger fires. Every push goes through `bin/gate-push`; the
+session's push allow list already grants the mirror's branch push and its
+tags (the `repo|refs/tags/*` grammar). A gate refusal is a provisioning gap
+to report, never something to route around.
+
+- [ ] `main` first — skip when current: `git rev-parse github/main` already
+      equal to the merge SHA → record the receipt (if absent) and move on.
+      Otherwise, with local `main` checked out at the merge SHA:
+      `bin/gate-push --remote github`
+      A non-fast-forward rejection here is the divergence hard stop from
+      step 2 (the mirror moved between check and push) — same contract, no
+      retry, no force.
+- [ ] Record: `work release record receipt github-main-push`
+- [ ] Then the tag — skip when current:
+      `git ls-remote github refs/tags/<tag>` already showing the recorded
+      merge SHA → record the receipt (if absent) and move on. Otherwise:
+      `bin/gate-push --tag <tag> --remote github`
+- [ ] Record: `work release record receipt github-tag-push`
+
+A rejected push (a 403 from a read-only credential, a protection rule) is a
+hard error naming the credential requirement — never an alternative push
+path, per HARD RULES.
+
+### Step 5 — `leg2-poll-actions` — the GitHub Actions release run
+
+Find the `release.yml` run for the recorded merge SHA on the mirror
+(`gh run list` filtered by workflow and head SHA — the recorded SHA, never
+"the latest run").
+
+- [ ] Already green for that SHA → skip the poll; make sure the receipts
+      below exist (their URLs must name the run that actually uploaded) and
+      move on.
+- [ ] Otherwise poll the run to completion (`gh run watch <run-id>`, or a
+      loop on `gh run view <run-id>`).
+- [ ] Green → PyPI has the version (with attestations) and the GitHub
+      Release exists. Record which run actually published:
+      `work release record receipt actions-run --url <Actions run URL>`
+      `work release record receipt pypi --url <PyPI release URL>`
+      `--url` is required on both. On a re-run, record the run that
+      UPLOADED, not merely the last green one — `release.yml` publishes
+      with `skip-existing`, so a later green run may have uploaded nothing.
+- [ ] Red, with refs current → re-dispatch the workflow via the API, keyed
+      on the recorded SHA: `gh run rerun <run-id>`. NEVER re-tag to
+      retrigger — the tag is immutable: never deleted, never re-pointed,
+      never re-signed. Then poll again. A run that cannot be re-run is the
+      fail-loudly path below.
+- [ ] Red at the **Gate version reuse** step (the version is already on the
+      index) → this is NOT an agent decision. Re-running cannot clear it:
+      the gate fails closed because a resumed publish and a republish of
+      different code are indistinguishable to the pipeline. Report it to
+      the human with the Actions run URL via the fail-loudly path below;
+      authorizing the resume means an admin setting the
+      `RELEASE_RESUME_VERSION` Actions variable to that exact version and
+      clearing it afterwards. Never set or ask for a blanket value.
+- [ ] Still red → FAIL LOUDLY with the Actions run URL:
+      `work state set --stop-reason=critical_error --critical-error
+      '{"summary": "GitHub release run red", "detail": "<Actions run URL>"}'`
+      then `work commit` and end the session. What to do about the red run
+      is the human's call — the single API re-dispatch above is the only
+      automatic remediation this leg attempts. Nothing has been published
+      internally yet — that is the point of the ordering.
+
+### Step 6 — `leg2-push-gitlab-tag` — the GitLab tag, LAST
+
+Only after the GitHub run is green. Public-before-internal is deliberate: a
+GitHub failure leaves no half-released internal state.
+
+- [ ] Skip when current: `git ls-remote origin refs/tags/<tag>` already
+      showing the recorded merge SHA → record the receipt (if absent) and
+      move on. A GitLab tag at any OTHER SHA is the tag hard error from
+      step 3 — never re-point it.
+- [ ] Push: `bin/gate-push --tag <tag> --remote origin`
+      GitLab's existing tag pipeline publishes the internal package
+      registry and container image from there.
+- [ ] Record: `work release record receipt gitlab-tag-push`
+
+### Step 7 — receipts complete, run complete
+
+- [ ] `work release status` must show every field recorded and nothing left
+      to advance. Fill any receipt gap NOW (`--note` that it was recorded
+      after the fact) — an unreceipted push is invisible to the resume
+      derivation.
+- [ ] Proceed to "Closing out the run" (retro, goal assessment, completion
+      state, `work commit`).
+
+### The idempotency ladder (re-entry map)
+
+Leg 2 may be entered any number of times — watch death, container reap,
+scheduled relaunch. Every re-entry converges because every step compares its
+target to the recorded merge SHA before acting:
+
+| Observed state | Action |
+| --- | --- |
+| Merge SHA already recorded | Re-record with the freshly re-read version — the mismatch check runs every time |
+| Tag exists at the recorded merge SHA, signature valid | Skip creation; ensure the tag record exists |
+| Tag exists anywhere else, or unsigned/invalid | HARD ERROR — never re-point, never re-sign, never delete |
+| GitHub `main` already at the merge SHA | Skip the push; ensure the receipt exists |
+| GitHub tag ref already at the merge SHA | Skip the push; ensure the receipt exists |
+| Actions run green for the recorded SHA | Skip the poll; receipts must name the run that uploaded |
+| Actions run red, refs current | Re-dispatch via the API, keyed on the recorded SHA — never re-tag |
+| GitLab tag already at the merge SHA | Skip the push; ensure the receipt exists |
+| Every receipt recorded | Nothing to advance — close out the run |

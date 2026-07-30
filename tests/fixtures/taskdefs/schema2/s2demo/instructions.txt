@@ -6,4 +6,5 @@ makes it this task. Used by the render-matrix tests.{% endblock %}
 {% block task_phases %}## Phase 1: Matrix demo work
 
 Target: {{ LMER_TASK_TARGET }}{% endblock %}
+{% block do_not_branch_rule %}- HARD RULE: DO NOT create a new branch — the matrix continues on an existing one{% endblock %}
 {% block do_not_extra %}- HARD RULE: DO NOT leave the render matrix{% endblock %}

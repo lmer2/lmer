@@ -20,9 +20,11 @@ from lmer_cli.mounts import (
     build_user_mounts,
     build_checkout_mount,
     build_file_mounts,
+    build_release_signing_key_mount,
     build_service_mode_mounts,
     resolve_host_uv_cache_dir,
     CONTAINER_UV_CACHE_DIR,
+    CONTAINER_RELEASE_SIGNING_KEY_PATH,
 )
 
 
@@ -487,6 +489,75 @@ class TestBuildFileMounts:
 
     def test_empty_specs_no_args(self):
         assert build_file_mounts("docker", []) == []
+
+
+class TestBuildReleaseSigningKeyMount:
+    """Mount-arg construction for the release SSH signing key."""
+
+    @pytest.fixture()
+    def fake_home(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        return home
+
+    def test_happy_path_single_ro_bind(self, fake_home):
+        key = fake_home / ".ssh" / "lmer_release_key"
+        key.parent.mkdir()
+        key.write_text("PRIVATE KEY")
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+                _is_selinux_enforcing.cache_clear()
+                args, reason = build_release_signing_key_mount("docker", key)
+        assert reason is None
+        assert args == ["-v", f"{key}:{CONTAINER_RELEASE_SIGNING_KEY_PATH}:ro"]
+
+    def test_selinux_label_on_podman(self, fake_home):
+        key = fake_home / "release_key"
+        key.write_text("PRIVATE KEY")
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=True):
+                _is_selinux_enforcing.cache_clear()
+                args, reason = build_release_signing_key_mount("podman", key)
+        assert reason is None
+        assert args == ["-v", f"{key}:{CONTAINER_RELEASE_SIGNING_KEY_PATH}:ro,z"]
+
+    def test_missing_file_refused(self, fake_home):
+        with patch("pathlib.Path.home", return_value=fake_home):
+            args, reason = build_release_signing_key_mount(
+                "docker", fake_home / "nope"
+            )
+        assert args == []
+        assert "does not exist" in reason
+
+    def test_directory_refused(self, fake_home):
+        key_dir = fake_home / ".ssh"
+        key_dir.mkdir()
+        with patch("pathlib.Path.home", return_value=fake_home):
+            args, reason = build_release_signing_key_mount("docker", key_dir)
+        assert args == []
+        assert "not a regular file" in reason
+
+    def test_out_of_home_symlink_refused(self, fake_home, tmp_path):
+        outside = tmp_path / "outside-key"
+        outside.write_text("PRIVATE KEY")
+        link = fake_home / "release_key"
+        link.symlink_to(outside)
+        with patch("pathlib.Path.home", return_value=fake_home):
+            args, reason = build_release_signing_key_mount("docker", link)
+        assert args == []
+        assert "outside the host home" in reason
+
+    def test_in_home_symlink_allowed(self, fake_home):
+        real = fake_home / "real_key"
+        real.write_text("PRIVATE KEY")
+        link = fake_home / "release_key"
+        link.symlink_to(real)
+        with patch("pathlib.Path.home", return_value=fake_home):
+            with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+                _is_selinux_enforcing.cache_clear()
+                args, reason = build_release_signing_key_mount("docker", link)
+        assert reason is None
+        assert args == ["-v", f"{link}:{CONTAINER_RELEASE_SIGNING_KEY_PATH}:ro"]
 
 
 class TestParseFileMountSpecs:

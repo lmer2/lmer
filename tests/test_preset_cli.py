@@ -29,6 +29,7 @@ from unittest.mock import patch
 
 import pytest
 
+from lmer_cli.presets import select_preset_name, task_preset_env_name
 from tests.test_lmer_cli_slack_target import (
     _BASE_ENV,
     _make_main_mocks,
@@ -514,8 +515,477 @@ class TestContainerUserFromDotenv:
         )
 
 
+class TestTaskPresetEnvName:
+    """Taskdef id → env var name derivation (issue #140)."""
+
+    @pytest.mark.parametrize(
+        "task_id,expected",
+        [
+            ("review", "LMER_REVIEW_PRESET"),
+            ("develop", "LMER_DEVELOP_PRESET"),
+            # Taskdef ids are directory names, so separators must normalize
+            # rather than produce an unsettable variable name.
+            ("code-review", "LMER_CODE_REVIEW_PRESET"),
+            ("my.task", "LMER_MY_TASK_PRESET"),
+            ("REVIEW", "LMER_REVIEW_PRESET"),
+            (" review ", "LMER_REVIEW_PRESET"),
+            # A digit may lead the suffix: the LMER_ prefix keeps the full
+            # name a legal identifier.
+            ("2fa", "LMER_2FA_PRESET"),
+        ],
+    )
+    def test_derives_env_var_name(self, task_id, expected):
+        assert task_preset_env_name(task_id) == expected, (
+            f"task_preset_env_name({task_id!r}) must be {expected!r}; "
+            f"got {task_preset_env_name(task_id)!r}"
+        )
+
+    @pytest.mark.parametrize(
+        "task_id",
+        [
+            None,
+            "",
+            "   ",
+            "-",
+            "--",
+            "...",
+            # No ASCII alphanumerics at all: also has no scoped selector.
+            "レビュー",
+        ],
+    )
+    def test_no_name_for_unusable_ids(self, task_id):
+        """An id that cannot produce a suffix has no taskdef-scoped selector
+        (LMER_PRESET still applies to it) rather than yielding LMER__PRESET."""
+        assert task_preset_env_name(task_id) is None, (
+            f"task_preset_env_name({task_id!r}) must be None; "
+            f"got {task_preset_env_name(task_id)!r}"
+        )
+
+    def test_derivation_is_many_to_one(self):
+        """Separator variants collapse to one variable name — a documented
+        limitation (two such taskdefs coexisting would share a selector), so
+        pin it rather than leave it to be discovered."""
+        names = {
+            task_preset_env_name(t)
+            for t in ("code-review", "code_review", "code.review", "code review")
+        }
+        assert names == {"LMER_CODE_REVIEW_PRESET"}, (
+            f"Separator variants must all derive one name; got {names!r}"
+        )
+
+
+class TestSelectPresetName:
+    """Selection precedence: --preset > LMER_<TASK>_PRESET > LMER_PRESET."""
+
+    def _select(self, flag, task_id, env):
+        return select_preset_name(flag, task_id, env)
+
+    def test_flag_wins_over_both_env_vars(self):
+        name, source = self._select(
+            "from-flag",
+            "review",
+            {"LMER_REVIEW_PRESET": "from-task", "LMER_PRESET": "from-generic"},
+        )
+        assert (name, source) == ("from-flag", "--preset")
+
+    def test_task_scoped_beats_generic(self):
+        name, source = self._select(
+            None,
+            "review",
+            {"LMER_REVIEW_PRESET": "from-task", "LMER_PRESET": "from-generic"},
+        )
+        assert (name, source) == ("from-task", "LMER_REVIEW_PRESET"), (
+            "The more specific selector must win; got "
+            f"({name!r}, {source!r})"
+        )
+
+    def test_generic_used_for_other_tasks(self):
+        name, source = self._select(
+            None,
+            "develop",
+            {"LMER_REVIEW_PRESET": "from-task", "LMER_PRESET": "from-generic"},
+        )
+        assert (name, source) == ("from-generic", "LMER_PRESET"), (
+            "A review-scoped var must not select for the develop task"
+        )
+
+    def test_task_scoped_alone_selects(self):
+        assert self._select(None, "review", {"LMER_REVIEW_PRESET": "x"}) == (
+            "x",
+            "LMER_REVIEW_PRESET",
+        )
+
+    def test_no_task_ignores_task_scoped_vars(self):
+        """Without a taskdef id (--no-task) only the generic var can select."""
+        assert self._select(None, None, {"LMER_REVIEW_PRESET": "from-task"}) == (
+            None,
+            None,
+        )
+        assert self._select(None, None, {"LMER_PRESET": "g"}) == ("g", "LMER_PRESET")
+
+    def test_blank_task_scoped_var_falls_through(self):
+        """LMER_REVIEW_PRESET= (empty/whitespace) disables the taskdef-scoped
+        selection instead of selecting a preset named ''."""
+        assert self._select(
+            None, "review", {"LMER_REVIEW_PRESET": "  ", "LMER_PRESET": "g"}
+        ) == ("g", "LMER_PRESET")
+
+    def test_nothing_selected(self):
+        assert self._select(None, "review", {}) == (None, None)
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\t"])
+    def test_blank_generic_var_is_unset(self, blank):
+        """A blank LMER_PRESET counts as unset for every task, matching the
+        scoped var. Pre-#140 an EMPTY value already meant "no preset" (the old
+        `or` chain treated it as falsy) while a WHITESPACE-ONLY one reached the
+        fail-fast path; the two now agree."""
+        assert self._select(None, "develop", {"LMER_PRESET": blank}) == (None, None)
+
+    def test_blank_generic_var_does_not_mask_scoped_var(self):
+        assert self._select(
+            None, "review", {"LMER_PRESET": "  ", "LMER_REVIEW_PRESET": "x"}
+        ) == ("x", "LMER_REVIEW_PRESET")
+
+    @pytest.mark.parametrize(
+        "flag,env,expected",
+        [
+            # The flag is stripped like env values are, so the two agree.
+            (" demo ", {}, ("demo", "--preset")),
+            ("\tdemo\n", {}, ("demo", "--preset")),
+            # A blank flag counts as unset and falls through (as it did before
+            # #140, when the `or` chain treated "" as falsy).
+            ("", {"LMER_REVIEW_PRESET": "x"}, ("x", "LMER_REVIEW_PRESET")),
+            ("   ", {"LMER_PRESET": "g"}, ("g", "LMER_PRESET")),
+            ("   ", {}, (None, None)),
+        ],
+    )
+    def test_flag_is_stripped_like_env_values(self, flag, env, expected):
+        assert self._select(flag, "review", env) == expected, (
+            f"select_preset_name({flag!r}, 'review', {env!r}) must be "
+            f"{expected!r}; got {self._select(flag, 'review', env)!r}"
+        )
+
+
+class TestTaskScopedPresetCli:
+    """End-to-end: LMER_<TASK>_PRESET drives a real main() invocation."""
+
+    def _run_task(self, argv, env_in, tmp_path, captured_env=None):
+        """Run main() for a real (non---no-task) invocation.
+
+        The host has no `review`/`develop` taskdef directory in tests, which
+        only warns (the container's taskdef set is authoritative), so this is
+        enough to exercise task-scoped selection.
+        """
+        return _run_main(argv, env_in=env_in, captured_env=captured_env, home=tmp_path)
+
+    def test_task_scoped_var_applies_to_matching_task(self, presets_file, tmp_path):
+        captured: dict = {}
+        rc = self._run_task(
+            ["review", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_REVIEW_PRESET": "demo",
+            },
+            tmp_path,
+            captured_env=captured,
+        )
+        assert rc == 0, f"main() must succeed; rc={rc}"
+        assert captured.get("LMER_CHECKOUT_BRANCH") == "preset-branch", (
+            "LMER_REVIEW_PRESET must apply the preset for `lmer review`; got "
+            f"{captured.get('LMER_CHECKOUT_BRANCH')!r}"
+        )
+        assert captured.get("LMER_LLM_NAME") == "opus", (
+            "The preset's env must reach the container as usual"
+        )
+
+    def test_task_scoped_var_ignored_for_other_task(self, presets_file, tmp_path):
+        """LMER_REVIEW_PRESET must not leak into a develop invocation — the
+        whole point of the taskdef scoping (issue #140)."""
+        captured: dict = {}
+        rc = self._run_task(
+            ["develop", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_REVIEW_PRESET": "demo",
+            },
+            tmp_path,
+            captured_env=captured,
+        )
+        assert rc == 0
+        assert captured.get("LMER_CHECKOUT_BRANCH") is None, (
+            "A review-scoped preset must not apply to `lmer develop`; got "
+            f"{captured.get('LMER_CHECKOUT_BRANCH')!r}"
+        )
+
+    def test_task_scoped_var_beats_generic(self, presets_file, tmp_path):
+        captured: dict = {}
+        rc = self._run_task(
+            ["review", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_REVIEW_PRESET": "other",
+                "LMER_PRESET": "demo",
+            },
+            tmp_path,
+            captured_env=captured,
+        )
+        assert rc == 0
+        assert captured.get("LMER_CHECKOUT_BRANCH") == "other-branch", (
+            "LMER_REVIEW_PRESET must beat LMER_PRESET for the review task; got "
+            f"{captured.get('LMER_CHECKOUT_BRANCH')!r}"
+        )
+
+    def test_generic_still_applies_to_unscoped_task(self, presets_file, tmp_path):
+        captured: dict = {}
+        rc = self._run_task(
+            ["develop", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_REVIEW_PRESET": "other",
+                "LMER_PRESET": "demo",
+            },
+            tmp_path,
+            captured_env=captured,
+        )
+        assert rc == 0
+        assert captured.get("LMER_CHECKOUT_BRANCH") == "preset-branch", (
+            "LMER_PRESET must still cover tasks with no scoped var; got "
+            f"{captured.get('LMER_CHECKOUT_BRANCH')!r}"
+        )
+
+    def test_flag_beats_task_scoped_var(self, presets_file, tmp_path):
+        captured: dict = {}
+        rc = self._run_task(
+            ["--preset", "other", "review", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_REVIEW_PRESET": "demo",
+            },
+            tmp_path,
+            captured_env=captured,
+        )
+        assert rc == 0
+        assert captured.get("LMER_CHECKOUT_BRANCH") == "other-branch", (
+            "--preset must override LMER_REVIEW_PRESET (issue #140 requires "
+            f"the flag to keep winning); got {captured.get('LMER_CHECKOUT_BRANCH')!r}"
+        )
+        assert captured.get("LMER_LLM_NAME") is None, (
+            "The demo preset (task-scoped only) must not apply when --preset "
+            "names another preset"
+        )
+
+    def test_dashed_task_id_uses_normalized_var(self, presets_file, tmp_path):
+        """A hyphenated taskdef id is selected by its underscored var name."""
+        captured: dict = {}
+        rc = self._run_task(
+            ["code-review", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_CODE_REVIEW_PRESET": "demo",
+            },
+            tmp_path,
+            captured_env=captured,
+        )
+        assert rc == 0
+        assert captured.get("LMER_CHECKOUT_BRANCH") == "preset-branch", (
+            "LMER_CODE_REVIEW_PRESET must select for the `code-review` task; "
+            f"got {captured.get('LMER_CHECKOUT_BRANCH')!r}"
+        )
+
+    def test_task_scoped_var_honored_from_dotenv(
+        self, presets_file, tmp_path, monkeypatch
+    ):
+        """The scoped var works from a .env file, which is the whole point of
+        pinning a per-task default in ~/.lmer/.env."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            f"LMER_REVIEW_PRESET=demo\nLMER_PRESETS_FILE={presets_file}\n"
+        )
+        captured: dict = {}
+        rc = self._run_task(["review", REPO_URL], {}, tmp_path, captured_env=captured)
+        assert rc == 0
+        assert captured.get("LMER_CHECKOUT_BRANCH") == "preset-branch", (
+            "A .env-sourced LMER_REVIEW_PRESET must be honored"
+        )
+
+    def test_no_task_ignores_task_scoped_var(self, presets_file, tmp_path):
+        """--no-task has no taskdef id, so a scoped var cannot select.
+
+        argv and the env var are deliberately made to AGREE: under --no-task
+        argparse still binds a positional to ns.task (with `--exec true` it is
+        literally "true", deriving LMER_TRUE_PRESET), so a test using
+        `_EXEC_ARGS` + LMER_REVIEW_PRESET would pass even with the no_task
+        guard removed. Here `--exec review` makes ns.task == "review", so
+        dropping the guard in _selected_task_id fails this test.
+        """
+        captured: dict = {}
+        rc = _run_main(
+            ["--no-task", "--exec", "review", REPO_URL],
+            env_in={
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_REVIEW_PRESET": "demo",
+            },
+            captured_env=captured,
+            home=tmp_path,
+        )
+        assert rc == 0
+        assert captured.get("LMER_CHECKOUT_BRANCH") is None, (
+            "A task-scoped preset must not apply to a --no-task run; got "
+            f"{captured.get('LMER_CHECKOUT_BRANCH')!r}"
+        )
+
+    def test_scoped_var_from_dotenv_still_beats_exported_generic(
+        self, presets_file, tmp_path, monkeypatch
+    ):
+        """Selection is by specificity, NOT by source tier: a .env-sourced
+        scoped var outranks an exported LMER_PRESET. Pinning the documented
+        contract — the surprising half of it is the warning below."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("LMER_REVIEW_PRESET=other\n")
+        captured: dict = {}
+        rc = self._run_task(
+            ["review", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_PRESET": "demo",  # exported
+            },
+            tmp_path,
+            captured_env=captured,
+        )
+        assert rc == 0
+        assert captured.get("LMER_CHECKOUT_BRANCH") == "other-branch", (
+            "The .env-sourced scoped var must still win over an exported "
+            f"LMER_PRESET; got {captured.get('LMER_CHECKOUT_BRANCH')!r}"
+        )
+
+    def test_file_sourced_scoped_var_overriding_export_warns(
+        self, presets_file, tmp_path, monkeypatch, capsys
+    ):
+        """The one case where file-beats-export contradicts the rest of the
+        CLI is announced at default verbosity (not info-level), naming both
+        sides and the --preset escape hatch."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("LMER_REVIEW_PRESET=other\n")
+        rc = self._run_task(
+            ["review", REPO_URL],
+            {"LMER_PRESETS_FILE": str(presets_file), "LMER_PRESET": "demo"},
+            tmp_path,
+        )
+        assert rc == 0
+        text = "".join(capsys.readouterr())
+        assert "LMER_REVIEW_PRESET" in text and "LMER_PRESET=demo" in text, (
+            f"The warning must name both selectors; got: {text!r}"
+        )
+        assert "--preset" in text, "The warning must point at the escape hatch"
+
+    def test_same_tier_selection_does_not_warn(
+        self, presets_file, tmp_path, monkeypatch, capsys
+    ):
+        """The documented setup — a global default plus a per-task override in
+        ONE .env — must stay quiet, or the warning would fire on every run."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            "LMER_PRESET=demo\nLMER_REVIEW_PRESET=other\n"
+        )
+        rc = self._run_task(
+            ["--verbose", "review", REPO_URL],
+            {"LMER_PRESETS_FILE": str(presets_file)},
+            tmp_path,
+        )
+        assert rc == 0
+        text = "".join(capsys.readouterr())
+        assert "overrides the exported" not in text, (
+            f"A single-.env global+override setup must not warn; got: {text!r}"
+        )
+        assert "LMER_REVIEW_PRESET" in text, (
+            "sanity: the scoped var must still be the selector here"
+        )
+
+    def test_blank_exported_generic_does_not_warn(
+        self, presets_file, tmp_path, monkeypatch, capsys
+    ):
+        """A whitespace-only exported LMER_PRESET is unset as far as the
+        selector is concerned, so nothing is being "overridden" and the tier
+        warning must stay quiet. Pins both call sites to the one blank-is-unset
+        rule in preset_env_value."""
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("LMER_REVIEW_PRESET=other\n")
+        rc = self._run_task(
+            ["review", REPO_URL],
+            {"LMER_PRESETS_FILE": str(presets_file), "LMER_PRESET": "   "},
+            tmp_path,
+        )
+        assert rc == 0
+        text = "".join(capsys.readouterr())
+        assert "overrides the exported" not in text, (
+            f"A blank generic var must not trigger the warning; got: {text!r}"
+        )
+
+    def test_exported_scoped_var_over_exported_generic_does_not_warn(
+        self, presets_file, tmp_path, capsys
+    ):
+        """An export outranking an export is unsurprising — no warning."""
+        rc = self._run_task(
+            ["review", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_PRESET": "demo",
+                "LMER_REVIEW_PRESET": "other",
+            },
+            tmp_path,
+        )
+        assert rc == 0
+        text = "".join(capsys.readouterr())
+        assert "overrides the exported" not in text, (
+            f"Export-over-export must not warn; got: {text!r}"
+        )
+
+    def test_announce_names_the_selecting_var(self, presets_file, tmp_path, capsys):
+        """The announce line attributes the selection, so a preset applied by
+        an invisible (.env-sourced) var is traceable.
+
+        The line is ``info()``-level (verbose-only), as it was before the
+        taskdef-scoped selector existed.
+        """
+        rc = self._run_task(
+            ["--verbose", "review", REPO_URL],
+            {
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_REVIEW_PRESET": "demo",
+            },
+            tmp_path,
+        )
+        assert rc == 0
+        text = "".join(capsys.readouterr())
+        assert "LMER_REVIEW_PRESET" in text, (
+            f"The announce line must name the selecting var; got: {text!r}"
+        )
+
+
 class TestPresetErrors:
     """Unknown / unconfigured preset names fail fast."""
+
+    def test_unknown_task_scoped_preset_exits_2(
+        self, presets_file, tmp_path, capsys
+    ):
+        """A typo'd LMER_<TASK>_PRESET fails fast rather than silently falling
+        back to LMER_PRESET (issue #140 decision), and the error names the var
+        that made the selection."""
+        rc = _run_main(
+            ["review", REPO_URL],
+            env_in={
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_REVIEW_PRESET": "nope",
+                "LMER_PRESET": "demo",
+            },
+            home=tmp_path,
+        )
+        assert rc == 2, f"Unknown task-scoped preset must exit 2; rc={rc}"
+        text = "".join(capsys.readouterr())
+        assert "nope" in text
+        assert "LMER_REVIEW_PRESET" in text, (
+            f"The error must name the selecting env var; got: {text!r}"
+        )
 
     def test_unknown_preset_lists_available(self, presets_file, tmp_path, capsys):
         rc = _run_main(

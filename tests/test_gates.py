@@ -579,24 +579,311 @@ class TestGateSystem:
         assert "All critical checks passed" in captured.out
         assert "1 warning(s) found" in captured.out
 
+    def _mock_git(self, remotes=None, branch="feature-x", pushurls=None):
+        """side_effect for subprocess.run covering run_push_gate's git calls.
+
+        `remotes` maps remote name -> fetch URL; `pushurls` maps remote name
+        -> `remote.<name>.pushurl`, which is what `get-url --push` reports
+        and what `git push` actually dials (falling back to the fetch URL
+        when unset). Unknown remotes fail like `git remote get-url` does.
+        """
+        remotes = remotes if remotes is not None else {"origin": "git@github.com:user/other-repo.git"}
+        pushurls = pushurls or {}
+
+        def fake_run(command, **kwargs):
+            if command[:3] == ["git", "remote", "get-url"]:
+                remote = command[-1]
+                url = remotes.get(remote)
+                if url is None:
+                    return MagicMock(returncode=2, stdout="", stderr=f"error: No such remote '{remote}'")
+                if "--push" in command:
+                    url = pushurls.get(remote, url)
+                return MagicMock(returncode=0, stdout=url + "\n", stderr="")
+            if command[:3] == ["git", "branch", "--show-current"]:
+                return MagicMock(returncode=0, stdout=branch + "\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        return fake_run
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": ""})
     @patch('subprocess.run')
     def test_run_push_gate_not_allowed(self, mock_run):
         """Test push gate with repository not in allow list"""
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="origin  git@github.com:user/other-repo.git (fetch)",
-            stderr=""
-        )
+        mock_run.side_effect = self._mock_git()
 
         success = self.gate.run_push_gate()
         assert success == False
 
-    @pytest.mark.skip(reason="Mock object issue with __name__ attribute")
+    # NB: SSH remote URLs spell the repo `github.com:user/other-repo` — the
+    # repo half is a plain substring, so entries name the path (`user/repo`).
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "user/other-repo"})
     @patch('subprocess.run')
     def test_run_push_gate_allowed(self, mock_run):
-        """Test push gate with repository in allow list"""
-        # This test has issues with mocking - skipping for now
-        pass
+        """Bare allow-list entry authorizes a branch push (default ref)."""
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        success = self.gate.run_push_gate()
+        assert success == True
+        self.gate.run_commit_gate.assert_called_once()
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "user/other-repo"})
+    @patch('subprocess.run')
+    def test_run_push_gate_bare_entry_refuses_tag(self, mock_run, capsys):
+        """Bare entries are branch-only: no allow list silently gains tag rights."""
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        success = self.gate.run_push_gate(ref="refs/tags/v0.2.0")
+        assert success == False
+        self.gate.run_commit_gate.assert_not_called()
+        out = capsys.readouterr().out
+        assert "Push not allowed" in out
+        assert "refs/tags/v0.2.0" in out
+        assert "Get explicit permission before pushing." in out
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "user/other-repo|refs/tags/*"})
+    @patch('subprocess.run')
+    def test_run_push_gate_explicit_tag_entry_allows_tag(self, mock_run):
+        """`repo|refs/tags/*` grants tag pushes to that repo."""
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        success = self.gate.run_push_gate(ref="refs/tags/v0.2.0")
+        assert success == True
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "github.com/group/project|refs/heads/main"})
+    @patch('subprocess.run')
+    def test_run_push_gate_mirror_entry_scoped_to_remote(self, mock_run):
+        """A mirror-repo entry authorizes only the remote it names."""
+        remotes = {
+            "origin": "git@gitlab.example.com:group/project.git",
+            "mirror": "https://github.com/group/project.git",
+        }
+        mock_run.side_effect = self._mock_git(remotes=remotes)
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(ref="refs/heads/main", remote="mirror") == True
+        assert self.gate.run_push_gate(ref="refs/heads/main", remote="origin") == False
+
+    @patch.dict(os.environ, {
+        "LMER_PUSH_ALLOW_LIST": "|refs/tags/*, user/other-repo|, a|b|c",
+    })
+    @patch('subprocess.run')
+    def test_run_push_gate_malformed_entries_ignored(self, mock_run):
+        """Malformed entries (empty half, extra delimiter) never fail open."""
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(ref="refs/tags/v0.2.0") == False
+        assert self.gate.run_push_gate(ref="refs/heads/main") == False
+        self.gate.run_commit_gate.assert_not_called()
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "user/other-repo"})
+    @patch('subprocess.run')
+    def test_run_push_gate_unresolvable_remote_fails_closed(self, mock_run, capsys):
+        """A named remote git cannot resolve refuses — the allow list must
+        never be skipped just because the remote lookup failed."""
+        mock_run.side_effect = self._mock_git(remotes={})
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(remote="nosuch") == False
+        self.gate.run_commit_gate.assert_not_called()
+        assert "fail closed" in capsys.readouterr().out
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "github.com/group/project|refs/heads/main"})
+    @patch('subprocess.run')
+    def test_run_push_gate_push_by_url_gated_on_the_url(self, mock_run):
+        """`--remote <raw URL>` is gated against the URL itself: a matching
+        grant authorizes it, anything else refuses — never a skip."""
+        mock_run.side_effect = self._mock_git(remotes={})
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(
+            ref="refs/heads/main",
+            remote="https://github.com/group/project.git") == True
+        assert self.gate.run_push_gate(
+            ref="refs/heads/main",
+            remote="https://github.com/attacker/repo.git") == False
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "user/other-repo"})
+    @patch('subprocess.run')
+    def test_run_push_gate_refspec_authorizes_the_dst_side(self, mock_run, capsys):
+        """`<src>:<dst>` authorization keys on dst: a branch-only grant must
+        not authorize a refspec that lands on a remote TAG (fnmatch's `*`
+        crosses `:`, so matching the whole refspec fails open here)."""
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(
+            ref="refs/heads/main:refs/tags/v9.9") == False
+        self.gate.run_commit_gate.assert_not_called()
+        # A branch-to-branch refspec inside the grant still works.
+        assert self.gate.run_push_gate(
+            ref="refs/heads/main:refs/heads/main") == True
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "user/other-repo|refs/tags/*"})
+    @patch('subprocess.run')
+    def test_run_push_gate_refspec_dst_matches_tag_grant(self, mock_run):
+        """The dst side is what a tag grant authorizes."""
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(
+            ref="refs/heads/main:refs/tags/v0.2.0") == True
+
+    @patch.dict(os.environ, {
+        "LMER_PUSH_ALLOW_LIST": "user/other-repo, user/other-repo|refs/tags/*",
+    })
+    @patch('subprocess.run')
+    def test_run_push_gate_rejects_delete_refspecs(self, mock_run, capsys):
+        """An empty `<src>` is a DELETION refspec (`git push origin
+        :refs/tags/v0.5.0`). It is never authorized — deletion is at least
+        as destructive as the force push already refused, and the release
+        flow declares published tags immutable."""
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(ref=":refs/heads/main") == False
+        assert self.gate.run_push_gate(ref=":refs/tags/v0.5.0") == False
+        assert self.gate.run_push_gate(ref=" :refs/tags/v0.5.0") == False
+        self.gate.run_commit_gate.assert_not_called()
+        assert "deletion" in capsys.readouterr().out
+
+    @patch.dict(os.environ,
+                {"LMER_PUSH_ALLOW_LIST": "forge.example.com/agents/global"})
+    @patch('subprocess.run')
+    def test_run_push_gate_push_by_url_match_is_anchored(self, mock_run):
+        """The push-by-URL branch matches the allow-list entry against the
+        URL's parsed identity, not as a substring: `--remote` is
+        agent-supplied, so an unanchored rule would let any host embedding
+        the allowed path authorize itself. The entry must pin the HOST."""
+        mock_run.side_effect = self._mock_git(remotes={})
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        def push(url):
+            return self.gate.run_push_gate(ref="refs/heads/main", remote=url)
+
+        assert push("https://forge.example.com/agents/global.git") == True
+        assert push("git@forge.example.com:agents/global.git") == True
+        # The finding: an allowed path embedded in a foreign host's path.
+        assert push("https://evil.example.com/mirror/agents/global.git") == False
+        # Userinfo may only precede the first `/`: an attacker-chosen host
+        # carrying the allowed identity in its PATH must not normalize to
+        # that identity (git dials evil.example.com / evil.invalid here).
+        assert push("https://evil.example.com/x@forge.example.com/agents/global") == False
+        assert push("git@evil.invalid:x@forge.example.com/agents/global.git") == False
+        assert push("https://evil.example.com/#@forge.example.com/agents/global") == False
+        # A partial component, and a URL naming no repository at all.
+        assert push("https://forge.example.com/agents/global-staging.git") == False
+        assert push("/srv/mirrors/agents/global") == False
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "agents/global"})
+    @patch('subprocess.run')
+    def test_run_push_gate_path_only_entry_does_not_authorize_by_url(self, mock_run):
+        """A path-only entry authorizes nothing on the push-by-URL branch.
+
+        Any forge can serve `agents/global`, so matching a bare path against
+        an agent-supplied URL is the substring hole with a different prefix.
+        Path-only grants remain valid for CONFIGURED remotes — see
+        test_run_push_gate_named_remote_keeps_substring_match."""
+        mock_run.side_effect = self._mock_git(remotes={})
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        def push(url):
+            return self.gate.run_push_gate(ref="refs/heads/main", remote=url)
+
+        assert push("https://forge.example.com/agents/global.git") == False
+        assert push("https://evil.example.com/agents/global.git") == False
+
+    @patch.dict(os.environ,
+                {"LMER_PUSH_ALLOW_LIST": "github.com/user/other-repo|refs/tags/*"})
+    @patch('subprocess.run')
+    def test_run_push_gate_authorizes_the_pushurl_not_the_fetch_url(self, mock_run):
+        """`git remote get-url` returns the FETCH url; `git push` uses
+        `remote.<name>.pushurl` when configured. Authorizing the fetch url
+        would green-light a push that lands somewhere else entirely."""
+        mock_run.side_effect = self._mock_git(
+            remotes={"origin": "https://github.com/user/other-repo.git"},
+            pushurls={"origin": "https://evil.example.invalid/x.git"})
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(
+            ref="refs/tags/v0.5.0", remote="origin") == False
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "user/other-repo"})
+    @patch('subprocess.run')
+    def test_run_push_gate_refuses_detached_head(self, mock_run, capsys):
+        """`git branch --show-current` exits 0 with EMPTY stdout on a
+        detached HEAD. "refs/heads/" would then match "refs/heads/*" under
+        fnmatch (`*` matches empty), so a bare entry would authorize a ref
+        naming no branch. Refuse, like any other unresolvable ref."""
+        mock_run.side_effect = self._mock_git(branch="")
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate() == False
+        self.gate.run_commit_gate.assert_not_called()
+        assert "detached HEAD" in capsys.readouterr().out
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "mirror/agents/global"})
+    @patch('subprocess.run')
+    def test_run_push_gate_named_remote_keeps_substring_match(self, mock_run):
+        """Anchoring is scoped to push-by-URL. A configured remote's URL is
+        operator-supplied, so the historical substring rule stays — deployed
+        allow lists naming a path fragment keep working."""
+        mock_run.side_effect = self._mock_git(
+            remotes={"origin": "https://evil.example.com/mirror/agents/global.git"})
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(ref="refs/heads/main") == True
+
+    def test_normalize_remote_url(self):
+        """host/path for every URL form git accepts; None when the string
+        names no repository (local path, bare host, path-less URL)."""
+        cases = {
+            "https://github.com/group/project.git": "github.com/group/project",
+            "https://github.com/group/project": "github.com/group/project",
+            "git@gitlab.example.com:group/project.git": "gitlab.example.com/group/project",
+            "ssh://git@gitlab.example.com:2222/group/project.git": "gitlab.example.com/group/project",
+            "https://token:x@forge.example.com/group/project.git": "forge.example.com/group/project",
+            "https://GitHub.com/Group/Project.git": "github.com/group/project",
+            "host/group/sub/project": "host/group/sub/project",
+            "/srv/mirrors/group/project": None,
+            "https://github.com/": None,
+            "github.com": None,
+            "": None,
+        }
+        for url, expected in cases.items():
+            assert self.gate._normalize_remote_url(url) == expected, url
+
+    @patch.dict(os.environ, {
+        "LMER_PUSH_ALLOW_LIST": "user/other-repo, user/other-repo|refs/tags/*",
+    })
+    @patch('subprocess.run')
+    def test_run_push_gate_rejects_force_short_and_glob_refs(self, mock_run, capsys):
+        """Force pushes (+), short (ambiguous) refs, and glob refspecs are
+        never authorized, however wide the grants: git resolves a short
+        `v1.2.3` to refs/tags/v1.2.3 when such a tag exists, so a
+        refs/heads/ normalization here would authorize the wrong ref class."""
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(ref="+refs/heads/main") == False
+        assert self.gate.run_push_gate(ref="main") == False
+        assert self.gate.run_push_gate(ref="v1.2.3") == False
+        assert self.gate.run_push_gate(ref="refs/heads/*") == False
+        assert self.gate.run_push_gate(ref="refs/heads/main:") == False
+        self.gate.run_commit_gate.assert_not_called()
+        assert "Refusing to authorize ref" in capsys.readouterr().out
+
+    def test_parse_push_allow_entry(self):
+        """Entry grammar: bare = branch-only, `|` splits repo from ref pattern."""
+        assert self.gate._parse_push_allow_entry("host/repo") == ("host/repo", "refs/heads/*")
+        assert self.gate._parse_push_allow_entry("host/repo|refs/tags/*") == ("host/repo", "refs/tags/*")
+        # Malformed entries parse to None (ignored by run_push_gate).
+        assert self.gate._parse_push_allow_entry("|refs/tags/*") is None
+        assert self.gate._parse_push_allow_entry("host/repo|") is None
+        assert self.gate._parse_push_allow_entry("a|b|c") is None
 
     def test_run_commit_gate_skip_tests_omits_check_tests(self, capsys, tmp_path, monkeypatch):
         """skip_tests=True must not invoke check_tests, but still runs other checks."""
@@ -952,6 +1239,182 @@ class TestCheckChangelog:
         result = self.gate.check_changelog()
         assert result.status == CheckStatus.WARNING
         assert "Changelog not updated" in result.message
+
+    def test_fragment_staged_with_changelog(self, tmp_path, monkeypatch):
+        """Test pass when a changelog.d fragment is staged (changelog present)"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "changelog.d" / "20260718-foo.yaml").write_text("added:\n  - foo\n")
+        subprocess.run(["git", "add", "changelog.d/20260718-foo.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.PASSED
+        assert "changelog.d/20260718-foo.yaml" in result.message
+
+    def test_fragment_staged_without_changelog_file(self, tmp_path, monkeypatch):
+        """Test pass when a fragment is staged and no changelog file exists"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "changelog.d" / "20260718-foo.yaml").write_text("added:\n  - foo\n")
+        subprocess.run(["git", "add", "changelog.d/20260718-foo.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.PASSED
+        assert "changelog.d/20260718-foo.yaml" in result.message
+
+    def test_fragment_only_repo_nothing_staged(self, tmp_path, monkeypatch):
+        """Fragment-only repo (changelog.d/, no changelog file): the
+        no-changelog warning points at the fragment convention"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "main.py").write_text("print('hello')")
+        subprocess.run(["git", "add", "main.py"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "No changelog file found" in result.message
+        assert any("changelog.d/YYYYMMDD-<topic>.yaml" in d for d in result.details)
+        assert not result.is_critical
+
+    def test_changelog_d_present_nothing_staged(self, tmp_path, monkeypatch):
+        """Test warning details point at fragment authoring when changelog.d exists"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "main.py").write_text("print('hello')")
+        subprocess.run(["git", "add", "main.py"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+        assert any("changelog.d/YYYYMMDD-<topic>.yaml" in d for d in result.details)
+        assert not result.is_critical
+
+    def test_no_changelog_d_warning_unchanged(self, tmp_path, monkeypatch):
+        """Regression: without changelog.d/, warning behavior is unchanged"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "main.py").write_text("print('hello')")
+        subprocess.run(["git", "add", "main.py"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+        assert result.details == ["Update the changelog if this commit includes user-facing changes"]
+
+    def test_non_yaml_fragment_does_not_count(self, tmp_path, monkeypatch):
+        """Test that a staged non-YAML file under changelog.d/ is not a fragment"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "changelog.d" / "README.md").write_text("# Fragments\n")
+        subprocess.run(["git", "add", "changelog.d/README.md"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+
+    def test_changelog_staged_with_changelog_d_present(self, tmp_path, monkeypatch):
+        """Test pass when CHANGELOG.yaml itself is staged and changelog.d exists"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        subprocess.run(["git", "add", "CHANGELOG.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.PASSED
+        assert "Changelog updated" in result.message
+
+    def test_staged_fragment_deletion_does_not_count(self, tmp_path, monkeypatch):
+        """A staged DELETION of a fragment is not a changelog update"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d").mkdir()
+        frag = tmp_path / "changelog.d" / "20260718-old.yaml"
+        frag.write_text("added:\n- x\n")
+        subprocess.run(["git", "add", "changelog.d/20260718-old.yaml"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "seed"], check=True, capture_output=True)
+        subprocess.run(["git", "rm", "changelog.d/20260718-old.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+
+    def test_nested_fragment_does_not_count(self, tmp_path, monkeypatch):
+        """Only files directly under changelog.d/ count as fragments"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.yaml").write_text("unreleased:\n  added: []\n")
+        (tmp_path / "changelog.d" / "sub").mkdir(parents=True)
+        (tmp_path / "changelog.d" / "sub" / "20260718-x.yaml").write_text("added:\n- x\n")
+        subprocess.run(["git", "add", "changelog.d/sub/20260718-x.yaml"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert "Changelog not updated" in result.message
+
+    def test_non_yaml_fragment_counts_in_non_ctl_repo(self, tmp_path, monkeypatch):
+        """changelog.d beside a non-YAML changelog is another tool's
+        convention — any staged fragment file counts, and the warning hint
+        does not prescribe the ctl YAML format"""
+        monkeypatch.chdir(tmp_path)
+        subprocess.run(["git", "init"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], check=True, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], check=True, capture_output=True)
+        (tmp_path / "CHANGELOG.md").write_text("# Changelog\n")
+        (tmp_path / "changelog.d").mkdir()
+        (tmp_path / "changelog.d" / "123.feature.rst").write_text("Added a thing.\n")
+        subprocess.run(["git", "add", "changelog.d/123.feature.rst"], check=True, capture_output=True)
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.PASSED
+        assert "123.feature.rst" in result.message
+
+        # And with nothing staged, the hint is convention-neutral.
+        subprocess.run(["git", "reset"], check=True, capture_output=True)
+        (tmp_path / "main.py").write_text("print('hello')")
+        subprocess.run(["git", "add", "main.py"], check=True, capture_output=True)
+        result = self.gate.check_changelog()
+        assert result.status == CheckStatus.WARNING
+        assert any("this repo's fragment convention" in d for d in result.details)
+        assert not any("YYYYMMDD-<topic>.yaml" in d for d in result.details)
 
 
 class TestCheckDeliverableFormats:

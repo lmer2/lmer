@@ -1,0 +1,48 @@
+{
+  "_fixture": "Test fixture for tests/test_rehearsal_negative_test.py \u2014 invented data shaped like GitHub's /actions/runs/{id}/jobs response, NOT recorded rehearsal evidence. The bad case: the run failed, but in the build job, not in verify-tag-signature \u2014 the failing job is wrong.",
+  "total_count": 6,
+  "jobs": [
+    {
+      "id": 3001,
+      "name": "Verify tag signature and main head",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/bot/lmer-rehearsal/actions/runs/103/job/3001"
+    },
+    {
+      "id": 3002,
+      "name": "Verify tag matches pyproject version",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/bot/lmer-rehearsal/actions/runs/103/job/3002"
+    },
+    {
+      "id": 3003,
+      "name": "Run CI checks",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/bot/lmer-rehearsal/actions/runs/103/job/3003"
+    },
+    {
+      "id": 3004,
+      "name": "Build wheel and sdist",
+      "status": "completed",
+      "conclusion": "failure",
+      "html_url": "https://github.com/bot/lmer-rehearsal/actions/runs/103/job/3004"
+    },
+    {
+      "id": 3005,
+      "name": "Publish to PyPI",
+      "status": "completed",
+      "conclusion": "skipped",
+      "html_url": "https://github.com/bot/lmer-rehearsal/actions/runs/103/job/3005"
+    },
+    {
+      "id": 3006,
+      "name": "Create GitHub Release",
+      "status": "completed",
+      "conclusion": "skipped",
+      "html_url": "https://github.com/bot/lmer-rehearsal/actions/runs/103/job/3006"
+    }
+  ]
+}

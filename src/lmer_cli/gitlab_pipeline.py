@@ -86,6 +86,17 @@ class TraceNotFoundError(GitLabPipelineError):
         super().__init__(f"Could not fetch trace for job {job_id}")
 
 
+class UnexpectedStatusError(GitLabPipelineError):
+    """Raised when the pipeline status does not match --expect-status."""
+
+    def __init__(self, status: Optional[str], expected: str):
+        self.status = status
+        self.expected = expected
+        super().__init__(
+            f"Pipeline status {status!r} does not match expected {expected!r}"
+        )
+
+
 class GitLabPipelineClient:
     """GitLab Pipeline API client."""
 
@@ -328,6 +339,27 @@ def show_status(
             output(f"  {format_job_status(job)}")
 
     return pipeline
+
+
+def check_expected_status(status: Optional[str], expected: Optional[str]) -> None:
+    """Enforce the --expect-status contract on a resolved pipeline status.
+
+    A no-op when no expectation was given or when the status matches;
+    otherwise raises UnexpectedStatusError (a GitLabPipelineError, so the
+    CLI exits non-zero). This is what makes
+    `work verify ... -- gitlab-pipeline ... --expect-status success` a real
+    receipt: a red or still-running pipeline can never exit 0.
+
+    Args:
+        status: Resolved pipeline status (plain status mode or the final
+            status from watch mode)
+        expected: Expected status (e.g. 'success'), or None to skip
+
+    Raises:
+        UnexpectedStatusError: If expected is set and status differs
+    """
+    if expected is not None and status != expected:
+        raise UnexpectedStatusError(status, expected)
 
 
 def resolve_pipeline_id(
