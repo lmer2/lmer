@@ -123,6 +123,40 @@ class TestPinnedRefInstall:
         assert match, "CTL_PINNED_REF assignment missing"
         assert re.fullmatch(r"[0-9a-f]{40}", match.group(1)), match.group(1)
 
+    def test_pin_carries_the_release_flow_fixes(self):
+        """The pin must be at or past the ctl merge that made this leg
+        workable: before it, the residual `unreleased:` section was read
+        case-sensitively (9 entries silently dropped) and no version write
+        without git side effects existed. Guard the exact reviewed value —
+        a pin that merely looks recent is not the same fact."""
+        match = re.search(r"^CTL_PINNED_REF=(\S+)$", _leg1(), re.MULTILINE)
+        assert (
+            match.group(1) == "5af16ceaa103095f53594fe6aa33246d05f72ba7"
+        ), match.group(1)
+
+    def test_credential_bootstrap_is_spelled_out(self):
+        """The container has no credential helper for git.20c.com and a
+        read-only ~/.gitconfig, so a bare `uv tool install` from that host
+        fails. The working form is named here so a release run does not
+        rediscover it at the point of failure."""
+        leg1 = _leg1()
+        assert "GIT_CONFIG_COUNT=1" in leg1
+        assert "GIT_CONFIG_KEY_0=" in leg1
+        assert "GIT_CONFIG_VALUE_0=" in leg1
+        assert "GITLAB_TOKEN_git_20c_com" in leg1
+        squashed = _squash(leg1)
+        assert "NO credential helper for `git.20c.com`" in squashed
+        assert "could not read Username" in squashed
+
+    def test_no_ctl_config_file_is_required(self):
+        """`ctl --help` lists no configured operations in a repo without a
+        Ctl/config.yml, but the operations still dispatch by plugin type.
+        Without this note a session reads the empty list as a broken
+        install and hard-stops."""
+        squashed = _squash(_leg1())
+        assert "needs no `Ctl/config.yml`" in squashed
+        assert "NOT a sign the install is broken" in squashed
+
     def test_pin_changes_are_taskdef_edits_not_session_decisions(self):
         leg1 = _squash(_leg1())
         assert "reviewed edit to this taskdef" in leg1
@@ -171,13 +205,41 @@ class TestDryRunBeforeCommit:
         assert "HARD STOP" in leg1
         assert "Do NOT bump the pin yourself" in leg1
 
+    def test_dry_run_is_a_throwaway_clone_not_a_ctl_flag(self):
+        """ctl has no dry-run flag at this pin — every operation writes in
+        place. A taskdef telling a session to "consult ctl --help for the
+        dry-run invocation" sends it looking for something that does not
+        exist, which is how the 0.6.0 run burned its leg-1 attempt."""
+        leg1 = _leg1()
+        assert "ctl has NO dry-run flag at this pin" in leg1
+        assert 'git clone --quiet --no-hardlinks --branch release-bump . "$DRYRUN"' in leg1
+        assert "never against the working checkout" in _squash(leg1)
+
+    def test_changelog_result_is_verified_by_parsing_not_by_diff(self):
+        """The roll rewrites the whole file, so a partial roll does not
+        stand out visually — which is exactly the failure that shipped an
+        incomplete changelog past a human reading the diff."""
+        leg1 = _squash(_leg1())
+        assert "by PARSING it, not by reading the diff" in leg1
+        assert "residual section is reset to empty lists" in leg1
+        assert "historical sections are semantically unchanged" in leg1
+
     def test_dry_run_detects_an_already_landed_bump(self):
         """Spec §7: an aborted release leaves the bump on prep-release; the
         next run's dry run detects it and skips the bump."""
         leg1 = _squash(_leg1())
-        assert "version already bumped" in leg1
-        assert "changelog already rolled" in leg1
-        assert "do NOT bump again" in leg1
+        assert "already exists in the changelog" in leg1
+        assert "Do NOT bump again" in leg1
+
+    def test_already_landed_bump_is_not_read_as_a_pin_failure(self):
+        """An already-rolled changelog makes the dry run FAIL (ctl refuses a
+        release version that already exists). Without this distinction the
+        hard-stop rule above swallows the resumable case and parks a
+        release that only needed its version recorded."""
+        leg1 = _squash(_leg1())
+        assert "BEFORE reading a failure as a pin problem" in leg1
+        assert "resumable state, NOT a hard stop" in leg1
+        assert "with the version NOT yet bumped on `prep-release`" in leg1
 
     def test_commit_goes_through_the_gate(self):
         leg1 = _squash(_leg1())
@@ -202,6 +264,89 @@ class TestChangelogModes:
         """The mechanism is the Phase 0.5 `release.changelog` value — the
         leg consumes it, never re-infers it from the tree."""
         assert "`release.changelog` parameter" in _squash(_leg1())
+
+
+class TestBumpInvocation:
+    """Step 4 names the commands that produce the bump, and names the ones
+    that must never run. `ctl version bump` without `--no-git` commits
+    outside the commit gate, creates an UNSIGNED tag under a name leg 2
+    does not use, and pushes both."""
+
+    def test_the_three_commands_are_named(self):
+        leg1 = _leg1()
+        assert "ctl version set <X.Y.Z> ." in leg1
+        assert "ctl changelog release <X.Y.Z>" in leg1
+        assert re.search(r"^uv lock\b", leg1, re.MULTILINE)
+
+    def test_version_write_has_no_git_side_effects(self):
+        leg1 = _squash(_leg1())
+        assert "performs NO git operations at all" in leg1
+        assert "no pull, no commit, no tag, no push" in leg1
+
+    def test_git_side_effect_forms_are_forbidden(self):
+        leg1 = _squash(_leg1())
+        assert "FORBIDDEN" in leg1
+        assert "`ctl version bump <segment>` without `--no-git`" in leg1
+        assert "`ctl version tag <X.Y.Z>`" in leg1
+
+    def test_segment_form_is_offered_with_its_ordering_constraint(self):
+        """`bump --no-git` validates the changelog, so it only succeeds
+        after the roll — an ordering a session cannot guess from the flag."""
+        leg1 = _squash(_leg1())
+        assert "ctl version bump <segment> --no-git ." in leg1
+        assert "must run AFTER `ctl changelog release`" in leg1
+
+    def test_init_is_ruled_out(self):
+        """`--init` creates an untracked Ctl/VERSION, which is precisely an
+        unexpected entry in the diff the next paragraph forbids."""
+        leg1 = _squash(_leg1())
+        assert "Do NOT pass `--init`" in leg1
+        assert "untracked `Ctl/VERSION`" in leg1
+
+    def test_repository_argument_is_required(self):
+        assert "The trailing `.` is required" in _squash(_leg1())
+
+
+class TestExpectedDiff:
+    """Step 4's "nothing else" check enumerates what IS expected, so a
+    session neither commits around a surprise nor stops on a known one."""
+
+    def test_uv_lock_is_an_expected_entry_not_a_surprise(self):
+        """It was implicit before: `uv lock` is needed for the precedent's
+        diff shape, but uv.lock would have tripped the "nothing else"
+        check."""
+        leg1 = _squash(_leg1())
+        assert "the project's OWN `version` line, one line" in leg1
+        assert "does not violate the \"nothing else\" rule" in leg1
+        assert "dependencies moved and IS a stop-and-ask" in leg1
+
+    def test_generated_changelog_md_is_staged(self):
+        """The roll regenerates CHANGELOG.md; on a first release it is
+        untracked, so it is outside `git diff` and would be dropped from
+        the commit without an explicit add."""
+        leg1 = _squash(_leg1())
+        assert "`CHANGELOG.md` — regenerated by the roll" in leg1
+        assert "`git add` it" in leg1
+        assert "including the deleted fragments and the regenerated" in leg1
+
+    def test_wholesale_reformat_is_declared_known(self):
+        """An undeclared 1800-line diff on a changelog roll reads as an
+        unexpected diff, and step 4 tells sessions to stop on those."""
+        leg1 = _squash(_leg1())
+        assert "KNOWN AND EXPECTED — do not stop for these" in leg1
+        assert "rewrites the WHOLE `CHANGELOG.yaml`" in leg1
+
+    def test_comment_loss_is_declared_and_not_papered_over(self):
+        leg1 = _squash(_leg1())
+        assert "DROPS every comment in `CHANGELOG.yaml`" in leg1
+        assert "do not hand-restore them in this commit" in leg1
+        # accepted-with-a-ticket, not accepted-and-forgotten
+        assert "ctl issue #32" in leg1
+
+    def test_anything_outside_the_set_still_stops(self):
+        assert "is a stop-and-ask, not something to commit around" in _squash(
+            _leg1()
+        )
 
 
 class TestBumpMRTarget:
