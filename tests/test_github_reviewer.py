@@ -14,6 +14,7 @@ regressions in:
 from __future__ import annotations
 
 import json
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -169,12 +170,12 @@ def test_gh_mergeable_to_gitlab_known_values_do_not_warn(capsys):
 
 
 # ---------------------------------------------------------------------------
-# Count-only review-thread comment counter (used by cmd_pr_info)
+# Count-only review-thread stats walker (used by cmd_pr_info)
 # ---------------------------------------------------------------------------
 
 
-def test_count_review_thread_comments_sums_totalcount_without_walking_bodies():
-    """The cheap-path counter sums comments.totalCount per thread,
+def test_fetch_review_thread_stats_sums_totalcount_without_walking_bodies():
+    """The cheap-path walker sums comments.totalCount per thread,
     paginating thread pages only (not per-thread reply pages).
     """
     page1 = {
@@ -184,8 +185,8 @@ def test_count_review_thread_comments_sums_totalcount_without_walking_bodies():
                     "reviewThreads": {
                         "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
                         "nodes": [
-                            {"comments": {"totalCount": 3}},
-                            {"comments": {"totalCount": 1}},
+                            {"isResolved": True, "resolvedBy": {"login": "bob"}, "comments": {"totalCount": 3}},
+                            {"isResolved": False, "resolvedBy": None, "comments": {"totalCount": 1}},
                         ],
                     }
                 }
@@ -198,7 +199,7 @@ def test_count_review_thread_comments_sums_totalcount_without_walking_bodies():
                 "pullRequest": {
                     "reviewThreads": {
                         "pageInfo": {"hasNextPage": False, "endCursor": None},
-                        "nodes": [{"comments": {"totalCount": 5}}],
+                        "nodes": [{"isResolved": False, "resolvedBy": None, "comments": {"totalCount": 5}}],
                     }
                 }
             }
@@ -212,38 +213,45 @@ def test_count_review_thread_comments_sums_totalcount_without_walking_bodies():
         return [page1, page2][len(calls) - 1]
 
     with patch.object(gh_cli, "_gh_json", side_effect=fake_gh_json):
-        total = gh_cli._count_review_thread_comments(
+        stats = gh_cli._fetch_review_thread_stats(
             "o/r", 1, host="github.com", token=None, page_size=10, max_pages=10
         )
 
-    assert total == 3 + 1 + 5
+    assert stats["comment_count"] == 3 + 1 + 5
+    assert len(stats["threads"]) == 3
+    assert stats["partial"] is False
     # Cursor was passed on the second call
     assert any("cursor=c1" in a for a in calls[1])
-    # Query must use first:0 on the per-thread comments to avoid fetching bodies
     query_text = next(a for a in calls[0] if "query=" in a)
+    # Query must use first:0 on the per-thread comments to avoid fetching bodies
     assert "comments(first: 0)" in query_text
+    # Provenance needs the resolver login...
+    assert "resolvedBy { login }" in query_text
+    # ...but resolvedAt does not exist in GitHub's schema — never request it.
+    assert "resolvedAt" not in query_text
 
 
-def test_count_review_thread_comments_warns_at_page_cap(capsys):
+def test_fetch_review_thread_stats_warns_and_marks_partial_at_page_cap(capsys):
     response = {
         "data": {
             "repository": {
                 "pullRequest": {
                     "reviewThreads": {
                         "pageInfo": {"hasNextPage": True, "endCursor": "x"},
-                        "nodes": [{"comments": {"totalCount": 2}}],
+                        "nodes": [{"isResolved": False, "resolvedBy": None, "comments": {"totalCount": 2}}],
                     }
                 }
             }
         }
     }
     with patch.object(gh_cli, "_gh_json", return_value=response):
-        total = gh_cli._count_review_thread_comments(
+        stats = gh_cli._fetch_review_thread_stats(
             "o/r", 1, host="github.com", token=None, page_size=1, max_pages=2
         )
 
     # 2 pages * 1 thread/page * 2 comments/thread
-    assert total == 4
+    assert stats["comment_count"] == 4
+    assert stats["partial"] is True
     err = capsys.readouterr().err
     assert "user_notes_count may undercount" in err
 
@@ -734,3 +742,209 @@ def test_cli_parser_accepts_page_size_and_max_pages():
     args = parser.parse_args(["o/r", "1", "--comments", "--page-size", "50", "--max-pages", "5"])
     assert args.page_size == 50
     assert args.max_pages == 5
+
+
+# ---------------------------------------------------------------------------
+# --resolve-thread resolution-policy guard (Thread Resolution Policy,
+# rules/git.md): only review sessions may resolve; LMER_TASK names the
+# session type.
+# ---------------------------------------------------------------------------
+
+
+RESOLVE_MUTATION_RESPONSE = {
+    "data": {"resolveReviewThread": {"thread": {"id": "PRRT_1", "isResolved": True}}}
+}
+
+
+def _run_resolve_thread(monkeypatch):
+    """Invoke main() as `github-review o/r 1 --resolve-thread PRRT_1` with
+    the GraphQL layer mocked; returns (exit_code, gh_json_mock)."""
+    monkeypatch.setattr(
+        sys, "argv", ["github-review", "o/r", "1", "--resolve-thread", "PRRT_1"]
+    )
+    with patch.object(
+        gh_cli, "_gh_json", return_value=RESOLVE_MUTATION_RESPONSE
+    ) as mock_gh_json:
+        rc = gh_cli.main()
+    return rc, mock_gh_json
+
+
+def test_resolve_thread_refused_in_non_review_session(monkeypatch, capsys):
+    monkeypatch.setenv("LMER_TASK", "develop")
+    rc, mock_gh_json = _run_resolve_thread(monkeypatch)
+
+    assert rc == 1
+    mock_gh_json.assert_not_called()  # refused before any API call
+    err = capsys.readouterr().err
+    # Names the session type and the policy...
+    assert "'develop' session" in err
+    assert "Thread Resolution Policy" in err
+    assert "rules/git.md" in err
+    # ...states the author workflow (reply with fix + SHA, leave open)...
+    assert "commit SHA" in err
+    assert "leaves the thread open" in err
+    assert "only the" in err and "reviewer resolves" in err
+    # ...and the workarounds (human web UI / host shell without LMER_TASK).
+    assert "web UI" in err
+    assert "LMER_TASK is unset" in err
+
+
+def test_resolve_thread_allowed_when_lmer_task_unset(monkeypatch, capsys):
+    monkeypatch.delenv("LMER_TASK", raising=False)
+    rc, mock_gh_json = _run_resolve_thread(monkeypatch)
+
+    assert rc == 0
+    mock_gh_json.assert_called_once()
+    assert "Resolved thread PRRT_1" in capsys.readouterr().out
+
+
+def test_resolve_thread_allowed_in_review_session(monkeypatch, capsys):
+    monkeypatch.setenv("LMER_TASK", "review")
+    rc, mock_gh_json = _run_resolve_thread(monkeypatch)
+
+    assert rc == 0
+    mock_gh_json.assert_called_once()
+    assert "Resolved thread PRRT_1" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# --info thread provenance (total/unresolved/resolved + resolver breakdown;
+# derived blocking_discussions_resolved)
+# ---------------------------------------------------------------------------
+
+
+def _thread_node(resolved, resolver=None, comments=1):
+    return {
+        "isResolved": resolved,
+        "resolvedBy": {"login": resolver} if resolver else None,
+        "comments": {"totalCount": comments},
+    }
+
+
+def _fake_info_gh_json(thread_nodes, *, has_next=False, fail_graphql=False):
+    """Fake _gh_json for cmd_pr_info: `gh pr view` returns the sample PR,
+    the GraphQL thread walk returns one page of ``thread_nodes``."""
+
+    def fake(args, *, host, token):
+        if args[0] == "pr":
+            return dict(SAMPLE_GH_PR)
+        if fail_graphql:
+            raise gh_cli.GitHubError("graphql exploded")
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": has_next, "endCursor": "c"},
+                            "nodes": thread_nodes,
+                        }
+                    }
+                }
+            }
+        }
+
+    return fake
+
+
+def test_cmd_pr_info_thread_provenance_mixed_resolvers():
+    nodes = [
+        _thread_node(True, "bob"),
+        _thread_node(True, "bob"),
+        _thread_node(True, "alice"),
+        _thread_node(False),
+    ]
+    with patch.object(gh_cli, "_gh_json", side_effect=_fake_info_gh_json(nodes)):
+        info = gh_cli.cmd_pr_info("o/r", 42, host="github.com", token=None)
+
+    assert info["thread_provenance"] == {
+        "total": 4,
+        "unresolved": 1,
+        "resolved": 3,
+        "resolvers": {"bob": 2, "alice": 1},
+        "partial": False,
+    }
+    # An unresolved thread → blocking discussions are NOT resolved
+    assert info["blocking_discussions_resolved"] is False
+
+    out = gh_cli.format_pr_info(info, json_output=False)
+    assert "=== Threads ===" in out
+    assert "Total: 4 (3 resolved, 1 unresolved)" in out
+    assert "  - @alice: 1" in out
+    assert "  - @bob: 2" in out
+    assert "counts partial" not in out
+
+
+def test_cmd_pr_info_thread_provenance_truncation_marker(capsys):
+    # Every page claims hasNextPage=True → max_pages cap hits → partial
+    nodes = [_thread_node(True, "bob")]
+    with patch.object(
+        gh_cli, "_gh_json", side_effect=_fake_info_gh_json(nodes, has_next=True)
+    ):
+        info = gh_cli.cmd_pr_info(
+            "o/r", 42, host="github.com", token=None, page_size=1, max_pages=2
+        )
+
+    assert info["thread_provenance"]["partial"] is True
+    out = gh_cli.format_pr_info(info, json_output=False)
+    assert "counts partial — page cap" in out
+
+
+def test_cmd_pr_info_partial_walk_never_claims_all_resolved():
+    """Fail-closed on truncation: a page-cap-truncated walk whose fetched
+    threads are all resolved must NOT report blocking_discussions_resolved
+    True — unfetched pages may hold unresolved threads."""
+    nodes = [_thread_node(True, "bob")]
+    with patch.object(
+        gh_cli, "_gh_json", side_effect=_fake_info_gh_json(nodes, has_next=True)
+    ):
+        info = gh_cli.cmd_pr_info(
+            "o/r", 42, host="github.com", token=None, page_size=1, max_pages=2
+        )
+
+    assert info["thread_provenance"]["partial"] is True
+    assert info["thread_provenance"]["unresolved"] == 0
+    assert info["blocking_discussions_resolved"] is False
+
+
+def test_cmd_pr_info_blocking_discussions_resolved_when_all_resolved():
+    nodes = [_thread_node(True, "bob"), _thread_node(True, "alice")]
+    with patch.object(gh_cli, "_gh_json", side_effect=_fake_info_gh_json(nodes)):
+        info = gh_cli.cmd_pr_info("o/r", 42, host="github.com", token=None)
+
+    assert info["blocking_discussions_resolved"] is True
+    assert info["thread_provenance"]["unresolved"] == 0
+
+
+def test_cmd_pr_info_json_thread_provenance_shape():
+    nodes = [_thread_node(True, "bob"), _thread_node(False)]
+    with patch.object(gh_cli, "_gh_json", side_effect=_fake_info_gh_json(nodes)):
+        info = gh_cli.cmd_pr_info("o/r", 42, host="github.com", token=None)
+
+    prov = json.loads(gh_cli.format_pr_info(info, json_output=True))["thread_provenance"]
+    # Same key shape as gitlab-review's thread_provenance block
+    assert set(prov.keys()) == {"total", "unresolved", "resolved", "resolvers", "partial"}
+    assert prov["total"] == 2
+    assert prov["unresolved"] == 1
+    assert prov["resolved"] == 1
+    assert prov["resolvers"] == {"bob": 1}
+    assert prov["partial"] is False
+
+
+def test_cmd_pr_info_provenance_failure_is_fail_soft(capsys):
+    """--info must never fail on provenance trouble: a GraphQL error
+    degrades to issue-comment counts and no Threads block."""
+    with patch.object(
+        gh_cli, "_gh_json", side_effect=_fake_info_gh_json([], fail_graphql=True)
+    ):
+        info = gh_cli.cmd_pr_info("o/r", 42, host="github.com", token=None)
+
+    # Fail-soft: no provenance, blocking flag stays True, count falls back
+    # to issue-level comments only (SAMPLE_GH_PR has 1).
+    assert info["thread_provenance"] is None
+    assert info["blocking_discussions_resolved"] is True
+    assert info["user_notes_count"] == 1
+
+    out = gh_cli.format_pr_info(info, json_output=False)
+    assert "=== Threads ===" not in out
+    err = capsys.readouterr().err
+    assert "thread provenance omitted" in err

@@ -832,3 +832,30 @@ This raises the bound but does not fix the leak itself — a high-enough fork ra
 - **Switch the host to cgroup v2** (RHEL 8 supports it but defaults to v1): boot with `systemd.unified_cgroup_hierarchy=1` and reboot. Coordinate this — it affects every container on the host.
 
 Both are host-infrastructure changes (they require a reboot and validation against other workloads on the box) and cannot be shipped by LMER itself. Until one is in place, `LMER_PIDS_LIMIT` plus the live-bump recovery above keep sessions working regardless of host kernel.
+
+### Review-Thread Resolution (gitlab-review / github-review)
+
+Thread resolution is the reviewer's verified sign-off (Thread Resolution
+Policy, `rules/git.md`): the author of a fix replies with what changed and
+the commit SHA and leaves the thread open; only the reviewer — a human, or
+a review session that verified the fix — resolves it.
+
+**Resolution guard.** `gitlab-review ... --resolve-thread` and
+`github-review ... --resolve-thread` refuse to run (exit 1, no API call)
+when `LMER_TASK` is set to anything other than `review` — that includes
+develop, followup, masterplan, and chat sessions, deliberately: a session
+that fixed the code must not sign off on its own fix. The refusal message
+names the workaround: a human resolves in the web UI, or runs the CLI from
+a host shell where `LMER_TASK` is unset. There is no override flag.
+
+**Thread provenance in `--info`.** Both CLIs render a "Threads" block —
+total / unresolved / resolved counts and a per-account resolver breakdown —
+and carry the same data under a `thread_provenance` key in `--json`.
+gitlab-review additionally flags threads whose resolution predates the MR's
+head commit ("resolved before the latest change"); github-review cannot
+(the GitHub GraphQL schema exposes no resolution timestamp), so it reports
+counts and resolvers only, and derives `blocking_discussions_resolved` from
+the fetched thread data instead of hardcoding it. When a page cap truncates
+the thread walk, the block says "counts partial — page cap" rather than
+presenting partial counts as totals. The block is advisory: `--info` never
+fails on provenance findings.

@@ -107,6 +107,18 @@ flow), that means:
 If a change genuinely seems to require targeting `main` directly, STOP and
 ask the human — never create such an MR on your own judgment.
 
+## 🚨 Thread Resolution Policy — only the reviewer resolves
+Resolution of a review discussion thread is the reviewer's verified
+sign-off, not housekeeping:
+- **The author of a fix NEVER resolves the thread.** Reply on the thread
+  naming what changed and the commit SHA, then leave it open for the
+  reviewer.
+- **Only the reviewer resolves**: a human, or a REVIEW session that
+  re-checked the pushed fix (reply "verified in <sha>" before resolving).
+- Resolving your own fix's thread is a policy violation. Tooling enforces
+  this: `gitlab-review`/`github-review --resolve-thread` refuse to run in
+  non-review sessions (`LMER_TASK` set and not `review`).
+
 ## 🚨 Merge Policy — review must be COMPLETE, not just quiet
 **CRITICAL**: Before merging any MR/PR (via UI, API, or a local merge pushed
 to the target branch), verify ALL of:
@@ -114,7 +126,9 @@ to the target branch), verify ALL of:
    system "mentioned in commit" notes don't count).
 2. **No un-re-reviewed fixes**: if commits were pushed to the source branch
    after the reviewer's last pass, the reviewer must re-review first —
-   author-resolved threads are NOT review sign-off.
+   author-resolved threads violate the Thread Resolution Policy above and
+   are never review sign-off (`--info`'s thread-provenance block surfaces
+   who resolved what, and when resolution predates the MR's head commit).
 3. Pipeline green (or the human explicitly waives it).
 
 A human instruction to merge does not waive these checks — verify and

@@ -67,6 +67,9 @@ class GitLabClient:
             )
 
         self.base_url = f"https://{self.host}/api/v4"
+        # True when the most recent _paginate() call stopped at the page cap
+        # while GitLab indicated more results exist (i.e. results truncated).
+        self.last_page_capped = False
         self.session = requests.Session()
         self.session.headers.update({
             'PRIVATE-TOKEN': self.token,
@@ -130,6 +133,7 @@ class GitLabClient:
         page_params = dict(params or {})
         page_params['per_page'] = page_size
 
+        self.last_page_capped = False
         results: List[Any] = []
         response = None
 
@@ -168,6 +172,7 @@ class GitLabClient:
         # Loop exited without natural termination -> safety cap hit
         next_page = response.headers.get('x-next-page', '').strip() if response is not None else ''
         if next_page:
+            self.last_page_capped = True
             print(
                 f"WARNING: gitlab-review pagination cap reached after "
                 f"{max_pages} pages ({len(results)} items) for /{endpoint}. "
@@ -253,6 +258,19 @@ class GitLabClient:
         project_encoded = project.replace('/', '%2F')
         return self._request('PUT', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions/{discussion_id}",
                            json={'resolved': True})
+
+    def get_commit(self, project: str, sha: str) -> Dict[str, Any]:
+        """Get a single repository commit by SHA.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            sha: Commit SHA (or ref name)
+
+        Returns:
+            Commit data including committed_date
+        """
+        project_encoded = project.replace('/', '%2F')
+        return self._request('GET', f"projects/{project_encoded}/repository/commits/{sha}")
 
     def list_open_merge_requests(
         self,

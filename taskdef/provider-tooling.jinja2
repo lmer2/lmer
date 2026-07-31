@@ -7,7 +7,8 @@
 {% if is_github -%}
 This repository is hosted on **GitHub** (`{{ LMER_REPO_HOST }}`).
 
-- Use **`github-review`** for atomic inline reviews (`--review-file`) and normalized reads (`--info`, `--issue-info`, `--comments`, `--all-comments`, `--list`, `--resolve-thread`).
+- Use **`github-review`** for atomic inline reviews (`--review-file`) and normalized reads (`--info`, `--issue-info`, `--comments`, `--all-comments`, `--list`).
+- `--resolve-thread` is a mutation reserved for review contexts: only a review session (or a human) resolves a thread, after verifying the fix — fix authors reply and leave threads open (Thread Resolution Policy, rules/git.md).
 - Use **`gh`** directly for create-PR, create-issue, comment, edit, and close — these are intentionally not wrapped.
 - Run `bash /Agents/global/hooks/github-review-docs.sh` to familiarize yourself with the tool.
 - A 404 / auth failure during `github-review` or `gh` usually means a missing or invalid token — check the env for `GH_TOKEN`, `GITHUB_TOKEN`, or a per-host `GH_TOKEN_<host>` variable.
@@ -15,6 +16,7 @@ This repository is hosted on **GitHub** (`{{ LMER_REPO_HOST }}`).
 This repository is hosted on **GitLab**{% if LMER_REPO_HOST is defined and LMER_REPO_HOST %} (`{{ LMER_REPO_HOST }}`){% endif %}.
 
 - Use **`gitlab-review`** for merge-request and issue operations.
+- `--resolve-thread` is a mutation reserved for review contexts: only a review session (or a human) resolves a thread, after verifying the fix — fix authors reply and leave threads open (Thread Resolution Policy, rules/git.md).
 - Run `bash /Agents/global/hooks/gitlab-review-docs.sh` to familiarize yourself with the tool.
 - A 404 during `gitlab-review` may indicate an invalid token — check the env for `_TOKEN` variables to see if there are multiple GitLab tokens specified.
 {%- endif %}
