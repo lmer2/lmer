@@ -256,6 +256,17 @@ COPY --chown=developer:developer . .
 RUN source .venv/bin/activate && \
     /opt/tools/bin/uv sync
 
+# PyYAML guarantee for the container entrypoint interpreter.
+# The host CLI (src/lmer_cli/cli.py) launches the in-container clone/exec
+# script with a bare `python3`. The ENV PATH above deliberately puts
+# /Agents/global/.venv/bin ahead of /usr/bin, so that `python3` resolves to
+# the uv-synced venv interpreter, which carries pyyaml>=6.0 from
+# pyproject.toml / uv.lock. This RUN turns that PATH ordering from an
+# accident into a build gate: the image build fails if `python3` ever stops
+# resolving to the venv, or if the venv loses PyYAML.
+RUN [ "$(command -v python3)" = "/Agents/global/.venv/bin/python3" ] && \
+    python3 -c "import sys, yaml; print('PyYAML', yaml.__version__, 'via', sys.executable)"
+
 # Copy agent-files/claude/ to .claude/ for Claude Code commands and settings
 # (kept separate from .claude/ in repo to avoid conflicts with local user state)
 RUN cp -r agent-files/claude/. .claude/

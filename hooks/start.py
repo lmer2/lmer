@@ -210,6 +210,140 @@ def find_taskdef_instructions(taskdef_name=None):
     return None
 
 
+def configured_taskdef_root():
+    """Root directory of the configured shared-taskdef repo, or None.
+
+    Identification: LMER_TASKDEF_REPO must be non-empty (a shared taskdef
+    repo is configured for this session) AND LMER_TASKDEF_PATHS must carry
+    at least one entry — the repo's tier is the LAST entry. This mirrors how
+    the CLI propagates the repo into the container: cli.py appends the
+    container clone path (/taskdef) as the final LMER_TASKDEF_PATHS entry
+    when LMER_TASKDEF_REPO is set, after any external taskdef mounts.
+    Matching that last entry was chosen over hardcoding the /taskdef clone
+    path (the hook keeps working if the clone location changes, and unit
+    tests can point the root at a tmp dir) and over keying off
+    LMER_TASKDEF_REPO alone (shadow detection needs to know WHICH
+    taskdef_search_dirs() slot the repo occupies). Returns None when
+    LMER_TASKDEF_REPO is unset/empty — legacy sessions without a shared
+    taskdef repo get no detection and no output — or when
+    LMER_TASKDEF_PATHS carries no entries.
+    """
+    if not os.environ.get("LMER_TASKDEF_REPO", "").strip():
+        return None
+    extra_paths = os.environ.get("LMER_TASKDEF_PATHS", "")
+    entries = [p.strip() for p in extra_paths.split(":") if p.strip()]
+    if not entries:
+        return None
+    return Path(entries[-1])
+
+
+def _shadow_tier_label(search_dir):
+    """Tier label for a taskdef_search_dirs() entry that shadows the
+    configured taskdef repo (see detect_shadowed_taskdefs).
+
+    Vocabulary — one unambiguous label per shadowing tier:
+      - "work-repo project tier"  {work_repo}/{host}/{project}/taskdef
+      - "work-repo global tier"   {work_repo}/taskdef
+      - "LMER_TASKDEF_PATHS entry <dir>" for an earlier PATHS entry; the
+        label carries the shadowing path so warning text stays unambiguous
+        when several external taskdef mounts are active.
+    """
+    work_repo_path = os.environ.get("LMER_WORK_REPO_PATH")
+    if work_repo_path:
+        work_root = Path(work_repo_path)
+        repo_host = os.environ.get("LMER_REPO_HOST")
+        repo_project = os.environ.get("LMER_REPO_PROJECT")
+        if (
+            repo_host
+            and repo_project
+            and search_dir == work_root / repo_host / repo_project / "taskdef"
+        ):
+            return "work-repo project tier"
+        if search_dir == work_root / "taskdef":
+            return "work-repo global tier"
+    return f"LMER_TASKDEF_PATHS entry {search_dir}"
+
+
+def detect_shadowed_taskdefs(configured_root=None):
+    """Read-only detector: which configured-repo taskdefs are shadowed?
+
+    Enumerates the taskdef names (subdirectories carrying instructions.txt)
+    under ``configured_root`` — default: configured_taskdef_root() — and,
+    for each name, walks the taskdef_search_dirs() entries that PRECEDE
+    that root in precedence order. A preceding dir shadows a name when
+    ``<dir>/<name>/instructions.txt`` exists — the same per-file check
+    find_taskdef_file() uses to resolve instructions. The first
+    (highest-precedence) match wins and is reported as
+    ``(taskdef_name, winning_dir, tier_label)`` with tier_label from
+    _shadow_tier_label().
+
+    Returns [] when no taskdef repo is configured (legacy sessions stay
+    silent), when the root does not appear in taskdef_search_dirs(), or
+    when nothing is shadowed. Detection is diagnostics only: it never
+    reorders the search, never changes tier precedence, and never raises
+    into the render path — unreadable or missing directories are skipped.
+    """
+    try:
+        if configured_root is None:
+            configured_root = configured_taskdef_root()
+        if configured_root is None:
+            return []
+        root = Path(configured_root)
+        preceding = []
+        found_root = False
+        for search_dir in taskdef_search_dirs():
+            if search_dir == root:
+                found_root = True
+                break
+            preceding.append(search_dir)
+        if not found_root or not preceding:
+            return []
+        try:
+            names = sorted(
+                entry.name
+                for entry in root.iterdir()
+                if entry.is_dir() and (entry / "instructions.txt").exists()
+            )
+        except OSError:
+            return []
+        shadowed = []
+        for name in names:
+            for search_dir in preceding:
+                try:
+                    hit = (search_dir / name / "instructions.txt").exists()
+                except OSError:
+                    continue
+                if hit:
+                    shadowed.append((name, search_dir, _shadow_tier_label(search_dir)))
+                    break
+        return shadowed
+    except Exception:
+        # Best-effort diagnostics — never break /start rendering.
+        return []
+
+
+def taskdef_shadow_warning_lines():
+    """Warning lines for configured-repo taskdefs shadowed by other tiers.
+
+    One line per shadowed name, greppable via ``TASKDEF SHADOW``:
+
+      ⚠️  TASKDEF SHADOW: taskdef '<name>' in the configured taskdef repo
+      is shadowed by <tier label>
+
+    where <tier label> comes from _shadow_tier_label() and names the
+    winning tier ("work-repo project tier", "work-repo global tier", or
+    "LMER_TASKDEF_PATHS entry <dir>"). Advisory only: these lines never
+    change which file is rendered, and detect_shadowed_taskdefs() is
+    fail-soft, so this can never break `/start`. Legacy sessions (no
+    LMER_TASKDEF_REPO) get [] — zero new output.
+    """
+    return [
+        f"⚠️  TASKDEF SHADOW: taskdef '{name}' in the configured taskdef "
+        f"repo is shadowed by {tier_label}"
+        for name, _winning_dir, tier_label in detect_shadowed_taskdefs()
+    ]
+
+
 class TaskdefRenderError(Exception):
     """A taskdef failed schema validation or the block lint.
 
@@ -507,6 +641,13 @@ def read_and_display_instructions(instructions_file, work_mode="finish"):
     """Read and display the task instructions, rendering with Jinja2."""
     print(f"📋 Task Instructions: {instructions_file.parent.name}")
     print(f"📍 Location: {instructions_file}")
+    # Shadow warnings sit between the task-context block above and the
+    # `taskdef source:` banner below the separator — impossible to miss,
+    # and directly under the Location line they explain. Advisory only:
+    # never alters the render, never returns False. Empty for legacy
+    # sessions (no LMER_TASKDEF_REPO), keeping their output byte-identical.
+    for line in taskdef_shadow_warning_lines():
+        print(line)
     print("\n" + "="*60)
 
     try:

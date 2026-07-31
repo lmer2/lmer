@@ -7,6 +7,7 @@ Python-first CLI for running LMER with a repository target, cloning inside the c
 - [Prerequisites](#prerequisites)
 - [Install Globally](#install-globally)
 - [Environment Variables](#environment-variables)
+- [Canonical Source Declarations (`sources.yaml`)](#canonical-source-declarations-sourcesyaml)
 - [Work-Repo Claude Assets](#work-repo-claude-assets)
 - [Tasks](#tasks)
 - [Basic Usage](#basic-usage)
@@ -102,17 +103,17 @@ The following environment variables control LMER behavior:
 
 - **`LMER_WORK_REPO_PATH`** - In-container clone location of the work repo. Defaults to `/work`; rarely needs overriding.
 
-- **`LMER_NAPKIN_REPO`** - Optional Git URL (SSH or HTTPS) of a dedicated *napkin* repo for shared team working notes. When set, lmer clones it to `/napkin` inside the container and points `LMER_NAPKIN_PATH` there. When unset, napkin falls back to a `napkin/` subdir of the work repo. **Host-side only:** the URL is credentialed on the host and the resulting URL is forwarded into the container; the variable name itself is not consumed inside the container.
+- **`LMER_NAPKIN_REPO`** - Optional Git URL (SSH or HTTPS) of a dedicated *napkin* repo for shared team working notes. When set, lmer clones it to `/napkin` inside the container and points `LMER_NAPKIN_PATH` there. When unset, napkin falls back to the work repo's `sources.napkin` declaration if one exists (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)), else to a `napkin/` subdir of the work repo. This variable is an explicit, **mismatch-checked override** of the declaration, not the only way to point at a napkin source: when a declaration also exists and the two URLs are equal after normalization, the env value wins silently (it carries the credential the declared form lacks); when they differ, lmer stops and asks interactively which to use, or exits 2 headless before any auxiliary clone. It also remains the operator-controlled escape hatch for a napkin repo on a different host than the work repo, which the same-host trust rule rejects as a declaration. **Host-side only:** the URL is credentialed on the host and the resulting URL is forwarded into the container; the variable name itself is not consumed inside the container.
 
 - **`LMER_NAPKIN_TOKEN`** - Optional auth token for `LMER_NAPKIN_REPO`. **Consumed host-side only** (highest-priority lookup for the napkin URL), baked into the URL as `https://oauth2:<token>@…`, and **never forwarded into the container**. Falls back to the standard per-host `GITLAB_TOKEN_<host>` / `GH_TOKEN` lookups when unset.
 
 - **`LMER_NAPKIN_PATH`** - **Computed and injected by lmer** (not a host input): the in-container path agents write napkin notes to. `/napkin` in separate-repo mode, else `{LMER_WORK_REPO_PATH}/napkin`. Agents and company-level Claude config should always reference `$LMER_NAPKIN_PATH` (and `~/napkin`, which is symlinked to it). Because it is computed rather than read from the host environment, it does not appear in `lmer --show-env` unless also set as a host `LMER_` variable.
 
-- **`LMER_TASKDEF_REPO`** - Optional Git URL (SSH or HTTPS) of a shared taskdef repo. When set, lmer clones it to `/taskdef` inside the container and inserts it into the task-definition search order **between** the work-repo taskdefs and the lmer built-in (i.e. after `{work_repo}/taskdef/`, before `/Agents/global/taskdef`). **Host-side only**, credentialed like `LMER_NAPKIN_REPO`.
+- **`LMER_TASKDEF_REPO`** - Optional Git URL (SSH or HTTPS) of a shared taskdef repo. When set, lmer clones it to `/taskdef` inside the container and inserts it into the task-definition search order **between** the work-repo taskdefs and the lmer built-in (i.e. after `{work_repo}/taskdef/`, before `/Agents/global/taskdef`). The taskdef source can equally be declared in the work repo's `sources.yaml` (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)); this variable is then an explicit, **mismatch-checked override** of that declaration rather than the only configuration mechanism. When a `sources.taskdef.repo` declaration also exists: equal after normalization → the env value wins silently, because it is the credentialed form of the same source; different → lmer stops and asks interactively which to use, or exits 2 headless before any auxiliary clone. The env var also remains the operator-controlled escape hatch for a taskdef repo on a different host than the work repo, which the same-host trust rule rejects as a declaration. **Host-side only**, credentialed like `LMER_NAPKIN_REPO`.
 
 - **`LMER_TASKDEF_TOKEN`** - Optional auth token for `LMER_TASKDEF_REPO`. **Consumed host-side only**, baked into the URL, and **never forwarded into the container**. Falls back to per-host `GITLAB_TOKEN_<host>` / `GH_TOKEN` lookups when unset.
 
-- **`LMER_TASKDEF_REF`** - Optional git ref/branch/tag to pin the `LMER_TASKDEF_REPO` clone for reproducibility. Forwarded into the container and passed to the clone checkout. When unset, the repo's default branch is used.
+- **`LMER_TASKDEF_REF`** - Optional git ref/branch/tag to pin the taskdef clone for reproducibility. Forwarded into the container and passed to the clone checkout. When unset, a `sources.taskdef.ref` declaration in the work repo's `sources.yaml` applies if present (see [Canonical Source Declarations](#canonical-source-declarations-sourcesyaml)), else the repo's default branch is used. Like the repo URL variables, this is an explicit, **mismatch-checked override** of the declared ref — resolution runs per field, so a ref-only mismatch counts: declared ref equal to the env value → the env value wins silently; different → interactive stop-and-ask, or exit 2 headless before any auxiliary clone. And like them, it stays the operator-controlled escape hatch when the declared taskdef source can't be used and the env-var pair (`LMER_TASKDEF_REPO` + this ref) points elsewhere.
 
 - **`LMER_RENDER_SOURCE`** - Test/CI-only switch for the render-matrix suite (`tests/test_taskdef_render_matrix.py`), not read by the CLI or the container runtime. When set, every taskdef directory found under the given path is rendered — honoring its root `taskdef.yaml` — against the *current checkout's* built-in base templates: `LMER_RENDER_SOURCE=<clone> uv run pytest tests/test_taskdef_render_matrix.py -q`. This is the contract an external taskdef content repo's CI uses to prove its bodies render against a pinned base (see docs/TASKDEFS.md).
 
@@ -249,6 +250,75 @@ The following environment variables control LMER behavior:
 - **`LMER_SUPERVISOR_PID`** - Set **by `lmer-supervisor` inside the container** (not a host input): the supervisor's own PID, exported before it forks Claude so the wrapped process and everything it spawns inherit it. An in-container command can send this PID `SIGUSR1` to request a graceful self-shutdown — the supervisor injects Claude's quit chord (Ctrl-C twice), escalating to SIGTERM/SIGKILL if needed, and reports a clean exit. `lmer-slack end-session` uses this to let a Slack chat session free its orchestrator slot on demand. Unset when Claude runs without the supervisor (`LMER_DISABLE_SUPERVISOR=1`).
 
 - **`LMER_NO_REPO`** - Set **by lmer inside the container** (not a host input) to `1` when the session deliberately has no repository — currently only when a Slack thread permalink is the sole `lmer chat` target and no git origin could be inferred from the current directory. The container's clone step is skipped (`/workspace` stays empty) and the chat taskdef drops its repository-specific instructions. Unset for all repository-backed sessions.
+
+### Canonical Source Declarations (`sources.yaml`)
+
+The work repo can declare the canonical taskdef and napkin sources in a `sources.yaml` file at its root. This makes the work repo itself the source of truth for where shared taskdefs and napkin notes come from, and turns the `LMER_TASKDEF_REPO` / `LMER_NAPKIN_REPO` / `LMER_TASKDEF_REF` environment variables into explicit, mismatch-checked overrides instead of the only configuration mechanism. Resolution runs in-container (in `clone_and_exec`, after the work-repo clone and before the auxiliary clones), where `sources.yaml` is guaranteed present and fresh.
+
+#### Schema (version 1)
+
+```yaml
+schema: 1
+sources:
+  taskdef:
+    repo: https://gitlab.example.com/group/taskdefs.git
+    ref: main                # optional; overrides the LMER_TASKDEF_REF default
+  napkin:
+    repo: https://gitlab.example.com/group/napkin.git
+```
+
+- The `sources` mapping is deliberately **profile-shaped**: it is the exact shape intended to become the `sources` section of a future named profile. No profile implementation exists today — only the shape is reserved.
+- Schema 1 covers `taskdef` and `napkin` only. `masterplan_mirror` is a documented **reserved** future key and is deliberately **not** part of schema 1.
+- `ref` is valid under `taskdef` only in schema 1 (there is no `LMER_NAPKIN_REF`). It participates in the same resolution matrix as `repo`, per field — see below.
+- Unknown keys under `sources:` and unknown top-level keys produce a **warning** (forward compatibility); an unknown `schema:` version **fails loud** (same pattern as `taskdef.yaml`).
+
+#### Same-host trust rule
+
+Declared repos must live on the **same host** as the work repo itself. The rationale: the work repo is agent-writable, and a declared source URL inherits the work-repo credential at clone time — an unrestricted declaration would let a committed `sources.yaml` route an operator token to an arbitrary host. Same-host-only kills that: the credential a declared URL receives is the one the work-repo URL already carries for that same host. A declaration on any other host is a **validation error** whose message points at the env-var override (`LMER_TASKDEF_REPO` / `LMER_NAPKIN_REPO`), which stays operator-controlled.
+
+The comparison is on the **hostname alone** — scheme and port do not participate. An SSH work repo on `ssh://git@host:2222/...` therefore accepts an `https://host/...` declaration, which is an ordinary self-hosted layout and one the credential derivation below already handles. The rule is about *which host* receives the operator's credential; a second port on the host that already holds it is not a different trust boundary.
+
+Accepting the declaration is not the same as handing it the credential, though. A declared HTTPS URL naming a **different port** than the work repo's — `https://host:5050/...` when the work repo is `https://host/...` — is cloned **anonymously, with the work-repo credential withheld**: a git host commonly runs other services on other ports, and `oauth2:<token>@host:5050` would send the operator's token to one of them as basic auth. (The same applies to a plain `http://` declaration against an HTTPS work repo.) A public repo on another port still clones; a private one fails through the loud declared-source failure path below, whose message names the withheld credential. If a declared source genuinely needs a credential on another port, set that source's env-var override, which is yours to set rather than the work repo's to state.
+
+**Credential scope requirement:** a declared source is cloned with the credential **derived from the work-repo URL** for that same host — an HTTPS work-repo URL has its userinfo (`oauth2:<token>@`) copied onto the declared URL; an SSH-form work-repo URL causes the declared URL to be converted to the same SSH form so the same key applies. The work-repo credential must therefore have **read access** to every declared repo. If it does not, use the env-var override for that source instead (env-var URLs are credentialed host-side, exactly as today).
+
+A declared-source clone failure is **loud**, never the warn-and-continue that legacy env-var auxiliary clones get: interactively, lmer prompts to either continue in legacy mode (as if that source were undeclared) or abort; headless, it exits 2 with a remediation message (fix the declaration, widen the credential's read scope, or set the env-var override). A declaration is a stated intent — silently proceeding without it would hand the session the wrong taskdefs or napkin.
+
+#### Resolution
+
+Resolution applies **per source** (`taskdef`, `napkin`) **and per field** (`repo`, plus `ref` for taskdef) — a ref-only mismatch is still a mismatch and triggers the mismatch row below.
+
+| declared | env var | behavior |
+|---|---|---|
+| yes | unset | Use the declaration (the new normal path); the clone URL derives its credential from the work-repo URL. |
+| yes | equal (normalized) | The **env value wins, silently** — it is the credentialed form of the same source; the declared side is clean, so using it would break auth. |
+| yes | different | **Interactive** (stdin is a TTY): a stop-and-ask prompt naming both values (credential-scrubbed), you pick one. **Headless**: exit 2 before any auxiliary clone, with an error naming both scrubbed values and the fix. |
+| no | set | Use the env value, with a one-line note that no declaration exists. |
+| no | unset | **Silent legacy mode** — behavior identical to a setup without `sources.yaml`. No per-session warning. |
+
+Equality is decided on normalized URLs (credentials stripped, trailing `.git` and slash dropped, host lowercased, default ports removed, SSH forms canonicalized), so cosmetic differences never count as a mismatch. Non-default ports are **kept** by that comparison — `host:2222/x` and `host:9999/x` can be genuinely different repos — with one addition: an env value that matches the URL lmer would *derive* from the declaration counts as equal too. That is what makes the `equal (normalized)` row fire for a work repo on a custom SSH port, where the env var holds the working `ssh://git@host:2222/...` form while the declaration names the clean `https://host/...` one. Only the rewrite the derivation itself performs is folded in; any other port difference is still a mismatch.
+
+#### No secrets, ever
+
+The work repo is shared; tokens stay host-side, exactly as today. Credential detection: a URL whose userinfo carries a password/token component — `https://user:secret@host/...`, `https://oauth2:<token>@host/...` — is a refuse-start validation **error** telling the operator to strip it. Bare SSH forms — `git@host:path` and `ssh://git@host/path` — are legal: `git@` there is protocol userinfo, not a credential. Every place a declared or env URL is rendered (the mismatch prompt, the headless error, `lmer --show-env`, log lines) shows it credential-scrubbed.
+
+Detection and scrubbing both cover secrets containing a `/` (the base64 alphabet has one), even though git itself will not clone such a URL unless the `/` is percent-encoded — the point is that the secret is refused and never printed, not that the URL works. The trade-off is a deliberate over-scrub in one exotic shape: a URL with **both** a non-default port and an `@` in its path (`https://host:8443/a/repo@v1.git`) is redacted as if the port were a secret. Redaction's rule is to over-scrub rather than risk a leak.
+
+One shape has no single right reading and is **refused as unreadable** rather than guessed at: a URL with **no scheme** whose `@` comes after a `/` — `a:b/c@d`. `user:se/cret@host/org/x.git` (a secret containing `/`) and `host:org/re@po.git` (an scp-form path containing `@`) are the same string shape, so any rule that reads one correctly misreads the other. The refusal names both readings, so whichever one you meant, the fix is in the message: strip the credential, or write the scheme form (`https://host/org/re@po.git`), which parses unambiguously. Redaction is regex-based and independent of that parse, so such a URL is still scrubbed wherever it is printed.
+
+#### Backward compatibility (silent legacy)
+
+Backward compatibility is absolute. An **absent `sources.yaml`** means the resolution matrix never engages — zero new output, zero behavior change. A **present file with a source key absent** is likewise silent legacy for that source: declarations are opt-in per source. Visibility comes from the `lmer --show-env` origin display (`declared` / `env-match` / `env-override` / `env-only` / `unset-fallback` — `env-match` is the normalized-equal row, where the env value is the credentialed form of the declaration rather than an override), the container-side resolution banner, and the in-container doctor check — not from per-session nagging.
+
+On the host side, `--show-env` reads the declaration from the local clone cache, so it also distinguishes *no declaration* from *no cache*: a warm mirror whose work repo carries no `sources.yaml` renders `declared: none (no sources.yaml in the work repo)`, while `declared: unknown (work repo not cached)` means the mirror itself is cold or unusable and says nothing about whether declarations exist.
+
+#### Known trade-off: declared-only sources are not clone-cache accelerated
+
+The clone-cache updater (see `LMER_CLONE_CACHE`) warms mirrors for the repos named by `LMER_TASKDEF_REPO` / `LMER_NAPKIN_REPO`. A source configured **only** in `sources.yaml` is not among them: the declaration is authoritative container-side, and host-side it is knowable only through the same best-effort (possibly stale) cache read `--show-env` labels as such. A source you migrate from the env var to a declaration therefore loses warm-mirror acceleration and is cloned directly every session. Correctness is unaffected — this is exactly the cold-cache path lmer used before the cache existed — but if clone time matters for a large taskdef repo, keeping the env var set alongside the declaration (the normalized-equal `env-match` row, which is silent and non-conflicting) keeps the mirror warm.
+
+#### `bin/doctor`
+
+Inside the container, `bin/doctor`'s `🔗 Declared Sources` section reports on the declaration: schema validity, reachability of each declared source (`git ls-remote` against the credential-derived URL), whether the declared `ref` exists on the remote, and whether the cloned taskdef repo's `taskdef.yaml` schema is supported. Every finding is a **warning** — a broken declaration never flips doctor's exit code. The underlying helper CLI (`python3 -m lmer_cli.container.sources doctor --json`) reads `${LMER_WORK_REPO_PATH:-/work}/sources.yaml` by default; pass `--path` to point it elsewhere.
 
 ### Work-Repo Claude Assets
 

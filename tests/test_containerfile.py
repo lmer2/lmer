@@ -112,6 +112,56 @@ class TestContainerfile:
                     assert False, f"{file_path} still references Dockerfile: {line}"
 
 
+class TestPyYamlEntrypointGuarantee:
+    """The bare `python3` the host CLI invokes in-container must have PyYAML.
+
+    The Containerfile guarantees this explicitly (commented build gate), not
+    as an accident of PATH ordering. The in-image import check itself lives in
+    the doctor container-gated tests; here we only assert the Containerfile
+    carries the guarantee.
+    """
+
+    def test_containerfile_has_commented_pyyaml_guarantee(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert "PyYAML guarantee" in content, \
+            "Containerfile missing the commented PyYAML guarantee"
+
+    def test_containerfile_asserts_python3_is_venv(self, project_root):
+        """The build gate pins bare `python3` to the uv-synced venv."""
+        content = (project_root / "Containerfile").read_text()
+        assert '[ "$(command -v python3)" = "/Agents/global/.venv/bin/python3" ]' in content, \
+            "Containerfile build gate does not assert python3 resolves to the venv"
+        assert "import sys, yaml" in content, \
+            "Containerfile build gate does not import yaml"
+
+    def test_guarantee_runs_after_path_env_and_final_sync(self, project_root):
+        """The gate must validate the final state: after ENV PATH and uv sync."""
+        content = (project_root / "Containerfile").read_text()
+        path_env = content.index('ENV PATH="/opt/tools/bin')
+        final_sync = content.rindex("uv sync")
+        gate = content.index("PyYAML guarantee")
+        assert path_env < gate, "PyYAML build gate must come after the ENV PATH line"
+        assert final_sync < gate, "PyYAML build gate must come after the final uv sync"
+
+    def test_venv_path_precedes_system_bin(self, project_root):
+        """/Agents/global/.venv/bin must appear in ENV PATH (ahead of /usr/bin)."""
+        content = (project_root / "Containerfile").read_text()
+        env_line = next(
+            line for line in content.splitlines()
+            if line.startswith('ENV PATH=')
+        )
+        assert "/Agents/global/.venv/bin" in env_line, \
+            "venv bin dir missing from ENV PATH"
+        # ${PATH} (which holds /usr/bin) is appended last, so venv wins
+        assert env_line.rstrip('"').endswith("${PATH}"), \
+            "ENV PATH must append the inherited PATH last so the venv wins"
+
+    def test_pyproject_declares_pyyaml(self, project_root):
+        """The venv only carries PyYAML because pyproject.toml requires it."""
+        content = (project_root / "pyproject.toml").read_text()
+        assert "pyyaml>=6.0" in content, "pyproject.toml no longer requires pyyaml>=6.0"
+
+
 class TestBuildProvenanceBaked:
     def test_containerfile_bakes_build_commit(self):
         content = (Path(__file__).parent.parent / "Containerfile").read_text()

@@ -43,6 +43,7 @@ User guide for the `lmer` command-line interface:
 - Task-based workflows (built-in `chat`, plus tasks loaded from the work-repo or `LMER_TASKDEF_PATHS`)
 - Basic usage examples and command-line options
 - Repository targeting (URLs, local paths, PR/MR/issue URLs)
+- Canonical source configuration (`sources.yaml`)
 - Exec mode and debugging options
 
 **Best for**: Learning how to use the `lmer` CLI tool, understanding task workflows, and getting started with LMER.

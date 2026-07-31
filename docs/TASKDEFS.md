@@ -26,15 +26,31 @@ Tasks are discovered from multiple sources, in this precedence order
 2. **Work-repo global** — `{work_repo}/taskdef/`, applies to every project.
 3. **`LMER_TASKDEF_PATHS`** — colon-separated list of extra directories
    passed via the environment.
-4. **`/taskdef`** — the clone of `LMER_TASKDEF_REPO`, when configured. The
-   CLI appends it after any user-supplied `LMER_TASKDEF_PATHS` entries;
-   `LMER_TASKDEF_REF` pins the clone to a branch/tag/SHA (the rollback
-   lever).
+4. **`/taskdef`** — the dedicated taskdef content repo clone, when
+   configured. The **canonical source** of the clone's URL and ref is the
+   work repo's `sources.yaml` declaration (`sources.taskdef.repo` /
+   `ref`) when present; `LMER_TASKDEF_REPO` / `LMER_TASKDEF_REF` act as
+   mismatch-checked overrides of that declaration — when both are set and
+   disagree, the session stops and asks rather than silently picking one
+   (headless sessions refuse to start). With no declaration and no env
+   var, behavior is unchanged legacy: nothing is cloned and this tier is
+   simply absent. `/taskdef` is appended after any user-supplied
+   `LMER_TASKDEF_PATHS` entries; the resolved ref pins the clone to a
+   branch/tag/SHA (the rollback lever). For the `sources.yaml` schema,
+   resolution table, and trust rule, see the sources.yaml section in
+   [LMER-CLI.md](./LMER-CLI.md).
 5. **Built-in** — the `taskdef/` directory shipped with this repository.
 
 This lets a project ship a customised taskdef in its work-repo project
 directory that shadows the built-in one (or adds a new task type) without
 touching the agents/global repo.
+
+When a taskdef repo *is* configured (declared in `sources.yaml` or via the
+env var) and a higher-precedence tier — work-repo project, work-repo
+global, or an `LMER_TASKDEF_PATHS` entry — shadows one of its taskdef
+names, `/start` prints a loud per-name warning naming the winning tier.
+Shadowing stays a supported override feature (see below); the warning
+makes it deliberate rather than accidental.
 
 ## The per-task manifest (`task.yaml`)
 
