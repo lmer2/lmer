@@ -28,6 +28,8 @@ from lmer_cli.clone_cache import (
     _git_env,
     _split_credentials,
     mirror_path,
+    read_cached_repo_file,
+    read_cached_repo_file_status,
     update_mirrors,
 )
 from lmer_cli.container.clone_and_exec import _mirror_path
@@ -346,6 +348,125 @@ class TestFailSoft:
         log.write_text("x" * (clone_cache.LOG_MAX_BYTES + 1))
         update_mirrors(["https://oauth2:sekrit@127.0.0.1:1/org/repo.git"], cache_root)
         assert log.stat().st_size <= clone_cache.LOG_MAX_BYTES
+
+
+class TestReadCachedRepoFile:
+    """read_cached_repo_file: host-side, read-only, fail-soft mirror reads.
+
+    Uses the *real* URL→mirror mapping (unlike the `cache` fixture) so the
+    reader is exercised end-to-end: resolve cache root, map URL, git show.
+    """
+
+    URL = "https://git.example.com/org/repo.git"
+    SOURCES = "sources:\n  - name: demo\n"
+
+    @pytest.fixture
+    def mirrored(self, tmp_path, upstream, monkeypatch):
+        """A real bare mirror at the real mapping's location for URL."""
+        (upstream / "sources.yaml").write_text(self.SOURCES)
+        _git("add", ".", cwd=upstream)
+        _git("commit", "-m", "declare sources", cwd=upstream)
+        cache_root = tmp_path / "reader-cache"
+        mirror = mirror_path(cache_root, self.URL)
+        mirror.parent.mkdir(parents=True)
+        subprocess.run(
+            ["git", "clone", "--bare", "--quiet", str(upstream), str(mirror)],
+            check=True,
+            capture_output=True,
+        )
+        monkeypatch.setenv("LMER_CLONE_CACHE_DIR", str(cache_root))
+        return cache_root, mirror
+
+    def test_returns_file_content_from_real_mirror(self, mirrored):
+        assert read_cached_repo_file(self.URL, "sources.yaml") == self.SOURCES
+
+    def test_unmapped_local_url_returns_none(self, mirrored, upstream):
+        # a local path never maps to a mirror — even though it is itself a
+        # perfectly readable git repo, the reader must not touch it
+        assert read_cached_repo_file(str(upstream), "sources.yaml") is None
+
+    def test_absent_mirror_returns_none(self, tmp_path, monkeypatch):
+        cache_root = tmp_path / "empty-cache"
+        cache_root.mkdir()
+        monkeypatch.setenv("LMER_CLONE_CACHE_DIR", str(cache_root))
+        assert read_cached_repo_file(self.URL) is None
+
+    def test_absent_cache_root_returns_none(self):
+        # HOME is hermetic and LMER_CLONE_CACHE_DIR unset: the default cache
+        # root does not exist, and the reader must not create it
+        assert read_cached_repo_file(self.URL) is None
+        assert not (Path(os.environ["HOME"]) / ".lmer" / "clone-cache").exists()
+
+    def test_headless_mirror_returns_none(self, mirrored):
+        _, mirror = mirrored
+        (mirror / "HEAD").unlink()
+        assert read_cached_repo_file(self.URL) is None
+
+    def test_missing_file_at_head_returns_none(self, mirrored):
+        assert read_cached_repo_file(self.URL, "no-such-file.yaml") is None
+
+    def test_missing_git_binary_returns_none(self, mirrored, monkeypatch):
+        def boom(*a, **kw):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(clone_cache.subprocess, "run", boom)
+        assert read_cached_repo_file(self.URL) is None
+
+    def test_tokenized_url_leaks_no_credential(self, mirrored):
+        tokenized = "https://oauth2:sekrit@git.example.com/org/repo.git"
+        content = read_cached_repo_file(tokenized, "sources.yaml")
+        # mapping scrubs userinfo: same mirror as the plain URL, content back
+        assert content == self.SOURCES
+        assert "sekrit" not in content
+        # a pure read logs nothing — and certainly never the token
+        log = Path(os.environ["HOME"]) / ".lmer" / "logs" / "clone-cache.log"
+        assert not log.exists() or "sekrit" not in log.read_text()
+
+    def test_status_reports_hit_with_content(self, mirrored):
+        assert read_cached_repo_file_status(self.URL, "sources.yaml") == (
+            self.SOURCES,
+            clone_cache.CACHE_HIT,
+        )
+
+    def test_status_distinguishes_absent_file_from_cold_cache(
+        self, mirrored, tmp_path, monkeypatch
+    ):
+        """The distinction the None-collapsing reader cannot make: a warm
+        mirror of a repo that simply lacks the file is NOT a cache miss."""
+        content, reason = read_cached_repo_file_status(self.URL, "no-such-file.yaml")
+        assert (content, reason) == (None, clone_cache.CACHE_FILE_ABSENT)
+
+        cold = tmp_path / "cold-cache"
+        cold.mkdir()
+        monkeypatch.setenv("LMER_CLONE_CACHE_DIR", str(cold))
+        assert read_cached_repo_file_status(self.URL) == (
+            None,
+            clone_cache.CACHE_NO_MIRROR,
+        )
+
+    def test_status_reports_headless_mirror_separately(self, mirrored):
+        """A mirror whose HEAD names no commit has nothing to show yet — a
+        different answer from "the file is not in this repo"."""
+        _, mirror = mirrored
+        (mirror / "HEAD").write_text("ref: refs/heads/no-such-branch\n")
+        assert read_cached_repo_file_status(self.URL) == (
+            None,
+            clone_cache.CACHE_NO_HEAD,
+        )
+
+    def test_status_reports_error_when_git_is_unusable(self, mirrored, monkeypatch):
+        def boom(*a, **kw):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(clone_cache.subprocess, "run", boom)
+        assert read_cached_repo_file_status(self.URL) == (None, clone_cache.CACHE_ERROR)
+
+    def test_read_writes_nothing_to_the_cache(self, mirrored):
+        cache_root, _ = mirrored
+        before = sorted(str(p.relative_to(cache_root)) for p in cache_root.rglob("*"))
+        assert read_cached_repo_file(self.URL, "sources.yaml") == self.SOURCES
+        after = sorted(str(p.relative_to(cache_root)) for p in cache_root.rglob("*"))
+        assert after == before  # no locks, no stamps, no tmp dirs
 
 
 class TestEntrypoint:

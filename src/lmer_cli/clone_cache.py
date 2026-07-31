@@ -7,11 +7,16 @@ that containers consume **read-only**: working clones are made with
 a stale or absent mirror is never wrong, and a damaged one is covered by
 the container's retry-direct fallback.
 
-This module is the cache's **single writer**. The CLI forks it detached at
-launch (``python -m lmer_cli.clone_cache``, repo URLs on stdin) so a
-session never waits on mirror maintenance; the same entrypoint serves
-external schedulers (systemd timer, k8s CronJob) that want to warm a cache
-on a cadence.
+This module is the cache's **single writer** and its single host-side
+**reader**. Writing: the CLI forks it detached at launch (``python -m
+lmer_cli.clone_cache``, repo URLs on stdin) so a session never waits on
+mirror maintenance; the same entrypoint serves external schedulers
+(systemd timer, k8s CronJob) that want to warm a cache on a cadence.
+Reading: :func:`read_cached_repo_file` lets the host see a file at a
+mirror's HEAD without a checkout (e.g. a work repo's declared sources for
+``--show-env``) — reads are **local-only** (no network, no fetch, no lock,
+no writes to the cache) and fail-soft: any miss or trouble yields None,
+never an exception.
 
 Credential rules (the reason this code lives host-side at all):
 
@@ -52,11 +57,87 @@ FETCH_TIMEOUT_S = 300  # refresh of an existing mirror
 CREATE_TIMEOUT_S = 900  # initial build of a large repo's mirror
 LOCK_DROPPING_MAX_AGE_S = 3600  # git *.lock files older than this are litter
 LOG_MAX_BYTES = 1_000_000  # clone-cache.log cap (truncate-and-restart)
+SHOW_TIMEOUT_S = 10  # read of one blob from a local mirror
 
 
 def mirror_path(cache_root: Path, repo_url: str) -> "Path | None":
     """The container's URL→``<host>/<project>.git`` mapping, reused verbatim."""
     return _mirror_path(Path(cache_root), repo_url)
+
+
+# Why read_cached_repo_file_status came back without content. The one
+# distinction a caller actually needs to phrase a message: FILE_ABSENT means
+# the mirror is fine and the repo simply does not carry that file (the normal
+# state for a work repo that declares nothing), while the other reasons mean
+# the cache has no usable answer yet.
+CACHE_HIT = "hit"
+CACHE_NO_MIRROR = "no-mirror"  # no cache dir, no mapping, or no mirror/HEAD
+CACHE_NO_HEAD = "no-head"  # mirror present but HEAD resolves to no commit
+CACHE_FILE_ABSENT = "absent"  # HEAD is a commit; the file is not in it
+CACHE_ERROR = "error"  # git missing, timeout, undecodable blob, …
+
+
+def read_cached_repo_file_status(
+    repo_url: str, path: str = "sources.yaml"
+) -> "tuple[str | None, str]":
+    """:func:`read_cached_repo_file`, with the reason for a miss preserved.
+
+    Returns ``(content, reason)`` where *reason* is one of the ``CACHE_*``
+    constants above and *content* is non-None only for ``CACHE_HIT``. Same
+    contract as the plain reader in every other respect — purely local,
+    fail-soft, never raises — it just does not throw the cause away, so a
+    caller can tell "this repo declares nothing" apart from "the cache is
+    cold". Resolving HEAD before the read is what makes that distinction
+    trustworthy: with a commit at HEAD, a failing ``git show`` means the
+    file is not in the tree rather than that there was nothing to show.
+    """
+    try:
+        cache_root = resolve_host_clone_cache_dir()
+        mirror = mirror_path(cache_root, repo_url)
+        if mirror is None or not (mirror / "HEAD").exists():
+            return None, CACHE_NO_MIRROR
+        head = subprocess.run(
+            ["git", "-C", str(mirror), "rev-parse", "--verify", "--quiet",
+             "HEAD^{commit}"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=SHOW_TIMEOUT_S,
+        )
+        if head.returncode != 0:
+            return None, CACHE_NO_HEAD
+        result = subprocess.run(
+            ["git", "-C", str(mirror), "show", f"HEAD:{path}"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=SHOW_TIMEOUT_S,
+        )
+    except Exception:
+        return None, CACHE_ERROR
+    if result.returncode != 0:
+        return None, CACHE_FILE_ABSENT
+    return result.stdout, CACHE_HIT
+
+
+def read_cached_repo_file(repo_url: str, path: str = "sources.yaml") -> "str | None":
+    """Best-effort read of one file at HEAD of *repo_url*'s cached mirror.
+
+    Purely local: no network, no fetch, no flock, no writes to the cache —
+    just ``git show HEAD:<path>`` against whatever mirror the updater last
+    left behind (which may be stale; a stale answer is still useful and a
+    cold cache is a normal miss). Every failure mode returns None — no
+    cache dir, no mirror, mirror without HEAD, file absent at HEAD, git
+    binary missing, timeout, undecodable blob — so a caller like
+    ``--show-env`` can never be broken by cache state. The credentialed
+    URL is never logged and never part of the return value (the mapping
+    scrubs userinfo, and this function emits nothing).
+
+    Deliberately collapses every one of those causes into None; a caller
+    that must distinguish them (to say "no sources.yaml" rather than "not
+    cached") uses :func:`read_cached_repo_file_status` instead.
+    """
+    return read_cached_repo_file_status(repo_url, path)[0]
 
 
 def _log_path() -> Path:

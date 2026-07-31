@@ -121,6 +121,21 @@ class TestContainerBuild:
             f"mise not available:\n{result.stderr}"
         )
 
+    def test_pyyaml_available(self, build_result, container_runtime):
+        """PyYAML must be importable in the image (doctor parses sources.yaml)."""
+        if build_result.returncode != 0:
+            pytest.skip("Build failed")
+        result = subprocess.run(
+            [container_runtime, "run", "--rm", BUILD_TAG,
+             "python3", "-c", "import yaml"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, (
+            f"PyYAML not importable:\n{result.stderr}"
+        )
+
     def test_venv_exists(self, build_result, container_runtime):
         """The project venv at /Agents/global/.venv must exist."""
         if build_result.returncode != 0:
@@ -138,9 +153,12 @@ class TestContainerBuild:
 
         A bare `docker run` without bind mounts, credentials, or full
         shell init will legitimately report some errors (missing
-        .credentials.json, node needing mise activation, etc.).  We
-        verify the script itself doesn't crash (exit 2) and produces
-        a complete report covering every check category.
+        .credentials.json, node needing mise activation, etc.).  There
+        is also no /work mount, so no sources.yaml exists — the
+        Declared Sources checks must degrade gracefully rather than
+        crash or block.  We verify the script itself doesn't crash
+        (exit 2) and produces a complete report covering every check
+        category.
         """
         if build_result.returncode != 0:
             pytest.skip("Build failed")
@@ -167,6 +185,7 @@ class TestContainerBuild:
             "Workspace",
             "SSH Agent",
             "Python Environment",
+            "Declared Sources",
             "Summary",
         ]:
             assert section in result.stdout, (

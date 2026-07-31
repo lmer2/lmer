@@ -19,6 +19,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 import re
@@ -26,6 +27,12 @@ from typing import Iterable, Mapping
 from dotenv import dotenv_values
 
 from . import resolve
+from .clone_cache import (
+    CACHE_ERROR,
+    CACHE_FILE_ABSENT,
+    read_cached_repo_file_status,
+)
+from .container import sources as container_sources
 from .container_home import ensure_container_home
 from .log import error, info, success, warning
 from .mounts import (
@@ -859,6 +866,161 @@ def _display_env_config_cli(
     print("---")
 
 
+def _display_sources_config_cli() -> None:
+    """Render the canonical-sources block (sources.yaml, issue #105) for --show-env.
+
+    Placement decisions (recorded for plan task 11):
+
+    (a) Sibling renderer called from BOTH --show-env call sites (the normal
+        path and the UnknownHarnessError fail-fast branch), NOT from inside
+        _display_env_config_cli: that function returns early when no LMER_*
+        vars are set, which would drop this block exactly when it is most
+        useful (nothing overridden means the declared/unset picture IS the
+        answer), and folding it in would break that function's tested
+        no-LMER-vars no-output contract.
+
+    (b) A source with neither a declaration nor an env var prints an explicit
+        `unset-fallback` row rather than being omitted — issue #105's "loud
+        when unset" requirement is satisfied HERE, in the host-side display.
+
+    (c) A cached sources.yaml that fails validation is surfaced as
+        `declared: invalid (<scrubbed reason>)` and the rows fall back to
+        env-only/unset-fallback; nothing raises and the exit code is
+        untouched — this renderer is strictly display-only. The recoverable
+        half of the same channel — load_sources' warnings list — prints as
+        `⚠️` lines under the `declared:` line, matching what bin/doctor and
+        container startup surface for the same file.
+
+    Declared side: the work repo's sources.yaml is read from the local clone
+    cache (read_cached_repo_file_status — no network, fail-soft) against the
+    RAW LMER_WORK_REPO env value, because the work-repo URL derivation further
+    down main() has not run yet at either call site. A cache hit is labeled
+    `(cached, possibly stale)`. A miss is phrased from the reason the reader
+    reports rather than from the bare None the plain reader returns: a warm
+    mirror whose repo carries no sources.yaml renders `declared: none (no
+    sources.yaml in the work repo)` — the expected state until the cutover —
+    and only a genuinely cold/unusable cache renders `unknown (work repo not
+    cached)`. Parse/validate/normalize/redact all come from the core
+    library (lmer_cli.container.sources) — nothing is reimplemented here;
+    the normalizer decides declared-vs-env equality so an env var that
+    silently matches the declaration is labeled `env-match` (the same origin
+    the container banner prints for that row), never `env-override`.
+    """
+    work_repo_url = os.environ.get("LMER_WORK_REPO", "")
+    config: "dict | None" = None
+    # Recoverable findings from load_sources (unknown keys, reserved keys,
+    # forward-compat notices). bin/doctor and container startup both print
+    # them; dropping them here would render a typo'd declaration as a clean
+    # `declared:` line on the one surface an operator uses to understand
+    # what their declaration is doing (review finding).
+    load_warnings: "list[str]" = []
+    if not work_repo_url:
+        declared_status = "unknown (LMER_WORK_REPO not set)"
+    else:
+        cached, cache_reason = read_cached_repo_file_status(
+            work_repo_url, container_sources.SOURCES_FILENAME
+        )
+        if cached is None:
+            if cache_reason == CACHE_FILE_ABSENT:
+                # Warm mirror, no declaration — the expected state for every
+                # work repo until the cutover lands, so it must not read as a
+                # clone-cache problem the operator should go debug.
+                declared_status = (
+                    f"none (no {container_sources.SOURCES_FILENAME} in the work repo)"
+                )
+            elif cache_reason == CACHE_ERROR:
+                declared_status = "unknown (work-repo cache unreadable)"
+            else:
+                declared_status = "unknown (work repo not cached)"
+        else:
+            tmp: "Path | None" = None
+            try:
+                # load_sources reads a file path; hand the cached bytes to it
+                # as a throwaway sources.yaml so schema/credential/trust-rule
+                # validation runs exactly as the container will run it.
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td) / container_sources.SOURCES_FILENAME
+                    tmp.write_text(cached, encoding="utf-8")
+                    config, raw_warnings = container_sources.load_sources(
+                        tmp, work_repo_url=work_repo_url
+                    )
+                # Warnings name the file by the path load_sources was given
+                # — the throwaway copy. Rewrite it to the real filename, the
+                # same substitution the SourcesConfigError branch does.
+                load_warnings = [
+                    w.replace(str(tmp), container_sources.SOURCES_FILENAME)
+                    for w in raw_warnings
+                ]
+                declared_status = "sources.yaml from work-repo cache (cached, possibly stale)"
+            except container_sources.SourcesConfigError as exc:
+                # Decision (c): render, never raise. Strip the throwaway temp
+                # path so the message names the real file, and scrub before
+                # printing — the reason may echo (scrubbed) repo URLs.
+                reason = str(exc)
+                if tmp is not None:
+                    reason = reason.replace(str(tmp), container_sources.SOURCES_FILENAME)
+                declared_status = f"invalid ({container_sources.scrub_credentials(reason)})"
+                config = None
+            except Exception as exc:  # display-only: never break --show-env
+                declared_status = f"unknown (cache read failed: {type(exc).__name__})"
+                config = None
+
+    declared_sources = (config or {}).get("sources") or {}
+    rows = []
+    for label, name, key, env_var in (
+        ("taskdef repo", "taskdef", "repo", "LMER_TASKDEF_REPO"),
+        ("taskdef ref", "taskdef", "ref", "LMER_TASKDEF_REF"),
+        ("napkin repo", "napkin", "repo", "LMER_NAPKIN_REPO"),
+    ):
+        declared_value = (declared_sources.get(name) or {}).get(key)
+        env_value = (os.environ.get(env_var) or "").strip() or None
+        if declared_value and env_value:
+            if key == "repo":
+                # Core predicate, not string equality: `git@h:o/x.git` and
+                # `https://h/o/x` are the same source, not an override — and
+                # so is the URL the container would derive from the
+                # declaration, which is what an SSH-on-a-custom-port work
+                # repo produces. Shared with the container's matrix so both
+                # surfaces call this row env-match.
+                same = container_sources.env_matches_declared(
+                    env_value, declared_value, work_repo_url
+                )
+            else:
+                same = env_value == declared_value  # refs are opaque strings
+            if same:
+                value, origin = declared_value, "env-match (declaration cached, possibly stale)"
+            else:
+                value, origin = env_value, "env-override"
+        elif declared_value:
+            value, origin = declared_value, "declared (cached, possibly stale)"
+        elif env_value:
+            value, origin = env_value, "env-only"
+        else:
+            # Decision (b): loud, explicit unset row.
+            value, origin = "(unset)", "unset-fallback"
+        # A valid config never carries credentials (load_sources refuses),
+        # but env values can — scrub every rendered value unconditionally
+        # (core-library redactor; _redact_env_value is the same host-side
+        # pattern but misses scp-form credentials).
+        rows.append((label, container_sources.scrub_credentials(value), origin))
+
+    name_width = max(len(r[0]) for r in rows)
+    value_width = max(len(r[1]) for r in rows)
+    print("---")
+    print("📚 Canonical Sources (sources.yaml):\n")
+    print(f"  declared: {declared_status}\n")
+    for warning in load_warnings:
+        # Scrub unconditionally, the same rule the rows below follow.
+        print(f"  ⚠️  {container_sources.scrub_credentials(warning)}")
+    if load_warnings:
+        print()
+    print(f"  {'Source':<{name_width}}  {'Value':<{value_width}}  Origin")
+    print(f"  {'─' * name_width}  {'─' * value_width}  {'─' * 20}")
+    for label, value, origin in rows:
+        print(f"  {label:<{name_width}}  {value:<{value_width}}  {origin}")
+    print("---")
+
+
 def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
     """Validate mutually exclusive / dependent options on a parsed namespace.
 
@@ -1523,8 +1685,12 @@ def main(argv: list[str] | None = None) -> int:
         # Fail fast — but under --show-env render the env table first: that
         # table is exactly the diagnostic for finding where a typo'd
         # LMER_HARNESS value comes from (host export vs. which .env file).
+        # The sources block is a sibling call (not inside the env renderer)
+        # so it still prints when no LMER_* vars are set — see
+        # _display_sources_config_cli's decision record.
         if ns.show_env:
             _display_env_config_cli(host_lmer_vars, early_env_file_sources)
+            _display_sources_config_cli()
         error(f"❌ {e}")
         return 2
     user_tag = " [user-installed]" if harness.source_dir is not None else ""
@@ -1549,9 +1715,12 @@ def main(argv: list[str] | None = None) -> int:
         _agents_child_harnesses(resolved_agents, harness) if resolved_agents else []
     )
 
-    # Handle --show-env: display env config table
+    # Handle --show-env: display env config table, then the canonical-sources
+    # block (sibling call so it renders even when the env table early-returns
+    # with no LMER_* vars set — see _display_sources_config_cli).
     if ns.show_env:
         _display_env_config_cli(host_lmer_vars, early_env_file_sources)
+        _display_sources_config_cli()
         # Without a task, just show env and exit
         if not ns.task and not ns.no_task:
             return 0
@@ -1897,6 +2066,16 @@ def main(argv: list[str] | None = None) -> int:
     # Host-side cache maintenance (#112): freshen/build the mirrors for every
     # repo this session will clone, in a detached background updater. The
     # session never waits on it; the container consumes the cache read-only.
+    #
+    # ACCEPTED GAP (#105): only the env-var forms are warmed. A taskdef/napkin
+    # source configured purely in the work repo's sources.yaml has no
+    # LMER_TASKDEF_REPO/LMER_NAPKIN_REPO here, so no mirror is ever built for
+    # it and the container's cache lookup misses every session — declaring a
+    # source is slower than exporting one. Deliberate, not an oversight: the
+    # declaration is only knowable host-side through the best-effort clone
+    # cache (the same possibly-stale read --show-env labels as such), and
+    # resolution is authoritative container-side, after this point. Documented
+    # in docs/LMER-CLI.md under Canonical Source Declarations.
     if clone_cache_container_dir is not None:
         _spawn_clone_cache_updater(
             [repo_url, work_repo_url, napkin_repo_url, taskdef_repo_url]
