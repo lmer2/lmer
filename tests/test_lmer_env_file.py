@@ -11,7 +11,7 @@ file is non-fatal (warned, then skipped).
 
 The behavioral tests run the real ``main()`` with the container runtime mocked
 out (reusing the harness from ``test_lmer_cli_slack_target``) and inspect the
-env dict the CLI hands to ``env_args``.
+env dict the CLI hands to ``build_container_env``.
 """
 
 import os

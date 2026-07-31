@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -79,7 +80,14 @@ from .presets import (
     select_preset_name,
     task_preset_env_name,
 )
-from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
+from .runtime import (
+    base_run_args,
+    build_container_env,
+    ContainerEnvError,
+    detect_runtime,
+    lmer_state_dir,
+    repo_root_path,
+)
 from .service import ServiceError, resolve_container, inspect_container_workdir
 from .tokens import (
     _get_gitlab_token,
@@ -203,6 +211,49 @@ def _publish_host_ports(
     """
     for port in ports:
         run += ["-p", f"{bind}:{port}:{port}"]
+
+
+def _make_sigterm_cleanup_handler(container_env):
+    """SIGTERM handler that deletes the env file, then dies as SIGTERM would.
+
+    Python's default SIGTERM disposition terminates without unwinding, which
+    strands the session's mode-0600 env file in ``$TMPDIR`` holding the
+    tokenized work-repo URL and every forwarded token (issue #158).
+
+    It deliberately does NOT raise. ``subprocess.call`` is::
+
+        with Popen(...) as p:
+            try:
+                return p.wait(timeout=timeout)
+            except:          # bare — catches SystemExit too
+                p.kill()
+                raise
+
+    so raising ``SystemExit`` here would unwind through that bare ``except``
+    and SIGKILL the ``docker``/``podman run`` client. In a non-TTY spawn the
+    client forwarding SIGTERM is exactly what stops the container (docker's
+    ``--sig-proxy`` is non-TTY-only), and ``--rm`` removal is daemon-side and
+    conditional on that exit — so killing the client leaves a running
+    container behind. That is why this restores the default disposition and
+    re-raises the signal at itself instead: process semantics stay identical
+    to having no handler at all, and the file still gets deleted.
+
+    "Identical to having no handler" is exact for the CLI, whose SIGTERM
+    disposition IS the default. It is not exact for a hypothetical in-process
+    caller that had installed ``SIG_IGN`` or a handler of its own before
+    calling ``main()``: this restores ``SIG_DFL``, so such a parent would die
+    where it previously ignored the signal. Nothing calls ``main()`` that way
+    today, and preserving the caller's disposition would mean either returning
+    from the handler (the file survives a second signal) or raising (the
+    unwinding this exists to avoid).
+    """
+
+    def _handler(signum, frame) -> None:
+        container_env.cleanup()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    return _handler
 
 
 def _apply_port_passthrough(
@@ -2170,72 +2221,108 @@ def main(argv: list[str] | None = None) -> int:
     if port_rc is not None:
         return port_rc
 
-    run += env_args(env)
-
-    # Image name was resolved earlier (before ensure_image)
-    run += [image]
-
-    # Container command
-    # Service mode and checkout mode still use clone_and_exec.py for work repo
-    # and MR branch handling — only --no-clone/--no-task skip it entirely.
-    use_clone_script = not (ns.no_clone or ns.no_task)
-    if not use_clone_script:
-        # Skip clone script entirely, run command directly
-        cmd_tokens = rest if rest else ["bash"]
-        run += cmd_tokens
-    else:
-        # Call the container clone+exec script from mounted repo
-        clone_script = "/Agents/global/src/lmer_cli/container/clone_and_exec.py"
-
-        if exec_mode:
-            # Remaining tokens after --exec are the command to run; if empty, default to bash
-            cmd_tokens = rest if rest else ["bash"]
-            run += [
-                "python3",
-                clone_script,
-                "--",
-                *cmd_tokens,
-            ]
-        else:
-            # Default to the harness runner (historically the literal
-            # "claude-runner" token, kept for claude so a new host CLI still
-            # works against older images).
-            run += [
-                "python3",
-                clone_script,
-                "--",
-                harness.runner_command,
-            ]
-
-    info("Running: " + shlex.join(run))
-
-    # A real interactive session (the default claude-runner path) attached to a
-    # special target announces itself via its handler's lifecycle hooks while it
-    # runs, so peers can tell the target is already taken. For a Slack thread
-    # this records the attachment in the host-side registry the listener
-    # consults, so it won't connect a second lmer to a thread that already has
-    # one — including this session if it was started manually (issue #74).
-    # --exec / --no-task one-shots are not interactive sessions, so they don't
-    # announce.
-    announce_session = use_clone_script and not exec_mode
-    if announce_session:
-        for handler in special_targets:
-            handler.on_session_start()
-
-    success(f"🚀 Launching container ({runtime} run {image})")
-    if runtime == "podman":
-        success(
-            "   (first run with this image may take several minutes "
-            "while podman remaps UIDs for --userns=keep-id)"
-        )
+    # Container environment. Values ride a mode-0600 --env-file (plus bare
+    # -e NAME inheritance markers for the few that a line-oriented file
+    # cannot carry), never argv — /proc/<pid>/cmdline is world-readable and
+    # used to expose every token a session carries (issue #158). A variable
+    # neither leg can carry aborts the launch rather than falling back to an
+    # inline -e NAME=value, so the invariant cannot be quietly violated.
     try:
-        return subprocess.call(run)
-    except KeyboardInterrupt:
-        return 130
-    finally:
+        container_env = build_container_env(env)
+    except ContainerEnvError as exc:
+        error(f"❌ {exc}")
+        return 2
+    # Installed immediately after the file exists — before the args are even
+    # appended — so the create→install window a signal could slip through is as
+    # narrow as possible. SIGTERM here is routine rather than an operator
+    # mishap: a reaped session (systemd KillMode=control-group, an orchestrator,
+    # the Slack reaper's ladder) gets one before SIGKILL. Unavailable off the
+    # main thread, where an embedded caller owns signal disposition anyway.
+    try:
+        previous_sigterm = signal.signal(
+            signal.SIGTERM, _make_sigterm_cleanup_handler(container_env)
+        )
+    except ValueError:
+        previous_sigterm = None
+    run += container_env.args
+    try:
+        # Image name was resolved earlier (before ensure_image)
+        run += [image]
+
+        # Container command
+        # Service mode and checkout mode still use clone_and_exec.py for work repo
+        # and MR branch handling — only --no-clone/--no-task skip it entirely.
+        use_clone_script = not (ns.no_clone or ns.no_task)
+        if not use_clone_script:
+            # Skip clone script entirely, run command directly
+            cmd_tokens = rest if rest else ["bash"]
+            run += cmd_tokens
+        else:
+            # Call the container clone+exec script from mounted repo
+            clone_script = "/Agents/global/src/lmer_cli/container/clone_and_exec.py"
+
+            if exec_mode:
+                # Remaining tokens after --exec are the command to run; if empty, default to bash
+                cmd_tokens = rest if rest else ["bash"]
+                run += [
+                    "python3",
+                    clone_script,
+                    "--",
+                    *cmd_tokens,
+                ]
+            else:
+                # Default to the harness runner (historically the literal
+                # "claude-runner" token, kept for claude so a new host CLI still
+                # works against older images).
+                run += [
+                    "python3",
+                    clone_script,
+                    "--",
+                    harness.runner_command,
+                ]
+
+        # No environment VALUE appears here: build_container_env emits only
+        # --env-file plus bare -e NAME markers (enforced by its postcondition).
+        # The one inline -e in the command comes from mounts.py's
+        # SSH_AUTH_SOCK=/ssh-agent, a fixed container-side socket path.
+        info("Running: " + shlex.join(run))
+
+        # A real interactive session (the default claude-runner path) attached to a
+        # special target announces itself via its handler's lifecycle hooks while it
+        # runs, so peers can tell the target is already taken. For a Slack thread
+        # this records the attachment in the host-side registry the listener
+        # consults, so it won't connect a second lmer to a thread that already has
+        # one — including this session if it was started manually (issue #74).
+        # --exec / --no-task one-shots are not interactive sessions, so they don't
+        # announce.
+        announce_session = use_clone_script and not exec_mode
         if announce_session:
             for handler in special_targets:
-                handler.on_session_end()
+                handler.on_session_start()
+
+        success(f"🚀 Launching container ({runtime} run {image})")
+        if runtime == "podman":
+            success(
+                "   (first run with this image may take several minutes "
+                "while podman remaps UIDs for --userns=keep-id)"
+            )
+        try:
+            return subprocess.call(run, env=container_env.subprocess_env())
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            if announce_session:
+                for handler in special_targets:
+                    handler.on_session_end()
+    finally:
+        # Cleanup BEFORE restoring the disposition: in the other order a
+        # SIGTERM landing between the two statements gets the default
+        # disposition and strands the file — in the one window where it is
+        # guaranteed to still exist, and the reaper's ladder makes a second
+        # SIGTERM unexceptional.
+        container_env.cleanup()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

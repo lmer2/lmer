@@ -18,7 +18,7 @@ session container, not new sessions.
 
 Behavioral tests run the real ``main()`` with the container runtime mocked
 out (the test_lmer_cli_slack_target harness) and inspect the env dict the CLI
-hands to ``env_args``.
+hands to ``build_container_env``.
 """
 
 import json
