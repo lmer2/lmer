@@ -94,14 +94,21 @@ class TestManifestShape:
         assert "release_signing_key" in creds
 
     def test_declares_push_allow_targets(self):
-        """Push-allow needs for the GitHub mirror (main + tag) and the
+        """Push-target needs for the GitHub mirror (main + tag) and the
         GitLab tag push — roles, never concrete repo URLs (those are
         per-adopter `release:` parameters)."""
-        entries = {e["target"]: e["refs"] for e in _load()["needs"]["push_allow"]}
+        data = _load()
+        entries = {e["target"]: e["refs"] for e in data["needs"]["push_targets"]}
         assert set(entries) == {"github_mirror", "gitlab_origin"}
         assert "refs/heads/main" in entries["github_mirror"]
         assert "refs/tags/*" in entries["github_mirror"]
         assert entries["gitlab_origin"] == ["refs/tags/*"]
+        # The documentation block must NOT share the name of the live grant
+        # key: `push_allow` at the top level IS a push grant (#107), and a
+        # same-named block one indent away is one stray dedent from
+        # becoming one.
+        assert "push_allow" not in data
+        assert "push_allow" not in data["needs"]
 
     def test_masterplan_flag_declared_off(self):
         """The release flow's durable state is `work` run state, not the
