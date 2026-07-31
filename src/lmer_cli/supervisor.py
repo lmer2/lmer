@@ -8,9 +8,12 @@ the user's terminal and claude. The supervisor:
   the slave end as stdin/stdout/stderr.
 - Forwards bytes between the host TTY and the PTY master in both directions,
   preserving raw mode and propagating ``SIGWINCH`` for terminal resizes.
-- Optionally exposes a FastAPI endpoint with two routes for programmatic
-  read/write of the wrapped process. The endpoint is gated by ``--fastapi``
-  (or ``LMER_FASTAPI=1``) and protected with a bearer token.
+- Optionally exposes a FastAPI control plane for programmatic read/write of
+  the wrapped process, plus a ``/resize`` route so a client that renders the
+  session itself — a browser terminal, which has no host TTY behind it and
+  therefore no ``SIGWINCH`` to follow — can declare its own geometry. The
+  endpoint is gated by ``--fastapi`` (or ``LMER_FASTAPI=1``) and protected
+  with a bearer token.
 - Optionally injects ``/start`` followed by a CR to the wrapped process
   shortly after startup so an lmer task begins automatically. Disabled by
   ``--manual-start`` (or ``LMER_MANUAL_START=1``). CR (``\\r``) is what an
@@ -21,6 +24,20 @@ the user's terminal and claude. The supervisor:
   injection is deferred until Claude's input prompt has actually rendered
   (see ``_wait_for_ready_marker``) so a startup-timing race or transient
   modal/dialog can't swallow the submit CR.
+- Tracks when the wrapped process last produced a byte and reports it on
+  ``/healthz`` (``last_output_at`` / ``idle_seconds``). The forwarding loop
+  already sees every chunk on its way to the buffer, the session log and stdout,
+  so the fact costs one clock read per chunk and nothing per probe — and it is
+  the only place it *can* be measured, because a finished-but-unended session is
+  invisible from the host: run state flips when the session ends (spec D24), so
+  until then "working" and "sitting at the prompt with nothing to do" look
+  identical to everything outside the container.
+- Keeps the session's own copy of everything the PTY produced, when (and only
+  when) something mounted a directory at :data:`CONTAINER_SESSION_LOG_DIR` for
+  it to write into. That file is the log of record for an orchestrated session:
+  it is written by this process, inside the container, so it survives anything
+  that happens to the host process attached to the container (see
+  :class:`SessionLog`).
 - Optionally injects a follow-up prompt (host CLI ``--prompt`` →
   ``LMER_START_PROMPT``) a configurable delay after the ``/start`` injection so
   an automated run can hand claude an extra instruction without manual typing.
@@ -49,9 +66,10 @@ import threading
 import time
 import tty
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterable, Mapping, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .harness import UnknownHarnessError, resolve_harness
 from .util import decode_escape_bytes
@@ -114,6 +132,17 @@ OUTPUT_BUFFER_LIMIT = 1024 * 1024  # 1 MiB rolling buffer of child output
 # receives a SIGWINCH and re-renders with the correct dimensions.
 DEFAULT_WINSIZE_RECHECK_DELAY = 0.5
 
+# Bounds on the geometry the FastAPI ``/resize`` route will apply. Zero rows or
+# columns is not "size unknown", it is a wedged terminal: a TUI lays out against
+# whatever the PTY reports and then draws nothing, and a browser session has no
+# host TTY whose SIGWINCH would put it back to a usable size — so 0 is refused
+# rather than applied. The ceiling is equally deliberate:
+# ``struct.pack("HHHH", ...)`` in :func:`_set_winsize` raises outright past
+# 65535, and four-digit geometry is a client bug better answered with a 422 than
+# handed to an ioctl.
+MIN_WINSIZE_DIMENSION = 1
+MAX_WINSIZE_DIMENSION = 1000
+
 # Self-shutdown: the wrapped agent can ask the supervisor to quit the session
 # (e.g. an in-container ``lmer-slack end-session`` so a Slack chat session frees
 # its orchestrator slot instead of lingering until the idle timeout) by sending
@@ -134,6 +163,29 @@ DEFAULT_SHUTDOWN_ESCALATE_GRACE = 10.0
 # Poll cadence while waiting for the child to exit between escalation steps.
 SHUTDOWN_POLL_INTERVAL = 0.2
 
+# Where the session's own log goes, and the one rule about these two names: they
+# are a cross-version interface, so they may not change. The orchestrator
+# platform bind-mounts a per-session host directory at CONTAINER_SESSION_LOG_DIR
+# and then *probes* for the file inside it — a session started from an image
+# whose lmer predates this feature simply leaves the directory empty, which is
+# how the platform tells the two apart without asking anything about versions
+# (lmer_platform.spawn.container_log_path_for). Rename either half and a running
+# fleet quietly stops recording, so the value is spelled here once and imported
+# by the mount side rather than repeated.
+#
+# The directory is never created here. Its existence *is* the request: a plain
+# `lmer` run on a laptop has nothing mounted there and must keep writing nothing,
+# and creating it would fill a container's writable layer with a log no reader
+# will ever come looking for.
+CONTAINER_SESSION_LOG_DIR = "/home/developer/.lmer-session"
+SESSION_LOG_NAME = "session.log"
+
+# 0600 rather than the umask's guess: this file is every byte the session drew,
+# credentials the agent typed included, and the directory it lands in is shared
+# with the host by a bind mount (the same reasoning as the transcript's
+# lmer_platform.transcripts.TRANSCRIPT_FILE_MODE).
+SESSION_LOG_MODE = 0o600
+
 
 class OutputBuffer:
     """Thread-safe rolling buffer keyed by cumulative byte offset.
@@ -142,9 +194,36 @@ class OutputBuffer:
     HTTP clients read via :meth:`read_since` using a monotonically
     increasing cursor (the cumulative byte count). Older bytes are evicted
     once the buffer exceeds ``limit``.
+
+    It also keeps *when* the last chunk arrived (:attr:`idle_seconds`), and this
+    is the right object to keep it on for one structural reason: :meth:`append`
+    is the single funnel every byte the wrapped process produced passes through,
+    and :meth:`read_since` — the ``/output`` route, and therefore the platform's
+    re-attach drain — cannot reach it. So "how long has the harness been quiet"
+    can only be moved by the harness *doing something*, never by somebody asking.
+
+    Which settles what counts as activity: **output, and never input**. The
+    question the fact answers is whether the harness is doing anything, and typed
+    input that produces nothing back is exactly the idle case — an operator who
+    answered a prompt and got no response has a wedged session, not a busy one, and
+    a clock that counted their keystroke would report the opposite. Input reaches
+    the child through :func:`run_supervisor`'s write path, which never touches this
+    object. A keystroke the TUI *echoes* does move the clock, and rightly so: in
+    raw mode that echo is the harness drawing.
+
+    ``clock`` is :func:`time.monotonic` rather than the wall clock, and not for
+    tests (though it is injectable for them): an NTP correction mid-session must
+    not be able to report a negative idle, or a quiet session as busy. The wall
+    clock is applied once, at read time, to say *when* that was
+    (:func:`_activity_report`).
     """
 
-    def __init__(self, limit: int = OUTPUT_BUFFER_LIMIT) -> None:
+    def __init__(
+        self,
+        limit: int = OUTPUT_BUFFER_LIMIT,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._limit = limit
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
@@ -152,6 +231,12 @@ class OutputBuffer:
         self._size = 0
         self._start_offset = 0  # offset of first byte still in the buffer
         self._end_offset = 0    # offset just past the last byte ever written
+        self._clock = clock
+        # ``None`` until the first chunk, and it stays that way rather than being
+        # seeded at construction: a session whose harness has not drawn a byte yet
+        # has no last-output moment, and inventing one would date an event that
+        # never happened. See :meth:`idle_seconds`.
+        self._last_append: Optional[float] = None
 
     @property
     def end_offset(self) -> int:
@@ -163,10 +248,31 @@ class OutputBuffer:
         with self._lock:
             return self._start_offset
 
+    @property
+    def idle_seconds(self) -> Optional[float]:
+        """Seconds since the wrapped process last produced output, or ``None``.
+
+        ``None`` means "nothing has been produced at all", which is a real answer
+        and not an error: it covers a session's first moments, and it is the
+        answer a reader has to be able to render as *nothing* rather than as
+        zero — an idle of ``0.0`` says the harness just wrote something.
+
+        Clamped at zero because a monotonic clock read on another thread can land
+        a hair behind the one that recorded the append, and a negative idle is not
+        a fact anybody can act on.
+        """
+        with self._lock:
+            if self._last_append is None:
+                return None
+            return max(0.0, self._clock() - self._last_append)
+
     def append(self, data: bytes) -> None:
         if not data:
             return
         with self._cond:
+            # Under the same lock as the bytes, so a reader can never see output
+            # that the idle clock has not accounted for yet.
+            self._last_append = self._clock()
             self._chunks.append(data)
             self._size += len(data)
             self._end_offset += len(data)
@@ -224,6 +330,124 @@ class OutputBuffer:
             return b"".join(collected), self._end_offset, dropped
 
 
+class SessionLog:
+    """The session's own copy of its PTY output, written from inside the container.
+
+    Why this exists at all, given that the host side already tees the same bytes
+    into a file: the host tee lives in whatever process attached to the container
+    — for an orchestrated session, a thread in the platform daemon holding the PTY
+    *master*, which is an fd and not a path. That process dying takes the tee with
+    it and no successor can re-open it, so the scrollback stops growing while the
+    session inside the container carries on working (the failure
+    :mod:`lmer_platform.reattach` was written to paper over). This log has no such
+    dependency: the writer is the supervisor itself, so the record survives
+    everything short of the container.
+
+    Three properties are load-bearing, and each is a promise the read side relies
+    on:
+
+    - **The file itself is the signal.** The platform probes it rather than asking
+      anything about versions (``lmer_platform.session_io.canonical_log``), so it
+      is opened once at startup — before the wrapped command is even forked — and
+      what is in it means "this session's log of record is here". Which is also
+      why :meth:`write` *removes* it when it can no longer keep that promise: a
+      frozen file that still claimed to be the record would strand a reader on a
+      truncated log while the host tee beside it held everything.
+    - **Unbuffered appends.** The reader is another process tailing the path while
+      the session runs; anything held in this process's buffers is scrollback the
+      operator does not have yet. ``O_APPEND`` for the same reason
+      :func:`lmer_platform.reattach._append` uses it — the position is correct
+      regardless of who else has the file open.
+    - **Never fatal.** A session must not die, or block, because its log did.
+      Every failure degrades to "no in-container log", which is exactly the state
+      an older image is in, and which the platform already handles.
+    """
+
+    def __init__(self, path: str, fd: int) -> None:
+        self.path = path
+        self._fd: Optional[int] = fd
+        self._lock = threading.Lock()
+
+    @classmethod
+    def open_if_mounted(
+        cls, directory: Optional[str] = None, name: str = SESSION_LOG_NAME
+    ) -> "Optional[SessionLog]":
+        """Open the session log if a directory was mounted for it. Else ``None``.
+
+        *directory* defaults to :data:`CONTAINER_SESSION_LOG_DIR` read at call
+        time, so the constant stays the single spelling of the mount point.
+
+        Appends rather than truncates: a truncating open would make a second
+        supervisor in one container erase the first one's record, and there is no
+        case where losing bytes already written is the better answer.
+        """
+        if directory is None:
+            directory = CONTAINER_SESSION_LOG_DIR
+        if not os.path.isdir(directory):
+            return None
+        path = os.path.join(directory, name)
+        try:
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                SESSION_LOG_MODE,
+            )
+        except OSError as exc:
+            # Warned rather than raised: the session is the point, and a platform
+            # that finds no file falls back to the host-side tee.
+            sys.stderr.write(
+                f"lmer-supervisor: cannot open the session log {path!r}: {exc}; "
+                f"this session's output is recorded only by whatever is attached "
+                f"to the container\n"
+            )
+            return None
+        return cls(path, fd)
+
+    def write(self, chunk: bytes) -> None:
+        """Append *chunk*. A failure abandons the log instead of freezing it.
+
+        See the class docstring: the file's presence is a claim about what it
+        contains, so a writer that can no longer append withdraws the claim by
+        unlinking. The alternative — leaving a file that stops at the failure —
+        would have the platform serve a truncated log as canonical and ignore the
+        complete host-side copy beside it.
+        """
+        with self._lock:
+            if self._fd is None:
+                return
+            try:
+                # Looped because ``os.write`` is allowed to write less than it was
+                # given, and a short write here is not a slow log but a hole in the
+                # record — silent, and impossible to spot afterwards.
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(self._fd, view):]
+            except OSError as exc:
+                sys.stderr.write(
+                    f"lmer-supervisor: cannot write the session log "
+                    f"{self.path!r}: {exc}; removing it so the host-side log "
+                    f"stays this session's record\n"
+                )
+                self._abandon()
+
+    def close(self) -> None:
+        """Release the fd. Idempotent, and safe to call on an abandoned log."""
+        with self._lock:
+            fd, self._fd = self._fd, None
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+    def _abandon(self) -> None:
+        """Unlink and stop writing. Caller holds the lock."""
+        fd, self._fd = self._fd, None
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        with contextlib.suppress(OSError):
+            os.unlink(self.path)
+
+
 class _InputBody(BaseModel):
     data: str
     append_newline: bool = False
@@ -235,12 +459,80 @@ class _OutputResponse(BaseModel):
     dropped_bytes: int
 
 
-def _set_winsize(fd: int, rows: int, cols: int) -> None:
-    """Set the window size on a TTY file descriptor."""
+class _ResizeBody(BaseModel):
+    """Geometry for ``POST /resize``, bounds-checked before it reaches the PTY.
+
+    The bounds ride on the fields rather than living in the route body so
+    FastAPI refuses a bad request before any ioctl runs and its 422 names the
+    offending field in ``detail[].loc`` — the browser client that sent a stray
+    ``0`` learns *which* dimension it got wrong instead of watching its
+    terminal wedge.
+    """
+
+    rows: int = Field(ge=MIN_WINSIZE_DIMENSION, le=MAX_WINSIZE_DIMENSION)
+    cols: int = Field(ge=MIN_WINSIZE_DIMENSION, le=MAX_WINSIZE_DIMENSION)
+
+
+def _set_winsize(fd: int, rows: int, cols: int, *, strict: bool = False) -> None:
+    """Set the window size on a TTY file descriptor.
+
+    ``strict`` decides who hears about a failed ioctl, and the two modes exist
+    because the callers differ in whether anyone is owed an answer:
+
+    - The forgiving default serves the host-TTY path — the ``SIGWINCH`` handler
+      and the post-launch recheck timer. Those fire on their own schedule and
+      routinely race a PTY that is being torn down as the child exits; a
+      terminal that is already gone is not something they can act on, so they
+      shrug and let the session finish shutting down.
+    - ``strict=True`` serves a caller that was *asked* to resize and has to
+      reply — the FastAPI ``/resize`` route. Swallowing the error there would
+      answer 200 with geometry that never reached the PTY, leaving a browser
+      client rendering at the wrong size with no signal that its request was
+      lost. Raising lets the route report the failure honestly.
+    """
     try:
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     except OSError:
-        pass
+        if strict:
+            raise
+
+
+def _activity_report(
+    idle_seconds: Optional[float], *, now: Optional[datetime] = None
+) -> dict:
+    """The two ``/healthz`` fields that say when the harness last did something.
+
+    Both spellings come out of the *same* reading of the idle clock, so they can
+    never disagree with each other, and both are ``None`` together when nothing
+    has been produced yet (:attr:`OutputBuffer.idle_seconds`) — reported as nulls
+    rather than omitted keys, for the reason the geometry is (see
+    :func:`_build_fastapi_app`).
+
+    Why both: ``idle_seconds`` is the *measurement*, taken from one monotonic
+    clock inside the container, and it is what a reader can act on without owning
+    a correct clock of its own — a browser on a phone comparing a timestamp
+    against its own idea of now is how a busy session comes to look abandoned.
+    ``last_output_at`` is that same measurement placed on the wall clock, because
+    it is the form that survives being written down: a number of seconds is only
+    true at the instant it was read, and anything that logs or forwards this needs
+    a moment, not an age.
+
+    The wall clock is applied here, at read time, and only here. Recording it at
+    append time instead would cost a second syscall per chunk and would freeze a
+    pre-NTP-correction timestamp into the record.
+
+    Rounded to a tenth: the question is "has this been quiet for a while", asked
+    in minutes, and the remaining digits of a float are noise in a payload an
+    operator reads.
+    """
+    if idle_seconds is None:
+        return {"last_output_at": None, "idle_seconds": None}
+    wall = datetime.now(timezone.utc) if now is None else now
+    last = wall - timedelta(seconds=idle_seconds)
+    return {
+        "last_output_at": last.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "idle_seconds": round(idle_seconds, 1),
+    }
 
 
 def _preconfigure_pty_for_injection(fd: int) -> None:
@@ -378,12 +670,37 @@ def _build_fastapi_app(
     output: OutputBuffer,
     write_input: "callable[[bytes], int]",
     token: str,
+    *,
+    resize: Optional[Callable[[int, int], None]] = None,
+    get_winsize: Optional[Callable[[], Optional[tuple[int, int]]]] = None,
 ):
-    """Construct the FastAPI app exposing ``/input`` and ``/output``.
+    """Construct the FastAPI app exposing ``/input``, ``/output`` and ``/resize``.
 
     ``write_input`` is called with the bytes to deliver to the wrapped
-    process's stdin. ``token`` gates both endpoints via the
+    process's stdin. ``token`` gates every endpoint via the
     ``Authorization: Bearer <token>`` header.
+
+    ``/resize`` is for sessions with no host TTY behind them: a browser-rendered
+    terminal inherits whatever geometry the PTY was created with and has no
+    ``SIGWINCH`` to correct it, so the client itself has to say how wide it is.
+    When a host TTY *is* attached it stays authoritative — its next
+    ``SIGWINCH`` re-applies the host geometry over anything posted here.
+
+    ``resize`` and ``get_winsize`` are how the routes reach the PTY master: the
+    app only ever sees these callables, never the fd, so the control plane can
+    be exercised without allocating a terminal. Both are optional because the
+    app predates them and older callers pass three positional arguments — with
+    neither supplied ``/input``/``/output`` behave exactly as before,
+    ``/resize`` answers 503 (there is nothing to resize, which is a deployment
+    fact, not a crash) and ``/healthz`` reports a null geometry.
+
+    ``/healthz``'s ``rows``/``cols`` are reported for the client's benefit, not
+    as an echo-back template: a PTY that nothing has sized yet answers with its
+    real ``0x0`` (a browser session has no host TTY to seed it), which is
+    precisely the client's cue that it must resize — while ``/resize`` refuses a
+    zero dimension. So geometry read from ``/healthz`` is not automatically a
+    valid ``/resize`` body; a client posts the size it wants, not the size it
+    found.
     """
     from fastapi import FastAPI, Header, HTTPException, Query
 
@@ -403,10 +720,25 @@ def _build_fastapi_app(
         # newline in the input box and never submit. The field is named
         # ``append_newline`` for backwards-compatible API shape but the
         # behavior is "press Enter after the text".
-        if body.append_newline:
-            payload = _ensure_submit_cr(payload)
-        n = write_input(payload.encode("utf-8"))
-        return {"bytes_written": n}
+        if not body.append_newline:
+            return {"bytes_written": write_input(payload.encode("utf-8"))}
+
+        # Type it and submit it, ONCE. No follow-up "nudge" CRs on this path —
+        # see :data:`_SUBMIT_UNCONFIRMED_NOTE` for the whole of why, in short:
+        # a bare CR is a no-op only against an empty input box with no dialog on
+        # screen, and this handler cannot see the screen. The auto-start path
+        # nudges because it waits for an observed readiness marker first and runs
+        # before the session can raise a permission prompt at all; this one runs
+        # mid-session, which is exactly when one is up.
+        written = write_input(_ensure_submit_cr(payload).encode("utf-8"))
+        # Said in the reply rather than assumed away: the CR went to the PTY, and
+        # whether the TUI registered it as a submit is not something this process
+        # observes. A caller that wants certainty has the terminal view.
+        return {
+            "bytes_written": written,
+            "submit_confirmed": False,
+            "note": _SUBMIT_UNCONFIRMED_NOTE,
+        }
 
     @app.get("/output", response_model=_OutputResponse)
     def get_output(
@@ -422,10 +754,59 @@ def _build_fastapi_app(
             dropped_bytes=dropped,
         )
 
+    @app.post("/resize")
+    def post_resize(body: _ResizeBody, authorization: Optional[str] = Header(default=None)):
+        _check_auth(authorization)
+        if resize is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "resize unavailable: this supervisor was started without "
+                    "PTY resize support"
+                ),
+            )
+        try:
+            resize(body.rows, body.cols)
+        except OSError as exc:
+            # The PTY can go away under us (child exited, master closed). Report
+            # it as an error the client can read instead of letting uvicorn turn
+            # the ioctl failure into a bare 500 with a traceback in the log.
+            raise HTTPException(
+                status_code=500, detail=f"cannot set window size: {exc}"
+            ) from exc
+        return {"rows": body.rows, "cols": body.cols}
+
     @app.get("/healthz")
     def healthz(authorization: Optional[str] = Header(default=None)):
         _check_auth(authorization)
-        return {"ok": True, "cursor": output.end_offset}
+        # Geometry rides along on the liveness probe so a client learns what it
+        # is attaching to in the same request that told it the endpoint is up,
+        # and can skip a /resize that would only re-apply the current size.
+        # Unknown geometry is reported as nulls rather than omitted keys: the
+        # shape stays stable for clients that read it unconditionally, and a
+        # failing ioctl must not turn a liveness probe into an error. An unsized
+        # PTY's real 0x0 is passed through as-is — see this function's docstring
+        # for why that is not a body to post straight back to /resize.
+        size = None
+        if get_winsize is not None:
+            with contextlib.suppress(OSError):
+                size = get_winsize()
+        rows, cols = size if size is not None else (None, None)
+        # Idleness rides along for the same reason the geometry does — a caller
+        # learns what it is attached to in the request that proved it is up — and
+        # because this is the only place the fact exists: the host cannot see the
+        # difference between a harness that is working and one that finished and
+        # is sitting at its prompt, since run state only moves when the session
+        # *ends* (spec D24). "Nothing produced yet" answers null, exactly like an
+        # unknown geometry, so a reader that renders it has one absent case to
+        # handle rather than two.
+        return {
+            "ok": True,
+            "cursor": output.end_offset,
+            "rows": rows,
+            "cols": cols,
+            **_activity_report(output.idle_seconds),
+        }
 
     return app
 
@@ -792,15 +1173,57 @@ def _start_auto_start_thread(
     return thread
 
 
+#: What "press Enter" is on the wire: CR, not LF. A raw-mode TUI reads ``\r`` as
+#: Enter and inserts ``\n`` as a literal newline in the input box.
+_SUBMIT_CR = b"\r"
+
+#: What ``/input`` says about a submit it cannot see land.
+#:
+#: This path used to follow every submitted message with two bare-CR "nudges",
+#: on the argument that "once the text has gone through, the prompt is empty and
+#: a bare CR is a no-op there". That is true only of an empty input box *with no
+#: dialog on screen*. Since Claude Code v2.1.119 a CR fires the topmost
+#: modal/dialog — the same routing change this module's own auto-start path
+#: exists to work around, which is why that path waits for
+#: :data:`DEFAULT_AUTO_START_READY_MARKER` before it types anything.
+#:
+#: The two paths are not alike. Auto-start runs once, at startup, after an
+#: *observed* readiness marker, before the session can have raised a permission
+#: prompt. ``/input`` runs on every message an operator or uber lmer sends
+#: through ``POST /api/sessions/{id}/input``, the chat pane, ``lmer pipe`` and
+#: the slack path — mid-session, which is precisely when a tool-permission prompt
+#: is on screen, because the agent raises one while it is working and the
+#: operator is watching. A blind CR 150ms behind the operator's "no, stop" takes
+#: that prompt's default, and nothing in the transcript says a CR did it.
+#:
+#: What the nudges remedied is real (a submit CR swallowed by a re-render leaves
+#: the text typed and unsent), but remedying it here means predicting the screen
+#: state at +150ms, which this process never reads. So the submit is sent once
+#: and the uncertainty is reported instead of being resolved by guessing. The
+#: session's terminal view is where an operator can both see and fix it.
+_SUBMIT_UNCONFIRMED_NOTE = (
+    "Enter was sent after the text. Whether the TUI registered it as a submit "
+    "is not something the supervisor can observe, so if the message is still "
+    "sitting in the input box, submit it from the session's terminal view."
+)
+
+
 def _ensure_submit_cr(payload: str) -> str:
-    """Append a submit CR (``\\r``) unless ``payload`` already ends with CR/LF.
+    """Append a submit CR (``\\r``) unless ``payload`` already ends with one.
 
     CR (not LF) is "press Enter" in claude's raw-mode TUI; an already-present
-    trailing CR/LF is left intact so the caller never double-submits. Shared by
-    the FastAPI ``/input`` handler and ``_inject_start_prompt`` so the submit
+    trailing CR is left intact so the caller never double-submits. Shared by the
+    FastAPI ``/input`` handler and ``_inject_start_prompt`` so the submit
     convention lives in one place.
+
+    A trailing **LF** is not a submit and no longer counts as one. In raw mode it
+    is inserted as a literal newline in the input box, so ``"text\\n"`` with
+    ``append_newline`` set used to be typed and never sent — the CR that
+    eventually submitted it came from the follow-up nudges, which this path no
+    longer has (:data:`_SUBMIT_UNCONFIRMED_NOTE`). The caller's own newline is
+    kept, because it is what they asked for; the Enter is added behind it.
     """
-    if payload.endswith(("\r", "\n")):
+    if payload.endswith("\r"):
         return payload
     return payload + "\r"
 
@@ -834,7 +1257,7 @@ def _inject_auto_start(
         if nudge_delay > 0:
             time.sleep(nudge_delay)
         with contextlib.suppress(OSError):
-            write(b"\r")
+            write(_SUBMIT_CR)
 
 
 def _inject_start_prompt(
@@ -846,8 +1269,10 @@ def _inject_start_prompt(
     """Type a follow-up prompt and submit it after ``/start`` was injected.
 
     Sends the prompt text followed by a submit CR (``\\r``) — Enter in claude's
-    raw-mode TUI (via :func:`_ensure_submit_cr`, so a trailing CR/LF already
-    present on ``prompt`` is not doubled). Then sends ``nudge_count`` bare-CR
+    raw-mode TUI (via :func:`_ensure_submit_cr`, so a trailing **CR** already
+    present on ``prompt`` is not doubled; a trailing **LF** is not a submit and
+    gets a CR behind it, so an ``LMER_START_PROMPT`` ending in a newline is now
+    submitted where it previously was not). Then sends ``nudge_count`` bare-CR
     nudges, mirroring :func:`_inject_auto_start`: the prompt's submit CR can be
     swallowed during a startup re-render just like ``/start``'s, leaving the
     text typed-but-unsubmitted with nothing to re-trigger it. Each follow-up
@@ -870,7 +1295,7 @@ def _inject_start_prompt(
         if nudge_delay > 0:
             time.sleep(nudge_delay)
         with contextlib.suppress(OSError):
-            write(b"\r")
+            write(_SUBMIT_CR)
 
 
 def _inject_shutdown_chord(
@@ -1010,6 +1435,14 @@ def run_supervisor(
     # reach the already-frozen child env.
     os.environ[SUPERVISOR_PID_ENV] = str(os.getpid())
 
+    # Before the fork, so the file exists from the earliest moment this session
+    # could have produced a byte. A reader that finds it treats it as the log of
+    # record (see SessionLog), and the window in which it is absent is a window in
+    # which the reader is looking at the host-side tee instead — so the narrower
+    # that window, the less of a session's start is described by two different
+    # streams.
+    session_log = SessionLog.open_if_mounted()
+
     master_fd, slave_fd = os.openpty()
 
     # Pre-clear ICRNL/ECHO/ICANON before fork so the auto-/start injection that
@@ -1050,10 +1483,29 @@ def run_supervisor(
         with write_lock:
             return os.write(master_fd, data)
 
+    # The FastAPI control plane touches the PTY's geometry through these two
+    # closures instead of being handed the fd, so the app never has to know it
+    # is talking to a terminal. No write lock: TIOCSWINSZ/TIOCGWINSZ don't move
+    # bytes through the master, so they can't interleave with a payload write.
+    # ``strict=True`` unlike the host-TTY callers: a client that posted /resize
+    # is waiting on the result, so a failed ioctl has to reach the route and
+    # become an error response instead of a 200 for geometry that never landed.
+    def set_child_winsize(rows: int, cols: int) -> None:
+        _set_winsize(master_fd, rows, cols, strict=True)
+
+    def get_child_winsize() -> Optional[tuple[int, int]]:
+        return _get_winsize(master_fd)
+
     fastapi_shutdown = None
     server_thread = None
     if options["fastapi"]:
-        app = _build_fastapi_app(output, write_to_child, fastapi_token)
+        app = _build_fastapi_app(
+            output,
+            write_to_child,
+            fastapi_token,
+            resize=set_child_winsize,
+            get_winsize=get_child_winsize,
+        )
         server_thread, fastapi_shutdown = _start_fastapi_server(app, fastapi_host, fastapi_port)
         # Status line carries only host + port (no secret value): the bearer
         # token is never interpolated, only the name of the env var that holds
@@ -1151,6 +1603,13 @@ def run_supervisor(
                 if not chunk:
                     break
                 output.append(chunk)
+                # Persisted before it is forwarded, deliberately: the file is the
+                # copy that has to survive, stdout is the copy that might not, and
+                # a record that lagged the stream derived from it would be the one
+                # ordering a reader crossing from one to the other could not
+                # tolerate (it would re-render bytes it already had).
+                if session_log is not None:
+                    session_log.write(chunk)
                 with contextlib.suppress(OSError):
                     os.write(stdout_fd, chunk)
 
@@ -1188,6 +1647,10 @@ def run_supervisor(
             fastapi_shutdown()
         if server_thread is not None:
             server_thread.join(timeout=2.0)
+        # Only the fd goes; the file stays, because it is the record of a session
+        # that has just ended and someone is about to read it back.
+        if session_log is not None:
+            session_log.close()
 
     _, status = os.waitpid(pid, 0)
     # A requested self-shutdown is a deliberate, clean sign-off: report exit 0 so

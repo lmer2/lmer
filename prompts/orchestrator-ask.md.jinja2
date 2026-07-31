@@ -1,0 +1,19 @@
+## Asking your operator
+
+This session was started by the lmer orchestrator (`LMER_ASK_DIR` is set), so nobody is watching this terminal — your operator is looking at the orchestrator's web view. A question you only write into your normal output reaches no one, and an interactive prompt blocks until the session is reaped.
+
+`lmer-ask` is the only way to reach your operator. Never put a question to them through this harness's own question or permission dialog — an interactive prompt, or a built-in question tool if this session has one: the operator is not watching this terminal, the dialog blocks the session where nobody can see it, and the orchestrator can neither show it nor answer it. That has happened, and the question was never seen. If such a tool exists in this session, its existence is not an invitation; `lmer-ask` is.
+
+Use the `lmer-ask` command instead:
+
+- `lmer-ask ask "<question>"` posts the question and waits; the operator's reply is printed on stdout. Add `--option "<choice>"` (repeatable) to suggest answers — they are a hint, not a menu, so handle a reply that matches none of them.
+- One question per `lmer-ask ask`. A multi-part decision is that many asks: the channel holds several open questions at once, and each one gets its own card, its own options and its own answer in the operator's view. Options belong to exactly one question, and tapping one sends it, so parts packed into a single entry give the operator options that claim to answer all of them at once.
+- Exit code 2 means nobody has answered yet. That is not an error and the question is still open: report where you are, then resume with `lmer-ask wait <id>`. If you have since decided without the operator, withdraw it with `lmer-ask close <id>` so nobody answers a question you no longer hold open.
+- Answers arrive while you work. If a wait times out and you go on to other tasks, re-run that wait between them rather than at the end of the session.
+- Before you conclude the operator has not answered — and before you record any stop reason or end this session — run `lmer-ask wait <id>` (or `lmer-ask list`) one final time. `lmer-ask list` marks an answer you have never read as `answered (unread)`, and `lmer-end-session` refuses once to end a session that has one.
+- If you have a monitor or watch tool, arm it to re-run the wait so an idle session still hears the answer.
+- `lmer-ask note "<text>"` posts a progress note that expects no reply. Use it before long stretches of silent work.
+- `lmer-signal "<what happened>"` signals the orchestrator on a milestone — you pushed an MR, you finished the review, you are done with the current task. One-way and terminal: it goes to the supervising assistant rather than to your operator (`lmer-ask` is their channel), nothing answers it, and there is nothing to wait for.
+- Exit code 3 means there is no channel (you are not orchestrated after all) — then say what you need in your ordinary output and stop.
+
+Ask when a decision is genuinely yours to hand over — an ambiguous requirement, a destructive step, a fork in the approach — not for routine confirmations. Prefer `--message-file` or `--stdin` for text containing backticks, `$` or quotes, exactly as with any other command.

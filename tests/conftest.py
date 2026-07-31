@@ -1,13 +1,32 @@
 """Shared fixtures for tests."""
 import ast
+import contextlib
+import errno
 import inspect
 import os
 import subprocess
 import textwrap
 from pathlib import Path
+from unittest import mock
 import pytest
 
 from lmer_cli import user_harnesses
+
+
+#: Set on any host that is expected to be able to run the tests which *execute*
+#: web sources under Node — see :func:`require_node_toolchain` for what changes
+#: and why it is the host's call rather than the test's.
+REQUIRE_NODE_ENV = "LMER_TESTS_REQUIRE_NODE"
+
+#: Spellings of "yes". Anything else — an empty value included — leaves the
+#: default in place, so a stray ``LMER_TESTS_REQUIRE_NODE=`` in a .env file does
+#: not arm the strict mode by accident.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+#: LMER_* vars :func:`strip_lmer_env` leaves alone: switches that tell the *test
+#: harness* how strict to be, which are not run context. Stripping one would let
+#: any module that isolates its environment silently disarm a guard.
+_HARNESS_ENV = frozenset({REQUIRE_NODE_ENV})
 
 
 def strip_lmer_env(monkeypatch):
@@ -18,10 +37,116 @@ def strip_lmer_env(monkeypatch):
     CLI has no run context and cannot write into the operational work repo
     (issue #93). Kept as a plain helper — an autouse fixture here would
     force stripping onto every test in the suite; modules opt in instead.
+
+    :data:`_HARNESS_ENV` is exempt: those name how the suite should behave, not
+    which run it belongs to, so removing them cannot help the isolation this is
+    for and would quietly weaken the guards that read them.
     """
     for key in list(os.environ):
-        if key.startswith("LMER_"):
+        if key.startswith("LMER_") and key not in _HARNESS_ENV:
             monkeypatch.delenv(key, raising=False)
+
+
+def node_is_expected():
+    """Whether a missing Node toolchain is a failure rather than a skip."""
+    return os.environ.get(REQUIRE_NODE_ENV, "").strip().lower() in _TRUTHY
+
+
+def require_node_toolchain(reason):
+    """Skip the calling test — or fail it, on a host that is supposed to have Node.
+
+    A few web guards do not read the sources, they *execute* them: the render
+    path is lifted verbatim out of ``Markdown.vue`` and hostile input is run
+    through it under Node (:mod:`tests.test_platform_web_markdown`). That is the
+    only place the parser's own defences are exercised rather than pinned by
+    reading, so it is the coverage least affordable to lose.
+
+    And losing it was silent. With no Node those tests skipped; ``pytest -q``
+    prints a skip as an ``s``, the run still exits 0, and nothing anywhere says
+    that the strongest checks in the file did not run — the same shape as a
+    vacuous test, which reads as passing while having verified nothing. It also
+    fools any tool that judges a run by its exit code: a mutation sweep over the
+    render path scored every one of those probes as "not caught" when they had
+    simply never executed.
+
+    So the host decides and the test obeys. A machine that can build the UI has
+    a Node — ``lmer platform setup-ui`` fetches a pinned one into
+    ``~/.lmer/platform/node/`` — and setting this variable is how such a machine
+    says so. Someone on a Node-less laptop sets nothing, still gets a runnable
+    suite, and is told in the skip reason what it cost.
+
+    Under the flag this never skips: a guard that can be satisfied by skipping is
+    the bug it was written to catch.
+    """
+    if node_is_expected():
+        pytest.fail(
+            f"{reason}\n"
+            f"{REQUIRE_NODE_ENV} is set, so this host is expected to run the "
+            "web guards that execute their sources. Skipping them here would "
+            "drop the only coverage that runs hostile input through the real "
+            "render path, and would leave the run green while doing it.\n"
+            "To get a toolchain: `lmer platform setup-ui` fetches the pinned "
+            "Node into ~/.lmer/platform/node/ and installs web/'s pinned JS "
+            "dependencies. With a Node already on PATH, `npm ci` in web/ does "
+            "the second half on its own.\n"
+            f"To go back to skipping, unset {REQUIRE_NODE_ENV} — and accept "
+            "that these guards did not run.",
+            pytrace=False,
+        )
+    pytest.skip(
+        f"{reason} — the web guards that execute their sources did not run; "
+        f"set {REQUIRE_NODE_ENV}=1 to make this a failure instead"
+    )
+
+
+def node_binary():
+    """The platform's own pinned Node if ``setup-ui`` has run, else one on PATH.
+
+    Lives here because five test modules need it and every one of them used to
+    carry its own copy — and two of those copies had only the first root, which is
+    the one that never resolves inside pytest.
+
+    Two roots, for that reason. ``node_dir()`` resolves through
+    ``store.platform_dir()``, and :func:`_isolate_platform_state` repoints that at
+    a tmp dir for the whole session, so the "pinned toolchain" branch was dead in
+    every pytest invocation: a host whose only Node was the one
+    ``lmer platform setup-ui`` fetched skipped every test that executes web
+    sources, silently. The second root is the same path with the redirection
+    undone — computing it is a path lookup, not a read of the state the fixture
+    exists to isolate.
+
+    Returns the path as a string, or ``None`` when there is no Node at all, which
+    is :func:`require_node_toolchain`'s decision to act on rather than this
+    function's.
+
+    Calls :func:`tests.webdeps.ensure_web_deps` first, for the reason that module
+    documents: Node's presence and ``web/node_modules``' presence are independent,
+    and every session container has the former while a fresh checkout never has
+    the latter. Each per-module copy of this resolver used to make the call; the
+    chokepoint moved here with the resolver, so it is still the one place a
+    node-using test passes through.
+    """
+    import shutil
+
+    from tests.webdeps import ensure_web_deps
+
+    ensure_web_deps()
+
+    from lmer_cli.runtime import lmer_state_dir
+    from lmer_platform.store import PLATFORM_DIRNAME, platform_dir
+    from lmer_platform.ui_build import NodeToolchain, node_dir
+
+    isolated = node_dir()
+    # Derived from node_dir() rather than respelled, so a change to the layout
+    # underneath the platform dir travels here instead of going quiet.
+    installed = (
+        lmer_state_dir() / PLATFORM_DIRNAME / isolated.relative_to(platform_dir())
+    )
+    for root in (isolated, installed):
+        own = NodeToolchain(root=root)
+        if own.node.is_file():
+            return str(own.node)
+    return shutil.which("node")
 
 
 def ast_body_lines(fn):
@@ -157,6 +282,29 @@ def _isolate_user_harnesses(tmp_path_factory):
     user_harnesses.DEFAULT_HARNESSES_DIR = original
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_platform_state(tmp_path_factory):
+    """Point platform state away from the real ~/.lmer/platform (issue #141).
+
+    ``lmer_platform.store.PLATFORM_DIR`` defaults to ``lmer_state_dir()/platform``,
+    so any test that reaches the store without patching it writes to the
+    developer's real state dir — config, the shared secret, the tracked-run index
+    and the work-repo mirror clone all live there.
+
+    This is not hypothetical: a test that called ``monkeypatch.undo()`` reverted
+    its own fixture's ``PLATFORM_DIR`` patch mid-test and cloned a pytest tmp
+    repository over the real mirror. Per-test fixtures still patch this to their
+    own tmp dir; this session-scoped default is the floor beneath them, in the
+    same spirit as the work-repo leak guard and user-harness isolation above.
+    """
+    from lmer_platform import store as platform_store
+
+    original = platform_store.PLATFORM_DIR
+    platform_store.PLATFORM_DIR = str(tmp_path_factory.mktemp("platform-state"))
+    yield
+    platform_store.PLATFORM_DIR = original
+
+
 @pytest.fixture
 def project_root():
     """Get the project root directory."""
@@ -220,3 +368,93 @@ def lmer_subprocess_env():
             "LMER_WORK_REPO", "git@example.com:fixture/work-repo.git"
         ),
     }
+
+
+# --- refusals the kernel will not perform for you ---------------------------
+#
+# A test that makes a real mode bit and expects the next syscall to fail is a
+# test about the *uid the suite runs as*: root is exempt from the permission
+# check for owned files, so `chmod(0o000)` then `open()` succeeds for uid 0 and
+# the `pytest.raises` never fires. CI's pytest job runs as root while every
+# developer runs as themselves, which is the worst version of it — green for
+# everyone who runs the suite the usual way, red in the pipeline, forever.
+#
+# So the refusal is injected at the syscall the production code actually makes,
+# and the assertion is about the code's handling of EACCES rather than about the
+# kernel's willingness to produce one. Same shape as
+# tests/test_platform_transcripts.py::test_a_write_failure_leaves_the_original_intact_and_no_temp,
+# which injects for the same reason: the failure cannot be built from the
+# filesystem without also breaking the thing being measured.
+
+
+def _same_file(candidate, target) -> bool:
+    """Whether two paths name one file, tolerant of how each was spelled."""
+    try:
+        return Path(candidate).resolve() == Path(target).resolve()
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+@contextlib.contextmanager
+def denied_read(path):
+    """Make opening *path* raise ``PermissionError``, at any uid.
+
+    Patches :meth:`pathlib.Path.open`, which is what the transcript reader and
+    the scrubber use. Every other path opens normally.
+    """
+    target = Path(path)
+    real_open = Path.open
+
+    def guarded(self, *args, **kwargs):
+        if _same_file(self, target):
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        return real_open(self, *args, **kwargs)
+
+    with mock.patch.object(Path, "open", guarded):
+        yield
+
+
+@contextlib.contextmanager
+def denied_create(directory):
+    """Make creating a file *directly inside* ``directory`` raise ``PermissionError``.
+
+    Patches :func:`os.open`, which is where :func:`lmer_platform.store.write_json`
+    lands (through ``_create_owner_only``) — so this is the unwritable-state-dir
+    case as the code meets it, without depending on the kernel to enforce a mode
+    bit against the uid running the suite.
+    """
+    target = Path(directory)
+    real_open = os.open
+
+    def guarded(path, *args, **kwargs):
+        try:
+            parent = Path(os.fsdecode(path)).parent
+        except (TypeError, ValueError):
+            parent = None
+        if parent is not None and _same_file(parent, target):
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_open(path, *args, **kwargs)
+
+    with mock.patch("os.open", guarded):
+        yield
+
+
+@contextlib.contextmanager
+def denied_access(path):
+    """Make :func:`os.access` answer ``False`` for *path*, at any uid.
+
+    The ask channel asks that question directly (``protocol.resolve_channel_dir``)
+    and it is the one syscall root does not lie about by accident: ``os.access``
+    for uid 0 returns True for a directory it could not have written had it been
+    anybody else, which is exactly the uid-mismatch case being modelled.
+    """
+    target = Path(path)
+    real_access = os.access
+
+    def guarded(candidate, mode, **kwargs):
+        if _same_file(candidate, target):
+            return False
+        return real_access(candidate, mode, **kwargs)
+
+    with mock.patch("os.access", guarded):
+        yield

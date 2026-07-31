@@ -47,6 +47,16 @@ build/
 *.egg
 .eggs/
 
+# UI build state. Named explicitly because the patterns above are anchored at the
+# context root and match nothing under web/: Dockerfile.platform builds the UI in
+# its own stage (`npm ci` against web/package-lock.json), so a host node_modules
+# would carry the host's platform binaries into the builder and a host web/dist
+# would be a stale bundle in the build context. The sources themselves are needed
+# — do not exclude web/.
+web/node_modules/
+web/dist/
+
 # Docker
 Containerfile
+Dockerfile.platform
 .dockerignore

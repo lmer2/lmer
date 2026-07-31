@@ -9,6 +9,11 @@ default:
 
 variables:
   UV_SYSTEM_PYTHON: "1"
+  # The platform image (Dockerfile.platform, issue #150) is a second artifact of
+  # this project, not a variant of the session image ${CI_REGISTRY_IMAGE} holds,
+  # so it gets its own repository under the project's registry path. Named once
+  # here because both the build and the publish job tag from it.
+  PLATFORM_IMAGE: "${CI_REGISTRY_IMAGE}/lmer-platform"
 
 #──────────────────────────────────────────────────────────────────────────────
 # LINT STAGE
@@ -33,6 +38,16 @@ pre-commit:
 pytest:
   stage: test
   image: python:3.12  # Full image includes git
+  variables:
+    # Arm the strict mode of tests/conftest.py's require_node_toolchain: with
+    # this set, a missing Node toolchain fails the web guards that *execute*
+    # their sources instead of skipping them. Those are the only tests that run
+    # hostile input through Markdown.vue's real render path and the only one that
+    # builds the bundle to check its chunk split — and on this image they all
+    # skipped, silently, because a skip is an `s` in a run that still exits 0.
+    # The toolchain they need is installed in before_script; if that install ever
+    # breaks, this variable is what turns the resulting silence into a red job.
+    LMER_TESTS_REQUIRE_NODE: "1"
   before_script:
     # jq is required at runtime by libexec/claude-agent-files.sh to merge
     # the work-repo permissions.allow into ~/.claude/settings.json. The
@@ -40,6 +55,27 @@ pytest:
     # this install. The runtime container (Containerfile) installs jq too.
     - apt-get update && apt-get install -y --no-install-recommends jq
     - pip install uv && uv sync --frozen
+    # The Node the guards above run under, fetched with the same command an
+    # operator runs on a host: `setup-ui` downloads the pinned Node
+    # (lmer_platform.ui_build.NODE_VERSION, SHA-256 verified) into
+    # ~/.lmer/platform/node/, runs `npm ci` in web/ and builds the bundle —
+    # which is exactly what those tests look for: the pinned node binary (the
+    # second root tests._node_binary tries), web/node_modules to resolve
+    # markdown-it, dompurify and vite out of, and a dist newer than its sources
+    # so the bundle test reuses this build instead of repeating it.
+    #
+    # Reusing the command rather than installing Node here keeps the version pin
+    # in one place: apt's nodejs would be a second, older toolchain that builds a
+    # different artifact than the pin describes, and a literal version in this
+    # file would rot the first time that pin moves.
+    #
+    # Nothing is cached deliberately. The two paths worth caching are the Node
+    # tree and npm's cache, and both live under ~/.lmer/platform, outside
+    # $CI_PROJECT_DIR — which is the only place GitLab's cache can take paths
+    # from. What is inside it, web/node_modules (123 MB) and web/dist, is
+    # replaced wholesale by `npm ci` and by the mtime comparison that decides a
+    # rebuild, so caching either would upload a cache to save nothing.
+    - uv run lmer platform setup-ui
   script:
     - uv run pytest tests/ -v --cov=src --cov-report=term-missing --cov-report=xml:coverage.xml
   coverage: '/TOTAL.*\s(\d+%)/'
@@ -81,12 +117,17 @@ build-container:
   services:
     - docker:24.0-dind
   variables:
-    # TLS disabled: the GitLab Kubernetes executor does not share the
-    # /certs/client volume between the dind service and the build container,
-    # so the build container cannot find ca.pem at docker login. Traffic
-    # stays on localhost inside a single pod, so plaintext is acceptable.
+    # TLS disabled: the /certs/client volume is not shared between the dind
+    # service and the build container, so the build container cannot find
+    # ca.pem at docker login. Traffic never leaves the runner host, so
+    # plaintext is acceptable.
     DOCKER_TLS_CERTDIR: ""
-    DOCKER_HOST: "tcp://localhost:2375"
+    # Reach dind by its service alias. Under the docker executor the service
+    # is a separate container, so localhost is not it -- localhost only works
+    # on the Kubernetes executor, where the service shares the build pod's
+    # network namespace. If this project ever builds on a k8s runner, this
+    # value has to follow the executor.
+    DOCKER_HOST: "tcp://docker:2375"
   before_script:
     - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
   script:
@@ -98,6 +139,60 @@ build-container:
         docker push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}
       fi
   rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+build-platform-container:
+  stage: build
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  variables:
+    # See build-container for the rationale on disabling dind TLS and on
+    # addressing the service as `docker` rather than localhost.
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: "tcp://docker:2375"
+  before_script:
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+  script:
+    # LMER_BUILD_COMMIT is baked into the image (Dockerfile.platform writes it to
+    # /opt/lmer/BUILD_INFO) because the installed tree has no .git to answer
+    # "what commit is this?" with. The full SHA, not the short one: the tag says
+    # which build this is, the provenance says which commit exactly. BUILD_UID and
+    # BUILD_GID are left at their 1000 defaults, as the session image's build does.
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker build --build-arg LMER_BUILD_COMMIT=${CI_COMMIT_SHA} \
+          -t ${PLATFORM_IMAGE}:${CI_COMMIT_TAG} -t ${PLATFORM_IMAGE}:latest \
+          -f Dockerfile.platform .
+      else
+        docker build --build-arg LMER_BUILD_COMMIT=${CI_COMMIT_SHA} \
+          -t ${PLATFORM_IMAGE}:${CI_COMMIT_SHORT_SHA} -f Dockerfile.platform .
+        # A merge-request run builds only: it is a check on the Dockerfile, and
+        # nothing consumes a per-branch platform image. Pushing is the default
+        # branch's job, as it is for the session image.
+        if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+          docker push ${PLATFORM_IMAGE}:${CI_COMMIT_SHORT_SHA}
+        fi
+      fi
+  rules:
+    # Unlike build-container this also runs on merge requests, because the build
+    # *is* the check on Dockerfile.platform — no test can tell whether `npm ci`,
+    # the UI build or `pip install .` still succeed inside it — and a check that
+    # first runs after the merge cannot fail the merge request that broke it.
+    # Scoped with changes: so it costs nothing on the merge requests that touch
+    # neither the recipe nor what it builds.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - Dockerfile.platform
+        - .dockerignore
+        - pyproject.toml
+        # COPY targets the install needs (pyproject names them for `readme` and
+        # `license-files`): renaming or removing one breaks the build, so the
+        # build has to run on the merge request that does it.
+        - README.md
+        - LICENSE
+        - web/**/*
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -129,15 +224,41 @@ publish-container:
   services:
     - docker:24.0-dind
   variables:
-    # See build-container for the rationale on disabling dind TLS.
+    # See build-container for the rationale on disabling dind TLS and on
+    # addressing the service as `docker` rather than localhost.
     DOCKER_TLS_CERTDIR: ""
-    DOCKER_HOST: "tcp://localhost:2375"
+    DOCKER_HOST: "tcp://docker:2375"
   before_script:
     - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
   script:
     - docker build -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG} -t ${CI_REGISTRY_IMAGE}:latest -f Containerfile .
     - docker push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}
     - docker push ${CI_REGISTRY_IMAGE}:latest
+  rules:
+    - if: $CI_COMMIT_TAG
+  environment:
+    name: container-registry
+
+publish-platform-container:
+  stage: publish
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  variables:
+    # See build-container for the rationale on disabling dind TLS and on
+    # addressing the service as `docker` rather than localhost.
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_HOST: "tcp://docker:2375"
+  before_script:
+    - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
+  script:
+    # Built again rather than pulled from the build stage, the way
+    # publish-container is: a tagged release publishes an image built from the
+    # tagged tree, and the layers are still in the runner's cache. See
+    # build-platform-container for what LMER_BUILD_COMMIT is for.
+    - docker build --build-arg LMER_BUILD_COMMIT=${CI_COMMIT_SHA} -t ${PLATFORM_IMAGE}:${CI_COMMIT_TAG} -t ${PLATFORM_IMAGE}:latest -f Dockerfile.platform .
+    - docker push ${PLATFORM_IMAGE}:${CI_COMMIT_TAG}
+    - docker push ${PLATFORM_IMAGE}:latest
   rules:
     - if: $CI_COMMIT_TAG
   environment:

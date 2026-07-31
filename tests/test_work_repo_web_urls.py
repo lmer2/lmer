@@ -5,6 +5,18 @@ GitLab blob/tree URL, derived from the checkout's `origin` remote with
 credentials STRIPPED — the tokenized remote the runner clones with must
 never leak into user-facing output — and the CLI wires it into every
 user-facing artifact print (artifact, report, log display, resume brief).
+
+Since T66 the path-shape half of that is extracted (`detect_forge`,
+`forge_web_url`) so the platform's file listing can build the same URLs from
+its own checkout instead of keeping a second copy — a copy is how one forge
+keeps a bug the other fixed. Two properties of the extraction are pinned
+below: GitHub gets `/blob/` where GitLab gets `/-/blob/`, and a caller that asks
+for neither a forge nor a default gets NO url rather than a guessed one. Both
+link-building callers do pass GitLab as that default — `web_url_for` since #104
+and the platform's run-file listing since T86 — because a self-hosted GitLab is
+usually at `git.<domain>`, and the two surfaces answering differently for the
+same run dir was the bug T86 fixed. The `forge=` override they carry for the
+platform's `work_repo_forge` knob is pinned here too.
 """
 import json
 import subprocess
@@ -152,6 +164,165 @@ class TestWebUrlFor:
         target = repo / "a file.md"
         target.write_text("x")
         assert git_ops.web_url_for(target) == f"{WEB_BASE}/-/blob/main/a%20file.md"
+
+
+class TestForgeDetection:
+    """Which forge a hostname is — the rule the path shape is chosen by."""
+
+    @pytest.mark.parametrize(
+        "host",
+        ["github.com", "GITHUB.COM", "gist.github.com", "acme.ghe.com"],
+    )
+    def test_github_hosts(self, host):
+        assert git_ops.detect_forge(host) == git_ops.FORGE_GITHUB
+
+    @pytest.mark.parametrize(
+        "host",
+        ["gitlab.com", "gitlab.example.com", "gitlab-ce.example.com",
+         "salsa.gitlab.com"],
+    )
+    def test_gitlab_hosts(self, host):
+        assert git_ops.detect_forge(host) == git_ops.FORGE_GITLAB
+
+    @pytest.mark.parametrize(
+        "host", ["git.example.com", "code.internal", "bitbucket.org", "", None],
+    )
+    def test_unrecognised_hosts_are_none(self, host):
+        """No guessing: an unknown host's path layout is unknown."""
+        assert git_ops.detect_forge(host) is None
+
+    def test_a_port_is_ignored(self):
+        """Callers pass a base URL's authority straight in."""
+        assert git_ops.detect_forge("gitlab.example.com:8443") == git_ops.FORGE_GITLAB
+
+    def test_the_github_rule_is_the_token_lookups_rule(self):
+        """One classification, not two: a host that is GitHub for credentials and
+        something else for URLs is a bug with no symptom until someone clicks."""
+        from lmer_cli import tokens
+
+        for host in ("github.com", "acme.ghe.com", "git.example.com"):
+            assert (git_ops.detect_forge(host) == git_ops.FORGE_GITHUB) is (
+                tokens._is_github_host(host)
+            )
+
+
+class TestForgeWebUrl:
+    """The extracted path shapes — the one definition of blob-vs-tree per forge."""
+
+    def test_gitlab_file(self):
+        assert git_ops.forge_web_url(
+            "https://gitlab.example.com/group/work", "main", "runs/r/spec.md"
+        ) == "https://gitlab.example.com/group/work/-/blob/main/runs/r/spec.md"
+
+    def test_github_file_has_no_dash_segment(self):
+        assert git_ops.forge_web_url(
+            "https://github.com/owner/work", "main", "runs/r/spec.md"
+        ) == "https://github.com/owner/work/blob/main/runs/r/spec.md"
+
+    def test_github_dir(self):
+        assert git_ops.forge_web_url(
+            "https://github.com/owner/work", "main", "runs/r", is_dir=True
+        ) == "https://github.com/owner/work/tree/main/runs/r"
+
+    def test_repo_root_is_a_tree(self):
+        assert git_ops.forge_web_url(
+            "https://github.com/owner/work", "trunk"
+        ) == "https://github.com/owner/work/tree/trunk"
+
+    def test_unrecognised_forge_gets_no_url(self):
+        """A broken link is worse than a plain filename — 'etc.' in the ask is not
+        licence to invent path layouts."""
+        assert git_ops.forge_web_url(
+            "https://git.example.com/group/work", "main", "runs/r/spec.md"
+        ) is None
+
+    def test_unrecognised_forge_takes_a_default_when_one_is_given(self):
+        """What both link-building surfaces pass: a work repo on a plain hostname is
+        a self-hosted GitLab in practice (`web_url_for`, and the platform's run-file
+        listing since T86)."""
+        assert git_ops.forge_web_url(
+            "https://git.example.com/group/work", "main", "spec.md",
+            default_forge=git_ops.FORGE_GITLAB,
+        ) == "https://git.example.com/group/work/-/blob/main/spec.md"
+
+    def test_an_explicit_forge_beats_detection(self):
+        """The operator's override (the platform's `work_repo_forge`) answers a
+        question the hostname cannot, so detection must not win over it — in either
+        direction, since a GitHub Enterprise Server can be called anything."""
+        assert git_ops.forge_web_url(
+            "https://gitlab.example.com/group/work", "main", "spec.md",
+            forge=git_ops.FORGE_GITHUB,
+        ) == "https://gitlab.example.com/group/work/blob/main/spec.md"
+        assert git_ops.forge_web_url(
+            "https://github.com/owner/work", "main", "spec.md",
+            forge=git_ops.FORGE_GITLAB,
+        ) == "https://github.com/owner/work/-/blob/main/spec.md"
+
+    def test_an_explicit_forge_beats_the_default_too(self):
+        assert git_ops.forge_web_url(
+            "https://git.example.com/group/work", "main", "spec.md",
+            forge=git_ops.FORGE_GITHUB, default_forge=git_ops.FORGE_GITLAB,
+        ) == "https://git.example.com/group/work/blob/main/spec.md"
+
+    def test_a_forge_that_is_no_forge_switches_the_link_off(self):
+        """How `work_repo_forge=none` reaches here: a value with no path shape gets
+        no URL, and the default cannot resurrect it."""
+        assert git_ops.forge_web_url(
+            "https://gitlab.example.com/group/work", "main", "spec.md",
+            forge="none", default_forge=git_ops.FORGE_GITLAB,
+        ) is None
+
+    def test_no_base_gets_no_url(self):
+        assert git_ops.forge_web_url("", "main", "spec.md") is None
+
+    def test_ref_and_path_are_quoted(self):
+        assert git_ops.forge_web_url(
+            "https://github.com/owner/work", "fix/a b", "a file.md"
+        ) == "https://github.com/owner/work/blob/fix/a%20b/a%20file.md"
+
+
+class TestWebUrlForAcrossForges:
+    """`web_url_for` keeps every existing caller's URL and gains GitHub."""
+
+    def test_github_work_repo_gets_githubs_shape(self, tmp_path, monkeypatch):
+        repo = _init_work_repo(
+            tmp_path, remote=f"https://x-access-token:{TOKEN}@github.com/owner/work.git"
+        )
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(repo))
+        target = repo / "f.md"
+        target.write_text("x")
+        url = git_ops.web_url_for(target)
+        assert url == "https://github.com/owner/work/blob/main/f.md"
+        assert TOKEN not in url
+
+    def test_a_self_hosted_gitlab_on_a_plain_hostname_keeps_its_links(
+        self, tmp_path, monkeypatch
+    ):
+        """The regression this default exists to prevent: `git.<domain>` is what a
+        self-hosted GitLab is usually called, and its links have worked since #104."""
+        repo = _init_work_repo(
+            tmp_path, remote="https://git.example.com/group/work.git"
+        )
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(repo))
+        target = repo / "f.md"
+        target.write_text("x")
+        assert git_ops.web_url_for(target) == (
+            "https://git.example.com/group/work/-/blob/main/f.md"
+        )
+
+
+class TestCheckoutBranch:
+    def test_reads_the_checkouts_branch(self, tmp_path):
+        repo = _init_work_repo(tmp_path / "r", branch="work-main")
+        assert git_ops.checkout_branch(repo) == "work-main"
+
+    def test_a_directory_that_is_not_a_repo_falls_back(self, tmp_path):
+        assert git_ops.checkout_branch(tmp_path) == git_ops.DEFAULT_WEB_BRANCH
+
+    def test_a_missing_directory_falls_back_rather_than_raising(self, tmp_path):
+        assert git_ops.checkout_branch(tmp_path / "absent") == (
+            git_ops.DEFAULT_WEB_BRANCH
+        )
 
 
 class TestWebBaseFromRemote:

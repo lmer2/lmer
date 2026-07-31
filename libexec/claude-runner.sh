@@ -337,6 +337,68 @@ if [ -n "$(printf '%s' "$LMER_HUMAN_IDENTITY" | tr -d '[:space:]')" ]; then
     fi
 fi
 
+# ── Operator ask channel (orchestrated sessions) ──
+# When the lmer orchestrator started this session it mounts an ask channel and
+# sets LMER_ASK_DIR to its container path (issue #141). Render the fragment that
+# tells the model to use `lmer-ask` instead of asking into a terminal nobody is
+# watching. Gated on the env var, so an ordinary session is told nothing.
+#
+# The template/renderer search and the append are factored into a function here
+# rather than copied from the human-identity block above: that block is left
+# byte-for-byte intact (its stability is this script's compatibility contract),
+# and a second inline copy of the same 40 lines is how they drift apart.
+append_prompt_fragment() {
+    local rel="$1" label="$2" template="" renderer="" candidate
+
+    for candidate in \
+        "$(dirname "$0")/../prompts/$rel" \
+        "/workspace/prompts/$rel" \
+        "$LMER_HOME/prompts/$rel" \
+        "/Agents/global/prompts/$rel"; do
+        if [ -f "$candidate" ]; then
+            template="$candidate"
+            break
+        fi
+    done
+
+    for candidate in \
+        "$(dirname "$0")/render-prompt-fragment.py" \
+        "/workspace/libexec/render-prompt-fragment.py" \
+        "$LMER_HOME/libexec/render-prompt-fragment.py" \
+        "/Agents/global/libexec/render-prompt-fragment.py"; do
+        if [ -f "$candidate" ]; then
+            renderer="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$template" ] || [ -z "$renderer" ]; then
+        echo "⚠️  $label requested but its template/renderer was not found"
+        return 1
+    fi
+
+    if [ -z "$AGENTS_COMBINED" ]; then
+        AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+        if [ -n "$WORKSPACE_AGENTS" ]; then
+            cat "$WORKSPACE_AGENTS" > "$AGENTS_COMBINED"
+        elif [ -n "$USER_AGENTS" ]; then
+            cat "$USER_AGENTS" > "$AGENTS_COMBINED"
+        fi
+    fi
+    printf '\n\n' >> "$AGENTS_COMBINED"
+    if "${LMER_PYTHON:-python3}" "$renderer" "$template" >> "$AGENTS_COMBINED"; then
+        AGENTS_PROMPT_ARGS="--append-system-prompt-file $AGENTS_COMBINED"
+        echo "✅ $label injected into system prompt"
+        return 0
+    fi
+    echo "⚠️  Failed to render $label template at $template"
+    return 1
+}
+
+if [ -n "$(printf '%s' "$LMER_ASK_DIR" | tr -d '[:space:]')" ]; then
+    append_prompt_fragment "orchestrator-ask.md.jinja2" "Operator ask channel" || true
+fi
+
 # ── Non-interactive session notice ──
 # Claude Code discovers only CLAUDE.md natively, so AGENTS.md — and with it the
 # NON-INTERACTIVE SESSIONS rule — reaches the model solely through the system

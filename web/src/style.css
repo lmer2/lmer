@@ -1,0 +1,108 @@
+/* What is left of the hand-rolled stylesheet after the Vuetify migration: the
+   things the framework does not do. Colours, spacing and component looks come
+   from the theme in main.js — nothing here should restate them. */
+
+:root {
+  /* The palette lives in the theme (main.js) and NOWHERE else — there is no
+     second place to keep in sync, and no hex belongs in this file.
+
+     That still leaves the first-paint gap: Vuetify injects its theme stylesheet
+     from JS, so between this CSS parsing and the app mounting there is no theme
+     at all, and a dark phone would flash white. `color-scheme` hands exactly that
+     gap to the browser, which paints its own dark canvas when the OS is dark.
+     Delegating the one frame costs a slightly different grey for a moment and
+     buys a single source of truth for every frame after it. */
+  color-scheme: light dark;
+
+  /* Vuetify asks for Roboto, which this bundle deliberately does not ship, so
+     name the stack the phone's OS actually renders best instead of falling
+     through to a generic sans-serif. */
+  --v-font-body: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Vuetify's layout maths knows nothing about a phone's notch: the app bar is
+   fixed at top 0 and v-main's offset comes from --v-layout-top. Adding the insets
+   to both keeps the bar's controls clear of the status bar and keeps the offset
+   correct, so content still starts below the bar. Unlayered rules beat Vuetify's
+   @layer defaults, which is why no !important is needed. */
+.v-app-bar.v-toolbar {
+  padding-top: env(safe-area-inset-top);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+.v-main {
+  padding-top: calc(var(--v-layout-top, 0px) + env(safe-area-inset-top));
+  padding-bottom: calc(var(--v-layout-bottom, 0px) + env(safe-area-inset-bottom));
+  padding-left: calc(var(--v-layout-left, 0px) + env(safe-area-inset-left));
+  padding-right: calc(var(--v-layout-right, 0px) + env(safe-area-inset-right));
+}
+
+/* One-handed use: Vuetify's buttons are 36px and its chips 32px, both short of a
+   comfortable thumb target. Icon buttons are already square and sized by props. */
+.v-btn:not(.v-btn--icon) { min-height: 40px; }
+.v-chip.v-chip--link { min-height: 40px; }
+
+/* A repeated typographic role rather than a one-off: the same small uppercase
+   heading separates "needs you" from everything else in every list. */
+.section-title {
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: var(--v-medium-emphasis-opacity);
+  margin: 18px 0 8px;
+}
+
+/* Long values (targets, paths, session ids) must scroll inside their own box
+   rather than pushing the page sideways. Two details do the real work: `display:
+   block`, because overflow is ignored on inline elements and this mostly wraps
+   <code>; and `min-width: 0`, because a flex or grid child otherwise refuses to
+   shrink below its content and takes the page width with it. */
+.scroll-x {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  min-width: 0;
+}
+
+code {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 0.8125rem;
+  background: rgb(var(--v-theme-code));
+  color: rgb(var(--v-theme-on-code));
+  padding: 1px 5px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+
+/* Key/value rows stay a definition list: Vuetify's list items truncate their
+   titles with an ellipsis, and a silently cut-off target or log path is the one
+   thing this view must not do. */
+dl.kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+}
+
+dl.kv dt {
+  font-size: 0.75rem;
+  opacity: var(--v-medium-emphasis-opacity);
+}
+
+dl.kv dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The reason a row is at the top of the fleet, restated as a stripe down the
+   card edge so it survives a glance at arm's length. */
+.tone-edge {
+  border-inline-start-width: 4px;
+  border-inline-start-style: solid;
+}
+
+.tone-edge-attention { border-inline-start-color: rgb(var(--v-theme-warning)); }
+.tone-edge-bad { border-inline-start-color: rgb(var(--v-theme-error)); }

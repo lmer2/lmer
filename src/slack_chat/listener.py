@@ -30,6 +30,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from lmer_cli.presets import Preset, load_presets, parse_preset_token
+from lmer_cli.tls import ensure_ca_bundle
 
 from .registry import is_thread_connected
 from .sessions import SessionManager
@@ -63,26 +64,14 @@ _bot_user_id: str | None = None
 def _ensure_ca_bundle() -> None:
     """Point OpenSSL's default verify path at certifi's CA bundle.
 
-    Some Python builds - notably the standalone CPython that ``uv tool
-    install`` uses - are compiled with a default ``SSL_CERT_FILE`` location
-    that does not exist on every host. On such systems
-    ``ssl.create_default_context()`` finds no CA bundle and every TLS
-    handshake fails with "unable to get local issuer certificate", which is
-    exactly what the socket-mode WSS connection (aiohttp) and the Slack web
-    client (slack_sdk) hit at startup.
-
-    Setting ``SSL_CERT_FILE`` to certifi's bundle before any SSL context is
-    created fixes all of those in one place. An existing ``SSL_CERT_FILE``
-    (e.g. a deliberate corporate-CA override) is left untouched.
+    Kept as a module-level name because the socket-mode startup path and its tests
+    both reference it, but the implementation is shared: the same missing-trust-
+    store problem hit the pinned-Node download in :mod:`lmer_platform.ui_build`,
+    and one fix in two places is one fix that can drift. See
+    :func:`lmer_cli.tls.ensure_ca_bundle` for why it works and why an existing
+    ``SSL_CERT_FILE`` is deliberately left alone.
     """
-    if os.environ.get("SSL_CERT_FILE"):
-        return
-    try:
-        import certifi
-    except ImportError:
-        logger.debug("certifi_not_available, leaving SSL_CERT_FILE unset")
-        return
-    os.environ["SSL_CERT_FILE"] = certifi.where()
+    ensure_ca_bundle()
 
 
 def _load_env_files() -> None:

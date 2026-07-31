@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!-- Mobile is a constraint on every view, not a separate UI (spec §10.1). -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <!-- Paints the phone's own browser chrome to match the app bar, so the page
+         does not end at a mismatched white strip. The two values are the theme's
+         background colours, and they are restated here on purpose: this frame is
+         read out of the markup before any script exists, so there is nothing to
+         import them from. The duplication is what
+         tests/test_platform_web_theme.py pins to src/main.js — the same bargain
+         the storage key already gets, and the reason it is only these two.
+         They stop mattering the moment the app mounts: main.js repaints both from
+         the live theme, so a scheme picked in the app bar reaches the chrome too. -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f4f2" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1b1a19" />
+    <title>lmer platform</title>
+    <!-- The one frame the theme cannot reach. Vuetify injects its theme stylesheet
+         from JS, so everything before the app mounts is painted by the browser from
+         `color-scheme` — which src/style.css leaves as `light dark`, i.e. the OS
+         decides. Correct for an operator following the OS, and a dark flash before
+         a forced light theme (or the reverse) for one who is not.
+         So the stored preference is read here, ahead of the bundle, and turned into
+         the declarations that decide that frame: `color-scheme` for the page, and
+         the chrome around it, which is the same disagreement one line further out
+         — the metas above answer prefers-color-scheme, so a forced scheme would
+         leave the phone's own strip painted in the other one until the app mounts.
+         Still no colour written here, which is the rule that has not moved: the
+         value copied across is one of the two already in the markup, the palette
+         lives in src/main.js, and style.css holds no hex.
+         The key and the three words are src/App.vue's, restated because this runs
+         before that module exists and cannot import it —
+         tests/test_platform_web_theme.py is what keeps the two spellings in step. -->
+    <script>
+      try {
+        var mode = window.localStorage.getItem('lmer.theme.mode')
+        // 'system' and anything unrecognised (another version of this app, a
+        // cleared value) leave the declaration alone: the browser keeps painting
+        // the OS's scheme, which is what following the system means.
+        if (mode === 'light' || mode === 'dark') {
+          document.documentElement.style.colorScheme = mode
+          // And the chrome: the forced scheme's own meta value onto both of them,
+          // which leaves the media queries with nothing left to disagree about.
+          var metas = document.querySelectorAll('meta[name="theme-color"]')
+          var forced = null
+          metas.forEach(function (meta) {
+            if (meta.media.indexOf(mode) !== -1) forced = meta
+          })
+          if (forced) metas.forEach(function (meta) { meta.content = forced.content })
+        }
+      } catch (exc) {
+        // Reading storage throws in private browsing and in some embedded
+        // webviews. A preference is never worth a blank page.
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

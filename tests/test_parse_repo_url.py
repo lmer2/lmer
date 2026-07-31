@@ -111,6 +111,63 @@ class TestParseRepoUrl:
         assert project == "group/project"
 
 
+# Project names whose last character is one of `.`, `g`, `i`, `t`. The SSH branch
+# used to remove the `.git` suffix with rstrip(".git"), which strips a character
+# *class* and so ate those too: `group/project` came back as `group/projec`, and
+# LMER_REPO_PROJECT — the run directory, the memory dir, the log path — was filed
+# under the mangled name. Real projects in the work repo look like this
+# (`docs/lmer-doc-bot`, `openpipes/openpipes.net`), so it is not a corner case.
+#
+# Both spellings are checked for every name because only the SSH branch was
+# broken: the HTTPS branch removes the suffix with a regex. A test that passed on
+# both would prove nothing about either.
+GIT_CHAR_TAILED_PROJECTS = [
+    "group/project",
+    "docs/lmer-doc-bot",
+    "openpipes/openpipes.net",
+    "group/tooling",
+]
+
+
+@pytest.mark.parametrize("project", GIT_CHAR_TAILED_PROJECTS)
+class TestProjectNamesEndingInGitCharacters:
+    """A `.git` suffix is removed as a suffix, never as a set of characters."""
+
+    def test_ssh_url(self, project):
+        """The broken spelling: git@host:group/project kept only `group/projec`."""
+        assert _parse_repo_url(f"git@gitlab.example.com:{project}") == (
+            "gitlab.example.com", project,
+        )
+
+    def test_ssh_url_with_git_suffix(self, project):
+        """And with the suffix actually present, which is the common spelling."""
+        assert _parse_repo_url(f"git@gitlab.example.com:{project}.git") == (
+            "gitlab.example.com", project,
+        )
+
+    def test_https_url(self, project):
+        assert _parse_repo_url(f"https://gitlab.example.com/{project}") == (
+            "gitlab.example.com", project,
+        )
+
+    def test_https_url_with_git_suffix(self, project):
+        assert _parse_repo_url(f"https://gitlab.example.com/{project}.git") == (
+            "gitlab.example.com", project,
+        )
+
+    def test_both_spellings_name_the_same_project(self, project):
+        """The identity must not depend on which spelling reached the parser.
+
+        ``lmer`` picks the spelling by whether it holds a token for the host
+        (:func:`lmer_cli.cli._derive_repo_url_from_task_target` answers in SSH
+        shape without one), so a project whose run directory changed name with the
+        token state is the same bug seen from the outside.
+        """
+        assert _parse_repo_url(f"git@gitlab.example.com:{project}.git") == (
+            _parse_repo_url(f"https://gitlab.example.com/{project}.git")
+        )
+
+
 class TestParseGitlabMrUrl:
     """Tests for _parse_gitlab_mr_url function."""
 

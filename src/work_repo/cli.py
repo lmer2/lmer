@@ -1231,13 +1231,23 @@ def cmd_state(args) -> int:
 def cmd_answer(text: str) -> int:
     """Execute answer command (issue #98 — resume-on-answer).
 
-    Applies a human's answer to the run's recorded open question through
+    Applies a human's answer to the run's open question through
     run_state.answer_question (appends `question_answered`, clears
     `open_question` + `stop_reason`; status untouched), then pushes the run
     dir — the answer is exactly the record a fresh session resumes from, so
     it must not stay local. Mutating-verb rules: no run context and no open
-    question recorded are errors (exit 1). No auto-seed: an answer can only
-    land on a run that already asked something.
+    question are errors (exit 1). No auto-seed: an answer can only land on a
+    run that already asked something.
+
+    What counts as answerable is the *question stop*, not the recorded text
+    (T24) — and this must agree with _apply_pushed_answer, because the two
+    are one feature seen from two sides: `lmer --answer` on the host and
+    `work answer` in the container answer the same question on the same run,
+    and an operator who is told the two are equivalent (they are documented
+    that way) must not find one recording the answer and the other refusing
+    it. A question stop whose text was never recorded is still a question
+    the run is waiting on; refusing to record its answer loses the answer,
+    which is the failure this verb exists to prevent.
     """
     if not text.strip():
         print("❌ answer requires a non-empty text", file=sys.stderr)
@@ -1251,15 +1261,21 @@ def cmd_answer(text: str) -> int:
     except (run_state.RunStateError, OSError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
-    if state is None or not state.get("open_question"):
-        print("❌ No open question recorded — nothing to answer", file=sys.stderr)
+    if state is None or (
+        not state.get("open_question") and state.get("stop_reason") != "question"
+    ):
+        print(
+            "❌ No open question — the run is not stopped on one, so there is "
+            "nothing to answer",
+            file=sys.stderr,
+        )
         return 1
     try:
         run_state.answer_question(rdir, state, text)
     except (run_state.RunStateError, OSError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
-    print("✅ Question answered — open question and question stop cleared")
+    print("✅ Question answered — question stop cleared")
     _push_run_dir(state, "question answered", saved="answer")
     return 0
 
@@ -3044,20 +3060,24 @@ def _answer_marker_path(answer: str) -> Path:
 
 
 def _apply_pushed_answer(rdir: Path, state: dict) -> tuple[dict, dict | None]:
-    """Apply a pushed LMER_ANSWER to the run's recorded open question (issue #98); returns (state, answered)."""
+    """Apply a pushed LMER_ANSWER to the run's question stop (issue #98); returns (state, answered)."""
     # Resume-on-answer: a pushed answer (LMER_ANSWER, set by
-    # `lmer --answer "<text>"` on the host) to the run's recorded open
-    # question is applied BEFORE deciding, so the brief leads with the
-    # answered pair instead of the stale question block. Fail-soft: a
-    # problem applying it degrades to the plain brief, never a failure.
-    # Consume-once: _answer_marker_path guards against the container-lived
-    # env var replaying into a later question (review on !126).
+    # `lmer --answer "<text>"` on the host) to the run's open question is
+    # applied BEFORE deciding, so the brief leads with the answered pair
+    # instead of the stale question block. Fail-soft: a problem applying it
+    # degrades to the plain brief, never a failure. Consume-once:
+    # _answer_marker_path guards against the container-lived env var
+    # replaying into a later question (review on !126).
+    #
+    # The question stop is the trigger, not the recorded text (T24): a run
+    # that stopped with `--stop-reason=question` and no `--question` is the
+    # common shape, and requiring the text meant the answer was silently
+    # dropped for exactly those runs — no event, stop still standing.
     answered = None
     answer = (os.environ.get("LMER_ANSWER") or "").strip()
     if (
         answer
         and state.get("stop_reason") == "question"
-        and state.get("open_question")
         and not _answer_marker_path(answer).exists()
     ):
         try:
