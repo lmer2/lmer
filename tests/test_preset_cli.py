@@ -20,7 +20,7 @@ task; an unknown preset name fails fast (exit 2) listing the available names.
 
 The behavioral tests run the real ``main()`` with the container runtime mocked
 out (reusing the harness from ``test_lmer_cli_slack_target``) and inspect the
-env dict the CLI hands to ``env_args``.
+env dict the CLI hands to ``build_container_env``.
 """
 
 import json

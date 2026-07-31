@@ -27,6 +27,7 @@ This project provides a FIPS 140-2 compliant development environment using Oracl
   - [Security Settings](#security-settings)
 - [Makefile Commands](#makefile-commands)
 - [Environment Variables](#environment-variables)
+  - [How the environment reaches the container](#how-the-environment-reaches-the-container)
 - [Building for Production](#building-for-production)
 - [Troubleshooting](#troubleshooting)
   - [FIPS Mode Not Enabled](#fips-mode-not-enabled)
@@ -319,6 +320,89 @@ Set via the host environment, `~/.lmer/.env`, or a project-local `.env` file:
 - `CLAUDE_API_KEY` - Claude API key (if needed)
 - `LMER_HARNESS` - Agent harness the session runs (`claude` default; `codex`, `pi` — all baked into the image; see [HARNESSES.md](./HARNESSES.md))
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, ... - Provider API keys for non-claude harnesses (forwarded from `.env` like any other variable)
+
+### How the environment reaches the container
+
+No environment **value** is ever placed in the `docker`/`podman run` command
+line. `/proc/<pid>/cmdline` is world-readable, so a `-e NAME=value` argument
+exposes the value to every user on the host for as long as the session runs
+— and a session's environment routinely carries a credentialed work-repo
+clone URL, git forge tokens and the FastAPI bearer token.
+
+The CLI uses two transports (`runtime.build_container_env`):
+
+- **`--env-file`** for everything the line-oriented env-file format carries
+  faithfully. The file is written mode `0600` inside a mode `0700` temporary
+  directory and deleted once the run command returns. Both docker and podman
+  accept the flag.
+- **A bare `-e NAME` inheritance marker** for everything else — overwhelmingly
+  values containing a newline or carriage return, which an env file cannot
+  represent: a multi-line `--prompt`/`--answer`, or Slack thread text. Both
+  runtimes read such a value from the client's own environment, and
+  `/proc/<pid>/environ` is mode `0400`, readable only by its owner.
+
+There is no third transport, and no inline fallback — that form is the exposure
+this design removes. Two things **abort the launch** instead, each with a
+message naming the variable and the reason, value redacted:
+
+- **A name or value no leg can deliver.** A NUL byte (`execve` truncates a
+  value, the marker leg raises out of `subprocess`, and an env file would carry
+  the raw byte into a name), or bytes that are not valid UTF-8 — docker's
+  env-file parser runs `utf8.Valid` per line and rejects the whole file, and
+  the client environment would silently substitute U+FFFD. Refusing loudly
+  beats corrupting quietly.
+- **A name no bare marker can express**, when the env file cannot take it
+  either: an empty name, one containing `=`, or one ending in `*`
+  (podman glob-expands a trailing `*`). Also a name the runtime client reads
+  from its own environment — `PATH`, `HOME`, `TMPDIR`, the `DOCKER_*`/podman
+  client variables, the proxy and `SSL_CERT_*` names — whose value *also*
+  contains a newline, since overriding those would break the client itself.
+  That reserved list is explicit and narrow on purpose: it gates a hard abort,
+  so completeness there is a functional convenience, not a security boundary
+  (a name missing from it can only corrupt the client's environment, never leak
+  a value).
+
+Several shapes are **routed to the marker leg rather than rejected**, because
+they worked before #158 and must keep working — each verified against a real
+docker client:
+
+- a name an env file would misread: `#`-prefixed, or containing a space or tab
+  (docker's env-file parser rejects those names outright, while podman's
+  accepts them, so the outcome would be runtime-dependent);
+- a name an env file would silently **rename**: one with leading whitespace,
+  which docker strips (`unicode.IsSpace`, so NBSP/VT/FF/U+3000 too) before
+  splitting on `=`. The marker leg passes such a name through verbatim.
+  Whitespace *inside* a name other than a space or tab is left alone — docker
+  parses it, so it takes the env-file leg like any other name;
+- a name a bare marker handles fine despite looking odd: leading `-`, interior
+  `*`;
+- an encoded `NAME=value` line at or over **64 KiB**, the token limit both
+  env-file parsers inherit from Go's `bufio.Scanner` — past it docker aborts
+  with `bufio.Scanner: token too long`. The marker leg's ceiling
+  (`MAX_ARG_STRLEN`, 128 KiB) is twice as generous. The measurement is on the
+  encoded line, not the value, so a multibyte value is counted as the parser
+  counts it.
+
+Three consequences worth knowing:
+
+- The verbose `Running: …` line prints the full run command and no longer
+  contains any environment value. The one inline `-e` you may still see is
+  `SSH_AUTH_SOCK=/ssh-agent` from the SSH-agent mount — a fixed container-side
+  socket path, not a forwarded value.
+- The env file is removed in the launch path's `finally`, and a `SIGTERM`
+  handler deletes it too, so a reaped session (systemd `KillMode=control-group`,
+  an orchestrator, a session reaper) still cleans up. That handler deliberately
+  does **not** raise: unwinding would pass through `subprocess.call`'s bare
+  `except: p.kill()` and SIGKILL the runtime client, and in a non-TTY spawn the
+  client forwarding `SIGTERM` is what stops the container (`--sig-proxy` is
+  non-TTY-only) — with `--rm` removal being daemon-side and conditional on that
+  exit, killing the client would leave a container running. It cleans up, then
+  restores the default disposition and re-raises the signal at itself, so
+  process semantics are exactly as if no handler existed. Only a `SIGKILL` of
+  `lmer` itself can leave a `lmer-env-*` directory behind in `$TMPDIR`. It is
+  owner-only; delete it if you find one.
+- Hosts that ran an earlier build may hold stale `lmer-env-*` directories from
+  sessions killed before this landed. They are owner-only and safe to delete.
 
 ## Building for Production
 
