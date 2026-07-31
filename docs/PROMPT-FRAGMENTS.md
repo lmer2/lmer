@@ -6,9 +6,14 @@ you feed session-specific context (e.g. the human user's identity) to the
 model without hard-coding text in shell and without modifying the target
 project's `AGENTS.md`.
 
-Today there is exactly one shipped fragment — `human-identity` — but the
-pieces (`render-prompt-fragment.py`, the template search, the append step)
-are deliberately generic and intended to be reused for future fragments.
+`human-identity` is the only *templated* fragment today, but the pieces
+(`render-prompt-fragment.py`, the template search, the append step) are
+deliberately generic and intended to be reused for future fragments. Two
+more fragments ship as plain markdown (`prompts/agent-memory.md`,
+`prompts/non-interactive.md`): they carry no session values, so they skip
+the renderer and are concatenated directly. Everything below about *when*
+a fragment is injected applies to them unchanged — each is gated on its own
+env var (`LMER_PERSIST_AGENT_MEMORY`, `LMER_NONINTERACTIVE`).
 
 ## How it works
 

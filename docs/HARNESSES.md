@@ -305,7 +305,25 @@ children explicitly, never inherit them from neutral registry data.
 Children are also barred
 from fanning out further: `spawn-harness` strips `LMER_AGENTS` /
 `LMER_AGENTS_CONFIG` from the child environment (no grandchildren,
-structurally). How agents are configured and selected at launch:
+structurally).
+
+Children equally cannot answer *approval* questions, which is a prompt-level
+problem rather than a flag one: a child that obeys a rule telling it to stop
+and ask ends its turn on an unanswerable question, exits 0, and leaves a
+near-empty output file — the orchestrator then consolidates from N-1 agents
+with nothing to indicate it lost one. `spawn-harness` therefore sets
+`LMER_NONINTERACTIVE=1` on every child (unconditionally — no preset overlay
+or `--env` pair can unset it) **and prepends the rule itself to the child's
+prompt**: "state what you would have asked and why you stopped, in your final
+output". The in-band copy is what actually steers the child — a fan-out child
+execs its harness binary directly, so no runner script injects `AGENTS.md`
+into a claude child's system prompt (Claude Code discovers only `CLAUDE.md`
+natively), and no lmer path renders an environment value into any model's
+context. The prompt is the one channel every harness reads identically. See
+`LMER_NONINTERACTIVE` in [LMER-CLI.md](./LMER-CLI.md) for host-side use on
+cron/CI launches, where the same text arrives as the
+`prompts/non-interactive.md` fragment instead. How agents are configured and
+selected at launch:
 [Fan-out agents in docs/PRESETS.md](./PRESETS.md#fan-out-agents---agents--lmer_agents).
 
 ## Architecture

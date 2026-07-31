@@ -168,6 +168,25 @@ harness_render_global_context() {
             ;;
     esac
 
+    # Non-interactive marker — the rule text has to travel with the session,
+    # not just the variable. Nothing puts an LMER_* value in front of a model
+    # on its own, so a session that is told "no human is attached" only knows
+    # it because this fragment is in its context (issue #137).
+    case "${LMER_NONINTERACTIVE,,}" in
+        1|true|yes)
+            local noninteractive_fragment
+            noninteractive_fragment="$(harness_find_resource "prompts/non-interactive.md")"
+            if [ -n "$noninteractive_fragment" ]; then
+                printf '\n' >> "$tmp"
+                cat "$noninteractive_fragment" >> "$tmp"
+                have_content=1
+                echo "✅ Non-interactive session notice added to global context"
+            else
+                echo "⚠️  LMER_NONINTERACTIVE set but non-interactive fragment not found"
+            fi
+            ;;
+    esac
+
     if [ "$have_content" = "1" ]; then
         if mkdir -p "$(dirname "$target")" && mv "$tmp" "$target"; then
             echo "✅ Global context written to $target"
