@@ -85,6 +85,53 @@ Notes:
 - Distinct from the source-root `taskdef.yaml` (schema versioning, below):
   `task.yaml` sits inside one task's directory and describes that task.
 
+### `push_allow:` — taskdef-declared push targets
+
+A taskdef that knows where its sessions must push can declare it, so the
+operator does not have to configure `LMER_PUSH_ALLOW_LIST` for a target the
+task requires by definition:
+
+```yaml
+push_allow:
+  - gitlab.example.com/group/project
+  - github.com/group/mirror|refs/tags/*
+```
+
+The entries use exactly the `LMER_PUSH_ALLOW_LIST` grammar (see
+[LMER-CLI.md](./LMER-CLI.md) and the `lmer_cli.push_allow` module docstring),
+and the two sources are **unioned** — any single entry granting the target
+allows the push. A bare entry still authorizes branch refs only.
+
+**This key does NOT follow normal tier precedence.** It resolves from the
+**trusted tiers only** — the `LMER_TASKDEF_PATHS` directories, then the
+shipped taskdef root. The work-repo tiers
+(`{work_repo}/{host}/{project}/taskdef/` and `{work_repo}/taskdef/`) are
+excluded, and so are the pre-resolved `LMER_TASKDEF_DIR` /
+`LMER_TASK_INSTRUCTIONS` fallbacks, which may point into one. The reason is
+the threat model, not tidiness: every agent session pushes to the work repo
+through routine `work commit`, so a `task.yaml` landed there would let one
+session grant push targets to every later session of that task type,
+org-wide, without ever passing review. Those tiers keep their normal
+first-match precedence for benign keys like `masterplan:` — the exclusion is
+specific to `push_allow`.
+
+Resolution is fail-soft in the same way as `masterplan:`: a missing,
+unreadable, malformed or wrongly-typed manifest contributes **no entries**
+and never breaks the gate. Only a top-level list of **strings** counts;
+anything else (a mapping, a nested list) is ignored rather than stringified
+into a junk entry.
+
+> **The name is reserved for the grant.** `taskdef/release/task.yaml`
+> records the *roles* a release session must be able to push to
+> (`target: github_mirror`, whose concrete repositories are per-adopter
+> parameters) — that block is documentation-only, nothing parses it, and it
+> is called **`needs.push_targets`**, not `push_allow`. The distinct name is
+> the point: a documentation block sharing the grant's name would be one
+> stray dedent — a diff that reads as whitespace, in a file whose reviewers
+> have no reason to read it as a permission change — away from becoming a
+> live push grant. Only the **top-level** `push_allow` key grants, and only
+> a list of strings there counts.
+
 ## Tier ownership
 
 Each tier has one clear owner:

@@ -69,7 +69,8 @@ ZERO_SHA = "0" * 40
 # Refs are fully qualified — that is what git hands the pre-push hook on
 # stdin (bare-branch normalization is a python-side nicety, tested apart).
 CASES = [
-    # Bare entry: substring match, branch refs ONLY.
+    # Bare entry (no `|`): branch refs ONLY. The repo half is matched by
+    # the #107 grammar — here the legacy host-less project path rule.
     ("group/project", GITLAB_SSH, "refs/heads/main", True),
     ("group/project", GITLAB_SSH, "refs/tags/v0.2.0", False),  # bare vs tag ref
     # Explicit refs/tags/* entry grants tags, and only tags.
@@ -99,6 +100,121 @@ CASES = [
     ("user/other-repo", GITLAB_SSH, "refs/heads/main", False),
     # Whitespace around entries and around the delimiter is trimmed.
     (" group/project | refs/tags/* ", GITLAB_SSH, "refs/tags/v0.2.0", True),
+
+    # ---- #107 repo-half grammar; every point must agree on ALL of it ----
+    # Exact repo: SSH / HTTPS / bare spellings are interchangeable.
+    ("gitlab.example.com/group/project", GITLAB_SSH, "refs/heads/main", True),
+    ("https://gitlab.example.com/group/project", GITLAB_SSH, "refs/heads/main", True),
+    ("git@gitlab.example.com:group/project.git", GITLAB_SSH, "refs/heads/main", True),
+    ("gitlab.example.com/group/other", GITLAB_SSH, "refs/heads/main", False),
+    # Whole host: any project there, but the host must match exactly.
+    ("gitlab.example.com", GITLAB_SSH, "refs/heads/main", True),
+    ("sub.gitlab.example.com", GITLAB_SSH, "refs/heads/main", False),
+    ("github.com", GITLAB_SSH, "refs/heads/main", False),
+    # Wildcard domain: subdomains only, dot boundary enforced, apex excluded.
+    ("*.example.com", GITLAB_SSH, "refs/heads/main", True),
+    ("*.example.com", "git@example.com:group/project.git", "refs/heads/main", False),
+    ("*.example.com", "git@evilexample.com:group/project.git", "refs/heads/main", False),
+    ("*.example.com|refs/tags/*", GITLAB_SSH, "refs/tags/v0.2.0", True),
+    ("*.example.com", GITLAB_SSH, "refs/tags/v0.2.0", False),  # bare: branches only
+    # Host + project prefix, at SEGMENT boundaries.
+    ("gitlab.example.com/group", GITLAB_SSH, "refs/heads/main", True),
+    ("gitlab.example.com/group", "git@gitlab.example.com:groupfoo/x.git",
+     "refs/heads/main", False),
+    ("gitlab.example.com/gro", GITLAB_SSH, "refs/heads/main", False),
+    # Legacy host-less path: any host, still segment-bounded.
+    ("group/project", "https://other.example.org/group/project.git",
+     "refs/heads/main", True),
+    ("group/project", "https://gitlab.example.com/group/project2.git",
+     "refs/heads/main", False),
+    # The substring rule this grammar REPLACED would have allowed both of
+    # these; every enforcement point must now refuse them.
+    ("group/proj", GITLAB_SSH, "refs/heads/main", False),
+    ("group/project", "https://evil.example.com/mirror/group/project.git",
+     "refs/heads/main", False),
+    # Hosts are case-insensitive; project paths are not.
+    ("GITLAB.EXAMPLE.COM/group/project", GITLAB_SSH, "refs/heads/main", True),
+    ("gitlab.example.com/Group/Project", GITLAB_SSH, "refs/heads/main", False),
+    # Entry shapes that only exist once the two grammars are merged: a bare
+    # entry and a ref-scoped entry, of different repo shapes, in one list.
+    ("*.example.com, github.com/group/project|refs/tags/*",
+     GITLAB_SSH, "refs/heads/main", True),
+    ("*.example.com, github.com/group/project|refs/tags/*",
+     GITHUB_MIRROR, "refs/tags/v0.2.0", True),
+    ("*.example.com, github.com/group/project|refs/tags/*",
+     GITHUB_MIRROR, "refs/heads/main", False),
+    ("*.example.com, github.com/group/project|refs/tags/*",
+     GITLAB_SSH, "refs/tags/v0.2.0", False),
+    # A wildcard grant for one domain must not leak onto another host in
+    # the same list, whichever half of the entry the ref matches.
+    ("*.example.com|refs/tags/*, group/project",
+     GITHUB_MIRROR, "refs/tags/v0.2.0", False),
+    ("*.example.com|refs/tags/*, group/project",
+     GITHUB_MIRROR, "refs/heads/main", True),
+
+    # ---- Inputs no implementation may choke on or over-read ----
+    # A malformed URL grants nothing AND does not abort the entries around
+    # it: an unmatched IPv6 bracket raises inside urlsplit/urlparse, so an
+    # unguarded parse would make the verdict depend on where the bad entry
+    # sits in the list (it granted when listed second, crashed when first).
+    ("https://[::1/g/p", GITLAB_SSH, "refs/heads/main", False),
+    ("https://[::1/g/p, gitlab.example.com", GITLAB_SSH, "refs/heads/main", True),
+    ("gitlab.example.com, https://[::1/g/p", GITLAB_SSH, "refs/heads/main", True),
+    ("gitlab.example.com", "https://[::1/g/p", "refs/heads/main", False),
+    # No scheme and no `:` before the first `/`: git reads the whole string
+    # as a local PATH, so there is no authority and no userinfo to strip.
+    # The `@` names no host (URL_IDENTITIES states None for this URL), so
+    # nothing may authorize it — least of all the identity after the `@`.
+    ("github.com", "user@github.com/group/project", "refs/heads/main", False),
+    ("github.com/group/project", "user@github.com/group/project",
+     "refs/heads/main", False),
+    # An empty (or otherwise invalid) scheme is not a URL — git refuses it,
+    # "protocol '' is not supported" — so the text after `://` is not a host.
+    ("github.com", "://github.com/group/project", "refs/heads/main", False),
+    ("github.com/group/project", "://github.com/group/project",
+     "refs/heads/main", False),
+
+    # ---- IPv6 literals: the BRACKET is the host boundary ----
+    # The leak these rows exist for: splitting the authority on its first
+    # `:` collapses every address sharing a first hextet to one host
+    # (`[2001`), and every `::`-leading address to the host `[`, so an
+    # entry naming one address authorized a push to a DIFFERENT one. The
+    # mirrors did that while gate-push (urlsplit) resolved the real
+    # address, which made them laxer than the gate.
+    ("https://[2001:db8::1]/group/project",
+     "https://[2001:db8::9999]/group/project", "refs/heads/main", False),
+    ("https://[::1]/group/project", "https://[::2]/group/project",
+     "refs/heads/main", False),
+    ("https://[2001:db8::1]", "https://[2001:db8::9999]/group/project",
+     "refs/heads/main", False),
+    ("[2001:db8::1]", "git@[2001:db8::9999]:group/project.git",
+     "refs/heads/main", False),
+    # A truncated address is not a host prefix — `[2001` names nothing.
+    ("[2001", "https://[2001:db8::1]/group/project", "refs/heads/main", False),
+    ("[2001:db8::1", "https://[2001:db8::1]/group/project",
+     "refs/heads/main", False),
+    # ...and the exact address does grant, in every spelling git accepts:
+    # they are one identity everywhere.
+    ("https://[2001:db8::1]/group/project",
+     "https://[2001:db8::1]/group/project", "refs/heads/main", True),
+    ("[2001:db8::1]/group/project", "https://[2001:db8::1]/group/project",
+     "refs/heads/main", True),
+    ("[2001:db8::1]/group/project", "git@[2001:db8::1]:group/project.git",
+     "refs/heads/main", True),
+    ("[2001:db8::1]/group/project",
+     "ssh://git@[2001:db8::1]:22/group/project.git", "refs/heads/main", True),
+    ("https://[2001:db8::1]", "https://[2001:db8::1]/group/project",
+     "refs/heads/main", True),
+    ("[2001:db8::1]|refs/tags/*", "https://[2001:db8::1]/group/project",
+     "refs/tags/v0.2.0", True),
+    ("[2001:db8::1]", "https://[2001:db8::1]/group/project",
+     "refs/tags/v0.2.0", False),          # bare entry: branches only
+    # An unclosed bracket names no host, so nothing authorizes it — the
+    # mirrors used to read it as host `[` with the path intact, which a
+    # legacy host-less entry then granted.
+    ("group/project", "https://[::1/group/project", "refs/heads/main", False),
+    ("[::1]/group/project", "https://[::1/group/project",
+     "refs/heads/main", False),
 ]
 
 
@@ -334,6 +450,16 @@ URL_CASES = [
     # closed, and the hook must not fall back to the CONFIGURED-remote
     # substring rule just because the string carries no URL punctuation.
     ("github.com", "github.com", False),
+    # IPv6: the anchored branch pins the address exactly, in both mirrors.
+    ("[2001:db8::1]/group/project", "https://[2001:db8::1]/group/project", True),
+    ("[2001:db8::1]", "https://[2001:db8::1]/group/project", True),
+    ("https://[2001:db8::1]/group/project",
+     "https://[2001:db8::1]/group/project", True),
+    ("[2001:db8::1]/group/project",
+     "https://[2001:db8::9999]/group/project", False),
+    ("[2001:db8::9999]", "https://[2001:db8::1]/group/project", False),
+    ("[2001", "https://[2001:db8::1]/group/project", False),
+    ("group/project", "https://[::1/group/project", False),
 ]
 
 # The `host/path` identity each URL carries, stated as a CONSTANT rather
@@ -370,6 +496,44 @@ URL_IDENTITIES = [
     # Empty scheme — git refuses it ("protocol '' is not supported"), and
     # `urlsplit` finds no authority either.
     ("://github.com/group/project", None),
+    # IPv6 literals. The bracket is the host boundary in every spelling git
+    # accepts, and the identity is the address WITHOUT brackets — that is
+    # what `urlsplit().hostname` reports, and git requires the brackets
+    # outside a scheme URL to keep the address's colons apart from the
+    # `host:path` delimiter.
+    ("https://[2001:db8::1]/group/project", "2001:db8::1/group/project"),
+    ("https://[2001:db8::1]:8443/group/project", "2001:db8::1/group/project"),
+    ("ssh://git@[2001:db8::1]:22/group/project.git", "2001:db8::1/group/project"),
+    ("git@[2001:db8::1]:group/project.git", "2001:db8::1/group/project"),
+    ("[2001:db8::1]/group/project", "2001:db8::1/group/project"),
+    ("https://[::1]/group/project", "::1/group/project"),
+    # No path, so no repository — the same rule as `https://github.com/`.
+    ("https://[2001:db8::1]", None),
+    ("[2001:db8::1]", None),
+    # An unclosed bracket is not a URL at all (`urlsplit` raises here) and
+    # names no host: `https://[::1/group/project` must NOT be read as the
+    # host `[` carrying the path `group/project`.
+    ("https://[::1/group/project", None),
+    ("[::1/group/project", None),
+]
+
+
+# (entry spelling, the single host that entry names). The property guards
+# below drive every one of these against every URL: an entry may authorize
+# only when the host it names IS the host git dials. The IPv6 entries are
+# in URL spelling because that is the shape that leaked — `https://[addr]`
+# normalized to the host `[2001` in both mirrors, so ONE such entry
+# authorized every address sharing that first hextet.
+ENTRY_HOSTS = [
+    ("github.com", "github.com"),
+    ("gitlab.example.com", "gitlab.example.com"),
+    ("evil.example.com", "evil.example.com"),
+    ("evil.invalid", "evil.invalid"),
+    ("https://[2001:db8::1]", "2001:db8::1"),
+    ("https://[2001:db8::9999]", "2001:db8::9999"),
+    ("[2001:db8::1]", "2001:db8::1"),
+    ("https://[::1]", "::1"),
+    ("[::2]", "::2"),
 ]
 
 
@@ -383,7 +547,18 @@ def independent_host(url):
     """
     url = url.strip()
     if "://" in url:
-        return (urlsplit(url).hostname or "").lower()
+        try:
+            return (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            return ""       # e.g. an unclosed IPv6 bracket: not a URL
+    # git requires an IPv6 literal to be BRACKETED outside a scheme URL,
+    # "to avoid ambiguity with a local path containing a colon" — so the
+    # bracket, not the first colon, is where the host ends.
+    match = re.match(r"^(?:[^@/]+@)?\[([^\[\]/]+)\](?:[:/]|$)", url)
+    if match:
+        return match.group(1).lower()
+    if url.partition("/")[0].startswith("["):
+        return ""           # malformed bracket: names no host
     match = re.match(r"^(?:[^@/]+@)?([^:/]+):", url)
     if match:
         return match.group(1).lower()
@@ -412,9 +587,8 @@ def test_the_authorized_host_is_the_host_git_would_dial(
     it holds whatever the implementations happen to do — and it is checked
     in both mirrors that have this branch.
     """
-    for entry in ("github.com", "gitlab.example.com", "evil.example.com",
-                  "evil.invalid"):
-        if entry == independent_host(url):
+    for entry, names in ENTRY_HOSTS:
+        if names == independent_host(url):
             continue  # this entry legitimately names the dialled host
         allow = f"{entry}|refs/heads/*"
         monkeypatch.setenv("LMER_PUSH_ALLOW_LIST", allow)
@@ -442,6 +616,44 @@ def test_the_authorized_host_is_the_host_git_would_dial(
         assert result.returncode == 1, (
             f"pre-push hook authorized entry {entry!r} for {url!r}, which "
             f"git dials at {independent_host(url)!r}: {result.stdout}"
+        )
+
+
+@pytest.mark.parametrize("url,_expected",
+                         [pair for pair in URL_IDENTITIES if pair[0].strip()])
+def test_the_configured_remote_branch_pins_that_host_too(
+        url, _expected, tmp_path, monkeypatch, capsys):
+    """The same property, over the CONFIGURED-remote branch.
+
+    That branch is deliberately wider — prefixes, wildcard domains and
+    host-less paths all grant there — but a HOST-naming entry must still
+    only authorize the host git actually dials. The property guard above
+    drives the push-by-URL branch only, and that is precisely where a
+    shared normalization bug hid: `user@github.com/group/project`, which
+    git reads as a local path, normalized to a `github.com` identity in all
+    three implementations and so was granted by an entry naming a host the
+    push never reaches.
+
+    The entries here are bare hosts, so no legitimate wildcard or
+    host-less grant is being asserted away — only "an entry naming host A
+    never authorizes a push git sends to host B".
+    """
+    ref = "refs/heads/main"
+    for index, (entry, names) in enumerate(ENTRY_HOSTS):
+        if names == independent_host(url):
+            continue  # this entry legitimately names the dialled host
+        allow = f"{entry}|refs/heads/*"
+        dialled = independent_host(url) or "(no host)"
+        scratch = tmp_path / f"entry{index}"
+        scratch.mkdir(exist_ok=True)
+        verdicts = {
+            "gates.py": gates_verdict(allow, url, ref, monkeypatch),
+            "hooks/pc.py": pc_verdict(allow, url, ref),
+            "install.sh pre-push": bash_verdict(allow, url, ref, scratch),
+        }
+        assert verdicts == {name: False for name in verdicts}, (
+            f"entry {entry!r} authorized configured remote {url!r}, which "
+            f"git dials at {dialled}: {verdicts}"
         )
 
 
@@ -548,8 +760,13 @@ def test_detached_head_refuses_instead_of_matching_refs_heads_star(
     assert "detached HEAD" in capsys.readouterr().out
 
     # hooks/pc.py's push_allowed() has the same shape; its caller is what
-    # must not hand it an empty branch (see main()).
-    assert PC_HOOK.push_allowed("group/project", "") is True, (
+    # must not hand it an empty branch (see main()). The URL is a real repo
+    # URL (granted by the `group/project` entry through the host-less rule)
+    # rather than the bare entry text: since #107 the repo half is parsed
+    # into host+path instead of substring-matched, so `group/project` as a
+    # URL would now be read as host `group`, and this test would fail for a
+    # reason that has nothing to do with the empty ref it exists to pin.
+    assert PC_HOOK.push_allowed(GITLAB_SSH, "") is True, (
         "push_allowed itself still normalizes '' — the guard belongs in the "
         "caller, and this pins which side owns it"
     )
