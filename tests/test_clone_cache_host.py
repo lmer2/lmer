@@ -17,7 +17,9 @@ import fcntl
 import json
 import os
 import subprocess
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -25,6 +27,9 @@ import pytest
 
 from lmer_cli import clone_cache
 from lmer_cli.clone_cache import (
+    _carries_credentials,
+    _config_env,
+    _credential_sources_off,
     _git_env,
     _split_credentials,
     mirror_path,
@@ -150,18 +155,62 @@ class TestSplitCredentials:
         keys = {v for k, v in env.items() if k.startswith("GIT_CONFIG_KEY_")}
         assert any(k.lower() == f"http.{scrubbed}.extraheader".lower() for k in keys)
 
-    def test_ssh_and_bare_urls_pass_through(self):
-        for url in ("git@example.com:org/repo.git", "https://example.com/org/repo.git"):
-            scrubbed, env = _split_credentials(url)
-            assert scrubbed == url
-            assert not any(k.startswith("GIT_CONFIG_KEY_") for k in env)
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://example.com/org/repo.git",  # no userinfo
+            "git@example.com:org/repo.git",  # scp-like form, no scheme
+            "https://exa mple.com:99999/x",  # unparseable port
+        ],
+    )
+    def test_uncredentialable_urls_pass_through_untouched(self, url):
+        """A URL lmer cannot credential gets an EMPTY env: the operator's own git
+        config — credential helper included — stays the authenticating path, as
+        it was before this function existed.
+
+        Review on !178: an earlier iteration reset `credential.helper` here too,
+        which silently removed a working auth path (a `gh auth login`/`store`
+        helper is how a tokenless private repo mirrored) in exchange for nothing
+        #157 asked for.
+        """
+        scrubbed, env = _split_credentials(url)
+        assert scrubbed == url
+        assert env == {}
+        assert not _carries_credentials(env)
+
+    def test_credentialed_env_cancels_inherited_headers_before_adding_ours(
+        self, monkeypatch
+    ):
+        """Without the reset git sends the inherited header AND ours — measured
+        on the wire with git 2.52.0 (review on !178). Order matters: the empty
+        value resets the list, so it has to precede our own entry."""
+        monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+        scrubbed, env = _split_credentials("https://oauth2:sekrit@example.com/o/r.git")
+        assert env["GIT_CONFIG_COUNT"] == "3"
+        assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
+        assert env["GIT_CONFIG_VALUE_0"] == ""
+        assert env["GIT_CONFIG_KEY_1"] == f"http.{scrubbed}.extraHeader"
+        assert env["GIT_CONFIG_VALUE_1"] == ""  # cancels anything inherited
+        assert env["GIT_CONFIG_KEY_2"] == f"http.{scrubbed}.extraHeader"
+        assert env["GIT_CONFIG_VALUE_2"].startswith("Authorization: Basic ")
+
+    def test_carries_credentials_reads_the_header_value_not_the_key(self):
+        _, with_token = _split_credentials("https://oauth2:sekrit@example.com/o/r.git")
+        _, without = _split_credentials("https://example.com/o/r.git")
+        assert _carries_credentials(with_token)
+        assert not _carries_credentials(without)
+        # a reset-only env names extraHeader too, but with an empty value: that
+        # cancels a header rather than sending one
+        resets = _config_env(_credential_sources_off("https://example.com/o/r.git"))
+        assert not _carries_credentials(resets)
 
     def test_indices_default_to_zero_when_nothing_inherited(self, monkeypatch):
         monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
         _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
-        assert env["GIT_CONFIG_COUNT"] == "2"
-        assert env["GIT_CONFIG_KEY_0"].endswith(".extraHeader")
-        assert env["GIT_CONFIG_KEY_1"] == "credential.helper"
+        assert env["GIT_CONFIG_COUNT"] == "3"
+        assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
+        assert env["GIT_CONFIG_KEY_1"].endswith(".extraHeader")  # cancels inherited
+        assert env["GIT_CONFIG_KEY_2"].endswith(".extraHeader")  # ours
 
     def test_inherited_numbered_config_is_appended_to(self, monkeypatch):
         """Review on !154: _git_env merges over os.environ, so hardcoding
@@ -173,24 +222,153 @@ class TestSplitCredentials:
         monkeypatch.setenv("GIT_CONFIG_KEY_1", "core.sshCommand")
         monkeypatch.setenv("GIT_CONFIG_VALUE_1", "ssh -i /keys/ci")
         _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
-        assert env["GIT_CONFIG_COUNT"] == "4"
-        assert env["GIT_CONFIG_KEY_2"].endswith(".extraHeader")
-        assert env["GIT_CONFIG_KEY_3"] == "credential.helper"
+        assert env["GIT_CONFIG_COUNT"] == "5"
+        assert env["GIT_CONFIG_KEY_2"] == "credential.helper"
+        assert env["GIT_CONFIG_KEY_3"].endswith(".extraHeader")
+        assert env["GIT_CONFIG_KEY_4"].endswith(".extraHeader")
         # the inherited pairs are untouched — they survive the merge in _git_env
         assert "GIT_CONFIG_KEY_0" not in env
         assert "GIT_CONFIG_KEY_1" not in env
         merged = _git_env(env)
         assert merged["GIT_CONFIG_KEY_0"] == "user.name"
         assert merged["GIT_CONFIG_KEY_1"] == "core.sshCommand"
-        assert merged["GIT_CONFIG_COUNT"] == "4"
+        assert merged["GIT_CONFIG_COUNT"] == "5"
 
     @pytest.mark.parametrize("bogus", ["", "  ", "not-a-number", "-3", "0"])
     def test_unparseable_inherited_count_falls_back_to_zero(self, monkeypatch, bogus):
         # Same reading git itself applies to an invalid value: nothing inherited.
         monkeypatch.setenv("GIT_CONFIG_COUNT", bogus)
         _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
-        assert env["GIT_CONFIG_COUNT"] == "2"
-        assert env["GIT_CONFIG_KEY_0"].endswith(".extraHeader")
+        assert env["GIT_CONFIG_COUNT"] == "3"
+        assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
+
+
+class TestHeadersOnTheWire:
+    """What git *actually sends*, recorded off a real request (review on !178).
+
+    This has to go to the wire. ``git config --get-urlmatch http <url>`` reports
+    only the single best-matching value, while git sends the accumulated
+    multi-valued list — so an assertion built on ``--get-urlmatch`` stays green
+    whether the empty value resets the list or merely substitutes a more
+    specific entry, which is exactly the property that was wrong in iteration 1.
+    Measured on git 2.52.0; the class already drives real git elsewhere.
+    """
+
+    @pytest.fixture
+    def recorder(self):
+        """A server that records request headers and 404s, plus its base URL."""
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.headers)
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"no")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}", seen
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    @staticmethod
+    def _sent(url, cred_env, monkeypatch, seen, operator_config):
+        """Headers git put on the wire fetching *url* under *cred_env*."""
+        # the operator's own git config, in the hermetic HOME
+        gitconfig = Path(os.environ["HOME"]) / ".gitconfig"
+        gitconfig.parent.mkdir(parents=True, exist_ok=True)
+        gitconfig.write_text(operator_config)
+        for var in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            monkeypatch.delenv(var, raising=False)
+        seen.clear()
+        subprocess.run(
+            ["git", "ls-remote", url],
+            env=_git_env(cred_env), capture_output=True, text=True, timeout=60,
+        )
+        assert seen, "git made no request"
+        return seen[0]
+
+    @staticmethod
+    def _auth(headers):
+        return headers.get_all("Authorization") or []
+
+    def test_credentialed_fetch_sends_exactly_one_auth_header_and_it_is_ours(
+        self, recorder, monkeypatch
+    ):
+        """Without the reset git sends the operator's header *and* ours."""
+        base, seen = recorder
+        monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+        operator = f'[http "{base}/"]\n\textraHeader = Authorization: Basic INHERITED\n'
+        scrubbed, cred_env = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git")
+
+        ours = [
+            v for k, v in cred_env.items()
+            if k.startswith("GIT_CONFIG_VALUE_") and v.startswith("Authorization: ")
+        ]
+        assert len(ours) == 1
+        ours_value = ours[0].removeprefix("Authorization: ")
+
+        # baseline: the operator's header is genuinely in effect for this URL
+        assert self._auth(self._sent(scrubbed, {}, monkeypatch, seen, operator)) == [
+            "Basic INHERITED"
+        ]
+        # and the credentialed env leaves exactly one — ours
+        assert self._auth(
+            self._sent(scrubbed, cred_env, monkeypatch, seen, operator)
+        ) == [ours_value]
+
+    def test_retry_leaves_the_operators_own_config_alone(
+        self, recorder, monkeypatch
+    ):
+        """The retry drops lmer's injection only — it is the tokenless env.
+
+        Cancelling the operator's headers too made the retry stricter than the
+        tokenless path and discarded a credential of theirs that works.
+        """
+        base, seen = recorder
+        monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+        operator = (
+            f'[http "{base}/"]\n'
+            f'\textraHeader = Authorization: Basic INHERITED\n'
+            f'\textraHeader = X-Required: tenant-a\n'
+        )
+        scrubbed, _ = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git")
+
+        # {} is what _attempt_with_fallback hands the retry
+        headers = self._sent(scrubbed, {}, monkeypatch, seen, operator)
+        assert self._auth(headers) == ["Basic INHERITED"]
+        assert headers.get_all("X-Required") == ["tenant-a"]
+
+    def test_credentialed_reset_also_drops_non_auth_headers(
+        self, recorder, monkeypatch
+    ):
+        """The accepted cost of the credentialed reset, pinned so it is visible.
+
+        An empty `http.<url>.extraHeader` resets git's whole header list, not
+        just Authorization entries, and git offers no narrower instrument. If a
+        future git grows one, this test fails and the trade can be revisited.
+        """
+        base, seen = recorder
+        monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+        operator = f'[http "{base}/"]\n\textraHeader = X-Required: tenant-a\n'
+        scrubbed, cred_env = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git")
+
+        # in effect without our env ...
+        assert self._sent(scrubbed, {}, monkeypatch, seen, operator).get_all(
+            "X-Required"
+        ) == ["tenant-a"]
+        # ... and cancelled by the credentialed reset
+        assert self._sent(
+            scrubbed, cred_env, monkeypatch, seen, operator
+        ).get_all("X-Required") is None
 
 
 class TestMirrorCreate:
@@ -311,6 +489,236 @@ class TestMirrorFetch:
         self._age_stamp(mirror)
         update_mirrors([str(upstream)], cache_root)
         assert dropping.exists()
+
+
+class TestAnonymousFallback:
+    """#157: a credential lmer injected is not necessarily one the remote
+    accepts. A host with GITLAB_TOKEN set and no GitHub token gets that PAT
+    injected into github.com URLs, and GitHub challenges it even for a *public*
+    repo — so the mirror of a public repo failed with "could not read Username"
+    where an anonymous fetch of the same URL succeeds. A failed attempt that
+    carried credentials is retried once without them.
+
+    The retry keys on what the updater knows it sent, never on git's error
+    text: that text ("could not read Username") is identical for a rejected
+    credential, a private repo and a nonexistent path.
+    """
+
+    def _credentialed(self, upstream) -> str:
+        """A credential-bearing URL whose scrubbed form is the local upstream.
+
+        ``file://oauth2:sekrit@/path`` scrubs to ``file:///path``, so the
+        anonymous retry reaches real git while the first attempt looks exactly
+        like a tokenized https URL to the updater.
+        """
+        return f"file://oauth2:sekrit@{upstream}"
+
+    def _start_rejecting(self, monkeypatch) -> list:
+        """Make every git call that carries an Authorization header fail the way
+        GitHub does, and let credential-free calls through to real git."""
+        real = clone_cache._run_git
+        seen = []
+
+        def fake(args, timeout, cred_env):
+            seen.append(dict(cred_env))
+            if _carries_credentials(cred_env):
+                raise RuntimeError(
+                    "git fetch failed (exit 128): fatal: could not read Username "
+                    "for 'https://github.com': terminal prompts disabled"
+                )
+            return real(args, timeout=timeout, cred_env=cred_env)
+
+        monkeypatch.setattr(clone_cache, "_run_git", fake)
+        return seen
+
+    @pytest.fixture
+    def reject_credentialed_fetches(self, monkeypatch):
+        return self._start_rejecting(monkeypatch)
+
+    @pytest.fixture
+    def count_creates(self, monkeypatch):
+        """Count _create_mirror attempts and the env each one ran with."""
+        attempts = []
+        real = clone_cache._create_mirror
+
+        def counting(mirror, scrubbed_url, cred_env):
+            attempts.append(dict(cred_env))
+            return real(mirror, scrubbed_url, cred_env)
+
+        monkeypatch.setattr(clone_cache, "_create_mirror", counting)
+        return attempts
+
+    def _log_text(self) -> str:
+        log = Path.home() / ".lmer" / "logs" / "clone-cache.log"
+        return log.read_text() if log.exists() else ""
+
+    def test_rejected_credentials_still_build_the_mirror(
+        self, cache, upstream, reject_credentialed_fetches
+    ):
+        cache_root, mirror = cache
+        update_mirrors([self._credentialed(upstream)], cache_root)
+        # the public repo mirrored anyway — issue #157's acceptance criterion
+        assert (mirror / "HEAD").exists()
+        assert _git("rev-parse", "refs/heads/main", cwd=mirror) == _git(
+            "rev-parse", "main", cwd=upstream
+        )
+        assert "retrying without the credential lmer injected" in self._log_text()
+
+    def test_retry_runs_with_the_tokenless_env_not_a_stricter_one(
+        self, cache, upstream, reject_credentialed_fetches, count_creates
+    ):
+        """The retry drops lmer's injection and changes nothing else (!178).
+
+        An earlier iteration handed the retry `credential.helper=` plus an empty
+        `http.<url>.extraHeader`, cancelling the operator's own header and
+        helper too — stricter than the tokenless path, and it discarded a
+        credential of theirs that would have worked. `{}` is the tokenless env.
+        """
+        cache_root, _ = cache
+        update_mirrors([self._credentialed(upstream)], cache_root)
+        assert len(count_creates) == 2
+        assert _carries_credentials(count_creates[0])
+        assert count_creates[1] == {}
+
+    def test_rejected_credentials_on_an_existing_mirror_still_fetch(
+        self, cache, upstream, monkeypatch
+    ):
+        cache_root, mirror = cache
+        update_mirrors([str(upstream)], cache_root)  # build it credential-free
+        (upstream / "new.txt").write_text("more\n")
+        _git("add", ".", cwd=upstream)
+        _git("commit", "-m", "second", cwd=upstream)
+        stamp = mirror.with_name(mirror.name + ".stamp")
+        old = time.time() - 3600
+        os.utime(stamp, (old, old))
+        # only now start rejecting credentialed calls: the refresh path retries too
+        self._start_rejecting(monkeypatch)
+        update_mirrors([self._credentialed(upstream)], cache_root)
+        assert _git("rev-parse", "refs/heads/main", cwd=mirror) == _git(
+            "rev-parse", "main", cwd=upstream
+        )
+
+    def test_working_credentials_are_not_retried(self, cache, upstream, count_creates):
+        """A token the remote accepts must cost exactly one attempt — existing
+        token-authenticated flows are unchanged in behavior and timing."""
+        cache_root, mirror = cache
+        update_mirrors([self._credentialed(upstream)], cache_root)
+        assert (mirror / "HEAD").exists()
+        assert len(count_creates) == 1
+        assert _carries_credentials(count_creates[0])
+        assert "retrying without the credential" not in self._log_text()
+
+    def test_no_retry_when_no_credentials_were_sent(self, cache, upstream, monkeypatch):
+        """Nothing to drop: a tokenless failure is reported, not retried."""
+        attempts = []
+
+        def boom(mirror, scrubbed_url, cred_env):
+            attempts.append(dict(cred_env))
+            raise RuntimeError("upstream unreachable")
+
+        cache_root, mirror = cache
+        monkeypatch.setattr(clone_cache, "_create_mirror", boom)
+        update_mirrors([str(upstream)], cache_root)
+        assert len(attempts) == 1
+        assert "retrying without the credential" not in self._log_text()
+        assert "upstream unreachable" in self._log_text()
+        assert not (mirror / "HEAD").exists()
+        assert list(cache_root.rglob("*.git.tmp")) == []
+
+    def test_both_attempts_failing_reports_the_credentialed_error(
+        self, cache, upstream, monkeypatch
+    ):
+        """The anonymous failure of a repo that really does need credentials
+        says nothing useful — the credentialed error is the informative one."""
+        attempts = []
+
+        def boom(mirror, scrubbed_url, cred_env):
+            attempts.append(dict(cred_env))
+            raise RuntimeError(
+                "CRED-FAILURE" if _carries_credentials(cred_env) else "ANON-FAILURE"
+            )
+
+        cache_root, _ = cache
+        monkeypatch.setattr(clone_cache, "_create_mirror", boom)
+        update_mirrors([self._credentialed(upstream)], cache_root)
+        assert len(attempts) == 2
+        assert _carries_credentials(attempts[0])
+        assert not _carries_credentials(attempts[1])  # retry drops the header
+        log = self._log_text()
+        assert "update failed: CRED-FAILURE" in log
+        assert "update failed: ANON-FAILURE" not in log
+
+    def test_timeout_is_not_treated_as_a_rejected_credential(
+        self, cache, upstream, monkeypatch
+    ):
+        """Review on !178: retrying a timed-out create starts a second
+        from-scratch transfer (the .tmp is gone, nothing resumes), doubling a
+        window in which this mirror's flock is held and every launch skips its
+        warming — and it is certain to fail again on a repo that genuinely needs
+        credentials. A timeout says nothing about credentials."""
+        cache_root, mirror = cache
+        attempts = []
+
+        def timeout(mirror_path_, scrubbed_url, cred_env):
+            attempts.append(dict(cred_env))
+            raise subprocess.TimeoutExpired(cmd=["git", "fetch"], timeout=900)
+
+        monkeypatch.setattr(clone_cache, "_create_mirror", timeout)
+        update_mirrors([self._credentialed(upstream)], cache_root)  # fail-soft
+        assert len(attempts) == 1
+        assert "retrying without the credential" not in self._log_text()
+        assert not (mirror / "HEAD").exists()
+
+    def test_local_oserror_is_not_treated_as_a_rejected_credential(
+        self, cache, upstream, monkeypatch
+    ):
+        cache_root, _ = cache
+        attempts = []
+
+        def enospc(mirror_path_, scrubbed_url, cred_env):
+            attempts.append(dict(cred_env))
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(clone_cache, "_create_mirror", enospc)
+        update_mirrors([self._credentialed(upstream)], cache_root)
+        assert len(attempts) == 1
+        assert "No space left on device" in self._log_text()
+
+    def test_retrys_own_failure_is_logged_not_swallowed(
+        self, cache, upstream, monkeypatch
+    ):
+        """update_mirrors stringifies only the exception it catches, so without
+        this line a retry that died of ENOSPC is reported as the auth failure
+        (review on !178)."""
+        cache_root, _ = cache
+
+        def boom(mirror_path_, scrubbed_url, cred_env):
+            if _carries_credentials(cred_env):
+                raise RuntimeError("CRED-FAILURE")
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(clone_cache, "_create_mirror", boom)
+        update_mirrors([self._credentialed(upstream)], cache_root)
+        log = self._log_text()
+        assert "retry without the injected credential also failed" in log
+        assert "No space left on device" in log  # the retry's own cause survives
+        assert "update failed: CRED-FAILURE" in log  # and the reported error
+
+    def test_failed_retry_leaves_no_tmp_and_no_mirror(self, cache, tmp_path):
+        """Both attempts fail for real (the upstream does not exist), through
+        the real create path: no half-built mirror, no leftover build dir."""
+        cache_root, mirror = cache
+        update_mirrors([f"file://oauth2:sekrit@{tmp_path / 'does-not-exist'}"], cache_root)
+        assert not mirror.exists()
+        assert list(cache_root.rglob("*.git.tmp")) == []
+
+    def test_retry_carries_no_token_into_the_cache_or_the_log(
+        self, cache, upstream, reject_credentialed_fetches
+    ):
+        cache_root, mirror = cache
+        update_mirrors([self._credentialed(upstream)], cache_root)
+        assert _scan_for("sekrit", cache_root) == []
+        assert "sekrit" not in self._log_text()
 
 
 class TestFailSoft:
