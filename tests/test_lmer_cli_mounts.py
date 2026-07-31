@@ -7,8 +7,14 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 import tempfile
 
-from lmer_cli.cli import parse_file_mount_specs
+from lmer_cli.cli import (
+    conflicting_mount_destinations,
+    parse_args,
+    parse_dir_mount_specs,
+    parse_file_mount_specs,
+)
 from lmer_cli.mounts import (
+    DirMountSpec,
     FileMountSpec,
     selinux_opt,
     _is_selinux_enforcing,
@@ -19,6 +25,7 @@ from lmer_cli.mounts import (
     build_host_uv_cache_mount,
     build_user_mounts,
     build_checkout_mount,
+    build_dir_mounts,
     build_file_mounts,
     build_release_signing_key_mount,
     build_service_mode_mounts,
@@ -46,42 +53,90 @@ class TestSelinuxOpt:
             assert selinux_opt("podman") == ""
             assert selinux_opt("docker") == ""
 
-    def test_is_selinux_enforcing_returns_true_when_enforcing(self):
+    @staticmethod
+    def _no_selinuxfs(tmp_path):
+        """Point the sysfs probe at a path that does not exist.
+
+        Every ``getenforce`` case below is about the *fallback*, so selinuxfs has
+        to be absent for the test to be about what it says it is. Patched rather
+        than assumed: whether ``/sys/fs/selinux/enforce`` exists is a property of
+        the host running the suite, and a test that reads differently on Fedora
+        than on Debian is the failure mode this whole class exists to avoid.
+        """
+        return patch(
+            "lmer_cli.runtime.SELINUX_ENFORCE_PATH", tmp_path / "no-selinuxfs"
+        )
+
+    def test_is_selinux_enforcing_reads_the_kernel_first(self, tmp_path):
+        """selinuxfs answers without a subprocess — the container has no getenforce."""
+        enforce = tmp_path / "enforce"
+        enforce.write_text("1", encoding="utf-8")
+        _is_selinux_enforcing.cache_clear()
+        with patch("lmer_cli.runtime.SELINUX_ENFORCE_PATH", enforce):
+            with patch(
+                "lmer_cli.runtime.subprocess.run", side_effect=FileNotFoundError
+            ):
+                assert _is_selinux_enforcing() is True
+        _is_selinux_enforcing.cache_clear()
+
+    def test_is_selinux_enforcing_reads_permissive_from_the_kernel(self, tmp_path):
+        """``0`` is permissive, and it must not fall through to the shell-out:
+        a host with selinuxfs mounted has already given the answer."""
+        enforce = tmp_path / "enforce"
+        enforce.write_text("0\n", encoding="utf-8")
+        _is_selinux_enforcing.cache_clear()
+        with patch("lmer_cli.runtime.SELINUX_ENFORCE_PATH", enforce):
+            with patch("lmer_cli.runtime.subprocess.run") as run:
+                assert _is_selinux_enforcing() is False
+                run.assert_not_called()
+        _is_selinux_enforcing.cache_clear()
+
+    def test_is_selinux_enforcing_returns_true_when_enforcing(self, tmp_path):
         """Test SELinux detection when getenforce returns Enforcing"""
         _is_selinux_enforcing.cache_clear()
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = "Enforcing\n"
-        with patch("lmer_cli.runtime.subprocess.run", return_value=mock_result):
-            _is_selinux_enforcing.cache_clear()
-            assert _is_selinux_enforcing() is True
+        with self._no_selinuxfs(tmp_path):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=mock_result):
+                _is_selinux_enforcing.cache_clear()
+                assert _is_selinux_enforcing() is True
+        _is_selinux_enforcing.cache_clear()
 
-    def test_is_selinux_enforcing_returns_false_when_permissive(self):
+    def test_is_selinux_enforcing_returns_false_when_permissive(self, tmp_path):
         """Test SELinux detection when getenforce returns Permissive"""
         _is_selinux_enforcing.cache_clear()
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = "Permissive\n"
-        with patch("lmer_cli.runtime.subprocess.run", return_value=mock_result):
-            _is_selinux_enforcing.cache_clear()
-            assert _is_selinux_enforcing() is False
+        with self._no_selinuxfs(tmp_path):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=mock_result):
+                _is_selinux_enforcing.cache_clear()
+                assert _is_selinux_enforcing() is False
+        _is_selinux_enforcing.cache_clear()
 
-    def test_is_selinux_enforcing_returns_false_when_disabled(self):
+    def test_is_selinux_enforcing_returns_false_when_disabled(self, tmp_path):
         """Test SELinux detection when getenforce returns Disabled"""
         _is_selinux_enforcing.cache_clear()
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = "Disabled\n"
-        with patch("lmer_cli.runtime.subprocess.run", return_value=mock_result):
-            _is_selinux_enforcing.cache_clear()
-            assert _is_selinux_enforcing() is False
+        with self._no_selinuxfs(tmp_path):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=mock_result):
+                _is_selinux_enforcing.cache_clear()
+                assert _is_selinux_enforcing() is False
+        _is_selinux_enforcing.cache_clear()
 
-    def test_is_selinux_enforcing_returns_false_when_command_not_found(self):
+    def test_is_selinux_enforcing_returns_false_when_command_not_found(self, tmp_path):
         """Test SELinux detection when getenforce command is not available"""
         _is_selinux_enforcing.cache_clear()
-        with patch("lmer_cli.runtime.subprocess.run", side_effect=FileNotFoundError):
-            _is_selinux_enforcing.cache_clear()
-            assert _is_selinux_enforcing() is False
+        with self._no_selinuxfs(tmp_path):
+            with patch(
+                "lmer_cli.runtime.subprocess.run", side_effect=FileNotFoundError
+            ):
+                _is_selinux_enforcing.cache_clear()
+                assert _is_selinux_enforcing() is False
+        _is_selinux_enforcing.cache_clear()
 
 
 class TestBuildWorkspaceMount:
@@ -491,6 +546,58 @@ class TestBuildFileMounts:
         assert build_file_mounts("docker", []) == []
 
 
+class TestBuildDirMounts:
+    """Mount-arg construction for explicit per-directory mounts (--mount-dir)."""
+
+    def test_single_ro_mount_arg_shape(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args = build_dir_mounts(
+                "docker",
+                [DirMountSpec(Path("/home/user/data"), "/home/developer/data", "ro")],
+            )
+        assert args == ["-v", "/home/user/data:/home/developer/data:ro"]
+
+    def test_rw_mode_preserved(self):
+        """The transcript mount depends on this: the harness writes into it."""
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args = build_dir_mounts(
+                "docker",
+                [DirMountSpec(Path("/tmp/t"), "/home/developer/.claude/projects", "rw")],
+            )
+        assert args == ["-v", "/tmp/t:/home/developer/.claude/projects:rw"]
+
+    def test_selinux_suffix_when_enforcing(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=True):
+            _is_selinux_enforcing.cache_clear()
+            args = build_dir_mounts("podman", [DirMountSpec(Path("/tmp/a"), "/etc/a", "rw")])
+        assert args[-1].endswith(":rw,z")
+
+    def test_multiple_specs_in_order(self):
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args = build_dir_mounts(
+                "docker",
+                [
+                    DirMountSpec(Path("/tmp/a"), "/etc/a", "ro"),
+                    DirMountSpec(Path("/tmp/b"), "/etc/b", "rw"),
+                ],
+            )
+        assert args == ["-v", "/tmp/a:/etc/a:ro", "-v", "/tmp/b:/etc/b:rw"]
+
+    def test_empty_specs_no_args(self):
+        assert build_dir_mounts("docker", []) == []
+
+    def test_file_and_dir_mounts_produce_the_same_arg_shape(self):
+        """One grammar, one arg shape — the two builders share a body for it."""
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            files = build_file_mounts("docker", [FileMountSpec(Path("/tmp/x"), "/etc/x", "rw")])
+            dirs = build_dir_mounts("docker", [DirMountSpec(Path("/tmp/x"), "/etc/x", "rw")])
+        assert files == dirs
+
+
 class TestBuildReleaseSigningKeyMount:
     """Mount-arg construction for the release SSH signing key."""
 
@@ -648,3 +755,169 @@ class TestParseFileMountSpecs:
     def test_empty_inputs_yield_no_specs(self):
         assert parse_file_mount_specs([], "") == []
         assert parse_file_mount_specs([], " , ") == []
+
+
+class TestParseDirMountSpecs:
+    """Validation and merge semantics for --mount-dir / LMER_MOUNT_DIRS.
+
+    The same grammar as --mount-file, so the same properties are asserted: a
+    shared parser body is only worth anything if both flags are held to it.
+    """
+
+    @pytest.fixture()
+    def host_dir(self, tmp_path):
+        d = tmp_path / "transcripts"
+        d.mkdir()
+        return d
+
+    def test_valid_single_flag_defaults_ro(self, host_dir):
+        specs = parse_dir_mount_specs([f"{host_dir}:/home/developer/data"], "")
+        assert specs == [DirMountSpec(host_dir, "/home/developer/data", "ro")]
+
+    def test_rw_mode_is_honoured(self, host_dir):
+        specs = parse_dir_mount_specs([f"{host_dir}:/etc/data:rw"], "")
+        assert specs[0].mode == "rw"
+
+    def test_tilde_expansion(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        (tmp_path / "data").mkdir()
+        specs = parse_dir_mount_specs(["~/data:/etc/data"], "")
+        assert specs[0].host == tmp_path / "data"
+
+    def test_env_var_expansion(self, host_dir, monkeypatch):
+        monkeypatch.setenv("MY_DATA", str(host_dir))
+        specs = parse_dir_mount_specs(["$MY_DATA:/etc/data"], "")
+        assert specs[0].host == host_dir
+
+    def test_env_entries_come_before_flags(self, host_dir, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        specs = parse_dir_mount_specs([f"{other}:/etc/b"], f"{host_dir}:/etc/a")
+        assert [s.container for s in specs] == ["/etc/a", "/etc/b"]
+
+    def test_env_value_splits_on_comma(self, host_dir, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        specs = parse_dir_mount_specs([], f"{host_dir}:/etc/a, {other}:/etc/b:rw")
+        assert [s.container for s in specs] == ["/etc/a", "/etc/b"]
+        assert specs[1].mode == "rw"
+
+    def test_last_wins_dedup_with_warning(self, host_dir, tmp_path):
+        other = tmp_path / "other"
+        other.mkdir()
+        with patch("lmer_cli.cli.warning") as mock_warning:
+            specs = parse_dir_mount_specs(
+                [f"{other}:/etc/same:rw"], f"{host_dir}:/etc/same"
+            )
+        assert len(specs) == 1
+        assert specs[0].host == other
+        assert specs[0].mode == "rw"
+        mock_warning.assert_called_once()
+
+    def test_missing_host_dir_fails_fast(self, tmp_path):
+        """lmer does not create it: a typo must be an error, not an empty mount."""
+        with pytest.raises(ValueError, match="not an existing directory"):
+            parse_dir_mount_specs([f"{tmp_path}/nope:/etc/nope"], "")
+
+    def test_host_file_fails_fast(self, tmp_path):
+        """A file where a directory was asked for is the mistake worth catching."""
+        f = tmp_path / "a-file"
+        f.write_text("x")
+        with pytest.raises(ValueError, match="not an existing directory"):
+            parse_dir_mount_specs([f"{f}:/etc/dir"], "")
+
+    def test_relative_container_path_fails_fast(self, host_dir):
+        with pytest.raises(ValueError, match="must be absolute"):
+            parse_dir_mount_specs([f"{host_dir}:relative/dest"], "")
+
+    def test_bad_mode_fails_fast(self, host_dir):
+        with pytest.raises(ValueError, match="must be 'ro' or 'rw'"):
+            parse_dir_mount_specs([f"{host_dir}:/etc/data:rwx"], "")
+
+    def test_malformed_entry_fails_fast(self, host_dir):
+        with pytest.raises(ValueError, match="host:container"):
+            parse_dir_mount_specs([str(host_dir)], "")
+
+    def test_errors_name_the_source_the_entry_came_from(self, tmp_path):
+        """A stale .env entry has to be traceable to the .env, not to the flag."""
+        with pytest.raises(ValueError, match="LMER_MOUNT_DIRS"):
+            parse_dir_mount_specs([], f"{tmp_path}/nope:/etc/nope")
+        with pytest.raises(ValueError, match="--mount-dir"):
+            parse_dir_mount_specs([f"{tmp_path}/nope:/etc/nope"], "")
+
+    def test_empty_inputs_yield_no_specs(self):
+        assert parse_dir_mount_specs([], "") == []
+        assert parse_dir_mount_specs([], " , ") == []
+
+
+class TestMountDirFlagWiring:
+    """The flag itself: repeatable, and it names its env var like every other."""
+
+    def test_mount_dir_is_repeatable(self):
+        ns, _rest = parse_args(
+            ["chat", "repo", "--mount-dir", "/a:/x", "--mount-dir", "/b:/y"]
+        )
+        assert ns.mount_dir == ["/a:/x", "/b:/y"], (
+            "without action=append only the last entry would reach the parser"
+        )
+
+    def test_mount_dir_defaults_to_nothing(self):
+        ns, _rest = parse_args(["chat", "repo"])
+        assert ns.mount_dir is None
+
+    def test_mount_dir_does_not_capture_a_container_command(self):
+        """`--` ends lmer's own argv; the platform's mount must precede it."""
+        ns, rest = parse_args(["chat", "repo", "--mount-dir", "/a:/x", "--", "echo", "hi"])
+        assert ns.mount_dir == ["/a:/x"]
+        assert rest == ["echo", "hi"]
+
+    def test_mount_dir_help_names_its_env_var(self, capsys):
+        """The documented convention: a flag's help points at its env var."""
+        with pytest.raises(SystemExit):
+            parse_args(["--help"])
+        help_text = capsys.readouterr().out
+        assert "--mount-dir" in help_text
+        assert "LMER_MOUNT_DIRS" in help_text
+
+
+class TestConflictingMountDestinations:
+    """A file mount and a dir mount on one destination: the runtime refuses it."""
+
+    def test_a_shared_destination_is_reported(self, tmp_path):
+        f = tmp_path / "f"
+        f.write_text("x")
+        d = tmp_path / "d"
+        d.mkdir()
+        clashes = conflicting_mount_destinations(
+            parse_file_mount_specs([f"{f}:/etc/same"], ""),
+            parse_dir_mount_specs([f"{d}:/etc/same:rw"], ""),
+        )
+        assert clashes == ["/etc/same"]
+
+    def test_distinct_destinations_do_not_clash(self, tmp_path):
+        f = tmp_path / "f"
+        f.write_text("x")
+        d = tmp_path / "d"
+        d.mkdir()
+        assert conflicting_mount_destinations(
+            parse_file_mount_specs([f"{f}:/etc/a"], ""),
+            parse_dir_mount_specs([f"{d}:/etc/b"], ""),
+        ) == []
+
+    def test_a_nested_destination_is_not_a_clash(self, tmp_path):
+        """Only an identical destination is refused by the runtime.
+
+        A file mounted *inside* a mounted directory is exactly what the claude
+        credential mounts do beside the transcript dir, so it must stay legal.
+        """
+        f = tmp_path / "f"
+        f.write_text("x")
+        d = tmp_path / "d"
+        d.mkdir()
+        assert conflicting_mount_destinations(
+            parse_file_mount_specs([f"{f}:/home/developer/.claude/.credentials.json"], ""),
+            parse_dir_mount_specs([f"{d}:/home/developer/.claude:rw"], ""),
+        ) == []
+
+    def test_empty_inputs_never_clash(self):
+        assert conflicting_mount_destinations([], []) == []

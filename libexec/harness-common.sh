@@ -148,6 +148,29 @@ harness_render_global_context() {
         fi
     fi
 
+    # Orchestrated sessions get the ask-channel contract (issue #141). Gated on
+    # LMER_ASK_DIR, which the orchestrator sets only when it has actually mounted
+    # the channel — so a session that can't reach an operator is never told to
+    # try. A prompt fragment rather than a taskdef block because the orchestrator
+    # spawns existing taskdefs (develop, review, followup) that know nothing
+    # about it, and this reaches all of them without forking any.
+    if [ -n "$(printf '%s' "$LMER_ASK_DIR" | tr -d '[:space:]')" ]; then
+        local ask_template ask_renderer
+        ask_template="$(harness_find_resource "prompts/orchestrator-ask.md.jinja2")"
+        ask_renderer="$(harness_find_resource "libexec/render-prompt-fragment.py")"
+        if [ -n "$ask_template" ] && [ -n "$ask_renderer" ]; then
+            printf '\n' >> "$tmp"
+            if "${LMER_PYTHON:-python3}" "$ask_renderer" "$ask_template" >> "$tmp"; then
+                have_content=1
+                echo "✅ Operator ask channel added to global context"
+            else
+                echo "⚠️  Failed to render ask-channel template at $ask_template"
+            fi
+        else
+            echo "⚠️  LMER_ASK_DIR set but ask-channel template/renderer not found"
+        fi
+    fi
+
     # Agent memory usage instructions — the memory store is harness-neutral,
     # but the non-claude harnesses have no built-in memory feature, so the
     # read/write/persist contract is delivered as context. Only rendered when

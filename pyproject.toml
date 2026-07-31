@@ -32,6 +32,12 @@ dependencies = [
     "jinja2>=3.1.6",
     "fastapi>=0.110.0",
     "uvicorn>=0.27.0",
+    # The orchestrator platform's terminal passthrough (issue #141) is a
+    # WebSocket. Plain `uvicorn` ships no WS implementation, so `ws="auto"`
+    # resolves to none and the handshake is refused with a 404 before it reaches
+    # the app — invisible to tests, because Starlette's TestClient drives ASGI
+    # directly and never performs the HTTP upgrade.
+    "websockets>=12.0",
     "slack-bolt>=1.18.0",
     "aiohttp>=3.9.0",
     "certifi>=2023.7.22",
@@ -54,9 +60,13 @@ dev = [
 lmer = "lmer_cli.cli:main"
 lmer-supervisor = "lmer_cli.supervisor:main"
 lmer-pipe = "lmer_cli.pipe:main"
+lmer-ctl = "lmer_platform.ctl:main"
 gitlab-review = "gitlab_reviewer.cli:main"
 lmer-slack = "slack_chat.cli:main"
 lmer-slack-listener = "slack_chat.listener:main"
+lmer-ask = "ask_channel.cli:main"
+lmer-signal = "ask_channel.signal_cli:main"
+lmer-end-session = "lmer_cli.session_end:main"
 github-review = "github_reviewer.cli:main"
 work = "work_repo.cli:main"
 

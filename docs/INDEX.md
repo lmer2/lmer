@@ -4,6 +4,21 @@ This directory contains comprehensive documentation for the LMER (LLM Environmen
 
 ## Documentation Files
 
+### [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md)
+**Platform Quickstart**
+
+The short path to running the lmer platform (web control plane + supervising
+assistant) on a host:
+- Install, `setup-ui`, first run, the shared secret
+- Reaching it remotely: direct bind vs an nginx reverse proxy (WebSocket
+  upgrade + timeouts included)
+- `LMER_PLATFORM_CONTAINER_URL` and the surviving-assistant restart gotcha
+- A tour of the fleet view, spawning, answering, wind down vs exit, uber lmer
+
+**Best for**: Getting the platform running and usable in a few minutes.
+
+---
+
 ### [CONTAINER.md](./CONTAINER.md)
 **Container Runtime Support**
 
@@ -17,6 +32,25 @@ Complete guide to using Docker and Podman with LMER. Covers:
 - Performance considerations and security benefits
 
 **Best for**: Understanding how containers work in this project, troubleshooting container issues, and learning about FIPS compliance.
+
+---
+
+### [PLATFORM-CONTAINER.md](./PLATFORM-CONTAINER.md)
+**Platform Container Image**
+
+Running the orchestrator platform (control plane + UI) as a container image
+built from `Dockerfile.platform`, instead of installing it on the host:
+- What the image is, against the session image and against a bare-host install
+- The path-identity invariant (`$HOME/.lmer` mounted at the identical absolute
+  path) and exactly what a renamed mount breaks
+- What to mount, including the credential paths that live outside `~/.lmer`
+- Why `--network=host`, the bind-address opt-in, and sessions dialing back
+- Upgrades, the restart semantics of a containerized daemon, and the session
+  re-attach limitation that is still open
+- Spike runbook: build, run, spawn, restart, and the predictions to confirm
+
+**Best for**: Deploying the platform as a pull rather than a Node build, and
+walking the container-platform spike.
 
 ---
 

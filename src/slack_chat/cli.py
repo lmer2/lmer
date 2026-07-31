@@ -42,6 +42,11 @@ import argparse
 from pathlib import Path
 from typing import List, Optional
 
+from lmer_cli.session_end import (
+    NO_SUPERVISOR_EXIT_CODE, SUPERVISOR_PID_ENV, request_session_end,
+    supervisor_pid,
+)
+
 from .permalink import parse_slack_permalink, is_slack_thread_url
 from .client import SlackClient, SlackError
 
@@ -60,17 +65,15 @@ POLL_TIMEOUT_EXIT_CODE: int = 2
 #: Slack errors, so a sustained outage doesn't hammer the API every interval.
 WATCH_ERROR_BACKOFF_MAX: float = 60.0
 
-#: Environment variable through which the in-container ``lmer-supervisor``
-#: publishes its own PID. ``end-session`` sends this PID ``SIGUSR1`` to ask the
-#: supervisor for a graceful self-shutdown. Kept in sync with
-#: ``lmer_cli.supervisor.SUPERVISOR_PID_ENV``.
-SUPERVISOR_PID_ENV: str = "LMER_SUPERVISOR_PID"
+#: Re-exported from :mod:`lmer_cli.session_end`, which now owns the mechanism.
+#: An alias rather than a copy so the two cannot drift: this value has to match
+#: what ``lmer_cli.supervisor`` exports, and three separate string literals
+#: agreeing by hand is not a guarantee.
 
-#: Exit code for ``end-session`` when it cannot find a supervisor to signal
-#: (no/invalid LMER_SUPERVISOR_PID, or the process is gone). Distinct from 1
-#: (generic Slack/runtime error) so callers can tell "nothing to shut down"
-#: apart from "the shutdown attempt errored".
-END_SESSION_NO_SUPERVISOR_EXIT_CODE: int = 3
+#: Alias of :data:`lmer_cli.session_end.NO_SUPERVISOR_EXIT_CODE`; the contract
+#: (distinct from 1 so "nothing to shut down" is distinguishable from "the attempt
+#: errored") is documented there.
+END_SESSION_NO_SUPERVISOR_EXIT_CODE: int = NO_SUPERVISOR_EXIT_CODE
 
 
 # ---------------------------------------------------------------------------
@@ -665,14 +668,7 @@ def _read_supervisor_pid() -> Optional[int]:
     ``lmer_cli.supervisor`` before it forks claude. Returns None when the var is
     unset, empty, or not a positive integer.
     """
-    raw = os.environ.get(SUPERVISOR_PID_ENV, "").strip()
-    if not raw:
-        return None
-    try:
-        pid = int(raw)
-    except ValueError:
-        return None
-    return pid if pid > 0 else None
+    return supervisor_pid()
 
 
 def _cmd_end_session(args: argparse.Namespace, client: SlackClient) -> int:
@@ -713,29 +709,17 @@ def _cmd_end_session(args: argparse.Namespace, client: SlackClient) -> int:
                 file=sys.stderr,
             )
 
-    pid = _read_supervisor_pid()
-    if pid is None:
-        print(
-            "Error: no supervisor to signal "
-            f"({SUPERVISOR_PID_ENV} is unset or invalid). This session cannot "
-            "shut itself down — it will end on the idle timeout instead.",
-            file=sys.stderr,
-        )
-        return END_SESSION_NO_SUPERVISOR_EXIT_CODE
+    # The shutdown itself is not a Slack concern and no longer lives here: the
+    # goodbye above is the only Slack-specific half. See
+    # :mod:`lmer_cli.session_end` — the mechanism moved out so that a taskdef with
+    # no Slack thread (anything the orchestrator winds down) can end its own
+    # session too, which it previously had no generic way to do.
+    result = request_session_end()
+    if not result.ok:
+        print(f"Error: {result.message}", file=sys.stderr)
+        return result.code
 
-    try:
-        os.kill(pid, signal.SIGUSR1)
-    except ProcessLookupError:
-        print(
-            f"Error: supervisor process {pid} is gone; nothing to shut down.",
-            file=sys.stderr,
-        )
-        return END_SESSION_NO_SUPERVISOR_EXIT_CODE
-    except OSError as exc:
-        print(f"Error: could not signal supervisor {pid}: {exc}", file=sys.stderr)
-        return 1
-
-    print(f"Shutdown requested (signaled supervisor pid {pid}).")
+    print(result.message.capitalize())
     return 0
 
 

@@ -47,14 +47,40 @@ _LMER_STATE_DIR = Path.home() / ".lmer"
 DEFAULT_PIDS_LIMIT = "512"
 
 
+#: The kernel's own answer, read rather than shelled out for. ``1`` is
+#: enforcing, ``0`` permissive; the file exists only while selinuxfs is mounted,
+#: which is exactly the condition under which SELinux can be enforcing at all.
+SELINUX_ENFORCE_PATH = Path("/sys/fs/selinux/enforce")
+
+
 @lru_cache(maxsize=1)
 def _is_selinux_enforcing() -> bool:
-    """
-    Check if SELinux is enabled and enforcing.
+    """Whether SELinux is enabled and enforcing.
 
-    Returns:
-        True if SELinux is enforcing, False otherwise
+    Reads :data:`SELINUX_ENFORCE_PATH` first and only falls back to
+    ``getenforce``. The order is load-bearing rather than an optimisation: this
+    is called from *inside* the platform container as well as on a host
+    (``lmer platform`` spawns sessions from there), and the container image
+    carries no ``selinux-utils`` — so a ``getenforce``-only probe answers "not
+    enforcing" on an enforcing host, every spawned session loses
+    ``--security-opt label=disable`` and the ``,z`` relabel suffix on its bind
+    mounts (:func:`base_run_args`, ``mounts.selinux_opt``), and the session dies
+    on AVC denials against ``/workspace`` and its mounted credentials. selinuxfs
+    is visible in the container on such a host, so reading it removes the
+    package dependency for every caller instead of adding one to one image.
+
+    The shell-out stays as the fallback for a host where selinuxfs is mounted
+    somewhere else. Both branches answer ``False`` when they cannot tell: a
+    wrong "enforcing" adds relabel flags a non-SELinux runtime rejects outright,
+    while a wrong "not enforcing" degrades to today's behaviour.
     """
+    try:
+        raw = SELINUX_ENFORCE_PATH.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        pass
+    else:
+        return raw.strip() == "1"
+
     try:
         result = subprocess.run(
             ["getenforce"],

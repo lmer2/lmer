@@ -1,0 +1,167 @@
+# The lmer platform (orchestrator control plane) as a container image (#150).
+#
+# A separate artifact from Containerfile, which builds the *session* image agents
+# work in. This one serves the FastAPI control plane and its Vue UI and starts
+# sessions through the host's container runtime over a bind-mounted socket, so it
+# needs none of the session image's FIPS toolchain, harness CLIs or browser — a
+# slim Python is the whole runtime.
+#
+# What it replaces: on a host, serving the UI means `lmer platform setup-ui`,
+# which fetches a pinned Node into the platform state dir and builds web/ with it
+# (see lmer_platform.ui_build). Here the bundle is built during the image build
+# and baked in, so deploying the platform is a pull.
+#
+#   docker build -f Dockerfile.platform -t lmer-platform:dev \
+#       --build-arg BUILD_UID="$(id -u)" --build-arg BUILD_GID="$(id -g)" \
+#       --build-arg LMER_BUILD_COMMIT="$(git rev-parse HEAD)" .
+#   scripts/platform-container-run.sh --image lmer-platform:dev
+#
+# Running it is not a one-liner, so the run helper is the example: this container
+# builds `docker run -v <host-path>:...` arguments that the *host's* daemon
+# resolves, which makes every path it derives from $HOME a claim about the host.
+# So $HOME/.lmer is bind-mounted at the IDENTICAL absolute path, HOME is the
+# host's home, --user matches the BUILD_UID/BUILD_GID above, and the network is
+# the host's (session control planes publish on host loopback, which is also
+# what makes -p and the EXPOSE below moot). Mount it anywhere else and the
+# sessions this platform starts write to paths nothing reads — silently, because
+# the runtime creates a missing bind source rather than refusing. The invariant,
+# the failure modes and what to mount beyond ~/.lmer are in
+# docs/PLATFORM-CONTAINER.md; the helper encodes them.
+#
+# The bind address is passed at run time and not baked: the daemon binds loopback
+# by default (spec D14), and a reachable bind is the operator opting into
+# TLS-free plaintext (LMER_PLATFORM_BIND_ADDRESS). A baked value would also
+# shadow whatever bind_address the UI writes into config.json (an environment
+# variable beats the file — see lmer_platform.config).
+
+
+# === UI builder ==============================================================
+#
+# The Node version here MUST match lmer_platform.ui_build.NODE_VERSION, minus its
+# leading "v". That pin is the toolchain the UI is reviewed and built with
+# everywhere else (`lmer platform setup-ui` verifies the archive's SHA-256 against
+# NODE_CHECKSUMS before extracting it), and a bundle built by a different Node is
+# a different artifact than the one that pin describes. Bumping one means bumping
+# both in the same commit; tests/test_platform_image.py asserts they agree.
+FROM node:24.18.0 AS ui-builder
+
+WORKDIR /build/web
+
+# Manifests first, so `npm ci` re-runs only when the pinned dependencies change
+# and not on every UI source edit. `npm ci` rather than `install` for the same
+# reason it is used on a host: it installs package-lock.json exactly and fails
+# instead of resolving something new.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+# The sources, and then the build. web/dist is never copied from the build
+# context — it is not committed (spec D10) and .dockerignore excludes it, so the
+# bundle in this image is always built here from the sources in this context.
+COPY web/ ./
+RUN npm run build && test -f dist/index.html
+
+
+# === Runtime =================================================================
+
+FROM python:3.12-slim
+
+LABEL org.opencontainers.image.title="lmer-platform"
+LABEL org.opencontainers.image.description="lmer orchestrator platform — control plane and UI"
+
+# git: the daemon clones and pulls the work-repo mirror the fleet view is read
+#   from (spec D24).
+# procps: `ps`. Not a runtime dependency — the platform reads liveness through
+#   /proc directly — but the spike runbook's key observation is comparing a
+#   registry entry's recorded pid against the processes in *this* container's PID
+#   namespace, and python:3.12-slim ships no ps to do it with. A few hundred
+#   kilobytes for the tool the checklist is written around.
+# docker-ce-cli: the *client* only. `lmer` starts session containers by talking
+#   to the host's daemon over the bind-mounted socket; this image runs no engine
+#   of its own. Debian ships no client-only package (its docker.io is the whole
+#   engine), so the client comes from Docker's own repository the way the session
+#   image gets it. Not pinned to an exact apt version deliberately: the client is
+#   wire-compatible across engine versions, and an exact pin makes "that version
+#   left the repository" a build failure. The keyring is what makes the download
+#   verifiable, and the suite is read from the base image rather than hardcoded so
+#   a base-image Debian bump does not silently install a foreign build.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        procps && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://download.docker.com/linux/debian/gpg \
+        -o /etc/apt/keyrings/docker.asc && \
+    chmod a+r /etc/apt/keyrings/docker.asc && \
+    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian %s stable\n' \
+        "$(dpkg --print-architecture)" \
+        "$(. /etc/os-release && echo "$VERSION_CODENAME")" \
+        > /etc/apt/sources.list.d/docker.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends docker-ce-cli && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build arguments for user ID, defaulting to the first ordinary host user. Same
+# reason the session image takes them (Containerfile): the platform state dir is
+# bind-mounted from the host, so the user inside has to own the files outside.
+ARG BUILD_UID=1000
+ARG BUILD_GID=1000
+
+# Non-root, with no sudo: unlike a session container this one runs no agent and
+# installs nothing at run time.
+RUN groupadd -g "$BUILD_GID" developer && \
+    useradd -m -s /bin/bash -u "$BUILD_UID" -g "$BUILD_GID" developer
+
+# === The package =============================================================
+#
+# Installed, not mounted and not editable: this image *is* the deployment
+# artifact, so what it serves is a build of the checkout it was built from. A
+# non-editable install needs the metadata files pyproject.toml names beside the
+# sources — README.md for `readme`, LICENSE for `license-files`.
+WORKDIR /opt/lmer
+COPY pyproject.toml README.md LICENSE ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir .
+
+# === The UI bundle ===========================================================
+#
+# Where the daemon looks for a prebuilt bundle (lmer_platform.ui_build.dist_dir).
+# The variable is set here so `lmer platform run` in this image serves the UI with
+# no setup step; point it elsewhere, or unset it, to serve something else.
+ENV LMER_PLATFORM_UI_DIST=/opt/lmer/ui
+COPY --from=ui-builder /build/web/dist /opt/lmer/ui
+
+# Bake build provenance so a running platform can answer "what commit is this
+# image?" — /opt/lmer has no .git. Placed after the heavy layers so a changing
+# commit does not bust their cache.
+ARG LMER_BUILD_COMMIT=unknown
+ENV LMER_BUILD_COMMIT=${LMER_BUILD_COMMIT}
+RUN printf '%s\n' "${LMER_BUILD_COMMIT}" > /opt/lmer/BUILD_INFO
+
+# Scaffolding for the one topology where the container's own home is also the
+# host's: the run helper passes HOME=<host home> and mounts <host home>/.lmer
+# there, so on a host whose user is /home/developer this directory is the mount
+# point and it has to already be owned by the image user — a directory the runtime
+# creates for a mount is root-owned, and the daemon could not write its own state
+# (config.json, the shared secret, the mirror, the registry, session logs) into
+# it. With any other host home the mount lands elsewhere and this is inert.
+RUN mkdir -p /home/developer/.lmer && \
+    chown -R developer:developer /home/developer/.lmer
+
+USER developer
+WORKDIR /home/developer
+
+# The daemon's default port (lmer_platform.config.DEFAULT_BIND_PORT). Documented
+# here; publishing it is the operator's `-p`, as is the reachable bind above.
+EXPOSE 8600
+
+# `lmer platform` with the subcommand as the command, so `docker run <image>`
+# serves the control plane and `docker run <image> status` (or secret, rescan,
+# runs, adopt, forget, spawn, resume) reaches the same CLI without an override of
+# the entrypoint. `setup-ui` is reachable too but cannot work here: the runtime
+# stage carries no web/ sources to build, and the bundle it would install is
+# already baked in above.
+ENTRYPOINT ["lmer", "platform"]
+CMD ["run"]

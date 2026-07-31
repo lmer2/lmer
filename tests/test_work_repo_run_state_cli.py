@@ -324,6 +324,13 @@ def _ask_question(run_env, question="sqlite or postgres?"):
                       "--question", question]) == 0
 
 
+def _ask_bare_question(run_env):
+    """Stop on a question without recording its text — `--question` is optional,
+    and this is what most runs in a real work repo actually look like."""
+    with patch("work_repo.cli.commit_work_path", return_value=0):
+        assert _main(["state", "set", "--stop-reason=question"]) == 0
+
+
 class TestAnswer:
     """`work answer` — resume-on-answer (issue #98)."""
 
@@ -354,6 +361,54 @@ class TestAnswer:
             run_state.write_state(run_env, state)
             assert _main(["answer", "archive it"]) == 0
         assert run_state.load_state(run_env)["status"] == "complete"
+
+    def test_answer_applies_to_a_question_stop_with_no_recorded_text(self, run_env):
+        # T24: the stop is what the answer resolves. Refusing here lost the
+        # answer for the shape most runs actually stop in — and disagreed with
+        # the pushed-answer path, which applies it.
+        _ask_bare_question(run_env)
+        with patch("work_repo.cli.commit_work_path", return_value=0) as push:
+            assert _main(["answer", "start empty"]) == 0
+        state = run_state.load_state(run_env)
+        assert state["stop_reason"] is None
+        assert state["open_question"] is None
+        event = run_state.read_events(run_env, last_n=0)[-1]
+        assert event["type"] == "question_answered"
+        assert event["data"] == {"question": None, "answer": "start empty"}
+        push.assert_called_once_with(
+            ["git.example.com/org/repo/runs/develop-issue-123"],
+            "run-state: develop-issue-123 question answered",
+        )
+
+    @pytest.mark.parametrize("ask,answerable", [
+        ("recorded", True), ("bare", True), ("other-stop", False),
+    ])
+    def test_the_two_answer_paths_agree_on_what_is_answerable(
+        self, run_env, monkeypatch, ask, answerable
+    ):
+        # One feature, two entrances: `work answer` in the container and
+        # `lmer --answer` on the host (LMER_ANSWER → _apply_pushed_answer)
+        # answer the same question on the same run, and are documented as
+        # equivalent. A state one records and the other refuses is a bug in
+        # whichever refuses, so the agreement is asserted rather than assumed.
+        if ask == "recorded":
+            _ask_question(run_env)
+        elif ask == "bare":
+            _ask_bare_question(run_env)
+        else:
+            with patch("work_repo.cli.commit_work_path", return_value=0):
+                _main(["state", "set", "--stop-reason=yield"])
+        state = run_state.load_state(run_env)
+
+        monkeypatch.setenv("LMER_ANSWER", "postgres")
+        _applied, answered = work_cli._apply_pushed_answer(run_env, dict(state))
+
+        run_state.write_state(run_env, state)  # back to the asking state
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            rc = _main(["answer", "postgres"])
+
+        assert (answered is not None) is answerable
+        assert (rc == 0) is answerable
 
     def test_no_open_question_errors(self, run_env, capsys):
         with patch("work_repo.cli.commit_work_path", return_value=0):
@@ -1035,11 +1090,54 @@ class TestSessionStart:
         assert "COMPLETED RUN" in out  # the #96 directive still governs reopening
         assert run_state.load_state(run_env)["status"] == "complete"
 
+    def test_lmer_answer_applied_to_a_question_stop_with_no_recorded_text(
+        self, run_env, capsys, monkeypatch
+    ):
+        # T24: a run can stop with `--stop-reason=question` and no `--question`,
+        # and most do. Until now the pushed answer was silently dropped for
+        # exactly those — no event, the stop still standing, and nothing said.
+        _ask_bare_question(run_env)
+        capsys.readouterr()  # drain the setup command's output
+        monkeypatch.setenv("LMER_ANSWER", "yes — start empty")
+
+        assert _main(["session-start"]) == 0
+
+        out = capsys.readouterr().out
+        lines = out.splitlines()
+        assert lines[0].startswith("✅ ANSWERED QUESTION")
+        assert lines[1] == "A: yes — start empty"  # no Q line: none was recorded
+        assert "not applied" not in out
+        state = run_state.load_state(run_env)
+        assert state["stop_reason"] is None
+        assert state["open_question"] is None
+        event = [
+            e for e in run_state.read_events(run_env, last_n=0)
+            if e["type"] == "question_answered"
+        ][-1]
+        assert event["data"] == {"question": None, "answer": "yes — start empty"}
+
+    def test_a_question_stop_with_no_text_is_untouched_without_an_answer(
+        self, run_env, capsys
+    ):
+        # The other half: no LMER_ANSWER, so the stop stays and the brief says so.
+        _ask_bare_question(run_env)
+        capsys.readouterr()
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "ANSWERED QUESTION" not in out
+        assert "Stop reason: question" in out
+        assert run_state.load_state(run_env)["stop_reason"] == "question"
+        events = [e["type"] for e in run_state.read_events(run_env, last_n=0)]
+        assert "question_answered" not in events
+
     def test_lmer_answer_ignored_without_open_question(self, run_env, capsys, monkeypatch):
         monkeypatch.setenv("LMER_ANSWER", "answer to nothing")
         assert _main(["session-start"]) == 0
         out = capsys.readouterr().out
         assert "ANSWERED QUESTION" not in out
+        # Silently, not fail-soft-with-a-warning: a run that never asked anything
+        # is the ordinary case for a container launched with a stale answer.
+        assert "not applied" not in out
         events = [e["type"] for e in run_state.read_events(run_env, last_n=0)]
         assert "question_answered" not in events
 
@@ -1049,7 +1147,78 @@ class TestSessionStart:
             _main(["state", "set", "--stop-reason=yield"])  # question resolved in-session
         monkeypatch.setenv("LMER_ANSWER", "stale answer")
         assert _main(["session-start"]) == 0
-        assert "ANSWERED QUESTION" not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "ANSWERED QUESTION" not in out
+        assert "not applied" not in out
+        events = [e["type"] for e in run_state.read_events(run_env, last_n=0)]
+        assert "question_answered" not in events
+
+    def test_lmer_answer_that_cannot_be_applied_degrades_to_the_plain_brief(
+        self, run_env, capsys, monkeypatch
+    ):
+        # Fail-soft, and the reason is the blast radius: this runs at the start
+        # of every session, so a problem applying an answer must cost the
+        # answered block and nothing else — never the brief, never the session.
+        _ask_question(run_env)
+        capsys.readouterr()
+        monkeypatch.setenv("LMER_ANSWER", "postgres")
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("state write failed")
+
+        monkeypatch.setattr(run_state, "answer_question", boom)
+        assert _main(["session-start"]) == 0
+
+        out = capsys.readouterr().out
+        assert "LMER_ANSWER not applied (continuing)" in out
+        assert "state write failed" in out
+        assert "ANSWERED QUESTION" not in out
+        assert "OPEN QUESTION" in out  # the plain brief, question stop intact
+        assert run_state.load_state(run_env)["stop_reason"] == "question"
+
+    def test_a_pushed_answer_is_redacted_in_the_brief(
+        self, run_env, capsys, monkeypatch
+    ):
+        # The brief is prompt-injected and the event lands in the shared work
+        # repo, so the answer goes through the same redaction as every other
+        # free-text writer — including on the text-less path.
+        secretish = "use glpat-AAAABBBBCCCCDDDDEEEE1 for the mirror"
+        _ask_bare_question(run_env)
+        capsys.readouterr()
+        monkeypatch.setenv("LMER_ANSWER", secretish)
+
+        assert _main(["session-start"]) == 0
+
+        out = capsys.readouterr().out
+        assert "glpat-AAAABBBBCCCCDDDDEEEE1" not in out
+        assert "A: use ***REDACTED*** for the mirror" in out
+        event = [
+            e for e in run_state.read_events(run_env, last_n=0)
+            if e["type"] == "question_answered"
+        ][-1]
+        assert event["data"]["answer"] == "use ***REDACTED*** for the mirror"
+
+    def test_lmer_answer_consumed_once_per_text_less_question(
+        self, run_env, capsys, monkeypatch
+    ):
+        # The marker is what stops the container-lived env var from replaying,
+        # and a text-less stop must not be the way around it: the answer is
+        # applied once, and the NEXT question stop keeps standing.
+        _ask_bare_question(run_env)
+        monkeypatch.setenv("LMER_ANSWER", "yes — start empty")
+        assert _main(["session-start"]) == 0
+        assert "ANSWERED QUESTION" in capsys.readouterr().out
+
+        _ask_bare_question(run_env)
+        assert _main(["session-start"]) == 0
+        out = capsys.readouterr().out
+        assert "ANSWERED QUESTION" not in out
+        assert run_state.load_state(run_env)["stop_reason"] == "question"
+        answers = [
+            e for e in run_state.read_events(run_env, last_n=0)
+            if e["type"] == "question_answered"
+        ]
+        assert len(answers) == 1
 
     def test_lmer_answer_consumed_once_per_container(self, run_env, capsys, monkeypatch):
         # The env var outlives its question (review on !126): after the answer

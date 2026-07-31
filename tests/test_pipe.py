@@ -128,8 +128,12 @@ class TestEndToEnd:
             monkeypatch.setenv("LMER_FASTAPI_TOKEN", "test-token")
             rc = pipe.main(["send", "/start", "--quiet"])
         assert rc == 0
-        # Server appends \r (Enter in raw-mode TUIs), not \n.
-        assert sink == [b"/start\r"]
+        # Server appends \r (Enter in raw-mode TUIs), not \n, and nothing
+        # follows it: `pipe send` means "type this and press Enter", so it takes
+        # the same /input path as every other caller — and that path sends the
+        # submit exactly once, because a second, blind CR would fire whatever
+        # dialog happened to be on screen (supervisor._SUBMIT_UNCONFIRMED_NOTE).
+        assert sink == [b"/start\r"], f"something followed the submit: {sink}"
 
     def test_send_no_newline(self, monkeypatch):
         with _live_app() as (port, _output, sink):

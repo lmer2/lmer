@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
+# The host classification rule, not a second copy of it: this is the function
+# that decides which provider a hostname belongs to for token lookup, and a forge
+# that reads as GitHub for credentials but GitLab for URLs would be a bug with no
+# symptom until someone clicked. ``lmer_cli.tokens`` costs nothing to import
+# (stdlib only), and ``work_repo.memory`` already reaches into ``lmer_cli`` the
+# same way.
+from lmer_cli.tokens import _is_github_host
+
 from .run_state import run_rel_path_candidates
 from .specs_index import specs_rel_path
 from .utils import sanitize_task_target
@@ -30,6 +38,28 @@ _NON_FAST_FORWARD_MARKERS = ("[rejected]", "non-fast-forward", "fetch first")
 # collapsing the rest into a "... and N more" line, so a large dirty tree can
 # never flood ``work commit``'s output.
 UNTRACKED_REPORT_CAP = 10
+
+#: The forges whose web path layout is known. Anything else is unknown, and
+#: :func:`forge_web_url` answers None for it — see that function for why a guess
+#: is worse than no link.
+FORGE_GITLAB = "gitlab"
+FORGE_GITHUB = "github"
+
+#: The ONE definition of each forge's blob/tree path shape. GitLab namespaces
+#: repository browsing under ``/-/`` (so a branch called ``blob`` cannot collide
+#: with the route), GitHub does not. A second copy of this map is how one forge
+#: keeps a bug the other one fixed, which is why the platform imports this module
+#: instead of building URLs of its own.
+_FORGE_PATH_PREFIX = {
+    FORGE_GITLAB: "/-/",
+    FORGE_GITHUB: "/",
+}
+
+#: What a checkout's branch reads as when git will not say — a detached HEAD, a
+#: directory that is not a repo. Wrong on a work repo whose default branch is
+#: named something else, and deliberately: a link to the wrong branch is fixable
+#: by the human looking at it, while no link at all loses the artifact.
+DEFAULT_WEB_BRANCH = "main"
 
 
 def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int, str]:
@@ -97,8 +127,98 @@ def _web_base_from_remote(remote: str) -> Optional[str]:
     return f"https://{host}/{project}"
 
 
+def detect_forge(host: Optional[str]) -> Optional[str]:
+    """Which forge a hostname belongs to (:data:`FORGE_GITLAB` /
+    :data:`FORGE_GITHUB`), or None when it cannot be told.
+
+    GitHub is classified by :func:`lmer_cli.tokens._is_github_host` — the same
+    rule token lookup uses, so a host cannot be GitHub for credentials and
+    something else for URLs. GitLab is ``gitlab.com``, its subdomains, and the
+    self-hosted convention of naming the instance ``gitlab.<domain>`` or
+    ``gitlab-<something>.<domain>``.
+
+    Everything else — ``git.example.com``, a GitHub Enterprise Server on a
+    custom name — is None, because the only honest thing to say about an
+    unrecognised host is that its path layout is unknown. A port is accepted
+    and ignored, so a base URL's authority can be passed straight in.
+    """
+    if not host:
+        return None
+    name = host.strip().lower().split(":", 1)[0]
+    if not name:
+        return None
+    if _is_github_host(name):
+        return FORGE_GITHUB
+    if name == "gitlab.com" or name.endswith(".gitlab.com"):
+        return FORGE_GITLAB
+    first = name.split(".", 1)[0]
+    if first == "gitlab" or first.startswith("gitlab-"):
+        return FORGE_GITLAB
+    return None
+
+
+def forge_web_url(
+    base: str,
+    ref: str,
+    rel_path: str = "",
+    *,
+    is_dir: bool = False,
+    forge: Optional[str] = None,
+    default_forge: Optional[str] = None,
+) -> Optional[str]:
+    """A forge's browse URL for *rel_path* at *ref*, or None for an unknown forge.
+
+    *base* is ``https://<host>/<project>`` — the credential-free form
+    :func:`_web_base_from_remote` produces, and the only form that may be passed
+    here, since whatever this returns is rendered as a clickable link. The forge
+    is derived from *base*'s host (:func:`detect_forge`); *rel_path* empty means
+    the repository root, which is always a tree.
+
+    *forge* names the forge outright and skips detection, because the operator
+    setting it exists for the cases detection gets wrong in *either* direction:
+    a GitHub Enterprise Server sits on any hostname, and a self-hosted GitLab
+    could be named after either. A value that is no known forge — the platform's
+    ``work_repo_forge=none`` — resolves to no prefix and therefore no URL, which
+    is how that setting switches links off.
+
+    *default_forge* is what an unrecognised host falls back to when *forge* is
+    unset, and both callers that build these links pass GitLab: a work repo on a
+    hostname that says nothing about it (``git.example.com``) is a self-hosted
+    GitLab in every deployment either has met, and the two surfaces disagreeing
+    about the same run dir — linked in ``work``, plain names in the platform —
+    was worse than either answer alone. Passing nothing still yields None, which
+    is what a caller with no configured opt-out to offer should do.
+    """
+    forge = forge or detect_forge(urlsplit(base).hostname) or default_forge
+    prefix = _FORGE_PATH_PREFIX.get(forge)
+    if not base or prefix is None:
+        return None
+    ref_q = quote(ref or DEFAULT_WEB_BRANCH, safe="/")
+    if not rel_path:
+        return f"{base}{prefix}tree/{ref_q}"
+    kind = "tree" if is_dir else "blob"
+    return f"{base}{prefix}{kind}/{ref_q}/{quote(rel_path, safe='/')}"
+
+
+def checkout_branch(repo_path) -> str:
+    """The branch *repo_path* is on, or :data:`DEFAULT_WEB_BRANCH`.
+
+    ``symbolic-ref`` (not ``rev-parse``) so an unborn initial branch still names
+    itself; a detached HEAD, a directory that is not a repo and a missing
+    directory all fall back. Never raises — this only ever decides which ref a
+    link points at.
+    """
+    try:
+        rc, branch = run_git_command(
+            ["symbolic-ref", "--short", "HEAD"], Path(repo_path), check=False
+        )
+    except Exception:
+        return DEFAULT_WEB_BRANCH
+    return branch.strip() if rc == 0 and branch.strip() else DEFAULT_WEB_BRANCH
+
+
 def web_url_for(path) -> Optional[str]:
-    """GitLab web URL for a path inside the work-repo checkout, or None.
+    """Forge web URL for a path inside the work-repo checkout, or None.
 
     Maps an absolute path under ``LMER_WORK_REPO_PATH`` (default ``/work``)
     to ``https://<host>/<project>/-/blob/<branch>/<relpath>`` for files and
@@ -107,6 +227,12 @@ def web_url_for(path) -> Optional[str]:
     web base comes from the checkout's ``origin`` remote with credentials
     stripped (:func:`_web_base_from_remote`); the branch is the current
     branch, falling back to ``main`` when detection fails (detached HEAD).
+
+    The path shape comes from :func:`forge_web_url`, so a work repo on GitHub
+    gets GitHub's ``/blob/`` rather than GitLab's ``/-/blob/``. A host that
+    classifies as neither keeps GitLab's shape, which is what these links have
+    always produced — a self-hosted GitLab is commonly at ``git.<domain>``, and
+    dropping its links would be a regression for the deployments that have them.
 
     Fail-soft by contract: any problem — no work repo, no origin remote, a
     remote with no host, a path outside or missing from the checkout —
@@ -129,18 +255,16 @@ def web_url_for(path) -> Optional[str]:
         base = _web_base_from_remote(remote.strip())
         if base is None:
             return None
-        # symbolic-ref (not rev-parse) so an unborn initial branch still
-        # names itself; a detached HEAD fails and falls back to main.
-        rc, branch = run_git_command(
-            ["symbolic-ref", "--short", "HEAD"], work_repo_path, check=False
+        rel = "" if target == work_repo_path else target.relative_to(
+            work_repo_path
+        ).as_posix()
+        return forge_web_url(
+            base,
+            checkout_branch(work_repo_path),
+            rel,
+            is_dir=target.is_dir(),
+            default_forge=FORGE_GITLAB,
         )
-        branch = branch.strip() if rc == 0 else ""
-        branch_q = quote(branch or "main", safe="/")
-        if target == work_repo_path:
-            return f"{base}/-/tree/{branch_q}"
-        kind = "tree" if target.is_dir() else "blob"
-        rel = quote(target.relative_to(work_repo_path).as_posix(), safe="/")
-        return f"{base}/-/{kind}/{branch_q}/{rel}"
     except Exception:
         return None
 

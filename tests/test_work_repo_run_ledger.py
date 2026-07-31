@@ -82,7 +82,7 @@ class TestWriteLedger:
     def test_atomic_no_tmp_left(self, tmp_path):
         run_state.write_ledger(tmp_path, {"schema": 1, "tasks": {}})
         assert (tmp_path / "ledger.yaml").exists()
-        assert not (tmp_path / ".ledger.yaml.tmp").exists()
+        assert not list(tmp_path.glob(".ledger.yaml.*.tmp"))  # temp carries pid+thread
 
     def test_preserves_insertion_order(self, tmp_path):
         run_state.write_ledger(

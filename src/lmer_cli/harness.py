@@ -13,9 +13,10 @@ each supported harness:
 - which Containerfile build-arg busts its install layer's cache
 
 Selection: ``lmer --harness <name>`` wins over the ``LMER_HARNESS`` environment
-variable; when neither is set the model name in ``LMER_LLM_NAME`` can imply a
-harness (word-bounded match, e.g. ``sonnet`` → claude, ``gpt`` → codex — see
-:data:`MODEL_HARNESS_HINTS`), and the final fallback is ``claude``. The
+variable; when neither is set the model name in ``LMER_LLM_NAME`` (exported, or
+set by ``lmer --model``) can imply a harness (word-bounded match, e.g.
+``sonnet`` → claude, ``gpt`` → codex — see :data:`MODEL_HARNESS_HINTS`), and the
+final fallback is ``claude``. The
 resolved name is forwarded into the container as ``LMER_HARNESS`` so
 container-side code (``clone_and_exec.py``, ``lmer-supervisor``) agrees with
 the host about which harness is running — container-side resolution therefore
@@ -47,7 +48,10 @@ HARNESS_ENV = "LMER_HARNESS"
 
 #: Environment variable carrying the session's model name (passed verbatim to
 #: the harness's model flag by the runner scripts). Also consulted for harness
-#: autoselection when no harness is configured explicitly.
+#: autoselection when no harness is configured explicitly. Set either by export
+#: or by ``lmer --model``, which wins over an exported value and over a preset's
+#: env — the flag is applied to the environment before anything reads this, so
+#: there is one answer here rather than a flag and a variable that can disagree.
 LLM_NAME_ENV = "LMER_LLM_NAME"
 
 #: Environment variable marking a session with no human attached (a

@@ -3,10 +3,12 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import threading
 import types
 from pathlib import Path
 
 import pytest
+import yaml
 
 from work_repo import run_state
 from tests.conftest import strip_lmer_env
@@ -134,7 +136,7 @@ class TestStateIO:
         run_state.write_state(rdir, state)
         loaded = run_state.load_state(rdir)
         assert loaded["slug"] == "s"
-        assert not list(rdir.glob(".state.yaml.tmp"))  # no tmp file left behind
+        assert not list(rdir.glob(".state.yaml.*.tmp"))  # no tmp file left behind
 
     def test_write_bumps_updated(self, run_env, tmp_path, monkeypatch):
         rdir = tmp_path / "r"
@@ -224,6 +226,180 @@ class TestLegacyStateMigration:
         assert not (rdir / "state.yml").exists()
         assert list(rdir.glob("state.yml.bad-*"))
         assert not list(rdir.glob("state.yaml.bad-*"))
+
+
+# --- concurrent writers of the authoritative files --------------------------
+#
+# Single-writer discipline (spec §3.4, issue #89) is a contract on the
+# destination: state.yaml and ledger.yaml are only ever written by write_state()
+# and write_ledger(). It is not a promise that one thread of one process is ever
+# inside them — a session writing run state while `work session-start` writes it,
+# or a second agent in the same run, is two writers on one path — and these two
+# files are what the fleet view and reviewers read.
+
+#: Rows per payload: enough that records lost to a truncation are countable, and
+#: enough yaml (~25 KB) that the split in the gated writer below sits where the
+#: real buffered writer would already have put bytes on disk.
+ATOMIC_ROWS = 100
+
+#: The two writers, with the file each publishes and the schema it accepts.
+ATOMIC_WRITERS = {
+    "state": (run_state.write_state, run_state.STATE_FILE, run_state.SCHEMA_VERSION),
+    "ledger": (
+        run_state.write_ledger,
+        run_state.LEDGER_FILE,
+        run_state.LEDGER_SCHEMA_VERSION,
+    ),
+}
+
+
+def _bulky_payload(owner: str, schema: int, rows: int = ATOMIC_ROWS) -> dict:
+    """A payload big enough that losing part of it is visible, and attributable."""
+    return {
+        "schema": schema,
+        "slug": f"{owner}-run",
+        "tasks": {
+            f"T{index}": {"status": "done", "owner": owner, "note": owner * 40}
+            for index in range(rows)
+        },
+    }
+
+
+@pytest.mark.parametrize("which", sorted(ATOMIC_WRITERS))
+def test_atomic_write_temp_carries_the_writers_process_and_thread(
+    which, tmp_path, monkeypatch
+):
+    """Two writers must never derive one temp path.
+
+    The pid alone keeps two processes apart and says nothing about two threads of
+    one process; neither was here before. Matches the shape
+    :func:`lmer_platform.store.write_json` settled on, so a reader of one knows
+    the other.
+    """
+    write, filename, schema = ATOMIC_WRITERS[which]
+    rdir = tmp_path / "r"
+    # Every path this writer writes through, unfiltered: filtering on the shape
+    # being asserted would let a wrongly named temp vanish from the list instead
+    # of failing a check.
+    written = []
+    real_write_text = Path.write_text
+
+    def capture(self, *args, **kwargs):
+        written.append(self)
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", capture)
+    write(rdir, _bulky_payload("solo", schema))
+
+    assert len(written) == 1, written
+    tmp = written[0]
+    assert tmp.parent == rdir, "a rename out of the directory is a copy, not atomic"
+    assert tmp.name.startswith("."), f"a visible temp reads as {filename}"
+    assert tmp.name.endswith(".tmp")
+    parts = tmp.name.split(".")
+    assert str(os.getpid()) in parts, "two processes must still not collide"
+    assert str(threading.get_ident()) in parts, "nor two threads of one process"
+
+
+@pytest.mark.parametrize("which", sorted(ATOMIC_WRITERS))
+def test_a_second_writer_cannot_hole_what_the_first_publishes(
+    which, tmp_path, monkeypatch
+):
+    """The damage a shared temp path does, held open instead of raced for.
+
+    Losing a write is the harmless outcome. What persists is a second writer's
+    truncation landing in the *middle* of the first's file — the first then
+    renames the hole over the authoritative file and reports success — and a
+    writer renaming a temp another writer has not finished. So the second writer
+    is held with its truncation done and its fd open across the first's rename,
+    which is the interleaving in question, rather than trusting a one-CPU
+    scheduler to produce it.
+    """
+    write, filename, schema = ATOMIC_WRITERS[which]
+    rdir = tmp_path / "r"
+    first_is_mid_file = threading.Event()
+    second_holds_its_temp = threading.Event()
+    published = threading.Event()
+    payloads, temps, flushed, errors = {}, {}, [], []
+    real_open = Path.open
+
+    def gated_write_text(self, data, encoding=None, errors=None, newline=None):
+        """:meth:`Path.write_text` with one pause added.
+
+        Same shape as the real one — a single open (which truncates), sequential
+        writes, close — split at a flush boundary the buffered writer produces on
+        its own for a payload this size. Splitting it here makes the moment
+        deterministic; it does not create it.
+        """
+        name = threading.current_thread().name
+        payloads[name] = data
+        if name == "second":
+            # Nothing to lose until the other writer has bytes on disk.
+            first_is_mid_file.wait(timeout=60)
+        half = len(data) // 2
+        with real_open(self, "w", encoding=encoding) as fh:
+            # The truncation is here: with a shared temp name, this is what lands
+            # in the middle of the other writer's file.
+            fh.write(data[:half])
+            fh.flush()
+            temps[name] = self
+            if name == "first":
+                flushed.append(self.stat().st_size)
+                first_is_mid_file.set()
+                second_holds_its_temp.wait(timeout=60)
+            else:
+                second_holds_its_temp.set()
+                # Hold the fd open across the other writer's rename.
+                published.wait(timeout=60)
+            fh.write(data[half:])
+
+    monkeypatch.setattr(Path, "write_text", gated_write_text)
+
+    def run(name):
+        try:
+            # The second payload is deliberately the shorter one: its truncation
+            # then ends before the first writer's offset, so the bytes between
+            # read back as NULs — the hole T59 measured on a published file —
+            # instead of being papered over by a same-sized payload.
+            rows = ATOMIC_ROWS if name == "first" else ATOMIC_ROWS // 4
+            write(rdir, _bulky_payload(name, schema, rows))
+        except BaseException as exc:  # pragma: no cover - a failure prints why
+            errors.append(exc)
+
+    first = threading.Thread(target=run, args=("first",), name="first")
+    second = threading.Thread(target=run, args=("second",), name="second")
+    first.start()
+    second.start()
+    first.join(timeout=120)
+
+    assert not first.is_alive(), "the first writer never published"
+    assert not errors, errors
+    assert second.is_alive(), "the second writer was supposed to still be holding on"
+    # Read here, not at the end: this is the moment a fleet-view poll would land
+    # in, with the other writer's fd still open on a file that has been renamed.
+    mid_race = (rdir / filename).read_bytes()
+    published.set()
+    second.join(timeout=120)
+
+    assert flushed and flushed[0] > 0, (
+        "the first writer had nothing on disk yet, so this proved nothing"
+    )
+    assert b"\x00" not in mid_race, "a hole is what a second writer's truncation leaves"
+    rows = yaml.safe_load(mid_race)["tasks"]
+    assert len(rows) == ATOMIC_ROWS, f"{ATOMIC_ROWS - len(rows)} records lost"
+    assert {row["owner"] for row in rows.values()} == {"first"}
+    assert mid_race == payloads["first"].encode(), (
+        f"what was published is not what the writer wrote ({len(mid_race)} bytes)"
+    )
+    # The second writer publishes last, whole, and leaves nothing behind.
+    assert (rdir / filename).read_bytes() == payloads["second"].encode()
+    assert list(rdir.glob(".*.tmp")) == [], "a temp outlived the race"
+    # The mechanism behind all of the above, named last: a failure here with the
+    # assertions above passing means the temps collided harmlessly this time.
+    assert temps["first"] != temps["second"], "both writers derived one temp path"
+    # The writers' own verdict last of all — a raise here is the symptom of the
+    # tear above, and reading it first would hide what was published.
+    assert not errors, errors
 
 
 class TestEvents:
@@ -566,6 +742,23 @@ class TestFormatBrief:
         assert lines[4] == ""
         assert lines[5].startswith("Run: develop-issue-123")
 
+    def test_answered_question_with_no_recorded_text_leads_with_the_answer(self):
+        # T24: a question stop that never recorded its text is answerable, and
+        # the answer is still the direction — there is just no Q line to print,
+        # since "Q: None" would read as the question rather than its absence.
+        d = run_state.decide(_state(), [], "s-1")
+        text = run_state.format_brief(
+            d, answered={"question": None, "answer": "postgres"}
+        )
+        lines = text.splitlines()
+        assert lines[0].startswith("✅ ANSWERED QUESTION")
+        assert "never recorded" in lines[0]
+        assert lines[1] == "A: postgres"
+        assert lines[2] == "Proceed accordingly — record the follow-up goal/phase as you go."
+        assert lines[3] == ""
+        assert lines[4].startswith("Run: develop-issue-123")
+        assert "Q:" not in text
+
     def test_no_answered_block_by_default(self):
         text = run_state.format_brief(run_state.decide(_state(), [], "s-1"))
         assert "ANSWERED QUESTION" not in text
@@ -654,12 +847,63 @@ class TestAnswerQuestion:
         assert updated["status"] == "complete"
         assert run_state.load_state(rdir)["status"] == "complete"
 
-    def test_no_open_question_raises(self, run_env, tmp_path):
+    @pytest.mark.parametrize("stop_reason", [None, "yield", "paused", "complete"])
+    def test_no_question_and_no_question_stop_raises(self, run_env, tmp_path, stop_reason):
+        # Nothing was asked, so there is nothing an answer resolves — unchanged
+        # by T24, which widened the *question stop*, not the verb.
         rdir = tmp_path / "r"
-        state = _state()
+        state = _state(stop_reason=stop_reason)
         run_state.write_state(rdir, state)
         with pytest.raises(run_state.RunStateError, match="no open question"):
             run_state.answer_question(rdir, state, "nothing was asked")
+
+    def test_question_stop_with_no_recorded_text_is_answerable(self, run_env, tmp_path):
+        # T24: `work state set --stop-reason=question` without `--question` is
+        # the common shape in the wild; refusing it dropped the answer and left
+        # the run blocked. The stop is the fact the answer resolves.
+        rdir = tmp_path / "r"
+        state = _state(stop_reason="question")
+        run_state.write_state(rdir, state)
+
+        updated = run_state.answer_question(rdir, state, "postgres")
+
+        assert updated["stop_reason"] is None
+        assert updated["open_question"] is None
+        assert run_state.load_state(rdir)["stop_reason"] is None
+        event = run_state.read_events(rdir, last_n=0)[-1]
+        assert event["type"] == "question_answered"
+        assert event["data"] == {"question": None, "answer": "postgres"}
+        assert event["note"] == "postgres"
+
+    def test_a_text_less_answer_is_still_redacted(self, run_env, tmp_path, monkeypatch):
+        # The null question must not take the answer's redaction with it.
+        rdir = tmp_path / "r"
+        state = _state(stop_reason="question")
+        run_state.write_state(rdir, state)
+        monkeypatch.setattr(run_state, "redact_secrets", lambda s: "<redacted>")
+
+        run_state.answer_question(rdir, state, "token=hunter2")
+
+        assert run_state.read_events(rdir, last_n=0)[-1]["data"] == {
+            "question": None, "answer": "<redacted>",
+        }
+
+    @pytest.mark.parametrize("stop_reason", [None, "yield"])
+    def test_a_recorded_question_is_answerable_whatever_the_stop_reason(
+        self, run_env, tmp_path, stop_reason
+    ):
+        # Pre-T24 behaviour, kept: a recorded question outliving its stop (a
+        # hand-edited or legacy state) is still answerable, and the event keeps
+        # the shape it always had.
+        rdir = tmp_path / "r"
+        state = _state(stop_reason=stop_reason, open_question="sqlite or postgres?")
+        run_state.write_state(rdir, state)
+
+        run_state.answer_question(rdir, state, "postgres")
+
+        assert run_state.read_events(rdir, last_n=0)[-1]["data"] == {
+            "question": "sqlite or postgres?", "answer": "postgres",
+        }
 
 
 class TestEmitGateEvent:

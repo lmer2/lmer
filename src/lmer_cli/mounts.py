@@ -423,6 +423,39 @@ class FileMountSpec(NamedTuple):
     mode: str = "ro"
 
 
+class DirMountSpec(NamedTuple):
+    """A single host-directory → container-destination bind mount.
+
+    The directory counterpart of :class:`FileMountSpec`, produced by
+    ``cli.parse_dir_mount_specs`` (which owns all validation): by the time a
+    spec exists, ``host`` is an existing *directory*, ``container`` is an
+    absolute path, and ``mode`` is ``ro`` or ``rw``.
+
+    A separate type rather than a ``kind`` field on ``FileMountSpec`` because
+    the two are validated against different host predicates, and mixing them
+    in one list is how a directory eventually reaches the file validator.
+    """
+
+    host: Path
+    container: str
+    mode: str = "ro"
+
+
+def _build_bind_mounts(runtime: str, specs: Iterable) -> List[str]:
+    """``-v host:container:mode`` per spec, with the SELinux label when needed.
+
+    Shared body of :func:`build_file_mounts` and :func:`build_dir_mounts`:
+    Docker and Podman need no distinction between binding a file and binding a
+    directory, so the arg shape is written once — two copies would let the
+    SELinux labeling drift between the two flags.
+    """
+    se = selinux_opt(runtime)
+    args: List[str] = []
+    for spec in specs:
+        args += ["-v", f"{spec.host}:{spec.container}:{spec.mode}{se}"]
+    return args
+
+
 def build_file_mounts(runtime: str, specs: Iterable[FileMountSpec]) -> List[str]:
     """
     Build volume mounts for explicit per-file mounts (--mount-file).
@@ -438,11 +471,33 @@ def build_file_mounts(runtime: str, specs: Iterable[FileMountSpec]) -> List[str]
     Returns:
         List of Docker/Podman arguments for the file mounts
     """
-    se = selinux_opt(runtime)
-    args: List[str] = []
-    for spec in specs:
-        args += ["-v", f"{spec.host}:{spec.container}:{spec.mode}{se}"]
-    return args
+    return _build_bind_mounts(runtime, specs)
+
+
+def build_dir_mounts(runtime: str, specs: Iterable[DirMountSpec]) -> List[str]:
+    """
+    Build volume mounts for explicit per-directory mounts (--mount-dir).
+
+    Bind-mounts each host directory at its container destination, ``ro``
+    unless the spec asks for ``rw``. Mounted as-is, never copied, exactly like
+    :func:`build_file_mounts`.
+
+    Two consequences of binding a *directory* the caller should know, since
+    neither is visible in the arg: the mount **shadows** whatever the image
+    has at that destination (the container sees the host tree, not the baked
+    one), and an ``rw`` mount is writable by the container user — which only
+    works when that uid can write the host directory (rootless Podman's
+    ``--userns=keep-id`` and the image's ``BUILD_UID`` are what make that hold
+    for the usual single-user install).
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        specs: Validated directory-mount specs
+
+    Returns:
+        List of Docker/Podman arguments for the directory mounts
+    """
+    return _build_bind_mounts(runtime, specs)
 
 
 def _find_container_socket(runtime: str) -> Optional[Path]:
