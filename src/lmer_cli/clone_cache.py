@@ -26,6 +26,19 @@ Credential rules (the reason this code lives host-side at all):
 - The token is **never on any argv**: git children fetch the *scrubbed*
   URL, with credentials injected via ephemeral ``GIT_CONFIG_*`` process
   env (an ``http.<url>.extraHeader`` Authorization header).
+- **Exactly one Authorization header goes out, and it is ours**: a credentialed
+  fetch cancels any header the operator's git config or the inherited
+  ``GIT_CONFIG_*`` pairs would add before appending its own, and resets
+  ``credential.helper`` so nothing can substitute other credentials or block a
+  detached updater on an interactive unlock.
+- A credential lmer injected may still be one the remote rejects (a
+  ``GITLAB_TOKEN`` fallback reaching a github.com URL). A failed attempt that
+  carried credentials is therefore retried **once without lmer's own
+  injection**, so a public repo mirrors regardless (issue #157). The retry
+  undoes what this process attached and nothing else: it runs the same empty
+  env a URL lmer could not credential gets, so the operator's own git config
+  — headers and credential helper included — is what remains, exactly as
+  before.
 - Updater output is credential-scrubbed and size-capped, and the log lives
   **outside the cache root** so containers can never read it.
 
@@ -176,16 +189,112 @@ def _inherited_git_config_count() -> int:
     return count if count > 0 else 0
 
 
+def _config_env(entries: "list[tuple[str, str]]") -> "dict[str, str]":
+    """Numbered ``GIT_CONFIG_*`` env carrying *entries*, in order.
+
+    The entries land at the next free indices so inherited numbered git config
+    survives (see :func:`_inherited_git_config_count`), and git applies them
+    *after* what it inherited — which is what lets an entry here override or
+    cancel an inherited one.
+    """
+    base = _inherited_git_config_count()
+    env = {"GIT_CONFIG_COUNT": str(base + len(entries))}
+    for offset, (key, value) in enumerate(entries):
+        env[f"GIT_CONFIG_KEY_{base + offset}"] = key
+        env[f"GIT_CONFIG_VALUE_{base + offset}"] = value
+    return env
+
+
+def _credential_sources_off(scrubbed_url: str) -> "list[tuple[str, str]]":
+    """Config entries clearing the way for **our own** credential on *url*.
+
+    One caller only — the credentialed branch of :func:`_split_credentials`,
+    which appends its ``Authorization`` header after these. The anonymous retry
+    deliberately does *not* use this list; see :func:`_attempt_with_fallback`.
+
+    - ``credential.helper=`` — no helper may answer a challenge in place of the
+      token we were given, and none may block a detached updater holding a
+      flock on an interactive unlock.
+    - ``http.<url>.extraHeader=`` — an empty value **resets** git's
+      multi-valued header list, cancelling an ``Authorization`` header the
+      operator configured globally (the corporate-proxy/Artifactory pattern)
+      or one arriving in an inherited ``GIT_CONFIG_KEY_n`` pair. Without it git
+      sends *both*, ours second: measured against git 2.52.0 by recording what
+      git puts on the wire, the bare ``[http]``, matching-URL-prefix and
+      inherited-env-pair forms all produced ``['Basic INHERITED', 'Basic
+      OURS']``, and the empty reset at the exact URL cancelled all three.
+
+    **Deliberate cost, and it is not free** (review on !178): the reset clears
+    git's *whole* header list for the URL, not only ``Authorization`` entries,
+    so an operator using ``http.extraHeader`` for a required non-auth header
+    (proxy routing, a tenant id) loses it on a URL lmer credentials — measured,
+    and a regression against the behaviour before the reset existed. It is
+    accepted because git offers no narrower instrument: the reset is
+    all-or-nothing, and the header list cannot be read back and re-emitted
+    selectively either, since ``git config --get-urlmatch http <url>`` reports
+    only the single best-matching value rather than the accumulated list git
+    actually sends (measured on the same git). The alternative is two
+    ``Authorization`` headers on the wire with the remote choosing between
+    them, which is worse for every operator rather than for a narrow one.
+    Tracked as issue #179 so the loss stays visible and revisitable rather than
+    folded into #157.
+
+    The claim is bounded, deliberately: this covers the credential sources
+    reachable through process env, which is why the caller says "no auth header
+    and no credential helper" rather than "no credentials".
+    """
+    return [
+        ("credential.helper", ""),
+        (f"http.{scrubbed_url}.extraHeader", ""),
+    ]
+
+
+def _carries_credentials(cred_env: "dict[str, str]") -> bool:
+    """Whether *cred_env* attaches an Authorization header to git's requests.
+
+    A fact the updater owns — it built the dict — which is why the retry in
+    :func:`_attempt_with_fallback` keys on this and never on git's error text:
+    "could not read Username" covers a wrong credential, a private repo and a
+    nonexistent path alike, and git never promised that wording.
+
+    An ``extraHeader`` entry with an **empty** value cancels headers rather
+    than sending one (:func:`_credential_sources_off`), so the paired *value*
+    is what decides, not the key name. Today's credentialed env carries a real
+    entry alongside its reset and would read as credentialed either way; the
+    value check keeps the predicate true to its name for any env that carries
+    resets alone.
+    """
+    prefix = "GIT_CONFIG_KEY_"
+    for key, name in cred_env.items():
+        if not key.startswith(prefix) or not name.endswith(".extraHeader"):
+            continue
+        if cred_env.get(f"GIT_CONFIG_VALUE_{key[len(prefix):]}", ""):
+            return True
+    return False
+
+
 def _split_credentials(repo_url: str) -> "tuple[str, dict[str, str]]":
     """Split an http(s) URL into (scrubbed URL, ephemeral git-config env).
 
     The env entries carry an ``http.<url>.extraHeader`` Authorization header
     so the token reaches git without ever appearing on an argv (host ``ps``
     shows every command line for the full duration of an initial mirror
-    build). Non-http URLs and URLs without userinfo pass through untouched.
+    build), preceded by :func:`_credential_sources_off` so exactly one
+    ``Authorization`` header goes out — ours. Without that reset an inherited
+    global header is sent *alongside* it (measured: git 2.52.0 puts both on
+    the wire).
 
-    The entries land at the next free ``GIT_CONFIG_*`` indices so inherited
-    numbered git config survives (see :func:`_inherited_git_config_count`).
+    URLs without userinfo — and URLs with no scheme or an unparseable one —
+    pass through with an **empty** env: the operator's own git config, credential
+    helper included, is then what authenticates, exactly as it did before this
+    function existed.
+
+    Note the userinfo branch is taken for *any* scheme, so an
+    ``ssh://user@host/…`` URL loses its login and gets a meaningless
+    ``http.ssh://….extraHeader``. That mangling predates this function and is
+    tracked separately — untangling it needs a store-URL/fetch-URL split, since
+    simply passing such URLs through puts their userinfo in the mirror's
+    ``remote.origin.url`` on disk, which the module's credential rules forbid.
     """
     if "://" not in repo_url:
         return repo_url, {}
@@ -201,17 +310,10 @@ def _split_credentials(repo_url: str) -> "tuple[str, dict[str, str]]":
     scrubbed = f"{parsed.scheme}://{host}{parsed.path or ''}"
     userinfo = f"{unquote(parsed.username or '')}:{unquote(parsed.password or '')}"
     token = base64.b64encode(userinfo.encode()).decode()
-    base = _inherited_git_config_count()
-    env = {
-        "GIT_CONFIG_COUNT": str(base + 2),
-        f"GIT_CONFIG_KEY_{base}": f"http.{scrubbed}.extraHeader",
-        f"GIT_CONFIG_VALUE_{base}": f"Authorization: Basic {token}",
-        # reset any inherited credential helpers: nothing may prompt or
-        # substitute other credentials under a detached updater
-        f"GIT_CONFIG_KEY_{base + 1}": "credential.helper",
-        f"GIT_CONFIG_VALUE_{base + 1}": "",
-    }
-    return scrubbed, env
+    entries = _credential_sources_off(scrubbed) + [
+        (f"http.{scrubbed}.extraHeader", f"Authorization: Basic {token}"),
+    ]
+    return scrubbed, _config_env(entries)
 
 
 def _git_env(cred_env: "dict[str, str]") -> "dict[str, str]":
@@ -353,6 +455,82 @@ def _create_mirror(mirror: Path, scrubbed_url: str, cred_env: "dict[str, str]") 
         raise
 
 
+def _fetch_existing(mirror: Path, scrubbed_url: str, cred_env: "dict[str, str]") -> None:
+    """Refresh an existing mirror from *scrubbed_url*."""
+    _run_git(
+        ["-C", str(mirror), "fetch", "--quiet", "--prune", scrubbed_url,
+         "+refs/*:refs/*"],
+        timeout=FETCH_TIMEOUT_S,
+        cred_env=cred_env,
+    )
+
+
+def _attempt_with_fallback(
+    operation, mirror: Path, cred_env: "dict[str, str]"
+) -> None:
+    """Run *operation(cred_env)*, retrying once anonymously if it failed (#157).
+
+    A credential lmer injected is not necessarily one the remote accepts: a
+    host with ``GITLAB_TOKEN`` set and no GitHub token gets that PAT injected
+    into github.com URLs by the generic token fallback, and GitHub challenges
+    it even for a **public** repo — which is how a mirror of a public repo
+    failed with "could not read Username" while an anonymous fetch of the same
+    URL would have succeeded (issue #157, seen in the #150 spike).
+
+    So a failed attempt that *carried* credentials is retried once **with
+    lmer's own injection dropped and nothing else changed** — an empty env,
+    byte-identical to what a URL lmer could not credential already gets. The
+    decision reads only what this process knows it sent
+    (:func:`_carries_credentials`) — never git's error text, which cannot tell a
+    rejected credential from a private or nonexistent repo.
+
+    The retry deliberately does *not* apply :func:`_credential_sources_off`
+    (review on !178). What #157 needs undone is the credential lmer chose, not
+    the operator's configuration: cancelling their headers and helper too made
+    the retry *stricter* than the tokenless path, discarding — measured — an
+    ``Authorization`` header of their own that would have worked, and any
+    non-auth header the request needs. Dropping to ``{}`` keeps the retry
+    symmetric with the rule stated for tokenless URLs: a request lmer cannot
+    credential is left entirely to the operator's git config. The cost is the
+    converse case — an operator whose own global header is the *wrong* one for
+    this host keeps sending it into the retry, so that mirror still fails — but
+    that was true before this retry existed and is not a regression.
+
+    **Only a non-zero git exit earns a retry.** ``RuntimeError`` is what
+    :func:`_run_git` raises for that, so a ``subprocess.TimeoutExpired`` or a
+    local ``OSError`` deliberately propagates untouched: retrying a create that
+    hit :data:`CREATE_TIMEOUT_S` would start a second *from-scratch* transfer
+    (``_create_mirror`` removes its ``.tmp``, so nothing resumes), doubling a
+    window in which this mirror's flock is held — and ``update_mirrors`` skips a
+    held lock rather than queueing, so every launch in that window silently gets
+    no warming for the repo. Certain to fail again anyway when the repo genuinely
+    needs credentials (review on !178).
+
+    A URL with no credentials makes exactly one attempt — there is nothing to
+    drop — and a working token still succeeds on the first, so
+    token-authenticated flows are untouched. If the retry fails too, the
+    *credentialed* failure is what propagates, since an anonymous failure on a
+    repo that really does need credentials says nothing useful; the retry's own
+    error is logged before that, because ``update_mirrors`` stringifies only the
+    exception it catches and the cause would otherwise be lost.
+    """
+    try:
+        operation(cred_env)
+        return
+    except RuntimeError as e:
+        if not _carries_credentials(cred_env):
+            raise
+        credentialed_failure = e
+    _log(f"{mirror.name}: update with credentials failed ({credentialed_failure}); "
+         f"retrying without the credential lmer injected")
+    try:
+        operation({})
+    except Exception as anon_failure:
+        _log(f"{mirror.name}: retry without the injected credential also "
+             f"failed: {anon_failure}")
+        raise credentialed_failure
+
+
 def _update_one(mirror: Path, repo_url: str) -> None:
     """Create or refresh one mirror. Must be called under its flock."""
     scrubbed_url, cred_env = _split_credentials(repo_url)
@@ -364,11 +542,9 @@ def _update_one(mirror: Path, repo_url: str) -> None:
         except OSError:
             pass  # no stamp: treat as stale
         _clean_lock_droppings(mirror)
-        _run_git(
-            ["-C", str(mirror), "fetch", "--quiet", "--prune", scrubbed_url,
-             "+refs/*:refs/*"],
-            timeout=FETCH_TIMEOUT_S,
-            cred_env=cred_env,
+        _attempt_with_fallback(
+            lambda env: _fetch_existing(mirror, scrubbed_url, env),
+            mirror, cred_env,
         )
     else:
         if mirror.is_dir():
@@ -378,7 +554,10 @@ def _update_one(mirror: Path, repo_url: str) -> None:
             # Safe: we hold this mirror's flock.
             _log(f"{mirror.name}: removing damaged mirror (no HEAD)")
             shutil.rmtree(mirror)
-        _create_mirror(mirror, scrubbed_url, cred_env)
+        _attempt_with_fallback(
+            lambda env: _create_mirror(mirror, scrubbed_url, env),
+            mirror, cred_env,
+        )
     stamp.touch()
 
 
