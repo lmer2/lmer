@@ -337,6 +337,46 @@ if [ -n "$(printf '%s' "$LMER_HUMAN_IDENTITY" | tr -d '[:space:]')" ]; then
     fi
 fi
 
+# ── Non-interactive session notice ──
+# Claude Code discovers only CLAUDE.md natively, so AGENTS.md — and with it the
+# NON-INTERACTIVE SESSIONS rule — reaches the model solely through the system
+# prompt assembled above. Setting LMER_NONINTERACTIVE in the environment tells
+# no agent anything on its own (no path renders LMER_* values into a session's
+# context), so the rule text itself is appended here for headless launches.
+# Plain markdown, no renderer needed — the fragment carries no session values.
+case "${LMER_NONINTERACTIVE,,}" in
+    1|true|yes)
+        NONINTERACTIVE_FRAGMENT=""
+        for candidate in \
+            "$(dirname "$0")/../prompts/non-interactive.md" \
+            "/workspace/prompts/non-interactive.md" \
+            "$LMER_HOME/prompts/non-interactive.md" \
+            "/Agents/global/prompts/non-interactive.md"; do
+            if [ -f "$candidate" ]; then
+                NONINTERACTIVE_FRAGMENT="$candidate"
+                break
+            fi
+        done
+
+        if [ -n "$NONINTERACTIVE_FRAGMENT" ]; then
+            if [ -z "$AGENTS_COMBINED" ]; then
+                AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+                if [ -n "$WORKSPACE_AGENTS" ]; then
+                    cat "$WORKSPACE_AGENTS" > "$AGENTS_COMBINED"
+                elif [ -n "$USER_AGENTS" ]; then
+                    cat "$USER_AGENTS" > "$AGENTS_COMBINED"
+                fi
+            fi
+            printf '\n\n' >> "$AGENTS_COMBINED"
+            cat "$NONINTERACTIVE_FRAGMENT" >> "$AGENTS_COMBINED"
+            AGENTS_PROMPT_ARGS="--append-system-prompt-file $AGENTS_COMBINED"
+            echo "✅ Non-interactive session notice injected into system prompt"
+        else
+            echo "⚠️  LMER_NONINTERACTIVE set but non-interactive.md not found"
+        fi
+        ;;
+esac
+
 # ── Agent memory restore ──
 # When LMER_PERSIST_AGENT_MEMORY is enabled, restore previously-saved
 # per-project agent memory from the work repo into Claude's memory directory

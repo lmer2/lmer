@@ -321,7 +321,12 @@ Children run permission-free (the
 lmer container is the security boundary), stateless (no run dirs, no
 work-repo writes), and cannot fan out further — `LMER_AGENTS` /
 `LMER_AGENTS_CONFIG` are stripped from the child environment, so there are
-no grandchildren. Per-harness invocation details:
+no grandchildren. Every child also gets `LMER_NONINTERACTIVE=1` and a
+one-paragraph notice at the head of its prompt — "report a gate-worthy
+problem, never end the turn asking for approval" — because an unanswerable
+question in a child is a dropped result, not a pause. The notice is in-band
+rather than a context file so it reaches every harness alike. Per-harness
+invocation details:
 [Non-interactive exec mode in docs/HARNESSES.md](./HARNESSES.md#non-interactive-exec-mode-spawn-harness).
 
 ## Merge semantics per consumer

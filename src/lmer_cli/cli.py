@@ -1902,6 +1902,11 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_DANGER_ZONE": os.environ.get("LMER_DANGER_ZONE"),
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
         "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
+        # No human attached (cron/scheduled launches): the AGENTS.md gates
+        # report instead of asking when this is set. Never inferred from the
+        # launch shape — only an explicit host value crosses over, while
+        # spawn-harness sets it on its own children (issue #137).
+        "LMER_NONINTERACTIVE": os.environ.get("LMER_NONINTERACTIVE"),
         # Per-lane model+effort dispatch for Claude subagent defs
         # (model[:effort] per lane; parsed in-container by
         # lmer_cli.container.dispatch_agents via claude-agent-files.sh).

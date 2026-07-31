@@ -4,6 +4,7 @@ Tests for the gate system and gate commands
 """
 
 import pytest
+import re
 import subprocess
 import os
 import sys
@@ -1755,12 +1756,143 @@ class TestGateStructure:
         content = main_config.read_text()
         assert "## 🛑 ERROR GATE" in content
 
-        # Check for required elements
+        # Check for required elements — the report block survives the
+        # risk-based rewrite, scoped to the STOP cases.
         assert "❌ ERROR ENCOUNTERED:" in content
         assert "📍 WHERE:" in content
         assert "🔍 ANALYSIS:" in content
         assert "🔧 PROPOSED FIX:" in content
         assert "💭 WHY THIS FIX:" in content
+
+    def test_error_gate_triggers_on_fix_cost_not_on_failure(self):
+        """The gate keys on what the fix costs, not on any error occurring (#137).
+
+        Gating every failure halts an agent on its own malformed commands — in a
+        headless child that is a dropped result, not a pause. Visibility stays
+        unconditional; only the narrow authorization cases stop.
+        """
+        content = (Path(__file__).parent.parent / "AGENTS.md").read_text()
+        # Whitespace-normalized: these rules must survive a reflow or a
+        # markdown formatter pass, which line-wrap columns and bullet indents
+        # would not.
+        flat = " ".join(content.split())
+
+        assert "## 🛑 ERROR GATE - When a fix needs authorization" in content
+        assert "## 🛑 ERROR GATE - When Something Fails" not in content
+
+        # The no-gate classes must stay explicitly no-gate.
+        assert "**Your own malformed command**" in flat
+        assert "fix it and continue" in flat
+        assert "**Environment or capability gap**" in flat
+
+        # A missing binary is a capability gap (class 2), never class 1 —
+        # class 2 carries the worked example that decides it.
+        assert "missing shortcut binary" not in flat
+        assert "`grep` for a missing `rg`" in flat
+
+        # The gated classes, and the churn trigger the gate exists for.
+        assert "when the fix would mutate state, is hard to reverse" in flat
+        assert "when you do not understand the cause" in flat
+
+        # Showing the error is never conditional on stopping.
+        assert "Visibility is unconditional in all four cases" in flat
+
+    def test_error_gate_report_has_non_interactive_closing(self):
+        """The STOP template must not hand a headless agent a question to emit.
+
+        The template is the most local, most concrete instruction at a STOP,
+        so a bare `(yes/no)` closing line would out-argue the general rule 130
+        lines above it (#137).
+        """
+        content = (Path(__file__).parent.parent / "AGENTS.md").read_text()
+        flat = " ".join(content.split())
+
+        assert "Shall I proceed with this fix? (yes/no)" in flat
+        assert "In a non-interactive session, replace that closing question" in flat
+        assert "⏸️ STOPPED — would have asked" in flat
+
+        # The override has to follow the template it overrides.
+        assert content.index("Shall I proceed with this fix?") < content.index(
+            "In a non-interactive session, replace that closing question"
+        )
+
+    def test_non_interactive_section(self):
+        """A headless session must report instead of ending its turn on a question."""
+        content = (Path(__file__).parent.parent / "AGENTS.md").read_text()
+        flat = " ".join(content.split())
+
+        assert "## 🤖 NON-INTERACTIVE SESSIONS" in content
+        assert "LMER_NONINTERACTIVE" in flat
+        assert "no gate below may end your turn with a question" in flat
+        # Not asking must not decay into doing it anyway.
+        assert "Do NOT perform the gated action either" in flat
+
+        # The clause has to precede the gates it governs.
+        assert content.index("## 🤖 NON-INTERACTIVE SESSIONS") < content.index(
+            "## 🛑 COMMIT GATE"
+        )
+
+    def test_non_interactive_section_states_truthy_contract(self):
+        """The prose is the parsing contract — no Python reads this var (#137).
+
+        Every other boolean LMER_* var documents `1`/`true`/`yes` on and
+        `0`/`false`/`no` off; a strict `=1` reading would make `=true` silently
+        mean "a human is present", which is the failure class this section is
+        about.
+        """
+        flat = " ".join((Path(__file__).parent.parent / "AGENTS.md").read_text().split())
+
+        assert "`1`, `true`, `yes`, case-insensitive" in flat
+        assert "A falsy value (`0`, `false`, `no`) or an unset variable" in flat
+
+    def test_non_interactive_section_carves_out_advance_approval(self):
+        """Composed with the COMMIT GATE, no carve-out makes headless runs useless.
+
+        cron/CI launches are exactly the runs whose purpose is to produce
+        committed work, so the section has to say that approval granted before
+        the session started still counts (#137).
+        """
+        flat = " ".join((Path(__file__).parent.parent / "AGENTS.md").read_text().split())
+
+        assert "Approval already granted before the session started is still approval" in flat
+        assert "covers approvals you would have to obtain *now*" in flat
+        # And it must say what each gate does instead of stopping.
+        assert "**CONTEXT SWITCH GATE** — state the switch" in flat
+        assert "**COMMIT GATE** — run `gate-check`" in flat
+
+    def test_cli_env_dict_declares_non_interactive(self):
+        """Guard: LMER_NONINTERACTIVE must be in cli.py's container env dict.
+
+        Without this entry, a cron wrapper exporting LMER_NONINTERACTIVE=1 on
+        the host has no effect on the agent inside the container, where the
+        AGENTS.md section above is what reads it. Lives beside that section's
+        tests rather than in the spawn-harness module: the reader is AGENTS.md,
+        not child-env composition.
+        """
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        pattern = re.compile(
+            r"""["']LMER_NONINTERACTIVE["']\s*:\s*os\.environ\.get\(\s*"""
+            r"""["']LMER_NONINTERACTIVE["']\s*\)"""
+        )
+        assert pattern.search(cli_py.read_text()), \
+            "LMER_NONINTERACTIVE entry missing from cli.py container env dict"
+
+    def test_non_interactive_fragment_carries_the_rule(self):
+        """The fragment is how the rule reaches a session at all (#137).
+
+        Nothing renders an LMER_* value into a model's context, and claude
+        discovers only CLAUDE.md natively — so for headless launches this file,
+        not the variable, is the delivery. It must therefore restate the rule
+        rather than point at AGENTS.md.
+        """
+        fragment = Path(__file__).parent.parent / "prompts" / "non-interactive.md"
+        assert fragment.is_file(), "prompts/non-interactive.md is missing"
+        flat = " ".join(fragment.read_text().split())
+
+        assert "No gate may end your turn with a question" in flat
+        assert "do not perform the gated action either" in flat
+        assert "is still approval" in flat
+
 
     def test_context_switch_gate(self):
         """Verify CONTEXT SWITCH GATE exists."""

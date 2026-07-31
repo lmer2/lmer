@@ -50,6 +50,23 @@ HARNESS_ENV = "LMER_HARNESS"
 #: autoselection when no harness is configured explicitly.
 LLM_NAME_ENV = "LMER_LLM_NAME"
 
+#: Environment variable marking a session with no human attached (a
+#: ``spawn-harness`` child, a cron run, any headless launch). The rule it
+#: stands for is the NON-INTERACTIVE SESSIONS section of AGENTS.md: no gate
+#: may end the turn with a question there, because nobody is going to answer
+#: it. The variable is the *signal*, never the delivery — nothing renders an
+#: environment value into a model's context, so the rule text travels
+#: separately: ``prompts/non-interactive.md`` for full sessions (appended to
+#: the system prompt by ``libexec/claude-runner.sh``, written to the global
+#: context file by ``harness_render_global_context`` for codex/pi), and
+#: :data:`~lmer_cli.container.spawn_harness.NONINTERACTIVE_NOTICE` in-band for
+#: fan-out children, which run no runner script. Set unconditionally on those
+#: children (see :func:`lmer_cli.container.spawn_harness.build_child_env`);
+#: host-exported values are forwarded into the container for headless
+#: launches. Truthy parsing (``1``/``true``/``yes``) is applied by the shell
+#: readers, matching every other boolean ``LMER_*`` variable.
+NONINTERACTIVE_ENV = "LMER_NONINTERACTIVE"
+
 #: Word-bounded, case-insensitive model-name words that imply a harness, in
 #: match order. Used only when neither ``--harness`` nor ``LMER_HARNESS`` is
 #: set: a model family name is usually enough to pick the right CLI
