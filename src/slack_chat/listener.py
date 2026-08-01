@@ -33,7 +33,7 @@ from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.tls import ensure_ca_bundle
 
 from .registry import is_thread_connected
-from .sessions import SessionManager
+from .sessions import SessionManager, listener_default_preset
 
 logger = logging.getLogger("lmer_slack.listener")
 
@@ -112,6 +112,53 @@ DM_ALLOWED_USERS: set[str] = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
 # unset. Repopulated from env in main() after .env load, mirroring how the
 # session manager and DM allowlist are reconstructed there.
 PRESETS: dict[str, Preset] = load_presets()
+
+
+def _preset_ack_parts(preset: Preset | None) -> tuple[str, str]:
+    """Say which preset the session being spawned is actually getting.
+
+    Returns ``(clause, warning)`` — a fragment appended to the connecting ack,
+    and an optional separate warning line.
+
+    Both selectors are reported, because both are invisible from Slack
+    (issue #181). A ``$preset:`` token names the preset it applies and, when it
+    replaced a listener-wide default, says so; with no token the
+    env-selected default is named too, since "my session silently got a preset
+    I never asked for" is exactly the confusion this is fixing. The person who
+    needs to know is the one who just typed the message, so this belongs in the
+    thread and not only in ``lmer_session_spawned``.
+
+    A default naming a preset that is not defined gets the warning line: the
+    spawned CLI rejects an unknown preset with exit 2, so the session would
+    otherwise die seconds after a cheerful "Connecting…" with the reason
+    visible only in the listener's log. Unlike an unknown *token* — a user
+    error, rejected before spawning — this is an operator misconfiguration of
+    the listener itself, so the spawn still goes ahead and only the diagnosis
+    is surfaced.
+    """
+    default_name, default_source = listener_default_preset()
+    if preset is not None:
+        if default_name and default_name != preset.name:
+            return (
+                f" using preset `{preset.name}` (replacing the listener "
+                f"default `{default_name}` from `{default_source}`)",
+                "",
+            )
+        return f" using preset `{preset.name}`", ""
+    if not default_name:
+        return "", ""
+    if default_name in PRESETS:
+        return (
+            f" using the listener default preset `{default_name}` "
+            f"(from `{default_source}`)",
+            "",
+        )
+    available = ", ".join(sorted(PRESETS)) or "(none configured)"
+    return "", (
+        f"⚠️ The listener default preset `{default_name}` (from "
+        f"`{default_source}`) is not defined, so this session will fail to "
+        f"start. Available presets: {available}."
+    )
 
 
 def build_app(token: str | None = None):
@@ -362,10 +409,12 @@ async def _connect_lmer_session(
             )
             return
 
+    preset_clause, preset_warning = _preset_ack_parts(preset)
     ack = "Connecting a session to this thread"
-    if preset is not None:
-        ack += f" using preset `{preset.name}`"
+    ack += preset_clause
     ack += "... ⏳ (the first reply can take a minute)"
+    if preset_warning:
+        ack += f"\n{preset_warning}"
     if is_dm:
         ack += "\nPlease reply *in this thread* to continue the conversation."
     await say(text=ack, thread_ts=thread_ts)
