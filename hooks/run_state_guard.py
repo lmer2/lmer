@@ -48,6 +48,24 @@ inline because hooks import no project code), the run-context gate
 (``LMER_REPO_HOST`` + ``LMER_REPO_PROJECT`` set, ``work`` on PATH), and
 ``stop_hook_active`` handling (no within-yield loops).
 
+They also share one stand-down: **while a gate is in flight** (issue #201),
+every trigger is suppressed. A ~14-minute suite makes background gating the
+normal pattern, and every nudge here mandates a work-repo write — trigger 2 a
+``work commit``, triggers 1 and 3 a ``work goal``/``work state set``/``work
+ledger set``. Any of those landing inside the running gate's window moves
+tracked files under the suite and fails its ``/work`` isolation guard; the
+mandated commit was the session's own stop hook, which is how a gate ended up
+arming itself against itself. ``work resume --json`` reports the fact as
+``gate_in_flight`` (derived server-side in ``lmer_cli.gate_lock``, the same
+pattern as ``run_dir_url`` — hooks import no project code).
+
+The suppression is bounded by the gate's life, never open-ended, which is
+what keeps "a session cannot stop with unpushed artifacts" true: deferred work
+leaves the run dir dirty, so the moment the gate ends trigger 2 fires normally
+and blocks the stop until it lands. No sentinel is burned and no counter is
+consumed while suppressed, so a session does not spend its nudges on stops it
+was never told about.
+
 The hook fails open everywhere: unreadable payload, git errors, ``work``
 failures, JSON parse errors, sentinel/counter I/O errors → exit 0, no
 output. Blocking is signalled only via ``{"decision": "block", "reason": …}``
@@ -255,6 +273,20 @@ def derive_run_dir_url(decision: dict | None) -> str | None:
     return None
 
 
+def derive_gate_in_flight(decision: dict | None) -> bool:
+    """Whether a gate command is running right now (issue #201).
+
+    Read from ``work resume --json``'s ``gate_in_flight``, which the work CLI
+    derives from the gate markers — the hook never inspects the marker
+    directory itself, for the same reason it never derives the run-dir URL:
+    one definition, on the side that owns it. Absent (an older work CLI, an
+    idle machine) reads as False, which is exactly the pre-#201 behavior.
+    """
+    if not isinstance(decision, dict):
+        return False
+    return bool(decision.get("gate_in_flight"))
+
+
 def ledger_nudge_needed(events: list | None, session: str) -> bool:
     """
     Trigger-3 decision, given the run's parsed events and the session id.
@@ -354,6 +386,7 @@ def evaluate(
     push_cap: int = PUSH_NUDGE_CAP,
     ledger_needed: bool = False,
     ledger_already_nudged: bool = True,
+    gate_in_flight: bool = False,
 ) -> dict:
     """
     Combine the triggers into one decision, from fully injected inputs.
@@ -369,7 +402,17 @@ def evaluate(
     is unset (defaults keep it off for callers that never gathered it).
     Trigger 2 fires independently whenever the run dir is dirty or unpushed
     and the session cap has not been reached.
+
+    ``gate_in_flight`` overrides all three (issue #201): every nudge here
+    mandates a work-repo write, and one landing inside a running gate's window
+    fails that gate. Returning empty reasons — rather than a softer message —
+    also leaves the sentinels and the counter untouched, so nothing is spent on
+    a stop the session was never told about, and the nudges return in full the
+    moment the gate ends.
     """
+    if gate_in_flight:
+        return {"state_reason": None, "ledger_reason": None, "push_reason": None}
+
     state_reason = None
     if missing_fields and activity and not state_already_nudged:
         state_reason = build_state_reason(missing_fields)
@@ -568,6 +611,11 @@ def main(argv: list[str] | None = None) -> int:
     sentinel_path = SENTINEL_TEMPLATE.format(session=session)
     counter_path = COUNTER_TEMPLATE.format(session=session)
 
+    # Issue #201: with a gate in flight every trigger stands down, so the
+    # gathering below is skipped too — those are git subprocesses run on every
+    # yield, and their answers cannot change the verdict.
+    gate_in_flight = derive_gate_in_flight(decision)
+
     # Trigger 1 inputs. Activity needs git subprocesses, so gather it only
     # when the cheaper checks (missing fields, sentinel) leave it in play.
     missing = missing_state_fields(decision)
@@ -576,7 +624,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         state_already_nudged = True  # sentinel unreadable — fail open, no nudge
     activity = False
-    if missing and not state_already_nudged:
+    if missing and not state_already_nudged and not gate_in_flight:
         cwd = payload.get("cwd")
         root = cwd if isinstance(cwd, str) and cwd.strip() else DEFAULT_WORKSPACE
         try:
@@ -589,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = derive_run_dir(decision, host, project, work_repo_path)
     run_dir_url = derive_run_dir_url(decision)
     dirty, unpushed = (False, False)
-    if run_dir:
+    if run_dir and not gate_in_flight:
         try:
             dirty, unpushed = gather_run_dir_status(run_dir)
         except Exception:
@@ -606,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         ledger_already_nudged = True  # sentinel unreadable — fail open, no nudge
     ledger_needed = False
-    if run_dir and not ledger_already_nudged:
+    if run_dir and not ledger_already_nudged and not gate_in_flight:
         try:
             ledger_needed = ledger_nudge_needed(read_run_events(run_dir), session)
         except Exception:
@@ -623,6 +671,7 @@ def main(argv: list[str] | None = None) -> int:
         run_dir_url=run_dir_url,
         ledger_needed=ledger_needed,
         ledger_already_nudged=ledger_already_nudged,
+        gate_in_flight=gate_in_flight,
     )
 
     # Bookkeeping BEFORE blocking, each failing open per trigger: a nudge

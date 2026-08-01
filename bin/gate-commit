@@ -22,6 +22,15 @@ except ImportError:  # run-state wiring must never break a gate
     def emit_gate_event(gate, outcome, **kwargs):
         pass
 
+try:
+    from lmer_cli.gate_lock import hold_gate_lock
+except ImportError:  # lock wiring must never break a gate, like receipts
+    from contextlib import contextmanager
+
+    @contextmanager
+    def hold_gate_lock(label):
+        yield
+
 
 def _head_sha():
     """Best-effort sha of HEAD immediately after the commit; None when
@@ -122,4 +131,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    sys.exit(gate_commit(args.message, args.verbose, args.bypass))
+    # Held across the whole command — checks, receipt AND the git commit
+    # (issue #201). Wrapped here rather than inside gate_commit() so no early
+    # return can leave the window uncovered.
+    with hold_gate_lock("gate-commit"):
+        rc = gate_commit(args.message, args.verbose, args.bypass)
+    sys.exit(rc)

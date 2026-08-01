@@ -1292,6 +1292,11 @@ class TestSessionEnd:
                 "git.example.com/org/repo/specs",
             ],
             "run-state: session end develop-issue-123",
+            # The one durability push exempt from the gate-in-flight deferral
+            # (issue #201): the session and its container are going away, so
+            # the gate whose window a deferral would protect is being torn down
+            # with them — and a deferral here has no later commit to flush into.
+            allow_during_gate=True,
         )
 
     def test_foreign_claim_left_alone(self, run_env, monkeypatch):

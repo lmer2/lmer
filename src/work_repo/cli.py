@@ -15,6 +15,8 @@ from pathlib import Path
 from datetime import datetime
 import yaml
 
+from lmer_cli import gate_lock
+
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import (
@@ -1290,6 +1292,18 @@ def _last_non_empty_line(tail: bytes) -> str | None:
 
 
 def cmd_verify(name: str, command: list[str]) -> int:
+    """Run a verify command while holding the gate-in-flight marker (#201).
+
+    A verify command is the same shape of hazard as a gate — it is usually the
+    same long suite — so work-repo commits must defer around it exactly as they
+    do around `gate-check`. The marker never defers THIS process (see
+    `gate_lock.active_gate`'s self-exclusion), so the receipt still lands.
+    """
+    with gate_lock.hold_gate_lock(f"work verify {name.strip() or 'verify'}"):
+        return _run_verify(name, command)
+
+
+def _run_verify(name: str, command: list[str]) -> int:
     """Execute verify command (issue #88 D2 — receipts for non-gate validation).
 
     Runs the command with stderr merged into stdout (so the hashed tail sees
@@ -2020,6 +2034,17 @@ def cmd_resume(as_json: bool = False) -> int:
         run_dir_url = web_url_for(rdir)
         if run_dir_url:
             decision["run_dir_url"] = run_dir_url
+        # Issue #201: the Stop hook must not mandate work-repo writes while a
+        # gate is in flight — its own nudge is what lands a commit inside the
+        # running suite's window. Derived here, server-side, for the same
+        # reason run_dir_url is: hooks import no project code, so the one
+        # definition of "a gate is running" stays in lmer_cli.gate_lock.
+        # Present only when true, so a hook reading an older work CLI sees the
+        # same thing an idle one does.
+        active = gate_lock.active_gate()
+        if active is not None:
+            decision["gate_in_flight"] = True
+            decision["gate_in_flight_detail"] = gate_lock.describe_marker(active)
     if as_json:
         print(json.dumps(decision, ensure_ascii=False))
     else:
@@ -3263,7 +3288,15 @@ def cmd_session_end() -> int:
         specs_rel = specs_index.specs_rel_path()
         if specs_rel and specs_rel not in rels:
             rels.append(specs_rel)
-        rc = commit_work_path(rels, f"run-state: session end {state['slug']}")
+        # The one durability push that does NOT defer to an in-flight gate
+        # (issue #201): the session and its container are going away, so the
+        # gate whose window a deferral would protect is being torn down with
+        # them — and a deferral here has no later commit to flush it.
+        rc = commit_work_path(
+            rels,
+            f"run-state: session end {state['slug']}",
+            allow_during_gate=True,
+        )
         if rc != 0:
             print("⚠️  Warning: run-state push failed at session end (state saved locally)")
     except Exception as exc:
