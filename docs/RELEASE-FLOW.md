@@ -84,6 +84,14 @@ On merge detection:
    image. Public-before-internal ordering means a GitHub failure leaves no
    half-released internal state — the flow cannot silently drift into
    "released internally but not publicly" or the reverse.
+   The container images that pipeline publishes are the ones its build
+   stage built and exercised: each build job pushes the commit-tagged
+   image and records the digest the registry stored it as, and the publish
+   job promotes *that digest* to `:vX.Y.Z` and `:latest` rather than
+   building a second copy. It re-reads each release tag afterwards and
+   fails if the registry does not serve the built digest under it, so
+   "the released image is the verified image" is checked in the job log
+   rather than assumed (#189).
 6. Record receipts (verification events, Actions run URL, PyPI URL) and
    complete the run.
 
