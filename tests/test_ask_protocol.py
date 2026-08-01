@@ -545,6 +545,34 @@ def test_a_channel_that_is_full_refuses_more(channel):
         protocol.post_question(channel, "and no questions either")
 
 
+def test_the_full_cap_counts_entries_not_the_files_they_accumulate(channel, monkeypatch):
+    """A long session's ordinary shape is not a full channel (issue #191).
+
+    A healthy question ends up as three files — question, answer, read receipt —
+    so a cap that counted files would refuse at a third of the entries it claims
+    to count, and tell the session it was looping while it was doing exactly what
+    the channel is for. ``MAX_ENTRIES`` is patched rather than reached because
+    what is under test is *what* is counted, not the value.
+    """
+    monkeypatch.setattr(protocol, "MAX_ENTRIES", 3)
+
+    for index in range(2):
+        question = protocol.post_question(channel, f"question {index}")
+        protocol.write_answer(channel, question, "yes")
+        protocol.mark_answer_read(channel, question)
+    # Six files, two entries. Counting files, the channel is already over the cap.
+    assert len(list(channel.iterdir())) == 6
+
+    third = protocol.post_question(channel, "the entry a file count would refuse")
+    protocol.close_question(channel, third, reason="stopped waiting")
+
+    assert len(list(channel.iterdir())) == 8
+    with pytest.raises(AskError, match=r"holds 3 entries, which is the limit"):
+        protocol.post_question(channel, "one too many")
+    with pytest.raises(AskError, match=r"holds 3 entries, which is the limit"):
+        protocol.post_note(channel, "and no notes either")
+
+
 def test_an_unwritable_channel_reads_as_no_channel(channel):
     """What a uid mismatch across the bind mount looks like from inside.
 

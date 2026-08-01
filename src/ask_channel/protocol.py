@@ -240,6 +240,11 @@ _SIGNAL_SUFFIXES = {SIGNAL_SUFFIX: KIND_SIGNAL}
 #: second time.
 _ENTRY_SUFFIXES = (*_OPERATOR_SUFFIXES, *_SIGNAL_SUFFIXES)
 
+#: Every suffix this module writes: the entries and the files filed under them.
+#: What id allocation scans, and the default for :func:`_entry_parts` — a caller
+#: that means the narrower set names it.
+_ALL_SUFFIXES = (*_ENTRY_SUFFIXES, *_SIDECAR_SUFFIXES)
+
 #: Ceilings. A question is a sentence an operator reads on a phone, an answer is
 #: a sentence they type on one; these are far above either. They exist so a
 #: runaway agent pasting a log file into a question cannot fill the state dir,
@@ -507,13 +512,20 @@ def resolve_channel_dir(
     return directory
 
 
-def _entry_parts(name: str) -> Optional[tuple]:
+def _entry_parts(name: str, suffixes: Iterable = _ALL_SUFFIXES) -> Optional[tuple]:
     """Split a filename into ``(seq, id, suffix)``, or ``None`` if it is not ours.
 
     Everything else in the directory — temp files, an editor's backup, a stray
     note from an operator poking around — is simply not an entry.
+
+    *suffixes* is which shapes the caller means, and callers disagree: id
+    allocation counts the sidecars too (an id must never be reused), while
+    counting *entries* must not — a healthy question accumulates up to three of
+    them. The default is the wider set, so a caller that says nothing gets the
+    parse that cannot hand out an id twice; a caller that means entries alone
+    passes :data:`_ENTRY_SUFFIXES` and says so.
     """
-    for suffix in (*_ENTRY_SUFFIXES, *_SIDECAR_SUFFIXES):
+    for suffix in suffixes:
         if not name.endswith(suffix):
             continue
         stem = name[: -len(suffix)]
@@ -616,29 +628,37 @@ def _clean_options(options: Optional[Iterable]) -> tuple:
     return tuple(cleaned)
 
 
-def _channel_is_full(directory: Path) -> bool:
-    """Whether the channel already holds as many entries as it will keep.
+def _entry_count(directory: Path) -> int:
+    """How many entries the channel holds — sidecars are not entries.
 
     Notes have no answer to wait for, so nothing else bounds them: an agent
     looping on ``lmer-ask note`` would grow a directory in the platform's state
     dir forever, and the reader would stop showing the old ones anyway
     (:data:`MAX_ENTRIES`). Refusing at the cap turns unbounded growth into a
     visible failure in the session that is causing it.
+
+    Only :data:`_ENTRY_SUFFIXES` are counted, and that is the whole point: an
+    answered-and-read question is three files, so counting files would refuse a
+    session at a third of the cap — and tell it that it was looping, which is a
+    long session's ordinary shape rather than a fault (issue #191). The cap is on
+    what a session *posted*; the files a question accumulates afterwards are the
+    channel working.
     """
     try:
         names = os.listdir(directory)
     except OSError:
-        return False
-    return sum(1 for name in names if _entry_parts(name) is not None) >= MAX_ENTRIES
+        return 0
+    return sum(1 for name in names if _entry_parts(name, _ENTRY_SUFFIXES) is not None)
 
 
 def _post(directory: Path, kind: str, payload: dict, suffix: str) -> Entry:
     """Allocate an id and land *payload* under it. Shared by question and note."""
-    if _channel_is_full(directory):
+    held = _entry_count(directory)
+    if held >= MAX_ENTRIES:
         raise AskError(
-            f"this channel already holds {MAX_ENTRIES} entries, which is the "
-            "limit — a session posting this much is looping, and the operator "
-            "stopped reading long ago"
+            f"this channel already holds {held} entries, which is the limit "
+            f"({MAX_ENTRIES}) — a session posting this much is looping, and the "
+            "operator stopped reading long ago"
         )
     last_error: Optional[Exception] = None
     for _ in range(_ALLOCATE_ATTEMPTS):
