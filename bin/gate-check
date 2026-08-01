@@ -19,26 +19,39 @@ except ImportError:  # run-state wiring must never break a gate
     def emit_gate_event(gate, outcome, **kwargs):
         pass
 
+try:
+    from lmer_cli.gate_lock import hold_gate_lock
+except ImportError:  # lock wiring must never break a gate, like receipts
+    from contextlib import contextmanager
+
+    @contextmanager
+    def hold_gate_lock(label):
+        yield
+
 
 def main() -> int:
     verbose = '-v' in sys.argv or '--verbose' in sys.argv
     debug = '--debug' in sys.argv
     started = time.monotonic()
-    gate = GateSystem(verbose=verbose, debug=debug)
-    rc = commit_gate(verbose=verbose, debug=debug, gate=gate)
-    try:
-        # Receipt assembly AND append are fail-soft: no receipt problem may
-        # ever change the gate's exit code.
-        emit_gate_event(
-            "gate-check",
-            "pass" if rc == 0 else "fail",
-            exit_code=rc,
-            duration_s=time.monotonic() - started,
-            summary=gate.receipt_summary(),
-            argv=receipt_argv(),
-        )
-    except Exception:
-        pass
+    # The marker covers the WHOLE command, receipt included (issue #201): a
+    # work-repo commit landing anywhere in this window would move tracked
+    # files under the running suite and fail its /work isolation guard.
+    with hold_gate_lock("gate-check"):
+        gate = GateSystem(verbose=verbose, debug=debug)
+        rc = commit_gate(verbose=verbose, debug=debug, gate=gate)
+        try:
+            # Receipt assembly AND append are fail-soft: no receipt problem may
+            # ever change the gate's exit code.
+            emit_gate_event(
+                "gate-check",
+                "pass" if rc == 0 else "fail",
+                exit_code=rc,
+                duration_s=time.monotonic() - started,
+                summary=gate.receipt_summary(),
+                argv=receipt_argv(),
+            )
+        except Exception:
+            pass
     return rc
 
 

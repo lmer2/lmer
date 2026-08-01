@@ -1,0 +1,5 @@
+fixed:
+- "Gating in the background no longer fails when the session yields mid-run: gate commands hold an in-flight marker, work-repo commits defer while one is live (recorded as a `commit_deferred` event and flushed by the commit that finally lands), and the run-state Stop hook stops mandating work-repo writes for that window (#201)"
+- "The /work isolation guard now names a concurrent writer as the cause when the work repo's HEAD moved during a run, instead of pointing only at LMER_* env isolation (#201)"
+added:
+- "`LMER_GATE_INFLIGHT_GUARD` kill switch and `LMER_GATE_LOCK_DIR` override for gate-in-flight coordination"

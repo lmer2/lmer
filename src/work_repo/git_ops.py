@@ -1,5 +1,6 @@
 """Git operations for work repository."""
 
+import json
 import os
 import re
 import subprocess
@@ -16,11 +17,26 @@ from urllib.parse import quote, urlsplit
 # same way.
 from lmer_cli.tokens import _is_github_host
 
-from .run_state import run_rel_path_candidates
+# The gate-in-flight marker (issue #201). Same reasoning as the token import
+# above: the decision "is a long gate running right now?" has exactly one
+# definition, and a second copy here would drift from the gates that write it.
+from lmer_cli import gate_lock
+
+from .run_state import append_event, run_dir, run_rel_path_candidates
 from .specs_index import specs_rel_path
 from .utils import sanitize_task_target
 
 PUSH_RETRIES = 3
+
+#: Where a deferred commit parks its trace until a commit can actually land
+#: (issue #201). It lives beside the gate markers in /tmp, NOT in the run dir,
+#: because writing the trace into the work repo is the very thing the deferral
+#: exists to avoid: appending to a currently-clean tracked file adds a porcelain
+#: entry, and the running suite's leak guard would report it as an appearance —
+#: the same failure in a new costume. Flushed into ``events.jsonl`` by the next
+#: commit that is allowed to proceed, so the trace lands *with* the commit that
+#: resolves it and is pushed where the reviewer can see it.
+DEFERRAL_QUEUE_NAME = "deferred-commits.jsonl"
 
 # Outcomes of :func:`claim_push_once` — the claim-by-push compare-and-swap
 # leg (docs/RUN-STATE.md §7). String constants rather than an enum so the
@@ -334,7 +350,137 @@ def stageable_paths(work_repo_path: Path, paths: list[str]) -> list[str]:
     ]
 
 
-def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
+def _deferral_queue_path() -> Path:
+    """The parked-deferrals file, beside the gate markers it belongs to."""
+    return gate_lock.lock_dir() / DEFERRAL_QUEUE_NAME
+
+
+def _current_run_dir() -> Optional[Path]:
+    """The run dir, or None — a broken/absent run must never break a commit."""
+    try:
+        return run_dir()
+    except Exception:
+        return None
+
+
+def _queue_deferral(rdir: Optional[Path], marker: dict, paths: list[str]) -> None:
+    """Park one deferral record for the next commit to flush. Fail-soft.
+
+    A deferral that left no trace would be a lie of omission: the caller was
+    told "0" and its files are still only on disk. The record carries which
+    gate caused it and what was not committed, so the flushed event answers
+    both questions the reviewer will have.
+    """
+    if rdir is None:
+        return
+    try:
+        record = {
+            "run_dir": str(rdir),
+            "gate": marker.get("gate"),
+            "pid": marker.get("pid"),
+            "started_at": marker.get("started_at"),
+            "paths": list(paths),
+        }
+        path = _deferral_queue_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _flush_deferrals(rdir: Optional[Path]) -> int:
+    """Append parked deferrals for *rdir* as `commit_deferred` events.
+
+    Called on the way into a commit that is *allowed* to proceed, so the events
+    are staged by that same commit and reach the work repo with it. Records for
+    other run dirs are kept for their own runs. Fail-soft; returns how many
+    events were written so the caller can say so.
+    """
+    if rdir is None:
+        return 0
+    path = _deferral_queue_path()
+    try:
+        if not path.exists():
+            return 0
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+    mine: list[dict] = []
+    others: list[str] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue  # torn line — drop it rather than replay it forever
+        if isinstance(record, dict) and record.get("run_dir") == str(rdir):
+            mine.append(record)
+        else:
+            others.append(line)
+
+    if not mine:
+        return 0
+
+    written = 0
+    for record in mine:
+        try:
+            gate = record.get("gate") or "a gate"
+            append_event(
+                rdir,
+                "commit_deferred",
+                note=f"work-repo commit deferred while {gate} was in flight",
+                data={
+                    "gate": gate,
+                    "pid": record.get("pid"),
+                    "paths": record.get("paths") or [],
+                },
+            )
+            written += 1
+        except (OSError, ValueError, TypeError):
+            break  # leave the rest parked rather than losing them
+
+    try:
+        if written >= len(mine) and not others:
+            path.unlink()
+        else:
+            remaining = others + [
+                json.dumps(r, ensure_ascii=False) for r in mine[written:]
+            ]
+            path.write_text(
+                "\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8"
+            )
+    except (OSError, ValueError, TypeError):
+        pass
+    return written
+
+
+def _report_deferral(marker: dict, paths: list[str]) -> None:
+    """Tell the session, in the moment, why nothing was committed."""
+    print(f"⏸️  Work-repo commit deferred: {gate_lock.describe_marker(marker)}")
+    print(
+        "   Committing now would move tracked files under the running gate and "
+        "fail its /work isolation guard (issue #201)."
+    )
+    print(f"   Left on disk, uncommitted: {', '.join(paths)}")
+    print(
+        "   Run `work commit` once the gate finishes — the stop hook will not "
+        "let the session end until it lands."
+    )
+    print(
+        "   While a gate runs, avoid other work-repo writes too (`work log`, "
+        "`work event`): the file changes alone can trip the same guard."
+    )
+
+
+def commit_work_path(
+    target_path,
+    commit_message: Optional[str] = None,
+    allow_during_gate: bool = False,
+) -> int:
     """
     Sync one or more paths in the work repo: add -> commit -> rebase -> push.
 
@@ -361,9 +507,17 @@ def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
             staged and the move lands as a move, not a duplicate.
         commit_message: Optional commit message (defaults to auto-generated
             from the first path).
+        allow_during_gate: Commit even while a gate holds the in-flight marker
+            (issue #201). Two callers set it, both deliberately: the release
+            CAS claim path (arbitration, not durability — deferring it would
+            wedge a release) and ``work session-end`` (the session and its
+            container are going away, so the gate whose window we would be
+            protecting is being torn down with them; durability wins).
 
     Returns:
-        Exit code (0 for success, non-zero for failure)
+        Exit code (0 for success, non-zero for failure). A deferral is 0 — it
+        is not a failure — but it leaves a ``commit_deferred`` trace behind
+        rather than passing silently as success.
     """
     work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
 
@@ -376,6 +530,35 @@ def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
     if not paths:
         print("✅ No existing paths to commit in work repository")
         return 0
+
+    # 0. Gate-in-flight check (issue #201), BEFORE any git write. A gate leaves
+    # the run dir dirty via its own receipt, which arms the stop hook, whose
+    # mandated commit then sweeps tracked files out from under the running
+    # suite and fails its /work isolation guard. Deferring here covers every
+    # durability push — `work commit` and the implicit ones behind `work state
+    # set` / `goal` / `artifact` / `ledger set` — not just the one path that
+    # happened to bite first.
+    marker = None if allow_during_gate else gate_lock.active_gate()
+    if marker is not None:
+        # Read-only: a run whose paths are already clean has nothing to defer,
+        # so it must not print a deferral for a no-op commit.
+        rc, pending = run_git_command(
+            ["status", "--porcelain", "--", *paths], work_repo_path, check=False
+        )
+        if rc != 0 or not pending.strip():
+            return 0
+        _report_deferral(marker, paths)
+        _queue_deferral(_current_run_dir(), marker, paths)
+        return 0
+
+    # Parked deferrals land as events now, so this commit carries the trace of
+    # the commits it is standing in for.
+    flushed = _flush_deferrals(_current_run_dir())
+    if flushed:
+        print(
+            f"↩️  Recording {flushed} commit deferred during a gate window "
+            "(issue #201); this commit carries the trace."
+        )
 
     # 1. Stage first — committing before any pull keeps the tree clean for
     # the rebase below (a dirty tree makes `git pull` refuse outright).

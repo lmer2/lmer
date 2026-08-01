@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 import pytest
 
-from lmer_cli import user_harnesses
+from lmer_cli import gate_lock, user_harnesses
 
 
 #: Set on any host that is expected to be able to run the tests which *execute*
@@ -26,7 +26,13 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 #: LMER_* vars :func:`strip_lmer_env` leaves alone: switches that tell the *test
 #: harness* how strict to be, which are not run context. Stripping one would let
 #: any module that isolates its environment silently disarm a guard.
-_HARNESS_ENV = frozenset({REQUIRE_NODE_ENV})
+#:
+#: ``LMER_GATE_LOCK_DIR`` is here for exactly that reason (issue #201): the
+#: session fixture below points it at a tmp dir so the suite cannot see the
+#: marker held by the very `gate-check` running it. Stripping it would send any
+#: env-isolating module back to the operational lock dir, where a live gate
+#: would defer the commit paths those tests are asserting on.
+_HARNESS_ENV = frozenset({REQUIRE_NODE_ENV, gate_lock.LOCK_DIR_ENV})
 
 
 def strip_lmer_env(monkeypatch):
@@ -213,6 +219,116 @@ def _work_repo_status_lines(work_repo_path):
     )
 
 
+def _work_repo_head(work_repo_path):
+    """The work repo's HEAD sha, or None when it cannot be read.
+
+    Snapshotted alongside the porcelain status so the guard can tell its two
+    causes apart (issue #201): a HEAD that moved during the run means a
+    CONCURRENT WRITER committed — a `work commit` landing inside the gate's
+    window — while a HEAD that stayed put with entries appearing points at the
+    suite itself. None simply drops the extra diagnosis; no toplevel check is
+    needed here because the guard consults this only once the status snapshot
+    has already established a real work repo at this path.
+    """
+    work_repo = Path(work_repo_path)
+    if not work_repo.is_dir():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(work_repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def work_repo_drift_report(
+    work_repo_path, appeared, vanished, head_before=None, head_after=None
+):
+    """The leak guard's failure text, or None when nothing drifted.
+
+    Pure assembly, kept out of the fixture so the message itself is testable —
+    it is the part a person actually reads at 2am, and it used to send them to
+    `LMER_*` env isolation and issue #93 for a cause that was neither.
+    """
+    if not appeared and not vanished:
+        return None
+    sections = []
+    if appeared:
+        sections.append("appeared:\n" + "\n".join(f"  {line}" for line in appeared))
+    if vanished:
+        sections.append(
+            "vanished (deleted, or swept into a commit):\n"
+            + "\n".join(f"  {line}" for line in vanished)
+        )
+    report = (
+        f"Test suite leaked into or altered the operational work repo ({work_repo_path}):\n"
+        + "\n".join(sections)
+    )
+    moved = bool(head_before and head_after and head_before != head_after)
+    if moved:
+        report += (
+            f"\n\nHEAD MOVED during this run ({head_before[:8]} -> {head_after[:8]}): "
+            "a concurrent writer COMMITTED while the suite was running. That is "
+            "issue #201 — the session's own `work commit` (or an implicit push "
+            "behind `work state set` / `goal` / `artifact`) landing inside a "
+            "background gate's window — and not test leakage, so the LMER_* env "
+            "isolation below is the wrong end to start from.\n"
+            "Gate commands hold an in-flight marker (lmer_cli.gate_lock) and "
+            "every work-repo durability commit defers while one is live, so this "
+            "is supposed to be impossible: seeing it means THE DEFERRAL BROKE — a "
+            "marker never written, one that expired early, or a write path that "
+            "does not route through the check in "
+            "work_repo.git_ops.commit_work_path. Chase that, not the tests."
+        )
+    elif appeared:
+        report += (
+            "\n\nHEAD did not move, so nothing was committed underneath the run. "
+            "Entries can still appear without a commit: a plain work-repo write "
+            "during the run (`work log`, `work event`) dirties a tracked file and "
+            "shows up here (issue #201 — commits defer around a gate, bare writes "
+            "do not)."
+        )
+    report += (
+        "\nTests reaching the `work` CLI must isolate LMER_* env "
+        "(see issue #93 and the _clean_lmer_env fixtures) — or a "
+        "concurrent writer changed the work repo mid-run."
+    )
+    return report
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_gate_lock_dir(tmp_path_factory):
+    """Point gate-in-flight markers away from the operational lock dir (#201).
+
+    `gate-check` holds a marker for its whole run — and the suite runs *inside*
+    it. Without this, every test that exercises a work-repo commit path would
+    see a live gate and defer instead of committing, i.e. the suite could only
+    pass when nobody was gating it. Same floor-beneath-the-fixtures role as
+    `_isolate_platform_state`; tests that want to see a marker write their own
+    into this dir.
+
+    BOTH the env var and the module default are redirected, and the second one
+    is what actually holds: a test isolating its environment with
+    `patch.dict(os.environ, …, clear=True)` drops the variable and would fall
+    back to the operational `/tmp` dir — which is exactly how this fixture was
+    first found wanting, by a napkin-commit test that deferred instead of
+    staging while the gate ran it.
+    """
+    directory = str(tmp_path_factory.mktemp("gate-locks"))
+    original_default = gate_lock.DEFAULT_LOCK_DIR
+    gate_lock.DEFAULT_LOCK_DIR = directory
+    os.environ[gate_lock.LOCK_DIR_ENV] = directory
+    yield
+    gate_lock.DEFAULT_LOCK_DIR = original_default
+    os.environ.pop(gate_lock.LOCK_DIR_ENV, None)
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _work_repo_leak_guard():
     """Fail the suite if tests leak run-state into the real work repo.
@@ -228,6 +344,7 @@ def _work_repo_leak_guard():
     """
     work_repo_path = os.environ.get("LMER_WORK_REPO_PATH", "/work")
     before = _work_repo_status_lines(work_repo_path)
+    head_before = _work_repo_head(work_repo_path)
     yield
     if before is None:
         return
@@ -239,27 +356,15 @@ def _work_repo_leak_guard():
             "deleted or broke it (issue #93).",
             pytrace=False,
         )
-    appeared = sorted(after - before)
-    vanished = sorted(before - after)
-    if appeared or vanished:
-        sections = []
-        if appeared:
-            sections.append(
-                "appeared:\n" + "\n".join(f"  {line}" for line in appeared)
-            )
-        if vanished:
-            sections.append(
-                "vanished (deleted, or swept into a commit):\n"
-                + "\n".join(f"  {line}" for line in vanished)
-            )
-        pytest.fail(
-            f"Test suite leaked into or altered the operational work repo ({work_repo_path}):\n"
-            + "\n".join(sections)
-            + "\nTests reaching the `work` CLI must isolate LMER_* env "
-            "(see issue #93 and the _clean_lmer_env fixtures) — or a "
-            "concurrent writer changed the work repo mid-run.",
-            pytrace=False,
-        )
+    report = work_repo_drift_report(
+        work_repo_path,
+        sorted(after - before),
+        sorted(before - after),
+        head_before,
+        _work_repo_head(work_repo_path),
+    )
+    if report:
+        pytest.fail(report, pytrace=False)
 
 
 @pytest.fixture(autouse=True, scope="session")

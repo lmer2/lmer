@@ -2505,6 +2505,14 @@ def main(argv: list[str] | None = None) -> int:
         # together a session can answer "what code am I actually running?".
         "LMER_SOURCE_COMMIT": checkout_commit(repo_root_path()),
         "LMER_RUN_STATE_GUARD": os.environ.get("LMER_RUN_STATE_GUARD"),
+        # Gate-in-flight coordination (issue #201): the kill switch for the
+        # work-repo commit deferral and the Stop hook's matching nudge
+        # suppression, and the marker directory both sides read. Both must
+        # cross into the container — the gates, the work CLI and the hook all
+        # run there, and a host-side value that stopped at the boundary would
+        # silently leave the deferral on.
+        "LMER_GATE_INFLIGHT_GUARD": os.environ.get("LMER_GATE_INFLIGHT_GUARD"),
+        "LMER_GATE_LOCK_DIR": os.environ.get("LMER_GATE_LOCK_DIR"),
         # Opt-in to the masterplan workflow. Truthy (get_bool_env) turns on the
         # session-start plugin provisioning in claude-runner.sh; LMER_TASK=masterplan
         # implies it. MASTERPLAN_RUNS_DIR is computed in-container from the run
