@@ -67,6 +67,20 @@ def isolate_dm_allowlist(monkeypatch):
     monkeypatch.setattr(listener, "DM_ALLOWED_USERS", set())
 
 
+@pytest.fixture(autouse=True)
+def isolate_preset_selectors(monkeypatch):
+    """Isolate the listener-wide preset default from the ambient environment.
+
+    ``LMER_CHAT_PRESET`` / ``LMER_PRESET`` select a preset for every session
+    the listener spawns (issue #181), so the connect ack names them. When the
+    suite runs inside a live listener-spawned session either may be set, which
+    would add a preset clause to acks these tests assert on. Clear both; the
+    tests that exercise the default set it explicitly.
+    """
+    monkeypatch.delenv("LMER_CHAT_PRESET", raising=False)
+    monkeypatch.delenv("LMER_PRESET", raising=False)
+
+
 class TestCsvEnvSet:
     def test_unset_is_empty(self, monkeypatch):
         monkeypatch.delenv("LMER_SLACK_DM_ALLOWED_USERS", raising=False)
@@ -844,6 +858,122 @@ class TestPresetSelection:
             dedup_channel=True,
             preset_name="my_service",
         )
+
+
+class TestListenerWideDefaultInAck:
+    """The connect ack names whichever preset the session actually gets
+    (issue #181).
+
+    ``LMER_CHAT_PRESET`` in the listener's environment applies to every session
+    it spawns. Both the honoured case and the displaced case are invisible from
+    Slack unless the ack says so, and the person who needs to know is the one
+    who just typed the message — not whoever later reads
+    ``lmer_session_spawned``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_default_alone_is_named(self, manager, slack_app, monkeypatch):
+        """The silently-honoured case: no token, but a preset still applies."""
+        monkeypatch.setattr(
+            listener, "PRESETS", {"wide": Preset(name="wide", checkout="/co")}
+        )
+        monkeypatch.setenv("LMER_CHAT_PRESET", "wide")
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        text = say.await_args.kwargs["text"]
+        assert "listener default preset `wide`" in text
+        assert "`LMER_CHAT_PRESET`" in text
+
+    @pytest.mark.asyncio
+    async def test_token_says_it_replaced_the_default(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listener,
+            "PRESETS",
+            {
+                "wide": Preset(name="wide", checkout="/wide"),
+                "chosen": Preset(name="chosen", checkout="/chosen"),
+            },
+        )
+        monkeypatch.setenv("LMER_CHAT_PRESET", "wide")
+        say = AsyncMock()
+
+        await listener._connect_lmer_session(
+            "C1", "111.222", say, preset_name="chosen"
+        )
+
+        text = say.await_args.kwargs["text"]
+        assert "using preset `chosen`" in text
+        assert "replacing the listener default `wide`" in text, (
+            "a token that displaced a default must say so — otherwise the "
+            "operator's default silently vanishes for that session"
+        )
+
+    @pytest.mark.asyncio
+    async def test_token_matching_the_default_is_not_called_a_replacement(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listener, "PRESETS", {"wide": Preset(name="wide", checkout="/wide")}
+        )
+        monkeypatch.setenv("LMER_CHAT_PRESET", "wide")
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say, preset_name="wide")
+
+        text = say.await_args.kwargs["text"]
+        assert "using preset `wide`" in text
+        assert "replacing" not in text
+
+    @pytest.mark.asyncio
+    async def test_no_preset_anywhere_keeps_the_plain_ack(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(listener, "PRESETS", {})
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        text = say.await_args.kwargs["text"]
+        assert "preset" not in text
+
+    @pytest.mark.asyncio
+    async def test_generic_var_is_named_as_its_own_source(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(
+            listener, "PRESETS", {"wide": Preset(name="wide", checkout="/co")}
+        )
+        monkeypatch.setenv("LMER_PRESET", "wide")
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        assert "`LMER_PRESET`" in say.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_undefined_default_warns_but_still_spawns(
+        self, manager, slack_app, monkeypatch
+    ):
+        """An operator misconfiguration, not a user error: the child CLI exits
+        2 on an unknown preset, so the session dies moments after the ack. Say
+        why in the thread rather than only in the listener's log."""
+        monkeypatch.setattr(
+            listener, "PRESETS", {"real": Preset(name="real", checkout="/co")}
+        )
+        monkeypatch.setenv("LMER_CHAT_PRESET", "typo")
+        say = AsyncMock()
+
+        await listener._connect_lmer_session("C1", "111.222", say)
+
+        manager.spawn.assert_awaited_once()
+        text = say.await_args.kwargs["text"]
+        assert "`typo`" in text
+        assert "is not defined" in text
+        assert "real" in text, "the warning lists what is actually available"
 
 
 class TestMainLmerEnvFile:

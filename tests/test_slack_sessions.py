@@ -1,6 +1,7 @@
 """Tests for slack_chat.sessions (lmer chat session lifecycle)."""
 
 import asyncio
+import json
 import os
 import stat
 import time
@@ -9,8 +10,14 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from lmer_cli.presets import Preset
-from slack_chat.sessions import Session, SessionManager, _env_int
+from lmer_cli.presets import Preset, select_preset_name
+from slack_chat.sessions import (
+    CHAT_TASK_ID,
+    Session,
+    SessionManager,
+    _env_int,
+    listener_default_preset,
+)
 
 
 def _fake_session(
@@ -430,49 +437,56 @@ class TestReap:
 PERMALINK = "https://x.slack.com/archives/C1/p1112220000000000"
 
 
+@pytest.fixture
+def captured(monkeypatch):
+    """Patch the subprocess spawn and PTY drain; capture the exec call.
+
+    The real ``lmer`` is never launched - we only assert on how spawn()
+    builds the command and environment.
+    """
+    import slack_chat.sessions as sessions_mod
+
+    calls: dict = {}
+
+    class _StubProc:
+        returncode = None
+        pid = 4242
+
+        async def wait(self):
+            return 0
+
+    async def fake_exec(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return _StubProc()
+
+    async def noop_drain(self, session):
+        return None
+
+    monkeypatch.setattr(sessions_mod.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(SessionManager, "_drain", noop_drain)
+    return calls
+
+
+@pytest.fixture
+def spawn_manager(tmp_path: Path) -> SessionManager:
+    """A SessionManager whose spawns are captured rather than executed."""
+    return SessionManager(
+        idle_timeout_minutes=30,
+        max_sessions=5,
+        lmer_bin="lmer",
+        spawn_cwd=str(tmp_path / "cwd"),
+        log_dir=str(tmp_path / "logs"),
+    )
+
+
 class TestSpawnWithPreset:
     """spawn() layers a preset's checkout/service/args onto the command and
     merges its env, without a preset producing the plain repo-less command."""
 
     @pytest.fixture
-    def captured(self, monkeypatch):
-        """Patch the subprocess spawn and PTY drain; capture the exec call.
-
-        The real ``lmer`` is never launched - we only assert on how spawn()
-        builds the command and environment.
-        """
-        import slack_chat.sessions as sessions_mod
-
-        calls: dict = {}
-
-        class _StubProc:
-            returncode = None
-            pid = 4242
-
-            async def wait(self):
-                return 0
-
-        async def fake_exec(*args, **kwargs):
-            calls["args"] = args
-            calls["kwargs"] = kwargs
-            return _StubProc()
-
-        async def noop_drain(self, session):
-            return None
-
-        monkeypatch.setattr(sessions_mod.asyncio, "create_subprocess_exec", fake_exec)
-        monkeypatch.setattr(SessionManager, "_drain", noop_drain)
-        return calls
-
-    @pytest.fixture
-    def manager(self, tmp_path: Path) -> SessionManager:
-        return SessionManager(
-            idle_timeout_minutes=30,
-            max_sessions=5,
-            lmer_bin="lmer",
-            spawn_cwd=str(tmp_path / "cwd"),
-            log_dir=str(tmp_path / "logs"),
-        )
+    def manager(self, spawn_manager: SessionManager) -> SessionManager:
+        return spawn_manager
 
     @pytest.mark.asyncio
     async def test_no_preset_is_plain_command(self, manager, captured):
@@ -529,3 +543,175 @@ class TestSpawnWithPreset:
         os.close(session.master_fd)
 
         assert captured["kwargs"]["env"]["LMER_LLM_NAME"] == "opus"
+
+
+class TestTokenPresetDisplacesListenerDefault:
+    """A ``$preset:`` token replaces the listener-wide default outright
+    (issue #181).
+
+    The listener spawns ``lmer chat``, so ``LMER_CHAT_PRESET`` in its
+    environment selects a preset for every session it starts. That default is
+    supported, but it must not *stack* with a token-selected one: before this,
+    the token's env won conflicts while the default silently filled every gap,
+    leaving two presets in play under two different merge rules and nothing
+    saying so.
+    """
+
+    @pytest.fixture
+    def manager(self, spawn_manager: SessionManager) -> SessionManager:
+        return spawn_manager
+
+    @pytest.mark.asyncio
+    async def test_token_preset_strips_every_selector(
+        self, manager, captured, monkeypatch
+    ):
+        """Both selectors go, so the child resolves no preset of its own."""
+        monkeypatch.setenv("LMER_CHAT_PRESET", "listener-wide")
+        monkeypatch.setenv("LMER_PRESET", "operator-choice")
+        session = await manager.spawn(
+            "C1", "1.1", PERMALINK, preset=Preset(name="from-token")
+        )
+        os.close(session.master_fd)
+
+        child_env = captured["kwargs"]["env"]
+        assert "LMER_CHAT_PRESET" not in child_env
+        assert "LMER_PRESET" not in child_env
+        assert select_preset_name(None, CHAT_TASK_ID, child_env) == (None, None), (
+            "with a token in play the child must resolve no preset at all"
+        )
+
+    @pytest.mark.asyncio
+    async def test_displacement_is_total_not_a_merge(
+        self, manager, captured, monkeypatch, tmp_path
+    ):
+        """The default's keys are not inherited where the token's preset
+        leaves them unset.
+
+        This is the test that fails if someone later "helpfully" turns
+        displacement back into a merge. The listener-wide default is a *real*
+        preset in a real presets file, and the two deliberately differ in keys
+        the token's preset does not set (``LMER_CHECKOUT_BRANCH``,
+        ``LMER_REASONING_EFFORT``) — so an implementation that loaded the
+        default and filled the gaps would visibly pass those through.
+        """
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(
+            json.dumps(
+                {
+                    "listener-wide": {
+                        "env": {
+                            "LMER_CHECKOUT_BRANCH": "listener-branch",
+                            "LMER_REASONING_EFFORT": "high",
+                            "LMER_LLM_NAME": "sonnet",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("LMER_PRESETS_FILE", str(presets_file))
+        monkeypatch.setenv("LMER_CHAT_PRESET", "listener-wide")
+        monkeypatch.delenv("LMER_CHECKOUT_BRANCH", raising=False)
+        monkeypatch.delenv("LMER_REASONING_EFFORT", raising=False)
+        # The token's preset sets LLM_NAME only; the listener-wide default
+        # would have contributed a branch and an effort on top of it.
+        token_preset = Preset(name="from-token", env={"LMER_LLM_NAME": "opus"})
+        session = await manager.spawn("C1", "1.1", PERMALINK, preset=token_preset)
+        os.close(session.master_fd)
+
+        child_env = captured["kwargs"]["env"]
+        assert child_env["LMER_LLM_NAME"] == "opus", "the token's preset applies"
+        assert "LMER_CHECKOUT_BRANCH" not in child_env, (
+            "the displaced default must not fill a key the token's preset "
+            "leaves unset — displacement is total, not a merge"
+        )
+        assert "LMER_REASONING_EFFORT" not in child_env
+        assert "LMER_CHAT_PRESET" not in child_env, (
+            "and the child must not be able to load the default itself"
+        )
+
+    @pytest.mark.asyncio
+    async def test_preset_env_may_set_a_selector_for_the_child(
+        self, manager, captured, monkeypatch
+    ):
+        """Stripping runs before the preset's own env, so an operator who
+        deliberately chains a default from a preset still gets it."""
+        monkeypatch.setenv("LMER_CHAT_PRESET", "listener-wide")
+        preset = Preset(name="from-token", env={"LMER_CHAT_PRESET": "chained"})
+        session = await manager.spawn("C1", "1.1", PERMALINK, preset=preset)
+        os.close(session.master_fd)
+
+        assert captured["kwargs"]["env"]["LMER_CHAT_PRESET"] == "chained"
+
+    @pytest.mark.asyncio
+    async def test_no_token_keeps_the_listener_wide_default(
+        self, manager, captured, monkeypatch
+    ):
+        """With no token the default is untouched — the child applies it."""
+        monkeypatch.setenv("LMER_CHAT_PRESET", "listener-wide")
+        session = await manager.spawn("C1", "1.1", PERMALINK)
+        os.close(session.master_fd)
+
+        child_env = captured["kwargs"]["env"]
+        assert child_env["LMER_CHAT_PRESET"] == "listener-wide"
+        assert select_preset_name(None, CHAT_TASK_ID, child_env) == (
+            "listener-wide",
+            "LMER_CHAT_PRESET",
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_log_names_the_displaced_default(
+        self, manager, captured, monkeypatch, caplog
+    ):
+        """A spawn log may never hide a second preset."""
+        monkeypatch.setenv("LMER_CHAT_PRESET", "listener-wide")
+        with caplog.at_level("INFO", logger="lmer_slack.sessions"):
+            session = await manager.spawn(
+                "C1", "1.1", PERMALINK, preset=Preset(name="from-token")
+            )
+        os.close(session.master_fd)
+
+        line = next(
+            r.getMessage() for r in caplog.records if "lmer_session_spawned" in r.getMessage()
+        )
+        assert "preset=from-token" in line
+        assert "displaced_default=listener-wide(LMER_CHAT_PRESET)" in line
+
+    @pytest.mark.asyncio
+    async def test_spawn_log_names_an_applying_default(
+        self, manager, captured, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("LMER_CHAT_PRESET", "listener-wide")
+        with caplog.at_level("INFO", logger="lmer_slack.sessions"):
+            session = await manager.spawn("C1", "1.1", PERMALINK)
+        os.close(session.master_fd)
+
+        line = next(
+            r.getMessage() for r in caplog.records if "lmer_session_spawned" in r.getMessage()
+        )
+        assert "preset=-" in line
+        assert "default_preset=listener-wide(LMER_CHAT_PRESET)" in line
+
+
+class TestListenerDefaultPreset:
+    """The listener-wide default resolver (issue #181)."""
+
+    def test_scoped_var_wins_over_generic(self):
+        assert listener_default_preset(
+            {"LMER_CHAT_PRESET": "scoped", "LMER_PRESET": "generic"}
+        ) == ("scoped", "LMER_CHAT_PRESET"), (
+            "LMER_CHAT_PRESET outranking an exported LMER_PRESET is the #140 "
+            "specificity rule, not a bug — pin it so it is not 'fixed' away"
+        )
+
+    def test_generic_alone_still_selects(self):
+        assert listener_default_preset({"LMER_PRESET": "generic"}) == (
+            "generic",
+            "LMER_PRESET",
+        )
+
+    def test_nothing_selected(self):
+        assert listener_default_preset({}) == (None, None)
+
+    def test_blank_value_is_unset(self):
+        assert listener_default_preset({"LMER_CHAT_PRESET": "  "}) == (None, None)

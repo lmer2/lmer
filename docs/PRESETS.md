@@ -11,7 +11,7 @@ any single spawner. Current consumers:
 
 | Consumer | How a preset is selected | Details |
 |---|---|---|
-| `lmer-slack-listener` (spawns a session per mention/DM) | `$preset:<name>` token in the triggering Slack message | [Slack-selected presets](#slack-selected-presets) |
+| `lmer-slack-listener` (spawns a session per mention/DM) | `$preset:<name>` token in the triggering Slack message, or `LMER_CHAT_PRESET` / `LMER_PRESET` in the listener's own environment as a listener-wide default (a token replaces it) | [Slack-selected presets](#slack-selected-presets) |
 | The `lmer` CLI (direct invocations) | `--preset <name>` flag, `LMER_<TASK>_PRESET` (one taskdef) or `LMER_PRESET` (all) env var | [CLI-selected presets](#cli-selected-presets) |
 | Agent fan-out (`spawn-harness` children, issue #130) | `--agents <name,...>` flag or `LMER_AGENTS` env var at launch | [Fan-out agents](#fan-out-agents---agents--lmer_agents) |
 
@@ -136,6 +136,63 @@ the connecting ack names the applied preset.
   that starts a session.
 
 Listener setup: [Spawning sessions automatically (`lmer-slack-listener`)](./LMER-CLI.md#spawning-sessions-automatically-lmer-slack-listener).
+
+### The listener-wide default (`LMER_CHAT_PRESET`)
+
+The token is not the only selector. Every session the listener spawns is an
+`lmer chat` invocation that inherits the listener's environment, so
+`LMER_CHAT_PRESET` — the [taskdef-scoped
+selector](#per-taskdef-presets-lmer_task_preset) for the `chat` taskdef — in
+the listener's own environment applies a preset to **every** session it
+starts, with no token and nothing in the Slack message. `LMER_PRESET` does the
+same when `LMER_CHAT_PRESET` is unset.
+
+That is a supported way to give a listener deployment a house default (a
+checkout to mount, a model to use) without asking every user to type a token:
+
+```bash
+# in the listener's environment / deployment .env
+LMER_CHAT_PRESET=house_default
+```
+
+**A `$preset:` token displaces the default entirely.** It is a replacement,
+not an overlay: when a token selects a preset, the listener removes every
+preset selector from the spawned session's environment, so the default is
+never loaded. None of its values survive, and none of its keys are inherited
+where the token's preset leaves them unset. (Before issue #181 the two stacked
+under two different rules — the token's `env` won conflicts while the default
+silently filled every gap — which left two presets in play and nothing saying
+so.)
+
+**The ack always names the preset in effect**, so which one applied is never
+something you have to reconstruct from a log:
+
+```
+Connecting a session to this thread using the listener default preset
+`house_default` (from `LMER_CHAT_PRESET`)... ⏳
+
+Connecting a session to this thread using preset `chosen` (replacing the
+listener default `house_default` from `LMER_CHAT_PRESET`)... ⏳
+```
+
+`lmer_session_spawned` records the same pair — `preset=` for the
+token-selected one, plus `default_preset=` or `displaced_default=` for the
+env-selected one.
+
+Two more things worth knowing:
+
+- **`LMER_CHAT_PRESET` outranks an exported `LMER_PRESET`.** This is the
+  [specificity rule](#per-taskdef-presets-lmer_task_preset) doing its job, not
+  a bug: taskdef-scoped selection beats the generic one regardless of where
+  each value came from, exactly as `LMER_REVIEW_PRESET` beats `LMER_PRESET`
+  for `lmer review`. If you want the generic variable to drive the listener,
+  leave `LMER_CHAT_PRESET` unset.
+- **An undefined default is an operator misconfiguration, and it is fatal per
+  session.** Unlike an unknown *token* (rejected before spawning), an unknown
+  default is only discovered by the spawned CLI, which exits 2. The listener
+  therefore warns in the thread — naming the variable and listing the
+  available presets — rather than leaving a session that dies seconds after
+  connecting with the reason buried in the listener's log.
 
 ## CLI-selected presets
 
@@ -338,7 +395,8 @@ contract:
 |---|---|---|
 | **`args`** (and `checkout`/`service` flags) | Appended verbatim to the fixed `lmer chat <permalink>` command, where extra tokens are meaningful | Applied as if typed *before* your own flags, so an explicit flag overrides the preset's value (repeatable flags like `--mount-file` accumulate from both); flags-only, validated up front |
 | **`env`** | Merged over the listener's inherited environment — **the preset wins** on conflict | Defaults only — an **exported environment variable wins** over the preset, while the preset wins over `.env`-file values; applies both host-side and in the container environment, where applied preset entries are forwarded even when the variable has no hardcoded passthrough |
-| **Unknown name** | Thread reply listing the available presets; no session spawns | Exit 2 listing the available presets |
+| **Unknown name** | Thread reply listing the available presets; no session spawns (a token) / a warning in the ack, and the spawned CLI exits 2 (the env-selected default) | Exit 2 listing the available presets |
+| **Two presets selected at once** | Cannot happen: a `$preset:` token [displaces](#the-listener-wide-default-lmer_chat_preset) the env-selected default whole, so exactly one preset is ever in play | Cannot happen: the selectors are a precedence chain (`--preset` > `LMER_<TASK>_PRESET` > `LMER_PRESET`), and the most specific one wins outright |
 
 The env asymmetry is deliberate: a Slack user has no way to express
 per-invocation intent beyond the message text, so the operator's preset is
