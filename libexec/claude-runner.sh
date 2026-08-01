@@ -75,18 +75,42 @@ exit(0 if data.get('project', {}).get('name') in ('lmer', 'lmer-cli') else 1)
         fi
 
         # Point the venv's editable install at /workspace/src first, with
-        # /Agents/global/src as a fallback. The whole runtime (entry-point
-        # scripts AND pytest) now resolves lmer_cli/work_repo/etc. from
-        # the dev checkout — and top-level packages absent from /workspace
-        # (e.g. integrations/, which lives only on certain refs) still
-        # resolve via /Agents/global/src instead of vanishing from sys.path.
-        # The earlier approach prepended /workspace/src to PYTHONPATH only,
-        # leaving entry points and pytest with different views of lmer_cli
-        # when the two trees diverged.
+        # /Agents/global/src as a fallback, so top-level packages absent from
+        # /workspace (e.g. integrations/, which lives only on certain refs)
+        # still resolve via /Agents/global/src instead of vanishing from
+        # sys.path.
         for pth in /Agents/global/.venv/lib/python*/site-packages/__editable__.lmer*.pth; do
             [ -f "$pth" ] && printf '/workspace/src\n/Agents/global/src\n' > "$pth"
         done
         echo "✅ Editable install redirected to /workspace/src (with /Agents/global/src fallback)"
+
+        # The .pth above is NOT sufficient on its own. The container entrypoint
+        # exports PYTHONPATH=/Agents/global/src:…, and PYTHONPATH precedes
+        # site-packages — so it beats the .pth and the operational tree wins
+        # anyway (#198). Prepend the dev checkout, in the same order as the
+        # .pth, so entry-point scripts and pytest share ONE view of
+        # lmer_cli/work_repo/etc. rather than two that disagree when the trees
+        # diverge. (An earlier fix set PYTHONPATH only, with no .pth — that is
+        # what left the two views out of step; both halves together are what
+        # make the dev checkout win consistently.)
+        PYTHONPATH="/workspace/src${PYTHONPATH:+:$PYTHONPATH}"
+        export PYTHONPATH
+
+        # State the resolved path unconditionally. A developer should be able
+        # to CHECK which tree this session imports, at startup, instead of
+        # inferring it from an AttributeError several commands later — which is
+        # how #198 was found. The suite asserts the same invariant
+        # (tests/test_import_provenance.py); this line is what makes it visible
+        # before any test runs.
+        RESOLVED_LMER="$("${LMER_PYTHON:-python3}" -c 'import lmer_cli; print(lmer_cli.__file__)' 2>/dev/null)"
+        if [ -z "$RESOLVED_LMER" ]; then
+            echo "⚠️  lmer_cli is not importable — cannot confirm which tree this session tests"
+        elif [ "${RESOLVED_LMER#/workspace/}" = "$RESOLVED_LMER" ]; then
+            echo "⚠️  lmer_cli resolves to $RESOLVED_LMER — NOT the /workspace checkout"
+            echo "   Tests and tooling here would exercise the operational runtime (#198)"
+        else
+            echo "✅ lmer_cli resolves to $RESOLVED_LMER"
+        fi
 
         # No --add-dir: Claude only sees /workspace (the development checkout)
         EXTRA_ARGS=""

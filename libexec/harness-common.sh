@@ -33,10 +33,13 @@ harness_session_id() {
 }
 
 # ── Self-development mode ──
-# When /workspace IS the lmer repository, export LMER_SELF_DEV=1 and point the
-# venv's editable install at /workspace/src first (with /Agents/global/src as
-# fallback) so the whole runtime — entry-point scripts AND pytest — resolves
-# lmer_cli/work_repo/etc. from the dev checkout. Mirrors claude-runner.sh.
+# When /workspace IS the lmer repository, export LMER_SELF_DEV=1 and make the
+# dev checkout win for every import: point the venv's editable install at
+# /workspace/src first (with /Agents/global/src as fallback) AND prepend
+# /workspace/src to PYTHONPATH, which otherwise beats the .pth outright (#198).
+# Both halves are needed — see the fuller comment in claude-runner.sh. Then
+# state the resolved path so the session can be checked rather than trusted.
+# Mirrors claude-runner.sh.
 harness_detect_self_dev() {
     LMER_SELF_DEV=0
     if [ -f "/workspace/pyproject.toml" ]; then
@@ -52,6 +55,18 @@ exit(0 if data.get('project', {}).get('name') in ('lmer', 'lmer-cli') else 1)
             for pth in /Agents/global/.venv/lib/python*/site-packages/__editable__.lmer*.pth; do
                 [ -f "$pth" ] && printf '/workspace/src\n/Agents/global/src\n' > "$pth"
             done
+            PYTHONPATH="/workspace/src${PYTHONPATH:+:$PYTHONPATH}"
+            export PYTHONPATH
+            local resolved
+            resolved="$("${LMER_PYTHON:-python3}" -c 'import lmer_cli; print(lmer_cli.__file__)' 2>/dev/null)"
+            if [ -z "$resolved" ]; then
+                echo "⚠️  lmer_cli is not importable — cannot confirm which tree this session tests"
+            elif [ "${resolved#/workspace/}" = "$resolved" ]; then
+                echo "⚠️  lmer_cli resolves to $resolved — NOT the /workspace checkout"
+                echo "   Tests and tooling here would exercise the operational runtime (#198)"
+            else
+                echo "✅ lmer_cli resolves to $resolved"
+            fi
         fi
     fi
 }
