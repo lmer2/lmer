@@ -131,13 +131,22 @@ build-container:
   before_script:
     - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
   script:
-    - |
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        docker build -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG} -t ${CI_REGISTRY_IMAGE}:latest -f Containerfile .
-      else
-        docker build -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA} -f Containerfile .
-        docker push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}
-      fi
+    # One build, whatever the pipeline is for. A tag pipeline used to build the
+    # image here, throw it away, and build a second, independently resolved copy
+    # in publish-container to push (#189) — so the released image was not the one
+    # anything had exercised. The commit-tagged image this job pushes is now the
+    # artifact publish-container promotes to :${CI_COMMIT_TAG} and :latest.
+    - docker build -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA} -f Containerfile .
+    - docker push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}
+    - scripts/ci-image.sh digest "${CI_REGISTRY_IMAGE}" "${CI_COMMIT_SHORT_SHA}" SESSION_IMAGE_DIGEST > build.env
+    - cat build.env
+  artifacts:
+    # How the digest reaches publish-container. A dotenv report is the narrowest
+    # carrier for it: it is a variable in the later job rather than a file it has
+    # to find and parse.
+    reports:
+      dotenv: build.env
+    expire_in: 1 week
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
@@ -160,21 +169,30 @@ build-platform-container:
     # "what commit is this?" with. The full SHA, not the short one: the tag says
     # which build this is, the provenance says which commit exactly. BUILD_UID and
     # BUILD_GID are left at their 1000 defaults, as the session image's build does.
+    # One build, whatever the pipeline is for — see build-container for why the
+    # tag pipeline no longer builds a second copy in the publish stage (#189).
+    - docker build --build-arg LMER_BUILD_COMMIT=${CI_COMMIT_SHA}
+        -t ${PLATFORM_IMAGE}:${CI_COMMIT_SHORT_SHA} -f Dockerfile.platform .
     - |
-      if [ -n "$CI_COMMIT_TAG" ]; then
-        docker build --build-arg LMER_BUILD_COMMIT=${CI_COMMIT_SHA} \
-          -t ${PLATFORM_IMAGE}:${CI_COMMIT_TAG} -t ${PLATFORM_IMAGE}:latest \
-          -f Dockerfile.platform .
+      # A merge-request run builds only: it is a check on the Dockerfile, and
+      # nothing consumes a per-branch platform image. Every other run pushes the
+      # commit-tagged image and records the digest the registry stored it as,
+      # which is what publish-platform-container promotes to the release tags.
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        echo "PLATFORM_IMAGE_PUSHED=no" > build.env
       else
-        docker build --build-arg LMER_BUILD_COMMIT=${CI_COMMIT_SHA} \
-          -t ${PLATFORM_IMAGE}:${CI_COMMIT_SHORT_SHA} -f Dockerfile.platform .
-        # A merge-request run builds only: it is a check on the Dockerfile, and
-        # nothing consumes a per-branch platform image. Pushing is the default
-        # branch's job, as it is for the session image.
-        if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
-          docker push ${PLATFORM_IMAGE}:${CI_COMMIT_SHORT_SHA}
-        fi
+        docker push ${PLATFORM_IMAGE}:${CI_COMMIT_SHORT_SHA}
+        echo "PLATFORM_IMAGE_PUSHED=yes" > build.env
+        scripts/ci-image.sh digest "${PLATFORM_IMAGE}" "${CI_COMMIT_SHORT_SHA}" PLATFORM_IMAGE_DIGEST >> build.env
       fi
+      cat build.env
+  artifacts:
+    # See build-container: this is how the digest reaches the publish stage. The
+    # file is written on every path, including the merge-request one that has no
+    # digest to report, because the report is declared unconditionally.
+    reports:
+      dotenv: build.env
+    expire_in: 1 week
   rules:
     # Unlike build-container this also runs on merge requests, because the build
     # *is* the check on Dockerfile.platform — no test can tell whether `npm ci`,
@@ -193,6 +211,14 @@ build-platform-container:
         - README.md
         - LICENSE
         - web/**/*
+        # How the job invokes the recipe, not just the recipe: the build args it
+        # passes, what it pushes and the digest it records. By the same argument
+        # as above — a change here that breaks this job would otherwise first run
+        # after the merge — and it is the argument #189 turned on, so a fix for
+        # "an artifact nobody checked" that itself ships unchecked would be an
+        # odd way to close it.
+        - .gitlab-ci.yml
+        - scripts/ci-image.sh
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
@@ -228,12 +254,20 @@ publish-container:
     # addressing the service as `docker` rather than localhost.
     DOCKER_TLS_CERTDIR: ""
     DOCKER_HOST: "tcp://docker:2375"
+  # Takes the build stage's dotenv (SESSION_IMAGE_DIGEST) and not build-package's
+  # wheel. `dependencies:` rather than `needs:`, deliberately: `needs:` would also
+  # release this job from waiting on the rest of the pipeline, and a release must
+  # not push a container image while pytest is still running.
+  dependencies:
+    - build-container
   before_script:
     - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
   script:
-    - docker build -t ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG} -t ${CI_REGISTRY_IMAGE}:latest -f Containerfile .
-    - docker push ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}
-    - docker push ${CI_REGISTRY_IMAGE}:latest
+    # Promotes the image build-container built and pushed, by digest — it does
+    # not build one. See scripts/ci-image.sh for why re-building here published
+    # an artifact nothing had checked (#189), and for the digest comparison that
+    # demonstrates the released tags carry the built bytes.
+    - scripts/ci-image.sh promote "${CI_REGISTRY_IMAGE}" "${SESSION_IMAGE_DIGEST}" "${CI_COMMIT_TAG}" latest
   rules:
     - if: $CI_COMMIT_TAG
   environment:
@@ -249,16 +283,18 @@ publish-platform-container:
     # addressing the service as `docker` rather than localhost.
     DOCKER_TLS_CERTDIR: ""
     DOCKER_HOST: "tcp://docker:2375"
+  # See publish-container for why this is `dependencies:` and not `needs:`.
+  dependencies:
+    - build-platform-container
   before_script:
     - docker login -u ${CI_REGISTRY_USER} -p ${CI_REGISTRY_PASSWORD} ${CI_REGISTRY}
   script:
-    # Built again rather than pulled from the build stage, the way
-    # publish-container is: a tagged release publishes an image built from the
-    # tagged tree, and the layers are still in the runner's cache. See
-    # build-platform-container for what LMER_BUILD_COMMIT is for.
-    - docker build --build-arg LMER_BUILD_COMMIT=${CI_COMMIT_SHA} -t ${PLATFORM_IMAGE}:${CI_COMMIT_TAG} -t ${PLATFORM_IMAGE}:latest -f Dockerfile.platform .
-    - docker push ${PLATFORM_IMAGE}:${CI_COMMIT_TAG}
-    - docker push ${PLATFORM_IMAGE}:latest
+    # Promotes build-platform-container's image by digest rather than building a
+    # second one. The rebuild this replaces was the sharpest case of #189: the
+    # image was the only check on Dockerfile.platform, and `docker-ce-cli` is
+    # deliberately unpinned while npm optional dependencies resolve per build, so
+    # the copy that shipped could differ from the copy that was exercised.
+    - scripts/ci-image.sh promote "${PLATFORM_IMAGE}" "${PLATFORM_IMAGE_DIGEST}" "${CI_COMMIT_TAG}" latest
   rules:
     - if: $CI_COMMIT_TAG
   environment:
