@@ -43,6 +43,38 @@
 .v-btn:not(.v-btn--icon) { min-height: 40px; }
 .v-chip.v-chip--link { min-height: 40px; }
 
+/* The send control of the three composers — the conversation, the ask-channel
+   reply, the answer that respawns a run — as one rule, because their sameness is
+   the point: an operator who learns to send in one has learned all three.
+
+   Why it is a row of its own rather than an icon in the field's corner: the
+   exemption in the rule above. An icon button is sized by its props, the three
+   composers sized theirs `small` (28px), and that landed inside a field whose whole
+   surface focuses the textarea and raises the keyboard — so the only way to send
+   was a sub-thumb target competing with the tap that focuses the box, plus a chord
+   no phone keyboard has. Reported live (issue 194): nothing typed in the chat reached
+   the session.
+
+   Full width below Vuetify's `sm` breakpoint, which is the phone: the widest
+   possible target, at the bottom of the card, where a thumb already is. Above it
+   the row leans end-ward and the button keeps its own width — a desktop pointer
+   does not need 600px of button, and the field's label reads left-to-right into
+   it. 44px because that is the smallest comfortable target the platform HIGs
+   agree on, and `size="large"` is Vuetify's own name for it. */
+.send-row {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.send-row > .v-btn { min-height: 44px; }
+
+/* `max-width` rather than the range syntax: Vuetify spells its own breakpoints this
+   way, and a phone two OS versions behind still understands it. */
+@media (max-width: 599.98px) {
+  .send-row > .v-btn { flex: 1 1 auto; }
+}
+
 /* A repeated typographic role rather than a one-off: the same small uppercase
    heading separates "needs you" from everything else in every list. */
 .section-title {

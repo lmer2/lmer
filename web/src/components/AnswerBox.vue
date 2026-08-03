@@ -133,19 +133,24 @@ async function submit() {
         moment.
       </v-alert>
 
-      <!-- Send is inside the field, reachable by the icon on any pointer and by
-           Ctrl+Enter (Cmd+Enter on a Mac) from a keyboard; bare Enter stays a
-           newline, because this is a box someone writes a paragraph in. Chat.vue's
-           composer carries the reasoning for all three of those.
-           What the icon cannot carry is this box's one distinguishing fact — that
-           sending it starts a container — so the sentence that used to sit beside
-           the button stays, and the button's label survives as the icon's
-           accessible name. -->
+      <!-- Send is a labelled control on its own row (`.send-row`, style.css),
+           reachable by a thumb on any device and by Ctrl+Enter (Cmd+Enter on a Mac)
+           from a keyboard; bare Enter stays a newline, because this is a box someone
+           writes a paragraph in and a phone's return key is the only way to make
+           one. Chat.vue's composer carries the reasoning for all three of those,
+           including why the icon that used to sit in the field's corner could not
+           be reached on a phone (issue 194).
+           This box's one distinguishing fact — that sending it starts a container —
+           stays where a sighted operator already reads it: the sentence directly
+           under the control, plus the accessible name. The label itself is the one
+           word, so that the visible text is contained in the announced name (WCAG
+           2.5.3, the same shape as Chat's "send" inside "send to this session")
+           rather than being a shorter paraphrase of it. -->
       <v-textarea
         v-model="draft"
         :disabled="busy || handedOff"
         label="your answer"
-        hint="Ctrl+Enter (Cmd on a Mac) sends, Enter is a new line. Goes to a new session for this run — the one that asked has exited"
+        hint="Tap answer below — Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends too. Goes to a new session for this run — the one that asked has exited"
         persistent-hint
         rows="3"
         auto-grow
@@ -154,20 +159,19 @@ async function submit() {
         class="mt-3"
         @keydown.ctrl.enter.prevent="submit"
         @keydown.meta.enter.prevent="submit"
-      >
-        <template #append-inner>
-          <v-btn
-            :icon="mdiReplyOutline"
-            :loading="busy"
-            :disabled="!canSend"
-            color="primary"
-            variant="tonal"
-            size="small"
-            aria-label="answer and start a session"
-            @click="submit"
-          />
-        </template>
-      </v-textarea>
+      />
+      <div class="send-row">
+        <v-btn
+          :prepend-icon="mdiReplyOutline"
+          :loading="busy"
+          :disabled="!canSend"
+          color="primary"
+          variant="tonal"
+          size="large"
+          aria-label="answer and start a session"
+          @click="submit"
+        >answer</v-btn>
+      </div>
       <p class="text-body-small text-medium-emphasis mt-2 mb-0">
         this starts a new session for the run
       </p>

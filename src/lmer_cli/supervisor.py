@@ -418,10 +418,12 @@ class SessionLog:
             try:
                 # Looped because ``os.write`` is allowed to write less than it was
                 # given, and a short write here is not a slow log but a hole in the
-                # record — silent, and impossible to spot afterwards.
-                view = memoryview(chunk)
-                while view:
-                    view = view[os.write(self._fd, view):]
+                # record — silent, and impossible to spot afterwards. The loop is
+                # :func:`_write_all`'s, shared rather than restated: the two had
+                # already diverged once (only one of them refused a zero-length
+                # write, so the same hole stayed open on this path), and a second
+                # copy is how that happens again.
+                _write_all(self._fd, chunk)
             except OSError as exc:
                 sys.stderr.write(
                     f"lmer-supervisor: cannot write the session log "
@@ -1208,6 +1210,53 @@ _SUBMIT_UNCONFIRMED_NOTE = (
 )
 
 
+def _write_all(fd: int, data: bytes) -> int:
+    """Write every byte of *data* to *fd*, returning how many that was.
+
+    ``os.write`` is allowed to write less than it was given, and a short write on
+    the path into a session is not a slow PTY — it is a message the session
+    received the front of. The tail is the half that matters: an ``/input``
+    payload's last byte is its submit CR (:func:`_ensure_submit_cr`), so a
+    truncated write leaves a partial message typed and *unsent*, under a 200 and a
+    byte count that looks like a delivery. Nothing downstream can tell, which is
+    the property that makes this worth a loop rather than a comment —
+    :meth:`SessionLog.write` loops for the same reason, and says so.
+
+    The master fd is blocking today, so this closes a hole rather than a reported
+    bug. The count is the caller's, not the kernel's per-call answer: ``/input``
+    reports it as ``bytes_written``, and a number smaller than what was posted
+    would be the one visible symptom of a payload that never fully landed.
+    """
+    view = memoryview(data)
+    written = 0
+    while view:
+        try:
+            chunk = os.write(fd, view)
+        except OSError as exc:
+            # How much landed rides on the failure, because it is the fact nobody
+            # downstream can recover: a write that dies part-way through (the child
+            # exiting between iterations) leaves the front of the message typed in
+            # the session's box, and "wrote 43 of 48" is the difference between
+            # that and nothing at all. ``/input`` surfaces this as its 500 detail.
+            raise OSError(
+                exc.errno,
+                f"{exc.strerror or exc}: wrote {written} of {len(data)} bytes "
+                f"to fd {fd}",
+            ) from exc
+        # A blocking fd does not answer 0 for a non-empty buffer — but a loop that
+        # trusted it to would spin forever holding the write lock rather than fail,
+        # and this is the one write path an operator's message goes through.
+        if chunk <= 0:
+            raise OSError(
+                errno.EIO,
+                f"wrote {written} of {len(data)} bytes to fd {fd} "
+                f"({chunk} on the last call)",
+            )
+        written += chunk
+        view = view[chunk:]
+    return written
+
+
 def _ensure_submit_cr(payload: str) -> str:
     """Append a submit CR (``\\r``) unless ``payload`` already ends with one.
 
@@ -1481,7 +1530,7 @@ def run_supervisor(
 
     def write_to_child(data: bytes) -> int:
         with write_lock:
-            return os.write(master_fd, data)
+            return _write_all(master_fd, data)
 
     # The FastAPI control plane touches the PTY's geometry through these two
     # closures instead of being handed the fd, so the app never has to know it

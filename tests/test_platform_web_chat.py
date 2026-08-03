@@ -580,6 +580,66 @@ for (const [name, probe] of Object.entries(cases)) {
 console.log(JSON.stringify(seen))
 """
 
+#: ``send()`` itself, run against a stubbed control plane (issue 194). Everything
+#: the function closes over is a plain box or a no-op — the point is narrow: what
+#: the reply becomes on the item that is held. The refs are the shapes ``ref()``
+#: hands it, and the JS half reports only the pending list it produced.
+_SEND_PROBE = """
+const props = { sessionId: 'probe-session' }
+let cursor = %d
+let reply = null
+const draft = { value: '' }
+const sending = { value: false }
+const problem = { value: null }
+const pending = { value: [] }
+const following = { value: false }
+const stale = () => false
+const nextTick = () => {}
+const stickToBottom = () => {}
+const poll = () => {}
+const sendSessionInput = async () => reply
+const generation = 0
+
+%s
+
+const cases = %s
+const typed = %s
+;(async () => {
+  const held = {}
+  for (const [name, answer] of Object.entries(cases)) {
+    reply = answer
+    pending.value = []
+    draft.value = typed
+    await send()
+    held[name] = pending.value.map((item) => ({
+      text: item.text,
+      submitConfirmed: item.submitConfirmed,
+      since: item.since,
+    }))
+  }
+  console.log(JSON.stringify(held))
+})()
+"""
+
+#: The label ladder, run rather than read (issue 194). ``props`` and the grace
+#: constant are what the function closes over in the component; the cases are the
+#: three rungs, and the JS half only reports the caption it produced.
+_LABEL_PROBE = """
+const PENDING_GRACE_MS = %d
+const SUBMIT_UNCONFIRMED_LABEL = %s
+const props = { now: 0 }
+
+%s
+
+const cases = %s
+const said = {}
+for (const [name, probe] of Object.entries(cases)) {
+  props.now = probe.now
+  said[name] = pendingLabel(probe.item)
+}
+console.log(JSON.stringify(said))
+"""
+
 #: A message about the harness's own markup, which the operator writes on the one
 #: screen they debug this platform from. ``<system-reminder>`` is in
 #: ``transcripts._WRAPPER_TAGS``, and the tag is cut out of a *user* turn wherever
@@ -835,8 +895,7 @@ def test_nothing_about_the_bubble_is_decided_by_a_clock():
     way, which is the one thing this view must never do — a send that succeeded may
     not read as a send that went nowhere. So the settle rule may consult the
     transcript and nothing else; the clock in this component belongs to the
-    *label*, which says "the transcript has not caught up yet" without touching
-    what is held.
+    *label*, which changes its wording without touching what is held.
     """
     settle = _chat_function("function settlePending")
     match = _chat_function("function comparable")
@@ -849,9 +908,249 @@ def test_nothing_about_the_bubble_is_decided_by_a_clock():
         "the settle rule no longer bounds itself to turns that arrived after the "
         "send, so an older identical message can settle a new bubble"
     )
-    assert "props.now - item.at > PENDING_GRACE_MS" in _chat_function(
-        "function pendingLabel"
-    ), "the grace period stopped being about the wording"
+    label = _chat_function("function pendingLabel")
+    assert "props.now - item.at" in label and "PENDING_GRACE_MS" in label, (
+        "the grace period stopped being about the wording"
+    )
+    assert "pending.value" not in label and "splice" not in label, (
+        "the label reaches into what is held; only the transcript may do that"
+    )
+
+
+# --- and what it says once the grace window is up (issue 194) -----------------
+
+#: A message with a newline in it, which is the shape the issue was reported over.
+_TYPED_AT_A_SESSION = "first line about the failure\nsecond line with /a/path in it"
+
+#: The same message with a newline left on the end — a composer the operator hit
+#: Enter in once more, or a paste that carried its own line break. It differs from
+#: `_TYPED_AT_A_SESSION` only in the whitespace `send()`'s `trim()` is there to take
+#: off, which is what makes it the fixture that can tell whether the call is still
+#: being made.
+_TYPED_WITH_A_TRAILING_NEWLINE = _TYPED_AT_A_SESSION + "\n"
+
+#: The cursor the send is made at, so the held item's `since` can be checked to be
+#: the transcript's end rather than a count of anything.
+_CURSOR_AT_SEND = 7
+
+
+def _held(typed=_TYPED_AT_A_SESSION):
+    """Run ``send()`` against three replies. Case name → the pending items."""
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+
+    cases = {
+        # What every `/input` with an Enter answers today: the CR was written, the
+        # submit is not observable from outside the TUI.
+        "unconfirmed": {
+            "session": "probe-session", "bytes_written": 61,
+            "submit_confirmed": False, "note": "…terminal view.",
+        },
+        # A control plane that can confirm one. Nothing does today; the rung is kept
+        # so the *reason* the caption is weak stays tied to the fact rather than to
+        # the route's current behaviour.
+        "confirmed": {
+            "session": "probe-session", "bytes_written": 61,
+            "submit_confirmed": True,
+        },
+        # A reply that says nothing about a submit — an older daemon, or a shape
+        # that changes. Silence is not a confirmation.
+        "silent": {"session": "probe-session", "bytes_written": 61},
+    }
+    script = _SEND_PROBE % (
+        _CURSOR_AT_SEND,
+        _chat_body("async function send"),
+        json.dumps(cases),
+        json.dumps(typed),
+    )
+    result = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"the send probe failed:\n{result.stdout}\n{result.stderr}"
+    )
+    return json.loads(result.stdout)
+
+
+def test_the_reply_from_the_control_plane_reaches_the_bubble():
+    """The root cause of the reported failure, pinned where it lived.
+
+    `send()` discarded the reply. That is the whole bug on this side: the route was
+    already answering `submit_confirmed: false` on every message typed at a TUI, and
+    `POST /api/sessions/{id}/input` was already forwarding it, so nothing had to be
+    built to know — the answer was arriving and being dropped, and the pane went on
+    to call the message sent.
+
+    So this runs the real `send()` and looks at what it held: the reply's verdict has
+    to be on the item, or the caption below has nothing to be honest with. Executed
+    rather than read, because "the function assigns a field" is what a source check
+    would confirm, and the thing that matters is which value ends up there — an
+    unconfirmed reply must not produce a confirmed item.
+    """
+    held = _held()
+
+    assert held["unconfirmed"] == [{
+        "text": _TYPED_AT_A_SESSION,
+        "submitConfirmed": False,
+        "since": _CURSOR_AT_SEND,
+    }], (
+        "the reply is not reaching the held item, so the view is back to claiming "
+        f"every send was submitted — {held['unconfirmed']}"
+    )
+    assert held["silent"][0]["submitConfirmed"] is False, (
+        "a reply that said nothing about the submit produced a confirmed item"
+    )
+    assert held["confirmed"][0]["submitConfirmed"] is True, (
+        "a confirmed submit is being reported as unconfirmed, so the caption would "
+        "hedge about something that is a fact"
+    )
+
+
+def test_what_was_typed_is_what_is_held_and_sent():
+    """The bubble holds the message, newline and all.
+
+    Both halves of the issue meet here: the composer sends a multi-line body (the
+    TUI accepts one whole — that half was established against a real claude), and
+    the bubble that stands in for it until the transcript catches up has to be the
+    same text, or the matching rule that settles it later cannot work.
+    """
+    held = _held()
+
+    for case, items in held.items():
+        assert len(items) == 1, f"{case}: one send, {len(items)} bubbles"
+        assert items[0]["text"] == _TYPED_AT_A_SESSION, (
+            f"{case}: the bubble holds {items[0]['text']!r}"
+        )
+        assert items[0]["since"] == _CURSOR_AT_SEND, (
+            f"{case}: `since` is {items[0]['since']}, not the transcript's end, so "
+            "the settle rule would look for the message in the wrong place"
+        )
+
+
+def test_a_newline_left_on_the_end_is_taken_off_before_the_message_goes():
+    """The one `send()` call the rest of this module cannot see.
+
+    `send()` derives a single value — `draft.value.trim()` (`Chat.vue:486`) — and
+    hands that same binding to `sendSessionInput` and to the held item, so the text
+    on the bubble is the text the POST body carried. That coupling is what lets this
+    check the request through what it holds.
+
+    It needs its own fixture because `_TYPED_AT_A_SESSION` has no whitespace at
+    either end: with the `trim()` deleted, every other assertion here still passes
+    while the body on the wire changes. The newline is the shape worth pinning
+    rather than spaces, because it is the character this whole issue is about, and
+    because it does not fail loudly downstream — `_ensure_submit_cr`
+    (`supervisor.py:1260`) treats a trailing LF as *not* a submit and appends the CR
+    behind it, so an untrimmed newline is typed into the TUI's box as a literal line
+    break and the message lands with a blank line on the end. Delivered, unremarkable
+    in the log, and different from what the operator wrote.
+    """
+    held = _held(_TYPED_WITH_A_TRAILING_NEWLINE)
+
+    for case, items in held.items():
+        assert len(items) == 1, f"{case}: one send, {len(items)} bubbles"
+        text = items[0]["text"]
+        assert not text.endswith("\n"), (
+            f"{case}: the trailing newline survived into {text!r}, so it is in the "
+            "POST body too — typed at the TUI as a line break rather than dropped"
+        )
+        assert text == _TYPED_AT_A_SESSION, (
+            f"{case}: the message came out as {text!r} rather than what was typed "
+            "with the trailing newline taken off, so the send is no longer trimming"
+        )
+
+
+def _labels():
+    """Run the label ladder over its three rungs. Case name → the caption."""
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+
+    grace = int(re.search(
+        r"const PENDING_GRACE_MS = (\d+)", _read(CHAT),
+    ).group(1))
+    unconfirmed = re.search(
+        r"const SUBMIT_UNCONFIRMED_LABEL = \(\n(.*?)\n\)\n", _read(CHAT), re.S,
+    )
+    assert unconfirmed, "the unconfirmed caption is no longer a named constant"
+    cases = {
+        # Inside the grace window, whatever the control plane said: a transcript
+        # that has not caught up in a few seconds is the ordinary case.
+        "still_going": {"now": 1000, "item": {"at": 0, "submitConfirmed": False}},
+        # Past it, and the submit was never confirmed — what every chat send is
+        # today, because a CR typed at a TUI is not an observable submit.
+        "unconfirmed": {"now": grace + 1000, "item": {"at": 0, "submitConfirmed": False}},
+        # Past it, with the submit a fact: only the transcript is behind.
+        "confirmed": {"now": grace + 1000, "item": {"at": 0, "submitConfirmed": True}},
+        # A reply that said nothing about the submit is not a confirmation of one.
+        "silent_reply": {"now": grace + 1000, "item": {"at": 0}},
+    }
+    script = _LABEL_PROBE % (
+        grace,
+        "(" + unconfirmed.group(1) + ")",
+        _chat_body("function pendingLabel"),
+        json.dumps(cases),
+    )
+    result = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"the label probe failed:\n{result.stdout}\n{result.stderr}"
+    )
+    return json.loads(result.stdout)
+
+
+def test_a_message_the_session_may_never_have_read_is_not_called_sent():
+    """The reported failure, at the layer it was actually in (issue 194).
+
+    An operator typed into this pane and nothing arrived in the session, for a
+    string of messages, and the pane called every one of them sent — so the app
+    reported a working conversation while the run heard nothing. The control plane
+    was not the one being coy about it: ``POST /input`` answers
+    ``submit_confirmed: false`` with a note whenever it typed an Enter it cannot
+    observe landing, which is every message typed at a TUI, and this view threw the
+    reply away.
+
+    A CR is not a submit it can see: a dialog on screen consumes the keystrokes and
+    answers *itself* with the Enter, and a re-render can swallow it — both
+    reproduced against a real claude TUI while this was diagnosed. So past the grace
+    window the caption may not say the word "sent", and it has to name the one place
+    an operator can see which happened.
+    """
+    said = _labels()
+
+    # The word on its own, because "unsent" is exactly what this caption is allowed
+    # — and required — to say.
+    assert not re.search(r"\bsent\b", said["unconfirmed"]), (
+        f"an unconfirmed submit is still reported as sent — {said['unconfirmed']!r}"
+    )
+    assert "terminal" in said["unconfirmed"], (
+        "the caption does not say where the message can be seen and submitted — "
+        f"{said['unconfirmed']!r}"
+    )
+    assert said["silent_reply"] == said["unconfirmed"], (
+        "a reply that said nothing about the submit is treated as a confirmation; "
+        "the fallback has to be the quiet answer"
+    )
+
+
+def test_the_two_honest_captions_are_still_there():
+    """The change is one rung, not a rewrite: a send in flight still says so, and a
+    submit that IS a fact still gets the sentence about the transcript being behind.
+
+    Both matter for the same reason the third rung does — a message on its way must
+    not read as a failure. The grace window is what separates them, and it is the
+    only thing in this component a clock decides.
+    """
+    said = _labels()
+
+    assert said["still_going"] == "sending…", (
+        f"a send inside the grace window says {said['still_going']!r}"
+    )
+    assert said["confirmed"] == "sent — the transcript has not caught up yet", (
+        f"a confirmed submit lost its caption — {said['confirmed']!r}"
+    )
 
 
 # --- dependencies -------------------------------------------------------------

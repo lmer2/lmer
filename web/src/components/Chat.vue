@@ -177,6 +177,30 @@ const PAGE = 40
 // that go through?".
 const PENDING_GRACE_MS = 45000
 
+// What the view says about a message the transcript still does not have once the
+// grace window is up, when the control plane could not confirm the Enter it typed
+// (issue 194). It is the one caption that must not say "sent": the supervisor
+// writes the submit CR and cannot see whether the TUI took it — a dialog on screen
+// consumes the keystrokes and answers itself with the CR, and a re-render can
+// swallow it — so a message can be sitting in the session's input box, typed and
+// unsent, while this pane calls it delivered. That is what an operator hit: the
+// app reported every send as sent and none of them had arrived.
+//
+// The sentence is the view's own rather than the note the control plane sends with
+// the same fact (`_SUBMIT_UNCONFIRMED_NOTE`), for the reason the transcript's roles
+// are mapped rather than rendered: that note is written for an API caller and says
+// "the supervisor", which is a code spelling of a thing this UI calls uber lmer.
+// What is reused is the *fact*, which is the half that has to have one source.
+// Both outcomes, because they are different repairs and the caption cannot tell
+// them apart: a modal on screen consumes the keystrokes *and* answers itself with
+// the Enter, so there is nothing left in the box to submit — while a swallowed CR
+// leaves the whole message typed and waiting. Naming only the second would send an
+// operator to the terminal view looking for text that is not there.
+const SUBMIT_UNCONFIRMED_LABEL = (
+  'not confirmed — the session may not have received it at all, or it may be '
+  + 'sitting unsent in its input box. The terminal view shows which.'
+)
+
 // How far off the end still counts as "reading the end". About one turn's worth:
 // a thumb that has come to rest a few pixels short is still following, while a
 // reader who has scrolled back deliberately is not.
@@ -465,13 +489,26 @@ async function send() {
   sending.value = true
   problem.value = null
   try {
-    await sendSessionInput(props.sessionId, text)
+    const reply = await sendSessionInput(props.sessionId, text)
     if (stale(mine)) return
     // Held until the transcript catches up. The send has already succeeded, so
     // this bubble is not a maybe — it is "delivered, not yet written down".
     // `since` is where the transcript ended when it went, which is what makes the
     // match forward-looking.
-    pending.value = [...pending.value, { text, at: Date.now(), since: cursor }]
+    //
+    // `submitConfirmed` is the one thing the reply is read for, and only ever to
+    // make the caption *weaker*: the route answers `submit_confirmed: false` plus a
+    // note whenever it typed an Enter it could not observe landing, and this view
+    // used to throw that away and claim the message was sent regardless (issue 194).
+    // Anything other than an explicit `true` counts as unconfirmed — a daemon that
+    // says nothing about the submit has not confirmed one — because the failure
+    // being fixed is over-claiming, so the fallback has to be the quiet answer.
+    pending.value = [...pending.value, {
+      text,
+      at: Date.now(),
+      since: cursor,
+      submitConfirmed: reply?.submit_confirmed === true,
+    }]
     draft.value = ''
     // Unconditionally, unlike a poll: this turn is one the operator just typed,
     // and not showing it would read as the send having gone nowhere.
@@ -483,17 +520,35 @@ async function send() {
   } catch (exc) {
     if (stale(mine)) return
     // Loud, and only here: the control plane refusing the input is the one thing
-    // that means the session never got it.
+    // that means the message was never submitted. Not quite the same as "the
+    // session saw none of it" — a write that fails part-way through the payload
+    // (the child exiting mid-write) leaves the front of the message typed in the
+    // box, and the supervisor's message says how many bytes landed, which is why
+    // the server's own words are kept rather than replaced with a flat sentence.
+    // Nothing was *sent* either way: the submit CR is the payload's last byte.
     problem.value = `not sent — ${exc.message}`
   } finally {
     if (!stale(mine)) sending.value = false
   }
 }
 
+// What is held is decided by the transcript alone (`settlePending`); this is the
+// only thing a clock touches, and all it moves is the wording. Three rungs, and the
+// order matters: inside the grace window a slow transcript is the ordinary case and
+// says nothing; past it, a message the transcript still does not have is only
+// called *sent* when the submit is a fact. It is not one today for anything typed
+// at a TUI, which is the whole of issue 194 — so the third rung is what a chat send
+// normally reaches, and it is the truth rather than a reassurance.
+//
+// Note what this deliberately does not do: drop the bubble, or claim the message
+// failed. A session working through an earlier turn queues this one and writes it
+// down later, and from here that is indistinguishable from text sitting unsent in
+// its input box — so the caption stops asserting and names the one place both can
+// be told apart.
 function pendingLabel(item) {
-  return props.now - item.at > PENDING_GRACE_MS
-    ? 'sent — the transcript has not caught up yet'
-    : 'sending…'
+  if (props.now - item.at <= PENDING_GRACE_MS) return 'sending…'
+  if (item.submitConfirmed) return 'sent — the transcript has not caught up yet'
+  return SUBMIT_UNCONFIRMED_LABEL
 }
 
 onMounted(() => {
@@ -709,31 +764,41 @@ watch(rendererLoaded, () => {
           showing right now, which may be a menu rather than its prompt.
         </v-alert>
 
-        <!-- Send is inside the field, and there are two ways to reach it.
+        <!-- Send is a labelled control on its own row, and there are two ways to
+             reach it. The row is the phone's way and it is the one that has to
+             work: this fleet is driven from a phone, where there is no Ctrl or
+             Cmd key at all, so the chord is a convenience and the button is the
+             affordance. `.send-row` (style.css, shared by the three composers)
+             is what makes it a thumb target rather than a corner icon.
 
-             The icon: it costs no layout — the field already occupies that
-             corner — which is what makes it worth keeping on every pointer.
-             The terminal's key pad is hidden for a fine pointer because there
-             it is *redundant* chrome (xterm takes the keystrokes itself, and
-             the block sits between the terminal and everything under it);
-             here the field is the only way in on every device, so hiding the
-             one visible affordance would leave a desktop operator with a box
-             and no sign of what sends it. `pointer: coarse` also reports the
-             *primary* pointer, so a touchscreen laptop is `fine` — gating the
-             only send control on it takes the button away from a finger.
+             It used to be a 28px icon in the field's `append-inner` slot, on the
+             argument that a corner the field already occupies costs no layout.
+             What that missed is where the tap lands: the field's whole surface
+             focuses the textarea and raises the keyboard, so an icon inside it
+             competes with the one thing the operator is trying not to do, at a
+             size the app's own one-handed-use rule exempts
+             (`.v-btn:not(.v-btn--icon)`). Reported live (issue 194): messages typed
+             in this pane never reached the session, because there was no way to
+             send one — "newlines from the app aren't sending" is what an Enter
+             that inserts a newline feels like when nothing else leaves.
 
-             The chord: Ctrl+Enter, Cmd+Enter on a Mac, which is the same
-             event with `metaKey` instead. Bare Enter is deliberately NOT
-             bound — this is a multi-line box (auto-grow, max-rows) an
-             operator writes a paragraph in, and a newline has to stay a
-             newline. `.prevent` because a browser that would have inserted
-             one on the chord must not leave it behind in a draft that a
-             failed send keeps. -->
+             The chord: Ctrl+Enter, Cmd+Enter on a Mac, which is the same event
+             with `metaKey` instead. Bare Enter is still deliberately NOT bound —
+             this is a multi-line box (auto-grow, max-rows) an operator writes a
+             paragraph in, and on a phone the return key is the *only* way to type
+             a newline, so binding it to send would make a multi-line message
+             uncomposable on the device this is for. `.prevent` because a browser
+             that would have inserted one on the chord must not leave it behind in
+             a draft that a failed send keeps.
+
+             The hint leads with the tap for the same reason the button exists: the
+             way in that always works is the one an operator must not have to
+             already know. -->
         <v-textarea
           v-model="draft"
           :disabled="sending"
           :label="composerLabel"
-          hint="Ctrl+Enter (Cmd on a Mac) sends, Enter is a new line. Typed into the session, then read back from its transcript — so it appears here with a delay"
+          hint="Tap send below — Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends too. Typed into the session, then read back from its transcript — so it appears here with a delay"
           persistent-hint
           rows="2"
           auto-grow
@@ -742,20 +807,19 @@ watch(rendererLoaded, () => {
           class="mt-3"
           @keydown.ctrl.enter.prevent="send"
           @keydown.meta.enter.prevent="send"
-        >
-          <template #append-inner>
-            <v-btn
-              :icon="mdiSend"
-              :loading="sending"
-              :disabled="!draft.trim()"
-              color="primary"
-              variant="tonal"
-              size="small"
-              aria-label="send to this session"
-              @click="send"
-            />
-          </template>
-        </v-textarea>
+        />
+        <div class="send-row">
+          <v-btn
+            :prepend-icon="mdiSend"
+            :loading="sending"
+            :disabled="!draft.trim()"
+            color="primary"
+            variant="tonal"
+            size="large"
+            aria-label="send to this session"
+            @click="send"
+          >send</v-btn>
+        </div>
       </template>
     </v-card-text>
   </v-card>

@@ -723,6 +723,15 @@ Claude is launched through `lmer-supervisor`, a Python process that sits between
   ```
 
   Both fields appear only when `append_newline` is true — a keystroke presses no Enter, so it has no submit to be unsure about — and `POST /api/sessions/{id}/input` forwards them unchanged. A client that needs certainty should watch `/output` or the session's terminal view. (The auto-`/start` path above keeps its nudges: it fires once at startup behind an observed prompt-ready marker, before any permission prompt can exist.)
+
+  **What a payload actually does at the far end**, established against a real Claude Code 2.1.220 TUI on a PTY (issue 194) rather than reasoned about, because two plausible-sounding theories about it were both wrong:
+
+  - **A multi-line payload arrives whole and submits once.** `"line one\nline two\r"` is recorded by the harness as a single turn, embedded newline intact — the LF is inserted as a literal newline in the input box and the trailing CR submits the lot. It does **not** submit at the first newline, and it does not sit unsent. So there is no need to split a message, and splitting one would make two turns out of it.
+  - **A dialog on screen swallows the whole message, not just the Enter.** With a modal up (a permission prompt, the trust dialog, a picker) the typed text is discarded *and* the CR answers the dialog with its default. Nothing about that is visible in the reply: the write succeeded, so `bytes_written` is the full payload and the session heard nothing.
+  - **A payload written while the TUI is mid-redraw is discarded** the same way, which is what the auto-`/start` path's readiness marker and settle delay exist to avoid.
+  - The prompt glyph is **not** evidence that no dialog is up: `❯` is also the selection cursor in Claude's own menus. That is why this endpoint reports the uncertainty instead of trying to detect the screen state.
+
+  A client that shows a human what it sent must therefore not turn a 200 into "delivered and read". The control UI's chat holds the sent message as pending until the session's own transcript has it, and once past its grace window says the submit is **not confirmed** — pointing at the terminal view, where both cases above are visible — instead of reporting it as sent.
 - `GET /output?cursor=N&timeout=S` — returns buffered output past `cursor` with optional long-poll timeout
 - `GET /healthz` — liveness probe (also requires the bearer token)
 
