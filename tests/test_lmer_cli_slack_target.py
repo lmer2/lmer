@@ -480,7 +480,7 @@ def _make_main_mocks(captured_env: dict | None = None):
         patch("lmer_cli.cli.resolve_host_clone_cache_dir", return_value=MagicMock())
     )
     stack.enter_context(
-        patch("lmer_cli.cli.build_clone_cache_mount", return_value=[])
+        patch("lmer_cli.cli.build_clone_cache_mounts", return_value=([], []))
     )
     # The host-side cache updater forks a detached real process; never let a
     # test run spawn it (its child would resolve and write the REAL cache).
