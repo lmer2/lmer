@@ -1,7 +1,8 @@
 """Host-side maintenance for the persistent git clone cache (issue #112).
 
 The cache is a host directory of bare mirrors (``<host>/<project>.git``)
-that containers consume **read-only**: working clones are made with
+that containers consume **read-only** — and, since issue #135, only the
+mirrors of the repos a given launch clones: working clones are made with
 ``--reference <mirror> --dissociate`` (see
 ``lmer_cli/container/clone_and_exec.py``), so a mirror only saves network —
 a stale or absent mirror is never wrong, and a damaged one is covered by
@@ -601,7 +602,7 @@ def update_mirrors(urls: "list[str]", cache_root: Path) -> None:
 def main() -> int:
     """Entrypoint for ``python -m lmer_cli.clone_cache``: one repo URL per
     stdin line (credentialed URLs allowed — stdin is not visible in ``ps``),
-    cache root resolved exactly like the mount (LMER_CLONE_CACHE_DIR or
+    cache root resolved exactly like the launch's mounts (LMER_CLONE_CACHE_DIR or
     ``~/.lmer/clone-cache``). Always exits 0: a cache warmer has no caller
     that could act on failure."""
     urls = [line.strip() for line in sys.stdin.read().splitlines() if line.strip()]

@@ -723,10 +723,14 @@ def _clone_cmd(
 
 
 # --- Persistent clone cache (issue #112) ------------------------------------
-# The host CLI bind-mounts a persistent host directory (default
-# ~/.lmer/clone-cache, see LMER_CLONE_CACHE / LMER_CLONE_CACHE_DIR in
-# docs/LMER-CLI.md) **read-only** at the container path carried in
-# LMER_CLONE_CACHE_PATH. All mirror maintenance is host-side
+# The host CLI bind-mounts, **read-only** and one per mirror, the bare
+# mirrors this launch's own repos have in its persistent cache directory
+# (default ~/.lmer/clone-cache, see LMER_CLONE_CACHE / LMER_CLONE_CACHE_DIR
+# in docs/LMER-CLI.md) — under the container path carried in
+# LMER_CLONE_CACHE_PATH, at the same relative position this script's
+# _mirror_path computes, so the lookup below is indifferent to whether the
+# host mounted the mirrors individually (issue #135) or the whole cache root
+# (before it). All mirror maintenance is host-side
 # (lmer_cli/clone_cache.py, forked detached at launch); this script is a
 # pure consumer: when a bare mirror (<host>/<project>.git) exists, working
 # clones are made with ``--reference <mirror> --dissociate`` — origin stays

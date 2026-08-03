@@ -2,7 +2,8 @@
 
 Architecture under test: the *host* CLI maintains the bare mirrors
 (``lmer_cli.clone_cache`` — covered in test_clone_cache_host.py) and
-bind-mounts the cache **read-only** at ``/clone-cache``, advertised via
+bind-mounts **read-only** the mirrors the launch itself needs, each at its
+usual path under ``/clone-cache`` (issue #135), advertised via
 ``LMER_CLONE_CACHE_PATH``. The container is a pure consumer: when a mirror
 exists it clones with ``--reference <mirror> --dissociate`` (origin stays
 the real remote, and the workspace never depends on the cache afterwards);
@@ -33,7 +34,8 @@ from lmer_cli.container.clone_and_exec import (
 )
 from lmer_cli.mounts import (
     CONTAINER_CLONE_CACHE_DIR,
-    build_clone_cache_mount,
+    build_clone_cache_mounts,
+    plan_clone_cache_mirror_mounts,
     resolve_host_clone_cache_dir,
 )
 from lmer_cli.runtime import _is_selinux_enforcing
@@ -348,8 +350,9 @@ class TestHostSideMount:
 
     @pytest.mark.parametrize("broad", ["/", "~", "~/"])
     def test_broad_root_refused(self, monkeypatch, tmp_path, broad):
-        # The whole cache root is bind-mounted into the container, so `~` would
-        # expose the entire home tree (read-only, but readable).
+        # Host-side guard (the container no longer sees the root at all, #135):
+        # the updater scatters `<host>/<group>/<project>.git` mirror trees
+        # through this directory, which `~` — let alone `/` — must never be.
         home = tmp_path / "home"
         home.mkdir()
         monkeypatch.setenv("HOME", str(home))
@@ -373,22 +376,169 @@ class TestHostSideMount:
         monkeypatch.setenv("LMER_CLONE_CACHE_DIR", "~/mirrors")
         assert resolve_host_clone_cache_dir() == home / "mirrors"
 
-    def test_mount_arg_shape_is_read_only(self):
-        # The container only consumes the cache (--reference --dissociate);
-        # all maintenance is host-side, so the mount is structurally :ro —
-        # no token or corruption can ever originate from a session.
+
+class TestPerMirrorMounts:
+    """Issue #135: a launch mounts the mirrors it will clone, one bind each —
+    never the cache root, which would hand every session the full history of
+    every repo the user has ever cached."""
+
+    @staticmethod
+    def _mirror(cache_root: Path, url: str) -> Path:
+        """Create a mirror-shaped directory for *url* under *cache_root*."""
+        mirror = _mirror_path(cache_root, url)
+        assert mirror is not None
+        mirror.mkdir(parents=True)
+        (mirror / "HEAD").write_text("ref: refs/heads/main\n")
+        return mirror
+
+    def _build(self, cache_root: Path, urls, runtime: str = "docker"):
         with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
             _is_selinux_enforcing.cache_clear()
-            args = build_clone_cache_mount("docker", Path("/home/user/.lmer/clone-cache"))
+            return build_clone_cache_mounts(runtime, cache_root, urls)
+
+    def test_only_the_launch_s_mirrors_are_mounted(self, tmp_path):
+        # The point of the issue: an unrelated cached repo — private, from a
+        # host this session has no credentials for — must not be visible.
+        cache = tmp_path / "clone-cache"
+        wanted = self._mirror(cache, "https://git.example.com/grp/proj.git")
+        unrelated = self._mirror(cache, "https://other.example.com/secret/repo.git")
+
+        args, pairs = self._build(cache, ["https://git.example.com/grp/proj.git"])
+
         assert args == [
             "-v",
-            f"/home/user/.lmer/clone-cache:{CONTAINER_CLONE_CACHE_DIR}:ro",
+            f"{wanted}:{CONTAINER_CLONE_CACHE_DIR}/git.example.com/grp/proj.git:ro",
+        ]
+        assert [str(m) for m, _ in pairs] == [str(wanted)]
+        assert str(unrelated) not in " ".join(args)
+        assert str(cache) + ":" not in " ".join(args)  # never the root itself
+
+    def test_container_path_matches_container_side_lookup(self, tmp_path):
+        # The container resolves the mirror itself via _mirror_path against
+        # CONTAINER_CLONE_CACHE_DIR; the bind has to land exactly there or the
+        # mount is invisible to the clone.
+        cache = tmp_path / "clone-cache"
+        url = "https://git.example.com:8443/grp/sub/proj.git"
+        self._mirror(cache, url)
+
+        _, pairs = self._build(cache, [url])
+
+        expected = _mirror_path(Path(CONTAINER_CLONE_CACHE_DIR), url)
+        assert [container for _, container in pairs] == [str(expected)]
+
+    def test_missing_mirror_produces_no_mount_and_creates_nothing(self, tmp_path):
+        # Cold cache: no bind at all. Handing Docker/Podman a missing source
+        # would have it create the path as a root-owned directory on the host.
+        cache = tmp_path / "clone-cache"
+        cache.mkdir()
+        url = "https://git.example.com/grp/proj.git"
+
+        args, pairs = self._build(cache, [url])
+
+        assert args == []
+        assert pairs == []
+        assert list(cache.iterdir()) == []
+
+    def test_directory_without_head_is_not_mounted(self, tmp_path):
+        # "Exists" means usable: the container refuses to reference a mirror
+        # with no HEAD, so mounting one would only widen exposure for nothing.
+        cache = tmp_path / "clone-cache"
+        url = "https://git.example.com/grp/proj.git"
+        mirror = _mirror_path(cache, url)
+        mirror.mkdir(parents=True)
+
+        args, _ = self._build(cache, [url])
+
+        assert args == []
+
+    def test_repeated_urls_produce_one_mount(self, tmp_path):
+        # The work repo and the napkin repo are frequently the same URL, and
+        # the same repo may arrive tokenized and plain.
+        cache = tmp_path / "clone-cache"
+        self._mirror(cache, "https://git.example.com/grp/proj.git")
+        urls = [
+            "https://git.example.com/grp/proj.git",
+            "https://git.example.com/grp/proj",
+            "https://oauth2:tok@git.example.com/grp/proj.git",
         ]
 
-    def test_selinux_label_on_podman(self):
+        args, pairs = self._build(cache, urls)
+
+        assert args.count("-v") == 1
+        assert len(pairs) == 1
+
+    def test_empty_and_unmappable_urls_are_skipped(self, tmp_path):
+        cache = tmp_path / "clone-cache"
+        cache.mkdir()
+
+        args, pairs = self._build(cache, [None, "", "/local/path/repo", "not a url"])
+
+        assert (args, pairs) == ([], [])
+
+    def test_symlinked_mirror_escaping_the_cache_is_refused(self, tmp_path):
+        # With per-mirror binds the symlink is followed HOST-side, so honoring
+        # one would mount an arbitrary host directory into the container.
+        cache = tmp_path / "clone-cache"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "HEAD").write_text("ref: refs/heads/main\n")
+        url = "https://git.example.com/grp/proj.git"
+        mirror = _mirror_path(cache, url)
+        mirror.parent.mkdir(parents=True)
+        mirror.symlink_to(outside, target_is_directory=True)
+
+        args, _ = self._build(cache, [url])
+
+        assert args == []
+
+    def test_symlinked_cache_root_still_mounts_its_mirrors(self, tmp_path):
+        # The escape guard compares resolved paths, so a cache root that is
+        # itself a symlink (~/.lmer → /data/lmer) keeps working.
+        real = tmp_path / "real-cache"
+        link = tmp_path / "clone-cache"
+        real.mkdir()
+        link.symlink_to(real, target_is_directory=True)
+        url = "https://git.example.com/grp/proj.git"
+        self._mirror(link, url)
+
+        args, pairs = self._build(link, [url])
+
+        assert len(pairs) == 1
+        assert args[1].endswith(f"{CONTAINER_CLONE_CACHE_DIR}/git.example.com/grp/proj.git:ro")
+
+    def test_planner_keeps_first_seen_order(self, tmp_path):
+        cache = tmp_path / "clone-cache"
+        first = "https://git.example.com/grp/one.git"
+        second = "https://git.example.com/grp/two.git"
+        self._mirror(cache, first)
+        self._mirror(cache, second)
+
+        pairs = plan_clone_cache_mirror_mounts(cache, [second, first, second])
+
+        assert [container for _, container in pairs] == [
+            f"{CONTAINER_CLONE_CACHE_DIR}/git.example.com/grp/two.git",
+            f"{CONTAINER_CLONE_CACHE_DIR}/git.example.com/grp/one.git",
+        ]
+
+    def test_mount_args_are_read_only(self, tmp_path):
+        # The container only consumes the cache (--reference --dissociate);
+        # all maintenance is host-side, so every bind is structurally :ro —
+        # no token or corruption can ever originate from a session.
+        cache = tmp_path / "clone-cache"
+        self._mirror(cache, "https://git.example.com/grp/proj.git")
+
+        args, _ = self._build(cache, ["https://git.example.com/grp/proj.git"])
+
+        assert args[-1].endswith(":ro")
+
+    def test_selinux_label_on_podman(self, tmp_path):
+        cache = tmp_path / "clone-cache"
+        self._mirror(cache, "https://git.example.com/grp/proj.git")
         with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=True):
             _is_selinux_enforcing.cache_clear()
-            args = build_clone_cache_mount("podman", Path("/x"))
+            args, _ = build_clone_cache_mounts(
+                "podman", cache, ["https://git.example.com/grp/proj.git"]
+            )
         assert args[-1].endswith(":ro,z")
 
 
@@ -416,12 +566,36 @@ class TestHostWiring:
 
     def test_mount_built_from_resolver(self):
         assert "resolve_host_clone_cache_dir()" in self.CLI_SRC
-        assert "build_clone_cache_mount(runtime, host_clone_cache)" in self.CLI_SRC
+        assert (
+            "build_clone_cache_mounts(\n"
+            "            runtime, host_clone_cache, clone_cache_urls + secondary_repo_urls\n"
+            "        )"
+        ) in self.CLI_SRC
+
+    def test_mounts_cover_every_repo_the_launch_clones(self):
+        # #135: the mounts are the mirrors for exactly the repos this launch
+        # clones — the updater's list plus the secondary MR/PR targets the
+        # container clones too, and nothing wider.
+        assert (
+            "clone_cache_urls = [repo_url, work_repo_url, napkin_repo_url, taskdef_repo_url]"
+            in self.CLI_SRC
+        )
+        assert "_derive_repo_url_from_task_target(t)\n            for t in secondary_targets" in self.CLI_SRC
+        assert "_spawn_clone_cache_updater(clone_cache_urls)" in self.CLI_SRC
+
+    def test_cache_root_is_never_mounted_whole(self):
+        # The pre-#135 shape (one bind of the cache root) must not come back:
+        # it exposed every cached repo to every session.
+        assert "build_clone_cache_mount(" not in self.CLI_SRC
+        assert f"{{host_clone_cache}}:{{CONTAINER_CLONE_CACHE_DIR}}" not in self.CLI_SRC
 
     def test_updater_spawn_gated_on_active_mount(self):
-        # The background updater runs only when the cache mount is active —
+        # The background updater runs only when the cache feature is active —
         # LMER_CLONE_CACHE=0 (or an unusable dir) disables both together.
-        assert "if clone_cache_container_dir is not None:" in self.CLI_SRC
+        assert (
+            "if clone_cache_container_dir is not None and host_clone_cache is not None:"
+            in self.CLI_SRC
+        )
         assert "_spawn_clone_cache_updater(" in self.CLI_SRC
 
 

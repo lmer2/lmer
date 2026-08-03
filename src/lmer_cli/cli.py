@@ -43,7 +43,7 @@ from .mounts import (
     FileMountSpec,
     PlannedCredentialMount,
     build_checkout_mount,
-    build_clone_cache_mount,
+    build_clone_cache_mounts,
     build_release_signing_key_mount,
     build_container_home_mounts,
     build_dir_mounts,
@@ -2286,23 +2286,24 @@ def main(argv: list[str] | None = None) -> int:
         else:
             info(f"⚠️  Host uv cache not found at {host_uv_cache}, skipping mount")
 
-    # Persistent git clone cache (#112): mount a host directory so the
-    # container's clone script keeps bare repo mirrors across sessions and
-    # later sessions fetch only what changed instead of re-cloning. On by
-    # default; LMER_CLONE_CACHE=0 disables. LMER_CLONE_CACHE_DIR overrides
-    # the host location (default ~/.lmer/clone-cache). Fail-soft: an
-    # unusable cache dir skips the mount and the container clones directly.
+    # Persistent git clone cache (#112): the mirrors themselves are mounted
+    # further down, once every repo URL this launch will clone is known —
+    # only those mirrors are mounted (#135), never the whole cache root.
+    # On by default; LMER_CLONE_CACHE=0 disables. LMER_CLONE_CACHE_DIR
+    # overrides the host location (default ~/.lmer/clone-cache). Fail-soft:
+    # an unusable cache dir disables the feature and the container clones
+    # directly.
     clone_cache_container_dir: str | None = None
+    host_clone_cache: Path | None = None
     if get_bool_env("LMER_CLONE_CACHE", default=True):
-        host_clone_cache = resolve_host_clone_cache_dir()
+        candidate_clone_cache = resolve_host_clone_cache_dir()
         try:
-            host_clone_cache.mkdir(parents=True, exist_ok=True)
+            candidate_clone_cache.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            info(f"⚠️  Clone cache dir unusable at {host_clone_cache} ({e}), skipping mount")
+            info(f"⚠️  Clone cache dir unusable at {candidate_clone_cache} ({e}), skipping mount")
         else:
-            run += build_clone_cache_mount(runtime, host_clone_cache)
+            host_clone_cache = candidate_clone_cache
             clone_cache_container_dir = CONTAINER_CLONE_CACHE_DIR
-            success(f"✅ Mounting git clone cache: {host_clone_cache} → {CONTAINER_CLONE_CACHE_DIR}")
 
     # Workspace mount removed - using /workspace directory from image instead
     # This avoids root:root ownership issues with Docker/Podman mounts
@@ -2407,10 +2408,42 @@ def main(argv: list[str] | None = None) -> int:
     # cache (the same possibly-stale read --show-env labels as such), and
     # resolution is authoritative container-side, after this point. Documented
     # in docs/LMER-CLI.md under Canonical Source Declarations.
-    if clone_cache_container_dir is not None:
-        _spawn_clone_cache_updater(
-            [repo_url, work_repo_url, napkin_repo_url, taskdef_repo_url]
+    if clone_cache_container_dir is not None and host_clone_cache is not None:
+        clone_cache_urls = [repo_url, work_repo_url, napkin_repo_url, taskdef_repo_url]
+
+        # Mount only the mirrors for the repos this launch clones (#135), each
+        # at the path the container's own lookup expects. A repo with no mirror
+        # yet contributes no mount: the container clones it directly while the
+        # updater below builds the mirror for next time.
+        #
+        # A secondary MR/PR target is cloned container-side as well
+        # (clone_secondary_mr, from a repo URL derived from the target), so its
+        # mirror joins the mount list — otherwise narrowing the mount would
+        # quietly take away borrowing the whole-root mount used to give it.
+        # It stays out of the updater list below: warming is for the repos the
+        # session works in, and a secondary repo's mirror exists only when some
+        # other session had it as its own project.
+        secondary_repo_urls = [
+            _derive_repo_url_from_task_target(t)
+            for t in secondary_targets
+            if isinstance(t, str)
+        ]
+        cache_mount_args, cache_mounted = build_clone_cache_mounts(
+            runtime, host_clone_cache, clone_cache_urls + secondary_repo_urls
         )
+        run += cache_mount_args
+        if cache_mounted:
+            success(
+                f"✅ Mounting git clone cache mirrors ({len(cache_mounted)}): "
+                + ", ".join(container_path for _, container_path in cache_mounted)
+            )
+        else:
+            info(
+                f"📦 No clone-cache mirrors yet for this session's repos "
+                f"({host_clone_cache}); cloning directly and warming the cache"
+            )
+
+        _spawn_clone_cache_updater(clone_cache_urls)
 
     # Compute the in-container napkin path (separate repo -> /napkin, else a
     # subdir of the work repo). Always injected so agents can use it in any mode.
