@@ -36,9 +36,20 @@ So each test here pins one decision whose loss has no visible symptom in a build
   and the launch — which for a session that records itself is in the other file —
   is a separate read of that file, shown on its own and never spliced in front
 - xterm's stylesheet comes from the package and nothing loads a font
+- coming back to the view produces an event *at all* — nothing else does, because
+  a return resizes nothing — and what it does then is repaint locally, never
+  resize a PTY the session owns
+- the sliver floor guards the local fit as well as the reported geometry: the
+  emulator taking a 2-column proposal rewraps its own buffer, which no later fit
+  and no repaint undoes
 
 Rendering, input routing, and how any of it feels one-handed are verified by
-building the bundle and by live test LT3 on a real phone.
+building the bundle and by live test LT3 on a real phone. Two things here were
+measured rather than reasoned, in a real browser against the bundled xterm — that
+``fit()`` is inert when the box is unchanged, and that a repaint restores a
+rendering while a fit does not — and the probe that measured them is kept with
+the run that added these tests (issue #211), not in this suite: it needs a
+browser, and CI here has none.
 """
 
 import json
@@ -415,7 +426,17 @@ def test_a_resize_the_operator_asked_for_is_debounced():
     phone. Uncoalesced, that burst is a round trip and a reflow per event."""
     text = _read(TERMINAL)
     assert "RESIZE_DEBOUNCE_MS" in text
-    assert "setTimeout(applyGeometry, RESIZE_DEBOUNCE_MS)" in text
+    # The debounce schedules a pass rather than the fit directly since #211 —
+    # a return to the view wants the same coalescing and an extra repaint — so
+    # what this pins is that the resize path still goes through the debounce and
+    # that the pass it schedules is the one that fits.
+    assert "setTimeout(runGeometryPass, RESIZE_DEBOUNCE_MS)" in text
+    assert "applyGeometry()" in _function_body(text, "function runGeometryPass"), (
+        "the debounced pass no longer fits, so a rotation reflows nothing"
+    )
+    assert "scheduleGeometryPass(false)" in _function_body(
+        text, "function onWindowResize",
+    ), "a window resize no longer goes through the debounce"
     assert "window.addEventListener('resize'" in text
     assert "window.removeEventListener('resize'" in text, "listener outlives the view"
     opened = _function_body(text, "function handleFrame")
@@ -1387,6 +1408,146 @@ def test_a_sliver_fit_is_dropped_never_clamped():
             and "clampDimension(term.cols, MIN_COLS)" in text), (
         "each axis is checked against its own floor before a resize is sent"
     )
+
+
+# --- coming back to the view (#211) -------------------------------------------
+#
+# Reported as "terminal view glitches when coming back to the tab, resizing the
+# terminal fixes the issue". Driving the bundled xterm (6.0.0) and fit addon
+# (0.11.0) in a real browser found two separate things, and the run's findings.md
+# holds the measurements:
+#
+#   - fit() does NOTHING when the box proposes the size the emulator already has.
+#     Not a resize, not even a renderer clear. So a rendering that went stale
+#     while this was off screen stays on screen, and a dimension change is the
+#     only thing in that library that redraws it — which is what "resizing fixes
+#     it" was telling us. With the buffer intact and the rows garbled, fit()
+#     repaired nothing and refresh() restored them exactly.
+#   - the sliver floor was only ever applied to the *reported* geometry. fit()
+#     was still handed a 2-column proposal, and it takes it: the buffer rewraps,
+#     the trailing line loses its text, and the emulator can settle at a size the
+#     box does not propose and stay there — a terminal wider than its own
+#     viewport until somebody resizes something.
+#
+# Neither has a symptom a build would show, which is why they are pinned here.
+
+def test_the_local_fit_is_floored_too_not_only_the_report():
+    """The 2026-07-29 sliver finding was half-applied, and this is the other half.
+
+    ``reportGeometry`` dropping a below-floor reading protects the *PTY*: nothing
+    is written on behalf of a mid-transition layout. It does nothing for this
+    client, because ``fit()`` was already called with that same proposal — and
+    ``fit()`` resizes the emulator to whatever it is given. Measured: a 40px-wide
+    box proposes 2 columns and the emulator becomes 2 columns wide; fitting back
+    afterwards does not restore the screen, and a repaint cannot either, because
+    a rewrap is damage to the buffer rather than to the rendering.
+
+    So the floor has to be checked BEFORE ``fit()``, and against the same
+    constants — two floors that can drift apart would be worse than one.
+    """
+    text = _read(TERMINAL)
+    body = _function_body(text, "function applyGeometry")
+    assert "proposeDimensions()" in body, (
+        "applyGeometry hands fit() whatever the box says without measuring first"
+    )
+    assert "plausibleGeometry(fit.proposeDimensions())" in body
+    assert body.index("plausibleGeometry") < body.index("fit.fit()"), (
+        "the floor is checked after the fit, which is the same as not at all"
+    )
+    predicate = _function_body(text, "function plausibleGeometry")
+    assert ("clampDimension(dims.cols, MIN_COLS)" in predicate
+            and "clampDimension(dims.rows, MIN_ROWS)" in predicate), (
+        "the local fit uses its own floor instead of the one reportGeometry uses"
+    )
+
+
+def test_returning_to_the_view_produces_an_event_at_all():
+    """A return that resizes nothing produced nothing: no ``resize``, no
+    ``ResizeObserver`` callback, and a ``fit()`` that would no-op anyway.
+
+    Both events, and the guard, for the reason ``App.vue``'s ``refetchOnReturn``
+    takes both: switching apps on a phone fires ``visibilitychange`` with no
+    focus event, a window raised over another fires ``focus`` without having been
+    hidden, and ``visibilitychange`` also fires on the way *out* — where doing
+    this work would repaint a pane nobody is looking at.
+    """
+    text = _read(TERMINAL)
+    body = _function_body(text, "function onReturnToView")
+    assert "document.visibilityState === 'hidden'" in body, (
+        "the handler runs on the way out of the view as well as back into it"
+    )
+    assert body.index("visibilityState") < body.index("scheduleGeometryPass"), (
+        "the guard does not precede the work"
+    )
+    assert "scheduleGeometryPass(true)" in body, "a return asks for no repaint"
+    for target, event in (
+        ("document", "visibilitychange"),
+        ("window", "focus"),
+    ):
+        assert f"{target}.addEventListener('{event}', onReturnToView)" in text, (
+            f"nothing listens for {event}"
+        )
+        # These two hang off document/window, so disposing the element does not
+        # take them with it: left behind they fire for the life of the tab and
+        # repaint a terminal that is gone.
+        assert f"{target}.removeEventListener('{event}', onReturnToView)" in text, (
+            f"the {event} listener outlives the view"
+        )
+
+
+def test_a_return_repaints_and_a_repaint_is_never_a_resize():
+    """The repaint is the whole point of the return, and it must stay local.
+
+    A resize is a write to a PTY the session owns and it reflows that session's
+    TUI for everyone attached — so forcing one to fix *this* client's rendering
+    would change the session for every other watcher. The operator asked for a
+    forced resize and settled on this instead (2026-08-03); a later change that
+    turns it back into a resize gives that decision away silently.
+
+    ``refresh`` also cannot be swapped for a ``start()``: re-reading the log
+    re-attaches the socket and drops the scrollback the operator was reading.
+    """
+    text = _read(TERMINAL)
+    body = _function_body(text, "function runGeometryPass")
+    assert "term.refresh(0, term.rows - 1)" in body, "the return repaints nothing"
+    assert "term.resize" not in text, "a resize forced from the client is back"
+    assert "type: 'resize'" not in body, (
+        "the return-to-view pass builds its own resize frame, bypassing the "
+        "opt-in gate in reportGeometry"
+    )
+    assert "start()" not in body, (
+        "a repaint became a re-attach, which drops the scrollback and spends a "
+        "ticket"
+    )
+
+
+def test_a_return_that_coalesces_with_a_resize_keeps_its_repaint():
+    """Both callers share one debounce, and they want different things from it.
+
+    Returning to the app while the phone rotates is one gesture that fires both,
+    and whichever landed last would otherwise decide: a resize arriving after a
+    return would replace the pending pass with one that only fits — and fitting
+    is precisely what does nothing when the box has not changed. So the repaint is
+    remembered on the pass rather than baked into the callback, and it is cleared
+    once it has been performed.
+    """
+    text = _read(TERMINAL)
+    assert "let repaintPending = false" in text
+    schedule = _function_body(text, "function scheduleGeometryPass")
+    assert "if (withRepaint) repaintPending = true" in schedule, (
+        "a scheduled repaint can be cancelled by a later resize"
+    )
+    body = _function_body(text, "function runGeometryPass")
+    assert "repaintPending = false" in body, (
+        "the flag is never cleared, so every later resize repaints too"
+    )
+    assert body.index("const repaint = repaintPending") < body.index("applyGeometry()")
+    # The pass is torn down with the view and restarted with the terminal, and a
+    # flag left standing across either would repaint something else's terminal.
+    for owner in ("onBeforeUnmount(()", "async function start"):
+        assert "repaintPending = false" in _function_body(text, owner), (
+            f"{owner} leaves a repaint pending"
+        )
 
 
 def test_an_unfocused_terminal_says_so_where_the_keyboard_is_real():
