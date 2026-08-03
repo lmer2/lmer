@@ -264,6 +264,11 @@ let cursor = 0
 let attempt = 0
 let reconnectTimer = null
 let resizeTimer = null
+// Whether the pending geometry pass owes a repaint. Separate from the timer
+// because the two callers want different things from the same debounce: a resize
+// needs the fit, a return needs the repaint, and a return must not lose its
+// repaint to a resize that landed in the same window.
+let repaintPending = false
 // Reset per connection, not per component: a reconnect is a fresh chance for the
 // plane to be up, and carrying the count over would spend the budget on the
 // attempt that was always going to fail.
@@ -538,6 +543,19 @@ function clampDimension(value, floor) {
   return Math.min(Math.round(value), MAX_DIMENSION)
 }
 
+// Whether a proposed geometry is one this component will act on at all — the same
+// question for the local fit as for the report, so there is one definition of
+// "below the floor" and not two that can drift apart.
+//
+// NaN is a real answer here and not a defensive check: proposeDimensions() reports
+// it for a box it cannot measure, which is every hidden panel. clampDimension
+// answers 0 for it, like every other unusable reading.
+function plausibleGeometry(dims) {
+  return !!dims
+    && clampDimension(dims.cols, MIN_COLS) > 0
+    && clampDimension(dims.rows, MIN_ROWS) > 0
+}
+
 function reportGeometry() {
   // The single gate on writing to a shared PTY. Nothing else in this component
   // sends a resize frame, so opting out here is the whole guarantee that watching
@@ -567,6 +585,19 @@ function applyGeometry() {
   // from a box with no width, and reporting from there would write a stale size
   // to the PTY on behalf of a pane nobody is looking at.
   if (!fit || !host.value?.clientWidth) return
+  // The floor is measured BEFORE the local fit, not only before the report. Half
+  // of this was missing: reportGeometry() has dropped below-floor readings since
+  // 2026-07-29, so a sliver never reached the PTY — but fit() was still handed
+  // one, and it resizes this emulator to whatever it is given. A 40px-wide box
+  // proposes 2 columns, and 2 columns rewraps the buffer: fitting back afterwards
+  // does not undo it (the trailing line — the prompt — loses its text), a repaint
+  // cannot either, and the emulator can settle at a size the box does not propose
+  // and stay there, since nothing resizes again to correct it. That last one is a
+  // terminal wider than its own viewport until the operator resizes something.
+  // A below-floor reading means "the box is not laid out yet", and the answer to
+  // that is the same here as it is there: silence, and the next real layout
+  // reports the real size.
+  if (!plausibleGeometry(fit.proposeDimensions())) return
   // The local half runs whether or not the session is ever told about it — the
   // emulator has to lay out for the box it is in.
   fit.fit()
@@ -604,9 +635,56 @@ function setResizeOptIn(enabled) {
   if (resizeOptIn.value) applyGeometry()
 }
 
-function onWindowResize() {
+// One debounced pass for both of the things that ask for one, so a return that
+// arrives with a resize (rotating the phone while switching back to the app) is
+// one pass rather than two — and so the repaint a return asked for is not lost to
+// a resize that coalesced with it.
+function scheduleGeometryPass(withRepaint) {
+  if (withRepaint) repaintPending = true
   clearTimeout(resizeTimer)
-  resizeTimer = setTimeout(applyGeometry, RESIZE_DEBOUNCE_MS)
+  resizeTimer = setTimeout(runGeometryPass, RESIZE_DEBOUNCE_MS)
+}
+
+function runGeometryPass() {
+  const repaint = repaintPending
+  repaintPending = false
+  applyGeometry()
+  // The repaint is what a return is FOR, and it is the half a re-fit cannot cover:
+  // fit() does nothing at all when the box proposes the size the emulator already
+  // has — it does not even clear the renderer (@xterm/addon-fit 0.11.0) — so a
+  // rendering that went stale while this was not on screen stays exactly as it
+  // was. Which is what "resizing the terminal fixes it" was saying all along: a
+  // dimension change is the only thing in that library that clears and redraws.
+  //
+  // A repaint and NOT a resize, deliberately (operator decision, 2026-08-03): a
+  // resize is a write to a PTY the session owns and it reflows that session's TUI
+  // for everyone attached, so forcing one to fix *this* client's rendering would
+  // change the session for every other watcher. refresh() is local, cannot fail,
+  // and the session cannot tell it happened.
+  //
+  // What it cannot do is repair the buffer. If the garbled output is what the
+  // session actually sent, this redraws it faithfully — only the session drawing
+  // again fixes that, and asking it to is the operator's Ctrl-L, not ours.
+  if (repaint && term) term.refresh(0, term.rows - 1)
+}
+
+function onWindowResize() {
+  scheduleGeometryPass(false)
+}
+
+// Coming back to the view, which no resize event covers: switching browser tabs —
+// or apps on a phone — resizes nothing, so `resize` and the ResizeObserver both
+// stay silent, and the box proposing the size it already had means fit() is inert
+// too. Meanwhile a backgrounded tab is exactly where xterm may not have rendered
+// at all, since requestAnimationFrame does not run there.
+//
+// Both events, for the reason App.vue's refetchOnReturn takes both: switching apps
+// on a phone fires visibilitychange with no focus event, and a desktop window
+// raised over another fires focus without ever having been hidden. The double fire
+// one gesture causes is what the debounce is for.
+function onReturnToView() {
+  if (document.visibilityState === 'hidden') return
+  scheduleGeometryPass(true)
 }
 
 function sendInput(data, appendNewline = false) {
@@ -871,6 +949,9 @@ async function start() {
   const mine = generation
   teardownSocket()
   clearTimeout(resizeTimer)
+  // The cancelled pass took its repaint with it, and a restart repaints anyway:
+  // buildTerminal() draws the replay into a terminal it just created.
+  repaintPending = false
   finished = false
   attempt = 0
   cursor = 0
@@ -944,6 +1025,8 @@ function hideLaunch() {
 
 onMounted(() => {
   window.addEventListener('resize', onWindowResize)
+  document.addEventListener('visibilitychange', onReturnToView)
+  window.addEventListener('focus', onReturnToView)
   // The window is not the only thing that changes this box. The terminal lives in
   // a tab panel that is display:none while the conversation is showing, so a
   // rotation there resizes nothing measurable and leaves the emulator laid out
@@ -958,9 +1041,15 @@ onBeforeUnmount(() => {
   disposed = true
   generation += 1
   window.removeEventListener('resize', onWindowResize)
+  // These two are on `document` and `window`, so nothing takes them with the
+  // element: left registered, they would fire for the life of the tab and repaint
+  // a terminal that has been disposed.
+  document.removeEventListener('visibilitychange', onReturnToView)
+  window.removeEventListener('focus', onReturnToView)
   boxWatcher.disconnect()
   boxWatcher = null
   clearTimeout(resizeTimer)
+  repaintPending = false
   teardownSocket()
   if (term) term.dispose()
   term = null

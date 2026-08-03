@@ -1,0 +1,13 @@
+fixed:
+- "control UI: the run terminal no longer garbles itself. Coming back to the\
+  \ browser tab now repaints the emulator — previously nothing at all happened\
+  \ on return (no resize event fires, and the fit addon does nothing when the box\
+  \ is unchanged), so a rendering that went stale while the tab was in the\
+  \ background stayed on screen until the operator resized something. The repaint\
+  \ is local: it never writes a size to the session's PTY, so it cannot reflow the\
+  \ session for anyone else watching it."
+- "control UI: a mid-transition layout (a tab panel or drawer part-way through\
+  \ opening) can no longer shrink the run terminal to two columns. The floor that\
+  \ already stopped such a reading from being sent to the session now also stops\
+  \ the emulator itself from taking it — it used to rewrap its own scrollback\
+  \ to the sliver width and lose the prompt line, which no later resize put back."
