@@ -1238,6 +1238,145 @@ class TestSessionLog:
         assert (tmp_path / supervisor.SESSION_LOG_NAME).read_bytes() == b"history"
 
 
+class TestWriteAll:
+    """A message reaches the session whole, or the write raises (issue 194).
+
+    The failure this closes is the quietest one in the delivery path: ``os.write``
+    may write less than it was given, and the *last* byte of an ``/input`` payload
+    is the submit CR — so a short write is not a slow PTY, it is a partial message
+    typed into the box and never sent, under a 200 with a byte count over it. The
+    view on the other end had no way to know (:mod:`tests.test_platform_web_chat`
+    holds that half).
+    """
+
+    def test_a_short_write_is_followed_up_until_the_payload_is_gone(self, monkeypatch):
+        chunks = []
+        real_write = supervisor.os.write
+        read_fd, write_fd = os.pipe()
+
+        def stingy(fd, data):
+            # The kernel's prerogative, made deterministic: at most 4 bytes a call.
+            # Scoped to this pipe, because ``supervisor.os`` *is* the os module —
+            # a process-wide truncation would silently clip pytest's own capture
+            # writes and the test that noticed would be some other one (same
+            # discipline as the log's fd-scoped fake above).
+            if fd != write_fd:
+                return real_write(fd, data)
+            head = bytes(data[:4])
+            chunks.append(head)
+            return real_write(fd, head)
+
+        monkeypatch.setattr(supervisor.os, "write", stingy)
+        try:
+            payload = b"a message long enough to be split, and its Enter\r"
+            written = supervisor._write_all(write_fd, payload)
+        finally:
+            monkeypatch.undo()
+            os.close(write_fd)
+            landed = os.read(read_fd, 4096)
+            os.close(read_fd)
+
+        assert landed == payload, (
+            "the session received a truncated message; the tail carries the submit"
+        )
+        assert written == len(payload), (
+            f"the reply would report {written} of {len(payload)} bytes as written"
+        )
+        assert len(chunks) > 1, "the fixture no longer forces a short write"
+
+    def test_a_write_that_moves_nothing_raises_instead_of_spinning(self, monkeypatch):
+        """A 0 the kernel should never answer must not become a wedged session: the
+        write lock is held here, so a spin would take every other writer with it.
+
+        The fake counts its own calls and gives up after a few, so losing the guard
+        surfaces as a failure rather than as a hung suite — there is no
+        ``pytest-timeout`` in this project, so an unbounded loop here would stall
+        CI instead of turning it red. Scoped to a sentinel fd for the same reason
+        the fake above is.
+        """
+        real_write = supervisor.os.write
+        sentinel = 987654
+        calls = []
+
+        def stuck(fd, data):
+            if fd != sentinel:
+                return real_write(fd, data)
+            calls.append(len(data))
+            assert len(calls) < 4, "_write_all is spinning on a zero-length write"
+            return 0
+
+        monkeypatch.setattr(supervisor.os, "write", stuck)
+        with pytest.raises(OSError) as caught:
+            supervisor._write_all(sentinel, b"xyz")
+        assert calls == [3], f"the guard did not stop at the first zero: {calls}"
+        # The diagnostic has to name how much landed, not how much was left: a
+        # message that died 43 bytes into 48 is a different repair from one that
+        # never started, and this string is what reaches the operator through
+        # ``/input``'s 500.
+        assert "0 of 3 bytes" in str(caught.value), str(caught.value)
+
+
+    def test_a_failure_part_way_through_says_how_much_landed(self, monkeypatch):
+        """The one fact nobody downstream can recover for themselves.
+
+        A write that dies between iterations — the child exiting under us — leaves
+        the front of the message typed in the session's input box. "wrote 43 of 48"
+        is the difference between that and a message the session never saw, and it
+        is what ``/input``'s 500 detail carries to the operator.
+        """
+        real_write = supervisor.os.write
+        sentinel = 987655
+        seen = []
+
+        def dies_after_the_first_chunk(fd, data):
+            if fd != sentinel:
+                return real_write(fd, data)
+            if seen:
+                raise OSError(errno.EIO, "the child is gone")
+            seen.append(True)
+            return 4
+
+        monkeypatch.setattr(supervisor.os, "write", dies_after_the_first_chunk)
+        with pytest.raises(OSError) as caught:
+            supervisor._write_all(sentinel, b"a message and its Enter\r")
+        assert "wrote 4 of 24 bytes" in str(caught.value), str(caught.value)
+
+    def test_the_control_plane_write_goes_through_the_loop(self):
+        """The wiring, not just the helper.
+
+        ``TestWriteAll`` above exercises ``_write_all`` directly and the ``/input``
+        route tests write into their own sink, so both halves can pass while the
+        supervisor's real writer calls ``os.write`` once — which is the bug. So the
+        call site itself is pinned: every writer into the child (``/input``, the
+        auto-start injection, the host TTY relay) goes through ``write_to_child``,
+        and ``write_to_child`` has to go through the loop.
+        """
+        import inspect
+
+        source = inspect.getsource(supervisor.run_supervisor)
+        assert "_write_all(master_fd, data)" in source, (
+            "write_to_child no longer writes through _write_all, so a short write "
+            "silently truncates whatever an operator typed"
+        )
+
+    def test_the_session_log_shares_the_loop(self):
+        """One implementation of "write all of it", not two.
+
+        The two had already diverged: only one refused a zero-length write, so the
+        hole this closes on the input path stayed open on the log path. A second
+        copy is how that happens again.
+        """
+        import inspect
+
+        source = inspect.getsource(supervisor.SessionLog.write)
+        assert "_write_all(" in source, (
+            "SessionLog.write hand-rolls the loop again"
+        )
+        assert "os.write(" not in source, (
+            "SessionLog.write still calls os.write directly"
+        )
+
+
 class TestEnsureSubmitCr:
     def test_appends_cr_when_missing(self):
         assert supervisor._ensure_submit_cr("hello") == "hello\r"

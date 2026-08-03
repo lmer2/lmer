@@ -101,7 +101,7 @@ function chooseOption(option) {
   draft.value += (/\s$/.test(draft.value) ? '' : ' ') + option
 }
 
-// What the field's icon and the chord are bound to. Both hand their handler an
+// What the send control and the chord are bound to. Both hand their handler an
 // event, so this takes no argument at all and reads the box itself; the guards it
 // used to carry live in `send`, which every path now goes through.
 function submit() {
@@ -168,17 +168,19 @@ function submit() {
         seconds, and carries on where it stopped.
       </v-alert>
 
-      <!-- Send is inside the field, reachable by the icon on any pointer and by
-           Ctrl+Enter (Cmd+Enter on a Mac) from a keyboard; bare Enter stays a
-           newline, because a reply to a real question is written in sentences.
-           Chat.vue's composer carries the reasoning for all three of those. The
-           button's label survives as the icon's accessible name — "reply", not
+      <!-- Send is a labelled control on its own row (`.send-row`, style.css),
+           reachable by a thumb on any device and by Ctrl+Enter (Cmd+Enter on a
+           Mac) from a keyboard; bare Enter stays a newline, because a reply to a
+           real question is written in sentences — and on a phone the return key is
+           the only way to type one. Chat.vue's composer carries the reasoning for
+           all three of those, including why the icon that used to sit in the
+           field's corner was not reachable (issue 194). The word is "reply", not
            "answer", because nothing is started here. -->
       <v-textarea
         v-model="draft"
         :disabled="busy || sent"
         label="your reply"
-        hint="Ctrl+Enter (Cmd on a Mac) sends, Enter is a new line. Goes straight to the running session — nothing is started"
+        hint="Tap send below — Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends too. Goes straight to the running session — nothing is started"
         persistent-hint
         rows="2"
         auto-grow
@@ -187,20 +189,19 @@ function submit() {
         class="mt-3"
         @keydown.ctrl.enter.prevent="submit"
         @keydown.meta.enter.prevent="submit"
-      >
-        <template #append-inner>
-          <v-btn
-            :icon="mdiSendOutline"
-            :loading="busy"
-            :disabled="!canSend"
-            color="primary"
-            variant="tonal"
-            size="small"
-            aria-label="send reply"
-            @click="submit"
-          />
-        </template>
-      </v-textarea>
+      />
+      <div class="send-row">
+        <v-btn
+          :prepend-icon="mdiSendOutline"
+          :loading="busy"
+          :disabled="!canSend"
+          color="primary"
+          variant="tonal"
+          size="large"
+          aria-label="send reply"
+          @click="submit"
+        >send reply</v-btn>
+      </div>
     </v-card-text>
   </v-card>
 </template>
