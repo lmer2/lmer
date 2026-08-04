@@ -1089,6 +1089,55 @@ def test_an_unconfirmed_submit_reaches_the_caller(
     assert "terminal view" in body["note"]
 
 
+@pytest.mark.parametrize("verdict", ["read", "unread", "unknown"])
+def test_the_text_read_verdict_reaches_the_caller(
+    client, platform_root, control_plane, verdict
+):
+    """``submit_text`` is the one half of a submit the supervisor can observe.
+
+    It says whether the harness was seen taking the text before Enter was
+    pressed (#210), which is what distinguishes "the submit may not have
+    registered" from "the message never got there" — so it travels with
+    ``submit_confirmed`` instead of being dropped at this boundary. All three
+    values are relayed as given: reducing ``unknown`` to a flag would turn "not
+    observed" into either a warning or a clean bill of health, and it is neither.
+    """
+    plant_session("s-1", port=control_plane.port)
+    control_plane.answer("/input", 200, {
+        "bytes_written": 9,
+        "submit_confirmed": False,
+        "note": "…submit it from the session's terminal view.",
+        "submit_text": verdict,
+    })
+
+    body = client.post(
+        "/api/sessions/s-1/input",
+        headers=bearer_header(),
+        json={"data": "an answer", "append_newline": True},
+    ).json()
+
+    assert body["submit_text"] == verdict
+
+
+def test_an_older_session_image_keeps_its_reply_shape(
+    client, platform_root, control_plane
+):
+    """A session whose image predates the text-read verdict reports nothing about
+    it, and the route must not invent one — an absent field reads as "this session
+    cannot tell you", while a fabricated value would read as a measurement."""
+    plant_session("s-1", port=control_plane.port)
+    control_plane.answer("/input", 200, {"bytes_written": 9})
+
+    body = client.post(
+        "/api/sessions/s-1/input",
+        headers=bearer_header(),
+        json={"data": "an answer", "append_newline": True},
+    ).json()
+
+    assert "submit_text" not in body
+    assert body == {"session": "s-1", "bytes_written": 9}
+
+
 def test_input_route_never_returns_the_session_token(
     client, platform_root, control_plane
 ):

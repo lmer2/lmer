@@ -2659,6 +2659,11 @@ def main(argv: list[str] | None = None) -> int:
         # Without this delay /start can fail to register before the prompt is
         # typed on slow systems, landing both on one input line (issue #65).
         "LMER_START_PROMPT_DELAY": os.environ.get("LMER_START_PROMPT_DELAY"),
+        # The margin between a submitted message's text and its Enter, covering
+        # what the kernel cannot answer once the harness has read the text — a
+        # harness still coalescing input in userspace (issue #210). It has to reach
+        # the in-container supervisor, or retuning that window needs a release.
+        "LMER_SUBMIT_ENTER_DELAY": os.environ.get("LMER_SUBMIT_ENTER_DELAY"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
         # only works if the container-side bind is 0.0.0.0. The host CLI

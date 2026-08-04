@@ -116,7 +116,10 @@ def fake_lmer(tmp_path):
         '  for arg in "$@"; do\n'
         '    if [ "$prev" = "--mount-dir" ]; then\n'
         "      case \"$arg\" in\n"
-        f'        *:{supervisor.CONTAINER_SESSION_LOG_DIR}:*) log_spec="$arg" ;;\n'
+        # spawn's copy of the constant, because that is what built the mount this
+        # stub is matching — the suite redirects the *writer's* copy away from the
+        # live session log (``_isolate_session_log_dir``).
+        f'        *:{spawn.CONTAINER_SESSION_LOG_DIR}:*) log_spec="$arg" ;;\n'
         "      esac\n"
         "    fi\n"
         '    prev="$arg"\n'
@@ -2048,13 +2051,19 @@ def test_the_container_log_directory_is_private_to_this_user(config):
 
 
 def test_the_container_log_mount_satisfies_lmer_s_own_validator(config):
-    """Handed to the parser that will actually read it, as with the transcript."""
+    """Handed to the parser that will actually read it, as with the transcript.
+
+    Asked of ``spawn``'s copy of the constant rather than the supervisor's: the
+    suite redirects the writer's copy away from the live session log
+    (``_isolate_session_log_dir``), and this test is about the destination the
+    command being inspected was built from.
+    """
     result = spawn.spawn_session(config, request_for())
-    spec = mount_spec_for(result.command, supervisor.CONTAINER_SESSION_LOG_DIR)
+    spec = mount_spec_for(result.command, spawn.CONTAINER_SESSION_LOG_DIR)
     specs = parse_dir_mount_specs([spec], "")
     assert len(specs) == 1
     assert specs[0].host == spawn.container_log_dir_for(result.session_id)
-    assert specs[0].container == supervisor.CONTAINER_SESSION_LOG_DIR
+    assert specs[0].container == spawn.CONTAINER_SESSION_LOG_DIR
     assert specs[0].mode == "rw", "the supervisor appends to it all session long"
 
 

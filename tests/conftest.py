@@ -410,6 +410,41 @@ def _isolate_platform_state(tmp_path_factory):
     platform_store.PLATFORM_DIR = original
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_session_log_dir(tmp_path_factory):
+    """Keep supervisor tests out of the *live* session log (#210).
+
+    ``supervisor.CONTAINER_SESSION_LOG_DIR`` is a real path, and in a session
+    that has one mounted it is the log the running supervisor is recording the
+    operator's own terminal into — which the platform serves back as that
+    session's terminal view. So every test that ran ``run_supervisor`` without
+    redirecting it appended its wrapped child's *raw PTY traffic* to what the
+    operator is looking at: 120 ``tick`` lines from the forwarding-loop test
+    alone, plus ``/start`` injections, a ^C and the escape sequences that come
+    with them, interleaved with the TUI mid-draw.
+
+    Pointed at a path that does not exist, which is the supervisor's documented
+    "nothing was mounted" case: no log is opened at all, so a test cannot leak
+    through one however it fails or is interrupted. Tests that assert *on* the
+    log point this at their own tmp dir, and their patch wins; this is the floor
+    beneath them, like the platform-state and gate-lock isolation above.
+
+    Only the *writer's* copy moves. ``lmer_platform.spawn`` imports the constant
+    by value and uses it to build a container ``--mount-dir`` — it writes nothing
+    locally, and the spawn tests bake the real value into parametrize at
+    collection time, before this fixture runs. Redirecting that copy too would
+    only make the suite assert against a divergence it created itself.
+    """
+    from lmer_cli import supervisor
+
+    original = supervisor.CONTAINER_SESSION_LOG_DIR
+    supervisor.CONTAINER_SESSION_LOG_DIR = str(
+        tmp_path_factory.mktemp("session-log") / "not-mounted"
+    )
+    yield
+    supervisor.CONTAINER_SESSION_LOG_DIR = original
+
+
 @pytest.fixture
 def project_root():
     """Get the project root directory."""

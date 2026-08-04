@@ -1370,6 +1370,14 @@ def create_app(
         if "submit_confirmed" in reply:
             answer["submit_confirmed"] = reply.get("submit_confirmed")
             answer["note"] = reply.get("note")
+        # The half of the delivery the supervisor *can* see: whether the harness was
+        # observed taking the text before Enter was pressed (#210) — ``read``,
+        # ``unread`` or ``unknown``, relayed as given rather than reduced to a flag,
+        # since "not observed" is not "observed to have failed". Only forwarded when
+        # the control plane reported it, so an older session image's reply keeps its
+        # exact shape.
+        if "submit_text" in reply:
+            answer["submit_text"] = reply.get("submit_text")
         return answer
 
     @app.get("/api/sessions/{session_id}/messages", dependencies=guard)
