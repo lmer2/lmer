@@ -55,6 +55,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import math
 import os
 import secrets
 import select
@@ -122,6 +123,71 @@ DEFAULT_AUTO_START_SETTLE_DELAY = 0.25
 # time to register before we type; fast systems simply wait this once at
 # startup. Tunable via ``--start-prompt-delay`` / ``LMER_START_PROMPT_DELAY``.
 DEFAULT_START_PROMPT_DELAY = 2.0
+
+# Margin between a submitted message's text and its Enter, on top of waiting for
+# the harness to read the text (:func:`_submit_payload`). The wait covers what
+# the kernel can answer — "has the child taken these bytes" — and this covers
+# what it cannot: a harness still coalescing input in userspace after the read, a
+# window nobody publishes. Empirical, hence tunable via
+# ``LMER_SUBMIT_ENTER_DELAY``.
+DEFAULT_SUBMIT_ENTER_DELAY = 0.2
+
+# Ceiling on that margin: the settle runs while the PTY write lock is held, so an
+# over-large value freezes the session's terminal I/O for its duration, and the
+# obvious env-var slip is milliseconds-for-seconds (``200``). One second is far
+# past any plausible coalescing window — see :func:`_resolve_submit_enter_delay`.
+SUBMIT_ENTER_DELAY_MAX = 1.0
+
+# How long the submit path waits for the harness to read the typed text before
+# pressing Enter anyway. The ceiling is set by who else waits on it, not by
+# harness behavior: the wait runs under the PTY write lock, and the platform's
+# control plane treats a slow ``/input`` as an unreachable session
+# (``session_io.CONTROL_TIMEOUT_SECONDS``, 5s). Giving up degrades to the pre-fix
+# delivery and says so (:data:`SUBMIT_TEXT_UNREAD`) rather than losing the
+# message.
+SUBMIT_DRAIN_TIMEOUT_SECONDS = 1.0
+
+# How long the forwarding loop waits before retrying a keystroke it could not
+# hand over because a submit held the write lock. Its own constant rather than a
+# borrowed one: it paces a lock retry, while the probe interval below paces a
+# kernel query, and the two coinciding today is not a reason to name them once.
+STDIN_RETRY_SECONDS = 0.001
+
+# Poll interval for that wait. A probe is an open/ioctl/close on cheap kernel
+# state, so this is set by how briefly the bytes may be visible in the queue
+# rather than by cost: the tighter it is, the more often arrival is *observed*
+# instead of falling through to :data:`SUBMIT_TEXT_UNKNOWN`.
+SUBMIT_DRAIN_POLL_SECONDS = 0.001
+
+# How long to keep looking for the written bytes to appear in the queue before
+# giving up on observing this write at all. A write to the master hands bytes to
+# a flip buffer that the line discipline picks up in *deferred* work, so the
+# queue reads zero for a moment after a write that certainly happened
+# (sub-millisecond on an idle host, wider under load). Too short only costs the
+# *observation* — the verdict becomes UNKNOWN and the Enter still goes out behind
+# the settle — whereas the old failure came from treating that unobserved zero as
+# proof.
+SUBMIT_ARRIVAL_GRACE_SECONDS = 0.25
+
+#: ``/input``'s verdict on the one half of a submit the supervisor can observe:
+#: the harness was seen taking the typed text out of the terminal's queue, so
+#: the Enter that follows cannot have been absorbed into the same read.
+SUBMIT_TEXT_READ = "read"
+
+#: The typed text was seen queued and was *still* queued when the wait ran out.
+#: The Enter was sent anyway — a wedged harness delays a message rather than
+#: swallowing it — but this is the reading that explains a message left in the
+#: input box.
+SUBMIT_TEXT_UNREAD = "unread"
+
+#: Nothing was observed about this write, and the verdict says so instead of
+#: guessing: the terminal could not be probed, the bytes never became visible in
+#: the queue (read before the first probe looked, or a flush slower than
+#: :data:`SUBMIT_ARRIVAL_GRACE_SECONDS`), or there was no text to observe. Not a
+#: failure report — most sends on a responsive session land here — but not
+#: evidence either.
+SUBMIT_TEXT_UNKNOWN = "unknown"
+
 OUTPUT_BUFFER_LIMIT = 1024 * 1024  # 1 MiB rolling buffer of child output
 
 # When the host terminal (especially VSCode's integrated terminal) hasn't
@@ -582,6 +648,332 @@ def _get_winsize(fd: int) -> Optional[tuple[int, int]]:
     return rows, cols
 
 
+def _resolve_submit_enter_delay() -> float:
+    """The submit margin from the environment, or its default.
+
+    Read at call time rather than resolved once into the options dict, which keeps
+    the value in one place and lets a test set it per case. It does **not** make a
+    host-side change visible to a running session: the only source is this
+    process's environment, fixed when the container was created, so retuning a
+    live session means restarting it (docs/LMER-CLI.md says so).
+
+    A value that is not a number, is not finite, is negative, or exceeds
+    :data:`SUBMIT_ENTER_DELAY_MAX` warns and falls back. A typo in an env var must
+    not be able to take the session's supervisor down, and silently treating one
+    as ``0`` would turn a mistake into the bug this delay exists to prevent.
+    """
+    raw = os.environ.get("LMER_SUBMIT_ENTER_DELAY")
+    if raw is None or not raw.strip():
+        return DEFAULT_SUBMIT_ENTER_DELAY
+    try:
+        value = float(raw)
+    except ValueError:
+        value = None
+    # Finite and bounded, not merely "parses as a float" — each of these got
+    # through a non-negative check and each breaks something different: ``nan``
+    # compares false against every threshold, so ``if settle > 0`` silently
+    # disabled the margin; ``inf`` (and ``1e400``) makes ``time.sleep`` raise
+    # *between* the text and the Enter, leaving the message typed and unsubmitted
+    # under a 500; ``200`` would hold the PTY write lock for three minutes.
+    if value is None or not math.isfinite(value) or not 0 <= value <= SUBMIT_ENTER_DELAY_MAX:
+        sys.stderr.write(
+            f"lmer-supervisor: ignoring LMER_SUBMIT_ENTER_DELAY={raw!r} "
+            f"(want a number of *seconds* from 0 to {SUBMIT_ENTER_DELAY_MAX}); "
+            f"using {DEFAULT_SUBMIT_ENTER_DELAY}\n"
+        )
+        return DEFAULT_SUBMIT_ENTER_DELAY
+    return value
+
+
+def _tty_input_pending(path: str) -> Optional[int]:
+    """Bytes written into the PTY that the child has **not read yet**.
+
+    ``None`` means the question could not be asked — the terminal is gone, or the
+    platform does not answer it — and callers must treat that as "unknown",
+    never as "drained".
+
+    ``TIOCINQ`` reports the line discipline's read queue, which is the child's
+    side of the terminal, so it has to be asked of the **slave**: the master's own
+    ``TIOCINQ``/``TIOCOUTQ`` answer about the other direction (and a pty master
+    reports ``0`` for its output queue unconditionally). The slave is re-opened per
+    call rather than held, because an fd kept open for the supervisor's lifetime
+    would stop the terminal hanging up when the child exits — and that hangup is
+    how the drain loop notices a finished session. ``O_NOCTTY`` so this never
+    becomes anybody's controlling terminal, ``O_NONBLOCK`` because opening a
+    terminal may wait for a carrier.
+
+    **A zero only counts in raw mode.** In canonical mode the count reports what a
+    reader could *take* — complete lines — so a half-typed line reads as zero,
+    indistinguishable from an empty queue and precisely the case that must not be
+    mistaken for "the child has it". The harness TUIs this supervisor wraps all
+    put the terminal in raw mode (that is why Enter is CR at all), so that is the
+    ordinary path; a canonical-mode child answers ``None`` for a zero instead, and
+    its submit is reported as :data:`SUBMIT_TEXT_UNKNOWN`.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        packed = fcntl.ioctl(fd, termios.TIOCINQ, b"\x00" * 4)
+        pending = struct.unpack("i", packed)[0]
+        if pending > 0:
+            # Unambiguous in either mode: bytes are queued and unread.
+            return pending
+        canonical = bool(termios.tcgetattr(fd)[3] & termios.ICANON)
+    except (OSError, termios.error):
+        return None
+    finally:
+        os.close(fd)
+    return None if canonical else 0
+
+
+def _wait_for_text_read(
+    probe: Callable[[], Optional[int]],
+    baseline: Optional[int],
+    *,
+    timeout: float = SUBMIT_DRAIN_TIMEOUT_SECONDS,
+    poll: float = SUBMIT_DRAIN_POLL_SECONDS,
+    arrival_grace: float = SUBMIT_ARRIVAL_GRACE_SECONDS,
+) -> str:
+    """Watch the bytes just written out of the terminal's input queue.
+
+    Returns one of :data:`SUBMIT_TEXT_READ`, :data:`SUBMIT_TEXT_UNREAD` or
+    :data:`SUBMIT_TEXT_UNKNOWN` — three answers rather than a bool, because
+    collapsing "nothing was observed" into either of the other two is how a guess
+    ends up presented as evidence.
+
+    *baseline* is the queue depth read **immediately before** the write being
+    watched, and arrival is **any increase** above it. That is what makes this
+    independent of the payload's size: ``TIOCINQ``'s buffer saturates at 4095
+    bytes on Linux however much was written, so a check phrased against the
+    payload's length is unsatisfiable at or above 4096 bytes — it left every large
+    message with no evidence at all. An 8000-byte write to a terminal nobody is
+    reading reports 4095, which is still an increase.
+
+    An increase cannot be another writer's bytes, since the whole submit sequence
+    runs under the PTY write lock. What does **not** hold is that *baseline*
+    captures everything queued before this write — a writer that released the lock
+    microseconds ago may still have bytes in flight. The verdict survives that
+    because :data:`SUBMIT_TEXT_READ` requires the queue to reach **zero**, which
+    our own bytes must have been consumed for.
+
+    An **unconfirmed empty queue is never** read as consumed: the queue reads zero
+    for a moment after a write that certainly happened (the line discipline is fed
+    by deferred work), and an earlier version resolved that zero with a timing
+    grace and with "the child produced some output" — either of which fires in
+    exactly the ambiguous state. So the only path to :data:`SUBMIT_TEXT_READ` runs
+    through seeing the queue grow first.
+
+    Giving up is bounded twice, because the two waits answer different questions:
+    *arrival_grace* bounds "have the bytes shown up at all" (past it, nothing can
+    be concluded — :data:`SUBMIT_TEXT_UNKNOWN`), and *timeout* bounds "has the
+    harness taken them" once they have (past it they demonstrably have not —
+    :data:`SUBMIT_TEXT_UNREAD`). Neither withholds the Enter; they only decide what
+    the caller is told.
+    """
+    if baseline is None:
+        return SUBMIT_TEXT_UNKNOWN
+    started = time.monotonic()
+    deadline = started + timeout
+    arrival_deadline = started + arrival_grace
+    arrived = False
+    while True:
+        pending = probe()
+        if pending is None:
+            # The terminal stopped answering (it went away, or it is in a mode
+            # whose count cannot carry this question). Nothing observed.
+            return SUBMIT_TEXT_UNKNOWN
+        if not arrived:
+            if pending > baseline:
+                arrived = True
+            elif time.monotonic() >= arrival_deadline:
+                return SUBMIT_TEXT_UNKNOWN
+        elif pending == 0:
+            return SUBMIT_TEXT_READ
+        if time.monotonic() >= deadline:
+            return SUBMIT_TEXT_UNREAD if arrived else SUBMIT_TEXT_UNKNOWN
+        time.sleep(poll)
+
+
+def _write_fully(
+    write: Callable[[bytes], int], data: bytes, *, target: str = "the session"
+) -> int:
+    """Write every byte of *data* through *write*, or raise saying how far it got.
+
+    ``os.write`` may write less than it was given, and on the path into a session a
+    short write is not a slow PTY — it is a message the session received the front
+    of. With the Enter now a write of its own, a truncated text write would leave a
+    partial message that then gets *submitted*, and nothing downstream can tell.
+
+    *target* only names the destination in the failure text, so a caller holding a
+    descriptor can say which one (:func:`_write_all` is this loop with an fd).
+
+    The ``count <= 0`` branch cannot fire on a blocking descriptor — ``os.write``
+    completes, blocks, or raises — and is kept because a callable makes no such
+    promise. The hazard in the other direction is not addressed here: a large
+    payload to a master whose child is not reading blocks *inside* ``os.write``
+    with the write lock held, which no timeout bounds (measured on this host: the
+    master accepted ~11.7 KB of unconsumed input before blocking).
+    """
+    view = memoryview(data)
+    written = 0
+    while view:
+        try:
+            count = write(view)
+        except OSError as exc:
+            # How much landed rides on the failure, because it is the fact nobody
+            # downstream can recover: "wrote 43 of 48" is the difference between a
+            # partial message typed in the box and nothing at all.
+            raise OSError(
+                exc.errno,
+                f"{exc.strerror or exc}: wrote {written} of {len(data)} bytes "
+                f"to {target}",
+            ) from exc
+        if count <= 0:
+            raise OSError(
+                errno.EIO,
+                f"wrote {written} of {len(data)} bytes to {target} "
+                f"({count} on the last call)",
+            )
+        written += count
+        view = view[count:]
+    return written
+
+
+def _ends_with_submit_cr(payload: str) -> bool:
+    """Whether *payload* already carries its own Enter.
+
+    The single predicate behind both directions of the trailing-CR convention —
+    :func:`_ensure_submit_cr` appends one for the auto-start injections, and
+    :func:`_split_submit_cr` peels it off for the two-write submit — so the two
+    cannot disagree about what "already submitted" means.
+
+    A trailing **LF** is not a submit: in raw mode it is a literal newline in the
+    input box, so it stays in the text and the Enter goes behind it.
+    """
+    return payload.endswith("\r")
+
+
+def _split_submit_cr(payload: str) -> str:
+    """The text to type, with any Enter the caller already supplied removed.
+
+    The Enter itself is not returned because it is invariant — it is always
+    :data:`_SUBMIT_CR`. An earlier version returned it alongside the text, which
+    advertised a variable that could not vary.
+    """
+    return payload[:-1] if _ends_with_submit_cr(payload) else payload
+
+
+def _submit_payload(
+    write: Callable[[bytes], int],
+    payload: str,
+    *,
+    probe: Optional[Callable[[], Optional[int]]] = None,
+    settle: float = DEFAULT_SUBMIT_ENTER_DELAY,
+    drain_timeout: float = SUBMIT_DRAIN_TIMEOUT_SECONDS,
+) -> tuple[int, str]:
+    """Type *payload*, then press Enter **as a write of its own**.
+
+    Returns ``(bytes_written, verdict)``, the verdict being one of
+    :data:`SUBMIT_TEXT_READ`, :data:`SUBMIT_TEXT_UNREAD`,
+    :data:`SUBMIT_TEXT_UNKNOWN` — what was observed about the harness taking the
+    text, never a claim about the submit itself, which this process cannot see.
+
+    Why the Enter cannot ride along in the same write (issue #210): a harness TUI
+    classifies each stdin read as *typing* or as a *paste*, and inside a paste
+    ``\r`` is a newline character rather than the Enter key. One write arrives as
+    one read, so a long enough message and its CR are read as a paste and the text
+    lands in the input box, unsent.
+
+    Two writes are not enough on their own — issued back to back they still reach
+    the child in one read, and a *timed* gap is a guess about when the child will
+    next be scheduled — hence the wait. The measurements behind that are in the
+    run's evidence document: they are host-specific numbers, and what this code
+    depends on is the ordering, not their values.
+
+    The text is **one write**, and the whole of it is what the wait watches. Do not
+    split off a tail to measure instead: a byte offset into UTF-8 severs a
+    multi-byte character across two reads, and the extra wait doubles a lock-hold
+    budget the platform's control timeout depends on. What one write gives up:
+    above the queue's 4095-byte ceiling, the moment the queue reads
+    zero there can still be bytes in the kernel's flip buffer, so the Enter can end
+    up in the same read as those. That window is the flush latency the arrival grace
+    is sized for, it only exists for messages past the ceiling, and it degrades to
+    the pre-fix symptom (a message left in the box) rather than to a wrong action —
+    the same trade the settle carries. #231 tracks those large-payload cases.
+
+    *settle* is the margin on top, for the part the kernel cannot answer: the
+    harness has the bytes but may still be coalescing in userspace, and nothing
+    about that is published (``LMER_SUBMIT_ENTER_DELAY``).
+
+    A payload that is only an Enter (an operator answering a dialog) is written
+    immediately: there is no text to be pasted, so there is nothing to wait for
+    and nothing observed — no wait, no settle, and ``unknown``.
+    """
+    text = _split_submit_cr(payload)
+    if not text:
+        return write(_SUBMIT_CR), SUBMIT_TEXT_UNKNOWN
+    data = text.encode("utf-8")
+    if probe is None:
+        # No terminal to ask: the settle carries the gap alone, which is weaker,
+        # and the verdict says so rather than implying more.
+        written = _write_fully(write, data)
+        if settle > 0:
+            time.sleep(settle)
+        return written + write(_SUBMIT_CR), SUBMIT_TEXT_UNKNOWN
+
+    baseline = probe()
+    written = _write_fully(write, data)
+    verdict = _wait_for_text_read(probe, baseline, timeout=drain_timeout)
+    if settle > 0:
+        time.sleep(settle)
+    return written + write(_SUBMIT_CR), verdict
+
+
+def _make_submit(
+    fd: int,
+    write_lock: "threading.Lock",
+    slave_path: Optional[str],
+    *,
+    drain_timeout: float = SUBMIT_DRAIN_TIMEOUT_SECONDS,
+) -> Callable[[str], tuple[int, str]]:
+    """A submit closure for one PTY: types a message and presses Enter, atomically.
+
+    The lock is held across the *whole* sequence — the text, the wait for the child
+    to read it, the settle, and the CR. That is why this exists instead of the
+    control plane composing two writes of its own: the pause between a message and
+    its Enter is exactly a window in which another writer (a second ``/input``, a
+    keystroke from the terminal view, the forwarding loop) would have its bytes
+    submitted as part of this message.
+
+    The hold is bounded by *drain_timeout* plus the settle, both ceilings set by who
+    waits on it rather than by harness behavior — see
+    :data:`SUBMIT_DRAIN_TIMEOUT_SECONDS` and :data:`SUBMIT_ENTER_DELAY_MAX`. The
+    forwarding loop does not pay it: it hands its stdin bytes over with a
+    try-acquire and keeps draining the master meanwhile, so a submit in progress
+    cannot stop the child's output from being read (which would deadlock the very
+    drain being waited for).
+
+    *slave_path* of ``None`` — a terminal that could not name itself — leaves the
+    settle to carry it alone, and the verdict is :data:`SUBMIT_TEXT_UNKNOWN` so
+    nobody downstream reads a weaker delivery as a stronger one.
+    """
+    probe = None if slave_path is None else lambda: _tty_input_pending(slave_path)
+
+    def submit(payload: str) -> tuple[int, str]:
+        with write_lock:
+            return _submit_payload(
+                lambda data: os.write(fd, data),
+                payload,
+                probe=probe,
+                settle=_resolve_submit_enter_delay(),
+                drain_timeout=drain_timeout,
+            )
+
+    return submit
+
+
 def _pick_ports(port_range: tuple[int, int], host: str, count: int) -> list[int]:
     """Pick ``count`` distinct free ports from the inclusive range.
 
@@ -675,12 +1067,23 @@ def _build_fastapi_app(
     *,
     resize: Optional[Callable[[int, int], None]] = None,
     get_winsize: Optional[Callable[[], Optional[tuple[int, int]]]] = None,
+    submit: Optional[Callable[[str], tuple[int, str]]] = None,
 ):
     """Construct the FastAPI app exposing ``/input``, ``/output`` and ``/resize``.
 
     ``write_input`` is called with the bytes to deliver to the wrapped
     process's stdin. ``token`` gates every endpoint via the
     ``Authorization: Bearer <token>`` header.
+
+    ``submit`` delivers a message *and its Enter* — the two-write sequence
+    :func:`_submit_payload` documents — as one indivisible operation. It is a
+    separate callable rather than something this app composes out of ``write_input``
+    because only the owner of the PTY write lock can close the window the pause
+    between the text and the CR opens. Optional because the app predates it and
+    callers with no terminal behind them (tests) pass three positional arguments;
+    then the sequence is composed here over ``write_input``, unlocked and with no
+    drain probe, and reports a ``submit_text`` verdict of ``unknown`` rather than
+    pretending otherwise.
 
     ``/resize`` is for sessions with no host TTY behind them: a browser-rendered
     terminal inherits whatever geometry the PTY was created with and has no
@@ -708,6 +1111,14 @@ def _build_fastapi_app(
 
     app = FastAPI(title="lmer claude supervisor", version="1")
 
+    def _unlocked_submit(payload: str) -> tuple[int, str]:
+        """Fallback for an app with no terminal behind it — see ``submit`` above."""
+        return _submit_payload(
+            write_input, payload, settle=_resolve_submit_enter_delay()
+        )
+
+    submit_payload = submit if submit is not None else _unlocked_submit
+
     def _check_auth(authorization):
         expected = f"Bearer {token}"
         if not authorization or not secrets.compare_digest(authorization, expected):
@@ -725,14 +1136,19 @@ def _build_fastapi_app(
         if not body.append_newline:
             return {"bytes_written": write_input(payload.encode("utf-8"))}
 
-        # Type it and submit it, ONCE. No follow-up "nudge" CRs on this path —
-        # see :data:`_SUBMIT_UNCONFIRMED_NOTE` for the whole of why, in short:
-        # a bare CR is a no-op only against an empty input box with no dialog on
-        # screen, and this handler cannot see the screen. The auto-start path
-        # nudges because it waits for an observed readiness marker first and runs
-        # before the session can raise a permission prompt at all; this one runs
+        # Type it and submit it, ONCE — and with the Enter as a write of its own,
+        # because a CR glued to the text is read as part of a paste and inserted
+        # as a newline instead of submitting (#210; :func:`_submit_payload` has
+        # the mechanism and the measurements).
+        #
+        # Still exactly one Enter, and still no follow-up "nudge" CRs — see
+        # :data:`_SUBMIT_UNCONFIRMED_NOTE` for the whole of why, in short: a bare
+        # CR is a no-op only against an empty input box with no dialog on screen,
+        # and this handler cannot see the screen. The auto-start path nudges
+        # because it waits for an observed readiness marker first and runs before
+        # the session can raise a permission prompt at all; this one runs
         # mid-session, which is exactly when one is up.
-        written = write_input(_ensure_submit_cr(payload).encode("utf-8"))
+        written, submit_text = submit_payload(payload)
         # Said in the reply rather than assumed away: the CR went to the PTY, and
         # whether the TUI registered it as a submit is not something this process
         # observes. A caller that wants certainty has the terminal view.
@@ -740,6 +1156,12 @@ def _build_fastapi_app(
             "bytes_written": written,
             "submit_confirmed": False,
             "note": _SUBMIT_UNCONFIRMED_NOTE,
+            # The one half of the delivery this process can see, and the half that
+            # explains a message left in the box: with the text observed read, the
+            # Enter behind it cannot have been swallowed by the paste this bug is
+            # about. Three values rather than a flag, so "not observed" is read as
+            # neither a failure nor a clean delivery — see :data:`SUBMIT_TEXT_READ`.
+            "submit_text": submit_text,
         }
 
     @app.get("/output", response_model=_OutputResponse)
@@ -1213,48 +1635,13 @@ _SUBMIT_UNCONFIRMED_NOTE = (
 def _write_all(fd: int, data: bytes) -> int:
     """Write every byte of *data* to *fd*, returning how many that was.
 
-    ``os.write`` is allowed to write less than it was given, and a short write on
-    the path into a session is not a slow PTY — it is a message the session
-    received the front of. The tail is the half that matters: an ``/input``
-    payload's last byte is its submit CR (:func:`_ensure_submit_cr`), so a
-    truncated write leaves a partial message typed and *unsent*, under a 200 and a
-    byte count that looks like a delivery. Nothing downstream can tell, which is
-    the property that makes this worth a loop rather than a comment —
-    :meth:`SessionLog.write` loops for the same reason, and says so.
-
-    The master fd is blocking today, so this closes a hole rather than a reported
-    bug. The count is the caller's, not the kernel's per-call answer: ``/input``
-    reports it as ``bytes_written``, and a number smaller than what was posted
-    would be the one visible symptom of a payload that never fully landed.
+    :func:`_write_fully`'s loop with a descriptor — see there for why a short write
+    on this path is a correctness problem rather than a slow one, and for the
+    blocking-write hazard it does not close. Kept as a name because the callers
+    that hold an fd (:meth:`SessionLog.write`, ``write_to_child``) should not each
+    build a closure.
     """
-    view = memoryview(data)
-    written = 0
-    while view:
-        try:
-            chunk = os.write(fd, view)
-        except OSError as exc:
-            # How much landed rides on the failure, because it is the fact nobody
-            # downstream can recover: a write that dies part-way through (the child
-            # exiting between iterations) leaves the front of the message typed in
-            # the session's box, and "wrote 43 of 48" is the difference between
-            # that and nothing at all. ``/input`` surfaces this as its 500 detail.
-            raise OSError(
-                exc.errno,
-                f"{exc.strerror or exc}: wrote {written} of {len(data)} bytes "
-                f"to fd {fd}",
-            ) from exc
-        # A blocking fd does not answer 0 for a non-empty buffer — but a loop that
-        # trusted it to would spin forever holding the write lock rather than fail,
-        # and this is the one write path an operator's message goes through.
-        if chunk <= 0:
-            raise OSError(
-                errno.EIO,
-                f"wrote {written} of {len(data)} bytes to fd {fd} "
-                f"({chunk} on the last call)",
-            )
-        written += chunk
-        view = view[chunk:]
-    return written
+    return _write_fully(lambda chunk: os.write(fd, chunk), data, target=f"fd {fd}")
 
 
 def _ensure_submit_cr(payload: str) -> str:
@@ -1445,6 +1832,7 @@ def run_supervisor(
     *,
     stdin_fd: Optional[int] = None,
     stdout_fd: Optional[int] = None,
+    write_lock: Optional["threading.Lock"] = None,
 ) -> int:
     """Run the supervisor loop.
 
@@ -1494,6 +1882,16 @@ def run_supervisor(
 
     master_fd, slave_fd = os.openpty()
 
+    # The slave's path, captured while we still hold an fd on it: the submit path
+    # re-opens it to ask how much of a typed message the child has not read yet
+    # (:func:`_tty_input_pending`), and after the fork below this process has no
+    # slave fd left to derive the name from. ``None`` if the terminal cannot name
+    # itself, which only costs the drain probe — the submit still happens.
+    try:
+        slave_path: Optional[str] = os.ttyname(slave_fd)
+    except OSError:
+        slave_path = None
+
     # Pre-clear ICRNL/ECHO/ICANON before fork so the auto-/start injection that
     # fires shortly after spawn isn't mangled by the PTY's default cooked-mode
     # line discipline. Skipped under --manual-start since nothing is injected.
@@ -1526,11 +1924,48 @@ def run_supervisor(
     # All writes to master_fd go through this lock so concurrent writers —
     # FastAPI's POST /input, the auto-/start timer, and the main forwarding
     # loop — never interleave bytes within a single payload.
-    write_lock = threading.Lock()
+    #
+    # Injectable so a test can hold it from outside and exercise the contended
+    # path: without a seam, the forwarding loop's try-acquire is indistinguishable
+    # from the blocking write it replaced. A lock passed in must be *unheld*, since
+    # every write to the child waits on it.
+    if write_lock is None:
+        write_lock = threading.Lock()
 
     def write_to_child(data: bytes) -> int:
         with write_lock:
             return _write_all(master_fd, data)
+
+    def try_write_to_child(data: bytes) -> Optional[int]:
+        """Forward *data* only if the lock is free. ``None`` means "try later".
+
+        For the one caller that must not block: the forwarding loop is a single
+        ``select`` loop, so a caller waiting on the write lock is a loop that has
+        stopped draining ``master_fd``. If the master's buffer fills meanwhile the
+        child blocks in ``write()``, therefore stops reading its stdin, therefore
+        cannot perform the read a submit is at that moment waiting for — the wait
+        would run to its timeout on a session that was working fine.
+
+        Only the wait on the *lock* is removed. The write itself is still a blocking
+        ``os.write``, so a master whose child has stopped reading can block here
+        once its buffers fill (~11.7 KB of unconsumed input on this host), with the
+        lock held. That tail case needs a non-blocking write and an output-side
+        buffer, and is not closed here.
+
+        Returns the bytes accepted so a short write can be retried rather than
+        silently dropping its tail.
+        """
+        if not write_lock.acquire(blocking=False):
+            return None
+        try:
+            return os.write(master_fd, data)
+        finally:
+            write_lock.release()
+
+    # Types a message and presses Enter as two writes with nothing able to land
+    # between them — see :func:`_make_submit`, which owns that guarantee and is
+    # tested on it directly.
+    submit_to_child = _make_submit(master_fd, write_lock, slave_path)
 
     # The FastAPI control plane touches the PTY's geometry through these two
     # closures instead of being handed the fd, so the app never has to know it
@@ -1554,6 +1989,7 @@ def run_supervisor(
             fastapi_token,
             resize=set_child_winsize,
             get_winsize=get_child_winsize,
+            submit=submit_to_child,
         )
         server_thread, fastapi_shutdown = _start_fastapi_server(app, fastapi_host, fastapi_port)
         # Status line carries only host + port (no secret value): the bearer
@@ -1630,13 +2066,29 @@ def run_supervisor(
     )
 
     stdin_open = True
+    # Host keystrokes (and the EOF marker) that could not be handed over while a
+    # submit held the write lock. They wait here rather than being written with a
+    # blocking acquire, so this loop keeps draining master_fd throughout — see
+    # :func:`try_write_to_child` for why a blocked loop is worse than a delayed
+    # keystroke. Ordering is preserved: the buffer is retried from its front, and
+    # stdin is left out of the select set while anything is queued, so a later
+    # keystroke cannot overtake an earlier one.
+    pending_stdin = b""
     try:
         while True:
             watch = [master_fd]
-            if stdin_open:
+            # Nothing to read stdin *for* while a keystroke is still waiting on
+            # the lock: stop selecting on it so the loop spins on master_fd
+            # instead of re-reading input it cannot yet deliver.
+            if stdin_open and not pending_stdin:
                 watch.append(stdin_fd)
             try:
-                rlist, _, _ = select.select(watch, [], [])
+                # A held-back keystroke needs a wake-up that does not depend on
+                # either fd becoming readable, since the thing being waited for is
+                # a lock release.
+                rlist, _, _ = select.select(
+                    watch, [], [], STDIN_RETRY_SECONDS if pending_stdin else None
+                )
             except InterruptedError:
                 continue
             except OSError as exc:
@@ -1668,16 +2120,26 @@ def run_supervisor(
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    # EOF on stdin: send EOT so a line-mode child can react,
-                    # then stop forwarding stdin. We keep the PTY master open
-                    # so the child isn't hit with SIGHUP, and continue
-                    # streaming any remaining output until the child exits.
-                    with contextlib.suppress(OSError):
-                        write_to_child(b"\x04")
+                    # EOF on stdin: send EOT so a line-mode child can react, then
+                    # stop forwarding stdin. The PTY master stays open so the child
+                    # isn't hit with SIGHUP, and remaining output keeps streaming
+                    # until it exits. Queued through the same buffer rather than
+                    # written blocking: "no further input to lose" answers input
+                    # loss, but blocking here would stop draining master_fd, which
+                    # is the chain the try-acquire exists to break.
+                    pending_stdin += b"\x04"
                     stdin_open = False
-                    continue
+                else:
+                    pending_stdin += chunk
+
+            if pending_stdin:
+                accepted = None
                 with contextlib.suppress(OSError):
-                    write_to_child(chunk)
+                    accepted = try_write_to_child(pending_stdin)
+                if accepted is not None:
+                    # A terminal may accept fewer bytes than it was handed; the
+                    # remainder stays queued instead of being dropped.
+                    pending_stdin = pending_stdin[accepted:]
     finally:
         if auto_start_thread is not None:
             auto_start_cancel.set()
