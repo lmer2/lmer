@@ -16,6 +16,7 @@ import pytest
 
 from lmer_cli.container import clone_and_exec
 from lmer_cli.harness import HARNESSES
+from tests._claude_runner_harness import run_claude_runner
 
 LIBEXEC = Path(__file__).parent.parent / "libexec"
 SRC = Path(__file__).parent.parent / "src"
@@ -434,3 +435,107 @@ class TestProvisionConfigFallback:
         target.write_text('{"from": "session"}')
         self._provision(tmp_path, tmp_path / "no-work", tmp_path / "no-global", fallback)
         assert target.read_text() == '{"from": "session"}'
+
+
+# The pin only exists where an operational tree exists; off-container (e.g.
+# upstream CI) these skip, and the substring tripwire in
+# tests/test_import_provenance.py still guards the scripts' source everywhere.
+OPERATIONAL_TREE = Path("/Agents/global/src/lmer_cli")
+
+needs_operational_tree = pytest.mark.skipif(
+    not OPERATIONAL_TREE.is_dir(),
+    reason="no operational tree at /Agents/global/src (not a session container)",
+)
+
+
+@needs_operational_tree
+class TestSupervisorPin:
+    """The runners exec the supervisor through the operational-tree pin (#236).
+
+    Behavioral, unlike the source-level tripwire: the real script runs with a
+    stub interpreter (via ``LMER_PYTHON``) and a stub ``lmer-supervisor`` on
+    PATH, and the assertion is which one was exec'd and with what argv — so
+    moving the pinned exec out of reach, breaking its guard condition, or
+    launching the console script anyway all fail here even with the pin's
+    text still present in the file.
+    """
+
+    def _stub(self, path: Path, capture: Path) -> None:
+        path.write_text(
+            "#!/bin/bash\n"
+            f'printf "%s\\n" "$@" > "{capture}"\n'
+            "exit 0\n"
+        )
+        _make_executable(path)
+
+    def _assert_pinned_argv(self, capture: Path, harness: str) -> None:
+        assert capture.exists(), "the pinned interpreter was never exec'd"
+        argv = capture.read_text().splitlines()
+        assert argv[0] == "-c"
+        assert 'sys.path.insert(0, "/Agents/global/src")' in argv[1]
+        assert "from lmer_cli.supervisor import main" in argv[1]
+        separator = argv.index("--")
+        assert argv[separator + 1] == harness, (
+            f"the wrapped command should follow '--', got {argv[separator:]}"
+        )
+
+    def test_codex_runner_execs_the_pinned_interpreter(self, tmp_path):
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        supervisor_argv = tmp_path / "supervisor_argv.txt"
+        self._stub(fake_bin / "lmer-supervisor", supervisor_argv)
+        python_argv = tmp_path / "python_argv.txt"
+        pinned_python = tmp_path / "pinned-python"
+        self._stub(pinned_python, python_argv)
+
+        run_harness_runner(
+            "codex", tmp_path, env={"LMER_PYTHON": str(pinned_python)}
+        )
+
+        self._assert_pinned_argv(python_argv, "codex")
+        assert not supervisor_argv.exists(), (
+            "the unpinned console script ran too — the pin was bypassed"
+        )
+
+    def test_codex_runner_falls_back_when_no_interpreter_exists(self, tmp_path):
+        """No usable interpreter beats no supervisor at all — but unpinned."""
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir(exist_ok=True)
+        supervisor_argv = tmp_path / "supervisor_argv.txt"
+        self._stub(fake_bin / "lmer-supervisor", supervisor_argv)
+
+        run_harness_runner(
+            "codex", tmp_path,
+            env={"LMER_PYTHON": str(tmp_path / "no-such-python")},
+        )
+
+        assert supervisor_argv.exists(), (
+            "with no pinnable interpreter the console script is the fallback"
+        )
+        argv = supervisor_argv.read_text().splitlines()
+        assert argv[0] == "--"
+        assert argv[1] == "codex"
+
+    def test_claude_runner_execs_the_pinned_interpreter(self, tmp_path):
+        extra_bin = tmp_path / "extra-bin"
+        extra_bin.mkdir()
+        supervisor_argv = tmp_path / "supervisor_argv.txt"
+        self._stub(extra_bin / "lmer-supervisor", supervisor_argv)
+        python_argv = tmp_path / "python_argv.txt"
+        pinned_python = tmp_path / "pinned-python"
+        self._stub(pinned_python, python_argv)
+
+        run_claude_runner(
+            tmp_path,
+            env={
+                # run_claude_runner owns tmp_path/bin; the supervisor stub
+                # rides on a second dir appended to the same PATH shape.
+                "PATH": f"{tmp_path / 'bin'}:{extra_bin}:/usr/bin:/bin",
+                "LMER_PYTHON": str(pinned_python),
+            },
+        )
+
+        self._assert_pinned_argv(python_argv, "claude")
+        assert not supervisor_argv.exists(), (
+            "the unpinned console script ran too — the pin was bypassed"
+        )

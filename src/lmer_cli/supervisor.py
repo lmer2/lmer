@@ -55,6 +55,7 @@ import argparse
 import contextlib
 import errno
 import fcntl
+import hashlib
 import math
 import os
 import secrets
@@ -1128,13 +1129,23 @@ def _build_fastapi_app(
     def post_input(body: _InputBody, authorization: Optional[str] = Header(default=None)):
         _check_auth(authorization)
         payload = body.data
+        # The delivery receipt (#197): what this process was asked to type,
+        # as the caller can independently recompute it. A write accepted here
+        # but never submitted used to leave no trace anywhere; the hash and
+        # length let the sender prove after the fact WHAT was handed to the
+        # PTY without the payload's content ever entering a log.
+        payload_bytes = payload.encode("utf-8")
+        receipt = {
+            "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
+            "payload_length": len(payload_bytes),
+        }
         # Append CR (\r), not LF (\n): claude's TUI runs in raw mode where
         # the Enter key arrives as \r. \n would be inserted as a literal
         # newline in the input box and never submit. The field is named
         # ``append_newline`` for backwards-compatible API shape but the
         # behavior is "press Enter after the text".
         if not body.append_newline:
-            return {"bytes_written": write_input(payload.encode("utf-8"))}
+            return {"bytes_written": write_input(payload_bytes), **receipt}
 
         # Type it and submit it, ONCE — and with the Enter as a write of its own,
         # because a CR glued to the text is read as part of a paste and inserted
@@ -1162,6 +1173,7 @@ def _build_fastapi_app(
             # about. Three values rather than a flag, so "not observed" is read as
             # neither a failure nor a clean delivery — see :data:`SUBMIT_TEXT_READ`.
             "submit_text": submit_text,
+            **receipt,
         }
 
     @app.get("/output", response_model=_OutputResponse)
@@ -1229,6 +1241,11 @@ def _build_fastapi_app(
             "cursor": output.end_offset,
             "rows": rows,
             "cols": cols,
+            # Which file this app's code was imported from. The one field that
+            # distinguishes a current control plane from a stale one: #236 was a
+            # supervisor running a checkout that predated /resize, and every
+            # probe of it looked healthy right up until a route was missing.
+            "source": __file__,
             **_activity_report(output.idle_seconds),
         }
 
@@ -1999,6 +2016,12 @@ def run_supervisor(
         sys.stderr.write(
             f"🛰  lmer-supervisor FastAPI listening on http://{fastapi_host}:{fastapi_port} "
             f"(bearer token in LMER_FASTAPI_TOKEN)\n"
+            # Which file this control plane is actually running. A supervisor
+            # imported from the wrong tree serves whatever routes THAT code has,
+            # and #236 was diagnosed by noticing the mismatch — this line puts
+            # the fact in the session log instead of leaving it to be inferred
+            # from a missing route. /healthz reports the same value.
+            f"🛰  lmer-supervisor code: {__file__}\n"
         )
         sys.stderr.flush()
 

@@ -175,6 +175,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -189,6 +190,7 @@ import requests
 
 from . import registry
 from .spawn import container_log_path_for, log_path_for, read_control_token
+from .store import append_event
 
 logger = logging.getLogger("lmer_platform.session_io")
 
@@ -830,6 +832,71 @@ def _get(
     return _call(endpoint, "GET", path, params=params, timeout=timeout)
 
 
+def _payload_hmac(
+    endpoint: Optional[ControlEndpoint], payload_bytes: bytes
+) -> Optional[str]:
+    """The durable form of "what was sent": an HMAC, never a bare hash.
+
+    The events log is append-only and never pruned, and short payloads make a
+    raw SHA-256 a dictionary lookup — a one-word answer has few enough
+    candidates that logging its hash IS logging its content. Keying with the
+    session's control token makes the record uninvertible from the log alone,
+    and checkable only while the session lives: the token file is unlinked at
+    registry removal while the events log is never pruned, so after teardown
+    the field verifies nothing — which is the point, since the log outliving
+    the key is what keeps old entries from ever becoming content. ``None``
+    when endpoint resolution failed — there is no key, and the attempt record
+    still carries the length and the error.
+    """
+    if endpoint is None:
+        return None
+    return hmac.new(
+        endpoint.token.encode("utf-8"), payload_bytes, hashlib.sha256
+    ).hexdigest()
+
+
+def _record_attempt(
+    event_type: str,
+    session_id: str,
+    *,
+    endpoint: Optional[ControlEndpoint],
+    reply: Optional[_ControlReply],
+    error: Optional[str],
+    **fields,
+) -> None:
+    """One INFO line + one events-log entry per control-plane attempt.
+
+    Called from a ``finally`` so the record exists for every attempt, not only
+    the ones that got an HTTP answer: the first resize against a starting
+    session routinely dies as a connection reset, and a log in which "no
+    record" reads as "no attempt" is exactly the silence #197 exists to
+    remove. ``status`` is ``None`` when no HTTP answer arrived and ``error``
+    says what happened instead; ``endpoint`` is ``None`` when resolution
+    itself was the failure. An HTTP *refusal* fills ``error`` too, with the
+    upstream detail — a 500's "pty is gone" existing only in an exception
+    string nothing writes down would be the same silence with a status code.
+    """
+    location = endpoint.location if endpoint is not None else None
+    status = reply.status if reply is not None else None
+    if error is None and reply is not None and not reply.ok:
+        error = reply.detail
+    logger.info(
+        "platform_%s session=%s endpoint=%s status=%s error=%s %s",
+        event_type, session_id, location, status, error,
+        " ".join(f"{key}={value}" for key, value in fields.items()),
+    )
+    append_event(
+        event_type,
+        data={
+            "session": session_id,
+            "endpoint": location,
+            "status": status,
+            "error": error,
+            **fields,
+        },
+    )
+
+
 def send_input(
     session_id: str, data: str, *, append_newline: bool = False
 ) -> dict:
@@ -854,18 +921,80 @@ def send_input(
         raise SessionIOError(
             f"input data must be a string, got {type(data).__name__}"
         )
-    endpoint = control_endpoint(session_id)
-    reply = _post(
-        endpoint, "/input", {"data": data, "append_newline": bool(append_newline)}
-    )
+    # Hashed before the wire so the receipt is independent of everything past
+    # this line: the control plane answers with the hash of what *it* received
+    # (``payload_sha256``, #197), and the two agreeing is what "delivered
+    # intact" means. The raw hash lives only in memory for that comparison —
+    # what is *recorded* is an HMAC (:func:`_payload_hmac` has why).
+    payload_bytes = data.encode("utf-8")
+    sent_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+    endpoint: Optional[ControlEndpoint] = None
+    reply: Optional[_ControlReply] = None
+    error: Optional[str] = None
+    try:
+        endpoint = control_endpoint(session_id)
+        reply = _post(
+            endpoint, "/input", {"data": data, "append_newline": bool(append_newline)}
+        )
+    except SessionIOError as exc:
+        error = str(exc)[:_DETAIL_LIMIT]
+        raise
+    finally:
+        if append_newline:
+            receipt = (
+                reply.payload.get("payload_sha256") if reply is not None else None
+            )
+            _record_attempt(
+                "session_input", session_id,
+                endpoint=endpoint, reply=reply, error=error,
+                bytes=reply.payload.get("bytes_written") if reply else None,
+                length=len(payload_bytes),
+                payload_hmac=_payload_hmac(endpoint, payload_bytes),
+                # A verdict, not the receipt itself: the supervisor's receipt
+                # is a raw hash, and writing it durably would undo what the
+                # HMAC above is for. ``None`` = no receipt to compare (old
+                # control plane, or no answer at all).
+                receipt_match=(
+                    None if receipt is None else receipt == sent_sha256
+                ),
+                submit_text=reply.payload.get("submit_text") if reply else None,
+            )
+        else:
+            # A write with no Enter is the web terminal's per-keystroke path —
+            # one call per character typed. Durably recording those would grow
+            # the events log without bound AND reconstruct typed input
+            # character by character (including at hidden prompts), so the
+            # delivery-forensics contract (#197) covers *messages*; keystrokes
+            # get a debug line and are otherwise what the PTY already echoes.
+            logger.debug(
+                "platform_session_keystroke session=%s endpoint=%s status=%s "
+                "bytes=%s error=%s",
+                session_id,
+                endpoint.location if endpoint else None,
+                reply.status if reply else None,
+                reply.payload.get("bytes_written") if reply else None,
+                error,
+            )
     if not reply.ok:
         raise ControlPlaneError(
             f"session {session_id} refused the input ({reply.detail})"
         )
-    logger.info(
-        "platform_session_input session=%s bytes=%s",
-        session_id, reply.payload.get("bytes_written"),
-    )
+    receipt_sha256 = reply.payload.get("payload_sha256")
+    if receipt_sha256 is not None and receipt_sha256 != sent_sha256:
+        # The control plane read back different bytes than were sent. Never
+        # observed (delivery was proven byte-perfect in #236's investigation),
+        # but this is the check that turns "we believe the wire is clean" into
+        # a receipt — and a mismatch must be loud, not a healthy-looking 200.
+        # Loud AND accurate: the 200 means the bytes were already typed into
+        # the session, so this must not read as a refusal — the taught
+        # recovery for "not sent" is retyping, which would deliver it twice.
+        raise ControlPlaneError(
+            f"session {session_id} received the input, but its control plane "
+            f"acknowledged different bytes than were sent (sent sha256 "
+            f"{sent_sha256}, control plane read {receipt_sha256}) — the "
+            "payload WAS typed into the session; check the terminal view "
+            "before retyping anything"
+        )
     return reply.payload
 
 
@@ -875,7 +1004,16 @@ def apply_resize(session_id: str, rows: int, cols: int) -> ResizeReport:
     Three answers from the control plane are not failures of this call and must
     never cost the caller its socket:
 
-    - **404** — the session's image predates the ``/resize`` route.
+    - **404** — whatever answers on the session's control port has no
+      ``/resize`` route. The 404 alone does not say why, and this code used to
+      think it did: the docstring once read "the session's image predates the
+      route", and #236 disproved it — sessions from a current image answered
+      404 because their supervisor had imported a stale checkout (the self-dev
+      ``/workspace`` clone of ``main``). An old image, a stale supervisor and
+      a re-bound port all produce this identical answer, which is why the
+      report states only the observation and names the endpoint; the
+      endpoint's ``/healthz`` ``source`` field is the checkable fact for
+      whoever investigates.
     - **503** — the supervisor is running with no PTY hook wired, so there is
       nothing to resize. A deployment fact, as its own docstring says.
     - **500** — the ioctl failed, which in practice means the PTY is gone and the
@@ -905,15 +1043,53 @@ def apply_resize(session_id: str, rows: int, cols: int) -> ResizeReport:
                 "small, so this reading is a layout artifact, not a window size"
             ),
         )
-    endpoint = control_endpoint(session_id)
-    reply = _post(endpoint, "/resize", {"rows": rows, "cols": cols})
+    endpoint: Optional[ControlEndpoint] = None
+    reply: Optional[_ControlReply] = None
+    error: Optional[str] = None
+    try:
+        endpoint = control_endpoint(session_id)
+        reply = _post(endpoint, "/resize", {"rows": rows, "cols": cols})
+    except SessionIOError as exc:
+        error = str(exc)[:_DETAIL_LIMIT]
+        raise
+    finally:
+        # Every attempt, at INFO, with the endpoint the daemon actually dialed
+        # — including the ones that got no HTTP answer at all: #236's 404 went
+        # unexplained for days partly because the only record of a failing
+        # resize was a debug line that named neither the endpoint nor the
+        # status, under a message asserting a cause the incident disproved.
+        _record_attempt(
+            "session_resize", session_id,
+            endpoint=endpoint, reply=reply, error=error,
+            rows=rows, cols=cols,
+        )
     if reply.ok:
         return ResizeReport(applied=True, status=reply.status)
-    if reply.status in (404, 503):
-        logger.debug(
-            "platform_session_resize_unsupported session=%s status=%s",
-            session_id, reply.status,
+    if reply.status == 404:
+        # An unknown-route answer. Reported as exactly that — an observation.
+        # #236 taught this line twice over: the old message asserted "the
+        # image predates the route" and was wrong (the supervisor had imported
+        # a stale checkout), and any replacement diagnosis would be the same
+        # mistake with different words — a re-bound port, for one, produces
+        # this identical answer. The checkable fact lives at the endpoint's
+        # /healthz ``source``; the docstring carries the #236 history.
+        logger.warning(
+            "platform_session_resize_route_missing session=%s endpoint=%s — "
+            "the endpoint answered 404 for /resize: whatever code serves that "
+            "port has no such route (its /healthz `source` names the file)",
+            session_id, endpoint.location,
         )
+        return ResizeReport(
+            applied=False,
+            status=reply.status,
+            event="resize_unsupported",
+            message=(
+                "this session's control plane does not serve /resize "
+                f"(HTTP 404 from {endpoint.location}: {reply.detail}) — "
+                "rendering continues at its current size"
+            ),
+        )
+    if reply.status == 503:
         return ResizeReport(
             applied=False,
             status=reply.status,

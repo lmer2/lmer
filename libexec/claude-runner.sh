@@ -514,7 +514,30 @@ fi
 # (e.g. older containers built before this feature shipped) or if the
 # user opts out with LMER_DISABLE_SUPERVISOR=1 (escape hatch for
 # bisecting rendering issues attributable to the PTY wrapper).
+#
+# The supervisor is operational infrastructure — the platform's only way to
+# reach this session — so it must run the image's code even when the self-dev
+# block above repoints imports at /workspace (#236: a supervisor imported from
+# the agent's checkout of `main` served a control plane with no /resize route
+# and the pre-#210 submit path). The pin is a sys.path insert rather than a
+# PYTHONPATH override because the harness is the supervisor's *child*: an env
+# pin would be inherited and silently undo the self-dev view the agent's own
+# tooling depends on (#198).
 if [ "${LMER_DISABLE_SUPERVISOR:-0}" != "1" ] && command -v lmer-supervisor >/dev/null 2>&1; then
+    # The interpreter default is the operational venv, not a bare `python3`:
+    # PATH may resolve python3 to an active workspace venv without the
+    # supervisor's deps, and a failed exec here ends the session with no
+    # harness at all. If neither interpreter exists this is not a container
+    # layout the pin understands — fall through to the console script.
+    SUPERVISOR_PYTHON="${LMER_PYTHON:-/Agents/global/.venv/bin/python3}"
+    if [ -x "$SUPERVISOR_PYTHON" ] && [ -d /Agents/global/src/lmer_cli ]; then
+        echo "✅ lmer-supervisor pinned to /Agents/global/src (operational tree)"
+        exec "$SUPERVISOR_PYTHON" -c 'import sys; sys.path.insert(0, "/Agents/global/src"); from lmer_cli.supervisor import main; sys.exit(main())' -- claude $EXTRA_ARGS $AGENTS_PROMPT_ARGS "$@"
+    fi
+    # Said out loud because under self-dev an unpinned supervisor is exactly
+    # the #236 configuration — the absence of the pin line must not be the
+    # only signal.
+    echo "⚠️  supervisor pin skipped (no usable interpreter or operational tree) — running unpinned"
     exec lmer-supervisor -- claude $EXTRA_ARGS $AGENTS_PROMPT_ARGS "$@"
 fi
 exec claude $EXTRA_ARGS $AGENTS_PROMPT_ARGS "$@"

@@ -347,10 +347,23 @@ harness_map_effort() {
 # ── Final exec through the supervisor ──
 # Run the harness through lmer-supervisor when available (PTY wrapper: FastAPI
 # endpoint, auto start-command injection — profile selected via LMER_HARNESS),
-# falling back to a direct exec. Mirrors the tail of claude-runner.sh.
+# falling back to a direct exec. Mirrors the tail of claude-runner.sh —
+# including the operational-tree pin: the supervisor must run the image's code
+# even when self-dev repoints imports at /workspace (#236), and the pin is a
+# sys.path insert rather than an env override so the harness child keeps the
+# self-dev view (#198).
 #   harness_exec <binary> [args...]
 harness_exec() {
     if [ "${LMER_DISABLE_SUPERVISOR:-0}" != "1" ] && command -v lmer-supervisor >/dev/null 2>&1; then
+        # Interpreter default is the operational venv, not a bare `python3` —
+        # see the matching block in claude-runner.sh for why.
+        SUPERVISOR_PYTHON="${LMER_PYTHON:-/Agents/global/.venv/bin/python3}"
+        if [ -x "$SUPERVISOR_PYTHON" ] && [ -d /Agents/global/src/lmer_cli ]; then
+            echo "✅ lmer-supervisor pinned to /Agents/global/src (operational tree)"
+            exec "$SUPERVISOR_PYTHON" -c 'import sys; sys.path.insert(0, "/Agents/global/src"); from lmer_cli.supervisor import main; sys.exit(main())' -- "$@"
+        fi
+        # Said out loud — see the matching block in claude-runner.sh.
+        echo "⚠️  supervisor pin skipped (no usable interpreter or operational tree) — running unpinned"
         exec lmer-supervisor -- "$@"
     fi
     exec "$@"
