@@ -19,6 +19,8 @@ arrives, and stubbing out the transport is exactly what would stop testing that.
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
 import queue
@@ -785,7 +787,9 @@ def test_the_input_payload_is_never_logged(platform_root, control_plane, caplog)
     plant_session("s-1", port=control_plane.port)
     caplog.set_level("DEBUG")
 
-    session_io.send_input("s-1", "hunter2-is-what-the-operator-pasted")
+    session_io.send_input(
+        "s-1", "hunter2-is-what-the-operator-pasted", append_newline=True
+    )
 
     logged = "\n".join(record.getMessage() for record in caplog.records)
     assert "platform_session_input" in logged
@@ -799,6 +803,185 @@ def test_non_string_input_is_refused_before_any_call(platform_root, control_plan
     with pytest.raises(session_io.SessionIOError):
         session_io.send_input("s-1", 42)
     assert control_plane.calls == []
+
+
+def test_input_attempts_are_logged_and_land_in_the_events_log(
+    platform_root, control_plane, caplog
+):
+    """Endpoint, status, length and an HMAC — never the payload (#197).
+
+    The write path used to leave no queryable trace: a payload accepted by
+    ``/input`` but never submitted existed nowhere afterwards. What makes the
+    record safe to keep durable is that it is an HMAC under the session's
+    control token, not a bare hash — a short answer's raw SHA-256 is a
+    dictionary lookup, i.e. content.
+    """
+    caplog.set_level("INFO")
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.send_input("s-1", "the answer", append_newline=True)
+
+    raw_sha = hashlib.sha256(b"the answer").hexdigest()
+    keyed = hmac.new(
+        CONTROL_TOKEN.encode(), b"the answer", hashlib.sha256
+    ).hexdigest()
+    logged = "\n".join(
+        record.getMessage() for record in caplog.records
+        if "platform_session_input" in record.getMessage()
+    )
+    assert f"endpoint=127.0.0.1:{control_plane.port}" in logged
+    assert "status=200" in logged
+    assert keyed in logged
+    assert raw_sha not in logged, (
+        "the raw payload hash is invertible for short payloads and must "
+        "never be recorded"
+    )
+    assert "the answer" not in logged
+
+    events = [e for e in store.read_events() if e["type"] == "session_input"]
+    assert events, "the attempt must land in the events log"
+    data = events[-1]["data"]
+    assert data["session"] == "s-1"
+    assert data["payload_hmac"] == keyed
+    assert data["length"] == len(b"the answer")
+    assert data["receipt_match"] is None, (
+        "the fake control plane sent no receipt, and that must be recorded "
+        "as unverified rather than as a match"
+    )
+    serialized = json.dumps(events[-1])
+    assert "the answer" not in serialized
+    assert raw_sha not in serialized
+
+
+def test_keystroke_writes_are_not_durably_recorded(
+    platform_root, control_plane, caplog
+):
+    """``append_newline=False`` is the web terminal's per-keystroke path.
+
+    One durable event per typed character would grow the never-pruned events
+    log without bound and reconstruct typed input character by character —
+    including at hidden prompts, which never echo into the PTY log. The
+    delivery-forensics contract covers messages; keystrokes get a debug line.
+    """
+    caplog.set_level("DEBUG")
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.send_input("s-1", "y")
+
+    assert not [
+        e for e in store.read_events() if e["type"] == "session_input"
+    ], "a keystroke write must not land in the durable events log"
+    info_and_up = [
+        record for record in caplog.records
+        if record.levelname != "DEBUG"
+        and "platform_session" in record.getMessage()
+    ]
+    assert not info_and_up, "keystrokes log at DEBUG only"
+    debug = "\n".join(
+        record.getMessage() for record in caplog.records
+        if "platform_session_keystroke" in record.getMessage()
+    )
+    assert "status=200" in debug
+    assert hashlib.sha256(b"y").hexdigest() not in debug
+
+
+def test_an_unanswered_input_attempt_is_still_recorded(platform_root):
+    """Transport failures are attempts too — the class that needs forensics.
+
+    The first write against a starting session routinely dies as a connection
+    reset; a log in which that leaves no record reads as "no attempt was
+    made", which is exactly the #197 silence the events log exists to remove.
+    """
+    plane = FakeControlPlane()
+    port = plane.port
+    plane.stop()
+    plant_session("s-1", port=port)
+
+    with pytest.raises(session_io.ControlPlaneError):
+        session_io.send_input("s-1", "the answer", append_newline=True)
+
+    events = [e for e in store.read_events() if e["type"] == "session_input"]
+    assert events, "an attempt that got no HTTP answer must still be recorded"
+    data = events[-1]["data"]
+    assert data["status"] is None
+    assert data["error"], "the record must say what happened instead"
+    assert data["endpoint"] == f"127.0.0.1:{port}"
+
+
+def test_an_unresolvable_input_attempt_is_still_recorded(platform_root):
+    """Endpoint resolution failing is the earliest attempt outcome there is."""
+    plant_session("s-dead", live=False)
+
+    with pytest.raises(session_io.ControlUnavailable):
+        session_io.send_input("s-dead", "the answer", append_newline=True)
+
+    events = [e for e in store.read_events() if e["type"] == "session_input"]
+    assert events
+    data = events[-1]["data"]
+    assert data["endpoint"] is None
+    assert data["status"] is None
+    assert "not running" in data["error"]
+
+
+def test_a_matching_input_receipt_passes_verification(
+    platform_root, control_plane
+):
+    """A real receipt, message path: the event's verdict is True — and a
+    verdict is all it is. Recording the supervisor's raw receipt hash would
+    reintroduce the short-payload inversion the HMAC exists to close, through
+    the other field; this is the guard that keeps ``receipt_match`` a boolean.
+    """
+    sent_sha = hashlib.sha256(b"hi!").hexdigest()
+    control_plane.answer(
+        "/input",
+        200,
+        {"bytes_written": 3, "payload_sha256": sent_sha, "payload_length": 3},
+    )
+    plant_session("s-1", port=control_plane.port)
+
+    reply = session_io.send_input("s-1", "hi!", append_newline=True)
+
+    assert reply["payload_sha256"] == sent_sha
+    events = [e for e in store.read_events() if e["type"] == "session_input"]
+    assert events[-1]["data"]["receipt_match"] is True
+    assert sent_sha not in json.dumps(events[-1]), (
+        "the raw receipt hash must never be durably recorded — the event "
+        "stores a verdict"
+    )
+
+
+def test_a_mismatched_input_receipt_is_loud(platform_root, control_plane):
+    """A control plane acknowledging different bytes must not look like a 200.
+
+    Delivery was proven byte-perfect while diagnosing #236, so this should
+    never fire — but "we believe the wire is clean" only became a fact when the
+    receipt existed to check, and a mismatch discovered by the receiver acting
+    on corrupt instructions is the worst possible way to learn of it.
+
+    Loud, but not a lie: the 200 means the bytes were already typed into the
+    session, and an error that reads as "not sent" teaches the operator to
+    retype — delivering it twice. The message has to carry both halves.
+    """
+    control_plane.answer(
+        "/input",
+        200,
+        {"bytes_written": 3, "payload_sha256": "not-what-was-sent"},
+    )
+    plant_session("s-1", port=control_plane.port)
+
+    with pytest.raises(session_io.ControlPlaneError) as caught:
+        session_io.send_input("s-1", "hi!", append_newline=True)
+    assert "different bytes" in str(caught.value)
+    assert "WAS typed into the session" in str(caught.value), (
+        "the error must not read as a refusal — the write already happened"
+    )
+    events = [e for e in store.read_events() if e["type"] == "session_input"]
+    assert events[-1]["data"]["receipt_match"] is False, (
+        "the durable record must carry the mismatch verdict"
+    )
+    serialized = json.dumps(events[-1])
+    assert hashlib.sha256(b"hi!").hexdigest() not in serialized
+    assert "not-what-was-sent" not in serialized
 
 
 # --- resizing (best-effort) ------------------------------------------------
@@ -845,17 +1028,18 @@ def test_the_narrowest_real_screen_still_resizes(platform_root, control_plane):
 
 
 @pytest.mark.parametrize(
-    "status, detail",
+    "status, detail, says",
     [
-        (404, "Not Found"),
+        (404, "Not Found", "does not serve /resize"),
         (503, "resize unavailable: this supervisor was started without PTY "
-              "resize support"),
+              "resize support", "cannot be resized"),
     ],
 )
 def test_an_unsupported_resize_is_tolerated(
-    platform_root, control_plane, status, detail
+    platform_root, control_plane, status, detail, says
 ):
-    """404 = image predates /resize, 503 = no PTY hook. Both mean carry on."""
+    """404 = whatever answers that port has no /resize route (#236),
+    503 = no PTY hook. Both mean carry on."""
     control_plane.answer("/resize", status, {"detail": detail})
     plant_session("s-1", port=control_plane.port)
 
@@ -864,6 +1048,83 @@ def test_an_unsupported_resize_is_tolerated(
     assert report.applied is False
     assert report.event == "resize_unsupported"
     assert report.status == status
+    assert says in report.message
+
+
+def test_the_resize_404_message_states_the_observation_not_a_diagnosis(
+    platform_root, control_plane
+):
+    """A 404 says a route is unserved — it does not say why.
+
+    #236 twice over: the old message asserted "the image predates the route"
+    and was wrong (the supervisor had imported a stale checkout), and the
+    first replacement asserted the stale-supervisor cause instead — equally
+    unknowable from a 404, since a re-bound port produces the identical
+    answer. This message sticks in the web client as a permanent notice, so a
+    wrong cause sends the operator hunting the wrong thing for days. The
+    message may name the endpoint and the observation; any causal word is a
+    regression.
+    """
+    control_plane.answer("/resize", 404, {"detail": "Not Found"})
+    plant_session("s-1", port=control_plane.port)
+
+    report = session_io.apply_resize("s-1", 24, 80)
+
+    assert "does not serve /resize" in report.message
+    assert f"127.0.0.1:{control_plane.port}" in report.message, (
+        "the observation includes WHERE it was made"
+    )
+    for diagnosis in ("image", "predates", "stale", "supervisor is running"):
+        assert diagnosis not in report.message, (
+            f"message asserts a cause ({diagnosis!r}) that a 404 cannot "
+            "establish"
+        )
+
+
+def test_an_unanswered_resize_attempt_is_still_recorded(platform_root):
+    """Same contract as input: no HTTP answer is still an attempt (#197)."""
+    plane = FakeControlPlane()
+    port = plane.port
+    plane.stop()
+    plant_session("s-1", port=port)
+
+    with pytest.raises(session_io.ControlPlaneError):
+        session_io.apply_resize("s-1", 24, 80)
+
+    events = [e for e in store.read_events() if e["type"] == "session_resize"]
+    assert events, "an attempt that got no HTTP answer must still be recorded"
+    data = events[-1]["data"]
+    assert data["status"] is None
+    assert data["error"]
+    assert data["rows"] == 24 and data["cols"] == 80
+
+
+def test_resize_attempts_are_logged_with_endpoint_and_status(
+    platform_root, control_plane, caplog
+):
+    """Every attempt, at INFO, naming the endpoint the daemon actually dialed.
+
+    #236's 404 went unexplained partly because the only record was a debug
+    line naming neither. The same facts land in the platform's events log so
+    delivery questions are answerable after the fact, not just while tailing.
+    """
+    caplog.set_level("INFO")
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.apply_resize("s-1", 40, 120)
+
+    logged = "\n".join(
+        record.getMessage() for record in caplog.records
+        if "platform_session_resize" in record.getMessage()
+    )
+    assert f"endpoint=127.0.0.1:{control_plane.port}" in logged
+    assert "status=200" in logged
+
+    events = [e for e in store.read_events() if e["type"] == "session_resize"]
+    assert events, "the attempt must land in the events log"
+    assert events[-1]["data"]["session"] == "s-1"
+    assert events[-1]["data"]["status"] == 200
+    assert events[-1]["data"]["endpoint"] == f"127.0.0.1:{control_plane.port}"
 
 
 def test_a_failed_resize_is_surfaced_as_a_problem(platform_root, control_plane):
@@ -876,6 +1137,12 @@ def test_a_failed_resize_is_surfaced_as_a_problem(platform_root, control_plane):
     assert report.applied is False
     assert report.event == "resize_failed"
     assert "ending" in report.message
+    # An HTTP refusal is an answered attempt whose reason must not exist only
+    # in an exception string nothing writes down: the upstream detail rides
+    # the record beside the status.
+    events = [e for e in store.read_events() if e["type"] == "session_resize"]
+    assert events[-1]["data"]["status"] == 500
+    assert "cannot set window size" in events[-1]["data"]["error"]
 
 
 def test_resize_on_an_unreachable_session_still_raises(platform_root):

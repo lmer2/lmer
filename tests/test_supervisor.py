@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import math
 import os
 import socket
@@ -2306,7 +2307,12 @@ class TestFastApiApp:
             headers={"Authorization": "Bearer test-token"},
         )
         assert resp.status_code == 200
-        assert resp.json() == {"bytes_written": 5}
+        body = resp.json()
+        assert body["bytes_written"] == 5
+        # The delivery receipt (#197): the caller can recompute both values
+        # from what it sent, so agreement proves the payload crossed intact.
+        assert body["payload_sha256"] == hashlib.sha256(b"hello").hexdigest()
+        assert body["payload_length"] == 5
         assert sink == [b"hello"]
 
     def test_input_appends_newline(self):
@@ -2416,6 +2422,10 @@ class TestFastApiApp:
         assert "terminal view" in body["note"], (
             "the reply has to say what the caller can do about it"
         )
+        # The receipt covers the payload as the caller sent it — the Enter the
+        # handler added on its own is not part of what the caller can recompute.
+        assert body["payload_sha256"] == hashlib.sha256(b"no, stop").hexdigest()
+        assert body["payload_length"] == len(b"no, stop")
 
     def test_a_keystroke_reply_says_nothing_about_a_submit(self):
         """``append_newline=False`` presses no Enter, so there is no submit to
@@ -2428,7 +2438,11 @@ class TestFastApiApp:
             json={"data": "\x1b[A", "append_newline": False},
             headers={"Authorization": "Bearer test-token"},
         ).json()
-        assert body == {"bytes_written": 3}
+        assert body["bytes_written"] == 3
+        assert "submit_confirmed" not in body
+        assert "note" not in body
+        # Only the write count and the delivery receipt — nothing about a submit.
+        assert set(body) == {"bytes_written", "payload_sha256", "payload_length"}
 
     def test_input_without_a_submit_is_written_exactly_as_given(self):
         """The opt-out, and the reason splitting the submit is safe.
@@ -2578,6 +2592,17 @@ class TestFastApiApp:
         # A browser client needs the geometry before it decides whether to resize.
         assert body["rows"] == 30
         assert body["cols"] == 100
+        # Provenance: which file this control plane's code was imported from.
+        # A supervisor running a stale tree looks healthy on every probe until
+        # a route is missing (#236) — this is the field that makes it visible.
+        # Asserted as "a real, absolute path to this module's file" rather than
+        # `== supervisor.__file__` — that comparison reads the same attribute
+        # off the same import and cannot fail on any tree. The wrong-tree
+        # property itself is covered where it lives: the runner launch
+        # (tests/test_harness_runners.py::TestSupervisorPin).
+        assert os.path.isabs(body["source"])
+        assert os.path.isfile(body["source"])
+        assert body["source"].endswith("supervisor.py")
 
     def test_healthz_geometry_is_null_when_unknown(self):
         # Nulls rather than missing keys so a client can tell "no geometry
@@ -2696,6 +2721,7 @@ class TestFastApiApp:
         # produced, and this route's rule is that an unknown answers as a null key.
         assert resp.json() == {
             "ok": True, "cursor": 0, "rows": None, "cols": None,
+            "source": supervisor.__file__,
             "last_output_at": None, "idle_seconds": None,
         }
 

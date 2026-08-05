@@ -106,3 +106,37 @@ def test_src_package_resolves_inside_this_checkout(package):
     assert resolved.is_relative_to(REPO_ROOT), _provenance_failure(
         package, resolved
     )
+
+
+@pytest.mark.parametrize(
+    "script", ["libexec/claude-runner.sh", "libexec/harness-common.sh"]
+)
+def test_runners_pin_the_supervisor_to_the_operational_tree(script):
+    """The supervisor is the one process the self-dev view must NOT reach.
+
+    The inverse invariant of everything above: the agent's tooling imports the
+    /workspace checkout (#198), but the supervisor is operational
+    infrastructure — the platform's only way to reach the session — and a
+    supervisor imported from the agent's checkout serves whatever routes THAT
+    code has (#236: a checkout of `main` cost every self-dev session its
+    /resize route and the #210 submit fix). Both runner scripts must launch it
+    with the operational tree pinned ahead of the self-dev view, via a
+    sys.path insert rather than an env override, so the pin does not leak into
+    the harness child and undo #198.
+
+    A source-level check, like the container-passthrough guards in
+    tests/test_gates.py: the property lives in a shell script the suite cannot
+    execute, and what this catches is the pin being dropped or reworded away.
+    """
+    text = (REPO_ROOT / script).read_text(encoding="utf-8")
+    assert "sys.path.insert(0, \"/Agents/global/src\")" in text, (
+        f"{script} no longer pins lmer-supervisor's imports to "
+        "/Agents/global/src. In a self-dev session the supervisor would "
+        "import the agent's /workspace checkout and serve whatever control "
+        "plane THAT code has (#236)."
+    )
+    assert "from lmer_cli.supervisor import main" in text, (
+        f"{script} pins sys.path but no longer launches the supervisor "
+        "through the pinned interpreter — the pin is decoration unless the "
+        "supervisor is imported under it (#236)."
+    )
