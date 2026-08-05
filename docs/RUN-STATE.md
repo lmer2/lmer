@@ -363,10 +363,32 @@ into the run dir at deferral time would dirty a possibly-clean tracked file and
 be reported by the running suite's leak guard as an appearance, which is the
 same failure in a new costume.
 
-That blind spot is worth knowing about directly: **commits defer around a gate,
-bare writes do not.** `work log` and `work event` write the run dir without
-committing, and a write that dirties a previously-clean tracked file can still
-trip the guard. While a gate is in flight, leave the work repo alone.
+Bare writes take the other path: **commits defer around a gate, bare writes
+attribute themselves** (issue #233). `work log` and `work event` write the run
+dir without committing, so instead of deferring, a write-shaped `work`
+invocation running inside a gate window journals its intent beside the markers
+— the paths it may write, plus a per-marker verdict on whether the marker's
+holder (pytest, for a suite) is among the writer's process ancestors, read
+from `/proc` at write time. The suite's leak guard consumes that journal at
+teardown and partitions the drift: entries under the write scope a
+**non-ancestor** invocation declared (the session that launched the suite,
+doing its job) are excused and reported informationally; a journaled write
+that **descends from the suite** fails the run naming the leaking command (a
+test reached the real `work` CLI — issue #93); anything unattributed and any
+HEAD move keeps the hard failure. **Removals are held to a stricter test**:
+whether a path was removed is read from the porcelain status code (`D` in
+either column), not from which side of the snapshot diff the line landed on —
+deleting a tracked file *adds* a ` D path` line — and a removal is excused
+only when the same tail reappears under a *different* declared prefix, which
+is what the session's own run-dir rename (`work goals freeze`, `work name`)
+produces and what a test's `rmtree` never does. The excuse is otherwise
+prefix-scoped, not per-file: a write from any source that lands inside an
+excused prefix rides that excuse for the suite's window — the granularity
+trade-off is documented at `cli._write_intent_rel_paths`, and outside excused
+prefixes hand edits still fail the run. The suite also holds a `pytest-suite` gate
+marker of its own (written by the conftest lock-dir fixture into the
+operational dir), so commit deferral covers bare `pytest` runs, not only
+gate-command runs.
 
 `LMER_GATE_INFLIGHT_GUARD=0` restores the pre-#201 behavior for every consumer
 at once (markers are still written); see [LMER-CLI.md](./LMER-CLI.md).

@@ -471,8 +471,9 @@ def _report_deferral(marker: dict, paths: list[str]) -> None:
         "let the session end until it lands."
     )
     print(
-        "   While a gate runs, avoid other work-repo writes too (`work log`, "
-        "`work event`): the file changes alone can trip the same guard."
+        "   Other work-repo writes (`work log`, `work event`, state updates) "
+        "are safe meanwhile: they journal themselves and the suite's guard "
+        "attributes them to this session, not to the tests (issue #233)."
     )
 
 
