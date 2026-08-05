@@ -36,6 +36,7 @@ kills the process in a ``finally``.
 """
 
 import contextlib
+import json
 import os
 import re
 
@@ -62,6 +63,8 @@ ASSISTANT_ROUTES = (
     ("GET", "/api/assistant/instructions"),
     ("POST", "/api/assistant/instructions"),
     ("POST", "/api/assistant/pending"),
+    ("GET", "/api/assistant/config"),
+    ("POST", "/api/assistant/config"),
 )
 
 #: The routes that neither spawn nor signal anything, so a test may call all of
@@ -74,6 +77,10 @@ PROCESSLESS_ROUTES = (
     ("GET", "/api/assistant/instructions"),
     ("POST", "/api/assistant/instructions"),
     ("POST", "/api/assistant/pending"),
+    ("GET", "/api/assistant/config"),
+    # POST /api/assistant/config is processless too, but it refuses the sweep's
+    # shared body by design (unknown keys are 400s); its own secret check lives
+    # with the config-route tests below.
 )
 
 
@@ -91,6 +98,18 @@ def platform_root(tmp_path, monkeypatch):
     root = tmp_path / "platform"
     monkeypatch.setattr(store, "PLATFORM_DIR", str(root))
     return root
+
+
+@pytest.fixture
+def known_presets(tmp_path, monkeypatch):
+    """Presets this host knows — the launch-setting name rules ask
+    load_presets(), and with no file every preset name is rightly unusable."""
+    path = tmp_path / "presets.json"
+    path.write_text(json.dumps({name: {} for name in (
+        "file-preset", "env-preset", "kept", "old", "new", "dev", "review",
+    )}), encoding="utf-8")
+    monkeypatch.setenv("LMER_PRESETS_FILE", str(path))
+    return path
 
 
 @pytest.fixture
@@ -1003,3 +1022,257 @@ def test_no_assistant_reply_carries_the_shared_secret(client, config, platform_r
         assert response.status_code == 200, f"{method} {path}: {response.text}"
         assert secret not in response.text, f"{method} {path} leaked the secret"
         assert SECRET not in response.text, f"{method} {path} leaked the secret"
+
+
+# --- GET/POST /api/assistant/config (issue #234) -------------------------------
+#
+# The settings surface: what the NEXT incarnation will run, each value with the
+# layer that decided it, and a write path that edits config.json and nothing
+# else. tests/test_platform_config.py owns the resolution chain itself and
+# tests/test_platform_assistant.py owns the spawn honouring it; what this file
+# pins is the HTTP shape — sources served, writes patched-not-replaced, refusals
+# arriving as 400s with the field named, and no route restarting anything.
+
+def test_config_reads_the_effective_settings_with_sources(
+    client, platform_root, known_presets, monkeypatch
+):
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "env-model")
+    cfg.update_stored({"assistant_preset": "file-preset"})
+
+    reply = client.get("/api/assistant/config", headers=bearer_header())
+    assert reply.status_code == 200
+    settings = reply.json()["settings"]
+    assert settings["model"] == {
+        "value": "env-model", "source": "env", "stored": None,
+    }
+    assert settings["preset"] == {
+        "value": "file-preset", "source": "config.json", "stored": "file-preset",
+    }
+    assert settings["harness"] == {
+        "value": None, "source": "default", "stored": None,
+    }
+    assert settings["agents"] == {
+        "value": None, "source": "default", "stored": None,
+    }
+    assert "NEXT incarnation" in reply.json()["note"]
+
+
+def test_config_write_persists_and_answers_with_the_effective_state(
+    client, platform_root
+):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"model": "sonnet-5"},
+    )
+    assert reply.status_code == 200
+    payload = reply.json()
+    assert payload["settings"]["model"] == {
+        "value": "sonnet-5", "source": "config.json", "stored": "sonnet-5",
+    }
+    assert payload["changed"] == ["model"]
+    assert "NEXT incarnation" in payload["note"]
+
+    stored = store.read_json(cfg.config_path())
+    assert stored["assistant_model"] == "sonnet-5"
+
+
+def test_config_write_is_a_patch_of_the_keys_named(
+    client, platform_root, known_presets
+):
+    cfg.update_stored({"assistant_model": "kept", "assistant_preset": "old"})
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"preset": "new"},
+    )
+    assert reply.status_code == 200
+    settings = reply.json()["settings"]
+    assert settings["model"]["value"] == "kept"
+    assert settings["preset"]["value"] == "new"
+
+
+@pytest.mark.parametrize("cleared", [None, "", "   "])
+def test_config_write_null_or_blank_clears_the_key(
+    client, platform_root, cleared
+):
+    cfg.update_stored({"assistant_model": "old"})
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"model": cleared},
+    )
+    assert reply.status_code == 200
+    assert reply.json()["settings"]["model"] == {
+        "value": None, "source": "default", "stored": None,
+    }
+    assert "assistant_model" not in store.read_json(cfg.config_path())
+
+
+def test_a_shadowed_write_lands_in_the_file_and_says_it_is_shadowed(
+    client, platform_root, monkeypatch
+):
+    """The chain's one trap, served honestly: the write is persisted, and the
+    reply's source says the export is still the value in effect."""
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "env-model")
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"model": "file-model"},
+    )
+    assert reply.status_code == 200
+    assert reply.json()["settings"]["model"] == {
+        "value": "env-model", "source": "env", "stored": "file-model",
+    }
+    assert store.read_json(cfg.config_path())["assistant_model"] == "file-model"
+
+
+@pytest.mark.parametrize("body, named", [
+    ({}, "at least one setting"),
+    ({"effort": "high"}, "effort"),
+    ({"model": 7}, "model"),
+    ({"model": "-x"}, "model"),
+])
+def test_config_write_refusals_are_400s_naming_the_problem(
+    client, platform_root, body, named
+):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json=body,
+    )
+    assert reply.status_code == 400
+    assert named in reply.json()["detail"]
+    assert not cfg.config_path().exists(), "a refused write must land nothing"
+
+
+def test_config_routes_touch_no_session(client, platform_root):
+    """Reading and writing settings is bookkeeping: nothing spawns, nothing is
+    signalled, and the running-incarnation question is untouched."""
+    client.get("/api/assistant/config", headers=bearer_header())
+    client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"model": "sonnet-5"},
+    )
+    assert registry.list_sessions(live_only=False) == []
+    assert assistant.status().running is False
+
+
+def test_config_replies_do_not_carry_the_shared_secret(
+    client, config, platform_root
+):
+    """The POST half of the sweep in test_no_assistant_reply_carries_the_shared_secret,
+    which cannot include this route because its body is refused there by design."""
+    secret = cfg.ensure_secret(config)
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"model": "sonnet-5"},
+    )
+    assert reply.status_code == 200
+    assert secret not in reply.text
+    assert SECRET not in reply.text
+
+
+def test_start_takes_launch_overrides_and_status_reports_them(
+    client, platform_root, long_lived
+):
+    with running(client, model="explicit-model", harness="codex") as payload:
+        assert payload["settings"]["model"] == "explicit-model"
+        assert payload["settings"]["harness"] == "codex"
+        status = client.get("/api/assistant", headers=bearer_header()).json()
+        assert status["settings"]["model"] == "explicit-model"
+
+
+def test_a_bad_launch_override_is_a_400_and_starts_nothing(
+    client, platform_root
+):
+    reply = client.post(
+        "/api/assistant/start", headers=bearer_header(),
+        json={"model": "   "},
+    )
+    assert reply.status_code == 400
+    assert "model" in reply.json()["detail"]
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_rotate_picks_up_a_persisted_change_with_no_override(
+    client, platform_root, long_lived
+):
+    """The modal's promised flow over the real routes: persist, rotate, and the
+    replacement reports the new model with nothing passed by hand."""
+    with running(client) as payload:
+        assert payload["settings"]["model"] is None
+        client.post(
+            "/api/assistant/config", headers=bearer_header(),
+            json={"model": "next-model"},
+        )
+        rotated = client.post(
+            "/api/assistant/rotate", headers=bearer_header(), json={},
+        )
+        assert rotated.status_code == 200, rotated.text
+        try:
+            assert rotated.json()["settings"]["model"] == "next-model"
+        finally:
+            kill(rotated.json().get("pid"))
+
+
+def test_an_unknown_start_body_key_is_refused_not_silently_dropped(
+    client, platform_root
+):
+    """A typo'd override must not become a 200 running the standing settings
+    with the operator believing the override took."""
+    reply = client.post(
+        "/api/assistant/start", headers=bearer_header(),
+        json={"modle": "gpt-x"},
+    )
+    assert reply.status_code == 400
+    assert "modle" in reply.json()["detail"]
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_an_agents_override_naming_nobody_is_a_400_at_every_surface(
+    client, platform_root
+):
+    """',' passes text/dash checks; the shared rule set has to catch it before
+    the spawn turns it into a 500 — at the config write, the start and the
+    rotate alike, with the rotate's incumbent (here: nothing) untouched."""
+    for path in ("/api/assistant/config", "/api/assistant/start",
+                 "/api/assistant/rotate"):
+        reply = client.post(path, headers=bearer_header(), json={"agents": ","})
+        assert reply.status_code == 400, f"{path}: {reply.text}"
+        assert "agents" in reply.json()["detail"]
+    assert not cfg.config_path().exists()
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_a_name_the_host_does_not_know_is_refused_at_every_surface(
+    client, platform_root
+):
+    """The blocking class from review round 1: a typo'd harness passed every
+    shape check, persisted 200, and the offered restart destroyed the assistant
+    behind another 200. Now the host-side authority answers first."""
+    for path in ("/api/assistant/config", "/api/assistant/start",
+                 "/api/assistant/rotate"):
+        reply = client.post(
+            path, headers=bearer_header(), json={"harness": "claud"},
+        )
+        assert reply.status_code == 400, f"{path}: {reply.text}"
+        assert "claud" in reply.json()["detail"]
+        assert "claude" in reply.json()["detail"], (
+            f"{path}: the refusal does not name the catalog"
+        )
+    assert not cfg.config_path().exists(), "a refused write must land nothing"
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_an_unusable_stored_value_is_visible_and_clearable(
+    client, platform_root
+):
+    """A hand-edited config.json carrying an unusable value must show up in
+    `stored` (the dialog prefills from it) so the null that removes it can be
+    composed from the screen — served as null it was invisible, unclearable,
+    and warned on every start forever."""
+    cfg.update_stored({"assistant_model": "-broken"})
+    read = client.get("/api/assistant/config", headers=bearer_header()).json()
+    assert read["settings"]["model"] == {
+        "value": None, "source": "default", "stored": "-broken",
+    }
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json={"model": None},
+    )
+    assert reply.status_code == 200
+    assert "assistant_model" not in store.read_json(cfg.config_path())

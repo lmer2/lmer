@@ -36,6 +36,23 @@ def platform_root(tmp_path, monkeypatch):
     return root
 
 
+@pytest.fixture
+def known_presets(tmp_path, monkeypatch):
+    """Presets this host knows, for tests that name one.
+
+    The launch-setting name rules ask ``load_presets()`` — the authority the
+    spawned ``lmer`` itself consults — and with no presets file every preset
+    name is *rightly* unusable, so a test that expects a preset value to
+    resolve has to make the host know it first.
+    """
+    path = tmp_path / "presets.json"
+    path.write_text(json.dumps({name: {} for name in (
+        "file-preset", "env-preset", "kept", "old", "new", "dev", "review",
+    )}), encoding="utf-8")
+    monkeypatch.setenv("LMER_PRESETS_FILE", str(path))
+    return path
+
+
 # --- defaults ---------------------------------------------------------------
 
 def test_defaults_bind_loopback(platform_root):
@@ -602,3 +619,436 @@ def test_a_command_that_fails_contributes_no_output(platform_root):
     """A non-zero exit means the answer is unknown, whatever landed on stdout."""
     assert cfg._probe_output(["sh", "-c", "echo 172.17.0.1; exit 7"]) == ""
     assert cfg._probe_output(["sh", "-c", "echo 172.17.0.1"]).strip() == "172.17.0.1"
+
+
+# --- the assistant's launch settings (issue #234) ----------------------------
+#
+# Four keys, one rule set: resolution follows the module's chain with the
+# provenance kept, unusable values warn and read as unset rather than taking
+# the assistant's start down, and the settings write path edits the stored
+# file only — an export must never be baked into config.json by a write that
+# happened while it was set.
+
+def test_assistant_settings_default_to_todays_behaviour(platform_root):
+    """Unset everywhere reads as None/default for every key — no new behaviour."""
+    config = cfg.load()
+    assert config.assistant_model is None
+    assert config.assistant_harness is None
+    assert config.assistant_preset is None
+    assert config.assistant_agents is None
+    settings = cfg.assistant_settings()
+    assert set(settings) == set(cfg.ASSISTANT_SETTING_KEYS)
+    for key in cfg.ASSISTANT_SETTING_KEYS:
+        assert settings[key].value is None
+        assert settings[key].source == "default"
+
+
+def test_assistant_settings_resolve_env_over_file_over_default(
+    platform_root, known_presets, monkeypatch
+):
+    store.write_json(cfg.config_path(), {
+        "assistant_model": "file-model",
+        "assistant_preset": "file-preset",
+    })
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "env-model")
+
+    config = cfg.load()
+    assert config.assistant_model == "env-model"
+    assert config.assistant_preset == "file-preset"
+    assert config.assistant_harness is None
+
+    settings = cfg.assistant_settings()
+    assert settings["model"].value == "env-model"
+    assert settings["model"].source == "env"
+    assert settings["preset"].value == "file-preset"
+    assert settings["preset"].source == "config.json"
+    assert settings["harness"].value is None
+    assert settings["harness"].source == "default"
+
+
+def test_a_blank_assistant_env_var_reads_as_unset(platform_root, monkeypatch):
+    """Blank counts as unset, as for every other env var here — the layer
+    below shows through instead of a whitespace model name reaching a flag."""
+    store.write_json(cfg.config_path(), {"assistant_model": "file-model"})
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "   ")
+    assert cfg.load().assistant_model == "file-model"
+    assert cfg.assistant_settings()["model"].source == "config.json"
+
+
+def test_an_unusable_stored_assistant_value_warns_and_reads_as_unset(
+    platform_root, caplog
+):
+    """The _resolve_pids_limit house rule (issue #234): a typo in config.json
+    costs that one setting, never the assistant's start — and never silently
+    starts something the operator did not ask for."""
+    store.write_json(cfg.config_path(), {
+        "assistant_model": 7, "assistant_harness": "   ",
+    })
+    config = cfg.load()
+    assert config.assistant_model is None
+    assert config.assistant_harness is None
+    settings = cfg.assistant_settings()
+    assert settings["model"].value is None
+    assert settings["model"].source == "default"
+    assert any(
+        "platform_assistant_setting_invalid" in record.message
+        for record in caplog.records
+    )
+
+
+def test_assistant_values_are_stripped_not_refused(platform_root):
+    store.write_json(cfg.config_path(), {"assistant_model": "  sonnet-5  "})
+    assert cfg.load().assistant_model == "sonnet-5"
+    assert cfg.assistant_settings()["model"].value == "sonnet-5"
+
+
+def test_assistant_settings_read_fresh_without_a_reload(platform_root):
+    """The whole reason the resolver exists: the daemon holds a boot-time
+    config, and a persisted change must reach the *next* start anyway."""
+    assert cfg.assistant_settings()["model"].value is None
+    cfg.update_stored({"assistant_model": "late-model"})
+    assert cfg.assistant_settings()["model"].value == "late-model"
+
+
+# --- the settings write path (update_stored) ---------------------------------
+
+def test_update_stored_edits_only_the_stored_layer(platform_root, monkeypatch):
+    """An export shadowing the write must not be baked into the file: the file
+    carries what was written, while the effective answer stays the env's."""
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "env-model")
+    cfg.update_stored({"assistant_model": "file-model"})
+    stored = store.read_json(cfg.config_path())
+    config_keys = {k: v for k, v in stored.items() if k not in ("schema", "updated")}
+    assert config_keys == {"assistant_model": "file-model"}
+    settings = cfg.assistant_settings()
+    assert settings["model"].value == "env-model"
+    assert settings["model"].source == "env"
+
+
+def test_update_stored_none_removes_the_key(platform_root):
+    store.write_json(cfg.config_path(), {
+        "assistant_model": "old", "assistant_preset": "kept",
+    })
+    cfg.update_stored({"assistant_model": None})
+    stored = store.read_json(cfg.config_path())
+    assert "assistant_model" not in stored
+    assert stored["assistant_preset"] == "kept"
+
+
+def test_update_stored_preserves_unknown_keys(platform_root):
+    """The same tolerance load() has: a file written by a newer build keeps its
+    keys through an older build's settings write."""
+    store.write_json(cfg.config_path(), {"future_key": "future-value"})
+    cfg.update_stored({"assistant_model": "m"})
+    stored = store.read_json(cfg.config_path())
+    assert stored["future_key"] == "future-value"
+    assert stored["assistant_model"] == "m"
+
+
+def test_update_stored_refuses_unknown_fields(platform_root):
+    with pytest.raises(cfg.ConfigError, match="unknown config field"):
+        cfg.update_stored({"assistant_effort": "high"})
+    assert not cfg.config_path().exists()
+
+
+def test_update_stored_refuses_a_write_that_would_break_the_next_boot(
+    platform_root
+):
+    """The merged file is validated whole before it lands, so the refusal
+    arrives on the write — with the caller attached — rather than at boot."""
+    with pytest.raises(cfg.ConfigError):
+        cfg.update_stored({"bind_port": 0})
+    assert not cfg.config_path().exists()
+
+
+def test_a_shadowed_setting_still_reports_its_stored_value(
+    platform_root, monkeypatch
+):
+    """What a settings screen edits is the file's layer, so the file's value
+    rides beside the effective one whichever layer won — prefilling a field
+    from the env value and saving it back is how an export gets baked in."""
+    store.write_json(cfg.config_path(), {"assistant_model": "file-model"})
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "env-model")
+    setting = cfg.assistant_settings()["model"]
+    assert setting.value == "env-model"
+    assert setting.source == "env"
+    assert setting.stored == "file-model"
+    assert setting.to_dict() == {
+        "value": "env-model", "source": "env", "stored": "file-model",
+    }
+
+
+def test_an_agents_value_naming_nobody_is_unusable_in_the_standing_layers(
+    platform_root, caplog
+):
+    """The rule that was once missed: ',' passes text checks, and lmer refuses
+    a fan-out that spawns nobody — stored, it made every start a 500."""
+    store.write_json(cfg.config_path(), {"assistant_agents": " , ,"})
+    assert cfg.load().assistant_agents is None
+    assert cfg.assistant_settings()["agents"].value is None
+    assert any(
+        "platform_assistant_setting_invalid" in record.message
+        for record in caplog.records
+    )
+
+
+def test_an_unusable_env_value_falls_through_to_the_file(
+    platform_root, monkeypatch, caplog
+):
+    """The effective answer must be the one the start path will use: an export
+    of '-x' contributes nothing, and the screen shows the file's value rather
+    than affirming a value the spawn would have discarded."""
+    store.write_json(cfg.config_path(), {"assistant_model": "file-model"})
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "-broken")
+    setting = cfg.assistant_settings()["model"]
+    assert setting.value == "file-model"
+    assert setting.source == "config.json"
+    assert any(
+        "platform_assistant_setting_invalid" in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("key, value", [
+    ("model", "   "),
+    ("model", 7),
+    ("model", "-x"),
+    ("agents", ","),
+    ("agents", " , ,"),
+])
+def test_validate_assistant_override_refuses_and_names_the_key(
+    platform_root, key, value
+):
+    with pytest.raises(cfg.ConfigError, match=key):
+        cfg.validate_assistant_override(key, value)
+
+
+def test_validate_assistant_override_strips_a_usable_value(
+    platform_root, known_presets
+):
+    assert cfg.validate_assistant_override("model", "  sonnet-5 ") == "sonnet-5"
+    assert cfg.validate_assistant_override("agents", "dev,review") == "dev,review"
+
+
+# --- the name rules: values the host would refuse at exit 2 -------------------
+#
+# Shape checks are not enough for three of the four settings: harness, preset
+# and agents names have host-side authorities (known_harnesses(),
+# load_presets()) and a name they do not know passes every shape check, spawns
+# a session that exists on paper, and exits 2 — from a *stored* value, that is
+# an assistant that cannot start, behind routes that answered 200.
+
+def test_an_unknown_harness_is_unusable_in_the_standing_layers(
+    platform_root, caplog
+):
+    store.write_json(cfg.config_path(), {"assistant_harness": "claud"})
+    assert cfg.load().assistant_harness is None
+    assert cfg.assistant_settings()["harness"].value is None
+    assert any(
+        "platform_assistant_setting_invalid" in record.message
+        for record in caplog.records
+    )
+
+
+def test_a_known_harness_resolves(platform_root):
+    store.write_json(cfg.config_path(), {"assistant_harness": "codex"})
+    assert cfg.load().assistant_harness == "codex"
+
+
+def test_an_unknown_preset_is_unusable_and_the_refusal_names_the_catalog(
+    platform_root, known_presets
+):
+    with pytest.raises(cfg.ConfigError) as refused:
+        cfg.validate_assistant_override("preset", "reviw")
+    assert "reviw" in str(refused.value)
+    assert "review" in str(refused.value), (
+        "the refusal does not name the catalog, so a typo cannot be spotted"
+    )
+
+
+def test_with_no_presets_file_every_preset_name_is_unusable(platform_root):
+    """An empty catalog is an authoritative answer, not an unavailable one:
+    with the feature off, lmer exits 2 for every preset name."""
+    with pytest.raises(cfg.ConfigError, match="LMER_PRESETS_FILE"):
+        cfg.validate_assistant_override("preset", "anything")
+
+
+def test_an_agents_selection_with_one_unknown_member_is_refused(
+    platform_root, known_presets
+):
+    with pytest.raises(cfg.ConfigError, match="nosuch"):
+        cfg.validate_assistant_override("agents", "dev,nosuch")
+
+
+def test_an_unknown_model_is_deliberately_not_refused(platform_root):
+    """No host-side authority exists for model ids — the harness is the only
+    thing that knows its own — so the verbatim stance stays."""
+    assert cfg.validate_assistant_override("model", "no-such-model") == "no-such-model"
+
+
+def test_an_oversized_value_is_unusable_before_it_can_break_the_spawn(
+    platform_root, caplog
+):
+    """One argv token past the kernel's MAX_ARG_STRLEN makes Popen raise E2BIG
+    — a spawn that cannot even fail as a session. Bounded far below that."""
+    huge = "m" * (cfg.MAX_ASSISTANT_SETTING_CHARS + 1)
+    with pytest.raises(cfg.ConfigError, match="model"):
+        cfg.validate_assistant_override("model", huge)
+    store.write_json(cfg.config_path(), {"assistant_model": huge})
+    assert cfg.load().assistant_model is None
+    assert cfg.assistant_settings()["model"].value is None
+
+
+def test_an_unavailable_authority_downgrades_to_shape_checks(
+    platform_root, monkeypatch, caplog
+):
+    """The check must never break a start the spawned lmer would have accepted:
+    an authority that cannot answer skips the name rule rather than refusing
+    everything (the _require_taskdef posture)."""
+    import lmer_cli.harness as harness_mod
+
+    def broken():
+        raise RuntimeError("registry unreadable")
+
+    monkeypatch.setattr(harness_mod, "known_harnesses", broken)
+    assert cfg.validate_assistant_override("harness", "claud") == "claud"
+    assert any(
+        "platform_assistant_authority_unavailable" in record.message
+        for record in caplog.records
+    )
+
+
+def test_an_unusable_stored_value_is_still_served_as_stored(platform_root):
+    """The settings screen edits the file's layer, so it has to see the file's
+    text even when resolution discards it — served as null, an unusable stored
+    value is invisible, unclearable from the screen, and warns forever."""
+    store.write_json(cfg.config_path(), {"assistant_model": "-broken"})
+    setting = cfg.assistant_settings()["model"]
+    assert setting.value is None
+    assert setting.source == "default"
+    assert setting.stored == "-broken"
+
+
+# --- round 2: the authority view must match what the child actually accepts ---
+
+def test_an_agents_member_matching_no_preset_takes_the_model_route(
+    platform_root
+):
+    """The regression class from review round 2: `--agents=fable` is the
+    documented model-route form and, with no presets file, the only usable
+    form of --agents at all — a catalog-membership check refused it and
+    silently stripped a working fan-out from the standing layers."""
+    assert cfg.validate_assistant_override("agents", "fable") == "fable"
+    store.write_json(cfg.config_path(), {"assistant_agents": "fable"})
+    assert cfg.load().assistant_agents == "fable"
+    assert cfg.assistant_settings()["agents"].value == "fable"
+
+
+def test_a_case_variant_of_a_defined_preset_is_refused_as_the_child_refuses_it(
+    platform_root, known_presets
+):
+    """resolve_agent_presets' own trap, inherited by consulting it rather than
+    re-deriving membership: 'Dev' must not silently take the model route when
+    a 'dev' preset exists."""
+    with pytest.raises(cfg.ConfigError, match="did you mean"):
+        cfg.validate_assistant_override("agents", "Dev")
+
+
+def test_a_harness_name_is_matched_case_insensitively(platform_root):
+    """resolve_harness_selection lowercases its input ('LMER_HARNESS=Codex
+    works'), so the membership check has to as well — 'Codex' ran codex before
+    the name rules existed and must keep doing so."""
+    assert cfg.validate_assistant_override("harness", "Codex") == "Codex"
+    store.write_json(cfg.config_path(), {"assistant_harness": "Codex"})
+    assert cfg.load().assistant_harness == "Codex"
+
+
+@pytest.fixture
+def dropin_harnesses(tmp_path, monkeypatch):
+    """An initially-empty user-harness directory, primed into the load cache.
+
+    The scenario the refresh exists for: the daemon has already read the
+    directory once (caching "nothing there"), and a drop-in is installed
+    afterwards — every freshly spawned lmer sees it, so the daemon's authority
+    view must too.
+    """
+    from lmer_cli.user_harnesses import (
+        clear_user_harness_cache, load_user_harnesses,
+    )
+
+    root = tmp_path / "harnesses"
+    monkeypatch.setenv("LMER_HARNESSES_DIR", str(root))
+    clear_user_harness_cache()
+    assert load_user_harnesses() == {}, "the stale 'no directory' answer"
+
+    def install(name):
+        harness_dir = root / name
+        harness_dir.mkdir(parents=True)
+        (harness_dir / "harness.json").write_text(
+            json.dumps({"schema": 1, "binary": name})
+        )
+        (harness_dir / "runner.sh").write_text("#!/bin/sh\nexit 0\n")
+        return harness_dir
+
+    yield install
+    clear_user_harness_cache()
+
+
+def test_a_dropin_installed_after_the_first_read_is_honoured(
+    platform_root, dropin_harnesses
+):
+    """The behaviour, not the mechanism: a name every freshly spawned lmer
+    accepts must not be refused by a long-lived daemon that read the directory
+    before the drop-in existed."""
+    with pytest.raises(cfg.ConfigError):
+        cfg.validate_assistant_override("harness", "mycli")
+    dropin_harnesses("mycli")
+    assert cfg.validate_assistant_override("harness", "mycli") == "mycli"
+
+
+def test_the_agents_path_sees_a_dropin_installed_after_the_first_read(
+    platform_root, dropin_harnesses, tmp_path, monkeypatch
+):
+    """The residue round 3 named: resolve_agent_presets reaches
+    known_harnesses() itself (a preset's --harness arg is validated there), so
+    the refresh has to happen on the agents path too — a fresh child accepts
+    this selection, and the daemon must agree."""
+    presets_file = tmp_path / "presets.json"
+    presets_file.write_text(json.dumps({
+        "myagent": {"args": ["--harness", "mycli"]},
+    }))
+    monkeypatch.setenv("LMER_PRESETS_FILE", str(presets_file))
+    with pytest.raises(cfg.ConfigError):
+        cfg.validate_assistant_override("agents", "myagent")
+    dropin_harnesses("mycli")
+    assert cfg.validate_assistant_override("agents", "myagent") == "myagent"
+
+
+def test_a_refresh_does_not_repeat_a_malformed_dropins_warning(
+    platform_root, dropin_harnesses, capsys
+):
+    """The module's once-per-process warning promise has to survive a daemon
+    refreshing per validation — a host with one malformed drop-in must not get
+    the warning re-emitted on every config read and every start."""
+    broken = dropin_harnesses("okcli").parent / "broken"
+    broken.mkdir()
+    (broken / "harness.json").write_text("{not json")
+    cfg.validate_assistant_override("harness", "okcli")
+    cfg.validate_assistant_override("harness", "okcli")
+    warnings = capsys.readouterr().err.count("User harness")
+    assert warnings == 1, (
+        f"the malformed drop-in warned {warnings} times across two refreshes"
+    )
+
+
+def test_a_non_string_stored_value_is_serialized_not_hidden(platform_root):
+    """The narrowed residue of the stored-value thread: a hand-written list or
+    number must be visible and clearable from the screen, not warn forever
+    behind a stored:null the dialog cannot act on."""
+    store.write_json(cfg.config_path(), {
+        "assistant_agents": ["dev", "review"], "assistant_model": 5,
+    })
+    settings = cfg.assistant_settings()
+    assert settings["agents"].value is None
+    assert settings["agents"].stored == '["dev", "review"]'
+    assert settings["model"].stored == "5"

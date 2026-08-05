@@ -87,11 +87,13 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   mdiRobot,
   mdiClose,
+  mdiCogOutline,
   mdiDotsVertical,
   mdiPlayCircleOutline,
   mdiRestart,
   mdiStopCircleOutline,
 } from '@mdi/js'
+import AssistantSettings from './AssistantSettings.vue'
 import Chat from './Chat.vue'
 import {
   fetchAssistant,
@@ -132,6 +134,16 @@ const orders = ref(null)
 const ordersProblem = ref(null)
 const ordersLoading = ref(false)
 const ordersOpen = ref(undefined)
+
+// The settings dialog (issue 234) lives in its own component, and the split is
+// what keeps this file's guard a guard: the drawer is pinned to carry no input
+// affordance at all — the tempting one being a standing-orders textarea, a second
+// writer of a chat-written document (T87) — while launch facts
+// (model/harness/preset/agents) are a config file's to edit and a form's to
+// write. This file owns only the open flag and the restart the dialog offers,
+// which routes through the same confirmation as the header's: ending a context
+// window is the same decision however it is reached.
+const settingsOpen = ref(false)
 
 let timer = null
 let disposed = false
@@ -307,6 +319,16 @@ onBeforeUnmount(() => {
         <!-- Stop and start are never both here: one of them is always the verb the
              daemon would refuse, and offering it would be offering a 409. -->
         <v-list density="compact">
+          <!-- Settings sit in the overflow rather than beside restart: the header
+               already carries a worded verb plus two icon buttons, and issue 194's
+               lesson was that this toolbar is read on a phone. Offered with no
+               uber lmer running too — what is being configured is the NEXT one,
+               which is exactly the state a start button is next to. -->
+          <v-list-item
+            :prepend-icon="mdiCogOutline"
+            title="uber lmer settings"
+            @click="settingsOpen = true"
+          />
           <v-list-item
             v-if="running"
             :prepend-icon="mdiStopCircleOutline"
@@ -351,6 +373,16 @@ onBeforeUnmount(() => {
       </v-card-actions>
     </v-card>
   </v-dialog>
+
+  <!-- The settings dialog (issue 234) — its own component, so this file stays
+       free of input affordances; see AssistantSettings.vue for everything it
+       promises. Its restart lands in the same confirmation as the header's. -->
+  <AssistantSettings
+    v-model="settingsOpen"
+    :running="running"
+    :running-settings="status?.settings || null"
+    @restart="confirmingRestart = true"
+  />
 
   <v-dialog v-model="confirmingStop" max-width="480">
     <v-card>

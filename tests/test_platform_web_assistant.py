@@ -764,6 +764,72 @@ def test_the_drawer_shows_the_standing_orders_and_offers_no_way_to_edit_them():
     )
 
 
+def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
+    """Issue #234. The drawer's no-affordance guard above is a one-line ban, and
+    keeping it one is why the settings dialog lives in its own file: launch facts
+    (model/harness/preset/agents) are a config file's to edit and a form's to
+    write, while the standing orders' write path stays the chat. What this pins
+    is the boundary — the dialog writes the config route and could not reach the
+    instructions route even by mistake (the rglob in the standing-orders test
+    covers every source file, this one included), and the drawer file itself
+    stays free of input widgets.
+    """
+    settings = WEB / "src" / "components" / "AssistantSettings.vue"
+    text = _read(settings)
+    words = _operator_words(settings)
+
+    assert "fetchAssistantConfig" in text and "setAssistantConfig" in text, (
+        "the dialog reads or writes something other than the daemon's config route"
+    )
+    assert "request('api/assistant/config')" in _read(API_JS), (
+        "the read is no longer the GET the daemon serves"
+    )
+    assert "api/assistant/instructions" not in text, (
+        "the settings dialog touches the standing orders, which are the chat's"
+    )
+    # The naming rule is the drawer's, and it travels with the feature: the
+    # dialog is about the same recipient.
+    assert "uber lmer" in words, "the dialog never says whose settings these are"
+    assert "assistant" not in words.lower(), (
+        f"the dialog calls the supervisor an assistant to the operator: {words!r}"
+    )
+    # The two ways a settings screen lies, said to the operator: scope and
+    # shadowing. Both are prose, so both are checked as operator words.
+    assert "next" in words and "incarnation" in words, (
+        "nothing states that a change applies to the next incarnation — a save "
+        "that visibly does nothing reads as broken"
+    )
+    assert "has no effect until that export is removed" in words, (
+        "an env-shadowed save is reported as if it took effect"
+    )
+    # Fields prefill from the stored layer, never the effective value: saving an
+    # export's text into config.json is the baking-in the API refuses to do.
+    assert re.search(r"\.stored \|\| ''", text), (
+        "the form prefills from something other than the stored layer"
+    )
+    # The restart the saved banner offers is the drawer's own confirmed one —
+    # ending a context window is one decision however it is reached.
+    drawer = _read(DRAWER)
+    assert '@restart="confirmingRestart = true"' in drawer, (
+        "the dialog's restart bypasses the drawer's confirmation"
+    )
+    assert "AssistantSettings" in drawer, (
+        "the dialog is not reachable from the drawer at all"
+    )
+    # The saved banner's one branch: when every changed key came back still
+    # pinned by an export, the restart offer is withheld — an operator taking
+    # it would pay a context window to run the export again.
+    assert "savedShadowed" in text, (
+        "nothing distinguishes an all-shadowed save from an effective one"
+    )
+    # Whitespace-normalized: the sentence wraps in the template, and the
+    # phrase is the assertion — not its line breaks.
+    assert "run the export, not what you saved" in " ".join(words.split()), (
+        "the all-shadowed save does not tell the operator the restart is "
+        "pointless"
+    )
+
+
 def test_the_standing_orders_are_fetched_on_demand_and_not_polled():
     """The drawer's cost is one status poll every ten seconds, and standing orders
     change a few times a month — so they are read when the panel is expanded.

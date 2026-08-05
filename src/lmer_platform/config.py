@@ -67,11 +67,13 @@ and for the case where the honest answer is "there isn't one".
 from __future__ import annotations
 
 import ipaddress
+import json
 import logging
 import os
 import secrets
 import stat
 import subprocess
+import threading
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Optional
@@ -103,6 +105,8 @@ __all__ = [
     "DOCKER_BRIDGE_INTERFACE", "ContainerReach", "config_path",
     "load", "save", "read_secret", "ensure_secret", "active_secret",
     "binding_notice", "configured_repo_url", "container_base_url",
+    "ASSISTANT_SETTING_KEYS", "AssistantSetting", "assistant_settings",
+    "update_stored", "validate_assistant_override",
 ]
 
 CONFIG_FILENAME = "config.json"
@@ -154,6 +158,37 @@ ENV_WORK_REPO_FORGE = "LMER_PLATFORM_WORK_REPO_FORGE"
 #: name, and a reverse proxy, a custom network or a runtime this build does not
 #: know about are all cases where an operator knows an answer the code cannot.
 ENV_CONTAINER_URL = "LMER_PLATFORM_CONTAINER_URL"
+
+#: How the orchestrating assistant's session is *run*, per platform instance
+#: (issue #234): the model, harness, preset and agents fan-out its ``lmer``
+#: invocation is given. Exactly the four launch facts a worker spawn already
+#: takes (:class:`lmer_platform.spawn.SpawnRequest`), because they are the four
+#: that travel as flags — a flag beats the container's environment and a
+#: preset's env, so what is configured here is what actually runs. Reasoning
+#: effort is deliberately NOT among them: ``lmer`` has no effort flag, the
+#: variable would have to ride ``--env-file``, and ``--env-file`` values lose
+#: to the daemon's own exported environment — a setting that can be silently
+#: shadowed is the failure mode this surface exists to avoid.
+#:
+#: Each defaults to ``None`` — today's behaviour, the session running whatever
+#: its environment and harness settle on — and resolves by the module's usual
+#: chain. The keys are the *request-body* spelling (``model``, not
+#: ``assistant_model``): one vocabulary for the routes, the resolver and the
+#: spawn fields they end up in.
+ENV_ASSISTANT_MODEL = "LMER_PLATFORM_ASSISTANT_MODEL"
+ENV_ASSISTANT_HARNESS = "LMER_PLATFORM_ASSISTANT_HARNESS"
+ENV_ASSISTANT_PRESET = "LMER_PLATFORM_ASSISTANT_PRESET"
+ENV_ASSISTANT_AGENTS = "LMER_PLATFORM_ASSISTANT_AGENTS"
+
+#: setting key -> (PlatformConfig field, env var). The one table the loader,
+#: the resolver and the API routes all read, so a fifth setting is added in
+#: exactly one place.
+ASSISTANT_SETTING_KEYS = {
+    "model": ("assistant_model", ENV_ASSISTANT_MODEL),
+    "harness": ("assistant_harness", ENV_ASSISTANT_HARNESS),
+    "preset": ("assistant_preset", ENV_ASSISTANT_PRESET),
+    "agents": ("assistant_agents", ENV_ASSISTANT_AGENTS),
+}
 
 #: ``work_repo_forge``'s third value, which is not a forge: the operator saying
 #: "build no links for this work repo". The only way to get unlinked run files,
@@ -230,6 +265,18 @@ class PlatformConfig:
     max_followup_rounds: int = DEFAULT_MAX_FOLLOWUP_ROUNDS
     autonomous_default: bool = False
     park_idle_side: bool = False
+    #: How the orchestrating assistant's session is run (issue #234) — see
+    #: :data:`ASSISTANT_SETTING_KEYS`. ``None`` is today's behaviour: the
+    #: session runs whatever its environment, its preset or its harness settles
+    #: on. Values are names handed to ``lmer``'s own flags verbatim — the model
+    #: name in particular is not validated here, because the harness is the
+    #: only thing that knows which ids it serves and a platform-side allowlist
+    #: would be a second, staler opinion (the same stance
+    #: :class:`lmer_platform.spawn.SpawnRequest` takes).
+    assistant_model: Optional[str] = None
+    assistant_harness: Optional[str] = None
+    assistant_preset: Optional[str] = None
+    assistant_agents: Optional[str] = None
 
     @property
     def secret_path(self) -> Path:
@@ -317,7 +364,280 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         )
     if normalized != forge:
         config = replace(config, work_repo_forge=normalized)
+    for field_name in (field for field, _ in ASSISTANT_SETTING_KEYS.values()):
+        value = getattr(config, field_name)
+        cleaned = _assistant_value(value, field=field_name)
+        if cleaned != value:
+            config = replace(config, **{field_name: cleaned})
     return config
+
+
+def _assistant_value(value: object, *, field: str) -> Optional[str]:
+    """A usable assistant launch setting, or ``None`` with a warning.
+
+    The ``_resolve_pids_limit`` house rule rather than :func:`_validate`'s
+    refusals, and the difference is what a bad value would cost: a mistyped
+    bind port must not boot a daemon somewhere the operator does not believe it
+    is, while a mistyped assistant setting read at *start time* would otherwise
+    take down the one session the operator talks to — refusing here would turn
+    a typo in ``config.json`` into an assistant that cannot start at all. So
+    anything that is not usable text warns, names the field, and reads as
+    unset: the assistant starts the way it did before the setting existed,
+    which is a session the operator can be told about the typo through.
+
+    "Usable" is deliberately the same set of shape rules
+    :meth:`lmer_platform.spawn.SpawnRequest.validate` enforces for these four
+    fields (:func:`_unusable_reason`), and this is the ONE definition of it for
+    the standing layers — ``load()``, :func:`assistant_settings` and the start
+    path all resolve through here. The rules living in one place is the fix for
+    a real bug: an ``agents`` that named nobody once passed every hand-copied
+    validation layer and was refused only inside the spawn, as a 500, on every
+    start — a stored value that made the assistant unstartable, which is
+    exactly what this posture exists to prevent.
+
+    What is *not* checked is the value's meaning — a model or harness name is
+    handed to ``lmer`` verbatim, per :attr:`PlatformConfig.assistant_model`.
+    """
+    if value is None:
+        return None
+    reason = _unusable_reason(field, value)
+    if reason is not None:
+        logger.warning(
+            "platform_assistant_setting_invalid field=%s value=%r — %s; "
+            "ignoring it and resolving as if this layer were unset",
+            field, value, reason,
+        )
+        return None
+    return str(value).strip()
+
+
+#: Ceiling on one launch-setting value. Names are a few dozen characters; the
+#: bound exists because each value becomes one argv token, and a token past the
+#: kernel's ``MAX_ARG_STRLEN`` (~128 KiB) makes ``Popen`` raise ``E2BIG`` — a
+#: spawn that cannot even fail as a session, surfacing as a 500 on every start
+#: for as long as the value is stored. Far above any name, far below the cliff.
+MAX_ASSISTANT_SETTING_CHARS = 4096
+
+
+def _authority_names(kind: str) -> Optional[set]:
+    """The names this host would accept for *kind* — or ``None`` for "cannot say".
+
+    The authorities already exist host-side and are the ones the spawned
+    ``lmer`` itself consults: ``known_harnesses()`` (built-ins plus
+    ``~/.lmer/harnesses``) and ``load_presets()`` (``LMER_PRESETS_FILE``, read
+    from this daemon's environment — which is the environment the spawn
+    inherits). An *empty* preset catalog is an authoritative answer for the
+    ``preset`` field, not an unavailable one: ``--preset`` has no fallback
+    route, so with the feature off ``lmer`` exits 2 for every preset name.
+    (``agents`` is deliberately NOT answered from this catalog — see
+    :func:`_agents_selection_reason` for the fallback that makes an empty
+    catalog mean something different there.)
+
+    The user-harness view is **refreshed** before the harness read
+    (:func:`lmer_cli.user_harnesses.refresh_user_harnesses`): the load cache
+    lives for the process — including a cached "no directory" from before a
+    first drop-in was installed — while every spawned ``lmer`` is a fresh
+    process that would see the new harness. A long-lived daemon refusing a
+    name every fresh child accepts is this check diverging from the authority
+    it quotes, which is the one failure it must not have. A refresh rather
+    than a cache *clear*, deliberately: the clear raced concurrent loads in
+    the server's threadpool (and the race failed open, downgrading the check
+    at exactly the wrong moment), and it re-emitted every malformed drop-in's
+    warning per validation — the refresh assigns in place and the loader
+    dedups its warnings, so neither failure exists to have.
+
+    ``None`` — the authority itself failing — downgrades the check to
+    shape-only rather than refusing everything, the same "warns only when it
+    has some host-side view" posture ``assistant._require_taskdef`` takes. And
+    the same residual applies: this answers for *this* package's checkout,
+    while the process spawned is ``config.lmer_bin`` — point that at a
+    different tree and the two can disagree, as everything imported from
+    ``lmer_cli`` already can.
+    """
+    try:
+        if kind == "harness":
+            from lmer_cli.harness import known_harnesses
+            from lmer_cli.user_harnesses import refresh_user_harnesses
+
+            refresh_user_harnesses()
+            return set(known_harnesses())
+        from lmer_cli.presets import load_presets
+
+        return set(load_presets())
+    except Exception as exc:  # noqa: BLE001 - validation must not break a start
+        logger.warning(
+            "platform_assistant_authority_unavailable kind=%s error=%s — "
+            "launch-setting names are checked for shape only", kind, exc,
+        )
+        return None
+
+
+def _unknown_name_reason(kind: str, names: list) -> Optional[str]:
+    """Why these *names* would make ``lmer`` exit 2 — ``None`` when they would not.
+
+    Membership is checked the way the child checks it, which differs by kind:
+    harness resolution lowercases its input (``resolve_harness_selection``, so
+    ``LMER_HARNESS=Codex`` works and ``Codex`` must pass here too), while
+    preset lookup is exact-case (``presets.get`` — a case-variant is a miss
+    the child refuses).
+    """
+    known = _authority_names(kind)
+    if known is None:
+        return None
+    if kind == "harness":
+        missing = sorted(
+            name for name in names if name.lower() not in known
+        )
+    else:
+        missing = sorted(name for name in names if name not in known)
+    if not missing:
+        return None
+    if known:
+        catalog = f"this host knows: {', '.join(sorted(known))}"
+    elif kind == "preset":
+        catalog = (
+            "this host has no presets at all (LMER_PRESETS_FILE is unset, "
+            "empty or unreadable)"
+        )
+    else:
+        catalog = f"this host knows no {kind} names at all"
+    return (
+        f"no {kind} named {', '.join(repr(name) for name in missing)} exists "
+        f"on this host — `lmer` would exit 2 after the session was already "
+        f"registered; {catalog}"
+    )
+
+
+def _agents_selection_reason(selection: str) -> Optional[str]:
+    """Why ``lmer`` would refuse this ``--agents`` selection — ``None`` if it won't.
+
+    Asked of ``resolve_agent_presets`` itself rather than re-derived as
+    catalog membership, because the resolver accepts more than the catalog:
+    a member matching no preset falls back to the **model route**
+    (``harness_for_model`` — ``fable`` resolves as a synthesized model agent),
+    which is the documented form ``--agents=fable,sol-review`` and, on a host
+    with no presets file, the only usable form of ``--agents`` at all. A
+    membership check here once refused exactly that and silently stripped a
+    working fan-out from the standing layers. The resolver is side-effect-free
+    and also encodes the refusals a re-derivation would miss — the
+    case-variant-of-a-preset trap, and unknown-name-with-catalog wording.
+
+    The user-harness view is refreshed first, exactly as in
+    :func:`_authority_names` and for the same divergence: the resolver reaches
+    ``known_harnesses()`` itself — a preset's ``--harness`` arg is validated
+    there, and ``harness_for_model`` consults user ``model_hints`` — so
+    without the refresh this path answered from whatever a previous read had
+    cached while the harness field beside it answered fresh.
+
+    The resolver's *warnings* are logged rather than dropped, because one of
+    them is the signal that makes the model route survivable: a typo'd preset
+    name containing a model word ("sonnet-reviw") resolves via the model route
+    with no error, and only fails hours later inside the session — the child
+    prints this note where its log can be read, and the daemon holding the
+    same note must not discard it.
+
+    Failure of the resolver itself downgrades to "no answer" (the caller's
+    shape checks have already run), the same posture as
+    :func:`_authority_names`.
+    """
+    try:
+        from lmer_cli.presets import load_presets, resolve_agent_presets
+        from lmer_cli.user_harnesses import refresh_user_harnesses
+
+        refresh_user_harnesses()
+        _resolved, warnings, error = resolve_agent_presets(
+            selection, load_presets()
+        )
+    except Exception as exc:  # noqa: BLE001 - validation must not break a start
+        logger.warning(
+            "platform_assistant_authority_unavailable kind=agents error=%s — "
+            "the agents selection is checked for shape only", exc,
+        )
+        return None
+    for note in warnings:
+        logger.warning(
+            "platform_assistant_agents_note selection=%r: %s", selection, note
+        )
+    if error is None:
+        return None
+    return (
+        f"`lmer` would refuse this agents selection and exit 2 after the "
+        f"session was already registered: {error}"
+    )
+
+
+def _unusable_reason(field: str, value: object) -> Optional[str]:
+    """Why *value* cannot be a launch setting for *field* — ``None`` when it can.
+
+    One rule set, shared by the two postures built on top: the standing layers
+    warn and fall through (:func:`_assistant_value`), an explicit ask is
+    refused with the reason (:func:`validate_assistant_override`).
+
+    Two kinds of rule, and both matter. The **shape** rules mirror
+    ``spawn._reject_option_value`` and ``spawn._reject_empty_agent_selection``:
+    a value those would refuse becomes a session that exists on paper and exits
+    2 before its first line of output. The **name** rules ask the host-side
+    authorities the spawned ``lmer`` itself consults (:func:`_authority_names`)
+    — because a harness, preset or agent name the host does not know passes
+    every shape check, the spawn *succeeds*, and the child exits 2 after the
+    route already answered 200: a one-letter typo persisted through the
+    settings surface would otherwise stop the incumbent, crash-loop the
+    supervisor's respawns, and take down the one session the operator talks to,
+    all behind successful-looking responses. ``model`` deliberately gets no
+    name rule — no host-side authority exists (the harness is the only thing
+    that knows its own ids), so the verbatim stance stays.
+
+    *field* accepts both spellings — the setting key (``agents``) and the
+    config field (``assistant_agents``) — so the callers do not translate.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return "not non-empty text"
+    text = value.strip()
+    if text.startswith("-"):
+        return (
+            "it begins with a dash, which `lmer`'s parser reads as the next "
+            "option rather than a name"
+        )
+    if len(text) > MAX_ASSISTANT_SETTING_CHARS:
+        return (
+            f"it is {len(text)} characters long, over the "
+            f"{MAX_ASSISTANT_SETTING_CHARS} limit — a launch setting is one "
+            "argv token, and an oversized one breaks the spawn itself rather "
+            "than the session"
+        )
+    if field in ("harness", "assistant_harness"):
+        return _unknown_name_reason("harness", [text])
+    if field in ("preset", "assistant_preset"):
+        return _unknown_name_reason("preset", [text])
+    if field in ("agents", "assistant_agents"):
+        if not [name for name in text.split(",") if name.strip()]:
+            return (
+                "it names no agent — the selection is split on commas and "
+                "blank entries are dropped, and `lmer` refuses a fan-out that "
+                "spawns nobody"
+            )
+        # NOT the preset catalog: agents members that match no preset take
+        # the model route, so the child's own resolver is the only honest
+        # authority for a selection.
+        return _agents_selection_reason(text)
+    return None
+
+
+def validate_assistant_override(key: str, value: object) -> str:
+    """A usable *explicit* launch-setting value, or a refusal naming *key*.
+
+    The other posture over :func:`_unusable_reason`'s one rule set: the caller
+    is attached and asking for exactly this value, so an unusable one is a
+    :class:`ConfigError` to answer with (the routes translate it to a 400)
+    rather than something to quietly start without — starting *something other
+    than what was asked for* is the failure the settings surface exists to
+    avoid. Assumes *key* is one of :data:`ASSISTANT_SETTING_KEYS`; unknown keys
+    are each surface's own refusal, since each names its own allowed set.
+    """
+    reason = _unusable_reason(key, value)
+    if reason is not None:
+        raise ConfigError(f"{key} is unusable ({value!r}): {reason}")
+    return str(value).strip()
 
 
 def load(overrides: Optional[dict] = None) -> PlatformConfig:
@@ -349,6 +669,10 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         "secret_file": _env_str(ENV_SECRET_FILE),
         "work_repo_mirror": _env_str(ENV_WORK_REPO_MIRROR),
         "work_repo_forge": _env_str(ENV_WORK_REPO_FORGE),
+        **{
+            field: _env_str(env_var)
+            for field, env_var in ASSISTANT_SETTING_KEYS.values()
+        },
     }
     values.update({k: v for k, v in env_values.items() if v is not None})
 
@@ -386,6 +710,162 @@ def save(config: PlatformConfig) -> None:
             f"save expects a PlatformConfig, got {type(config).__name__}"
         )
     write_json(config_path(), config.to_dict())
+
+
+@dataclass(frozen=True)
+class AssistantSetting:
+    """One effective assistant launch setting, and where it came from.
+
+    ``source`` names which layer of the chain produced the value — ``"env"``,
+    ``"config.json"`` or ``"default"`` — because the chain's one wrinkle is that
+    an export *shadows* what a settings screen wrote (module docstring), and a
+    screen that appears to have no effect is a bad afternoon. The per-call
+    override layer is deliberately not a source here: it exists only inside a
+    single start request and is never part of the standing answer this
+    describes.
+
+    ``stored`` is the ``config.json`` layer's own text whichever layer won —
+    what a settings screen has to edit. With an export standing in front of the
+    file the two differ, and a screen prefilled from ``value`` would show the
+    export's text in a field that writes the file: saving it would copy the env
+    value into ``config.json``, which is exactly the baking-in
+    :func:`update_stored` exists to prevent. It is the **raw** stored text,
+    deliberately not the cleaned value the resolution uses: an unusable stored
+    value served as ``null`` would prefill the field empty, make clearing it a
+    no-op diff, and leave a value nothing can see warning on every start — the
+    screen has to show what is actually in the file to be able to remove it.
+    """
+
+    value: Optional[str] = None
+    source: str = "default"
+    stored: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {"value": self.value, "source": self.source, "stored": self.stored}
+
+
+def assistant_settings() -> dict:
+    """The assistant's effective launch settings, one :class:`AssistantSetting` per key.
+
+    Read **fresh** — the environment and ``config.json`` as they are *now* —
+    rather than off a :class:`PlatformConfig` a caller is holding, and that is
+    the point of the function: the daemon loads its config once at boot, while
+    these settings are honoured at every assistant start and rotate (issue
+    #234), so a value persisted through ``POST /api/assistant/config`` must
+    reach the next incarnation without a daemon restart. Nothing else in the
+    config gets this treatment; a bind address that moved under a running
+    server would not be a feature.
+
+    Unusable values fall through with a warning (:func:`_assistant_value`) to
+    the next layer down — an export of ``"-x"`` resolves to what ``config.json``
+    says, and a typo there to the default; either way it costs that one layer,
+    never the assistant. That the *effective* answer here goes through the same
+    cleaner the start path reads is a promise, not a convenience: this is what
+    the settings screen shows as "how the next incarnation will be run", and a
+    screen reporting a value the start would have discarded is the screen lying.
+    A corrupt ``config.json`` has already been moved aside by ``store.read_json``
+    and reads as empty, the same tolerance :func:`load` has.
+    """
+    try:
+        stored = read_json(config_path())
+    except StoreError as exc:
+        logger.error(
+            "platform_config_unreadable error=%s — assistant settings resolve "
+            "from the environment and defaults only", exc,
+        )
+        stored = None
+    if not isinstance(stored, dict):
+        stored = {}
+    resolved = {}
+    for key, (field, env_var) in ASSISTANT_SETTING_KEYS.items():
+        raw = stored.get(field)
+        # The file's own content, usable or not — what the settings screen
+        # edits (see the dataclass); the cleaned value below is what
+        # resolution uses. A non-string a human hand-wrote into the JSON (a
+        # list where the schema wants a comma-string, a bare number) is
+        # serialized rather than dropped: served as null it would prefill the
+        # field empty, make clearing a no-op diff, and warn on every resolve
+        # with nothing on any screen to remove.
+        if isinstance(raw, str):
+            stored_text = raw.strip() or None
+        elif raw is None:
+            stored_text = None
+        else:
+            stored_text = json.dumps(raw)
+        file_value = _assistant_value(raw, field=field)
+        env_value = _assistant_value(_env_str(env_var), field=field)
+        if env_value is not None:
+            resolved[key] = AssistantSetting(
+                value=env_value, source="env", stored=stored_text
+            )
+            continue
+        if file_value is not None:
+            resolved[key] = AssistantSetting(
+                value=file_value, source="config.json", stored=stored_text
+            )
+            continue
+        resolved[key] = AssistantSetting(stored=stored_text)
+    return resolved
+
+
+#: Serializes :func:`update_stored`'s read-modify-write: the API handlers run in
+#: a threadpool, and two settings writes interleaving would silently drop one
+#: operator's change. Per-write atomicity is ``store.write_json``'s; this is the
+#: consistency across the cycle, the same distinction ``assistant._LOCK`` states.
+_STORED_LOCK = threading.Lock()
+
+
+def update_stored(changes: dict) -> dict:
+    """Persist *changes* into ``config.json`` — the stored layer and only it.
+
+    Not :func:`save`, deliberately: ``save`` writes a whole resolved
+    :class:`PlatformConfig`, and a resolved config has the environment baked
+    into it — persisting one from a daemon whose operator has
+    ``LMER_PLATFORM_ASSISTANT_MODEL`` exported would copy the export into the
+    file, where it would outlive the export and read as a choice nobody made.
+    This edits the stored mapping itself: unknown keys in the file survive
+    untouched (the same tolerance :func:`load` has for a file written by a
+    newer build), a value of ``None`` removes the key so the layer below shows
+    through, and everything else is stored as given.
+
+    The merged file is validated as a whole before it is written — built into a
+    :class:`PlatformConfig` exactly as :func:`load` would build it — so a write
+    that would make the next boot refuse the file is refused here instead, with
+    the caller still attached to hear it.
+
+    Returns the stored mapping as written.
+    """
+    known = _known_fields()
+    unknown = set(changes) - known
+    if unknown:
+        raise ConfigError(
+            f"unknown config field(s): {', '.join(sorted(unknown))}"
+        )
+    with _STORED_LOCK:
+        try:
+            stored = read_json(config_path())
+        except StoreError as exc:
+            logger.error(
+                "platform_config_unreadable error=%s — the update starts from "
+                "an empty stored config", exc,
+            )
+            stored = None
+        current = dict(stored) if isinstance(stored, dict) else {}
+        # The store's own bookkeeping, not configuration: ``write_json`` stamps
+        # both on every write, so carrying the old pair forward would only
+        # persist a stale ``updated``.
+        current.pop("schema", None)
+        current.pop("updated", None)
+        for field, value in changes.items():
+            if value is None:
+                current.pop(field, None)
+            else:
+                current[field] = value
+        _validate(PlatformConfig(**{
+            k: v for k, v in current.items() if k in known
+        }))
+        write_json(config_path(), current)
+    return current
 
 
 def configured_repo_url() -> Optional[str]:
