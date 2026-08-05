@@ -41,7 +41,23 @@ def _write_marker(directory, pid, gate="gate-check", started_at=None, raw=None):
 class TestParseMarker:
     def test_full_marker(self):
         marker = gate_lock.parse_marker('{"pid": 42, "gate": "gate-push", "started_at": 10.5}')
-        assert marker == {"pid": 42, "gate": "gate-push", "started_at": 10.5}
+        assert marker == {
+            "pid": 42,
+            "gate": "gate-push",
+            "started_at": 10.5,
+            "journal_only": False,
+        }
+
+    def test_journal_only_flag_is_normalized(self):
+        assert gate_lock.parse_marker(
+            '{"pid": 7, "journal_only": true}'
+        )["journal_only"] is True
+        # Anything but a literal true reads as a full (deferring) marker —
+        # mistaking journal-only for deferring only delays a commit, while
+        # the opposite mistake would leave a gate window unguarded.
+        assert gate_lock.parse_marker(
+            '{"pid": 7, "journal_only": "yes"}'
+        )["journal_only"] is False
 
     def test_pid_as_string_is_accepted(self):
         assert gate_lock.parse_marker('{"pid": "42"}')["pid"] == 42
@@ -153,6 +169,24 @@ class TestActiveGate:
         _write_marker(_lock_dir, os.getpid(), started_at=time.time())
         assert gate_lock.active_gate() is None
         assert gate_lock.active_gate(exclude_self=False) is not None
+
+    def test_journal_only_marker_never_defers_anyone(self, _lock_dir):
+        # The suite's redirected-dir marker (issue #233) exists for write
+        # attribution; the commit paths tests exercise must keep committing.
+        _lock_dir.mkdir(parents=True, exist_ok=True)
+        (_lock_dir / f"{os.getppid()}.json").write_text(
+            json.dumps(
+                {
+                    "pid": os.getppid(),
+                    "gate": "pytest-suite",
+                    "started_at": time.time(),
+                    "journal_only": True,
+                }
+            )
+        )
+        assert gate_lock.active_gate(exclude_self=False) is None
+        # …but attribution consumers still see it via read_markers.
+        assert [m["pid"] for m in gate_lock.read_markers()] == [os.getppid()]
 
     def test_dead_marker_is_ignored_and_pruned(self, _lock_dir):
         dead = _spawn_and_reap()

@@ -12,6 +12,29 @@ import pytest
 
 from lmer_cli import gate_lock, user_harnesses
 
+_OUTDATED_TREE_MSG = (
+    "tests/conftest.py needs the #233 write-attribution layer "
+    "(work_repo.write_journal and gate_lock journal-only markers), but this "
+    "process resolved lmer from a tree that predates it. On self-dev "
+    "containers a bare `pytest` imports the OPERATIONAL install at "
+    "/Agents/global/src rather than this checkout (issue #198) — an outdated "
+    "image, not a broken checkout. Run the suite through gate-check (it "
+    "prefixes PYTHONPATH with the checkout's src/), or invoke "
+    "`PYTHONPATH=<checkout>/src pytest` yourself."
+)
+
+try:
+    from work_repo import write_journal
+except ImportError as exc:  # pragma: no cover — needs a pre-#233 install
+    raise ImportError(_OUTDATED_TREE_MSG) from exc
+
+if "journal_only" not in inspect.signature(gate_lock.hold_gate_lock).parameters:
+    # Same skew, other module: write_journal may exist while gate_lock is
+    # still the pre-#233 build (or vice versa) depending on how the ambient
+    # tree was assembled — without this the failure is a TypeError deep in
+    # fixture setup instead of an explanation.
+    raise ImportError(_OUTDATED_TREE_MSG)
+
 
 #: Set on any host that is expected to be able to run the tests which *execute*
 #: web sources under Node — see :func:`require_node_toolchain` for what changes
@@ -183,6 +206,20 @@ def _work_repo_status_lines(work_repo_path):
     untracked or already-modified file leaves porcelain output unchanged —
     a known blind spot of any status-based diff.)
 
+    `core.quotePath=false` keeps non-ASCII paths literal instead of
+    quoted-and-escaped, which keeps accented session artifacts attributable
+    (issue #233); git still C-quotes paths containing spaces, quotes,
+    backslashes or control characters regardless of the setting, and
+    porcelain_entry_path decodes those rather than refusing them.
+
+    `errors="surrogateescape"` is what keeps a filename from disarming the
+    guard entirely: with quotePath=false git emits raw bytes, so one
+    non-UTF-8 name would otherwise raise UnicodeDecodeError, land in the
+    except below, and return None — reported at suite START that means "no
+    work repo to guard", i.e. the whole run silently skips, blame path
+    included. Every other degradation here fails loud; this one would not
+    (MR !200 review).
+
     Returns None when there is nothing to guard: the path is not a
     directory, git is unavailable, or the path is not itself the top level
     of a git repo (contributor machines and CI have no operational work
@@ -194,10 +231,11 @@ def _work_repo_status_lines(work_repo_path):
         return None
     try:
         result = subprocess.run(
-            ["git", "-C", str(work_repo), "status", "--porcelain",
-             "--untracked-files=all"],
+            ["git", "-C", str(work_repo), "-c", "core.quotePath=false",
+             "status", "--porcelain", "--untracked-files=all"],
             capture_output=True,
             text=True,
+            errors="surrogateescape",
             timeout=60,
         )
         if result.returncode != 0:
@@ -248,13 +286,23 @@ def _work_repo_head(work_repo_path):
 
 
 def work_repo_drift_report(
-    work_repo_path, appeared, vanished, head_before=None, head_after=None
+    work_repo_path,
+    appeared,
+    vanished,
+    head_before=None,
+    head_after=None,
+    attributed=None,
 ):
     """The leak guard's failure text, or None when nothing drifted.
 
     Pure assembly, kept out of the fixture so the message itself is testable —
     it is the part a person actually reads at 2am, and it used to send them to
     `LMER_*` env isolation and issue #93 for a cause that was neither.
+
+    *attributed* lists status entries the guard excluded as the session's own
+    journaled writes (issue #233); they are appended for completeness so the
+    reader sees the whole picture the guard saw, clearly separated from the
+    drift that is actually failing the run.
     """
     if not appeared and not vanished:
         return None
@@ -299,6 +347,228 @@ def work_repo_drift_report(
         "(see issue #93 and the _clean_lmer_env fixtures) — or a "
         "concurrent writer changed the work repo mid-run."
     )
+    if attributed:
+        report += (
+            "\n\nExcluded from this verdict — journaled writes by this "
+            "session's own work CLI during the run (issue #233):\n"
+            + "\n".join(f"  {line}" for line in attributed)
+        )
+    return report
+
+
+_C_ESCAPES = {"a": 7, "b": 8, "f": 12, "n": 10, "r": 13, "t": 9, "v": 11,
+              "\\": 92, '"': 34}
+
+
+def unquote_c_style(quoted):
+    """Decode git's C-style quoting, or None when the form is unrecognized.
+
+    Git quotes any path containing a space, a double quote, a backslash or a
+    control character — `core.quotePath=false` only stops it escaping
+    non-ASCII — so refusing quoted entries outright would fail a whole run
+    over a session artifact named `meeting notes.md`. The encoding is
+    unambiguous and reversible, so decoding it is strictly better than
+    refusing it; anything that does not decode still returns None and fails
+    safe — including an octal escape above \\377, which git's own
+    `quote_c_style` cannot emit (it formats an unsigned char) but which must
+    not become a ValueError escaping through a teardown fixture as a raw
+    ERROR instead of a verdict.
+    """
+    if len(quoted) < 2 or not quoted.startswith('"') or not quoted.endswith('"'):
+        return None
+    body = quoted[1:-1]
+    out = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            out.extend(char.encode("utf-8", "surrogateescape"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(body):
+            return None
+        nxt = body[index]
+        if nxt in _C_ESCAPES:
+            out.append(_C_ESCAPES[nxt])
+            index += 1
+        elif nxt in "01234567":
+            octal = body[index:index + 3]
+            if len(octal) < 3 or any(c not in "01234567" for c in octal):
+                return None
+            value = int(octal, 8)
+            if value > 0xFF:
+                return None
+            out.append(value)
+            index += 3
+        else:
+            return None
+    return out.decode("utf-8", "surrogateescape")
+
+
+def porcelain_status_code(line):
+    """The two-character XY status field, or None when the line is unreadable.
+
+    The status code is what says a path was DELETED (`D` in either column);
+    the diff side a line lands on does not — a deletion arrives as a new
+    ` D path` line, i.e. on the appeared side (issue #233, MR !200 review).
+    """
+    if len(line) < 4 or line[2] != " ":
+        return None
+    return line[:2]
+
+
+def porcelain_entry_path(line):
+    """The path a porcelain-v1 status line names, or None when it cannot be
+    read with confidence. None routes the entry to "unattributed", which
+    fails the run — the safe direction.
+
+    Quoted paths are decoded (see unquote_c_style). Rename/copy lines
+    (`old -> new`) still refuse, since the entry names two paths and the
+    excusal machinery is built on one — but only for the `R`/`C` statuses
+    that actually carry two-path syntax, so an ordinary untracked file whose
+    NAME contains ` -> ` stays attributable (MR !200 review round 3).
+    """
+    if len(line) < 4 or line[2] != " ":
+        return None
+    code = line[:2]
+    path = line[3:]
+    if ("R" in code or "C" in code) and " -> " in path:
+        return None
+    if path.startswith('"'):
+        if len(path) < 2 or not path.endswith('"'):
+            return None
+        return unquote_c_style(path)
+    return path
+
+
+def _locate_in_prefixes(path, prefixes):
+    """(prefix, tail) for the declared prefix containing *path*, else None."""
+    for prefix in prefixes:
+        if path == prefix:
+            return prefix, ""
+        if path.startswith(prefix + "/"):
+            return prefix, path[len(prefix) + 1:]
+    return None
+
+
+def partition_attributed_drift(appeared, vanished, attributed_scopes):
+    """Split drift into (attributed, residual_appeared, residual_vanished).
+
+    *attributed_scopes* is one prefix list PER journaled record, not a
+    flattened union: additions may be excused by any declared prefix (the
+    accepted scope granularity), but a removal's rename counterpart must come
+    from the SAME record, because "these two addresses belong to one run" is
+    exactly what a single record asserts and a union does not. Flattened, a
+    `work seed` of an unrelated run supplied a fresh `?? other/state.yaml`
+    that excused a test's ` D current/state.yaml` — the counterpart was
+    fabricated from two unrelated scopes (MR !200 review round 3).
+
+    An entry is excusable when it sits under a prefix some journaled
+    non-ancestor `work` invocation declared as its write scope (issue #233) —
+    with removals held to a stricter test, because a session write never
+    destroys content and a test deleting run-dir files is the #93 shape the
+    guard exists for.
+
+    "Removal" is read from the STATUS CODE, not the diff side: deleting a
+    tracked file adds a new ` D path` line, so it arrives among *appeared*
+    entries, while *vanished* means a status line stopped being reported —
+    which happens when its file was removed **or renamed away**. Keying on
+    the diff side alone gets both wrong (MR !200 review, major finding).
+
+    The session does vacate paths legitimately: `work goals freeze` and the
+    lazy rename behind `work name` move the whole run dir, which shows up as
+    ` D old/...` appearing, `?? new/...` appearing, and the old dir's former
+    entries vanishing. What separates that from a test's `rmtree` is a fact
+    already in the data — after a rename the journal declares BOTH addresses
+    in one record (`run_rel_path_candidates`), so every vacated path has a
+    counterpart with the same tail landing under a *different* prefix of that
+    same record. A removal with no such counterpart is never excused, and a
+    record declaring one prefix (no rename in play) can excuse no removal at
+    all.
+    """
+    scopes = [
+        [prefix.rstrip("/") for prefix in scope if prefix]
+        for scope in attributed_scopes
+    ]
+    scopes = [scope for scope in scopes if scope]
+    all_prefixes = sorted({prefix for scope in scopes for prefix in scope})
+
+    # Content present under a declared prefix at teardown — the landing half
+    # of a rename. Removals cannot themselves be a landing.
+    landed = set()
+    for line in appeared:
+        path = porcelain_entry_path(line)
+        code = porcelain_status_code(line)
+        if path is None or code is None or "D" in code:
+            continue
+        located = _locate_in_prefixes(path, all_prefixes)
+        if located is not None:
+            landed.add(located)
+
+    def vacated_by_declared_rename(path):
+        for scope in scopes:
+            located = _locate_in_prefixes(path, scope)
+            if located is None:
+                continue
+            prefix, tail = located
+            if any(
+                other != prefix and (other, tail) in landed for other in scope
+            ):
+                return True
+        return False
+
+    attributed, residual_appeared, residual_vanished = [], [], []
+    for line in appeared:
+        path = porcelain_entry_path(line)
+        code = porcelain_status_code(line)
+        if (
+            path is None
+            or code is None
+            or _locate_in_prefixes(path, all_prefixes) is None
+            or ("D" in code and not vacated_by_declared_rename(path))
+        ):
+            residual_appeared.append(line)
+        else:
+            attributed.append(line)
+    for line in vanished:
+        path = porcelain_entry_path(line)
+        if path is not None and vacated_by_declared_rename(path):
+            attributed.append(line)
+        else:
+            residual_vanished.append(line)
+    return attributed, residual_appeared, residual_vanished
+
+
+def work_repo_blame_report(work_repo_path, blamed, appeared, vanished):
+    """Failure text when a journaled `work` write descends from this suite.
+
+    The ancestry verdict is recorded by the `work` CLI itself at write time
+    (issue #233), so unlike the drift report this one can NAME the leaking
+    command — the reader starts at the test that spawned it, not at
+    env-isolation archaeology. Pure, for the same 2am reason as
+    work_repo_drift_report.
+    """
+    commands = ", ".join(
+        f"`work {record.get('command')}` (pid {record.get('pid')})"
+        for record in blamed
+    )
+    report = (
+        f"A test-descendant `work` invocation reached the operational work "
+        f"repo ({work_repo_path}) with write intent while this suite ran: "
+        f"{commands}.\n"
+        "The invocation journaled its own ancestry (issue #233): the writing "
+        "process descends from this pytest process, so a test reached the "
+        "real `work` CLI with ambient session env (issue #93). Isolate the "
+        "test's LMER_* env (see the _clean_lmer_env fixtures)."
+    )
+    sections = []
+    if appeared:
+        sections.append("appeared:\n" + "\n".join(f"  {line}" for line in appeared))
+    if vanished:
+        sections.append("vanished:\n" + "\n".join(f"  {line}" for line in vanished))
+    if sections:
+        report += "\n\n" + "\n".join(sections)
     return report
 
 
@@ -319,18 +589,39 @@ def _isolate_gate_lock_dir(tmp_path_factory):
     back to the operational `/tmp` dir — which is exactly how this fixture was
     first found wanting, by a napkin-commit test that deferred instead of
     staging while the gate ran it.
+
+    Three additions live here because this fixture is the one that knows both
+    lock dirs (issue #233). It captures the OPERATIONAL dir before the
+    redirect and (a) holds a gate marker for the pytest process there, so
+    work-repo durability commits defer during bare `pytest` runs exactly as
+    they do inside gate commands — outside `work` processes read that dir,
+    not the redirected one; (b) holds a JOURNAL-ONLY marker in the redirected
+    dir, because a leaking test's `work` child inherits this suite's
+    environment — redirect included — and would otherwise see no marker and
+    journal nothing, leaving its writes indistinguishable from the session's
+    excused ones (journal-only does not defer, so the commit paths tests
+    exercise keep committing); and (c) yields the captured operational dir,
+    so the leak guard below can consume the write-attribution journal living
+    beside the markers.
     """
+    operational = gate_lock.lock_dir()
     directory = str(tmp_path_factory.mktemp("gate-locks"))
     original_default = gate_lock.DEFAULT_LOCK_DIR
     gate_lock.DEFAULT_LOCK_DIR = directory
     os.environ[gate_lock.LOCK_DIR_ENV] = directory
-    yield
-    gate_lock.DEFAULT_LOCK_DIR = original_default
-    os.environ.pop(gate_lock.LOCK_DIR_ENV, None)
+    try:
+        with gate_lock.hold_gate_lock("pytest-suite", directory=operational):
+            with gate_lock.hold_gate_lock(
+                "pytest-suite", directory=Path(directory), journal_only=True
+            ):
+                yield operational
+    finally:
+        gate_lock.DEFAULT_LOCK_DIR = original_default
+        os.environ.pop(gate_lock.LOCK_DIR_ENV, None)
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _work_repo_leak_guard():
+def _work_repo_leak_guard(_isolate_gate_lock_dir):
     """Fail the suite if tests leak run-state into the real work repo.
 
     Tests that reach the `work` CLI (e.g. via hooks.start's
@@ -341,6 +632,21 @@ def _work_repo_leak_guard():
     nothing — if the suite changed it. A work repo that was snapshottable
     at suite start but not at teardown (e.g. deleted mid-suite) is also a
     failure. Skips only when no work repo is available to begin with.
+
+    Drift is partitioned by attribution before the verdict (issue #233).
+    The session that launched this suite keeps doing its job while it runs —
+    `work log`, `work event`, the writes behind `work state set` — and those
+    writes journal themselves (beside the gate markers, with a
+    process-ancestry verdict recorded at write time). Entries under a
+    non-ancestor invocation's declared write scope are excused; a journaled
+    write that DESCENDS from this pytest process fails the run naming the
+    command; unattributed drift and any HEAD move keep the hard failure
+    above. Removals are held to a stricter test than additions — see
+    partition_attributed_drift — so a test deleting run-dir content still
+    fails while the session's own run-dir rename does not. The excuse is
+    prefix-scoped, not per-file: a non-CLI write landing inside an excused
+    prefix rides that excuse, which is the granularity trade-off documented
+    at cli._write_intent_rel_paths.
     """
     work_repo_path = os.environ.get("LMER_WORK_REPO_PATH", "/work")
     before = _work_repo_status_lines(work_repo_path)
@@ -356,15 +662,65 @@ def _work_repo_leak_guard():
             "deleted or broke it (issue #93).",
             pytrace=False,
         )
+    # Two journals feed the verdict: the OPERATIONAL lock dir (the launching
+    # session's writes, and children whose cleared env fell back to the
+    # default dir) and the REDIRECTED dir this suite runs against (children
+    # that inherited the suite's environment journal against the journal-only
+    # marker there — the #93 shape). This teardown runs before the lock-dir
+    # fixture's, so gate_lock.lock_dir() still names the redirected dir.
+    records = write_journal.consume_records(
+        work_repo_path, os.getpid(), directory=_isolate_gate_lock_dir
+    ) + write_journal.consume_records(work_repo_path, os.getpid())
+    appeared = sorted(after - before)
+    vanished = sorted(before - after)
+    blamed = [
+        record
+        for record in records
+        if write_journal.guard_verdict(record, os.getpid()) is True
+    ]
+    if blamed:
+        pytest.fail(
+            work_repo_blame_report(work_repo_path, blamed, appeared, vanished),
+            pytrace=False,
+        )
+    head_after = _work_repo_head(work_repo_path)
+    if head_before and head_after and head_before != head_after:
+        # A moved HEAD is never excused: commits defer while this suite holds
+        # its marker, so one landing anyway means the deferral broke — or one
+        # of the two deliberate `allow_during_gate` committers ran (a release
+        # CAS claim, or `work session-end` tearing this container down, in
+        # which case this verdict is moot). Attribution must not soften the
+        # signal either way.
+        attributed, residual_appeared, residual_vanished = [], appeared, vanished
+    else:
+        # One scope per record — NOT a flattened union: which addresses were
+        # declared together is what licenses a rename counterpart (#233).
+        attributed_scopes = [
+            record.get("rel_paths", [])
+            for record in records
+            if write_journal.guard_verdict(record, os.getpid()) is False
+        ]
+        attributed, residual_appeared, residual_vanished = (
+            partition_attributed_drift(appeared, vanished, attributed_scopes)
+        )
     report = work_repo_drift_report(
         work_repo_path,
-        sorted(after - before),
-        sorted(before - after),
+        residual_appeared,
+        residual_vanished,
         head_before,
-        _work_repo_head(work_repo_path),
+        head_after,
+        attributed=attributed,
     )
     if report:
         pytest.fail(report, pytrace=False)
+    if attributed:
+        print(
+            f"\n[work-repo leak guard] {len(attributed)} status change(s) in "
+            f"{work_repo_path} attributed to this session's own journaled "
+            "work-CLI writes (issue #233):"
+        )
+        for line in attributed:
+            print(f"  {line}")
 
 
 @pytest.fixture(autouse=True, scope="session")

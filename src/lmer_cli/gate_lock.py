@@ -121,6 +121,14 @@ def parse_marker(text: str) -> dict | None:
         marker["started_at"] = float(parsed.get("started_at"))
     except (TypeError, ValueError):
         marker["started_at"] = None
+    # Journal-only markers trigger write-attribution journaling (issue #233)
+    # without deferring anything: the test suite plants one in its REDIRECTED
+    # lock dir so `work` children that inherited the suite's environment still
+    # journal their ancestry, while the commit paths those tests exercise keep
+    # committing. Anything unparseable counts as a full marker — mistaking a
+    # journal-only marker for a deferring one only delays a commit, while the
+    # opposite mistake would let a gate window go unguarded.
+    marker["journal_only"] = parsed.get("journal_only") is True
     return marker
 
 
@@ -268,13 +276,16 @@ def active_gate(exclude_self: bool = True) -> dict | None:
     Returns None when the kill switch is off, so every consumer opts out
     together. *exclude_self* drops a marker written by the calling process — a
     process must never defer on its own gate (``work verify -- <cmd>`` holds a
-    marker while its own receipt machinery runs).
+    marker while its own receipt machinery runs). Journal-only markers are
+    skipped: they exist for write attribution (issue #233), not deferral.
     """
     if not guard_enabled():
         return None
     mypid = os.getpid()
     for marker in read_markers():
         if exclude_self and marker.get("pid") == mypid:
+            continue
+        if marker.get("journal_only"):
             continue
         return marker
     return None
@@ -287,7 +298,9 @@ def describe_active_gate() -> str | None:
 
 
 @contextmanager
-def hold_gate_lock(label: str):
+def hold_gate_lock(
+    label: str, directory: Path | None = None, journal_only: bool = False
+):
     """
     Hold a marker naming this process as *label* for the duration of the block.
 
@@ -297,17 +310,25 @@ def hold_gate_lock(label: str):
     problem may change a gate's exit code (the receipt contract, applied here
     too), and a marker that could not be written only restores the pre-#201
     race.
+
+    *directory* overrides :func:`lock_dir` for the one holder that cannot use
+    it: the test suite redirects the lock dir for everything running inside
+    itself, yet must hold its own marker where OUTSIDE processes look — the
+    operational dir it captured before the redirect (issue #233).
+
+    *journal_only* marks the marker as attribution-only (see
+    :func:`parse_marker`): write journaling keys on it, deferral ignores it.
     """
     pid = os.getpid()
-    directory = lock_dir()
+    directory = directory or lock_dir()
     path = _marker_path(pid, directory)
     written = False
     try:
         directory.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(
-            {"pid": pid, "gate": label, "started_at": time.time()},
-            ensure_ascii=False,
-        )
+        record = {"pid": pid, "gate": label, "started_at": time.time()}
+        if journal_only:
+            record["journal_only"] = True
+        payload = json.dumps(record, ensure_ascii=False)
         path.write_text(payload + "\n", encoding="utf-8")
         written = True
     except (OSError, ValueError, TypeError):
