@@ -900,3 +900,52 @@ class TestCliSourceGuards:
         assert pattern.search(source), (
             "LMER_HARNESS_CACHE entry missing from cli.py env dict"
         )
+
+
+class TestRefresh:
+    """refresh_user_harnesses: the long-lived-process escape from the cache.
+
+    Written for the platform daemon validating harness names against what a
+    freshly spawned lmer would accept — the daemon's process outlives any
+    cached answer, while every child re-reads the directory.
+    """
+
+    def test_refresh_sees_a_dropin_the_cache_predates(self, tmp_path, monkeypatch):
+        from lmer_cli.user_harnesses import refresh_user_harnesses
+
+        root = tmp_path / "harnesses"
+        monkeypatch.setenv(HARNESSES_DIR_ENV, str(root))
+        assert load_user_harnesses() == {}, "cached: nothing installed yet"
+        write_harness(root, "acme", MINIMAL)
+        assert "acme" in refresh_user_harnesses()
+        assert "acme" in load_user_harnesses(), (
+            "the refresh replaced the cache entry, so plain loads see it too"
+        )
+
+    def test_refresh_assigns_and_never_deletes(self, tmp_path, monkeypatch):
+        """The concurrency property: load_user_harnesses is an unlocked
+        check-store-return, so the only safe mutation from another thread is
+        replacement — a deletion between its store and its return would raise
+        KeyError out of a path every caller treats as infallible."""
+        from lmer_cli import user_harnesses as module
+        from lmer_cli.user_harnesses import refresh_user_harnesses
+
+        root = tmp_path / "harnesses"
+        monkeypatch.setenv(HARNESSES_DIR_ENV, str(root))
+        load_user_harnesses()
+        key = str(user_harnesses_dir())
+        assert key in module._cache
+        refresh_user_harnesses()
+        assert key in module._cache, "refresh removed the key it should replace"
+
+    def test_refresh_does_not_repeat_warnings(self, tmp_path, monkeypatch, capsys):
+        from lmer_cli.user_harnesses import refresh_user_harnesses
+
+        root = tmp_path / "harnesses"
+        monkeypatch.setenv(HARNESSES_DIR_ENV, str(root))
+        broken = root / "broken"
+        broken.mkdir(parents=True)
+        (broken / "harness.json").write_text("{not json")
+        refresh_user_harnesses()
+        refresh_user_harnesses()
+        assert capsys.readouterr().err.count("User harness") == 1

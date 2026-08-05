@@ -127,6 +127,14 @@ conversation window is lost.
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
   drawer when needed.
+- **uber lmer settings** — how its session is *run* (model, harness, preset,
+  agents fan-out), per platform instance: the settings entry in the drawer's
+  overflow menu, or `GET`/`POST /api/assistant/config`. Each value shows which
+  layer decided it (an `LMER_PLATFORM_ASSISTANT_*` export beats what the
+  dialog persists to `config.json`, and the dialog says so). Changes apply to
+  the **next** incarnation — the running one keeps its context window until
+  you restart it, and the dialog offers the restart. Standing orders are the
+  chat's to edit and are deliberately not in this dialog.
 - **Adopt / forget** — runs started outside the platform can be adopted into
   the fleet view (`+ run` → adopt, or `POST /api/runs/adopt`); ended runs can
   be forgotten from their card (undo window; nothing on disk is touched).

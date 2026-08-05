@@ -348,6 +348,7 @@ reads is worse than an absent one: it reads as a control.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -362,7 +363,15 @@ from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
 
 from . import registry, spawn
-from .config import ConfigError, PlatformConfig, container_base_url, read_secret
+from .config import (
+    ASSISTANT_SETTING_KEYS,
+    ConfigError,
+    PlatformConfig,
+    assistant_settings,
+    container_base_url,
+    read_secret,
+    validate_assistant_override,
+)
 # The credential scrub, imported rather than reimplemented — the trade
 # :mod:`lmer_platform.config` and :mod:`lmer_platform.api` already make with
 # ``_scrub_credentials`` and ``_web_base_from_remote``. A second definition of
@@ -720,6 +729,14 @@ class AssistantStatus:
     pending: int
     handoff: Optional[str]
     log_path: Optional[str] = None
+    #: What the *running* incarnation was actually launched with — the four
+    #: launch settings (issue #234), read off its registry entry, where the
+    #: spawn recorded what it emitted. ``None`` when nothing is running, and
+    #: distinct on purpose from what :func:`lmer_platform.config.assistant_settings`
+    #: currently resolves: a settings change applies to the *next* incarnation,
+    #: so "current" and "next" are two answers and a UI showing only one of
+    #: them would read a pending change as a no-op or a lie.
+    settings: Optional[dict] = None
 
     @property
     def age_seconds(self) -> Optional[float]:
@@ -739,6 +756,7 @@ class AssistantStatus:
             "pending": self.pending,
             "handoff": self.handoff,
             "log_path": self.log_path,
+            "settings": self.settings,
             "taskdef": TASKDEF,
             "target": TARGET,
         }
@@ -944,7 +962,61 @@ def status() -> AssistantStatus:
         pending=len(state.pending),
         handoff=state.handoff,
         log_path=_opt_str(live.get("log_path")),
+        settings=_launched_settings(live),
     )
+
+
+def _launched_settings(live: dict) -> dict:
+    """The four launch settings off a live registry entry (issue #234).
+
+    What the running incarnation was *actually* started with, read where the
+    spawn recorded what it emitted. Always the four keys, so a client renders
+    one shape: an adopted assistant an older build spawned simply reads as
+    all-``None``, which is also the truth.
+
+    The model gets one extra source: the ordinary assistant spawn names none,
+    and the session reports the one it resolved strictly after the registry
+    entry is written — so when the entry lacks a model, the session's own
+    report (:func:`_reported_model`) fills it in, with the same precedence
+    ``spawn.absorb_ports`` keeps on the fleet path (a spawn that *named* a
+    model already recorded it, and nothing here can overwrite that). It is an
+    **overlay on the returned dict, never a registry write**: ``absorb_ports``
+    folds via ``registry.update``, which stamps the caller's pid as
+    ``owner_pid`` — the guard that stops a second daemon from stopping entries
+    it does not own — and a *status read* taking ownership of the incumbent
+    would make the real owner's stop path refuse its own assistant. Reading
+    here keeps :func:`status` genuinely side-effect free.
+    """
+    task = live.get("task")
+    task = task if isinstance(task, dict) else {}
+    settings = {key: _opt_str(task.get(key)) for key in ASSISTANT_SETTING_KEYS}
+    if settings["model"] is None:
+        settings["model"] = _reported_model(live.get("id"))
+    return settings
+
+
+def _reported_model(session_id: object) -> Optional[str]:
+    """The model the session reported for itself, or ``None``.
+
+    The same file and key ``spawn.absorb_ports`` reads
+    (:func:`lmer_platform.spawn.ports_file_for`), read directly so this path
+    stays a read — see :func:`_launched_settings` for why the fold's
+    ``registry.update`` must not run from here. Best-effort like every read of
+    that file: a session that reported nothing (or an unparseable file) is a
+    ``None``, never an error in a status call.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    try:
+        payload = json.loads(
+            spawn.ports_file_for(session_id).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    model = payload.get("model")
+    return model.strip() if isinstance(model, str) and model.strip() else None
 
 
 def _refuse(error: AssistantError, reason: str) -> AssistantError:
@@ -1041,6 +1113,56 @@ def _handoff_update(
         return state.handoff, state.handoff_at
     text = _scrubbed_text(handoff, field="handoff", limit=MAX_HANDOFF_CHARS)
     return text, (now if text != state.handoff else state.handoff_at)
+
+
+def _launch_settings(overrides: Optional[dict]) -> tuple:
+    """``(values, sources)`` — how the next incarnation should be run (issue #234).
+
+    Per key: an explicit *overrides* entry > ``LMER_PLATFORM_ASSISTANT_*`` env >
+    a **fresh** ``config.json`` read > ``None`` (today's behaviour). Fresh is
+    the point — the daemon's own :class:`PlatformConfig` is boot-time, and a
+    setting persisted through ``POST /api/assistant/config`` has to reach the
+    incarnation the operator rotates in without a daemon restart; see
+    :func:`lmer_platform.config.assistant_settings`.
+
+    Two validation postures over ONE rule set
+    (:func:`lmer_platform.config._unusable_reason` — shape rules mirroring what
+    ``spawn.SpawnRequest.validate`` enforces for these four fields), matching
+    who is asking. A value that arrived through the standing layers has already
+    fallen back with a warning when unusable (inside
+    :func:`lmer_platform.config.assistant_settings`) — a typo in a file must
+    not make the assistant unstartable. An explicit override is refused instead
+    (:class:`AssistantError`, so the route answers 400): the caller is
+    attached, and starting *something other than what they asked for* is the
+    failure the issue names. One definition matters more than it looks: these
+    rules once lived in three hand-synced places, and the one rule that was not
+    copied everywhere (an ``agents`` naming nobody) surfaced as an uncaught
+    ``SpawnError`` on every start.
+
+    Like :func:`_handoff_update`, called before the caller's side effects: a
+    rejected setting must not cost a container that is already starting.
+    """
+    values: dict = {}
+    sources: dict = {}
+    for key, setting in assistant_settings().items():
+        values[key] = setting.value
+        sources[key] = setting.source
+    for key, value in (overrides or {}).items():
+        if key not in ASSISTANT_SETTING_KEYS:
+            raise AssistantError(
+                f"unknown assistant setting {key!r}: expected one of "
+                f"{', '.join(sorted(ASSISTANT_SETTING_KEYS))}"
+            )
+        if value is None:
+            # Absent, not "force the default": null carries the standing answer
+            # forward, the same reading the handoff gives an omitted field.
+            continue
+        try:
+            values[key] = validate_assistant_override(key, value)
+        except ConfigError as exc:
+            raise AssistantError(str(exc)) from exc
+        sources[key] = "override"
+    return values, sources
 
 
 def _dotenv_line(name: str, value: str) -> str:
@@ -1176,7 +1298,10 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
 
 
 def start(
-    config: PlatformConfig, *, handoff: Optional[str] = None
+    config: PlatformConfig,
+    *,
+    handoff: Optional[str] = None,
+    settings: Optional[dict] = None,
 ) -> AssistantStatus:
     """Start the assistant. Refuses if one is already running.
 
@@ -1189,6 +1314,14 @@ def start(
     *handoff* replaces what the next incarnation is told; omitting it carries the
     recorded one forward, which is what makes a respawn after a crash as
     informed as a planned rotation.
+
+    *settings* is the per-call override layer for how the session is run —
+    ``model``/``harness``/``preset``/``agents`` (issue #234). Omitted keys fall
+    through to the standing answer (env, then a fresh ``config.json`` read,
+    then today's behaviour); see :func:`_launch_settings`. The supervisor's
+    respawns pass nothing here, which is what makes a respawn after a crash run
+    with the operator's *standing* configuration rather than with whatever a
+    one-off start once asked for.
     """
     with _LOCK:
         live = _live_assistant()
@@ -1209,6 +1342,7 @@ def start(
         state = read_state()
         now = utc_now_iso()
         text, stamp = _handoff_update(state, handoff, now)
+        launch, launch_sources = _launch_settings(settings)
 
         # After the refusals this module raises and before the spawn, so a second
         # start against a live assistant cannot rewrite the file the live one was
@@ -1233,8 +1367,35 @@ def start(
             taskdef=TASKDEF,
             target=TARGET,
             no_repo=True,
+            # The four launch settings travel as the typed fields the platform
+            # already emits as its own flags for workers — never appended to
+            # extra_args, where a later spelling would win over the recorded
+            # one (spawn._RESERVED_ARGS refuses exactly that).
+            preset=launch["preset"],
+            agents=launch["agents"],
+            harness=launch["harness"],
+            model=launch["model"],
             extra_args=("--env-file", str(env_file)) if env_file else (),
         )
+        # The backstop for rule drift, not the validation path: the values
+        # above already went through the one rule set
+        # (config._unusable_reason). If the spawn's own validation refuses
+        # anyway, the rules have drifted apart — and that must answer as a
+        # refusal the routes translate (400, logged, in platform history), not
+        # as a SpawnError nothing here catches: a 500 on every start is how
+        # the missing-rule bug this replaces actually presented.
+        try:
+            request.validate()
+        except spawn.SpawnError as exc:
+            raise _refuse(
+                AssistantError(
+                    f"the assistant's spawn request was refused: {exc} — a "
+                    "launch setting passed the settings rules and failed the "
+                    "spawn's; the two rule sets have drifted and this value "
+                    "needs the fix upstream"
+                ),
+                "invalid_request",
+            ) from exc
         try:
             result = spawn.spawn_session(config, request, kind=KIND)
         except spawn.CapacityError as exc:
@@ -1271,6 +1432,12 @@ def start(
                 # Where it was told the platform is, never what it authenticates
                 # with: this line is history an operator reads and pastes.
                 "platform_url": reach.url,
+                # How it was run and why — names only, with each value's layer
+                # beside it, because "which model was that incarnation on, and
+                # who chose it" is the post-mortem question a settings surface
+                # creates (issue #234).
+                "settings": launch,
+                "settings_sources": launch_sources,
             },
         )
         logger.info(
@@ -1354,7 +1521,12 @@ def stop(
         return gone
 
 
-def rotate(config: PlatformConfig, *, handoff: Optional[str] = None) -> AssistantStatus:
+def rotate(
+    config: PlatformConfig,
+    *,
+    handoff: Optional[str] = None,
+    settings: Optional[dict] = None,
+) -> AssistantStatus:
     """Replace the running assistant with a fresh one, carrying *handoff* over.
 
     The planned half of §8.3's context hygiene. The *trigger* is not here — an
@@ -1362,10 +1534,27 @@ def rotate(config: PlatformConfig, *, handoff: Optional[str] = None) -> Assistan
     :attr:`AssistantStatus.age_seconds` — but the transition is, because doing it
     as two API calls would leave a window where an operator's ``start`` lands
     between the stop and the respawn and wins the race for the generation counter.
+
+    *settings* rides to :func:`start` untouched, and a rotation with none is
+    already how a settings change lands (issue #234): the replacement resolves
+    the standing layers fresh, so "persist the new model, then rotate" needs no
+    override here.
     """
     with _LOCK:
+        # Refusals before side effects, with more at stake than in start: the
+        # stop below ends the incumbent, so an override start() would refuse
+        # must be refused while there is still an assistant to keep. The result
+        # is discarded and start() resolves again — what this guarantees is
+        # only that the *overrides* both calls validate are the same object,
+        # which is the one part that can refuse. The standing layers are not
+        # frozen between the two reads (a concurrent settings write serializes
+        # on config._STORED_LOCK, not this lock) and do not need to be: an
+        # unusable standing value warns and resolves as unset rather than
+        # refusing, so nothing that changes underneath can turn the second
+        # resolve into a refusal.
+        _launch_settings(settings)
         stop(reason="rotation", handoff=handoff)
-        return start(config)
+        return start(config, settings=settings)
 
 
 def ensure_running(config: PlatformConfig) -> AssistantStatus:

@@ -57,6 +57,18 @@ def platform_root(tmp_path, monkeypatch):
 
 
 @pytest.fixture
+def known_presets(tmp_path, monkeypatch):
+    """Presets this host knows — the launch-setting name rules ask
+    load_presets(), and with no file every preset name is rightly unusable."""
+    path = tmp_path / "presets.json"
+    path.write_text(json.dumps({name: {} for name in (
+        "file-preset", "env-preset", "kept", "old", "new", "dev", "review",
+    )}), encoding="utf-8")
+    monkeypatch.setenv("LMER_PRESETS_FILE", str(path))
+    return path
+
+
+@pytest.fixture
 def fake_lmer(tmp_path):
     """A stub standing in for `lmer`: records its argv and environment, then exits.
 
@@ -2125,3 +2137,200 @@ def test_a_rotation_rewrites_the_environment_for_the_new_incarnation(
             assert env_file_values()[assistant.ENV_PLATFORM_URL] == HOST_ALIAS_URL
         finally:
             kill(rotated.pid)
+
+
+# --- how the session is run: the launch settings (issue #234) -----------------
+#
+# The four keys a worker spawn already takes, honoured at start and rotate with
+# a FRESH config read — the daemon's own PlatformConfig is boot-time, and the
+# whole point is that a persisted change reaches the next incarnation without a
+# daemon restart. What the spawn recorded (the registry entry's task dict) is
+# what these assert on: it is the request the spawn actually received, not a
+# restatement of assistant.py.
+
+def _live_task(status):
+    entry = registry.read_session(status.session_id)
+    assert entry is not None
+    return entry.get("task") or {}
+
+
+def test_start_with_no_settings_is_todays_behaviour(config, long_lived):
+    """Unset everywhere: no flags emitted, status reports all-None settings."""
+    with started(config) as status:
+        task = _live_task(status)
+        for key in ("model", "harness", "preset", "agents"):
+            assert task.get(key) is None
+        assert assistant.status().settings == {
+            "model": None, "harness": None, "preset": None, "agents": None,
+        }
+    assert assistant.status().settings is None, (
+        "settings describe a running incarnation; with none there is no answer"
+    )
+
+
+def test_start_honours_the_assistant_env_vars(config, long_lived, monkeypatch):
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "env-model")
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_HARNESS, "codex")
+    with started(config) as status:
+        task = _live_task(status)
+        assert task["model"] == "env-model"
+        assert task["harness"] == "codex"
+        assert task["preset"] is None
+        live = assistant.status()
+        assert live.settings["model"] == "env-model"
+        assert live.to_dict()["settings"]["harness"] == "codex"
+
+
+def test_start_reads_config_json_fresh_not_the_boot_time_config(
+    config, long_lived
+):
+    """The config object handed to start() predates the persisted change; the
+    change must reach the spawn anyway (issue #234's 'no hand-editing')."""
+    cfg.update_stored({"assistant_model": "persisted-model"})
+    with started(config) as status:
+        assert _live_task(status)["model"] == "persisted-model"
+
+
+def test_an_explicit_setting_beats_the_env_var(config, long_lived, monkeypatch):
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "env-model")
+    with started(config, settings={"model": "explicit-model"}) as status:
+        assert _live_task(status)["model"] == "explicit-model"
+
+
+def test_a_null_setting_is_absent_not_a_forced_default(
+    config, long_lived, monkeypatch
+):
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MODEL, "env-model")
+    with started(config, settings={"model": None}) as status:
+        assert _live_task(status)["model"] == "env-model"
+
+
+def test_an_unusable_explicit_setting_is_refused_before_anything_starts(
+    config, platform_root
+):
+    """The caller is attached, so the answer is a refusal — never a session
+    running something other than what they asked for."""
+    for bad in ({"model": "   "}, {"model": 7}, {"model": "-x"},
+                {"agents": ","}, {"agents": " , ,"}, {"effort": "high"}):
+        with pytest.raises(assistant.AssistantError):
+            assistant.start(config, settings=bad)
+    assert assistant.status().running is False
+    assert not assistant.read_state().session_id
+
+
+def test_an_unusable_stored_setting_warns_and_starts_unset(
+    config, long_lived, caplog
+):
+    """The _resolve_pids_limit posture for the standing layers: a typo in
+    config.json costs the setting, never the assistant."""
+    cfg.update_stored({"assistant_model": "-not-a-name"})
+    with started(config) as status:
+        assert _live_task(status)["model"] is None
+    assert any(
+        "platform_assistant_setting_invalid" in record.message
+        for record in caplog.records
+    )
+
+
+def test_the_start_event_records_what_ran_and_which_layer_chose_it(
+    config, long_lived, known_presets, monkeypatch
+):
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_PRESET, "env-preset")
+    with started(config, settings={"model": "explicit-model"}):
+        events = events_of("assistant_started")
+        assert events, "the start is platform history"
+        data = events[-1].get("data") or {}
+        assert data["settings"]["model"] == "explicit-model"
+        assert data["settings"]["preset"] == "env-preset"
+        assert data["settings_sources"]["model"] == "override"
+        assert data["settings_sources"]["preset"] == "env"
+        assert data["settings_sources"]["harness"] == "default"
+
+
+def test_a_rotation_picks_up_a_persisted_change(config, long_lived):
+    """The exact flow the settings modal promises: persist, rotate, and the
+    replacement runs the new model with nothing passed by hand."""
+    with started(config):
+        cfg.update_stored({"assistant_model": "next-model"})
+        rotated = assistant.rotate(config)
+        try:
+            assert _live_task(rotated)["model"] == "next-model"
+        finally:
+            kill(rotated.pid)
+
+
+def test_a_rotation_refuses_a_bad_override_without_killing_the_incumbent(
+    config, long_lived
+):
+    """The stop inside rotate is a side effect; refusals come first — an
+    invalid override must not end the incarnation it failed to replace."""
+    with started(config) as status:
+        with pytest.raises(assistant.AssistantError):
+            assistant.rotate(config, settings={"model": "  "})
+        live = assistant.status()
+        assert live.running is True
+        assert live.session_id == status.session_id
+
+
+def test_a_respawn_runs_the_standing_configuration(config, long_lived):
+    """ensure_running passes no overrides: a crash respawn runs what the
+    operator configured, not what a one-off start once asked for."""
+    cfg.update_stored({"assistant_harness": "codex"})
+    with started(config, settings={"harness": "claude"}) as status:
+        kill(status.pid)
+        assert wait_for(lambda: not assistant.status().running)
+        respawned = assistant.ensure_running(config)
+        try:
+            assert _live_task(respawned)["harness"] == "codex"
+        finally:
+            kill(respawned.pid)
+
+
+def test_a_stored_agents_naming_nobody_starts_unset_not_a_500(
+    config, long_lived, caplog
+):
+    """The bug the one-rule-set refactor fixed: ',' passed every hand-copied
+    text check and was refused only inside the spawn — an uncaught SpawnError
+    on every start, from a value sitting in config.json."""
+    cfg.update_stored({"assistant_agents": ","})
+    with started(config) as status:
+        assert _live_task(status)["agents"] is None
+    assert any(
+        "platform_assistant_setting_invalid" in record.message
+        for record in caplog.records
+    )
+
+
+def test_status_reports_the_model_the_session_itself_resolved(
+    config, long_lived
+):
+    """The ordinary assistant spawn names no model; the session reports the one
+    it resolved strictly after the registry entry is written, and this module's
+    status is its own read path — without the overlay, `settings.model` here
+    stays null until something else happens to poll the fleet view."""
+    with started(config) as status:
+        facts = spawn.ports_file_for(status.session_id)
+        facts.parent.mkdir(parents=True, exist_ok=True)
+        facts.write_text(json.dumps({"model": "resolved-model"}), encoding="utf-8")
+        live = assistant.status()
+        assert live.settings["model"] == "resolved-model"
+
+
+def test_a_status_read_never_writes_the_registry(config, long_lived):
+    """The overlay must stay an overlay: absorb_ports folds via
+    registry.update, which stamps the caller's pid as owner_pid — the guard a
+    second daemon's stop path checks — so a status *read* folding that way
+    would take ownership of the incumbent and make the real owner refuse its
+    own assistant. status()'s docstring promises side-effect free, and this
+    is what holds it to that."""
+    with started(config) as status:
+        facts = spawn.ports_file_for(status.session_id)
+        facts.parent.mkdir(parents=True, exist_ok=True)
+        facts.write_text(json.dumps({"model": "resolved-model"}), encoding="utf-8")
+        entry_file = registry.session_path(status.session_id)
+        before = entry_file.read_bytes()
+        live = assistant.status()
+        assert live.settings["model"] == "resolved-model"
+        assert entry_file.read_bytes() == before, (
+            "reading the status rewrote the registry entry"
+        )

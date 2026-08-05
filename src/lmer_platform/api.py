@@ -89,7 +89,15 @@ from . import transcripts
 from .answer import AnswerError, AnswerRequest, answer_run
 from .ask import AskChannelError
 from .assistant import AssistantError
-from .config import PlatformConfig, configured_repo_url
+from .config import (
+    ASSISTANT_SETTING_KEYS,
+    ConfigError,
+    PlatformConfig,
+    assistant_settings,
+    configured_repo_url,
+    update_stored,
+    validate_assistant_override,
+)
 from .inventory import build_inventory
 from .lifecycle import LifecycleError
 from .meta import MetaError
@@ -389,6 +397,60 @@ def _instructions_reply(state) -> dict:
         "limit": assistant.MAX_INSTRUCTIONS_CHARS,
         "note": None if document else _NO_INSTRUCTIONS_NOTE,
     }
+
+
+#: What both assistant-config routes have to say out loud, every time (issue
+#: #234): the two facts about this surface that read as bugs when discovered by
+#: experiment. A changed setting that does nothing *visible* looks broken unless
+#: the reply says the running incarnation is deliberately untouched, and a
+#: persisted value that never takes effect looks broken unless the reply says an
+#: export is standing in front of it.
+_CONFIG_SCOPE_NOTE = (
+    "settings apply to the NEXT incarnation: the running assistant keeps its "
+    "context window until it is stopped or rotated. A value whose source is "
+    "'env' is an export shadowing config.json — what POST persists here has no "
+    "effect until that export is removed."
+)
+
+
+def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
+    """The body both assistant-config routes answer with (issue #234).
+
+    One shape for the read and the write, for :func:`_meta_reply`'s reason: the
+    reply to a write is the effective configuration as it now stands, re-resolved
+    through the same chain the next start will use — which is what lets a client
+    see, without a second read, that the value it just persisted is (or is not)
+    the one in effect. Each key carries its ``source`` because the chain's one
+    trap is an export shadowing the file; see :data:`_CONFIG_SCOPE_NOTE`.
+
+    *extra* is what only a write can say — which keys it changed.
+    """
+    payload = {
+        "settings": {
+            key: setting.to_dict()
+            for key, setting in assistant_settings().items()
+        },
+        "note": _CONFIG_SCOPE_NOTE,
+    }
+    payload.update(extra or {})
+    return payload
+
+
+def _body_launch_settings(payload: dict) -> Optional[dict]:
+    """The per-call launch overrides in a start/rotate body, or ``None``.
+
+    Everything except ``handoff`` — which travels beside them in the same body
+    and is not a launch setting — is passed through, unknown keys included,
+    so an unknown key gets :func:`lmer_platform.assistant._launch_settings`'s
+    own refusal. Lifting only the known keys here would silently drop a typo
+    (``{"modle": "gpt-x"}``): a 200, a session running the standing settings,
+    and an operator who believes the override took. Values are not coerced
+    either, the rule every assistant route follows: an unusable one keeps the
+    module's refusal (400, naming the field) instead of arriving as ``None``
+    and reading as "leave it alone".
+    """
+    named = {key: value for key, value in payload.items() if key != "handoff"}
+    return named or None
 
 
 def _run_dir_files(root: Path) -> tuple[list[str], bool]:
@@ -1140,7 +1202,8 @@ def create_app(
             "                               pending count here is the only\n"
             "                               non-consuming signal that something is\n"
             "                               waiting — watch it, do not drain to ask\n"
-            "  POST /api/assistant/start    start it {handoff?} — 409 when one is\n"
+            "  POST /api/assistant/start    start it {handoff?, model?, harness?,\n"
+            "                               preset?, agents?} — 409 when one is\n"
             "                               already up, which is how the incumbent\n"
             "                               keeps its context window. 200, not 202:\n"
             "                               the session is up when this returns\n"
@@ -1151,7 +1214,17 @@ def create_app(
             "                               record why it ended\n"
             "  POST /api/assistant/rotate   replace it with a fresh context window,\n"
             "                               carrying {handoff?} over — one call, so\n"
-            "                               no start lands in the gap\n"
+            "                               no start lands in the gap. Takes the\n"
+            "                               same launch overrides as start\n"
+            "  GET  /api/assistant/config   how the NEXT incarnation will be run —\n"
+            "                               model/harness/preset/agents, each with\n"
+            "                               the layer that decided it (env /\n"
+            "                               config.json / default). What the running\n"
+            "                               one uses is on GET /api/assistant\n"
+            "  POST /api/assistant/config   persist launch settings to config.json —\n"
+            "                               a patch of the keys named; null clears\n"
+            "                               one. Changes nothing about the running\n"
+            "                               incarnation: rotate to apply\n"
             "  GET  /api/assistant/handoff  the note the last incarnation left. A\n"
             "                               null one with a note means nobody left\n"
             "                               you anything, which is not the same as\n"
@@ -2189,9 +2262,19 @@ def create_app(
         daemon supervises at all is not a fact about the request, and a client that
         branched on it would be reading the daemon's wiring out of an assistant's
         status.
+
+        ``model``/``harness``/``preset``/``agents`` are the per-call launch
+        overrides (issue #234), beating the standing chain the way an explicit
+        override beats an export everywhere else in the config; omitted keys fall
+        through to it (:func:`lmer_platform.assistant._launch_settings`).
         """
+        payload = body or {}
         try:
-            started = assistant.start(config, handoff=(body or {}).get("handoff"))
+            started = assistant.start(
+                config,
+                handoff=payload.get("handoff"),
+                settings=_body_launch_settings(payload),
+            )
         except AssistantError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         assistant.resume_supervision()
@@ -2249,9 +2332,19 @@ def create_app(
         Starts one when nothing is running, deliberately: the case a rotation
         fires in is often an assistant that has already died, and refusing there
         would leave the operator with a 409 and no chat.
+
+        Takes the same per-call launch overrides as start (issue #234) — though
+        the ordinary way a settings change lands is a rotate with *none*: the
+        replacement resolves the standing chain fresh, so "persist, then
+        rotate" already runs the new configuration.
         """
+        payload = body or {}
         try:
-            rotated = assistant.rotate(config, handoff=(body or {}).get("handoff"))
+            rotated = assistant.rotate(
+                config,
+                handoff=payload.get("handoff"),
+                settings=_body_launch_settings(payload),
+            )
         except AssistantError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return rotated.to_dict()
@@ -2367,6 +2460,88 @@ def create_app(
         """
         notes = assistant.take_pending()
         return {"pending": notes, "count": len(notes)}
+
+    @app.get("/api/assistant/config", dependencies=guard)
+    def assistant_config() -> dict:
+        """How the next incarnation will be run, and who decided (issue #234).
+
+        Effective values, resolved through the standing chain **fresh** — the
+        environment and ``config.json`` as they are now, never this app's
+        boot-time config — because fresh is what the next start actually reads
+        (:func:`lmer_platform.assistant._launch_settings`). Each key carries its
+        ``source`` (``env`` / ``config.json`` / ``default``), which is the fact a
+        settings screen needs to stop lying: an export shadows what the POST
+        below persists, and a screen that appears to have no effect is a bad
+        afternoon (the same reason ``binding_notice`` names its source).
+
+        What the *running* incarnation was launched with is deliberately not
+        here — it is on ``GET /api/assistant`` (``settings``), because it is a
+        fact about the session, not about the configuration. The two differing
+        is the normal state between a settings change and the next rotate.
+        """
+        return _assistant_config_reply()
+
+    @app.post("/api/assistant/config", dependencies=guard)
+    def set_assistant_config(body: dict) -> dict:
+        """Persist assistant launch settings into ``config.json`` (issue #234).
+
+        The stored layer and only it: an export stays an export (and keeps
+        shadowing the file — the reply's ``source`` says so rather than letting
+        the write look effective), and what lands in the file is what was sent,
+        never an env-resolved value baked in where it would outlive the export
+        (:func:`lmer_platform.config.update_stored`).
+
+        Keys are the four setting names; omitted keys are left alone, so this is
+        a patch of exactly what the caller named. ``null`` — and the emptied
+        text field a browser sends as ``""`` — clears the key, letting the layer
+        below show through. Anything else must be usable text: the caller is
+        asking for a change, so an unusable value is refused with the field
+        named (400), the posture every explicit ask gets here, while the
+        warn-and-fall-back treatment is reserved for the standing layers read at
+        start time.
+
+        Nothing restarts on a write, deliberately: the running incarnation keeps
+        its context window, the reply says so (``note``), and the rotate verb is
+        one call away when the operator wants the new settings live.
+        """
+        if not isinstance(body, dict) or not body:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "name at least one setting to change — "
+                    f"{', '.join(sorted(ASSISTANT_SETTING_KEYS))}"
+                ),
+            )
+        changes: dict = {}
+        for key, value in body.items():
+            if key not in ASSISTANT_SETTING_KEYS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"unknown assistant setting {key!r}: expected one of "
+                        f"{', '.join(sorted(ASSISTANT_SETTING_KEYS))}"
+                    ),
+                )
+            field = ASSISTANT_SETTING_KEYS[key][0]
+            # Clearing is this route's own semantic — null, and the emptied
+            # text field a browser sends as "" — everything else goes through
+            # the ONE definition of a usable explicit value, shared with the
+            # start/rotate overrides. The rules living in one place is the
+            # point: a value this route persists is a value every later start
+            # resolves, so a rule missed here would come back as a warning (or
+            # worse) on every incarnation.
+            if value is None or (isinstance(value, str) and not value.strip()):
+                changes[field] = None
+                continue
+            try:
+                changes[field] = validate_assistant_override(key, value)
+            except ConfigError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            update_stored(changes)
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return _assistant_config_reply({"changed": sorted(body)})
 
     @app.post("/api/prune", dependencies=guard)
     def prune() -> dict:

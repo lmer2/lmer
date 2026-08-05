@@ -381,6 +381,32 @@ export function fetchAssistantInstructions() {
   return request('api/assistant/instructions')
 }
 
+// How the NEXT incarnation will be run (issue #234): model/harness/preset/agents,
+// each with the layer that decided it (env / config.json / default) and the
+// config.json layer's own value beside it. The `source` is the honest half of a
+// settings screen — an export shadows what the screen persists, and a screen that
+// appears to have no effect is exactly the bug this field exists to not be. What
+// the *running* incarnation was launched with is on `fetchAssistant()` instead
+// (`settings`), because that is a fact about the session, not the configuration;
+// the two differing is the normal state between a save and the next restart.
+export function fetchAssistantConfig() {
+  return request('api/assistant/config')
+}
+
+// Persist launch settings into config.json — a patch of exactly the keys named;
+// null (or an emptied field's '') clears one so the layer below shows through.
+// Nothing restarts: the running incarnation keeps its context window, and the
+// restart verb is the way to apply what this stored. The reply is the same shape
+// as the read, re-resolved — so a save under a shadowing export comes back still
+// saying `source: 'env'`, which the dialog surfaces instead of reporting success.
+export function setAssistantConfig(changes) {
+  return request('api/assistant/config', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(changes),
+  })
+}
+
 // There is deliberately no client here for `POST api/assistant/pending`, and that
 // absence is the decision (T31/T69): the route is a destructive *take* — the
 // digests the daemon spooled are handed to the caller and cleared — and the one
