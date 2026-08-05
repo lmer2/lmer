@@ -584,10 +584,19 @@ console.log(JSON.stringify(seen))
 #: the function closes over is a plain box or a no-op — the point is narrow: what
 #: the reply becomes on the item that is held. The refs are the shapes ``ref()``
 #: hands it, and the JS half reports only the pending list it produced.
+#:
+#: The stub can move ``cursor`` while the POST is in flight
+#: (``cursorAdvanceDuringSend``), because that is what really happens under
+#: ``send()``: the poll keeps running during the round trip, and one that finds the
+#: just-written turn advances the cursor past it (issue 237). The increment lives
+#: inside ``sendSessionInput`` so it lands exactly where the race puts it — after
+#: the send began, before its reply is handled.
 _SEND_PROBE = """
 const props = { sessionId: 'probe-session' }
-let cursor = %d
+const CURSOR_AT_SEND = %d
+let cursor = CURSOR_AT_SEND
 let reply = null
+let cursorAdvanceDuringSend = 0
 const draft = { value: '' }
 const sending = { value: false }
 const problem = { value: null }
@@ -597,7 +606,10 @@ const stale = () => false
 const nextTick = () => {}
 const stickToBottom = () => {}
 const poll = () => {}
-const sendSessionInput = async () => reply
+const sendSessionInput = async () => {
+  cursor += cursorAdvanceDuringSend
+  return reply
+}
 const generation = 0
 
 %s
@@ -606,8 +618,10 @@ const cases = %s
 const typed = %s
 ;(async () => {
   const held = {}
-  for (const [name, answer] of Object.entries(cases)) {
-    reply = answer
+  for (const [name, probe] of Object.entries(cases)) {
+    reply = probe.reply
+    cursorAdvanceDuringSend = probe.cursorAdvanceDuringSend || 0
+    cursor = CURSOR_AT_SEND
     pending.value = []
     draft.value = typed
     await send()
@@ -744,6 +758,49 @@ def _cases():
                 _agent_turn("Pushed.", _STAMPS[1]),
             ]),
             "pending": [{"text": "yes", "at": 0, "since": 2}],
+        },
+        # What the arrival-evidence layer accepts as the price of its wide bound
+        # (#237): the turn at `since` is a *stranger's* message, not this one, and
+        # this message is nowhere in the transcript — yet the reply after that turn
+        # settles the bubble. Checked rather than described, because it is the cost
+        # the component's comment claims to accept.
+        "a_strangers_turn_and_a_reply": {
+            "messages": _conversation([
+                _agent_turn("Working on it.", _STAMPS[0]),
+                _operator_turn("something entirely different", _STAMPS[1]),
+                _agent_turn("Looked at that instead.", _STAMPS[2]),
+            ]),
+            "pending": [{"text": _QUOTING_MARKUP, "at": 0, "since": 1}],
+        },
+        # Two identical sends inside one poll interval: the cursor never moved
+        # between them, so they share a `since` and the seq guard cannot separate
+        # them. One recorded turn, and no reply after it, so the text match is the
+        # only layer in play — and it may answer for one of them, not both.
+        "two_identical_sends_one_interval": {
+            "messages": _conversation([
+                _agent_turn("Ready.", _STAMPS[0]),
+                _operator_turn("yes", _STAMPS[1]),
+            ]),
+            "pending": [
+                {"text": "yes", "at": 0, "since": 1},
+                {"text": "yes", "at": 0, "since": 1},
+            ],
+        },
+        # The same pair once a reply follows that turn — which is the ordinary case
+        # within a poll or two. `claimed` is a text-match rule and the arrival branch
+        # does not consult it, so the turn the first bubble took is still arrival
+        # evidence for the second: both settle. Same accepted cost as the stranger's
+        # turn above, which is why it is pinned in the same place.
+        "two_identical_sends_then_a_reply": {
+            "messages": _conversation([
+                _agent_turn("Ready.", _STAMPS[0]),
+                _operator_turn("yes", _STAMPS[1]),
+                _agent_turn("Pushed.", _STAMPS[2]),
+            ]),
+            "pending": [
+                {"text": "yes", "at": 0, "since": 1},
+                {"text": "yes", "at": 0, "since": 1},
+            ],
         },
     }
 
@@ -888,6 +945,75 @@ def test_a_bubble_stays_up_until_the_transcript_has_the_message():
     )
 
 
+def test_the_text_match_answers_for_one_bubble_per_turn():
+    """Two identical sends inside one poll interval, and the guard that separates
+    them on the text path (review of !202).
+
+    They share a cursor, so they share a `since`, and the seq guard — written for
+    exactly the double-"yes" pair — cannot tell them apart at all. Before the turn
+    allocation one recorded turn matched *both* bubbles by text, so the operator's
+    second message vanished while it was still in flight even with nothing else in
+    the transcript.
+
+    What is pinned here is that rule and only that rule: a turn is matched by text
+    once, and the earlier send takes it because `pending` is in send order. It is
+    **not** a claim that the pair survives a poll — the arrival branch does not
+    consult `claimed`, so a reply after this turn settles the second bubble as well.
+    That shape is `two_identical_sends_then_a_reply`, asserted with the other
+    accepted costs below, and this transcript deliberately stops short of it.
+    """
+    settled = _settled()
+
+    assert settled["two_identical_sends_one_interval"] == ["yes"], (
+        "the text match answered for a different number than one bubble — "
+        f"{settled['two_identical_sends_one_interval']}; both gone means one turn "
+        "matched two messages by text, none means the first no longer settles "
+        "against its own turn"
+    )
+
+
+def test_the_arrival_backstop_accepts_a_strangers_turn_and_this_is_the_cost():
+    """The known false settle, pinned as behaviour rather than left as prose
+    (review of !202).
+
+    The arrival-evidence layer asks two questions about the transcript and neither
+    is about text, so a turn it accepts as evidence need not be this message's: an
+    unrelated operator turn at or past the send's cursor, with any later reply,
+    settles this bubble — and what settles is dropped and never re-added. For a
+    message that was never actually submitted that removes its "not confirmed"
+    warning for the rest of the run.
+
+    That is accepted deliberately (#237): the alternative is the bound that leaves
+    every bubble unsettleable, which is the reported bug. It is recorded here so
+    the trade is a checked fact — if a later change narrows the bound, this test
+    fails and says which cost was being paid, rather than a comment quietly going
+    stale. #238 closes the window at its source by sourcing the bound from the
+    server.
+
+    The second shape is the same cost reached through the same branch, and it is
+    what bounds the text-match guard above: the turn the first of two identical
+    bubbles took is still arrival evidence for the second, because `claimed` is a
+    text-match rule that the arrival scan does not read. So the pair is separated
+    only until a reply lands. Excluding claimed turns there would hold the pair for
+    a whole pass and was deliberately not done — it would not touch the residue
+    that `claimed` is rebuilt per call, which is the half no client-side rule can
+    close.
+    """
+    settled = _settled()
+
+    assert settled["a_strangers_turn_and_a_reply"] == [], (
+        "a stranger's turn no longer settles the bubble — if that is deliberate, "
+        "the accepted-cost comment in Chat.vue's settlePending header and the "
+        "#238 rationale both need revisiting, not just this assertion"
+    )
+    assert settled["two_identical_sends_then_a_reply"] == [], (
+        "the second of two identical sends is now held past a reply — if the "
+        "arrival scan started skipping claimed turns, the text-match guard's "
+        "comment and the test above both understate what it delivers, and the "
+        f"claim is theirs to widen: {settled['two_identical_sends_then_a_reply']}"
+    )
+
+
 def test_nothing_about_the_bubble_is_decided_by_a_clock():
     """Why a timeout was rejected, kept as a property of the code.
 
@@ -933,6 +1059,15 @@ _TYPED_WITH_A_TRAILING_NEWLINE = _TYPED_AT_A_SESSION + "\n"
 #: the transcript's end rather than a count of anything.
 _CURSOR_AT_SEND = 7
 
+#: What every ``/input`` carrying an Enter answers today: the CR was written, and
+#: whether the TUI took it as a submit is not observable from outside (#194). Shared
+#: by two cases below — the plain one and the raced one — so the race case differs
+#: from its baseline in the cursor movement alone.
+_UNCONFIRMED_REPLY = {
+    "session": "probe-session", "bytes_written": 61,
+    "submit_confirmed": False, "note": "…terminal view.",
+}
+
 
 def _held(typed=_TYPED_AT_A_SESSION):
     """Run ``send()`` against three replies. Case name → the pending items."""
@@ -941,22 +1076,23 @@ def _held(typed=_TYPED_AT_A_SESSION):
         require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
 
     cases = {
-        # What every `/input` with an Enter answers today: the CR was written, the
-        # submit is not observable from outside the TUI.
-        "unconfirmed": {
-            "session": "probe-session", "bytes_written": 61,
-            "submit_confirmed": False, "note": "…terminal view.",
-        },
+        "unconfirmed": {"reply": _UNCONFIRMED_REPLY},
         # A control plane that can confirm one. Nothing does today; the rung is kept
         # so the *reason* the caption is weak stays tied to the fact rather than to
         # the route's current behaviour.
-        "confirmed": {
+        "confirmed": {"reply": {
             "session": "probe-session", "bytes_written": 61,
             "submit_confirmed": True,
-        },
+        }},
         # A reply that says nothing about a submit — an older daemon, or a shape
         # that changes. Silence is not a confirmation.
-        "silent": {"session": "probe-session", "bytes_written": 61},
+        "silent": {"reply": {"session": "probe-session", "bytes_written": 61}},
+        # A poll that won the race: while the POST was in flight, the harness wrote
+        # the turn down and a poll absorbed it, so the cursor the reply comes back
+        # to is already past this very message (issue 237).
+        "poll_raced_the_reply": {
+            "reply": _UNCONFIRMED_REPLY, "cursorAdvanceDuringSend": 3,
+        },
     }
     script = _SEND_PROBE % (
         _CURSOR_AT_SEND,
@@ -1014,6 +1150,12 @@ def test_what_was_typed_is_what_is_held_and_sent():
     TUI accepts one whole — that half was established against a real claude), and
     the bubble that stands in for it until the transcript catches up has to be the
     same text, or the matching rule that settles it later cannot work.
+
+    `since` is checked here only for the cases whose cursor never moves, where "the
+    transcript's end" and "the cursor as of the send" are the same number and this
+    says nothing about which one was read. The raced case is where they differ, so
+    the property belongs to the test named for it below rather than to this loop —
+    and its failure message has to be that one, not this one.
     """
     held = _held()
 
@@ -1022,10 +1164,41 @@ def test_what_was_typed_is_what_is_held_and_sent():
         assert items[0]["text"] == _TYPED_AT_A_SESSION, (
             f"{case}: the bubble holds {items[0]['text']!r}"
         )
+        if case == "poll_raced_the_reply":
+            continue
         assert items[0]["since"] == _CURSOR_AT_SEND, (
             f"{case}: `since` is {items[0]['since']}, not the transcript's end, so "
             "the settle rule would look for the message in the wrong place"
         )
+
+
+def test_a_poll_that_wins_the_race_cannot_move_the_bubbles_since():
+    """The reported failure (issue 237): a message the session plainly answered
+    kept the "not confirmed" caption for the rest of the run.
+
+    The send and the poll overlap. The supervisor takes over a second to type the
+    text, wait out the drain and write the CR — and the harness records the turn
+    the moment the TUI takes it — so a poll can absorb this very message and move
+    the cursor past it before the POST reply is back. A `since` read *after* the
+    await then points beyond the turn it exists to find, and neither settle layer
+    may look behind it (the double-"yes" guard is that bound), so the bubble can
+    never settle: past the grace window the caption hardens into "not confirmed"
+    for a message the terminal shows delivered and answered.
+
+    So `since` has to be the cursor as of *starting* the send, and this runs the
+    real `send()` against a stub that advances the cursor mid-flight — the race
+    won by the poll every time — and reads the held item. Executed rather than
+    read, because "reads the cursor before the await" is an ordering fact only an
+    execution can pin.
+    """
+    held = _held()
+
+    item = held["poll_raced_the_reply"][0]
+    assert item["since"] == _CURSOR_AT_SEND, (
+        f"`since` is {item['since']}, the cursor as of the reply, not the send — "
+        "a poll that absorbs the message during the round trip leaves the bubble "
+        "looking for it beyond where it is, and it never settles"
+    )
 
 
 def test_a_newline_left_on_the_end_is_taken_off_before_the_message_goes():

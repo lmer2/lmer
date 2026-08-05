@@ -332,7 +332,23 @@ function comparable(text) {
 //
 // Only messages that arrived *after* the send count. Without that, answering "yes"
 // twice in one conversation would settle the second bubble against the first
-// answer and stop showing that the new one is still in flight.
+// answer and stop showing that the new one is still in flight. `since` is the
+// client's cursor, which trails the server's end by up to a poll, so the bound
+// forgives that lag — the first arrival bullet below owns that cost.
+//
+// `claimed` narrows the same pair: two sends inside one interval share a cursor,
+// so the seq guard cannot separate them, and without it one recorded "yes" matched
+// both. A turn is matched by text once, earliest send first (`pending` is in send
+// order).
+//
+// That is a rule about the TEXT match only — the arrival branch neither reads nor
+// writes `claimed` — so the second bubble is held just until a reply follows that
+// turn, then settles on the same accepted cost as a stranger's turn. Excluding
+// claimed turns there would close that within a pass and is deliberately not done:
+// `claimed` is rebuilt per call, so a later poll settles the second bubble anyway
+// once the first has gone. Both shapes are pinned as fixtures. Only per-message
+// identity fixes it and the transcript has none; issue 238 removes the shared bound
+// at the source instead.
 //
 // The words themselves are not always recoverable, which is why there is a second
 // way out of the bubble. The same server chokepoint that normalises a turn also
@@ -350,9 +366,19 @@ function comparable(text) {
 // needed to say the message is no longer in flight —
 //
 //   - the harness records what it is sent in the order it receives it, so an
-//     operator turn recorded after this send's cursor cannot be one that predates
-//     this message: if such a turn is there, this message is written down too,
-//     whatever the normalisation left of it;
+//     operator turn at or past this send's cursor is normally one recorded after
+//     this message went — and then this message is written down too, whatever the
+//     normalisation left of it. Normally, not always, and the exception is the
+//     cost of this whole layer: the cursor trails the server by up to a poll, so
+//     an unrelated turn from that lag window plus any later reply also settles
+//     this bubble — and a settled item is dropped, never re-added. For a message
+//     that was never submitted (issue 194's dialog-ate-the-CR case, which the
+//     caption exists for) the warning is therefore gone for the rest of the run.
+//     Accepted deliberately (issue 237): the alternative bound, read after the
+//     send's round trip, leaves EVERY bubble unsettleable and the caption then
+//     lies about messages that did arrive, which is what was reported. No
+//     client-side bound can tell a stranger's turn from evidence of its own;
+//     issue 238 sources the bound from the server instead;
 //   - and the agent's turn postdates *that* turn, so the evidence is a reply
 //     produced after the harness read input it took after this bubble appeared —
 //     not the tail of the turn that was already running when the message went. A
@@ -369,9 +395,16 @@ function settlePending() {
     (message) => message.role === 'user' && message.kind === 'said',
   )
   const agent = messages.value.filter((message) => message.role === 'assistant')
+  // Turns an earlier bubble already matched by text — see the header.
+  const claimed = new Set()
   pending.value = pending.value.filter((item) => {
     const arrived = said.filter((message) => message.seq >= item.since)
-    if (arrived.some((message) => comparable(message.text) === comparable(item.text))) {
+    const own = arrived.find(
+      (message) => !claimed.has(message.seq)
+        && comparable(message.text) === comparable(item.text),
+    )
+    if (own) {
+      claimed.add(own.seq)
       return false
     }
     return !arrived.some(
@@ -486,6 +519,14 @@ async function send() {
   const text = draft.value.trim()
   if (!text || sending.value) return
   const mine = generation
+  // Where the transcript ended when the message went, read BEFORE the round trip.
+  // The poll keeps running while the POST is in flight and the harness writes the
+  // turn down as soon as the TUI takes the submit, so a poll can absorb this very
+  // message and move `cursor` past it first. Read after the await, `since` then
+  // points beyond the turn it exists to find and no settle layer may look behind
+  // it, so the bubble outlives its own delivery and the caption below hardens into
+  // "not confirmed" for a message the session answered (issue 237).
+  const since = cursor
   sending.value = true
   problem.value = null
   try {
@@ -506,7 +547,7 @@ async function send() {
     pending.value = [...pending.value, {
       text,
       at: Date.now(),
-      since: cursor,
+      since,
       submitConfirmed: reply?.submit_confirmed === true,
     }]
     draft.value = ''
