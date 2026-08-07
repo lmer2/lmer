@@ -25,6 +25,7 @@ def _clean_lmer_env(monkeypatch):
         cfg.ENV_BIND_ADDRESS, cfg.ENV_BIND_PORT, cfg.ENV_SECRET_FILE,
         cfg.ENV_WORK_REPO_MIRROR, cfg.ENV_AUTONOMOUS, cfg.ENV_WORK_REPO,
         cfg.ENV_WORK_REPO_FORGE,
+        cfg.ENV_STALL_IDLE_SECONDS, cfg.ENV_STALL_BACKSTOP_SECONDS,
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -1052,3 +1053,95 @@ def test_a_non_string_stored_value_is_serialized_not_hidden(platform_root):
     assert settings["agents"].value is None
     assert settings["agents"].stored == '["dev", "review"]'
     assert settings["model"].stored == "5"
+
+
+# --- halt-detection thresholds (#243) ----------------------------------------
+#
+# Two knobs and one relationship between them. The tests below pin the three
+# things an operator can get wrong: which value means "off", which value means
+# "later", and what happens when the two are set the wrong way round.
+
+
+def test_the_halt_thresholds_default_to_ten_minutes_and_an_hour(platform_root):
+    """The numbers the operator chose (#243), not derived ones.
+
+    Ten minutes is when the precise paths may fire and an hour is when silence
+    alone is enough. Pinned here because both are policy: nothing in the code can
+    derive how long a run may legitimately be quiet, which is exactly why the
+    module that raises the flag refused to invent one until it had an owner.
+    """
+    config = cfg.load()
+    assert config.stall_idle_seconds == 600
+    assert config.stall_backstop_seconds == 3600
+
+
+def test_the_halt_thresholds_read_their_env_vars(platform_root, monkeypatch):
+    monkeypatch.setenv(cfg.ENV_STALL_IDLE_SECONDS, "120")
+    monkeypatch.setenv(cfg.ENV_STALL_BACKSTOP_SECONDS, "240")
+    config = cfg.load()
+    assert config.stall_idle_seconds == 120
+    assert config.stall_backstop_seconds == 240
+
+
+def test_the_halt_thresholds_come_from_the_config_file_too(platform_root):
+    store.write_json(cfg.config_path(), {
+        "stall_idle_seconds": 90, "stall_backstop_seconds": 900,
+    })
+    config = cfg.load()
+    assert config.stall_idle_seconds == 90
+    assert config.stall_backstop_seconds == 900
+
+
+@pytest.mark.parametrize("field,env", [
+    ("stall_idle_seconds", "ENV_STALL_IDLE_SECONDS"),
+    ("stall_backstop_seconds", "ENV_STALL_BACKSTOP_SECONDS"),
+])
+def test_zero_disables_a_halt_path_rather_than_being_refused(
+    platform_root, monkeypatch, field, env
+):
+    """``0`` is the off switch, and it must survive the loader.
+
+    Its neighbours (``max_concurrent_sessions`` and friends) are validated as
+    *positive* integers, so folding these in there would refuse the one value an
+    operator needs to turn a path off without editing code. A zero that raised
+    would also be a zero that took the daemon down at boot.
+    """
+    monkeypatch.setenv(getattr(cfg, env), "0")
+    assert getattr(cfg.load(), field) == 0
+
+
+@pytest.mark.parametrize("field", ["stall_idle_seconds", "stall_backstop_seconds"])
+def test_a_negative_halt_threshold_is_refused_by_name(platform_root, field):
+    with pytest.raises(cfg.ConfigError) as excinfo:
+        cfg.load(overrides={field: -1})
+    assert field in str(excinfo.value)
+    assert "0 disables it" in str(excinfo.value)
+
+
+def test_a_backstop_below_the_first_threshold_is_refused_not_reordered(
+    platform_root,
+):
+    """An inverted pair means the operator has them the wrong way round.
+
+    Silently swapping them would leave a host quietly running a configuration
+    nobody wrote; silently accepting them would make the backstop fire first and
+    the precise paths unreachable, so every halt would be reported as
+    ``backstop`` — the least informative answer — while looking like it worked.
+    """
+    with pytest.raises(cfg.ConfigError) as excinfo:
+        cfg.load(overrides={"stall_idle_seconds": 600, "stall_backstop_seconds": 60})
+    message = str(excinfo.value)
+    assert "stall_backstop_seconds" in message and "stall_idle_seconds" in message
+
+
+def test_a_disabled_backstop_is_not_read_as_an_inverted_pair(platform_root):
+    """0 is off, and off is not "earlier than the first threshold".
+
+    The guard above compares two numbers, and the whole point of the off switch
+    is that one of them may be zero — so the ordering check has to exempt it or
+    the escape hatch would be refused by the safety rail.
+    """
+    config = cfg.load(overrides={
+        "stall_idle_seconds": 600, "stall_backstop_seconds": 0,
+    })
+    assert config.stall_backstop_seconds == 0

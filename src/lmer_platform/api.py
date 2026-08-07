@@ -98,7 +98,7 @@ from .config import (
     update_stored,
     validate_assistant_override,
 )
-from .inventory import build_inventory
+from .inventory import StallPolicy, build_inventory
 from .lifecycle import LifecycleError
 from .meta import MetaError
 from .registry import list_sessions, prune_dead, read_session
@@ -596,7 +596,13 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     # costing a request per run: the view is polled from a phone, and "which of
     # these is waiting on me" is the question it exists to answer.
     inventory = build_inventory(
-        refs, sessions, tracked=tracked, questions=ask.pending_by_session(sessions)
+        refs, sessions, tracked=tracked, questions=ask.pending_by_session(sessions),
+        # Resolved here, where config is in hand: defaulting deeper would leave
+        # a host's config.json with no effect (#243).
+        stall=StallPolicy(
+            idle_after=config.stall_idle_seconds,
+            backstop_after=config.stall_backstop_seconds,
+        ),
     )
 
     payload = {

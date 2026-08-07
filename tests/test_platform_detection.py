@@ -1527,3 +1527,116 @@ def test_no_other_subcommand_starts_a_detection_thread(
     monkeypatch.setattr(daemon, "setup_ui", lambda force_node=False: platform_root)
 
     daemon.main(argv)
+
+
+# --- a halted session reaches the assistant (#243) ----------------------------
+#
+# The reason itself is inventory's (tests/test_platform_inventory.py owns which
+# silence means what). What is under test here is the half that is this module's:
+# the assistant is told, once, and in one line that names the run and what
+# stopped it — the requirement the issue states as "the assistant receives a
+# digest naming the run and the error class".
+
+
+STALL_NOTE = (
+    "no output for 14m; the harness recorded a provider refusal: billing_error"
+)
+
+
+def test_a_halted_session_reaches_the_assistant_naming_run_and_cause(config):
+    """One line, the run first and the cause in it.
+
+    The run reference leads because the assistant's next move is an API call and
+    that triple is what every run route takes; the cause rides in the note
+    because an assistant that has to open a terminal to find out what broke is
+    the situation this issue exists to end.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-243", reason="stalled", note=STALL_NOTE,
+                  state="running", label="issue 243",
+                  since="2026-08-05T16:32:00Z")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+
+    assert len(spool.calls) == 1
+    call = spool.calls[0]
+    assert call["kind"] == "stalled"
+    assert "gitlab.example.com/agents/global/develop-243" in call["note"]
+    assert "billing_error" in call["note"]
+    assert call["data"]["slug"] == "develop-243"
+    assert call["data"]["state"] == "running", (
+        "the row stays running: the container is up, which is what makes it worth "
+        "flagging rather than merely broken"
+    )
+
+
+def test_a_halt_that_persists_is_announced_once(config):
+    """The failure this replaces was silence; the failure it must not become is a
+    digest a minute for one halted run.
+
+    ``since`` is the moment it went quiet and inventory floors it to the minute,
+    so a condition that persists keeps producing the same identity however many
+    ticks it survives.
+    """
+    spool = Spool()
+    stalled = fleet(row("develop-243", reason="stalled", note=STALL_NOTE,
+                        state="running", since="2026-08-05T16:32:00Z"))
+    tick = detector(config, fleet(), stalled, stalled, stalled, spool=spool)
+
+    for _ in range(4):
+        tick.tick_once()
+
+    assert len(spool.calls) == 1, (
+        f"one halt spooled {len(spool.calls)} digests: {spool.notes}"
+    )
+
+
+def test_a_session_that_halts_again_is_a_second_event(config):
+    """Recovered and halted again is two events, not a duplicate of one.
+
+    The second halt has its own ``since`` — the session produced output in
+    between, which is what moved it — and swallowing that would hide exactly the
+    case where an operator restored credits and the run stopped a second time.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-243", reason="stalled", note=STALL_NOTE,
+                  state="running", since="2026-08-05T16:32:00Z")),
+        fleet(row("develop-243", state="running")),
+        fleet(row("develop-243", reason="stalled", note=STALL_NOTE,
+                  state="running", since="2026-08-05T18:10:00Z")),
+        spool=spool,
+    )
+
+    for _ in range(4):
+        tick.tick_once()
+
+    assert len(spool.calls) == 2
+
+
+def test_the_backstops_digest_does_not_claim_a_diagnosis(config):
+    """The three paths carry different strengths of claim, and the weakest one
+    has to survive the trip to the assistant saying so — otherwise an hour-late
+    "we do not know why" reads as a confident finding."""
+    spool = Spool()
+    note = "no output for 61m; nothing in the transcript says why (flagged on silence alone)"
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-243", reason="stalled", note=note, state="running",
+                  since="2026-08-05T16:32:00Z")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+
+    assert "silence alone" in spool.calls[0]["note"]

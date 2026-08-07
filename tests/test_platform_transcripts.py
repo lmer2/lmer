@@ -2122,3 +2122,274 @@ def test_the_ceiling_is_generous_enough_for_an_ordinary_report():
     assert transcripts.DETAIL_LIMIT < transcripts.TEXT_LIMIT, (
         "a tool's one-line hint must stay far tighter than a message's prose"
     )
+
+
+# --- last_turn: the bounded read halt detection asks for (#243) --------------
+#
+# One question, one file, one tail. The properties that matter here are the ones
+# whose failure is silent: a read that is not actually bounded (a fleet poll then
+# re-reads megabytes per stalled run), and a "nothing" that is indistinguishable
+# from "nothing was said" (the caller would put a run on the attention list for
+# the wrong reason, or fail to).
+
+def turn_line(role, text, *, at="2026-08-06T20:00:00Z"):
+    """One transcript record in the harness's own shape."""
+    return json.dumps({
+        "type": role,
+        "timestamp": at,
+        "message": {"role": role, "content": [{"type": "text", "text": text}]},
+    })
+
+
+def plant_turns(session_id, lines, *, name="session"):
+    directory = transcripts.session_transcript_dir(session_id) / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{name}.jsonl"
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target
+
+
+def test_last_turn_reads_the_newest_turn(platform_root):
+    registry.register("s-lt1", pid=DEAD_PID, run=dict(RUN))
+    plant_turns("s-lt1", [
+        turn_line("user", "please do the thing"),
+        turn_line("assistant", "on it"),
+        turn_line("user", "and this too"),
+    ])
+    turn = transcripts.last_turn("s-lt1")
+    assert turn is not None
+    assert turn.role == "user"
+    assert turn.text == "and this too"
+
+
+def test_last_turn_reads_a_tail_not_the_whole_file(platform_root):
+    """The bound is the reason this function exists rather than read_messages.
+
+    A stalled run stays stalled, and the fleet view is polled from a phone — so
+    this is called again for the same session every poll. Proven by planting a
+    file far larger than the tail and asserting the read stops at the bound:
+    the earliest turns must be unreachable, which is exactly what a seek buys.
+    """
+    filler = [turn_line("assistant", "x" * 4096) for _ in range(200)]
+    path = plant_turns("s-lt2", [turn_line("user", "the first thing ever said")]
+                       + filler + [turn_line("assistant", "the newest thing")])
+    registry.register("s-lt2", pid=DEAD_PID, run=dict(RUN))
+    assert path.stat().st_size > transcripts.LAST_TURN_TAIL_BYTES, (
+        "the fixture is smaller than the bound, so this proves nothing"
+    )
+
+    records = transcripts._tail_records(
+        path, tail_bytes=transcripts.LAST_TURN_TAIL_BYTES
+    )
+    texts = json.dumps(records)
+    assert "the newest thing" in texts
+    assert "the first thing ever said" not in texts, (
+        "the whole file was read; the tail bound is not being applied"
+    )
+    assert transcripts.last_turn("s-lt2").text == "the newest thing"
+
+
+def test_a_seeked_read_drops_its_first_partial_record(platform_root):
+    """A tail almost never starts on a record boundary, and half a JSON object
+    is not an error to report — it is a line to drop."""
+    path = plant_turns("s-lt3", [
+        turn_line("assistant", "y" * 2048),
+        turn_line("user", "the last word"),
+    ])
+    records = transcripts._tail_records(path, tail_bytes=600)
+    assert records, "everything was dropped, including the complete final record"
+    assert records[-1]["message"]["content"][0]["text"] == "the last word"
+
+
+def test_a_torn_final_line_does_not_lose_the_turn_before_it(platform_root):
+    """The harness appends while this reads, so the newest line can be half
+    written. That must cost the torn record, never the answer."""
+    directory = transcripts.session_transcript_dir("s-lt4") / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "session.jsonl").write_text(
+        turn_line("user", "answer me") + "\n" + '{"type": "assist',
+        encoding="utf-8",
+    )
+    registry.register("s-lt4", pid=DEAD_PID, run=dict(RUN))
+    turn = transcripts.last_turn("s-lt4")
+    assert turn is not None and turn.text == "answer me"
+
+
+def test_last_turn_prefers_the_file_being_appended_to(platform_root):
+    """A session can have several transcript files; the live one is the newest
+    by modification time, and that is the conversation it is in."""
+    registry.register("s-lt5", pid=DEAD_PID, run=dict(RUN))
+    old = plant_turns("s-lt5", [turn_line("assistant", "old business")], name="a")
+    new = plant_turns("s-lt5", [turn_line("user", "current business")], name="b")
+    os.utime(old, (1_600_000_000, 1_600_000_000))
+    os.utime(new, (1_700_000_000, 1_700_000_000))
+    assert transcripts.last_turn("s-lt5").text == "current business"
+
+
+@pytest.mark.parametrize("plant", ["nothing", "garbage", "empty"])
+def test_no_readable_turn_is_none_rather_than_a_guess(platform_root, plant):
+    """Three ways of not knowing, all ordinary — a codex or pi session (this
+    adapter is Claude-shaped), a file of noise, an empty one.
+
+    ``None`` has to mean "no opinion" here, because the caller is deciding
+    whether to put a run on the attention list. Anything that turned "I cannot
+    read this" into a turn would flag runs on the strength of a file this build
+    does not understand.
+    """
+    registry.register("s-lt6", pid=DEAD_PID, run=dict(RUN))
+    if plant == "garbage":
+        plant_turns("s-lt6", ["not json at all", "{also: not}"])
+    elif plant == "empty":
+        plant_turns("s-lt6", [""])
+    assert transcripts.last_turn("s-lt6") is None
+
+
+def test_an_unreadable_transcript_is_none_not_an_exception(platform_root):
+    """Whatever the caller is, it is on a poll path that must not raise."""
+    registry.register("s-lt7", pid=DEAD_PID, run=dict(RUN))
+    path = plant_turns("s-lt7", [turn_line("user", "hello")])
+    with denied_read(path):
+        assert transcripts.last_turn("s-lt7") is None
+
+
+def test_a_session_with_no_transcript_at_all_is_none(platform_root):
+    registry.register("s-lt8", pid=DEAD_PID, run=dict(RUN))
+    assert transcripts.last_turn("s-lt8") is None
+
+
+def test_a_tool_result_alone_is_not_the_newest_turn(platform_root):
+    """The normaliser folds a result onto the call that made it, so a session
+    whose last record is a tool result is still *in* its assistant turn — and
+    the answer must be that turn, not nothing."""
+    registry.register("s-lt9", pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir("s-lt9") / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "session.jsonl").write_text("\n".join([
+        json.dumps({
+            "type": "assistant",
+            "timestamp": "2026-08-06T20:00:00Z",
+            "message": {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash",
+                 "input": {"command": "gate-check"}},
+            ]},
+        }),
+        json.dumps({
+            "type": "user",
+            "timestamp": "2026-08-06T20:05:00Z",
+            "toolUseResult": {},
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            ]},
+        }),
+    ]) + "\n", encoding="utf-8")
+    turn = transcripts.last_turn("s-lt9")
+    assert turn is not None and turn.role == "assistant"
+    assert turn.tools and turn.tools[0].status == "ok"
+
+
+# --- the provider's refusal, as the harness records it (#243) -----------------
+#
+# Captured rather than invented, like the rest of this file's fixtures: a real
+# Claude Code (2.1.221) was pointed at an endpoint answering 400 with a billing
+# error, and at one answering 529 until its retries were exhausted. What it wrote
+# is claude-api-error.jsonl, and halt detection reads exactly these fields.
+
+API_ERROR_FIXTURE = FIXTURES / "claude-api-error.jsonl"
+
+
+def test_a_recorded_refusal_carries_its_class_and_status():
+    """The fields the harness commits to, and what they mean.
+
+    ``isApiErrorMessage`` is the gate; ``error`` is the provider's own class and
+    ``apiErrorStatus`` the HTTP status. Halt detection rests on this being a
+    *field* rather than a reading of the sentence, so a change of shape here has
+    to fail a test rather than quietly turn detection into prose-matching.
+    """
+    messages = transcripts.normalise_records(records(API_ERROR_FIXTURE))
+    assert [(m.api_error, m.api_error_status) for m in messages] == [
+        ("billing_error", 400), ("server_error", 529),
+    ]
+    assert all(m.role == "assistant" for m in messages), (
+        "the harness writes its refusal as an assistant turn; the api_error path "
+        "only trusts the marker on that role"
+    )
+    assert "Credit balance is too low" in messages[0].text
+    assert "529 Overloaded" in messages[1].text
+
+
+def test_an_ordinary_turn_carries_no_refusal_marker():
+    """The other direction, which is the one that matters: nothing in an ordinary
+    conversation may look like a refusal, however it is worded."""
+    messages = transcripts.normalise_records(records())
+    assert all(m.api_error is None for m in messages)
+    assert all(m.api_error_status is None for m in messages)
+
+
+def test_the_refusal_marker_crosses_to_a_client():
+    page = transcripts.normalise_records(records(API_ERROR_FIXTURE))[0].to_dict()
+    assert page["api_error"] == "billing_error"
+    assert page["api_error_status"] == 400
+
+
+@pytest.mark.parametrize("record,expected", [
+    ({"isApiErrorMessage": True, "error": "billing_error", "apiErrorStatus": 400},
+     (True, "billing_error", 400)),
+    # Marked, but a build that records neither detail: still a refusal. The flag
+    # is returned in its own right for exactly this row — deriving "was this a
+    # refusal" from the detail fields made this case read as an ordinary turn
+    # while three comments said otherwise (review of !205, iteration 2).
+    ({"isApiErrorMessage": True}, (True, None, None)),
+    # The flag is the gate — detail without it is not a refusal, because those
+    # keys could mean anything in a record shape this build has never seen.
+    ({"error": "billing_error", "apiErrorStatus": 400}, (False, None, None)),
+    # Wrong types read as absent rather than crossing as junk, and the refusal
+    # survives losing its detail.
+    ({"isApiErrorMessage": True, "error": 7, "apiErrorStatus": "400"},
+     (True, None, None)),
+    ({"isApiErrorMessage": True, "error": "x", "apiErrorStatus": True},
+     (True, "x", None)),
+    ({"isApiErrorMessage": "yes"}, (False, None, None)),
+])
+def test_the_refusal_fields_are_read_defensively(record, expected):
+    """This file is written by a program the platform does not version."""
+    assert transcripts._api_error_of(record) == expected
+
+
+@pytest.mark.parametrize("record,refused", [
+    ({"isApiErrorMessage": True, "error": "billing_error"}, True),
+    ({"isApiErrorMessage": True}, True),
+    ({"error": "billing_error", "apiErrorStatus": 400}, False),
+    ({}, False),
+])
+def test_the_refusal_flag_reaches_the_normalised_turn(record, refused):
+    """One step past the adapter, which is where the gap was.
+
+    The parametrised case above asserted the adapter's tuple and stopped there,
+    so it passed while the fact never crossed onto the message and every consumer
+    of it decided the opposite. Asserting the property on the object callers
+    actually hold is what closes that.
+    """
+    message = transcripts.normalise_records([{
+        "type": "assistant",
+        "timestamp": "2026-08-07T01:00:00Z",
+        "message": {"role": "assistant",
+                    "content": [{"type": "text", "text": "API Error"}]},
+        **record,
+    }])[0]
+    assert message.api_refusal is refused
+    assert message.to_dict()["api_refusal"] is refused
+
+
+def test_last_turn_reports_a_refusal_as_the_newest_turn(platform_root):
+    """End to end: the fixture on disk, through the bounded tail read, to the
+    fact halt detection asks for."""
+    registry.register("s-api1", pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir("s-api1") / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "session.jsonl").write_text(
+        API_ERROR_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    turn = transcripts.last_turn("s-api1")
+    assert turn is not None
+    assert turn.api_error == "server_error"
+    assert turn.api_error_status == 529

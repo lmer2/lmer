@@ -138,6 +138,46 @@ conversation window is lost.
 - **Adopt / forget** — runs started outside the platform can be adopted into
   the fleet view (`+ run` → adopt, or `POST /api/runs/adopt`); ended runs can
   be forgotten from their card (undo window; nothing on disk is touched).
+- **"stopped responding"** — a run whose session is up but whose agent stopped
+  producing anything, with no stop recorded by the run itself. That is what a
+  provider refusal looks like from outside: a spend limit, a `529 Overloaded`
+  the retries gave up on, or any error that ended a turn the agent never came
+  back from. The row moves onto the attention list and the assistant gets a
+  digest, so nobody has to open a terminal to find out. Nothing is sent to the
+  session — flagging is the whole behaviour.
+
+  The note says how it was decided, and the three answers do not carry the same
+  confidence: *the harness recorded a provider refusal* (the harness marks such a
+  turn as one, and names the class — `billing_error`, `server_error` — so this is
+  its own report rather than a reading of what the turn said), *it was given
+  input and never answered*, or *flagged on silence alone* (the backstop below;
+  no diagnosis is being claimed).
+
+  | variable | default | what it sets |
+  |---|---|---|
+  | `LMER_PLATFORM_STALL_IDLE_SECONDS` | `600` | how long a session may be silent before the first two checks apply |
+  | `LMER_PLATFORM_STALL_BACKSTOP_SECONDS` | `3600` | silence after which a run is flagged whatever its transcript says |
+
+  Both also live in `config.json`, and **`0` turns either off** — the precise
+  checks without the backstop is a coherent choice, and so is the whole feature
+  disabled. A backstop below the first threshold is refused rather than
+  quietly reordered.
+
+  Two things it deliberately will not do. It does not fire while a session is
+  *retrying* — a harness retrying an overloaded API is painting a countdown, so
+  it is not silent, and it writes nothing to its transcript until the retries are
+  exhausted (both measured against a real harness). It is caught at that point.
+  And past the backstop threshold it stops trying to tell a halt from a genuinely
+  long-running background command: an hour-old silence is flagged either way,
+  which is the trade that keeps a halt this build cannot recognise — a harness
+  with no readable transcript, or one that stops marking refusals — from going
+  unnoticed forever.
+
+  **On upgrade:** rebuild or re-pull the UI bundle (`lmer platform setup-ui`, or
+  pull the platform image) alongside the daemon restart, or the fleet view
+  renders the new chip as the raw word `stalled`. A restart is what makes the two
+  config fields take effect; there is no migration, and an existing
+  `config.json` without them takes the defaults.
 
 ## Where things live
 
