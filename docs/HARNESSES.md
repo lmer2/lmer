@@ -71,6 +71,7 @@ gracefully and are listed explicitly:
 | Supervisor auto-start + FastAPI endpoint     | ✅     | ✅    | ✅  |
 | Slash commands (`agent-files` commands)      | ✅     | ✅⁷   | ✅⁷ |
 | Skills (`agent-files` skills)                | ✅     | ❌    | ❌  |
+| Output styles (`agent-files` output-styles)  | ✅⁹    | ❌    | ❌  |
 | Stop/SessionEnd hook guards                  | ✅     | ❌    | ❌  |
 | Agent memory persistence (`work memory`)     | ✅     | ✅⁸   | ✅⁸ |
 | Masterplan workflow                          | ✅     | ❌    | ❌  |
@@ -113,6 +114,12 @@ gracefully and are listed explicitly:
    into the global context file (the `prompts/agent-memory.md` fragment,
    note 3's mechanism); persisting back remains the agent's
    `work memory persist`, as on claude.
+9. Claude-only: codex and pi have no equivalent feature and get nothing, so
+   anything *every* harness must obey belongs in the taskdef prompt rather
+   than in a style. Shipping a style and selecting one are separate
+   mechanisms, and a style reaches neither subagents nor the built-in coding
+   instructions by default — see
+   [LMER-CLI.md](LMER-CLI.md#output-styles-shipping-one-and-selecting-one-are-separate).
 
 ## Authentication
 

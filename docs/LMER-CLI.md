@@ -334,7 +334,7 @@ Inside the container, `bin/doctor`'s `🔗 Declared Sources` section reports on 
 
 ### Work-Repo Claude Assets
 
-The work repository can contribute Claude Code slash commands, skills, and a limited slice of `settings.json` to every session that uses it. This is the supported way to ship project-specific automation, runbooks, or pre-authorized tool patterns across all developers who share the work repo.
+The work repository can contribute Claude Code slash commands, skills, subagent definitions, output styles, and a limited slice of `settings.json` to every session that uses it. This is the supported way to ship project-specific automation, runbooks, or pre-authorized tool patterns across all developers who share the work repo.
 
 Layout (relative to the work-repo root, i.e. `/work/agent-files/claude/` inside the container):
 
@@ -345,6 +345,10 @@ agent-files/claude/
 ├── skills/
 │   └── runbook-xyz/
 │       └── SKILL.md         # Auto-discovered Claude Code skill
+├── agents/
+│   └── reviewer.md          # Subagent definition (*.md only)
+├── output-styles/
+│   └── terse.md             # Selectable Claude Code output style (*.md only)
 └── settings.json            # Only permissions.allow is merged
 ```
 
@@ -352,9 +356,31 @@ At container start, `claude-runner.sh` does the following:
 
 - Symlinks every entry under `agent-files/claude/commands/` into `~/.claude/commands/` so the files are visible to Claude Code's slash-command loader.
 - Symlinks every skill directory under `agent-files/claude/skills/` into `~/.claude/skills/` so Claude Code's skill discovery picks them up.
-- If `agent-files/claude/settings.json` exists, merges its `permissions.allow` array into `~/.claude/settings.json` (deduplicated). No other keys are honored — work-repo `settings.json` cannot, for example, add a `deny` entry or change the status-line command, so a misconfigured work repo cannot weaken protections that live in the global settings.
+- Symlinks every entry under `agent-files/claude/agents/` into `~/.claude/agents/`, where Claude Code discovers subagent definitions. (`LMER_DISPATCH_<LANE>` may then replace a linked lane definition with a rendered copy carrying the configured model/effort — see the `LMER_DISPATCH_*` entry under [LMER-Specific Environment Variables](#lmer-specific-environment-variables).)
+- Symlinks every entry under `agent-files/claude/output-styles/` into `~/.claude/output-styles/`, where Claude Code discovers output styles.
+- If `agent-files/claude/settings.json` exists, merges its `permissions.allow` array into `~/.claude/settings.json` (deduplicated). No other keys are honored — work-repo `settings.json` cannot, for example, add a `deny` entry, change the status-line command, or select an output style, so a misconfigured work repo cannot weaken protections that live in the global settings.
 
 Both sources (lmer global tree at `/Agents/global/agent-files/claude/`, plus the work repo) are overlaid, with work-repo entries overriding global ones on name collision. Per Claude Code's skill loader, changes to skills under `~/.claude/skills/` take effect immediately within the running session — adding a new file in the work repo and re-syncing does not require a container restart.
+
+Two properties of the loaders are worth knowing when you author these files (checked against Claude Code 2.1.221):
+
+- **Only `*.md` files are loaded** from `agents/` and `output-styles/`, while the runner links *every* entry it finds. A `terse.markdown` or `terse.md.j2` is linked and then silently ignored; subdirectories are descended into, so `output-styles/team/terse.md` does load.
+- **Overriding requires reusing the filename.** The runner's shadowing is by filename, but a file identifies itself by its frontmatter `name`. A work-repo `output-styles/team.md` with `name: lmer` therefore does not replace a global `output-styles/lmer.md` — both are linked and both load. Keep `name` equal to the filename stem. The two loaders differ on what happens when it is absent: a **style** falls back to the filename stem, so omitting `name` is safe there, while a **subagent definition without a `name` is dropped and nothing is logged** — the agent is simply not there. Always give an agent def a `name`.
+
+#### Output styles: shipping one and selecting one are separate
+
+An output style replaces Claude Code's built-in software-engineering system prompt for the main conversation (unless the style sets `keep-coding-instructions: true`), and it does **not** reach subagents — the `adversarial-reviewer`, `coder`, `explorer` and other agent definitions run their own prompts either way. Styles are also Claude-only: codex and pi have no equivalent, so a behavior every harness must follow belongs in the taskdef prompt rather than in a style.
+
+Delivering the file is what the layout above does. *Selecting* it is the `outputStyle` settings key, and not every source that can ship a style can also select one:
+
+| Source | Ships a style file | Can set `outputStyle` |
+|---|:---:|:---:|
+| lmer global tree (`agent-files/claude/`) | ✅ | ✅ — its `settings.json` becomes `~/.claude/settings.json` (symlinked normally; in danger zone the entrypoint copies it and replaces only the `permissions` object, so other keys survive) |
+| Work repo (`/work/agent-files/claude/`) | ✅ | ❌ — only `permissions.allow` is merged from a work-repo `settings.json` |
+
+So a work repo can put a style in front of every session that uses it, but it can never *automatically* activate one — that stays with the lmer global tree. This is deliberate (#252): a shared work repo replacing the main agent's system prompt is a much larger lever than the permission grants that merge is limited to. A shipped style is still offered in the `/config` picker, and the effective `~/.claude/settings.json` is a writable regular file after the merge, so a person in the session can always select a style by hand; what the boundary rules out is a work repo doing it unattended.
+
+`claude-runner.sh` has a third branch that merges `~/.claude/settings.local.json` into the effective settings, which would carry an `outputStyle`. Do not rely on it: nothing mounts a host file to that path, **and** the merge itself is broken today — its `jq` filter indexes the already-merged object with `.[0]`, so the filter always errors and the runner falls through to `⚠️  Failed to merge settings.local.json, using base settings`. Nothing from that file lands (#251).
 
 ### Tasks
 

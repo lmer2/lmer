@@ -147,25 +147,25 @@ class TestClaudeLinkAgentFiles:
             "claude_link_agent_files", str(home_claude), "", ""
         )
         assert result.returncode == 0, result.stderr
-        assert (home_claude / "commands").is_dir()
-        assert (home_claude / "skills").is_dir()
-        assert list((home_claude / "commands").iterdir()) == []
-        assert list((home_claude / "skills").iterdir()) == []
+        for subdir in ("commands", "skills", "output-styles"):
+            assert (home_claude / subdir).is_dir(), subdir
+            assert list((home_claude / subdir).iterdir()) == [], subdir
 
     def test_missing_source_subdir_is_skipped(self, trees):
-        """If only commands/ exists in a source (no skills/), skills target stays empty."""
+        """If only commands/ exists in a source, the other targets stay empty."""
         home_claude, global_src, _work_src = trees
         (global_src / "commands").mkdir(parents=True)
         (global_src / "commands" / "rgr.md").write_text("# rgr\n")
-        # No skills/ subdir
+        # No skills/ or output-styles/ subdir
 
         result = _run_helper(
             "claude_link_agent_files", str(home_claude), str(global_src), ""
         )
         assert result.returncode == 0, result.stderr
         assert (home_claude / "commands" / "rgr.md").is_symlink()
-        assert (home_claude / "skills").is_dir()
-        assert list((home_claude / "skills").iterdir()) == []
+        for subdir in ("skills", "output-styles"):
+            assert (home_claude / subdir).is_dir(), subdir
+            assert list((home_claude / subdir).iterdir()) == [], subdir
 
     def test_idempotent_re_run(self, trees):
         """Running twice should leave the same result and not error."""
@@ -206,6 +206,49 @@ class TestClaudeLinkAgentFiles:
         )
         assert result.returncode == 0, result.stderr
         assert (home_claude / "agents" / "explorer.md").read_text() == "work explorer"
+
+    def test_links_output_styles_from_global(self, trees):
+        """Issue #249: a style in the lmer tree reaches ~/.claude/output-styles/."""
+        home_claude, global_src, _work_src = trees
+        (global_src / "output-styles").mkdir(parents=True)
+        (global_src / "output-styles" / "terse.md").write_text(
+            "---\nname: terse\n---\nglobal terse\n"
+        )
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), ""
+        )
+        assert result.returncode == 0, result.stderr
+        linked = home_claude / "output-styles" / "terse.md"
+        assert linked.is_symlink()
+        assert linked.resolve() == (global_src / "output-styles" / "terse.md").resolve()
+        assert linked.read_text() == "---\nname: terse\n---\nglobal terse\n"
+
+    def test_links_output_styles_from_work_repo(self, trees):
+        """A style shipped by the work repo reaches the same directory."""
+        home_claude, _global_src, work_src = trees
+        (work_src / "output-styles").mkdir(parents=True)
+        (work_src / "output-styles" / "runbook.md").write_text(
+            "---\nname: runbook\n---\nwork runbook\n"
+        )
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), "", str(work_src)
+        )
+        assert result.returncode == 0, result.stderr
+        linked = home_claude / "output-styles" / "runbook.md"
+        assert linked.is_symlink()
+        assert linked.read_text() == "---\nname: runbook\n---\nwork runbook\n"
+
+    def test_work_output_styles_override_global(self, trees):
+        home_claude, global_src, work_src = trees
+        (global_src / "output-styles").mkdir(parents=True)
+        (global_src / "output-styles" / "terse.md").write_text("global terse")
+        (work_src / "output-styles").mkdir(parents=True)
+        (work_src / "output-styles" / "terse.md").write_text("work terse")
+        result = _run_helper(
+            "claude_link_agent_files", str(home_claude), str(global_src), str(work_src)
+        )
+        assert result.returncode == 0, result.stderr
+        assert (home_claude / "output-styles" / "terse.md").read_text() == "work terse"
 
 
 class TestClaudeRenderDispatchLanes:
@@ -443,6 +486,40 @@ class TestClaudeMergeWorkSettings:
 
         merged = json.loads((home_claude / "settings.json").read_text())
         assert merged["permissions"]["deny"] == []  # Work-repo deny ignored
+
+    def test_does_not_merge_work_repo_output_style(self, trees):
+        """A work repo may SHIP an output style (Issue #249) but not SELECT one.
+
+        Honoring outputStyle from the work repo would let a shared repo replace
+        the main agent's system prompt — a far bigger lever than the permission
+        grants #48 limited this merge to. This assertion is what keeps that
+        decision true in code; docs/LMER-CLI.md carries the rationale.
+        """
+        home_claude, _global_src, work_src = trees
+        self._write_settings(
+            home_claude / "settings.json",
+            {"permissions": {"allow": ["Bash(ls:*)"]}},
+        )
+        self._write_settings(
+            work_src / "settings.json",
+            {
+                "outputStyle": "work-repo-style",
+                "permissions": {"allow": ["Bash(make:*)"]},
+            },
+        )
+
+        result = _run_helper(
+            "claude_merge_work_settings", str(home_claude), str(work_src)
+        )
+        assert result.returncode == 0, result.stderr
+
+        merged = json.loads((home_claude / "settings.json").read_text())
+        assert "outputStyle" not in merged
+        # The permission grant it shipped alongside still lands, so this is
+        # about the key and not about the merge having been skipped.
+        assert sorted(merged["permissions"]["allow"]) == sorted(
+            ["Bash(ls:*)", "Bash(make:*)"]
+        )
 
     def test_replaces_symlink_settings_file(self, trees):
         """settings.json may be a symlink to a read-only mount — replace with regular file."""

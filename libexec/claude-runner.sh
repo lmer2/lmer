@@ -164,11 +164,12 @@ else
     fi
 fi
 
-# ── Lay out commands, skills, and settings under ~/.claude ──
+# ── Lay out commands, skills, agents, output styles, settings under ~/.claude ──
 # Symlink settings.json from the global tree first (if discovered above),
 # then merge in the work-repo's permissions.allow. Then populate
-# ~/.claude/commands/ and ~/.claude/skills/ with per-entry symlinks from
-# the global tree and the work repo (work overrides on name collision).
+# ~/.claude/commands/, skills/, agents/ and output-styles/ with per-entry
+# symlinks from the global tree and the work repo (work overrides on name
+# collision).
 WORK_AGENT_FILES="/work/agent-files/claude"
 [ -d "$WORK_AGENT_FILES" ] || WORK_AGENT_FILES=""
 
