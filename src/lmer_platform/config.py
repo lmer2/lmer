@@ -107,6 +107,8 @@ __all__ = [
     "binding_notice", "configured_repo_url", "container_base_url",
     "ASSISTANT_SETTING_KEYS", "AssistantSetting", "assistant_settings",
     "update_stored", "validate_assistant_override",
+    "DEFAULT_STALL_IDLE_SECONDS", "DEFAULT_STALL_BACKSTOP_SECONDS",
+    "ENV_STALL_IDLE_SECONDS", "ENV_STALL_BACKSTOP_SECONDS",
 ]
 
 CONFIG_FILENAME = "config.json"
@@ -133,6 +135,14 @@ DEFAULT_PULL_INTERVAL_SECONDS = 30
 DEFAULT_MAX_CONCURRENT_SESSIONS = 8
 DEFAULT_MAX_FOLLOWUP_ROUNDS = 5
 
+#: How long a live session may produce nothing before halt detection considers
+#: it (#243). An operator's number, not a derived one; silence alone does not
+#: raise anything (:func:`lmer_platform.inventory._stalled`).
+DEFAULT_STALL_IDLE_SECONDS = 600
+#: Silence past this raises the flag whatever the transcript says, so a halt the
+#: precise paths cannot recognise is found an hour late rather than never.
+DEFAULT_STALL_BACKSTOP_SECONDS = 3600
+
 ENV_BIND_ADDRESS = "LMER_PLATFORM_BIND_ADDRESS"
 ENV_BIND_PORT = "LMER_PLATFORM_BIND_PORT"
 ENV_SECRET_FILE = "LMER_PLATFORM_SECRET_FILE"
@@ -158,6 +168,12 @@ ENV_WORK_REPO_FORGE = "LMER_PLATFORM_WORK_REPO_FORGE"
 #: name, and a reverse proxy, a custom network or a runtime this build does not
 #: know about are all cases where an operator knows an answer the code cannot.
 ENV_CONTAINER_URL = "LMER_PLATFORM_CONTAINER_URL"
+
+#: The two halt-detection thresholds (#243). Both accept ``0``, which turns the
+#: path they govern off — hence validated apart from their positive-integer
+#: neighbours.
+ENV_STALL_IDLE_SECONDS = "LMER_PLATFORM_STALL_IDLE_SECONDS"
+ENV_STALL_BACKSTOP_SECONDS = "LMER_PLATFORM_STALL_BACKSTOP_SECONDS"
 
 #: How the orchestrating assistant's session is *run*, per platform instance
 #: (issue #234): the model, harness, preset and agents fan-out its ``lmer``
@@ -263,6 +279,10 @@ class PlatformConfig:
     # why an unattributable cap cannot be enforced, and what would have to become
     # true for this field to come back to exactly this spot.
     max_followup_rounds: int = DEFAULT_MAX_FOLLOWUP_ROUNDS
+    #: Halt detection (#243), in seconds of silence: when the precise paths may
+    #: fire, and when silence alone is enough. ``0`` disables each.
+    stall_idle_seconds: int = DEFAULT_STALL_IDLE_SECONDS
+    stall_backstop_seconds: int = DEFAULT_STALL_BACKSTOP_SECONDS
     autonomous_default: bool = False
     park_idle_side: bool = False
     #: How the orchestrating assistant's session is run (issue #234) — see
@@ -350,6 +370,25 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         value = getattr(config, name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
             raise ConfigError(f"{name} must be a positive integer, got {value!r}")
+    # Checked apart from the loop above because 0 is meaningful here: it is how
+    # an operator turns a path off.
+    for name in ("stall_idle_seconds", "stall_backstop_seconds"):
+        value = getattr(config, name)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ConfigError(
+                f"{name} must be a non-negative integer (0 disables it), "
+                f"got {value!r}"
+            )
+    # Refused rather than reordered: a backstop that fired first would make the
+    # precise paths unreachable, which nobody means to configure.
+    if 0 < config.stall_backstop_seconds < config.stall_idle_seconds:
+        raise ConfigError(
+            "stall_backstop_seconds "
+            f"({config.stall_backstop_seconds}) must not be below "
+            f"stall_idle_seconds ({config.stall_idle_seconds}): the backstop "
+            "fires on silence alone and is meant to come after the precise "
+            "paths, not instead of them (0 disables it)"
+        )
     # Refused rather than ignored, and case-folded rather than refused for case:
     # a misspelled forge would silently fall back to detection and leave the
     # operator looking at the links they set this to change.
@@ -669,6 +708,8 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         "secret_file": _env_str(ENV_SECRET_FILE),
         "work_repo_mirror": _env_str(ENV_WORK_REPO_MIRROR),
         "work_repo_forge": _env_str(ENV_WORK_REPO_FORGE),
+        "stall_idle_seconds": _env_int(ENV_STALL_IDLE_SECONDS),
+        "stall_backstop_seconds": _env_int(ENV_STALL_BACKSTOP_SECONDS),
         **{
             field: _env_str(env_var)
             for field, env_var in ASSISTANT_SETTING_KEYS.values()

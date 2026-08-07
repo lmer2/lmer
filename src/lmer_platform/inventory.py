@@ -99,25 +99,29 @@ is worse than none, and the read is already gated on the handful of sessions tha
 can answer it. Callers that hold the mapping already — or want no reads at all —
 pass ``activity=`` (see :func:`build_inventory`).
 
-Idleness is a **row fact and not an attention reason**, deliberately. Every member
-of :data:`ATTENTION_REASONS` is picked up automatically by detection (T69) and
-becomes a digest class, so adding one here would mean inventing a threshold — how
-many minutes of quiet is a problem — and there is no policy anywhere that says. A
-run's right answer differs by taskdef and by phase, and a wrong number spools a
-notification per session per baseline change. So the fact crosses, the assistant
-and the operator read it and decide, and the reason is one entry in that tuple plus
-one branch in :func:`_derive` on the day a threshold has an owner.
+Idleness is an attention reason, but silence alone never raises it (#243)
+------------------------------------------------------------------------
+Every member of :data:`ATTENTION_REASONS` becomes a digest class automatically
+(T69), so ``stalled`` waited until its thresholds had an owner; they are
+configuration now (:data:`lmer_platform.config.DEFAULT_STALL_IDLE_SECONDS`).
+
+Silence is the gate and not the evidence, because it is ambiguous: measured from
+inside a live session, a session waiting on a background command is exactly as
+quiet as one the provider refused, while a session doing work repaints and is
+never quiet at all. So :func:`_stalled` needs the newest transcript turn as well
+as the clock — see :data:`STALL_PATHS`.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from work_repo import run_state
 
-from . import assistant, meta
+from . import assistant, meta, transcripts
+from .config import DEFAULT_STALL_BACKSTOP_SECONDS, DEFAULT_STALL_IDLE_SECONDS
 from .reattach import OUTPUT_CONTROL_PLANE, OUTPUT_SESSION_LOG, detached_record
 from .registry import is_live
 from .runs import RunIndexError, run_key
@@ -129,6 +133,7 @@ logger = logging.getLogger("lmer_platform.inventory")
 __all__ = [
     "RUN_STATES", "ATTENTION_REASONS", "ATTENTION_PRIORITY", "SESSION_FIELDS",
     "RunView", "Inventory", "build_inventory",
+    "STALL_PATHS", "INPUT_ROLES", "QUIET_BY_DESIGN_TASKDEFS", "StallPolicy",
 ]
 
 #: Run states (spec §5.4). ``held`` and ``feedback`` arrive with the lifecycle
@@ -165,6 +170,9 @@ RUN_STATES = (
 #: on its ask channel, so answering it is a file the container is already
 #: watching (:mod:`lmer_platform.ask`). Merging them would put an operator one
 #: tap from starting a container when they meant to reply to a waiting session.
+#:
+#: ``stalled``: the session is *up* but its agent stopped producing anything and
+#: its run recorded no stop (#243). See :func:`_stalled`.
 ATTENTION_REASONS = (
     "question",
     "live_question",
@@ -175,22 +183,27 @@ ATTENTION_REASONS = (
     "unreadable",
     "cap_reached",
     "slot_contention",
+    "stalled",
 )
 
 #: Sort order for the attention list: a direct question outranks a crash, because
 #: one is blocked on the human and the other is merely broken. A *live* question
 #: comes first of all — the session is up, holding a slot, and doing nothing
 #: until it is answered.
+#: ``stalled`` outranks the failure reasons below it for the reason
+#: ``live_question`` comes first: it is alive and holding a concurrency slot,
+#: while a failed or crashed run has released everything.
 ATTENTION_PRIORITY = {
     "live_question": 0,
     "question": 1,
     "feedback": 2,
     "yield": 3,
     "cap_reached": 4,
-    "critical_error": 5,
-    "crashed": 6,
-    "slot_contention": 7,
-    "unreadable": 8,
+    "stalled": 5,
+    "critical_error": 6,
+    "crashed": 7,
+    "slot_contention": 8,
+    "unreadable": 9,
 }
 
 _TERMINAL_STATUSES = ("complete", "archived")
@@ -221,6 +234,34 @@ _TERMINAL_STATUSES = ("complete", "archived")
 #: it dies with the entry, and a row-level ``idle`` would invite a client to read
 #: it on a dormant run and get a null it could not explain.
 SESSION_FIELDS = ("id", "pid", "started_at", "log_path", "lifecycle", "activity")
+
+#: Taskdefs whose sessions are quiet *by design*, so silence means nothing about
+#: them. A denylist rather than an allowlist of "real" taskdefs: taskdefs are
+#: user-extensible, and an allowlist would silently never watch a new one.
+QUIET_BY_DESIGN_TASKDEFS = ("chat",)
+
+
+#: How a stall was recognised, named in the note because the three do not carry
+#: equal confidence:
+#:
+#: ``unanswered``
+#:     the newest turn is input nothing answered.
+#: ``api_error``
+#:     the harness marked the newest turn as the provider refusing
+#:     (``Message.api_refusal``). Its report, never a reading of the turn's text,
+#:     so prose about an outage stays an ordinary turn.
+#: ``backstop``
+#:     silence alone. It covers what the two above cannot see — a harness with no
+#:     readable transcript (codex, pi), or one that stops marking refusals — both
+#:     of which make them go quiet rather than wrong. The cost is eventually
+#:     flagging a long-running background command.
+STALL_PATHS = ("unanswered", "api_error", "backstop")
+
+
+#: Roles meaning *something was said to the session*. Named rather than written
+#: as "not the assistant", which swept in the ``system`` role of a local-command
+#: record — so typing ``/usage`` into a healthy run manufactured a halt.
+INPUT_ROLES = ("user", transcripts.MONITOR_ROLE)
 
 
 @dataclass(frozen=True)
@@ -719,12 +760,167 @@ def _live_question_note(questions: list) -> str:
     return f"{text} (+{extra} more)" if extra > 0 else text
 
 
+def _stall_cause(turn) -> Optional[str]:
+    """The provider's own error class, the HTTP status, or ``None``.
+
+    Never derived from the turn's text — see :func:`_refused`.
+    """
+    kind = getattr(turn, "api_error", None)
+    if isinstance(kind, str) and kind:
+        return kind
+    status = getattr(turn, "api_error_status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return f"HTTP {status}"
+    return None
+
+
+def _refused(turn) -> bool:
+    """Whether the harness marked this turn as the provider refusing.
+
+    The flag and only the flag: a refusal recorded with neither a class nor a
+    status is still a refusal, so reading the detail fields instead would drop it
+    to the backstop an hour later.
+    """
+    return getattr(turn, "api_refusal", False) is True
+
+
+def _stalled(
+    state: dict,
+    session: dict,
+    *,
+    policy: "StallPolicy",
+) -> Optional[Attention]:
+    """Whether this live session's agent has stopped, and how that was seen.
+
+    Cheap gates first, then one of :data:`STALL_PATHS`. The gates keep the
+    transcript read off rows that cannot need it, but not off a *quiet* one: a
+    session legitimately waiting on a long build sits past the idle threshold for
+    the whole wait and costs one bounded tail read per fleet poll.
+
+    ``None`` is every "not known to be stalled", including every failure — an
+    absent activity reading is unknowable, not quiet.
+    """
+    if policy.idle_after <= 0 and policy.backstop_after <= 0:
+        return None
+    if session.get("kind") == assistant.KIND:
+        return None
+    # Read defensively, as :attr:`RunView._task` is: an entry from another
+    # daemon version costs this row its stall opinion, never the fleet view.
+    task = session.get("task")
+    task = task if isinstance(task, dict) else {}
+    taskdef = state.get("taskdef") or task.get("taskdef")
+    if taskdef in QUIET_BY_DESIGN_TASKDEFS:
+        return None
+    # Status only. Do NOT add ``stop_reason`` here: it is sticky — nothing clears
+    # a phasic run's ``yield`` — so reading it silences this feature, backstop
+    # included, for the rest of such a run's life. Nothing is lost by ignoring
+    # it, since only the live branch of :func:`_derive` reaches this.
+    if state.get("status") in _TERMINAL_STATUSES:
+        return None
+
+    activity = session.get("activity")
+    activity = activity if isinstance(activity, dict) else {}
+    idle = activity.get("idle_seconds")
+    # ``bool`` is an ``int`` subclass, so a JSON ``true`` would otherwise read as
+    # "idle for one second" — the same check :func:`session_io.session_activity`
+    # makes one layer down, repeated here because this function is also reached
+    # with entries that never passed through it.
+    if isinstance(idle, bool) or not isinstance(idle, (int, float)):
+        return None
+
+    backstop = policy.backstop_after > 0 and idle >= policy.backstop_after
+    precise = policy.idle_after > 0 and idle >= policy.idle_after
+    if not (precise or backstop):
+        return None
+
+    path, cause = None, None
+    if precise:
+        turn = policy.read_last_turn(session.get("id"))
+        if turn is not None:
+            role = getattr(turn, "role", None)
+            if role == "assistant" and _refused(turn):
+                # The harness wrote this turn to say the provider refused. Only
+                # on an assistant turn: the marker belongs to a turn the harness
+                # produced, and reading it off any other role would let a quoted
+                # incident in someone's own message be reported as the provider
+                # having refused just now.
+                path, cause = "api_error", _stall_cause(turn)
+            elif role in INPUT_ROLES:
+                # Something was said to the session and nothing answered it.
+                path = "unanswered"
+    if path is None:
+        if not backstop:
+            # Quiet, but quiet with a reason: the session finished its turn and
+            # is waiting on something outside itself — a background command, or
+            # the operator. Not a halt, and not this module's business until the
+            # backstop says otherwise.
+            return None
+        path = "backstop"
+
+    return Attention(
+        reason="stalled",
+        note=_stall_note(idle, path=path, cause=cause),
+        # No timestamp, on purpose: detection keys on ``(run, reason, since)``
+        # and diffs against the previous tick only, while ``last_output_at`` is
+        # recomputed per request and can wobble across a boundary — which would
+        # spool a digest per tick. A constant identity still announces a second
+        # halt, because the condition clears when the session speaks.
+        since=None,
+    )
+
+
+def _stall_note(idle: float, *, path: str, cause: Optional[str]) -> str:
+    """One line: how long it has been quiet, what the halt looks like, and which
+    path decided it. Also what the digest says — :meth:`lmer_platform.detect
+    .Signal.digest` interpolates this.
+    """
+    quiet = f"no output for {round(idle / 60)}m"
+    if path == "api_error":
+        named = f": {cause}" if cause else ""
+        return f"{quiet}; the harness recorded a provider refusal{named}"
+    if path == "unanswered":
+        return f"{quiet}; it was given input and never answered (no cause claimed)"
+    return f"{quiet}; nothing in the transcript says why (flagged on silence alone)"
+
+
+@dataclass(frozen=True)
+class StallPolicy:
+    """The thresholds halt detection runs on, plus how it reads a transcript.
+
+    ``last_turn_reader=None`` means the real one — the convention ``activity``
+    and ``titles`` use in :func:`build_inventory`, and what production wants.
+    """
+
+    idle_after: int = DEFAULT_STALL_IDLE_SECONDS
+    backstop_after: int = DEFAULT_STALL_BACKSTOP_SECONDS
+    last_turn_reader: Optional[Callable] = None
+
+    def read_last_turn(self, session_id: Optional[str]):
+        """The session's newest turn, or ``None`` — never raising.
+
+        An unreadable transcript costs this run a late flag; an exception would
+        cost every run on the host its row.
+        """
+        if not session_id:
+            return None
+        reader = self.last_turn_reader or transcripts.last_turn
+        try:
+            return reader(session_id)
+        except Exception as exc:  # noqa: BLE001 - one row's precision, not the view
+            logger.warning(
+                "platform_stall_transcript_unread session=%s error=%r — this run "
+                "can still be flagged by the backstop", session_id, exc,
+            )
+            return None
+
+
 def _derive(
     state: Optional[dict],
     session: Optional[dict],
     *,
     unreadable: Optional[str] = None,
     questions: Optional[list] = None,
+    stall: Optional[StallPolicy] = None,
 ) -> tuple[str, Optional[Attention]]:
     """Map run state plus session liveness onto a run state and attention record.
 
@@ -760,18 +956,22 @@ def _derive(
         # host PTY died with a daemon and the container did not answer either, and
         # "running" would be asserting liveness on the strength of a process-table
         # entry nobody could ask anything (T36).
-        state = "detached" if _is_blind(session) else "running"
+        derived = "detached" if _is_blind(session) else "running"
         if questions:
             # Still on the attention list, and answerable: the ask channel is a
             # mounted directory, not the control plane, so a session the platform
             # is blind to can be replied to exactly as before. The two axes are
             # independent (spec D23) and this is the case that proves it.
-            return state, Attention(
+            return derived, Attention(
                 reason="live_question",
                 note=_live_question_note(questions),
                 since=questions[0].get("at"),
             )
-        return state, None
+        # Last: everything above is quiet for a reason already known.
+        stalled = _stalled(state, session, policy=stall or StallPolicy())
+        if stalled is not None:
+            return derived, stalled
+        return derived, None
 
     if unreadable is None and status in _TERMINAL_STATUSES:
         return "complete", None
@@ -824,10 +1024,11 @@ def _view_from_run_dir(
     last_session_id: Optional[str] = None,
     questions: Optional[list] = None,
     title: Optional[str] = None,
+    stall: Optional[StallPolicy] = None,
 ) -> RunView:
     state, error = _load_state_tolerantly(ref)
     run_state_state, attention = _derive(
-        state, session, unreadable=error, questions=questions
+        state, session, unreadable=error, questions=questions, stall=stall
     )
     state = state or {}
     return RunView(
@@ -947,6 +1148,7 @@ def build_inventory(
     questions: Optional[Mapping] = None,
     titles: Optional[Mapping] = None,
     activity: Optional[Mapping] = None,
+    stall: Optional[StallPolicy] = None,
 ) -> Inventory:
     """Join run dirs against session entries into the fleet view.
 
@@ -981,6 +1183,10 @@ def build_inventory(
     a *network* read, so the module docstring says what bounds it — live sessions
     with a control plane, one second each, every failure ``None`` — and ``{}`` is
     how a caller (or a test) asks for rows built without touching a container.
+
+    *stall* is the halt-detection policy (#243). ``None`` means the shipped
+    defaults with the real reader; ``StallPolicy(idle_after=0, backstop_after=0)``
+    asks for no stall opinion at all.
     """
     by_session_questions = dict(questions or {})
     by_title = _titles() if titles is None else dict(titles)
@@ -1047,6 +1253,7 @@ def build_inventory(
                 last_session_id=last_sessions.get(key),
                 questions=questions_for(entry),
                 title=_title_for(by_title, ref.host, ref.project, ref.slug),
+                stall=stall,
             )
         )
 

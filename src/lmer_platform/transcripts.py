@@ -211,6 +211,7 @@ __all__ = [
     "transcript_root", "session_transcript_dir", "locate_sources",
     "sessions_for_run", "normalise_records", "read_source", "read_messages",
     "scrub_transcript", "scrub_session_transcripts",
+    "LAST_TURN_TAIL_BYTES", "last_turn",
 ]
 
 #: Where a harness leaves its transcripts when the platform has not been told
@@ -305,6 +306,12 @@ MAX_SOURCES = 64
 #: as one enormous "line", and json.loads on it would cost more than the whole
 #: transcript.
 _MAX_LINE_BYTES = 1024 * 1024
+
+#: How much of a transcript's tail :func:`last_turn` reads. Big enough to hold
+#: the last few records whatever the file has grown to (a turn with a large tool
+#: result runs to tens of kilobytes), small enough that a fleet poll can afford
+#: one per stalled run. Too small answers ``None``, which is the safe direction.
+LAST_TURN_TAIL_BYTES = 256 * 1024
 
 #: How a tool call ended. ``pending`` is a real state, not an unknown: it is the
 #: tool the session is running right now, which is often the answer to "what is
@@ -573,6 +580,16 @@ class Message:
     tools: list = field(default_factory=list)
     seq: int = 0
     via: Optional[str] = None
+    #: Whether the harness wrote this turn to say the provider refused
+    #: (``isApiErrorMessage``). The fact; the two below are detail a build may
+    #: omit, so a refusal carrying neither is still a refusal. ``False`` on every
+    #: ordinary turn, including prose *about* an outage — which is why this
+    #: crosses as a field rather than being read out of :attr:`text`.
+    api_refusal: bool = False
+    #: The provider's error class (``billing_error``, ``server_error``) and HTTP
+    #: status. ``None`` when the refusal carried neither, or when there is none.
+    api_error: Optional[str] = None
+    api_error_status: Optional[int] = None
 
     @property
     def empty(self) -> bool:
@@ -590,6 +607,9 @@ class Message:
             "text": self.text,
             "truncated": self.truncated,
             "tools": [tool.to_dict() for tool in self.tools],
+            "api_refusal": self.api_refusal,
+            "api_error": self.api_error,
+            "api_error_status": self.api_error_status,
         }
 
 
@@ -1040,6 +1060,30 @@ def _monitor_report(text: str) -> Optional[str]:
     return "\n".join(part for part in parts if part)
 
 
+def _api_error_of(record: dict) -> tuple:
+    """``(refused, error class, http status)`` for one record.
+
+    The harness marks its own refusal turns rather than leaving them to be
+    recognised by wording, which is what lets halt detection avoid reading prose
+    (:func:`lmer_platform.inventory._stalled`). Captured from Claude Code 2.1.221
+    as ``tests/fixtures/transcripts/claude-api-error.jsonl``::
+
+        "isApiErrorMessage": true, "error": "billing_error", "apiErrorStatus": 400
+
+    ``isApiErrorMessage`` is the gate; the other two are detail a build may omit,
+    so the flag is returned in its own right. Everything is read defensively —
+    another program writes this file — and anything unexpected reads as absent.
+    """
+    if record.get("isApiErrorMessage") is not True:
+        return False, None, None
+    kind = record.get("error")
+    kind = kind.strip()[:64] if isinstance(kind, str) and kind.strip() else None
+    status = record.get("apiErrorStatus")
+    if isinstance(status, bool) or not isinstance(status, int):
+        status = None
+    return True, kind, status
+
+
 def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
     """Normalise one transcript record, or ``None`` when it carries nothing.
 
@@ -1143,9 +1187,11 @@ def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
         kind = "said"
 
     text, truncated = _present(text, TEXT_LIMIT, keep="tail")
+    api_refusal, api_error, api_error_status = _api_error_of(record)
     result = Message(
         role=role, kind=kind, text=text, at=timestamp, truncated=truncated,
-        tools=tools, via=via,
+        tools=tools, via=via, api_refusal=api_refusal,
+        api_error=api_error, api_error_status=api_error_status,
     )
     return None if result.empty else result
 
@@ -1199,6 +1245,79 @@ def _iter_records(path: Path) -> Iterator[dict]:
                 continue
             if isinstance(record, dict):
                 yield record
+
+
+def _tail_records(path: Path, *, tail_bytes: int) -> list:
+    """The records in the last *tail_bytes* of a JSONL file, oldest first.
+
+    Seeks, so the cost does not grow with the session. A seeked read drops its
+    first line, which is almost certainly half a record. Everything unreadable is
+    an empty list: the caller is deciding whether to raise attention, and half a
+    file is worse evidence than none.
+    """
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            start = max(0, size - tail_bytes)
+            if start:
+                handle.seek(start)
+            blob = handle.read()
+    except OSError as exc:
+        logger.warning(
+            "platform_transcript_tail_unreadable path=%s error=%s", path, exc
+        )
+        return []
+
+    lines = blob.decode("utf-8", errors="replace").splitlines()
+    if start and lines:
+        lines = lines[1:]
+
+    records = []
+    for line in lines:
+        line = line.strip()
+        if not line or len(line) >= _MAX_LINE_BYTES:
+            # The same bound ``_iter_records`` applies, for the same reason: one
+            # pathological line must not be parsed into the daemon's heap.
+            continue
+        try:
+            record = json.loads(line)
+        except ValueError:
+            # Ordinary here rather than exceptional: the harness appends while
+            # this reads, so the last line can be half-written.
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def last_turn(session_id: str) -> Optional["Message"]:
+    """The newest turn in *session_id*'s transcript, or ``None``.
+
+    What halt detection asks (#243): *who spoke last*. Not
+    :func:`read_messages`, which reads every transcript of the whole run for a
+    paging client — this runs on the fleet-view poll path and reads one file's
+    tail (:data:`LAST_TURN_TAIL_BYTES`), newest by mtime when there are several.
+
+    ``None`` for every ordinary way of not knowing — no transcript at all (codex,
+    pi), unreadable, nothing that normalises — and callers must read it as "no
+    opinion", never as "nothing was said".
+    """
+    sources = locate_sources(session_id)
+    if not sources:
+        return None
+    try:
+        newest = max(sources, key=lambda source: source.path.stat().st_mtime)
+    except OSError as exc:
+        logger.warning(
+            "platform_transcript_stat_failed session=%s error=%s", session_id, exc
+        )
+        return None
+
+    records = _tail_records(newest.path, tail_bytes=LAST_TURN_TAIL_BYTES)
+    if not records:
+        return None
+    messages, _ = _normalise(records)
+    return messages[-1] if messages else None
 
 
 def _normalise(records: Iterable[dict], *, cap: Optional[int] = None) -> tuple:

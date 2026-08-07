@@ -36,6 +36,12 @@ const ATTENTION_LABELS = {
   unreadable: 'run state could not be read',
   cap_reached: 'hit the followup round cap',
   slot_contention: 'is blocking queued work',
+  // Not 'is idle', which is what the row already says elsewhere and is not why
+  // this needs a person: the session is *up* and its agent stopped producing
+  // anything without its run ever recording a stop — a provider refusal, or
+  // something else that ended a turn it never came back from (#243). The note
+  // beside it says how long, and how confidently that was decided.
+  stalled: 'stopped responding',
 }
 
 // Tones are this domain's urgency vocabulary; Vuetify colours are how a chip or

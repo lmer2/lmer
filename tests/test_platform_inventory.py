@@ -11,7 +11,9 @@ import os
 
 import pytest
 
-from lmer_platform import assistant, inventory, meta, registry, runs, store
+from lmer_platform import (
+    assistant, inventory, meta, registry, runs, store, transcripts,
+)
 from lmer_platform.workrepo import RunDirRef
 from tests.conftest import strip_lmer_env
 
@@ -19,6 +21,19 @@ from tests.conftest import strip_lmer_env
 @pytest.fixture(autouse=True)
 def _clean_lmer_env(monkeypatch):
     strip_lmer_env(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_platform_root(tmp_path, monkeypatch):
+    """Every test in this file, away from the host's real platform dir.
+
+    Was opt-in until halt detection (#243) gave the module a code path that
+    *reads* — a stalled row asks for the session's newest transcript turn, which
+    resolves through the registry and the per-session transcript directory. With
+    the patch opt-in, any test that built a row for a long-idle session would
+    have read the real state dir of the machine running the suite.
+    """
+    monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
 
 
 @pytest.fixture
@@ -1560,28 +1575,34 @@ def test_a_wrong_shaped_idle_record_costs_the_field_and_not_the_row(tmp_path):
         assert payload["session"]["activity"] is None
 
 
-def test_a_long_idle_session_is_not_put_on_the_attention_list(tmp_path):
-    """The decision, recorded: idleness is a row fact, not an attention reason.
+def test_silence_alone_still_does_not_put_a_session_on_the_attention_list(tmp_path):
+    """The decision that replaced the old one (#243), and the measurement in it.
 
-    Every member of ``ATTENTION_REASONS`` is picked up by detection automatically
-    (T69) and becomes a digest class, so making one of these would mean inventing a
-    threshold — how long is too long — and nothing anywhere says. The right answer
-    differs by taskdef and by phase, and a wrong number spools a notification per
-    session. So the fact crosses and the reader decides; the reason is one entry in
-    that tuple plus one branch in ``_derive`` on the day a threshold has an owner.
+    This test used to assert the opposite — that idleness is a row fact and never
+    an attention reason — because raising one meant inventing a threshold nobody
+    owned. The operator set the numbers on 2026-08-06, so the reason exists now;
+    what survives unchanged, and is the whole of this test, is that **silence is
+    the gate and never the evidence**.
+
+    Measured, not assumed: a session waiting on a background command is exactly
+    as quiet as one the provider refused (idle climbed 6s → 175s here with a
+    background task and a full test suite running). So a session that finished
+    its turn and is waiting on work it launched — an assistant turn, ordinary
+    prose, nothing after it — must stay off the list however long it is quiet,
+    right up to the backstop.
     """
     ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
     run = inventory.build_inventory(
         [ref], [live_with_control("r1")],
-        activity={"s-r1": quiet_activity(seconds=86400.0)},
+        activity={"s-r1": quiet_activity(seconds=1800.0)},
+        stall=stall_policy(turn=assistant_turn("kicked off the gate in background")),
     ).runs[0]
 
     assert run.attention is None, (
-        "a quiet session raised an attention record, which detection turns into a "
-        "digest — on a threshold nobody has defined"
+        "a session waiting on a background command was flagged as halted — the "
+        "one false positive the operator explicitly ruled out"
     )
     assert run.state == "running"
-    assert not any("idle" in reason for reason in inventory.ATTENTION_REASONS)
 
 
 def test_the_idle_reading_does_not_cross_as_a_row_field(tmp_path):
@@ -1619,3 +1640,474 @@ def test_the_fold_never_writes_the_reading_onto_the_entry_it_was_given(tmp_path)
     assert "activity" not in entry, (
         "the idle reading was written into the caller's registry entry"
     )
+
+
+# --- halt detection: the stalled reason (#243) --------------------------------
+#
+# Three paths, one gate. The gate is silence; the paths are what makes silence
+# mean something, and each carries a different strength of claim — which is why
+# the note says which one fired.
+
+
+def turn(role, text, *, refusal=False, api_error=None, api_error_status=None,
+         kind="said"):
+    """One normalised turn, as ``transcripts.last_turn`` would return it."""
+    return transcripts.Message(
+        role=role, kind=kind, text=text, api_refusal=refusal,
+        api_error=api_error, api_error_status=api_error_status,
+    )
+
+
+def assistant_turn(text="all done, waiting on the build"):
+    return turn("assistant", text)
+
+
+def refusal_turn(text="Credit balance is too low", *, api_error="billing_error",
+                 status=400):
+    """An assistant turn the *harness* marked as the provider refusing.
+
+    The field names and values are the ones a real Claude Code writes — captured
+    in ``tests/fixtures/transcripts/claude-api-error.jsonl`` and asserted against
+    in ``tests/test_platform_transcripts.py``, so this stub cannot drift into
+    testing a shape the harness never produces.
+    """
+    return turn("assistant", text, refusal=True, api_error=api_error,
+                api_error_status=status)
+
+
+def stall_policy(*, turn=None, idle_after=600, backstop_after=3600, reader=None):
+    """A policy with the transcript read stubbed, the way *activity* is stubbed.
+
+    The real reader is a file read; handing one in is what keeps these tests
+    about the decision rather than about a planted transcript (that half is
+    covered in ``tests/test_platform_transcripts.py``).
+    """
+    return inventory.StallPolicy(
+        idle_after=idle_after,
+        backstop_after=backstop_after,
+        last_turn_reader=reader if reader is not None else (lambda session_id: turn),
+    )
+
+
+def stalled_row(tmp_path, *, seconds, policy=None, state=None, entry=None):
+    ref = plant_run(
+        tmp_path, "r1",
+        state_yaml=state if state is not None else state_yaml(status="in-progress"),
+    )
+    return inventory.build_inventory(
+        [ref], [entry if entry is not None else live_with_control("r1")],
+        activity={"s-r1": quiet_activity(seconds=seconds)},
+        stall=policy if policy is not None else stall_policy(),
+    ).runs[0]
+
+
+def test_input_with_no_answer_is_a_halt_and_needs_no_text_matching(tmp_path):
+    """The shape the reported live instance had, and the strongest of the three.
+
+    That session took a ``/followup`` at 06:46:57Z and produced no turn at all —
+    no error message, nothing in the transcript to match on. What says it halted
+    is *structural*: the newest turn is the input, and nothing answered it.
+    """
+    run = stalled_row(
+        tmp_path, seconds=900.0,
+        policy=stall_policy(turn=turn("user", "please pick this up")),
+    )
+    assert run.attention is not None
+    assert run.attention.reason == "stalled"
+    assert "never answered" in run.attention.note
+    assert run.state == "running", (
+        "the two axes are independent: the container is up and holding a slot"
+    )
+
+
+@pytest.mark.parametrize("text,api_error,status,cause", [
+    ("Credit balance is too low", "billing_error", 400, "billing_error"),
+    ("API Error: 529 Overloaded. This is a server-side issue, usually temporary",
+     "server_error", 529, "server_error"),
+    # A build that marks the turn but records no class: the status still names
+    # something a reader can act on, so the path fires rather than falling back
+    # to an hour of silence.
+    ("API Error: 500 Internal Server Error", None, 500, "HTTP 500"),
+])
+def test_a_refusal_the_harness_marked_names_the_class(
+    tmp_path, text, api_error, status, cause
+):
+    """The class comes from the harness's own fields, never from the wording.
+
+    Both values are real: a Claude Code pointed at an endpoint answering 400 with
+    a billing error records ``error: billing_error`` / ``apiErrorStatus: 400``,
+    and one whose 529 retries are exhausted records ``server_error`` / ``529``.
+    Captured in ``tests/fixtures/transcripts/claude-api-error.jsonl``.
+    """
+    run = stalled_row(
+        tmp_path, seconds=900.0,
+        policy=stall_policy(
+            turn=refusal_turn(text, api_error=api_error, status=status)
+        ),
+    )
+    assert run.attention is not None
+    assert run.attention.reason == "stalled"
+    assert cause in run.attention.note
+
+
+@pytest.mark.parametrize("prose", [
+    "All 8298 tests passed. Pushed 5290 lines of changes.",
+    "Done. See inventory.py:529 for the guard; gate-check is running.",
+    "Committed as a1b529f and started the gate.",
+    "Backfilled 1529 rows; waiting on the migration to finish.",
+    "I documented the spend limit behaviour and pushed.",
+    "The run died on API Error: 529 Overloaded again — retrying now.",
+])
+def test_prose_about_an_outage_is_an_ordinary_turn(tmp_path, prose):
+    """The false positive that a substring table manufactured, pinned shut.
+
+    Every string here is agent prose of the kind this repo's own sessions write
+    all day, and a lowercased-substring matcher classified each one as *the
+    provider refused* — flagging a healthy session that was waiting on a
+    background gate, fifty minutes before the backstop would have said the
+    honest thing, with a cause the assistant had no way to check.
+
+    The turn now has to be one the harness *marked*, so wording cannot
+    manufacture a flag. These sit inside the first threshold and below the
+    backstop, where the answer must be "no opinion".
+    """
+    run = stalled_row(
+        tmp_path, seconds=900.0, policy=stall_policy(turn=assistant_turn(prose)),
+    )
+    assert run.attention is None, (
+        f"ordinary prose was read as a provider refusal: {prose!r}"
+    )
+
+
+def test_a_refusal_quoted_by_someone_else_is_unanswered_not_a_refusal(tmp_path):
+    """An operator's own words about an incident are not the provider refusing.
+
+    A ``/followup`` that quotes an outage and is then never answered is a halt —
+    but the truthful path is ``unanswered``, and naming a cause read out of the
+    operator's text would attribute their sentence to the provider, to a consumer
+    that cannot tell the difference.
+    """
+    quoted = turn(
+        "user",
+        "the run died on API Error: 529 Overloaded again, please retry",
+        refusal=True, api_error="server_error", api_error_status=529,
+    )
+    run = stalled_row(tmp_path, seconds=900.0, policy=stall_policy(turn=quoted))
+    assert run.attention is not None
+    assert "never answered" in run.attention.note
+    assert "refused" not in run.attention.note
+
+
+@pytest.mark.parametrize("role", ["system", "monitor"])
+def test_only_input_roles_raise_the_unanswered_claim(tmp_path, role):
+    """``unanswered`` names the roles that are input rather than "not assistant".
+
+    The normaliser gives a *local command* the ``system`` role, so an operator
+    opening a healthy run's terminal and typing ``/usage`` while it waits on a
+    long gate used to manufacture a flag out of their own diagnostic keystroke.
+    A monitor turn genuinely is something said to the session, and stays one.
+    """
+    run = stalled_row(
+        tmp_path, seconds=900.0,
+        policy=stall_policy(turn=turn(role, "/usage", kind="notice")),
+    )
+    if role in inventory.INPUT_ROLES:
+        assert run.attention is not None and "never answered" in run.attention.note
+    else:
+        assert run.attention is None, (
+            f"a {role!r} record was read as input the session failed to answer"
+        )
+
+
+def test_the_backstop_catches_what_no_pattern_matched(tmp_path):
+    """The operator's own priority: a reworded provider error must not go
+    undetected forever, so silence past the far threshold flags on its own."""
+    unmatched = assistant_turn("Request failed after several attempts.")
+    early = stalled_row(
+        tmp_path, seconds=1800.0, policy=stall_policy(turn=unmatched),
+    )
+    assert early.attention is None, "the backstop fired before its threshold"
+
+    late = stalled_row(
+        tmp_path, seconds=3700.0, policy=stall_policy(turn=unmatched),
+    )
+    assert late.attention is not None
+    assert late.attention.reason == "stalled"
+    assert "silence alone" in late.attention.note, (
+        "the backstop must say that is all it knows, not imply a diagnosis"
+    )
+
+
+def test_a_quiet_session_below_the_threshold_is_not_flagged(tmp_path):
+    run = stalled_row(
+        tmp_path, seconds=300.0, policy=stall_policy(turn=turn("user", "go on")),
+    )
+    assert run.attention is None
+
+
+def test_the_threshold_is_inclusive_at_its_own_number(tmp_path):
+    run = stalled_row(
+        tmp_path, seconds=600.0, policy=stall_policy(turn=turn("user", "go on")),
+    )
+    assert run.attention is not None
+
+
+@pytest.mark.parametrize("idle_after,backstop_after", [(0, 0), (0, 3600)])
+def test_zero_turns_a_path_off(tmp_path, idle_after, backstop_after):
+    """The escape hatch has to actually reach the decision, not just the config.
+
+    With the precise paths off, a session that would have been flagged at ten
+    minutes is not flagged at twenty — and with both off, nothing is flagged at
+    all however long the silence runs.
+    """
+    run = stalled_row(
+        tmp_path, seconds=1200.0,
+        policy=stall_policy(
+            turn=turn("user", "please pick this up"),
+            idle_after=idle_after, backstop_after=backstop_after,
+        ),
+    )
+    assert run.attention is None
+
+
+def test_a_session_with_no_idle_reading_is_never_stalled(tmp_path):
+    """Unknowable is not "quiet": a mixed fleet, or a container that did not
+    answer, must read exactly as it did before this existed."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    run = inventory.build_inventory(
+        [ref], [live_with_control("r1")], activity={},
+        stall=stall_policy(turn=turn("user", "please pick this up")),
+    ).runs[0]
+    assert run.attention is None
+
+
+@pytest.mark.parametrize("stop_reason", ["question", "yield", "critical_error"])
+def test_a_stale_stop_reason_does_not_silence_the_feature(tmp_path, stop_reason):
+    """The committed ``stop_reason`` is sticky, so it cannot gate this.
+
+    ``work state set`` rewrites the field only when ``--stop-reason`` is passed,
+    ``POST /api/runs/resume`` clears it for a question stop and leaves the rest
+    alone, and the phasic taskdef has every run record ``yield`` at each phase
+    boundary. So a phasic run past its first yield carries ``yield`` forever, and
+    the first cut of this feature read that as "quiet because it said so" — which
+    silenced halt detection, backstop included, for exactly those runs. Nine runs
+    in the work repo were sitting in that state when this was found.
+
+    Nothing is lost by ignoring it here: this function is only reached from the
+    *live* branch, where a session still winding down seconds after recording its
+    stop is nowhere near the threshold, and a run that stopped and exited never
+    arrives at all.
+    """
+    run = stalled_row(
+        tmp_path, seconds=900.0,
+        state=state_yaml(status="in-progress", stop_reason=stop_reason),
+        policy=stall_policy(turn=turn("user", "please pick this up")),
+    )
+    assert run.attention is not None, (
+        f"a live session halted mid-phase was silenced by a stale {stop_reason!r}"
+    )
+    assert run.attention.reason == "stalled"
+
+
+@pytest.mark.parametrize("stop_reason,expected", [
+    ("question", "question"),
+    ("yield", "yield"),
+    ("critical_error", "critical_error"),
+])
+def test_a_stopped_run_still_reports_what_it_recorded(
+    tmp_path, stop_reason, expected
+):
+    """The other side of the same field: once the session is gone, the recorded
+    stop is what speaks for the run, and this change must not touch that."""
+    ref = plant_run(
+        tmp_path, "r2",
+        state_yaml=state_yaml(status="in-progress", stop_reason=stop_reason),
+    )
+    exited = inventory.build_inventory(
+        [ref], [], stall=stall_policy(turn=turn("user", "please pick this up")),
+    ).runs[0]
+    assert exited.attention.reason == expected
+
+
+def test_a_finished_run_whose_session_is_winding_down_is_not_stalled(tmp_path):
+    run = stalled_row(
+        tmp_path, seconds=7200.0,
+        state=state_yaml(status="complete", stop_reason="complete"),
+        policy=stall_policy(turn=turn("user", "please pick this up")),
+    )
+    assert run.attention is None
+
+
+def test_the_orchestrating_assistant_is_never_stalled(tmp_path):
+    """It sits at its prompt between the operator's messages, by design. A
+    permanent badge on the platform's own row is a badge nobody reads."""
+    entry = live_with_control("r1", kind=assistant.KIND)
+    run = stalled_row(
+        tmp_path, seconds=86400.0, entry=entry,
+        policy=stall_policy(turn=turn("user", "hello?")),
+    )
+    assert run.attention is None
+
+
+@pytest.mark.parametrize("source", ["run_state", "session_entry"])
+def test_a_chat_session_is_never_stalled(tmp_path, source):
+    """Silent whenever nobody is typing — and the taskdef is readable from the
+    run's own state or the session entry, so both have to be honoured."""
+    if source == "run_state":
+        state = state_yaml(status="in-progress", taskdef="chat")
+        entry = live_with_control("r1")
+    else:
+        state = state_yaml(status="in-progress")
+        entry = live_with_control("r1", task={"taskdef": "chat"})
+    run = stalled_row(
+        tmp_path, seconds=86400.0, state=state, entry=entry,
+        policy=stall_policy(turn=turn("user", "hello?")),
+    )
+    assert run.attention is None
+
+
+def test_a_live_question_outranks_a_stall_on_the_same_row(tmp_path):
+    """A session blocked on its ask channel is quiet for a reason the operator
+    can act on directly, and answering it is a file rather than a diagnosis."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    run = inventory.build_inventory(
+        [ref], [live_with_control("r1")],
+        activity={"s-r1": quiet_activity(seconds=7200.0)},
+        questions={"s-r1": [{"text": "which repo?", "at": "2026-08-06T20:00:00Z"}]},
+        stall=stall_policy(turn=turn("user", "which repo?")),
+    ).runs[0]
+    assert run.attention.reason == "live_question"
+
+
+def test_a_dead_session_is_crashed_rather_than_stalled(tmp_path):
+    """A stall is a claim about a session that is *up*. Once the process is gone
+    the evidence and the remedy are both different."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    run = inventory.build_inventory(
+        [ref], [session("r1", live=False)],
+        activity={"s-r1": quiet_activity(seconds=7200.0)},
+        stall=stall_policy(turn=turn("user", "please pick this up")),
+    ).runs[0]
+    assert run.attention.reason == "crashed"
+
+
+def test_the_stall_identity_does_not_move_between_polls(tmp_path):
+    """``since`` is deliberately absent, so one halt is one digest.
+
+    Detection keys a condition on ``(run, reason, since)`` and diffs against the
+    **previous tick only**, so a ``since`` that changes between polls is a new
+    condition every time — a digest per detection tick for one halt, which is the
+    firehose that module exists to prevent.
+
+    And a timestamp derived from the idle reading would change: the supervisor
+    recomputes ``last_output_at`` per request as wall-clock now minus a monotonic
+    idle reading and truncates it, so consecutive reads of an unchanging silence
+    can land either side of a boundary. Two polls whose reported onset differs
+    must still be one condition.
+    """
+    seen = set()
+    for at in ("2026-07-28T11:38:03Z", "2026-07-28T11:38:04Z"):
+        ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+        run = inventory.build_inventory(
+            [ref], [live_with_control("r1")],
+            activity={"s-r1": {"last_output_at": at, "idle_seconds": 900.0}},
+            stall=stall_policy(turn=turn("user", "please pick this up")),
+        ).runs[0]
+        seen.add(run.attention.since)
+    assert seen == {None}, (
+        f"the same halt produced {len(seen)} identities: {sorted(map(str, seen))}"
+    )
+
+
+def test_how_long_it_has_been_quiet_is_still_reported(tmp_path):
+    """Dropping the timestamp must not drop the fact a reader needs: the note
+    carries the duration, and the row already carries the live idle reading."""
+    run = stalled_row(
+        tmp_path, seconds=840.0,
+        policy=stall_policy(turn=turn("user", "please pick this up")),
+    )
+    assert "14m" in run.attention.note
+    assert run.to_dict()["session"]["activity"]["idle_seconds"] == 840.0
+
+
+def test_a_transcript_that_cannot_be_read_leaves_the_backstop_working(tmp_path):
+    """The reader is a file read on a poll path, so it must not be able to take
+    the fleet view down — and a run it cannot speak for is flagged late by the
+    backstop rather than never.
+    """
+    def explode(session_id):
+        raise OSError("transcript is on a filesystem that went away")
+
+    early = stalled_row(
+        tmp_path, seconds=900.0, policy=stall_policy(reader=explode),
+    )
+    assert early.attention is None
+
+    late = stalled_row(
+        tmp_path, seconds=7200.0, policy=stall_policy(reader=explode),
+    )
+    assert late.attention is not None
+    assert late.attention.reason == "stalled"
+
+
+def test_no_transcript_at_all_still_reaches_the_backstop(tmp_path):
+    """The ordinary state of a codex or pi session: the adapter is Claude-shaped,
+    so those runs have no turn to read and only the backstop can speak for them.
+    """
+    run = stalled_row(
+        tmp_path, seconds=7200.0, policy=stall_policy(reader=lambda sid: None),
+    )
+    assert run.attention is not None
+    assert "silence alone" in run.attention.note
+
+
+def test_the_stall_note_says_how_long_and_which_path(tmp_path):
+    """The note is what the digest interpolates, so the run, the class and the
+    strength of the claim have to be legible in one line (operator's ask)."""
+    run = stalled_row(
+        tmp_path, seconds=840.0,
+        policy=stall_policy(turn=refusal_turn(
+            "API Error: 529 Overloaded.", api_error="server_error", status=529,
+        )),
+    )
+    note = run.attention.note
+    assert "14m" in note, f"the note does not say how long it has been quiet: {note!r}"
+    assert "server_error" in note
+    assert len(note) < 200, "the note has to fit a digest line"
+
+
+def test_a_refusal_the_harness_marked_without_a_class_is_still_a_halt(tmp_path):
+    """The flag is the fact; the class and status are detail that may be absent.
+
+    A build that marks the turn and records neither used to read as an ordinary
+    turn — so the halt waited for the backstop an hour later, which is precisely
+    the case the design names as the backstop's *reason for existing*. Arriving
+    there by accident hid the gap instead of covering it, and the docstring, a
+    test comment and an unreachable branch in the note all claimed otherwise
+    (review of !205, iteration 2).
+    """
+    run = stalled_row(
+        tmp_path, seconds=900.0,
+        policy=stall_policy(turn=turn("assistant", "API Error", refusal=True)),
+    )
+    assert run.attention is not None, (
+        "a refusal the harness marked but did not classify was not recognised"
+    )
+    assert run.attention.reason == "stalled"
+    assert "recorded a provider refusal" in run.attention.note
+    assert run.attention.note.endswith("refusal"), (
+        f"no class was recorded, so none may be implied: {run.attention.note!r}"
+    )
+
+
+def test_detail_without_the_marker_is_not_a_refusal(tmp_path):
+    """The other side of the gate: those keys could mean anything in a record
+    shape this build has never seen, so only the harness's own flag counts."""
+    run = stalled_row(
+        tmp_path, seconds=900.0,
+        policy=stall_policy(turn=turn(
+            "assistant", "all done", api_error="billing_error",
+            api_error_status=400,
+        )),
+    )
+    assert run.attention is None
