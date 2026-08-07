@@ -355,7 +355,6 @@ import signal
 import threading
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -369,7 +368,9 @@ from .config import (
     PlatformConfig,
     assistant_settings,
     container_base_url,
+    mint_assistant_credential,
     read_secret,
+    revoke_assistant_credential,
     validate_assistant_override,
 )
 # The credential scrub, imported rather than reimplemented — the trade
@@ -381,6 +382,7 @@ from .config import (
 from .transcripts import _scrub, _scrub_decoded
 from .store import (
     StoreError,
+    age_seconds,
     append_event,
     ensure_state_dir,
     read_json,
@@ -534,7 +536,6 @@ SETTLED_SECONDS = 120.0
 #: Reentrant because :func:`rotate` is a stop and a start.
 _LOCK = threading.RLock()
 
-_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 class AssistantError(RuntimeError):
@@ -782,24 +783,11 @@ def _opt_scrubbed(value: object) -> Optional[str]:
 def _age_seconds(started_at: Optional[str]) -> Optional[float]:
     """Seconds since an ISO-8601 Z timestamp; ``None`` when unparseable.
 
-    Same shape as ``work_repo.run_state._iso_to_minutes_apart`` — one timestamp
-    format across both state layers, and an unparseable one is missing data
-    rather than a crash in a status call. ``TypeError`` is in the catch rather
-    than a separate type check in front of it, because that is what ``strptime``
-    raises for ``None`` and for anything else that is not text: one answer, one
-    branch.
-
-    A timestamp in the future reads *negative*, deliberately unclamped: that is
-    a clock that moved or a hand-edited state file, and clamping it to zero
-    would report a plausible-looking age for a fact that is wrong. Nothing
-    downstream needs a non-negative value — an age policy compares against an
-    upper bound, which a negative never trips.
+    :func:`lmer_platform.store.age_seconds`' rule, kept under this name for the
+    readers of this module. It moved beside the function that *writes* the format
+    when a third copy of it appeared.
     """
-    try:
-        when = datetime.strptime(started_at, _TS_FORMAT).replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
-        return None
-    return (datetime.now(timezone.utc) - when).total_seconds()
+    return age_seconds(started_at)
 
 
 def state_path() -> Path:
@@ -1176,35 +1164,67 @@ def _dotenv_line(name: str, value: str) -> str:
     return f'{name}="{escaped}"\n'
 
 
+def _assistant_credential(config: PlatformConfig) -> Optional[str]:
+    """What the next incarnation authenticates with — minted, or the fallback.
+
+    A fresh per-incarnation credential (issue #244), so the platform can tell
+    this session's calls from the operator's browser — without which an open
+    browser tab would suppress the very check-in reminders the assistant needs
+    (:mod:`lmer_platform.checkin`).
+
+    A failed mint falls back to the shared secret rather than costing the
+    operator their chat window: the assistant then runs as it did before this
+    existed, unattributed and reminded about runs it has read. Loud, because that
+    line is the only place that says why the digest went noisy.
+
+    Nothing is minted on a host with **no** shared secret: the daemon creates that
+    on first start, so its absence means there is no platform to authenticate to,
+    and a key to a server nobody runs is worse than the sentence saying so.
+    """
+    try:
+        shared = read_secret(config)
+    except ConfigError as exc:
+        logger.error(
+            "platform_assistant_secret_unreadable error=%s — the assistant will "
+            "start without credentials", exc,
+        )
+        return None
+    if not shared:
+        return None
+    try:
+        return mint_assistant_credential()
+    except ConfigError as exc:
+        logger.error(
+            "platform_assistant_credential_unmintable error=%s — falling back to "
+            "the shared secret, so this incarnation's calls cannot be told from "
+            "the operator's and its check-ins will not register", exc,
+        )
+        return shared
+
+
 def _assistant_environment(config: PlatformConfig) -> tuple:
     """``(env, reach)`` — what to tell the session, and what was decided.
 
     Two variables or one, never a mixture. A URL with no secret is a 401
     machine and a secret with no URL is a credential with nothing to spend it
     on, so the pair is all-or-nothing and the absent case carries its reason.
+
+    The credential is minted here (:func:`_assistant_credential`) and written
+    nowhere else: it reaches the container through the 0600 ``.env``, never argv,
+    and the transcript scrub strikes a live one out by value.
     """
     reach = container_base_url(config)
-    try:
-        secret = read_secret(config)
-    except ConfigError as exc:
-        logger.error(
-            "platform_assistant_secret_unreadable error=%s — the assistant will "
-            "start without credentials", exc,
-        )
-        secret = None
+    credential = _assistant_credential(config) if reach.reachable else None
 
-    if reach.reachable and secret:
-        # SPEC CORRECTION (§8.1). The spec says the assistant's token is "scoped
-        # to the elevated verbs". It is not, and nothing here can make it so:
-        # there is exactly one shared secret for the whole API
-        # (``config.ensure_secret``, checked by ``api.require_secret``) and no
-        # scoping mechanism anywhere behind it — no per-caller identity, no
-        # per-route capability, no second credential. What the assistant holds is
-        # the operator's own key, so it can do anything the operator's browser
-        # can. The claim is dropped rather than left standing, because a spec
-        # that asserts a boundary nobody implemented is worse than one that
-        # admits there is none: the next person to add a dangerous verb would
-        # believe the assistant could not reach it.
+    if reach.reachable and credential:
+        # SPEC CORRECTION (§8.1), amended by issue #244. The spec calls the
+        # assistant's token "scoped to the elevated verbs". It is not. #244 added
+        # a second credential, so a caller is now *identifiable* — but it opens
+        # every route the operator's key opens, because no per-route capability
+        # exists to scope it against. The claim therefore stays dropped rather
+        # than half-restored: the next person to add a dangerous verb must not
+        # believe the assistant cannot reach it. (What identity would buy next is
+        # the retired ``max_concurrent_assistant_spawns`` cap, still not built.)
         #
         # This is the documented exception to ``ask_channel/protocol.py``'s "no
         # credential travels into the container". That reasoning is about
@@ -1214,7 +1234,7 @@ def _assistant_environment(config: PlatformConfig) -> tuple:
         # window that cannot spawn or answer anything is not an orchestrator.
         return {
             ENV_PLATFORM_URL: reach.url,
-            ENV_PLATFORM_CREDENTIAL: secret,
+            ENV_PLATFORM_CREDENTIAL: credential,
         }, reach
 
     reason = reach.reason or (
@@ -1471,6 +1491,11 @@ def stop(
         text, stamp = _handoff_update(state, handoff, now)
         live = _live_assistant()
 
+        # First, and on both paths: the credential is a file, not a session
+        # property, so a stop that left it valid would be a container-spawning
+        # key belonging to nobody. Rotation re-mints under this same lock.
+        revoke_assistant_credential()
+
         if live is None:
             if state.session_id is not None or text != state.handoff:
                 _write_state(replace(
@@ -1512,7 +1537,9 @@ def stop(
             logger.error(
                 "platform_assistant_stop_failed id=%s pid=%s — it did not die to "
                 "SIGTERM or SIGKILL; its registry entry is left alone so the fleet "
-                "view keeps showing it", session_id, live.get("pid"),
+                "view keeps showing it, and its credential stays revoked, so the "
+                "surviving container now gets a 401 from every route",
+                session_id, live.get("pid"),
             )
         else:
             logger.info(

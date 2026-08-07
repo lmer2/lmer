@@ -37,6 +37,7 @@ import logging
 import os
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,6 +45,7 @@ from ask_channel import protocol as ask_protocol
 from lmer_platform import (
     ask,
     assistant,
+    checkin,
     daemon,
     detect,
     inventory,
@@ -1528,6 +1530,269 @@ def test_no_other_subcommand_starts_a_detection_thread(
 
     daemon.main(argv)
 
+
+# --- the fourth stage: runs nobody has looked at (issue #244) ------------------
+#
+# Everything above needs something to *happen*. This stage is the one that fires
+# when nothing does, so what it must not become is the firehose the diff exists
+# to avoid: one digest for the whole quiet fleet, and not again until another
+# window has passed. lmer_platform.checkin owns the staleness rules and their
+# tests; these pin the wiring — that the tick runs the pass, that the digest
+# reaches the same spool through the same seam, that the window is read fresh
+# from configuration, and that a failure here costs this stage and nothing else.
+
+def stale_fleet(*slugs, seen_hours_ago=4):
+    """A fleet of *slugs* the platform saw ``seen_hours_ago`` hours ago."""
+    from datetime import datetime, timedelta, timezone
+
+    payload = fleet(*[row(slug) for slug in slugs])
+    when = (datetime.now(timezone.utc) - timedelta(hours=seen_hours_ago))
+    checkin.observe(payload)
+    marks = checkin.read_marks()
+    for ref in marks:
+        marks[ref] = {"first_seen": when.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    store.write_json(checkin.marks_path(), {"runs": marks})
+    return payload
+
+
+def checkin_digests(spool):
+    return [
+        call for call in spool.calls
+        if call["kind"] == checkin.STALE_DIGEST_KIND
+    ]
+
+
+def test_a_tick_tells_the_assistant_which_runs_nobody_has_checked(config):
+    payload = stale_fleet("review-mr-202", "develop-issue-236")
+    spool = Spool()
+    tick = detector(config, payload, spool=spool)
+
+    tick.tick_once()
+
+    digests = checkin_digests(spool)
+    assert len(digests) == 1, "one digest names them all, never one per run"
+    assert "2 runs have gone unchecked" in digests[0]["note"]
+    assert "review-mr-202" in digests[0]["note"]
+    assert digests[0]["data"]["count"] == 2
+    assert tick.stale_reported == 2
+
+
+def test_the_same_stale_run_is_not_announced_every_tick(config):
+    payload = stale_fleet("review-mr-202")
+    spool = Spool()
+    tick = detector(config, payload, spool=spool)
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+
+    assert len(checkin_digests(spool)) == 1, (
+        "a stale run costs one digest per window, not one per 30s tick"
+    )
+
+
+def test_a_quiet_fleet_that_was_just_seen_says_nothing(config):
+    """The baseline: a run first seen on this tick is not stale."""
+    spool = Spool()
+    detector(config, fleet(row("develop-issue-1")), spool=spool).tick_once()
+    assert checkin_digests(spool) == []
+
+
+def test_the_window_is_read_fresh_from_configuration(config, monkeypatch):
+    """An operator widening the window means the next sweep, not the next boot."""
+    payload = stale_fleet("review-mr-202", seen_hours_ago=2)
+    monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "10800")  # three hours
+    spool = Spool()
+    tick = detector(config, payload, spool=spool)
+
+    tick.tick_once()
+    assert checkin_digests(spool) == [], "two hours is inside a three-hour window"
+
+    monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "3600")
+    tick.tick_once()
+    assert len(checkin_digests(spool)) == 1
+
+
+def test_a_window_of_zero_turns_the_stage_off_entirely(config, monkeypatch):
+    payload = stale_fleet("review-mr-202")
+    monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "0")
+    spool = Spool()
+    tick = detector(config, payload, spool=spool)
+
+    tick.tick_once()
+
+    assert checkin_digests(spool) == []
+    assert tick.stale_reported == 0
+
+
+def test_a_refused_digest_is_retried_rather_than_swallowed(config):
+    """Deliver-then-mark: nothing reached the spool, so nothing was announced."""
+    payload = stale_fleet("review-mr-202")
+    failing = Spool(error=RuntimeError("spool is unwritable"))
+    tick = detector(config, payload, spool=failing)
+
+    tick.tick_once()
+    assert tick.stale_reported == 0
+
+    working = Spool()
+    again = detector(config, payload, spool=working)
+    again.tick_once()
+    assert len(checkin_digests(working)) == 1
+
+
+def test_a_failing_check_in_pass_does_not_cost_the_diff(config, monkeypatch, detected):
+    """Its own stage, like the sweep: one broken pass must not stop detection."""
+    def explode(*_args, **_kwargs):
+        raise OSError("marks file is unreadable")
+
+    monkeypatch.setattr(checkin, "observe", explode)
+    spool = Spool()
+    payload = fleet(row("develop-issue-1", reason="question", note=QUESTION))
+    tick = detector(config, fleet(), payload, spool=spool)
+
+    tick.tick_once()   # baseline
+    fresh = tick.tick_once()
+
+    assert [signal.kind for signal in fresh] == ["question"]
+    assert any(
+        "stage=checkin" in record.message for record in detected.records
+    ), "the absorbed failure has to name its own stage"
+
+
+def test_the_startup_notice_says_the_window(config):
+    notice = detect.Detector(config, notifier=Spool()).notice
+    assert "60m" in notice and "looked at" in notice
+
+
+def test_the_startup_notice_says_when_check_ins_are_off(config, monkeypatch):
+    monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "0")
+    notice = detect.Detector(config, notifier=Spool()).notice
+    assert "OFF" in notice
+
+
+# --- what the first review round found (iteration 1) --------------------------
+#
+# Three properties the check-in stage claimed and did not have. Each one is
+# silent when it breaks — a spool quietly full of one digest class, a feature
+# that cannot register a single read, a file that only grows — so each gets a
+# test that fails loudly instead.
+
+def test_a_marks_write_that_fails_costs_a_repeat_per_window_not_per_tick(
+    config, monkeypatch
+):
+    """The eviction bug: at a 30s tick an unwritable checkins.json produced 120
+    digests an hour against a spool bounded at 50, so every question, crash and
+    completion digest was evicted by this one within half an hour."""
+    payload = stale_fleet("review-mr-202")
+    monkeypatch.setattr(checkin, "record_announced", _raises_store_error)
+    spool = Spool()
+    tick = detector(config, payload, spool=spool)
+
+    for _ in range(6):
+        tick.tick_once()
+
+    assert len(checkin_digests(spool)) == 1, (
+        "the digest was re-spooled every tick because the *record* of it could "
+        "not be written"
+    )
+
+
+def test_the_in_memory_announcement_is_dropped_once_the_file_writes(config):
+    """It is a fallback for one process, not a second store.
+
+    Seeded directly with an announcement a window old, which is the state a
+    daemon is in after an unwritable marks file and a window of waiting — the
+    next digest lands, the file takes it, and the fallback has to go with it.
+    """
+    payload = stale_fleet("review-mr-202")
+    tick = detector(config, payload, spool=Spool())
+    tick._announced["gitlab.example.com/agents/global/review-mr-202"] = _hours_ago(4)
+
+    tick.tick_once()
+
+    assert not tick._announced, "a successful write has to retire the fallback"
+    marks = checkin.read_marks()["gitlab.example.com/agents/global/review-mr-202"]
+    assert marks.get("announced_at"), "and the record has to be on disk instead"
+
+
+def _running_assistant():
+    """The one fact ``_unattributed_caveat`` reads off the status."""
+    return SimpleNamespace(running=True)
+
+
+def _raises_store_error(*_args, **_kwargs):
+    raise store.StoreError("checkins.json is unwritable")
+
+
+def _hours_ago(hours):
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def test_an_assistant_on_the_shared_secret_is_told_why_this_repeats(
+    config, monkeypatch, detected
+):
+    """The state of the first deploy that ships this: the running assistant was
+    adopted across the restart, so it holds the operator's shared secret and no
+    read it makes can ever register."""
+    payload = stale_fleet("review-mr-202")
+    monkeypatch.setattr(assistant, "status", _running_assistant)
+    assert cfg.active_assistant_credential() is None, "precondition"
+    spool = Spool()
+    tick = detector(config, payload, spool=spool)
+
+    tick.tick_once()
+
+    digest = checkin_digests(spool)[0]
+    assert "shared secret" in digest["note"], (
+        "the digest that will not stop has to say why it will not stop"
+    )
+    assert "rotate" in digest["note"].lower()
+    assert digest["data"]["caveat"], "the caveat is machine-readable too"
+    assert any(
+        "platform_checkin_unattributed" in record.message
+        for record in detected.records
+    ), "and the operator reading logs rather than the chat gets one line"
+
+
+def test_an_attributable_assistant_gets_no_caveat(config, monkeypatch):
+    payload = stale_fleet("review-mr-202")
+    cfg.mint_assistant_credential()
+    monkeypatch.setattr(assistant, "status", _running_assistant)
+    spool = Spool()
+    detector(config, payload, spool=spool).tick_once()
+
+    digest = checkin_digests(spool)[0]
+    assert "shared secret" not in digest["note"]
+    assert "caveat" not in digest["data"]
+
+
+def test_no_assistant_at_all_is_not_a_caveat(config):
+    """Nothing to attribute — and whoever starts one next mints a credential."""
+    payload = stale_fleet("review-mr-202")
+    spool = Spool()
+    detector(config, payload, spool=spool).tick_once()
+    assert "shared secret" not in checkin_digests(spool)[0]["note"]
+
+
+def test_a_disabled_window_still_prunes_the_marks_file(config, monkeypatch):
+    """observe() is the only pruner, and _note_check keeps stamping whatever the
+    window says — so an early return above it left the file growing forever on a
+    host with the feature switched off."""
+    monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "0")
+    both = fleet(row("kept"), row("forgotten"))
+    tick = detector(config, both, fleet(row("kept")), spool=Spool())
+
+    tick.tick_once()
+    assert len(checkin.read_marks()) == 2
+
+    tick.tick_once()
+    assert list(checkin.read_marks()) == [
+        "gitlab.example.com/agents/global/kept"
+    ], "a run that left the fleet kept its entry forever"
 
 # --- a halted session reaches the assistant (#243) ----------------------------
 #

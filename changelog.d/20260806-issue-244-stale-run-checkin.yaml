@@ -1,0 +1,5 @@
+added:
+- "The platform now tells the orchestrating assistant which runs nobody has looked at, on a timer (default one hour, `checkin_window_seconds` / `LMER_PLATFORM_CHECKIN_WINDOW_SECONDS`, `0` disables). One digest names every stale run, so a fleet that goes quiet is noticed without the operator asking"
+- "The fleet view shows when each run was last read by the orchestrator, and marks the ones past the check-in window"
+changed:
+- "The orchestrating assistant now runs on a credential minted for its incarnation and revoked when it stops, instead of holding the operator's shared secret. Both open the same API — what it buys is that the platform can tell the assistant's calls from the browser's, and that a stopped incarnation's environment file is no longer a live key"

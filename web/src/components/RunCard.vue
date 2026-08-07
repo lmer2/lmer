@@ -7,8 +7,8 @@ import {
   mdiSourceRepository, mdiTicketOutline, mdiTuneVariant,
 } from '@mdi/js'
 import {
-  ago, attentionLabel, driverLabel, duration, ledgerSummary, portUrl,
-  shortTarget, stateMeta, targetLink, targetRef, toneColor,
+  ago, attentionLabel, checkinLabel, driverLabel, duration, ledgerSummary,
+  portUrl, shortTarget, stateMeta, targetLink, targetRef, toneColor,
 } from '../format.js'
 
 // Which kind of thing the run is against. The word in the chip says it too, and
@@ -83,6 +83,15 @@ const idle = computed(() => {
   const label = duration(props.run.session?.activity?.idle_seconds)
   return label ? `idle ${label}` : null
 })
+
+// When the orchestrator last looked at this run (issue 244). Beside the other time
+// facts rather than up by the chip: it says nothing about the run — which may be
+// working perfectly — only about the *orchestrator's* attention, so that "is anyone
+// driving this?" need not be a question put to uber lmer itself.
+//
+// Unpainted, like every other addition here: colour is urgency, and a quiet run is
+// not more urgent than a crashed one. The *word* carries the signal.
+const checkin = computed(() => checkinLabel(props.run.checkin, props.now))
 
 // The platform's own session, read once so that everything the treatment touches —
 // the card's border and the badge — is the same fact, and no other row can pay for
@@ -314,6 +323,16 @@ const forgettable = computed(
           v-if="idle"
           :title="run.session?.activity?.last_output_at || ''"
         >{{ idle }}</span>
+        <!-- Lifted by emphasis rather than colour when the run has gone
+             unchecked: findable while scanning, without competing with the
+             attention stripe. -->
+        <span
+          v-if="checkin"
+          :class="run.checkin?.stale ? 'text-high-emphasis' : null"
+          :title="run.checkin?.checked_at
+            ? `the orchestrator last read this run at ${run.checkin.checked_at}`
+            : 'nothing has read this run yet'"
+        >{{ checkin }}</span>
         <span :title="run.updated || ''">{{ ago(run.updated, now) }}</span>
       </div>
 

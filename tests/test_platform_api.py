@@ -892,3 +892,62 @@ def test_asset_symlink_loop_is_a_404_not_a_500(client, built_ui):
 
     response = client.get("/assets/loop", headers=bearer_header())
     assert response.status_code == 404
+
+
+# --- the fleet row carries its check-in facts (issue #244) --------------------
+#
+# The operator's half of the check-in work: the daemon tells the orchestrator
+# which runs have gone unchecked, and the same staleness rides on the row so the
+# fleet view can show it without anyone asking the orchestrator. What matters
+# here is that the row and the digest cannot disagree — same window, same
+# eligibility, one computation in lmer_platform.checkin — and that a fleet poll
+# stays a read.
+
+def test_every_row_carries_a_check_in_block(platform_root):
+    import os
+
+    registry.register(
+        "s-1", pid=os.getpid(),
+        run={"host": "gitlab.example.com", "project": "agents/global",
+             "slug": "develop-1"},
+    )
+    payload = api.build_state(cfg.load())
+
+    facts = payload["runs"][0]["checkin"]
+    assert set(facts) == {"checked_at", "since", "age_seconds", "stale"}
+    assert facts["checked_at"] is None, "nothing has read this run"
+    assert facts["stale"] is False, "a run the platform has just seen is not stale"
+
+
+def test_the_row_reports_a_check_the_orchestrator_made(platform_root):
+    import os
+
+    from lmer_platform import checkin
+
+    run = ("gitlab.example.com", "agents/global", "develop-1")
+    registry.register(
+        "s-1", pid=os.getpid(),
+        run={"host": run[0], "project": run[1], "slug": run[2]},
+    )
+    checkin.record_check(*run)
+
+    facts = api.build_state(cfg.load())["runs"][0]["checkin"]
+    assert facts["checked_at"], "the row does not report what the daemon recorded"
+    assert facts["stale"] is False
+
+
+def test_a_fleet_poll_records_no_check_in(platform_root):
+    """Reading the list is not reading a run — and a browser polling it must not
+    keep the whole fleet looking fresh."""
+    import os
+
+    from lmer_platform import checkin
+
+    registry.register(
+        "s-1", pid=os.getpid(),
+        run={"host": "gitlab.example.com", "project": "agents/global",
+             "slug": "develop-1"},
+    )
+    api.build_state(cfg.load())
+    api.build_state(cfg.load())
+    assert checkin.read_marks() == {}, "build_state wrote check-in state"

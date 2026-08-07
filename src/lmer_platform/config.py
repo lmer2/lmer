@@ -104,15 +104,25 @@ __all__ = [
     "ENV_CONTAINER_URL", "PODMAN_HOST_ALIAS", "DOCKER_BRIDGE_NETWORK",
     "DOCKER_BRIDGE_INTERFACE", "ContainerReach", "config_path",
     "load", "save", "read_secret", "ensure_secret", "active_secret",
+    "ASSISTANT_CREDENTIAL_FILENAME", "assistant_credential_path",
+    "mint_assistant_credential", "active_assistant_credential",
+    "revoke_assistant_credential",
     "binding_notice", "configured_repo_url", "container_base_url",
     "ASSISTANT_SETTING_KEYS", "AssistantSetting", "assistant_settings",
     "update_stored", "validate_assistant_override",
+    "CHECKIN_SETTING_KEYS", "DEFAULT_CHECKIN_WINDOW_SECONDS",
+    "ENV_CHECKIN_WINDOW", "checkin_settings", "validate_checkin_window",
     "DEFAULT_STALL_IDLE_SECONDS", "DEFAULT_STALL_BACKSTOP_SECONDS",
     "ENV_STALL_IDLE_SECONDS", "ENV_STALL_BACKSTOP_SECONDS",
 ]
 
 CONFIG_FILENAME = "config.json"
 SECRET_FILENAME = "secret"
+#: The *current* assistant incarnation's own credential (issue #244). Its own
+#: file for ``config.json``'s reason, and deliberately **not** relocatable the way
+#: ``secret_file`` is: the daemon mints, revokes and re-mints this one, and a
+#: second location to keep in step is a second way to leave a live key behind.
+ASSISTANT_CREDENTIAL_FILENAME = "assistant-credential"
 MIRROR_DIRNAME = "work"
 
 #: Loopback by default (D14). The operator opts into a reachable bind.
@@ -134,6 +144,10 @@ DEFAULT_PULL_INTERVAL_SECONDS = 30
 #: running out of room says so before a spawn is refused for it.
 DEFAULT_MAX_CONCURRENT_SESSIONS = 8
 DEFAULT_MAX_FOLLOWUP_ROUNDS = 5
+#: How long a run may go unchecked before the daemon says so (issue #244). The
+#: operator's number, and a reminder interval rather than a deadline — a run past
+#: it costs one line in one digest. ``0`` turns check-in digests off.
+DEFAULT_CHECKIN_WINDOW_SECONDS = 3600
 
 #: How long a live session may produce nothing before halt detection considers
 #: it (#243). An operator's number, not a derived one; silence alone does not
@@ -195,6 +209,21 @@ ENV_ASSISTANT_MODEL = "LMER_PLATFORM_ASSISTANT_MODEL"
 ENV_ASSISTANT_HARNESS = "LMER_PLATFORM_ASSISTANT_HARNESS"
 ENV_ASSISTANT_PRESET = "LMER_PLATFORM_ASSISTANT_PRESET"
 ENV_ASSISTANT_AGENTS = "LMER_PLATFORM_ASSISTANT_AGENTS"
+
+#: The check-in window, per platform instance (issue #244) — how often to sweep
+#: what has gone quiet is a property of a host's fleet, not of a build.
+#:
+#: Deliberately **not** in :data:`ASSISTANT_SETTING_KEYS`: those four become argv
+#: tokens and are validated as such, while this is an integer the daemon reads on
+#: its own tick and hands to nobody. Served beside them in its own group, so one
+#: settings surface covers both without pretending they are one kind of thing.
+ENV_CHECKIN_WINDOW = "LMER_PLATFORM_CHECKIN_WINDOW_SECONDS"
+
+#: setting key -> (PlatformConfig field, env var). One entry today; a table so a
+#: second knob costs one line, as in the launch table above.
+CHECKIN_SETTING_KEYS = {
+    "window_seconds": ("checkin_window_seconds", ENV_CHECKIN_WINDOW),
+}
 
 #: setting key -> (PlatformConfig field, env var). The one table the loader,
 #: the resolver and the API routes all read, so a fifth setting is added in
@@ -297,6 +326,10 @@ class PlatformConfig:
     assistant_harness: Optional[str] = None
     assistant_preset: Optional[str] = None
     assistant_agents: Optional[str] = None
+    #: How long a run may go unchecked before the daemon spools a digest naming
+    #: it (issue #244), in seconds. ``0`` disables check-in digests; see
+    #: :data:`ENV_CHECKIN_WINDOW` for why this sits apart from the four above.
+    checkin_window_seconds: int = DEFAULT_CHECKIN_WINDOW_SECONDS
 
     @property
     def secret_path(self) -> Path:
@@ -408,7 +441,70 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         cleaned = _assistant_value(value, field=field_name)
         if cleaned != value:
             config = replace(config, **{field_name: cleaned})
+    window = _checkin_window_value(config.checkin_window_seconds)
+    if window != config.checkin_window_seconds:
+        config = replace(config, checkin_window_seconds=window)
     return config
+
+
+def _checkin_window_value(value: object) -> int:
+    """A usable check-in window, or the default with a warning.
+
+    :func:`_assistant_value`'s posture: this resolves inside ``load()``, so
+    refusing would be a host that will not boot over a number whose only effect
+    is how often a reminder is spooled. An *explicit* write gets the opposite
+    treatment (:func:`validate_checkin_window`).
+    """
+    coerced = _coerced_window(value)
+    reason = _checkin_window_reason(coerced)
+    if reason is None:
+        return int(coerced)
+    logger.warning(
+        "platform_checkin_window_invalid value=%r — %s; using the default of "
+        "%ds instead", value, reason, DEFAULT_CHECKIN_WINDOW_SECONDS,
+    )
+    return DEFAULT_CHECKIN_WINDOW_SECONDS
+
+
+def _coerced_window(value: object) -> object:
+    """*value* as an int when it is one written down, else unchanged.
+
+    Every layer that carries this value can carry text — an export, a form field,
+    a hand-edited file. Anything that is not a number keeps its own refusal below.
+    """
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return value
+    return value
+
+
+def _checkin_window_reason(value: object) -> Optional[str]:
+    """Why *value* cannot be a check-in window — ``None`` when it can.
+
+    One rule set behind both postures, as :func:`_unusable_reason` is for the
+    launch settings. Call it on a coerced value.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"it is not a whole number of seconds ({type(value).__name__})"
+    if value < 0:
+        return "a window cannot be negative — 0 disables check-in digests"
+    return None
+
+
+def validate_checkin_window(value: object) -> int:
+    """A usable check-in window from an explicit ask, or a refusal.
+
+    The caller is attached and asking for exactly this value, so an unusable one
+    is a :class:`ConfigError` for the route to answer 400 with: a window silently
+    normalised to the default is a setting the operator believes they changed.
+    """
+    coerced = _coerced_window(value)
+    reason = _checkin_window_reason(coerced)
+    if reason is not None:
+        raise ConfigError(f"checkin_window_seconds is unusable ({value!r}): {reason}")
+    return int(coerced)
 
 
 def _assistant_value(value: object, *, field: str) -> Optional[str]:
@@ -710,6 +806,14 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         "work_repo_forge": _env_str(ENV_WORK_REPO_FORGE),
         "stall_idle_seconds": _env_int(ENV_STALL_IDLE_SECONDS),
         "stall_backstop_seconds": _env_int(ENV_STALL_BACKSTOP_SECONDS),
+        # Not `_env_int`: it raises, which is right for a bind port and wrong
+        # for a reminder interval. Cleaned here rather than in ``_validate`` so
+        # an unusable export costs its own layer and lets ``config.json`` show
+        # through — which is what :func:`checkin_settings` answers, and the two
+        # must not disagree.
+        "checkin_window_seconds": _layer_window(
+            _env_str(ENV_CHECKIN_WINDOW), layer="env"
+        ),
         **{
             field: _env_str(env_var)
             for field, env_var in ASSISTANT_SETTING_KEYS.values()
@@ -775,11 +879,16 @@ class AssistantSetting:
     value served as ``null`` would prefill the field empty, make clearing it a
     no-op diff, and leave a value nothing can see warning on every start — the
     screen has to show what is actually in the file to be able to remove it.
+
+    Since issue #244 one setting served through these routes is not a launch flag
+    — the check-in window (:func:`checkin_settings`). It shares this shape because
+    every word above is as true of it, which is also why ``value`` is not
+    annotated ``str``.
     """
 
-    value: Optional[str] = None
+    value: Optional[object] = None
     source: str = "default"
-    stored: Optional[str] = None
+    stored: Optional[object] = None
 
     def to_dict(self) -> dict:
         return {"value": self.value, "source": self.source, "stored": self.stored}
@@ -847,6 +956,78 @@ def assistant_settings() -> dict:
             continue
         resolved[key] = AssistantSetting(stored=stored_text)
     return resolved
+
+
+def checkin_settings() -> dict:
+    """The check-in group's effective settings, one per :data:`CHECKIN_SETTING_KEYS`.
+
+    :func:`assistant_settings`' sibling, read **fresh** for a stronger version of
+    its reason: the detector reads this every tick, so an operator who widens the
+    window expects the next sweep to use it, not the next restart.
+
+    An unusable layer falls through with a warning, so the effective answer is
+    the one the tick will read — a screen reporting a value the daemon would have
+    discarded is the screen lying.
+    """
+    try:
+        stored = read_json(config_path())
+    except StoreError as exc:
+        logger.error(
+            "platform_config_unreadable error=%s — check-in settings resolve "
+            "from the environment and defaults only", exc,
+        )
+        stored = None
+    if not isinstance(stored, dict):
+        stored = {}
+    resolved = {}
+    for key, (field, env_var) in CHECKIN_SETTING_KEYS.items():
+        raw = stored.get(field)
+        env_value = _layer_window(_env_str(env_var), layer="env")
+        file_value = _layer_window(raw, layer="config.json")
+        if env_value is not None:
+            resolved[key] = AssistantSetting(
+                value=env_value, source="env", stored=raw
+            )
+            continue
+        if file_value is not None:
+            resolved[key] = AssistantSetting(
+                value=file_value, source="config.json", stored=raw
+            )
+            continue
+        resolved[key] = AssistantSetting(
+            value=DEFAULT_CHECKIN_WINDOW_SECONDS, source="default", stored=raw
+        )
+    return resolved
+
+
+#: Bad ``(layer, value)`` pairs already warned about. This resolution runs on
+#: every fleet read, so one typo in an export would otherwise warn every few
+#: seconds for the life of the daemon. Keyed on the value too, so a
+#: corrected-then-broken-again one is announced again.
+_WARNED_WINDOWS: set = set()
+
+
+def _layer_window(raw: object, *, layer: str) -> Optional[int]:
+    """One layer's window, or ``None`` when it says nothing usable.
+
+    ``_assistant_value``'s shape for the integer group: a bad value costs *that
+    layer*, so an export of ``"soon"`` resolves to what ``config.json`` says.
+    """
+    if raw is None:
+        return None
+    coerced = _coerced_window(raw)
+    reason = _checkin_window_reason(coerced)
+    if reason is None:
+        return int(coerced)
+    seen = (layer, repr(raw))
+    if seen not in _WARNED_WINDOWS:
+        _WARNED_WINDOWS.add(seen)
+        logger.warning(
+            "platform_checkin_window_invalid layer=%s value=%r — %s; resolving "
+            "as if this layer were unset (said once per value)",
+            layer, raw, reason,
+        )
+    return None
 
 
 #: Serializes :func:`update_stored`'s read-modify-write: the API handlers run in
@@ -1080,6 +1261,108 @@ def active_secret() -> Optional[str]:
         return None
     _SECRET_MEMO = (key, secret)
     return secret
+
+
+#: Memo for :func:`active_assistant_credential`, keyed on the file's stat exactly
+#: as :data:`_SECRET_MEMO` is. One level rather than two: this file's location is
+#: not configurable, so there is no second file whose change could move it.
+_ASSISTANT_CREDENTIAL_MEMO: tuple = (None, None)
+
+
+def assistant_credential_path() -> Path:
+    """Where the running assistant's minted credential lives."""
+    return platform_dir() / ASSISTANT_CREDENTIAL_FILENAME
+
+
+def mint_assistant_credential() -> str:
+    """Generate the next incarnation's credential, replacing any current one.
+
+    Minting rather than handing over the shared secret is what makes the
+    assistant's calls *attributable*: before issue #244 every request looked like
+    the operator's, so "has anyone checked this run?" had no answer.
+
+    Two properties, and they are why this is not a second shared secret:
+
+    - **Per incarnation.** A fresh value on every start and rotate, revoked with
+      the session — where the shared secret in a stopped assistant's
+      ``assistant.env`` stays valid as long as that file exists.
+    - **Not a scope.** It opens exactly what the shared secret opens. It adds
+      identity, not a boundary.
+
+    Created 0600 by ``os.open`` rather than chmod'ed after, like
+    :func:`ensure_secret`: a credential that is world-readable for a millisecond
+    has leaked. Raises :class:`ConfigError` for the caller to fall back on.
+    """
+    path = assistant_credential_path()
+    credential = secrets.token_urlsafe(32)
+    try:
+        ensure_state_dir(path.parent)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, (credential + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)  # in case the file pre-existed with looser bits
+    except OSError as exc:
+        raise ConfigError(f"cannot write assistant credential {path} ({exc})")
+    logger.info("platform_assistant_credential_minted path=%s", path)
+    return credential
+
+
+def active_assistant_credential() -> Optional[str]:
+    """The credential the running assistant holds, or ``None`` when there is none.
+
+    From disk rather than memory because a daemon outlives the incarnations it
+    starts, and one adopted at boot was never minted a credential by this
+    process. Memoized on the file's stat, for :func:`active_secret`'s reason.
+
+    Never raises: ``None`` means nothing is attributed to the assistant, which
+    costs an extra reminder rather than an authentication failure.
+    """
+    global _ASSISTANT_CREDENTIAL_MEMO
+    path = assistant_credential_path()
+    key = _stat_key(path)
+    if key is None:
+        return None
+    cached_key, cached = _ASSISTANT_CREDENTIAL_MEMO
+    if cached_key == key:
+        return cached
+    try:
+        credential = path.read_text(encoding="utf-8").strip() or None
+    except OSError as exc:
+        logger.warning(
+            "platform_assistant_credential_unreadable path=%s error=%s — the "
+            "assistant's calls cannot be told from the operator's until it is "
+            "restarted", path, exc,
+        )
+        return None
+    _warn_if_permissive(path)
+    _ASSISTANT_CREDENTIAL_MEMO = (key, credential)
+    return credential
+
+
+def revoke_assistant_credential() -> bool:
+    """Remove the current assistant credential. Returns whether one was there.
+
+    Called by :func:`lmer_platform.assistant.stop`, rotation included — there the
+    successor is minted under the same lock, so the gap is between two calls.
+
+    Absorbs its failures loudly: refusing to stop the assistant over an undeleted
+    file would leave the container running *and* the credential live.
+    """
+    path = assistant_credential_path()
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.error(
+            "platform_assistant_credential_unrevoked path=%s error=%s — it stays "
+            "valid until the file is removed by hand", path, exc,
+        )
+        return False
+    logger.info("platform_assistant_credential_revoked path=%s", path)
+    return True
 
 
 def binding_notice(config: PlatformConfig) -> str:

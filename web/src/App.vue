@@ -276,6 +276,11 @@ function haystack(run) {
     run.attention?.note,
     run.preset, run.agents, driverLabel(run),
     run.orchestrator && 'uber lmer',
+    // The word the row shows, not the age beside it: "unchecked" is a state an
+    // operator asks the list for ("what has nobody looked at"), while the time is
+    // rendered relative and a query never means one — the same reason `updated`
+    // is not in here.
+    run.checkin?.stale && 'unchecked',
     ...(run.ports || []).map((port) => `:${port.host}`),
   ].filter(Boolean).join(' ').toLowerCase()
 }

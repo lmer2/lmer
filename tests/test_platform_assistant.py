@@ -1560,7 +1560,13 @@ def test_the_assistant_is_given_the_url_and_the_secret(
     with started(config):
         values = env_file_values()
         assert values[assistant.ENV_PLATFORM_URL] == HOST_ALIAS_URL
-        assert values[assistant.ENV_PLATFORM_CREDENTIAL] == secret
+        # The credential is the incarnation's own since #244, never the
+        # operator's shared secret — tests/test_platform_assistant_credential.py
+        # owns the minting; what this pins is that the *pair* is written.
+        assert values[assistant.ENV_PLATFORM_CREDENTIAL] == (
+            cfg.active_assistant_credential()
+        )
+        assert values[assistant.ENV_PLATFORM_CREDENTIAL] != secret
         assert assistant.ENV_PLATFORM_UNREACHABLE not in values
 
 
@@ -1576,14 +1582,16 @@ def test_a_docker_host_with_a_wildcard_bind_needs_no_configuration(
     pin_runtime(monkeypatch, "docker")
     pin_gateway(monkeypatch, "172.17.0.1")
     config = cfg.load({"lmer_bin": str(fake_lmer), "bind_address": "0.0.0.0"})
-    secret = cfg.ensure_secret(config)
+    cfg.ensure_secret(config)
 
     with started(config):
         values = env_file_values()
         assert values[assistant.ENV_PLATFORM_URL] == (
             f"http://172.17.0.1:{cfg.DEFAULT_BIND_PORT}"
         )
-        assert values[assistant.ENV_PLATFORM_CREDENTIAL] == secret
+        assert values[assistant.ENV_PLATFORM_CREDENTIAL] == (
+            cfg.active_assistant_credential()
+        )
         assert assistant.ENV_PLATFORM_UNREACHABLE not in values
 
 
@@ -2163,7 +2171,10 @@ def test_start_with_no_settings_is_todays_behaviour(config, long_lived):
         assert assistant.status().settings == {
             "model": None, "harness": None, "preset": None, "agents": None,
         }
-    assert assistant.status().settings is None, (
+    # ``started`` SIGKILLs the stub and returns; the registry entry goes when the
+    # spawn's watcher thread records the exit, which is asynchronous — so this
+    # waits for the incarnation to be gone rather than racing the reaper.
+    assert wait_for(lambda: assistant.status().settings is None), (
         "settings describe a running incarnation; with none there is no answer"
     )
 
@@ -2334,3 +2345,37 @@ def test_a_status_read_never_writes_the_registry(config, long_lived):
         assert entry_file.read_bytes() == before, (
             "reading the status rewrote the registry entry"
         )
+
+
+def test_the_taskdef_says_what_a_check_in_is(platform_root):
+    """Issue #244. The digest that arrives when *nothing* happened is the one an
+    incarnation has no prior for: every other kind names an event, and this one
+    names silence — so a prompt that shipped it without saying what to do would
+    get "three runs are quiet" relayed to the operator as news rather than acted
+    on.
+
+    The four steps are the whole instruction, and the second is the one the issue
+    exists for: in a turn-based flow the run went quiet because a turn was never
+    taken, and taking it is the check-in.
+    """
+    text = orchestrate_prose()
+    assert "stale_runs" in text, "the digest class the assistant will receive"
+    assert "Read the run" in text, "nothing says a check-in begins by reading"
+    assert "If a turn is owed, take it" in text, (
+        "the run went quiet because nobody turned it; a check-in that stops at "
+        "reading leaves it exactly as quiet"
+    )
+    assert "only your reads count" in text, (
+        "without this, an incarnation told about a run it just read will assume "
+        "the tracking is broken"
+    )
+    assert "not a check-in" in text, (
+        "GET /api/state has to be named as not counting, or the assistant will "
+        "believe looking at the fleet clears every run"
+    )
+    assert "named again next window" in text, (
+        "a repeat reads as a bug unless it is stated as the design"
+    )
+    assert "Never wind one down to quieten the digest" in text, (
+        "the one dangerous way to make a reminder stop is not ruled out"
+    )

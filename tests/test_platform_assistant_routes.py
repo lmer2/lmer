@@ -1276,3 +1276,83 @@ def test_an_unusable_stored_value_is_visible_and_clearable(
     )
     assert reply.status_code == 200
     assert "assistant_model" not in store.read_json(cfg.config_path())
+
+
+# --- the check-in window rides the same routes (issue #244) --------------------
+#
+# One settings surface, two groups. tests/test_platform_config.py owns the
+# resolution chain; what these pin is the HTTP shape — that the window is served
+# beside the launch settings without being pretended into one, that it is
+# writable through the same patch, and that its refusals behave like every other
+# explicit ask here.
+
+def test_config_serves_the_checkin_window_in_its_own_group(client, platform_root):
+    reply = client.get("/api/assistant/config", headers=bearer_header())
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["checkin"]["window_seconds"] == {
+        "value": cfg.DEFAULT_CHECKIN_WINDOW_SECONDS,
+        "source": "default",
+        "stored": None,
+    }
+    assert "window_seconds" not in body["settings"], (
+        "a launch flag and a daemon-side interval are not the same kind of thing"
+    )
+
+
+def test_config_write_persists_the_checkin_window(client, platform_root):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"checkin_window_seconds": 7200},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["checkin"]["window_seconds"]["value"] == 7200
+    assert reply.json()["changed"] == ["checkin_window_seconds"]
+    assert cfg.load().checkin_window_seconds == 7200
+
+
+def test_config_write_accepts_zero_to_turn_check_ins_off(client, platform_root):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"checkin_window_seconds": 0},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["checkin"]["window_seconds"]["value"] == 0
+
+
+def test_config_write_clears_the_checkin_window_back_to_the_default(
+    client, platform_root
+):
+    cfg.update_stored({"checkin_window_seconds": 7200})
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"checkin_window_seconds": None},
+    )
+    assert reply.status_code == 200, reply.text
+    window = reply.json()["checkin"]["window_seconds"]
+    assert window["value"] == cfg.DEFAULT_CHECKIN_WINDOW_SECONDS
+    assert window["source"] == "default"
+    assert window["stored"] is None
+
+
+@pytest.mark.parametrize("bad", [-30, "soon", 3.5, True])
+def test_config_write_refuses_an_unusable_window(client, platform_root, bad):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"checkin_window_seconds": bad},
+    )
+    assert reply.status_code == 400, reply.text
+    assert "checkin_window_seconds" in reply.json()["detail"]
+    assert not cfg.config_path().exists(), "a refused write must land nothing"
+
+
+def test_the_window_is_writable_beside_a_launch_setting_in_one_patch(
+    client, platform_root, known_presets
+):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"preset": "dev", "checkin_window_seconds": 600},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["settings"]["preset"]["value"] == "dev"
+    assert reply.json()["checkin"]["window_seconds"]["value"] == 600

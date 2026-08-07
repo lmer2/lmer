@@ -99,7 +99,7 @@ logger = logging.getLogger("lmer_platform.store")
 
 __all__ = [
     "SCHEMA_VERSION", "StoreError", "PLATFORM_DIR", "SNAPSHOT_FILE_MODE",
-    "STATE_DIR_MODE", "utc_now_iso",
+    "STATE_DIR_MODE", "utc_now_iso", "TS_FORMAT", "age_seconds", "clamp_text",
     "platform_dir", "sessions_dir", "logs_dir", "snapshot_path", "events_path",
     "ensure_state_dir",
     "read_json", "write_json", "mutating", "append_event", "read_events",
@@ -200,9 +200,49 @@ def mutating(path: Path):
         yield
 
 
+#: The one timestamp format across both state layers (``work_repo.run_state``).
+#: Named because what :func:`utc_now_iso` writes is what :func:`age_seconds` has
+#: to be able to read.
+TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
 def utc_now_iso() -> str:
     """Timestamp in the format both state layers use (``work_repo.run_state``)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(TS_FORMAT)
+
+
+def age_seconds(stamp: object, *, now: Optional[datetime] = None):
+    """Seconds since an ISO-8601 Z timestamp; ``None`` when it will not parse.
+
+    :func:`utc_now_iso`'s inverse, and here rather than in each caller because
+    three copies of it is three chances to disagree about what a stamp means.
+
+    Unparseable is missing data rather than a crash — every caller is on a read
+    path where "not known" is the honest answer. ``TypeError`` shares the catch
+    because that is what ``strptime`` raises for ``None``.
+
+    A future timestamp reads **negative**, unclamped: clamping would report a
+    plausible age for a fact that is wrong. Callers that must not act on one say
+    so themselves (:func:`lmer_platform.checkin._latest_stamp`).
+    """
+    try:
+        when = datetime.strptime(stamp, TS_FORMAT).replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+    return ((now or datetime.now(timezone.utc)) - when).total_seconds()
+
+
+def clamp_text(text: str, limit: int) -> str:
+    """*text* cut to *limit* characters, with the cut said out loud.
+
+    One definition for the package: there were two of this name in it, with
+    different edge behaviour — same name, same package, quietly different
+    answers. The ellipsis is contract, not decoration: a truncation a reader
+    cannot see is worse than a long string.
+    """
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
 
 
 def platform_dir() -> Path:

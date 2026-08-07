@@ -47,6 +47,7 @@ import logging
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+from . import registry
 from .store import (
     StoreError, mutating, read_json, snapshot_path, utc_now_iso, write_json,
 )
@@ -56,7 +57,7 @@ logger = logging.getLogger("lmer_platform.runs")
 __all__ = [
     "RUNS_FILE", "SOURCES", "TrackedRun", "RunIndexError", "run_key",
     "load_index", "list_tracked", "get_tracked", "track", "forget",
-    "note_session",
+    "note_session", "run_for_session", "run_key_of_entry",
 ]
 
 RUNS_FILE = "runs.json"
@@ -294,6 +295,56 @@ def note_session(
     if get_tracked(host, project, slug) is None:
         return None
     return track(host, project, slug, session_id=session_id)
+
+
+def run_for_session(session_id: str) -> Optional[tuple]:
+    """``(host, project, slug)`` of the run *session_id* belongs to, or ``None``.
+
+    The second source is the whole point: a clean exit **removes** the registry
+    entry (``spawn._watch`` on ``code == 0``), so the entry answers for a live or
+    crashed session and says nothing for the ordinary finished one. The tracked
+    index remembers the other side and outlives every entry.
+
+    Both callers need both halves. The session routes keep serving a session that
+    is only a PTY log, so with the registry read alone an assistant reading a
+    *dormant* run got a 200 and stamped nothing — the shape issue #244 was filed
+    about, announced again every window forever.
+
+    ``None`` means no run this host knows, and neither caller infers from it.
+    Tolerant on both reads: a missing key costs a stamp or a narrowed transcript,
+    never the response.
+    """
+    try:
+        entry = registry.read_session(session_id)
+    except registry.RegistryError as exc:
+        logger.debug(
+            "platform_run_for_session_unreadable id=%s error=%s — falling back "
+            "to the tracked index", session_id, exc,
+        )
+        entry = None
+    key = run_key_of_entry(entry)
+    if key is not None:
+        return key
+    for candidate in list_tracked():
+        if candidate.last_session_id == session_id:
+            return (candidate.host, candidate.project, candidate.slug)
+    return None
+
+
+def run_key_of_entry(entry: Optional[dict]) -> Optional[tuple]:
+    """``(host, project, slug)`` off a registry entry's ``run`` block, or ``None``.
+
+    One reading of that block for everything that asks: an entry written before
+    the run had an identity carries empty parts, and three copies of "check all
+    three" is how one of them starts accepting ``("", "", "")`` as a run.
+    """
+    run = (entry or {}).get("run")
+    if not isinstance(run, dict):
+        return None
+    host, project, slug = run.get("host"), run.get("project"), run.get("slug")
+    if not all(isinstance(part, str) and part for part in (host, project, slug)):
+        return None
+    return (host, project, slug)
 
 
 def forget(host: str, project: str, slug: str) -> bool:

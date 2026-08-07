@@ -360,8 +360,8 @@ def _probe(body):
 
     script = "\n".join([
         "import assert from 'node:assert/strict'",
-        "import { driverLabel, duration, targetLink, targetRef } from "
-        f"{FORMAT.as_uri()!r}",
+        "import { checkinLabel, driverLabel, duration, targetLink, targetRef } "
+        f"from {FORMAT.as_uri()!r}",
         body,
         "console.log('probe ok')",
     ])
@@ -1776,3 +1776,75 @@ def test_the_way_out_of_a_run_is_last_and_colourless():
         "nothing says what forgetting does to the run — the operator's fear here "
         "is that it deletes work"
     )
+
+
+# --- the row says when anyone last looked at the run (issue #244) --------------
+#
+# The fleet view's half of the check-in work: the daemon tells the assistant which
+# runs have gone unchecked, and the operator asked to be able to see the same
+# thing without asking the assistant. What these keep is that the row *reports* a
+# verdict rather than reaching one, and that showing it costs the row's signal
+# nothing — an unpainted word in the dimmed line, like every other addition here.
+
+def test_the_row_reports_the_daemons_staleness_rather_than_deciding_it():
+    """A row that decided for itself would mark runs no digest ever names.
+
+    The window, the eligibility rules and the clock all live in
+    ``lmer_platform.checkin``; the payload carries the answer. A component that
+    compared an age against a number of its own would drift from the digest the
+    assistant acts on the first time either changed.
+    """
+    text = _read(RUN_CARD)
+    assert "checkinLabel(props.run.checkin" in text, (
+        "the row is not reading the daemon's own check-in block"
+    )
+    assert not re.search(r"3600|checkin_window", text), (
+        "the row has a window of its own, so the marker and the digest can "
+        "disagree about which runs have gone quiet"
+    )
+
+
+def test_the_check_in_marker_is_not_painted():
+    """Colour in this app is urgency, and a quiet run is not a crashed one."""
+    text = _read(RUN_CARD)
+    marker = re.search(
+        r'<span\s+v-if="checkin".*?</span>', text, re.S,
+    )
+    assert marker, "the check-in span is gone from the row"
+    assert "color=" not in marker.group(0), (
+        "the check-in marker took a colour, which puts a second urgency signal "
+        "in a row whose ramp already means something"
+    )
+    assert "text-high-emphasis" in marker.group(0), (
+        "a stale run has to be findable while scanning the list — the emphasis "
+        "is what does that without reaching for the ramp"
+    )
+
+
+def test_the_two_check_in_wordings_are_two_different_facts():
+    """"checked" must mean something read the run; it is not a synonym for an age.
+
+    The clock a stale run reports runs from whatever last restarted it — a read,
+    a digest already spooled, or first sight of the run — so wording that as
+    "checked" would have the row inventing a look nobody took.
+    """
+    _probe("""
+    const now = Date.parse('2026-08-06T12:00:00Z')
+    assert.equal(
+      checkinLabel({checked_at: '2026-08-06T11:48:00Z', age_seconds: 720,
+                    stale: false}, now),
+      'checked 12m ago')
+    assert.equal(
+      checkinLabel({checked_at: null, age_seconds: 15600, stale: true}, now),
+      'unchecked 4h')
+    assert.equal(
+      checkinLabel({checked_at: '2026-08-06T07:40:00Z', age_seconds: 15600,
+                    stale: true}, now),
+      'unchecked 4h',
+      'a run that was read hours ago and has gone stale is unchecked, not checked')
+    assert.equal(
+      checkinLabel({checked_at: null, age_seconds: 30, stale: false}, now), null,
+      'a run the platform has only just seen says nothing at all')
+    assert.equal(checkinLabel(null, now), null,
+      'a payload from a daemon that predates check-ins renders nothing')
+    """)
