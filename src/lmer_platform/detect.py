@@ -182,6 +182,17 @@ milestone the assistant hears twice rather than one it never hears: a crash
 between the two costs a duplicate, and the assistant can see it is a duplicate
 (same signal id) while a lost "the review is finished" is invisible to everyone.
 
+A fourth job on the same tick: runs nobody has looked at (issue #244)
+---------------------------------------------------------------------
+Everything above needs something to *happen* — a condition to appear, a session
+to end, an agent to signal. A run that just stops moving produces none of it, and
+in a turn-based flow that idles both sides at once.
+
+:mod:`lmer_platform.checkin` is the answer; :meth:`Detector._check_ins` runs it
+off this tick's fleet read. Two things keep it from being the firehose everything
+above avoids: one digest names every stale run, and a run it named waits another
+window before it is named again.
+
 Failure is absorbed, and a persistent one goes quiet
 ----------------------------------------------------
 A detection failure must never take the daemon down: the fleet view is what an
@@ -214,13 +225,15 @@ from typing import Optional
 from ask_channel import protocol as ask_protocol
 from work_repo import run_state
 
-from . import ask, assistant, registry, transcripts
+from . import ask, assistant, checkin, registry, transcripts
 from .api import build_state
-from .config import PlatformConfig
+from . import config as config_module
+from .config import PlatformConfig, checkin_settings
 from .inventory import _TERMINAL_STATUSES
 from .spawn import ports_file_for
 from .store import (
     StoreError,
+    clamp_text,
     append_event,
     mutating,
     read_json,
@@ -317,10 +330,11 @@ def _clamp(text: str, limit: int) -> str:
     question an operator wrote at any length. Truncating is a shortened digest;
     not truncating is a refused notification for exactly the runs whose questions
     are long enough to need care.
+
+    The rule is :func:`lmer_platform.store.clamp_text`'s; this name survives
+    because it is what readers of this module reach for.
     """
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 1)].rstrip() + "…"
+    return clamp_text(text, limit)
 
 
 @dataclass(frozen=True)
@@ -901,6 +915,9 @@ class Detector:
         #: ``notified`` because the two can disagree: a signal is recorded in
         #: platform history whether or not its digest reached the spool.
         self.signalled = 0
+        #: Runs named in a check-in digest (issue #244) — runs rather than
+        #: digests, because one digest names all of them.
+        self.stale_reported = 0
         self._stop = threading.Event()
         self._sleep = sleep or self._stop.wait
         self._read_state = state_reader or build_state
@@ -910,6 +927,10 @@ class Detector:
         self._seen: Optional[dict] = None
         #: stage -> (cause, consecutive count), for the log dedupe.
         self._failed: dict = {}
+        #: ``{run ref: announced_at}`` for digests spooled but not recorded on
+        #: disk; cleared by the first successful write (see :meth:`_check_ins`).
+        self._announced: dict = {}
+        self._warned_unattributed = False
 
     def stop(self) -> None:
         """Ask the loop to finish, and cut short the wait it is sitting in."""
@@ -939,7 +960,28 @@ class Detector:
             "reading as a crash.\n"
             "   — and it picks up milestones a session announced itself with "
             "lmer-signal (an MR pushed, a review finished), which reach the "
-            "assistant and not your attention list."
+            "assistant and not your attention list.\n"
+            f"   — {self._checkin_notice()}"
+        )
+
+    def _checkin_notice(self) -> str:
+        """The check-in half of :attr:`notice`, in one sentence (issue #244).
+
+        Worth a line because it is the one thing here that produces a digest when
+        *nothing* happened, and worth saying when it is off: a feature that is
+        disabled and one that is broken look identical from the chat window.
+        """
+        window = checkin_settings()["window_seconds"].value
+        if not window:
+            return (
+                "check-in digests are OFF on this host "
+                "(checkin_window_seconds is 0): a run nobody looks at is never "
+                "mentioned. POST /api/assistant/config to set a window."
+            )
+        return (
+            f"every {window // 60 or 1}m it also tells the assistant which runs "
+            "nobody has *looked at* — the silence case no event can cover, since "
+            "a run that stops moving emits nothing at all."
         )
 
     def start(self) -> threading.Thread:
@@ -998,11 +1040,22 @@ class Detector:
             self._clear("signals")
 
         try:
-            current = _signals(self._read_state(self.config))
+            payload = self._read_state(self.config)
         except Exception as exc:  # noqa: BLE001 - the daemon serves regardless
             self._absorb("scan", exc)
             return []
         self._clear("scan")
+        current = _signals(payload)
+
+        # The fourth stage, on the fleet read this tick already paid for. Its
+        # own stage for the sweep's reason: a staleness pass that cannot write
+        # must not cost the diff below.
+        try:
+            self.stale_reported += len(self._check_ins(payload))
+        except Exception as exc:  # noqa: BLE001 - one digest, not the tick
+            self._absorb("checkin", exc)
+        else:
+            self._clear("checkin")
 
         baseline, self._seen = self._seen, current
         if baseline is None:
@@ -1020,6 +1073,115 @@ class Detector:
         for signal in fresh:
             self._deliver(signal)
         return fresh
+
+    def _check_ins(self, payload: dict) -> list:
+        """Spool one digest naming every run nobody has checked. Returns them.
+
+        The window is read fresh every tick, because a change through
+        ``POST /api/assistant/config`` means the next sweep, not the next restart.
+
+        A window of 0 is off — but the *prune* still runs, since ``observe`` is
+        the only pruner and the API keeps stamping whatever the window says; an
+        early return above it left ``checkins.json`` growing forever on a host
+        with the feature switched off.
+
+        A refused digest is retried, unlike a refused signal, because a stale run
+        has no ``events.jsonl`` copy to fall back on. Retried per *window* though,
+        held in :attr:`_announced` when the marks file will not take it: per tick,
+        an unwritable file spooled 120 digests an hour into a 50-note spool and
+        evicted every other digest class within half an hour.
+
+        "Delivered" is narrower than it reads — ``notify`` reports liveness, not
+        persistence — so a digest lost to a full disk is suppressed for one
+        window. That self-heals; the opposite direction is the eviction above.
+        """
+        window = checkin_settings()["window_seconds"].value
+        marks = checkin.observe(payload)
+        if not window:
+            return []
+        marks = self._with_pending_announcements(marks)
+        stale = checkin.stale_runs(payload, window=window, marks=marks)
+        if not stale:
+            return []
+        note, data = checkin.digest(
+            stale, window=window, caveat=self._unattributed_caveat()
+        )
+        delivered, live = self._spool(note, checkin.STALE_DIGEST_KIND, data)
+        if not delivered:
+            return []
+        stamped = utc_now_iso()
+        try:
+            checkin.record_announced(stale)
+        except StoreError as exc:
+            # Absorbed rather than raised: the stage above would score this a
+            # failed pass and re-announce everything next tick, which is the
+            # behaviour being fixed.
+            for run in stale:
+                self._announced[run.ref] = stamped
+            logger.warning(
+                "platform_checkin_marks_unwritable error=%s — the digest was "
+                "spooled and this daemon will remember it for one window in "
+                "memory; a restart before the file is writable re-announces it",
+                exc,
+            )
+        else:
+            self._announced.clear()
+        logger.info(
+            "platform_checkin_digest runs=%d window=%ds oldest=%s "
+            "assistant_live=%s",
+            len(stale), window, stale[0].ref, bool(live),
+        )
+        return stale
+
+    def _with_pending_announcements(self, marks: dict) -> dict:
+        """*marks* with announcements this process made but could not persist.
+
+        Folded in rather than consulted separately, so the staleness computation
+        keeps one input: an in-memory ``announced_at`` is the same fact as a
+        stored one, and a stored stamp wins because it is at least as new.
+        """
+        if not self._announced:
+            return marks
+        merged = dict(marks)
+        for ref, at in self._announced.items():
+            record = dict(merged.get(ref) or {})
+            if at > (record.get("announced_at") or ""):
+                record["announced_at"] = at
+            merged[ref] = record
+        return merged
+
+    def _unattributed_caveat(self) -> Optional[str]:
+        """Why this digest will keep arriving whatever the assistant does.
+
+        The one state where the mechanism is knowably broken rather than quiet:
+        an assistant on the **shared secret** attributes every read to the
+        operator, so nothing it does clears a run. Not hypothetical — it is the
+        first deploy that ships this, since an assistant surviving the daemon
+        restart is adopted rather than re-launched and keeps its old ``.env``.
+
+        In the digest and not only in the log, because the digest is what will
+        not stop and its reader is the one that can act on it.
+        """
+        if config_module.active_assistant_credential() is not None:
+            return None
+        if not assistant.status().running:
+            # Nothing to attribute, and a fresh start mints a credential.
+            return None
+        if not self._warned_unattributed:
+            self._warned_unattributed = True
+            logger.warning(
+                "platform_checkin_unattributed — the running assistant holds the "
+                "shared secret rather than a minted credential (started before "
+                "check-ins existed, adopted across a daemon restart, or a mint "
+                "that failed), so nothing it reads registers as a check-in and "
+                "this digest repeats every window. Rotate it: POST /api/assistant/rotate"
+            )
+        return (
+            "NOTE: you are running on the shared secret rather than your own "
+            "credential, so nothing you read clears a run and this digest will "
+            "repeat every window until you are rotated — tell the operator, and "
+            "offer POST /api/assistant/rotate."
+        )
 
     def _deliver(self, signal: Signal) -> None:
         """Hand one digest to the assistant's spool, absorbing a refusal.

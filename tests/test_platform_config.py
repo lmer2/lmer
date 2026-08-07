@@ -1055,6 +1055,84 @@ def test_a_non_string_stored_value_is_serialized_not_hidden(platform_root):
     assert settings["model"].stored == "5"
 
 
+# --- the check-in window (issue #244) ----------------------------------------
+#
+# Not a launch setting and deliberately not in ASSISTANT_SETTING_KEYS: those
+# four become argv tokens on the assistant's own command line, while this is an
+# integer the daemon reads on its detection tick. What it shares is the
+# resolution chain, so these pin the same properties the four have — an export
+# shadows the file, an unusable layer falls through rather than refusing — plus
+# the one that is its own: 0 is a value, not a mistake.
+
+def test_the_window_defaults_to_an_hour(platform_root):
+    assert cfg.load().checkin_window_seconds == 3600
+    setting = cfg.checkin_settings()["window_seconds"]
+    assert setting.value == 3600
+    assert setting.source == "default"
+    assert setting.stored is None
+
+
+def test_the_window_resolves_env_over_file_over_default(platform_root, monkeypatch):
+    store.write_json(cfg.config_path(), {"checkin_window_seconds": 900})
+    assert cfg.load().checkin_window_seconds == 900
+    assert cfg.checkin_settings()["window_seconds"].source == "config.json"
+
+    monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "120")
+    assert cfg.load().checkin_window_seconds == 120
+    setting = cfg.checkin_settings()["window_seconds"]
+    assert setting.value == 120
+    assert setting.source == "env"
+    assert setting.stored == 900, "the screen edits the file, not the export"
+
+
+def test_zero_disables_the_digest_and_is_not_a_mistake(platform_root):
+    cfg.update_stored({"checkin_window_seconds": 0})
+    assert cfg.load().checkin_window_seconds == 0
+    assert cfg.checkin_settings()["window_seconds"].value == 0
+
+
+def test_an_unusable_window_costs_its_layer_not_the_daemon(
+    platform_root, monkeypatch, caplog
+):
+    """A typo in an export must not be a host that will not boot: the whole
+    effect of this value is how often a reminder is spooled.
+
+    The warning is said once per distinct bad value for the life of the process
+    (it resolves on every fleet read, so per-resolve would flood the log), which
+    makes it the one memo here with no stat key to expire it — so this test
+    clears it rather than assuming nothing earlier in the session tripped it.
+    """
+    cfg._WARNED_WINDOWS.clear()
+    store.write_json(cfg.config_path(), {"checkin_window_seconds": 900})
+    monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "soon")
+    # Both readers, and the same answer from each: the loaded config and the
+    # fresh resolution the tick uses must not disagree about three layers.
+    assert cfg.load().checkin_window_seconds == 900
+    assert cfg.checkin_settings()["window_seconds"].source == "config.json"
+    assert cfg.checkin_settings()["window_seconds"].value == 900
+    assert any(
+        "platform_checkin_window_invalid" in record.message
+        for record in caplog.records
+    )
+
+
+def test_a_negative_window_in_the_file_falls_back_to_the_default(platform_root):
+    store.write_json(cfg.config_path(), {"checkin_window_seconds": -60})
+    assert cfg.load().checkin_window_seconds == 3600
+
+
+def test_validate_checkin_window_refuses_an_explicit_bad_value(platform_root):
+    """The other posture: the caller is attached and asking for this value."""
+    for bad in (-1, "soon", 3.5, True, None):
+        with pytest.raises(cfg.ConfigError) as excinfo:
+            cfg.validate_checkin_window(bad)
+        assert "checkin_window_seconds" in str(excinfo.value)
+
+
+def test_validate_checkin_window_accepts_numeric_text(platform_root):
+    assert cfg.validate_checkin_window("7200") == 7200
+    assert cfg.validate_checkin_window(0) == 0
+
 # --- halt-detection thresholds (#243) ----------------------------------------
 #
 # Two knobs and one relationship between them. The tests below pin the three

@@ -133,6 +133,27 @@ export function duration(seconds) {
   return `${Math.round(hours / 24)}d`
 }
 
+// When the orchestrator last looked at this run, and whether that was too long
+// ago (issue #244). It renders the daemon's verdict rather than reaching one: a
+// row deciding for itself would mark runs the assistant is never told about.
+//
+// The two wordings are different facts. "checked 12m ago" means something read
+// the run; "unchecked 4h" means nothing has, timed from whatever last restarted
+// the clock — a read, a digest already sent, or first sight. Saying "checked" on
+// the strength of the last would be the row inventing a look nobody took.
+//
+// The age is `duration()`'s whole hours, while the digest renders "4h20m": the row
+// is scanned, the digest is read. Null renders nothing, and null is ordinary — a
+// just-seen run is neither checked nor quiet yet.
+export function checkinLabel(checkin, now = Date.now()) {
+  if (!checkin) return null
+  if (checkin.stale) {
+    const waited = duration(checkin.age_seconds)
+    return waited ? `unchecked ${waited}` : null
+  }
+  return checkin.checked_at ? `checked ${ago(checkin.checked_at, now)}` : null
+}
+
 export function ledgerSummary(ledger) {
   if (!ledger || !ledger.total) return null
   const parts = [`${ledger.done}/${ledger.total} tasks`]

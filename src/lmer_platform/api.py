@@ -7,7 +7,7 @@ queue and slots arrive with M3.
 
 Authentication
 --------------
-One shared secret (spec D9/§10.5), accepted two ways:
+The shared secret (spec D9/§10.5), accepted two ways:
 
 - ``Authorization: Bearer <secret>`` — for CLI and API clients.
 - ``Authorization: Basic <base64>`` — so a **browser** can reach the platform
@@ -22,6 +22,14 @@ deliberately **no artificial delay** on failure: the secret is 256 bits of
 ``token_urlsafe``, so online guessing is not the threat, while a sleep-per-failure
 would hand an attacker an amplification primitive — many cheap connections each
 pinning a threadpool worker. Failures are logged instead.
+
+Since issue #244 a **second** credential opens the same routes: the one minted
+per assistant incarnation (:func:`lmer_platform.config.mint_assistant_credential`).
+It exists so a caller can be *told apart*, not held back — both open everything,
+and :class:`Caller` says which arrived. The check-in tracking is its only consumer
+and its whole reason: the browser polls a session's routes every few seconds, so a
+platform that cannot tell those from the assistant's reads cannot answer "has
+anybody actually looked at this run".
 
 The one route that does *not* take the secret is the tty WebSocket, because a
 browser cannot reliably put a header on a handshake. It takes a single-use ticket
@@ -49,6 +57,7 @@ import json
 import logging
 import os
 import secrets as secrets_mod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -80,6 +89,7 @@ from work_repo.git_ops import (
 from . import SCHEMA_VERSION
 from . import ask
 from . import assistant
+from . import checkin
 from . import lifecycle
 from . import meta
 from . import reattach
@@ -93,10 +103,13 @@ from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
     PlatformConfig,
+    active_assistant_credential,
     assistant_settings,
+    checkin_settings,
     configured_repo_url,
     update_stored,
     validate_assistant_override,
+    validate_checkin_window,
 )
 from .inventory import StallPolicy, build_inventory
 from .lifecycle import LifecycleError
@@ -104,7 +117,9 @@ from .meta import MetaError
 from .registry import list_sessions, prune_dead, read_session
 from .relations import RelationError
 from .resume import ResumeError, ResumeRequest, resume_run
-from .runs import RunIndexError, forget, list_tracked, run_key, track
+from .runs import (
+    RunIndexError, forget, list_tracked, run_for_session, run_key, track,
+)
 from .session_io import ControlPlaneError, SessionIOError
 # ``_repo_urls`` and ``derive_run_identity`` are the pair that predicts a run's
 # host and project, and the work-repo project taskdef tier is filed under exactly
@@ -129,10 +144,17 @@ logger = logging.getLogger("lmer_platform.api")
 
 __all__ = [
     "build_state", "create_app", "discover_spawn_options", "REALM",
-    "WS_POLICY_VIOLATION",
+    "WS_POLICY_VIOLATION", "Caller", "CALLER_ASSISTANT", "CALLER_OPERATOR",
 ]
 
 REALM = "lmer platform"
+
+#: Who a request came from, once authenticated — one value per credential
+#: (issue #244). ``operator`` names *everything else* rather than a person: a
+#: browser, ``curl`` and a script all present the same shared secret and are
+#: indistinguishable, which is why the assistant got its own.
+CALLER_OPERATOR = "operator"
+CALLER_ASSISTANT = "assistant"
 
 #: Close code for a tty socket the platform will not serve. 1008 (policy
 #: violation) rather than a private code because a browser can read neither: a
@@ -143,6 +165,11 @@ WS_POLICY_VIOLATION = 1008
 #: RFC 6455 caps a close reason at 123 bytes; the reasons here are explanations,
 #: so they are truncated rather than assumed short.
 _WS_REASON_LIMIT = 120
+
+#: The check-in window's key in a config request body (issue #244). Its config
+#: field's own name: the four launch settings are spelled short (``model``, not
+#: ``assistant_model``) because they are also spawn fields, and this is not one.
+_CHECKIN_WINDOW_KEY = "checkin_window_seconds"
 
 #: What a starting assistant is told when its predecessor left it nothing (T60).
 #: A fact about the host rather than an error, and the ``orchestrate`` taskdef
@@ -409,7 +436,9 @@ _CONFIG_SCOPE_NOTE = (
     "settings apply to the NEXT incarnation: the running assistant keeps its "
     "context window until it is stopped or rotated. A value whose source is "
     "'env' is an export shadowing config.json — what POST persists here has no "
-    "effect until that export is removed."
+    "effect until that export is removed. The checkin group is the exception "
+    "to the first sentence: the daemon reads the window on its next tick, so a "
+    "change there takes effect without a rotation."
 )
 
 
@@ -429,6 +458,13 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
         "settings": {
             key: setting.to_dict()
             for key, setting in assistant_settings().items()
+        },
+        # Its own group rather than a fifth entry above (issue #244): those four
+        # become argv tokens on the assistant's command line, and this is an
+        # integer the daemon reads on its own tick.
+        "checkin": {
+            key: setting.to_dict()
+            for key, setting in checkin_settings().items()
         },
         "note": _CONFIG_SCOPE_NOTE,
     }
@@ -566,6 +602,26 @@ def _run_files_reply(
     }
 
 
+def _fold_checkins(payload: dict) -> None:
+    """Put each row's check-in facts on the row, in place (issue #244).
+
+    On the payload rather than left to the client, like every other joined fact
+    here: the view is polled from a phone, and a request per row is one per
+    tracked run on the first screen the app draws.
+
+    It is a **read**. A fleet poll must not move the stamps, or a browser left
+    open on the list would keep the whole fleet looking fresh — the trap the
+    caller check closes, arriving through the other door.
+
+    Both lists get it: ``attention`` holds separate copies of the same rows.
+    """
+    window = checkin_settings()["window_seconds"].value
+    marks = checkin.read_marks()
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if isinstance(row, dict):
+            row["checkin"] = checkin.row_checkin(row, marks, window=window)
+
+
 def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     """Assemble the fleet view for the runs **this orchestrator tracks**.
 
@@ -616,6 +672,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
         },
     }
     payload.update(inventory.to_dict())
+    _fold_checkins(payload)
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
@@ -969,6 +1026,53 @@ def _unbuilt_message() -> str:
     )
 
 
+@dataclass(frozen=True)
+class Caller:
+    """Who authenticated a request (issue #244).
+
+    What ``require_secret`` returns, for the handlers that care; most do not.
+
+    **Not** an authorisation boundary: both credentials open every route (see
+    :func:`lmer_platform.assistant._assistant_environment`). This says who called
+    so the platform can answer "has the assistant looked at this run", and it
+    must not grow into "may this caller do that".
+    """
+
+    kind: str
+
+    @property
+    def is_assistant(self) -> bool:
+        return self.kind == CALLER_ASSISTANT
+
+
+def _note_check(
+    caller: "Caller",
+    *,
+    session_id: Optional[str] = None,
+    run: Optional[tuple] = None,
+) -> None:
+    """Record that the assistant looked at a run (issue #244).
+
+    Called at the *end* of a handler, after the work succeeded: a refusal is not
+    a look at anything.
+
+    The run comes from :func:`lmer_platform.runs.run_for_session` rather than a
+    registry read, because these routes keep serving a session that has nothing
+    left but a PTY log and a clean exit removes the entry. Reading the entry
+    alone stamped nothing for exactly the shape #244 was filed about.
+
+    Two guards, both the feature rather than caution: only the assistant's
+    credential counts (a browser tab left open would otherwise suppress the
+    reminders for the run on screen), and only routes naming **one** run stamp
+    (``GET /api/state`` would mark the whole fleet checked at once).
+    """
+    if not caller.is_assistant:
+        return
+    identity = run or (run_for_session(session_id) if session_id else None)
+    if identity:
+        checkin.record_check(*identity)
+
+
 def _presented_secret(authorization: Optional[str]) -> Optional[str]:
     """Pull the candidate secret out of an ``Authorization`` header."""
     if not authorization:
@@ -1030,7 +1134,19 @@ def create_app(
     # exactly one app in exactly one process (see session_io on why that matters).
     tickets = session_io.TicketStore()
 
-    def require_secret(authorization: Optional[str] = Header(default=None)) -> None:
+    def require_secret(
+        authorization: Optional[str] = Header(default=None)
+    ) -> Caller:
+        """Authenticate, and say who called (issue #244).
+
+        The shared secret first — the common case, and the one this app was
+        handed at construction. The minted credential is read from disk each time
+        (memoized on its stat) because it changes under a running daemon.
+
+        A handler that wants the identity declares
+        ``caller: Caller = Depends(require_secret)``; FastAPI resolves it once per
+        request either way, so the credential is compared once.
+        """
         presented = _presented_secret(authorization)
         # Encoded bytes on both sides, not the strings: ``compare_digest``
         # refuses two ``str`` arguments unless both are ASCII-only, and
@@ -1047,10 +1163,18 @@ def create_app(
         # non-ASCII secret unusable — and a constant-time comparison is the last
         # place a shape check belongs. Encoding is total, so every credential
         # gets compared rather than sorted into "comparable" and "rejected".
-        if presented is not None and secrets_mod.compare_digest(
-            presented.encode("utf-8"), secret.encode("utf-8")
-        ):
-            return
+        if presented is not None:
+            offered = presented.encode("utf-8")
+            if secrets_mod.compare_digest(offered, secret.encode("utf-8")):
+                return Caller(CALLER_OPERATOR)
+            minted = active_assistant_credential()
+            if minted and secrets_mod.compare_digest(
+                offered, minted.encode("utf-8")
+            ):
+                # Which incarnation it is is deliberately not read: that cost an
+                # `assistant.read_state()` per request — file, handoff re-scrub and
+                # up to MAX_PENDING notes — for a field nothing consumed.
+                return Caller(CALLER_ASSISTANT)
         logger.warning(
             "platform_auth_rejected scheme=%s",
             (authorization or "").partition(" ")[0].lower() or "none",
@@ -1378,6 +1502,7 @@ def create_app(
             le=session_io.MAX_LOG_LIMIT,
         ),
         source: Optional[str] = None,
+        caller: Caller = Depends(require_secret),
     ) -> dict:
         """Scrollback for one session — the terminal's history (spec D16).
 
@@ -1412,6 +1537,7 @@ def create_app(
             detached = reattach.detached_record(read_session(session_id))
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
         return {
             "session": session_id,
             "live": live,
@@ -1420,7 +1546,9 @@ def create_app(
         }
 
     @app.post("/api/sessions/{session_id}/input", dependencies=guard)
-    def session_input(session_id: str, body: dict) -> dict:
+    def session_input(
+        session_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
         """Type into a running session, via its own control plane.
 
         This is the route that makes the platform an orchestrator rather than a
@@ -1457,6 +1585,8 @@ def create_app(
         # exact shape.
         if "submit_text" in reply:
             answer["submit_text"] = reply.get("submit_text")
+        # The strongest form of "I have this run": a /followup follows a read.
+        _note_check(caller, session_id=session_id)
         return answer
 
     @app.get("/api/sessions/{session_id}/messages", dependencies=guard)
@@ -1468,6 +1598,7 @@ def create_app(
             ge=1,
             le=transcripts.MAX_MESSAGE_LIMIT,
         ),
+        caller: Caller = Depends(require_secret),
     ) -> dict:
         """The readable view of one run: its harness transcript, normalised (D6).
 
@@ -1501,6 +1632,7 @@ def create_app(
             live = session_io.session_is_live(session_id)
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
         return {"session": session_id, "live": live, **page.to_dict()}
 
     # --- one session's ask channel (spec D26/D27, T23) -----------------------
@@ -1510,7 +1642,9 @@ def create_app(
     # container: only that session is polling it, and only while it is up.
 
     @app.get("/api/sessions/{session_id}/ask", dependencies=guard)
-    def session_ask(session_id: str) -> dict:
+    def session_ask(
+        session_id: str, caller: Caller = Depends(require_secret)
+    ) -> dict:
         """Everything on one session's ask channel, oldest first.
 
         Questions, progress notes and the answers already given, in the order the
@@ -1529,6 +1663,7 @@ def create_app(
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         except AskChannelError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
         return {
             "session": session_id,
             "live": live,
@@ -1538,7 +1673,12 @@ def create_app(
     @app.post(
         "/api/sessions/{session_id}/ask/{question_id}/answer", dependencies=guard
     )
-    def session_ask_answer(session_id: str, question_id: str, body: dict) -> dict:
+    def session_ask_answer(
+        session_id: str,
+        question_id: str,
+        body: dict,
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
         """Answer one question a live session is waiting on.
 
         The question id is in the path, not the body, and that is the point: an
@@ -1566,6 +1706,7 @@ def create_app(
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         except AskChannelError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
         return {
             "session": session_id,
             "question_id": recorded["question_id"],
@@ -1629,16 +1770,21 @@ def create_app(
         return report.to_dict()
 
     @app.post("/api/sessions/{session_id}/tty-ticket", dependencies=guard)
-    def tty_ticket(session_id: str) -> dict:
+    def tty_ticket(
+        session_id: str, caller: Caller = Depends(require_secret)
+    ) -> dict:
         """Mint the single-use credential the tty socket requires.
 
-        Authenticated with the shared secret like every other route — the ticket
-        exists precisely so the *socket* never has to be.
+        Authenticated like every other route — the ticket exists precisely so the
+        *socket* never has to be.
         """
         try:
             session_io.require_session(session_id)
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        # The only signal the socket can give: the tty stream carries no
+        # credential, so nothing downstream of this mint is attributable.
+        _note_check(caller, session_id=session_id)
         return {
             "session": session_id,
             "ticket": tickets.mint(session_id),
@@ -1959,7 +2105,12 @@ def create_app(
     # route's reason: a project is ``group/subgroup``.
 
     @app.get("/api/runs/files", dependencies=guard)
-    def run_files(host: str = "", project: str = "", slug: str = "") -> dict:
+    def run_files(
+        host: str = "",
+        project: str = "",
+        slug: str = "",
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
         """The run's own files in the mirror, each with its forge URL.
 
         Deliberately does **not** pull: this is read while an operator is looking
@@ -1977,6 +2128,7 @@ def create_app(
             run_key(host, project, slug)
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _note_check(caller, run=(host, project, slug))
         return _run_files_reply(config, host, project, slug)
 
     # --- which runs belong together (T53) -------------------------------------
@@ -2089,7 +2241,7 @@ def create_app(
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
     @app.post("/api/runs/answer", dependencies=guard, status_code=202)
-    def answer(body: dict) -> dict:
+    def answer(body: dict, caller: Caller = Depends(require_secret)) -> dict:
         """Answer a run that stopped to ask a question, by respawning it (T19).
 
         Keyed on the **run**, and the body shape is ``/api/runs/adopt``'s plus the
@@ -2133,10 +2285,11 @@ def create_app(
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _note_check(caller, run=(request.host, request.project, request.slug))
         return result.to_dict()
 
     @app.post("/api/runs/resume", dependencies=guard, status_code=202)
-    def resume(body: dict) -> dict:
+    def resume(body: dict, caller: Caller = Depends(require_secret)) -> dict:
         """Continue a tracked run by starting its next session (T25, T41).
 
         Keyed on the **run** and shaped like ``/api/runs/answer`` for the same
@@ -2190,6 +2343,7 @@ def create_app(
             raise HTTPException(status_code=429, detail=str(exc)) from exc
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _note_check(caller, run=(request.host, request.project, request.slug))
         return result.to_dict()
 
     # --- the orchestrating assistant (spec §8, T60) ---------------------------
@@ -2497,35 +2651,48 @@ def create_app(
         never an env-resolved value baked in where it would outlive the export
         (:func:`lmer_platform.config.update_stored`).
 
-        Keys are the four setting names; omitted keys are left alone, so this is
-        a patch of exactly what the caller named. ``null`` — and the emptied
-        text field a browser sends as ``""`` — clears the key, letting the layer
-        below show through. Anything else must be usable text: the caller is
-        asking for a change, so an unusable value is refused with the field
-        named (400), the posture every explicit ask gets here, while the
-        warn-and-fall-back treatment is reserved for the standing layers read at
-        start time.
+        Keys are the four launch-setting names plus ``checkin_window_seconds``
+        (issue #244), which is spelled as its config field because it is not a
+        launch flag and does not share their short-name vocabulary. Omitted keys
+        are left alone, so this is a patch of exactly what the caller named.
+        ``null`` — and the emptied text field a browser sends as ``""`` — clears
+        the key, letting the layer below show through. Anything else must be a
+        usable value: the caller is asking for a change, so an unusable one is
+        refused with the field named (400), the posture every explicit ask gets
+        here, while the warn-and-fall-back treatment is reserved for the standing
+        layers read at start time.
 
         Nothing restarts on a write, deliberately: the running incarnation keeps
         its context window, the reply says so (``note``), and the rotate verb is
-        one call away when the operator wants the new settings live.
+        one call away when the operator wants the new settings live. The window
+        is the one key that needs neither — the daemon's next tick reads it.
         """
+        accepted = sorted(ASSISTANT_SETTING_KEYS) + [_CHECKIN_WINDOW_KEY]
         if not isinstance(body, dict) or not body:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "name at least one setting to change — "
-                    f"{', '.join(sorted(ASSISTANT_SETTING_KEYS))}"
+                    f"{', '.join(accepted)}"
                 ),
             )
         changes: dict = {}
         for key, value in body.items():
+            if key == _CHECKIN_WINDOW_KEY:
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    changes[key] = None
+                    continue
+                try:
+                    changes[key] = validate_checkin_window(value)
+                except ConfigError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                continue
             if key not in ASSISTANT_SETTING_KEYS:
                 raise HTTPException(
                     status_code=400,
                     detail=(
                         f"unknown assistant setting {key!r}: expected one of "
-                        f"{', '.join(sorted(ASSISTANT_SETTING_KEYS))}"
+                        f"{', '.join(accepted)}"
                     ),
                 )
             field = ASSISTANT_SETTING_KEYS[key][0]

@@ -194,7 +194,7 @@ from typing import Iterable, Iterator, Optional
 from ask_channel.protocol import KIND_QUESTION, AskError
 
 from . import ask, registry, runs
-from .config import active_secret
+from .config import active_assistant_credential, active_secret
 from .session_io import SessionNotFound
 from .store import logs_dir
 
@@ -518,16 +518,32 @@ def _platform_secret() -> Optional[str]:
     transcript that persisted it would be a container-spawning credential
     sitting in a file the chat view serves to a browser.
     """
-    secret = active_secret()
-    if secret is None:
+    return _long_enough(active_secret(), what="secret")
+
+
+def _assistant_credential() -> Optional[str]:
+    """The assistant's minted credential, when there is one (issue #244).
+
+    :func:`_platform_secret`'s reason with more at stake: this credential reaches
+    a *container* whose transcript the chat view renders, so an incarnation that
+    runs ``env`` writes it into the file this module serves to a browser — and it
+    opens the same API as the shared secret.
+    """
+    return _long_enough(active_assistant_credential(), what="assistant credential")
+
+
+def _long_enough(value: Optional[str], *, what: str) -> Optional[str]:
+    """*value*, unless it is too short to tell from prose."""
+    if value is None:
         return None
-    if len(secret) < _MIN_SECRET_CHARS:
+    if len(value) < _MIN_SECRET_CHARS:
         logger.debug(
-            "platform_transcript_secret_too_short chars=%d — not masked by value; "
-            "a secret this short cannot be told from prose", len(secret),
+            "platform_transcript_secret_too_short kind=%s chars=%d — not masked "
+            "by value; a credential this short cannot be told from prose",
+            what, len(value),
         )
         return None
-    return secret
+    return value
 
 
 @dataclass
@@ -837,13 +853,9 @@ def locate_sources(session_id: str) -> list:
 
 
 def _run_key_of(entry: Optional[dict]) -> Optional[tuple]:
-    run = (entry or {}).get("run")
-    if not isinstance(run, dict):
-        return None
-    host, project, slug = run.get("host"), run.get("project"), run.get("slug")
-    if not (host and project and slug):
-        return None
-    return (host, project, slug)
+    """One entry's run key — :func:`lmer_platform.runs.run_key_of_entry`'s job,
+    reused rather than spelled again."""
+    return runs.run_key_of_entry(entry)
 
 
 def sessions_for_run(session_id: str) -> list:
@@ -856,20 +868,15 @@ def sessions_for_run(session_id: str) -> list:
     is the truthful answer rather than an empty view.
     """
     _validated(session_id)
-    entry = registry.read_session(session_id)
-    key = _run_key_of(entry)
+    # Both halves live in ``runs.run_for_session``, which the check-in stamping
+    # reads too: two resolutions of "which run is this session" is how the
+    # stamping surface came to be narrower than the serving one (issue #244).
+    key = runs.run_for_session(session_id)
 
     # Tolerant by its own contract: a corrupt index reads as empty rather than
     # raising, so there is nothing to guard against here.
     tracked = runs.list_tracked()
 
-    if key is None:
-        # The entry is gone (a clean exit removes it), so the run has to be found
-        # from the other side: the index remembers the last session per run.
-        for candidate in tracked:
-            if candidate.last_session_id == session_id:
-                key = (candidate.host, candidate.project, candidate.slug)
-                break
     if key is None:
         return [session_id]
 
@@ -915,15 +922,15 @@ def _scrub(text: str) -> str:
     (:func:`_present`, on every string this module emits) and the write path
     (:func:`scrub_transcript`, on the file left behind when a session ends).
 
-    The platform's own shared secret is struck out **first**, by value rather
-    than by shape (:func:`_platform_secret`). First because it is the one
-    replacement that cannot be wrong: a shape substitution that rewrote the text
-    around the secret could leave the value itself behind in a form no later
-    pattern recognises.
+    The platform's own credentials are struck out **first**, by value rather
+    than by shape (:func:`_platform_secret`, :func:`_assistant_credential`).
+    First because they are the replacements that cannot be wrong: a shape
+    substitution that rewrote the text around one could leave the value itself
+    behind in a form no later pattern recognises.
     """
-    secret = _platform_secret()
-    if secret:
-        text = text.replace(secret, _REDACTED)
+    for known in (_platform_secret(), _assistant_credential()):
+        if known:
+            text = text.replace(known, _REDACTED)
     for pattern, replacement in _CREDENTIAL_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
