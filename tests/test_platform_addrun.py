@@ -1624,14 +1624,39 @@ def test_the_taskdef_menu_can_still_express_a_name_the_host_cannot_see():
             )
 
 
-def test_the_form_has_exactly_one_menu_and_it_is_the_taskdef():
-    """The reversal is scoped: every other name field here is one the host has no
-    complete list for, so a second v-select would be a field with no way out."""
+#: The only fields that may be a menu, and the rule is the reason rather than the
+#: count: a ``v-select`` submits only what the host enumerated, so it is allowed
+#: exactly where the host's list is the complete one and a value outside it could
+#: not work anyway.
+#:
+#: - ``taskdef`` — the operator's call, on the reasoning that the list is static.
+#: - ``slot`` — service slots are declared in the *daemon's own* ``config.json``
+#:   and validated by the same process that serves this list, so unlike the
+#:   presets file (read where ``lmer`` runs, not where the daemon does) there is
+#:   no second place a name could come from. A slot the daemon does not declare is
+#:   refused with a 400, which makes free text here a field whose only useful
+#:   values are the enumerated ones.
+#:
+#: Every other name field stays free text — see
+#: :func:`test_the_preset_and_agent_name_fields_stay_free_text`.
+MENU_FIELDS = {"spawn.taskdef", "spawn.slot"}
+
+
+def test_only_the_fields_the_host_can_enumerate_are_menus():
+    """The reversal is scoped: a name field the host has no complete list for
+    must not be a menu, because that is a field with no way out."""
     text = _add_run_source()
 
-    assert text.count("<v-select") == 1
+    menus = re.findall(r'<v-select\b[^>]*?v-model="([^"]+)"', text, re.S)
+    assert set(menus) <= MENU_FIELDS, (
+        f"{sorted(set(menus) - MENU_FIELDS)} is a menu, but the host has no "
+        "complete list for it"
+    )
+    assert text.count("<v-select") == len(menus), (
+        "a v-select is bound to no field at all"
+    )
     assert _field_elements(text, "spawn.taskdef")[0].split()[0] == "v-select", (
-        "the one menu in this form is not the taskdef's"
+        "the taskdef field is no longer the menu the operator asked for"
     )
 
 

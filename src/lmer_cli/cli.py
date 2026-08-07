@@ -478,12 +478,47 @@ def _record_session_model(model: str | None) -> None:
         _record_platform_facts(model=model)
 
 
-def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+class ParseRefused(Exception):
+    """Raised instead of exiting when a *quiet* parse rejects its argv.
+
+    argparse prints usage and raises ``SystemExit``, which is right for a
+    command line and wrong for a caller that parses on a server path:
+    ``lmer_platform.slots`` asks "would these preset args rebind the slot?" on
+    every fleet-view poll, where the usage block would land in the daemon's log
+    and a swapped ``sys.stderr`` would be a process-global mutation on a
+    threadpool route.
+    """
+
+
+class _QuietParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` that raises rather than printing and exiting.
+
+    Every output path is closed, not just ``error()``: ``-h`` reaches
+    :meth:`exit` through ``print_help``, and both write through
+    ``_print_message``.
+    """
+
+    def error(self, message: str):  # pragma: no cover - exercised via parse_args
+        raise ParseRefused(message)
+
+    def exit(self, status: int = 0, message: str | None = None):
+        raise ParseRefused(message or f"parser exited with status {status}")
+
+    def _print_message(self, message, file=None):
+        return
+
+
+def parse_args(
+    argv: list[str], *, quiet: bool = False
+) -> tuple[argparse.Namespace, list[str]]:
     """
     Parse command-line arguments for lmerpy.
 
     Args:
         argv: List of command-line arguments to parse
+        quiet: Raise :class:`ParseRefused` instead of printing usage and
+            exiting, for callers that parse on a server path. Off by default, so
+            the command line behaves exactly as it did.
 
     Returns:
         Tuple of (parsed namespace, remaining args after known args)
@@ -498,7 +533,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         rest = argv[idx + 1:]
         argv = argv[:idx]
 
-    parser = argparse.ArgumentParser(prog="lmerpy", add_help=True)
+    parser_class = _QuietParser if quiet else argparse.ArgumentParser
+    parser = parser_class(prog="lmerpy", add_help=True)
     # Task is optional when --no-task is provided; otherwise required
     parser.add_argument("task", nargs="?", help="Task type (e.g., chat, review, develop, modernize)")
     parser.add_argument("target", nargs="*", help="Repository URL/path or PR/MR/issue URL. First target is primary (sets env vars), additional targets are cloned but don't override env vars.")

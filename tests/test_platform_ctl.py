@@ -386,6 +386,10 @@ ROUTE_TABLE = [
      {"taskdef": "review", "target": "mr-163", "preset": "sol", "agents": "2",
       "model": "opus", "harness": "codex", "ports": 2,
       "repo_url": "git@x:y.git", "description": "the follow-up review"}),
+    # A slot spawn names no preset: the slot supplies it (#245).
+    (["spawn", "develop", "issue-245", "--slot", "webapp"],
+     "POST", "/api/sessions", None,
+     {"taskdef": "develop", "target": "issue-245", "slot": "webapp"}),
     (["send", "s-1", "/followup rebase please"], "POST",
      "/api/sessions/s-1/input", None,
      {"data": "/followup rebase please", "append_newline": True}),
@@ -663,3 +667,77 @@ def test_standing_orders_can_be_written_from_stdin(
 
     read = ok(["orders", "get"], client, capsys)
     assert read["instructions"] == document.strip()
+
+
+# --- service slots (issue #245) ----------------------------------------------
+
+def test_spawn_reaches_a_slot_the_way_the_browser_does(
+    configured, client, platform_root, monkeypatch, capsys
+):
+    """One flag, so the assistant and the operator's shell get the same surface
+    the fleet view has."""
+    from lmer_platform import spawn as spawn_mod
+
+    captured = {}
+
+    def fake_spawn(config, request, kind="worker"):
+        captured["request"] = request
+        return spawn_mod.SpawnResult(
+            session_id="s-1", pid=4242,
+            log_path=platform_root / "logs" / "s-1.log",
+            host="gitlab.example.com", project="agents/global",
+            slug="develop-245", command=["lmer", "develop", "issue-245"],
+        )
+
+    monkeypatch.setattr(api, "spawn_session", fake_spawn)
+    payload = ok(
+        ["spawn", "develop", "issue-245", "--slot", "webapp"], client, capsys
+    )
+
+    assert payload["session_id"] == "s-1"
+    assert captured["request"].slot == "webapp"
+    assert captured["request"].preset is None, (
+        "the slot supplies the preset; ctl must not invent one"
+    )
+
+
+def test_a_spawn_naming_no_slot_omits_the_field(
+    configured, client, platform_root, monkeypatch, capsys
+):
+    from lmer_platform import spawn as spawn_mod
+
+    captured = {}
+
+    def fake_spawn(config, request, kind="worker"):
+        captured["request"] = request
+        return spawn_mod.SpawnResult(
+            session_id="s-1", pid=4242,
+            log_path=platform_root / "logs" / "s-1.log",
+            host="gitlab.example.com", project="agents/global",
+            slug="develop-1", command=["lmer", "develop", "issue-1"],
+        )
+
+    monkeypatch.setattr(api, "spawn_session", fake_spawn)
+    ok(["spawn", "develop", "issue-1"], client, capsys)
+
+    assert captured["request"].slot is None
+
+
+def test_an_occupied_slot_comes_back_as_a_409_the_assistant_can_relay(
+    configured, client, platform_root, monkeypatch, capsys
+):
+    """Like the cap's 429: an answer to relay, never something to retry."""
+    from lmer_platform import spawn as spawn_mod
+
+    def occupied(config, request, kind="worker"):
+        raise spawn_mod.SlotOccupied(
+            "service slot 'webapp' is already held by session s-7"
+        )
+
+    monkeypatch.setattr(api, "spawn_session", occupied)
+    payload = refused(
+        ["spawn", "develop", "issue-245", "--slot", "webapp"], client, capsys
+    )
+
+    assert payload["status"] == 409
+    assert "s-7" in payload["body"]["detail"]

@@ -3,6 +3,17 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { mdiFormatListBulleted, mdiMagnify, mdiPencil } from '@mdi/js'
 import { adoptRun, fetchCandidates, fetchSpawnOptions, spawnSession } from '../api.js'
 
+const props = defineProps({
+  // Convenience only: the daemon re-checks and refuses an occupied slot whoever
+  // is asking, so a list that went stale between polls costs a refusal rather
+  // than a session in a slot somebody else has (#245).
+  freeSlots: { type: Array, default: () => [] },
+  // Every declared slot, free or not. The picker offers only the free ones, but
+  // "all busy" and "no slots at all" must not render identically, and the slot
+  // rows live on the fleet screen rather than this one.
+  slots: { type: Array, default: () => [] },
+})
+
 const emit = defineEmits(['changed'])
 
 const mode = ref('spawn')
@@ -17,7 +28,7 @@ const mode = ref('spawn')
 // only the harness can, and it does so by rejecting what it does not know.
 const spawn = ref({
   taskdef: 'develop', target: '', repo_url: '', preset: '', agents: [],
-  model: '', ports: 0,
+  model: '', ports: 0, slot: null,
 })
 const busy = ref(false)
 const error = ref(null)
@@ -135,6 +146,20 @@ watch(
   },
 )
 
+// A slot and a preset are exclusive — the daemon refuses a request naming both.
+// They clear each other rather than one disabling the other: the preset field
+// has to stay typeable, since the host cannot enumerate every preset an
+// operator keeps in a file its own environment does not name.
+//
+// No loop between the two: each only clears on a value `typed` reads as
+// present, and what it writes is the empty one.
+watch(() => spawn.value.slot, (picked) => {
+  if (typed(picked)) spawn.value.preset = ''
+})
+watch(() => spawn.value.preset, (picked) => {
+  if (typed(picked)) spawn.value.slot = null
+})
+
 onMounted(() => {
   loadOptions()
   if (mode.value === 'adopt') loadCandidates()
@@ -195,6 +220,15 @@ const agentsSelection = computed(() =>
     .join(','),
 )
 
+// The service rides in the label: two slots on one host are told apart by what
+// they are bound to, not by whatever they were named.
+const slotItems = computed(() =>
+  props.freeSlots.map((slot) => ({
+    value: slot.name,
+    title: slot.service ? `${slot.name} — ${slot.service}` : slot.name,
+  })),
+)
+
 const canSpawn = computed(() =>
   Boolean(typed(spawn.value.taskdef) && typed(spawn.value.target)),
 )
@@ -211,10 +245,13 @@ async function doSpawn() {
       ports: Number(spawn.value.ports) || 0,
     }
     if (typed(spawn.value.repo_url)) payload.repo_url = typed(spawn.value.repo_url)
+    // Exclusive rather than ordered: the daemon refuses a request naming both,
+    // so the field the operator did not choose is not sent at all.
+    if (typed(spawn.value.slot)) payload.slot = typed(spawn.value.slot)
     // Omitted rather than sent empty: the daemon reads a present-but-blank
     // preset or agents as a value it must refuse, and an untouched field is not
     // a value at all.
-    if (typed(spawn.value.preset)) payload.preset = typed(spawn.value.preset)
+    else if (typed(spawn.value.preset)) payload.preset = typed(spawn.value.preset)
     if (agentsSelection.value) payload.agents = agentsSelection.value
     // Same rule for the model, and the same reason the field is not prefilled
     // with a guess: unset means "whatever this session's environment, preset or
@@ -313,11 +350,39 @@ async function doAdopt(candidate) {
             placeholder="https://git.example.com/group/project.git"
             class="mb-3"
           />
+          <!-- Only the free ones: a picker offering something the daemon will
+               refuse teaches the operator to distrust it. All busy is precisely
+               the state they need told, and it is invisible from this view
+               otherwise — a note rather than disabled items, because there is
+               nothing to choose (#245). -->
+          <v-alert
+            v-if="slots.length && !freeSlots.length"
+            type="info"
+            variant="tonal"
+            density="compact"
+            class="mb-3"
+          >
+            every service slot is busy or unusable
+            ({{ slots.map((slot) => slot.name).join(', ') }}) — spawn without
+            one, or wait for a slot to free.
+          </v-alert>
+          <v-select
+            v-if="freeSlots.length"
+            v-model="spawn.slot"
+            :items="slotItems"
+            label="service slot"
+            hint="takes the slot and runs against its dev service; supplies its own preset"
+            persistent-hint
+            clearable
+            class="mb-3"
+          />
           <v-combobox
             v-model="spawn.preset"
             :items="options.presets"
             label="preset"
-            hint="a named startup config from this host's presets file (--preset)"
+            :hint="spawn.slot
+              ? `the ${spawn.slot} slot supplies its preset — typing one here drops the slot`
+              : `a named startup config from this host's presets file (--preset)`"
             persistent-hint
             clearable
             class="mb-3"

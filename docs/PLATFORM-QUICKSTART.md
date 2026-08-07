@@ -138,6 +138,13 @@ conversation window is lost.
 - **Adopt / forget** — runs started outside the platform can be adopted into
   the fleet view (`+ run` → adopt, or `POST /api/runs/adopt`); ended runs can
   be forgotten from their card (undo window; nothing on disk is touched).
+- **Service slots** — named single-occupancy bindings from a runner to a dev
+  service on this host, declared under `slots` in `config.json` and shown as a
+  row each under the runs list. The spawn dialog's picker offers the free ones;
+  `lmer-ctl spawn … --slot <name>` takes one from a shell. Occupancy is derived
+  from live sessions, so a slot frees when its session's process ends and a
+  crash cannot strand one. Full reference:
+  [SERVICE-MODE.md](SERVICE-MODE.md#service-slots-several-agents-one-dev-stack).
 - **"stopped responding"** — a run whose session is up but whose agent stopped
   producing anything, with no stop recorded by the run itself. That is what a
   provider refusal looks like from outside: a spend limit, a `529 Overloaded`
@@ -184,6 +191,7 @@ conversation window is lost.
 | what | where |
 |---|---|
 | platform state, logs, UI | `~/.lmer/platform/` |
+| per-instance config (incl. service slots) | `~/.lmer/platform/config.json` |
 | shared secret | `lmer platform secret` |
 | per-session host log | `~/.lmer/platform/logs/<session-id>.log` |
 | events ledger | `~/.lmer/platform/events.jsonl` |

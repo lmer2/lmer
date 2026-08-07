@@ -18,8 +18,11 @@ import AssistantChat from './components/AssistantChat.vue'
 import RunCard from './components/RunCard.vue'
 import RunDetail from './components/RunDetail.vue'
 import RunNav from './components/RunNav.vue'
+import SlotRow from './components/SlotRow.vue'
 import { fetchState, forgetRun, prune, rescan } from './api.js'
-import { ago, attentionLabel, driverLabel, stateMeta, targetRef } from './format.js'
+import {
+  ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef,
+} from './format.js'
 import { rememberChoice, storedChoice } from './preferences.js'
 
 const POLL_MS = 10000
@@ -137,6 +140,13 @@ const runs = computed(() => state.value?.runs || [])
 const calm = computed(() => runs.value.filter((run) => !run.attention))
 const totals = computed(() => state.value?.totals || { runs: 0, live: 0, attention: 0 })
 const mirror = computed(() => state.value?.mirror || null)
+// Service slots (#245). Empty on a host that declares none, and the section
+// below then renders nothing rather than an explanatory card — a fixture nobody
+// configured is not news.
+const slots = computed(() => state.value?.slots || [])
+// Filtered here rather than in the dialog, so the row's wording and the
+// dialog's list come from one predicate.
+const freeSlots = computed(() => slots.value.filter(slotIsFree))
 
 // Staleness must be visible rather than silently wrong (spec R20): a fleet view
 // confidently showing week-old phases is worse than one admitting it can't tell.
@@ -550,7 +560,12 @@ onUnmounted(() => {
           @changed="load"
           @open="open"
         />
-        <AddRun v-else-if="view === 'add'" @changed="load" />
+        <AddRun
+          v-else-if="view === 'add'"
+          :free-slots="freeSlots"
+          :slots="slots"
+          @changed="load"
+        />
 
         <template v-else>
           <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
@@ -665,6 +680,22 @@ onUnmounted(() => {
                 >clear crashed sessions</v-btn>
               </v-card-text>
             </v-card>
+          </template>
+
+          <!-- Under the runs and never among them (#245): interleaving would put
+               rows that can never ask for anything into the list whose whole job
+               is to say who is asking. Outside the runs/empty-state branch
+               above, because a fleet tracking nothing is the state you are most
+               likely to be about to spawn into a slot from. -->
+          <template v-if="!loading && slots.length">
+            <div class="section-title">service slots</div>
+            <SlotRow
+              v-for="slot in slots"
+              :key="slot.name"
+              :row="slot"
+              :runs="runs"
+              @open="open"
+            />
           </template>
         </template>
       </v-container>

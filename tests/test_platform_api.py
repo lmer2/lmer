@@ -894,6 +894,186 @@ def test_asset_symlink_loop_is_a_404_not_a_500(client, built_ui):
     assert response.status_code == 404
 
 
+# --- service slots (issue #245) ----------------------------------------------
+
+# ``slot_host`` and its presets come from tests/conftest.py — one fake for
+# every module, with the real resolve_container's keyword-only signature.
+
+def _declare_slots(entries):
+    store.write_json(cfg.config_path(), {"slots": entries})
+
+
+def test_build_state_carries_a_row_per_declared_slot(platform_root, slot_host):
+    _declare_slots([
+        {"name": "webapp", "preset": "webapp_dev", "description": "Web app dev"},
+        {"name": "plain", "preset": "no_service"},
+    ])
+
+    payload = api.build_state(cfg.load())
+
+    assert [row["name"] for row in payload["slots"]] == ["webapp", "plain"]
+    assert payload["slots"][0] == {
+        "name": "webapp", "preset": "webapp_dev", "description": "Web app dev",
+        "service": "webapp-web", "state": "free", "reason": None,
+        "occupant": None, "occupants": [], "service_occupants": [],
+    }
+    assert payload["slots"][1]["state"] == "misconfigured"
+    assert "sets no service" in payload["slots"][1]["reason"]
+
+
+def test_build_state_has_an_empty_slots_list_when_none_are_declared(
+    platform_root, slot_host
+):
+    """A host that declares none is the ordinary case, not a missing key."""
+    assert api.build_state(cfg.load())["slots"] == []
+
+
+def test_an_occupied_row_names_the_run_holding_it(platform_root, slot_host):
+    import os
+
+    _declare_slots([{"name": "webapp", "preset": "webapp_dev"}])
+    registry.register(
+        "s-holder", pid=os.getpid(), slot="webapp",
+        run={"host": "gitlab.example.com", "project": "agents/global",
+             "slug": "develop-1"},
+    )
+
+    row = api.build_state(cfg.load())["slots"][0]
+
+    assert row["state"] == "occupied"
+    assert row["occupant"] == {
+        "session_id": "s-holder", "host": "gitlab.example.com",
+        "project": "agents/global", "slug": "develop-1",
+    }
+
+
+def test_a_crashed_session_does_not_hold_a_slot_in_the_payload(
+    platform_root, slot_host
+):
+    """The payload reads sessions with ``live_only=False`` so crashed runs stay
+    in the attention list — a dead entry must still not hold a slot."""
+    _declare_slots([{"name": "webapp", "preset": "webapp_dev"}])
+    registry.register(
+        "s-dead", pid=2**22, slot="webapp",
+        run={"host": "gitlab.example.com", "project": "agents/global",
+             "slug": "develop-2"},
+    )
+
+    payload = api.build_state(cfg.load())
+
+    assert payload["slots"][0]["state"] == "free"
+    # …and the crash is still visible, which is why the list is unfiltered.
+    assert payload["totals"]["runs"] == 1
+
+
+def test_the_spawn_route_passes_the_slot_through(client, platform_root, monkeypatch):
+    from lmer_platform import spawn as spawn_mod
+
+    captured = {}
+
+    def fake_spawn(config, request, kind="worker"):
+        captured["request"] = request
+        return spawn_mod.SpawnResult(
+            session_id="s-1", pid=4242,
+            log_path=platform_root / "logs" / "s-1.log",
+            host="gitlab.example.com", project="agents/global", slug="develop-1",
+            command=["lmer", "develop", "t"],
+        )
+
+    monkeypatch.setattr(api, "spawn_session", fake_spawn)
+    response = client.post(
+        "/api/sessions", headers=bearer_header(),
+        json={"taskdef": "develop", "target": "t", "slot": "webapp"},
+    )
+
+    assert response.status_code == 201
+    assert captured["request"].slot == "webapp"
+
+
+def test_spawning_into_an_occupied_slot_returns_409(
+    client, platform_root, monkeypatch
+):
+    """Well formed, and it works unchanged once the holder stops."""
+    from lmer_platform import spawn as spawn_mod
+
+    def occupied(config, request, kind="worker"):
+        raise spawn_mod.SlotOccupied(
+            "service slot 'webapp' is already held by session s-7"
+        )
+
+    monkeypatch.setattr(api, "spawn_session", occupied)
+    response = client.post(
+        "/api/sessions", headers=bearer_header(),
+        json={"taskdef": "develop", "target": "t", "slot": "webapp"},
+    )
+
+    assert response.status_code == 409
+    assert "s-7" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("detail", [
+    "unknown service slot 'wbeapp'",
+    "service slot 'webapp' is not usable: preset 'typo' is not defined on this host",
+])
+def test_an_unknown_or_unusable_slot_returns_400(
+    client, platform_root, monkeypatch, detail
+):
+    """400 rather than 409: no amount of waiting fixes either one."""
+    from lmer_platform import spawn as spawn_mod
+
+    def refused(config, request, kind="worker"):
+        raise spawn_mod.SpawnError(detail)
+
+    monkeypatch.setattr(api, "spawn_session", refused)
+    response = client.post(
+        "/api/sessions", headers=bearer_header(),
+        json={"taskdef": "develop", "target": "t", "slot": "webapp"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == detail
+
+
+def test_the_payload_names_every_holder_of_a_contended_slot(
+    platform_root, slot_host
+):
+    """The spawn gate's race is disclosed, not prevented — so the surface built
+    to answer "who has my dev service" has to report both holders rather than
+    name one and look settled."""
+    import os
+
+    _declare_slots([{"name": "webapp", "preset": "webapp_dev"}])
+    for session_id, slug in (("s-one", "develop-1"), ("s-two", "develop-2")):
+        registry.register(
+            session_id, pid=os.getpid(), slot="webapp",
+            run={"host": "gitlab.example.com", "project": "acme/app",
+                 "slug": slug},
+        )
+
+    row = api.build_state(cfg.load())["slots"][0]
+
+    assert row["state"] == "occupied"
+    assert [h["session_id"] for h in row["occupants"]] == ["s-one", "s-two"]
+    # The single-holder key stays, so an older client still reads something true.
+    assert row["occupant"]["session_id"] == "s-one"
+
+
+def test_two_slots_on_one_service_are_not_both_offered_in_the_payload(
+    platform_root, slot_host
+):
+    """Name-keyed exclusion let every slot resolving to one service read free."""
+    _declare_slots([
+        {"name": "a", "preset": "webapp_dev"},
+        {"name": "b", "preset": "webapp_alt"},
+    ])
+
+    rows = {row["name"]: row for row in api.build_state(cfg.load())["slots"]}
+
+    assert rows["a"]["state"] == "free"
+    assert rows["b"]["state"] == "misconfigured"
+    assert "already bound by slot 'a'" in rows["b"]["reason"]
+
+
 # --- the fleet row carries its check-in facts (issue #244) --------------------
 #
 # The operator's half of the check-in work: the daemon tells the orchestrator

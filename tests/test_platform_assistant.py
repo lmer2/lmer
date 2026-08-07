@@ -135,12 +135,23 @@ def kill(pid):
 
 @contextlib.contextmanager
 def started(config, **kwargs):
-    """Start an assistant and make sure it is gone by the end of the test."""
+    """Start an assistant and make sure it is gone by the end of the test.
+
+    "Gone" is waited for, not assumed. ``SIGKILL`` is asynchronous: the process
+    stays Running until the kernel schedules its death, so a liveness probe
+    straight after the kill can still read alive — measured at ~13% of attempts
+    on an idle machine and more under load. Every test that asserts on state
+    *after* this block was racing that transition; the one that surfaced it was
+    ``test_start_with_no_settings_is_todays_behaviour``, whose closing assertion
+    needs the entry to read dead. Waited for here rather than in each test, since
+    the promise is this helper's to keep.
+    """
     status = assistant.start(config, **kwargs)
     try:
         yield status
     finally:
         kill(status.pid)
+        wait_for(lambda: not registry.is_live({"pid": status.pid}))
 
 
 def wait_for(predicate, timeout=5.0):
