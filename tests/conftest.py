@@ -954,3 +954,54 @@ def denied_access(path):
 
     with mock.patch("os.access", guarded):
         yield
+
+
+# --- service slots (issue #245) ----------------------------------------------
+
+#: The presets a slot fixture host knows — one entry per shape the slot rules
+#: care about, in one place, because three modules carrying their own copy is
+#: how the three drifted.
+SLOT_PRESETS = {
+    "webapp_dev": {"checkout": "/srv/webapp", "service": "webapp-web"},
+    "other_dev": {"checkout": "/srv/other", "service": "other-web"},
+    # Resolves to the same service as webapp_dev — the collision rule.
+    "webapp_alt": {"checkout": "/srv/webapp", "service": "webapp-web"},
+    # Sets no service, so it cannot back a slot.
+    "no_service": {"checkout": "/srv/plain"},
+}
+
+
+@pytest.fixture
+def slot_host(tmp_path, monkeypatch):
+    """A host that knows :data:`SLOT_PRESETS`, with every service resolving.
+
+    Yields the list of ``(runtime, service_name, announce)`` the probe was asked
+    for, so a test can assert what was queried and what was not.
+
+    The fake's signature is a deliberate copy of the real
+    :func:`lmer_cli.service.resolve_container` — ``announce`` keyword-only. A
+    laxer fake (one that also accepts it positionally) passes a caller that
+    would fail against the real function, which is precisely the regression a
+    fake is supposed to catch.
+    """
+    import json as _json
+
+    from lmer_platform import slots as slots_mod
+
+    path = tmp_path / "slot-presets.json"
+    path.write_text(_json.dumps(SLOT_PRESETS), encoding="utf-8")
+    monkeypatch.setenv("LMER_PRESETS_FILE", str(path))
+
+    calls = []
+
+    def _resolve(runtime, service_name, *, announce=True):
+        calls.append((runtime, service_name, announce))
+        return "container-id"
+
+    monkeypatch.setattr(slots_mod, "resolve_container", _resolve)
+    monkeypatch.setattr(slots_mod, "_detected_runtime", lambda: "a-runtime")
+    # Module-level memos (probe answers, collision-warning dedup): no test may
+    # inherit another's.
+    slots_mod.clear_probe_cache()
+    yield calls
+    slots_mod.clear_probe_cache()

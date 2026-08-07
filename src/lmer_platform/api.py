@@ -126,9 +126,11 @@ from .session_io import ControlPlaneError, SessionIOError
 # that pair (T73). Private and reused deliberately, the same trade this module
 # already makes with ``lmer_cli.cli``'s discovery helpers: a second reading of a
 # repo URL here would offer the operator a tier the container never searches.
+from .slots import slot_rows
 from .spawn import (
     CapacityError,
     RunAlreadyLive,
+    SlotOccupied,
     SpawnError,
     SpawnRequest,
     _repo_urls,
@@ -670,6 +672,12 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
             "count": len(tracked),
             "runs": [entry.to_dict() for entry in tracked],
         },
+        # On this payload rather than a route of its own (#245): a second
+        # endpoint for the view to poll would be a second thing to keep in step.
+        # The sessions read above are passed in to save a registry read;
+        # ``slot_rows`` filters them for liveness itself, which matters because
+        # this list deliberately includes dead entries.
+        "slots": [row.to_dict() for row in slot_rows(config, sessions=sessions)],
     }
     payload.update(inventory.to_dict())
     _fold_checkins(payload)
@@ -1436,9 +1444,11 @@ def create_app(
     def create_session(body: dict) -> dict:
         """Spawn a session and start tracking its run.
 
-        Returns 429 at the concurrency cap rather than queueing: the queue and
-        slots that make waiting graceful land in M3, and silently dropping a spawn
-        request would be worse than refusing it with the numbers.
+        Returns 429 at the concurrency cap rather than queueing: the queue that
+        makes waiting graceful is still unbuilt, and silently dropping a spawn
+        request would be worse than refusing it with the numbers. Service slots
+        exist (issue #245) — a spawn naming an occupied one is refused here with
+        a 409, not queued.
 
         A 201 can still carry a ``warning``: a spawn whose run could not be
         identified starts a perfectly healthy session that is never recorded, so
@@ -1461,6 +1471,10 @@ def create_app(
                 agents=body.get("agents"),
                 harness=body.get("harness"),
                 model=body.get("model"),
+                # Not a launch flag like the four above it: the slot resolves
+                # against ``config.slots`` and supplies the preset, which is why
+                # naming both is refused rather than ordered (issue #245).
+                slot=body.get("slot"),
                 ports=body.get("ports") or 0,
                 extra_args=tuple(body.get("extra_args") or ()),
                 # The run's name in this fleet, and pointedly not part of the
@@ -1481,6 +1495,11 @@ def create_app(
         # answer and resume routes, so it is one of the ways a second session for
         # one run used to be a plain API call away.
         except RunAlreadyLive as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        # Before SpawnError, and a 409 for the same reason as the clause above:
+        # an occupied slot is a well-formed request that works once the holding
+        # session ends. Unknown or unusable falls through to the 400 (#245).
+        except SlotOccupied as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc))

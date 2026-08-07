@@ -162,9 +162,9 @@ Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume b
 ### [SERVICE-MODE.md](./SERVICE-MODE.md)
 **Service Mode**
 
-How `--service` and `--checkout` let lmer run against an already-running containerized project (Docker Compose stack, Podman pod, etc.) by `docker exec`-ing into the project's container instead of cloning a fresh copy.
+How `--service` and `--checkout` let lmer run against an already-running containerized project (Docker Compose stack, Podman pod, etc.) by `docker exec`-ing into the project's container instead of cloning a fresh copy. Plus **service slots**: named single-occupancy bindings from a runner to one of this host's dev services, declared in the platform's `config.json`, so several agents can share a host without two of them landing on one database.
 
-**Best for**: Working with projects whose tests require their own runtime environment (database fixtures, Django settings, etc.).
+**Best for**: Working with projects whose tests require their own runtime environment (database fixtures, Django settings, etc.), and handing out one dev stack across a fleet.
 
 ---
 

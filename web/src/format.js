@@ -56,8 +56,37 @@ const TONE_COLORS = {
   done: 'tone-done',
 }
 
+// Service slots (#245). Separate from STATE_META rather than an extension of
+// it: these describe a *slot*, not a run, and one shared map would leave half
+// its keys meaningless on either side. Keep in step with
+// lmer_platform.slots.SLOT_STATES.
+//
+// The tones are the same ramp read as "can I use this", and the two failures
+// are separated because they are fixed in different places — start the service,
+// or edit the config. The icons are not decoration: the ramp alone hands a
+// red/green-blind operator the same muddy tone for the usable row and the
+// broken one.
+const SLOT_META = {
+  free: { label: 'free', tone: 'live', icon: 'blank-circle' },
+  occupied: { label: 'in use', tone: 'idle', icon: 'circle' },
+  service_down: { label: 'service not running', tone: 'attention', icon: 'alert' },
+  misconfigured: { label: 'misconfigured', tone: 'bad', icon: 'alert-circle' },
+}
+
 export function stateMeta(state) {
   return STATE_META[state] || { label: state || 'unknown', tone: 'idle' }
+}
+
+// An unknown slot state paints and names itself rather than rendering blank —
+// a daemon newer than this bundle is what produces one.
+export function slotMeta(state) {
+  return SLOT_META[state] || { label: state || 'unknown', tone: 'idle', icon: 'alert' }
+}
+
+// One definition, so the row's wording and the spawn dialog's picker cannot
+// disagree about which slots are on offer.
+export function slotIsFree(slot) {
+  return slot?.state === 'free'
 }
 
 // An unmapped tone must still paint something: an undefined colour renders as an

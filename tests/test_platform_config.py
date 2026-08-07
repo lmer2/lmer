@@ -1055,6 +1055,48 @@ def test_a_non_string_stored_value_is_serialized_not_hidden(platform_root):
     assert settings["model"].stored == "5"
 
 
+# --- service slots (issue #245) ----------------------------------------------
+
+def test_slots_default_to_none_declared(platform_root):
+    assert cfg.load().slots == ()
+
+
+def test_slots_survive_a_save_load_round_trip(platform_root):
+    entries = [{"name": "webapp", "preset": "webapp_dev", "description": "Web app"}]
+    cfg.save(cfg.load(overrides={"slots": entries}))
+
+    assert cfg.load().slots == tuple(entries)
+
+
+def test_update_stored_writes_slots_without_baking_in_the_environment(
+    platform_root, monkeypatch
+):
+    """The settings write path reaches slots like any other stored field."""
+    monkeypatch.setenv(cfg.ENV_BIND_ADDRESS, "0.0.0.0")
+    entries = [{"name": "webapp", "preset": "webapp_dev"}]
+
+    stored = cfg.update_stored({"slots": entries})
+
+    assert stored["slots"] == entries
+    assert "bind_address" not in stored
+
+
+def test_no_environment_variable_declares_slots(platform_root, monkeypatch):
+    """Declaring slots is once-per-host file work; a JSON list in an export is
+    a footgun, so there is deliberately no override for it."""
+    monkeypatch.setenv("LMER_PLATFORM_SLOTS", '[{"name": "x", "preset": "y"}]')
+
+    assert cfg.load().slots == ()
+
+
+def test_a_slots_entry_is_not_parsed_at_the_config_layer(platform_root):
+    """A daemon that refuses to boot over a mistyped slot cannot be used to fix
+    the slot, so the entries arrive here exactly as the file spells them."""
+    store.write_json(cfg.config_path(), {"slots": [{"nonsense": True}]})
+
+    assert cfg.load().slots == ({"nonsense": True},)
+
+
 # --- the check-in window (issue #244) ----------------------------------------
 #
 # Not a launch setting and deliberately not in ASSISTANT_SETTING_KEYS: those
@@ -1132,6 +1174,7 @@ def test_validate_checkin_window_refuses_an_explicit_bad_value(platform_root):
 def test_validate_checkin_window_accepts_numeric_text(platform_root):
     assert cfg.validate_checkin_window("7200") == 7200
     assert cfg.validate_checkin_window(0) == 0
+
 
 # --- halt-detection thresholds (#243) ----------------------------------------
 #

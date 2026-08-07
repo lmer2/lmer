@@ -326,6 +326,16 @@ class PlatformConfig:
     assistant_harness: Optional[str] = None
     assistant_preset: Optional[str] = None
     assistant_agents: Optional[str] = None
+    #: Service slots this host declares (issue #245) — the raw ``config.json``
+    #: entries, deliberately unparsed here. :mod:`lmer_platform.slots` turns
+    #: them into definitions and skips a malformed one with a warning; parsing
+    #: at this layer would make a typo in one slot either raise at boot — and a
+    #: daemon that will not start cannot be reconfigured through its own UI — or
+    #: leave this field holding a shape the file does not have.
+    #:
+    #: No environment override, unlike every scalar above it: a JSON list in an
+    #: env var is a footgun, and declaring slots is once-per-host file work.
+    slots: tuple = ()
     #: How long a run may go unchecked before the daemon spools a digest naming
     #: it (issue #244), in seconds. ``0`` disables check-in digests; see
     #: :data:`ENV_CHECKIN_WINDOW` for why this sits apart from the four above.
@@ -441,10 +451,33 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         cleaned = _assistant_value(value, field=field_name)
         if cleaned != value:
             config = replace(config, **{field_name: cleaned})
+    slots = _slots_value(config.slots)
+    if slots != config.slots:
+        config = replace(config, slots=slots)
     window = _checkin_window_value(config.checkin_window_seconds)
     if window != config.checkin_window_seconds:
         config = replace(config, checkin_window_seconds=window)
     return config
+
+
+def _slots_value(value: object) -> tuple:
+    """The service-slot entries as a tuple, or ``()`` with a warning.
+
+    The :func:`_assistant_value` house rule rather than :func:`_validate`'s
+    refusals: ``slots`` is read long after boot, and a daemon that refuses to
+    start over a mistyped slot cannot be used to fix the slot. Only the
+    container is checked here; what an entry must look like is
+    :mod:`lmer_platform.slots`' rule.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    logger.warning(
+        "platform_config_unusable field=slots value=%r — expected a list of "
+        "slot entries; no service slots are declared", value,
+    )
+    return ()
 
 
 def _checkin_window_value(value: object) -> int:

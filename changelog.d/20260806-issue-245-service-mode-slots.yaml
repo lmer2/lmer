@@ -1,0 +1,4 @@
+added:
+- "Platform: service slots — named single-occupancy bindings from a runner to a dev service, declared in `config.json` and spawnable from the fleet view, API or `lmer-ctl` (#245)"
+- "Platform: one dev service takes one slot — a slot whose preset cannot back it is refused, and a spawn contending for a held service gets a 409 (#245)"
+- "lmer CLI: `parse_args(..., quiet=True)` raises `ParseRefused` instead of printing usage and exiting; the command line is unchanged (#245)"

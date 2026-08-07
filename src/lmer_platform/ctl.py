@@ -374,7 +374,7 @@ def _call_spawn_options(args) -> Call:
 def _call_spawn(args) -> Call:
     body = {"taskdef": args.taskdef, "target": args.target}
     body.update(_given(args, (
-        "repo_url", "preset", "agents", "harness", "model", "ports",
+        "repo_url", "preset", "agents", "harness", "model", "ports", "slot",
         "title", "description",
     )))
     return Call("POST", "/api/sessions", body=body)
@@ -602,6 +602,13 @@ def create_parser() -> argparse.ArgumentParser:
     spawn.add_argument("--harness", help="claude, codex, pi — whatever the host has.")
     spawn.add_argument("--model", help="Model override.")
     spawn.add_argument("--ports", type=int, help="How many ports to publish.")
+    spawn.add_argument(
+        "--slot",
+        help=(
+            "A free service slot to occupy, by name (see `status`). The slot "
+            "supplies its own preset, so this and --preset are exclusive."
+        ),
+    )
     spawn.add_argument(
         "--title",
         help="The run's label in the fleet view, in the operator's words.",

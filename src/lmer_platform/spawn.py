@@ -125,7 +125,7 @@ import shutil
 import subprocess
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -139,7 +139,7 @@ from lmer_cli.supervisor import (
 )
 from work_repo import run_state
 
-from . import ask, meta, registry, runs
+from . import ask, meta, registry, runs, slots
 from .config import ENV_REPO_URL, PlatformConfig, configured_repo_url
 from .store import StoreError, append_event, logs_dir, utc_now_iso
 from . import store
@@ -147,7 +147,8 @@ from . import store
 logger = logging.getLogger("lmer_platform.spawn")
 
 __all__ = [
-    "SpawnError", "CapacityError", "RunAlreadyLive", "live_session_for_run",
+    "SpawnError", "CapacityError", "RunAlreadyLive", "SlotOccupied",
+    "live_session_for_run",
     "SpawnRequest", "SpawnResult", "ANSWER_FLAG",
     "wait_for_exit_recorded",
     "PRESET_FLAG", "AGENTS_FLAG", "MODEL_FLAG", "NO_REPO_ENV",
@@ -303,6 +304,16 @@ class RunAlreadyLive(SpawnError):
     :class:`CapacityError` is: the request was well formed and the same request
     will work once that session stops, so it is a 409 rather than the 400 a bare
     ``SpawnError`` means.
+    """
+
+
+class SlotOccupied(SpawnError):
+    """Raised when the service slot a spawn asked for is already held.
+
+    A 409 for the reason :class:`CapacityError` and :class:`RunAlreadyLive` are:
+    nothing about the request is wrong and it works unchanged once the holding
+    session ends. An *unknown* or *unusable* slot is a bare :class:`SpawnError`
+    and a 400, because no amount of waiting fixes it.
     """
 
 
@@ -481,6 +492,11 @@ class SpawnRequest:
     #: The longer form of the same note, markdown, for a spawn that has more to say
     #: about why the run exists than a label can hold.
     description: Optional[str] = None
+    #: The service slot to occupy (issue #245). Unlike every other field here it
+    #: names nothing in argv: the slot resolves against ``config.slots`` and it
+    #: is the slot's *preset* that is emitted, which is what makes occupying a
+    #: slot and running in service mode one act rather than two that must agree.
+    slot: Optional[str] = None
 
     def validate(self) -> "SpawnRequest":
         if not isinstance(self.taskdef, str) or not self.taskdef.strip():
@@ -524,6 +540,18 @@ class SpawnRequest:
             _reject_option_value(name, value)
         if self.agents is not None:
             _reject_empty_agent_selection(self.agents)
+        if self.slot is not None:
+            if not isinstance(self.slot, str) or not self.slot.strip():
+                raise SpawnError(f"slot must be non-empty text, got {self.slot!r}")
+            # A contradiction rather than a precedence question, like
+            # ``no_repo`` beside a repo URL: dropping either one silently would
+            # grant a slot against a service the session never opened.
+            if self.preset is not None:
+                raise SpawnError(
+                    f"slot {self.slot!r} is set together with preset "
+                    f"{self.preset!r}: a slot supplies its own preset, so name "
+                    "one or the other"
+                )
         # A contradiction rather than a precedence question: silently dropping
         # one of the two would mean a caller believing it named a repository and
         # a session that has none, or the reverse.
@@ -1729,6 +1757,83 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
     _exit_event(session_id).set()
 
 
+def _claim_slot(
+    config: PlatformConfig, request: SpawnRequest
+) -> tuple:
+    """Check the requested service slot and fill its preset in (issue #245).
+
+    Returns ``(request, service)``: unchanged and ``None`` when no slot was
+    asked for, otherwise a copy carrying the slot's preset and the dev service
+    it resolved to. The service is returned so it can be *recorded* on the
+    session's entry — occupancy by service then reads what this session took
+    rather than re-deriving it from a presets file that may have changed since.
+    Nothing else is written: the claim *is* that registry entry, which is why
+    there is no release path and a session that dies frees its slot unaided.
+
+    Refusals run permanent-before-transient, so an operator hears the thing they
+    have to fix rather than the one that might pass on a retry. The
+    service-occupancy check is not redundant with the name-keyed one above it:
+    the one-service-one-slot rule is derived from the presets file, which is hot
+    by design, so a slot that was unusable when a session started can become its
+    service's first resolver once the operator fixes it — at which point only
+    the running sessions still say the service is taken.
+
+    The probe is uncached here: a poll can afford a stale answer, an action
+    taken on one cannot.
+
+    This does **not** make the claim atomic. The occupancy read and the
+    ``registry.register`` that records it are separated by the process start, so
+    two spawns racing for one free slot can both get past — the same
+    read-then-act window :func:`_refuse_if_run_is_live` and the concurrency cap
+    already have, and left open the same way, because closing it means holding a
+    lock across every spawn rather than changing anything about slots. The cost
+    is therefore reported and not prevented:
+    :func:`lmer_platform.slots._held` returns *every* holder, the row says how
+    many there are, and the daemon logs ``slot_double_occupancy``.
+    """
+    if request.slot is None:
+        return request, None
+
+    status = slots.slot_status(config, request.slot, cached=False)
+    if status is None:
+        declared = [d.name for d in slots.slot_definitions(config)]
+        raise SpawnError(
+            f"unknown service slot {request.slot!r}"
+            + (
+                f" — this host declares {', '.join(sorted(declared))}"
+                if declared else " — this host declares no service slots"
+            )
+        )
+    if status.unusable_reason is not None:
+        raise SpawnError(
+            f"service slot {request.slot!r} is not usable: "
+            f"{status.unusable_reason}"
+        )
+    if status.occupant is not None:
+        held_by = status.occupant.get("session_id")
+        raise SlotOccupied(
+            f"service slot {request.slot!r} is already held by session "
+            f"{held_by}"
+        )
+    # The slot's *name* is free but its dev service is not. Only reachable when
+    # the presets file changed under a running session, which is why this is
+    # measured from the sessions rather than derived from the file.
+    if status.service_occupants:
+        raise SlotOccupied(
+            f"service slot {request.slot!r}: {status.service_busy_reason}"
+        )
+    if status.service_down_reason is not None:
+        raise SpawnError(
+            f"service slot {request.slot!r} targets service "
+            f"{status.service!r}, which is not running: "
+            f"{status.service_down_reason}"
+        )
+
+    # ``validate`` has already refused a request naming both, so the preset
+    # field is empty and this fills it.
+    return replace(request, preset=status.definition.preset), status.service
+
+
 def spawn_session(
     config: PlatformConfig,
     request: SpawnRequest,
@@ -1739,9 +1844,14 @@ def spawn_session(
 
     Raises :class:`CapacityError` when the configured concurrency cap is already
     met — enforced here rather than in the caller so every spawn path (the API, the
-    assistant's own start) is bounded by the same check. The queue and slots that
-    make waiting graceful arrive in M3; until then a spawn over cap is simply
+    assistant's own start) is bounded by the same check. The queue that makes
+    waiting graceful is still unbuilt; until then a spawn over cap is simply
     refused with the numbers in the message.
+
+    Raises :class:`SlotOccupied` — or a bare :class:`SpawnError` for a slot that
+    is unknown or unusable — when ``request.slot`` names a service slot this
+    spawn cannot have (:func:`_claim_slot`), which is also where a slot spawn
+    gets its preset filled in.
 
     ``max_concurrent_sessions`` counts *workers*: see :func:`_live_worker_count`
     for why the assistant is not one of them.
@@ -1760,6 +1870,10 @@ def spawn_session(
             f"concurrency cap reached: {live}/{config.max_concurrent_sessions} "
             "worker sessions already running"
         )
+
+    # After the cap, so a host that is simply full says so rather than blaming
+    # the slot.
+    request, slot_service = _claim_slot(config, request)
 
     # Two URLs, because "what this run's repo is" and "what its identity is
     # derived from" are separable claims — only the first is recorded anywhere.
@@ -1891,8 +2005,15 @@ def spawn_session(
             # this key answers "which model is driving this run" rather than
             # only "which model was requested".
             "model": request.model,
+            # Recorded rather than re-derived, because the presets file is hot:
+            # a slot repointed while this session runs must not change what it
+            # is understood to be holding (issue #245).
+            "slot_service": slot_service,
         },
         run={"host": host, "project": project, "slug": slug},
+        # The *only* record that the slot is taken — nothing writes an occupancy
+        # file — so a session that dies takes its claim with it (issue #245).
+        slot=request.slot,
         # Reachability, minus the credential: ``token_ref`` is a path, and
         # registry.register rejects an inline ``token`` outright (spec §6.2).
         control={

@@ -2480,3 +2480,278 @@ def test_the_event_table_cannot_grow_without_bound(config):
     # ago has already lost whatever race it cared about.
     assert "synthetic-0" not in spawn._EXIT_RECORDED
     assert f"synthetic-{spawn._EXIT_RECORDED_CAP + 24}" in spawn._EXIT_RECORDED
+
+
+# --- service slots (issue #245) ----------------------------------------------
+#
+# The gate, not the slot layer: what a spawn does with a slot, which refusal it
+# raises for which condition, and that the claim lands on the registry entry.
+# How a slot's state is *derived* is tests/test_platform_slots.py.
+
+# ``slot_host`` and its presets come from tests/conftest.py — one fake for
+# every module, with the real resolve_container's keyword-only signature.
+
+
+def slot_config(fake_lmer, entries=None):
+    return cfg.load({
+        "lmer_bin": str(fake_lmer),
+        "slots": entries if entries is not None else [
+            {"name": "webapp", "preset": "webapp_dev", "description": "Web app dev"},
+        ],
+    })
+
+
+def test_a_slot_spawn_emits_the_slots_preset(platform_root, fake_lmer, slot_host):
+    """Occupying a slot *is* running in service mode — one act, not two that
+    have to agree."""
+    result = spawn.spawn_session(
+        slot_config(fake_lmer), request_for(slot="webapp")
+    )
+
+    assert "--preset" in result.command
+    assert result.command[result.command.index("--preset") + 1] == "webapp_dev"
+
+
+def test_a_slot_spawn_records_the_slot_on_the_registry_entry(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """The entry is the only record that the slot is taken."""
+    # The watcher reaps on a clean exit, so without this the stub exits before
+    # the assertion under load and the entry is legitimately gone — green on an
+    # idle machine, red in a gate run.
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(
+        slot_config(fake_lmer), request_for(slot="webapp")
+    )
+
+    try:
+        assert registry.read_session(result.session_id)["slot"] == "webapp"
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_a_spawn_naming_no_slot_leaves_the_field_none(config, monkeypatch):
+    """Nothing about an ordinary spawn changes."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for())
+
+    try:
+        assert registry.read_session(result.session_id)["slot"] is None
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_an_unknown_slot_is_refused_and_names_what_is_declared(
+    platform_root, fake_lmer, slot_host
+):
+    """A typo'd slot must not produce a session that quietly holds nothing."""
+    with pytest.raises(spawn.SpawnError, match="unknown service slot 'wbeapp'") as exc:
+        spawn.spawn_session(slot_config(fake_lmer), request_for(slot="wbeapp"))
+
+    assert "webapp" in str(exc.value)
+    assert not isinstance(exc.value, spawn.SlotOccupied)
+
+
+def test_an_unknown_slot_on_a_host_with_none_says_so(
+    platform_root, fake_lmer, slot_host
+):
+    with pytest.raises(spawn.SpawnError, match="declares no service slots"):
+        spawn.spawn_session(slot_config(fake_lmer, []), request_for(slot="webapp"))
+
+
+@pytest.mark.parametrize("preset, fragment", [
+    ("typo_dev", "not defined on this host"),
+    ("no_service", "sets no service"),
+])
+def test_an_unusable_slot_is_refused_with_its_reason(
+    platform_root, fake_lmer, slot_host, preset, fragment
+):
+    """400, not 409: no amount of waiting fixes a definition."""
+    config = slot_config(fake_lmer, [{"name": "webapp", "preset": preset}])
+
+    with pytest.raises(spawn.SpawnError, match="is not usable") as exc:
+        spawn.spawn_session(config, request_for(slot="webapp"))
+
+    assert fragment in str(exc.value)
+    assert not isinstance(exc.value, spawn.SlotOccupied)
+
+
+def test_an_occupied_slot_raises_slot_occupied_naming_the_holder(
+    platform_root, fake_lmer, slot_host
+):
+    registry.register("s-holder", pid=os.getpid(), slot="webapp")
+
+    with pytest.raises(spawn.SlotOccupied, match="s-holder"):
+        spawn.spawn_session(slot_config(fake_lmer), request_for(slot="webapp"))
+
+
+def test_slot_occupied_is_a_spawn_error(config):
+    """So a caller that only knows the base class still refuses the spawn."""
+    assert issubclass(spawn.SlotOccupied, spawn.SpawnError)
+
+
+def test_a_dead_holder_does_not_hold_the_slot(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """The stranding case: a session that died without cleaning up."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    registry.register("s-dead", pid=2**22, slot="webapp")
+
+    result = spawn.spawn_session(slot_config(fake_lmer), request_for(slot="webapp"))
+
+    try:
+        assert registry.read_session(result.session_id)["slot"] == "webapp"
+    finally:
+        # This file's convention at 23 other FAKE_LMER_SLEEP sites: the stub is
+        # kept alive only to outlast the assertion, and leaving it running would
+        # hand the rest of the suite a sleeping child, its PTY, a drain thread —
+        # and here a live entry still holding slot 'webapp'.
+        os.kill(result.pid, 9)
+
+
+def test_a_slot_whose_service_is_down_is_refused(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    from lmer_platform import slots as slots_mod
+    from lmer_cli.service import ServiceError
+
+    def _down(runtime, service_name, *, announce=True):
+        raise ServiceError(f"No running container matched '{service_name}'")
+
+    monkeypatch.setattr(slots_mod, "resolve_container", _down)
+    slots_mod.clear_probe_cache()
+
+    with pytest.raises(spawn.SpawnError, match="which is not running") as exc:
+        spawn.spawn_session(slot_config(fake_lmer), request_for(slot="webapp"))
+
+    assert "webapp-web" in str(exc.value)
+
+
+def test_the_spawn_gate_probes_the_service_uncached(
+    platform_root, fake_lmer, slot_host
+):
+    """An action taken on the answer cannot afford a stale one."""
+    from lmer_platform import slots as slots_mod
+
+    config = slot_config(fake_lmer)
+    slots_mod.slot_rows(config)  # warms the memo the fleet view uses
+    assert len(slot_host) == 1
+
+    spawn.spawn_session(config, request_for(slot="webapp"))
+
+    assert len(slot_host) == 2
+
+
+def test_slot_and_preset_together_are_a_contradiction(
+    platform_root, fake_lmer, slot_host
+):
+    """Naming both says two different things about which service this targets."""
+    with pytest.raises(spawn.SpawnError, match="a slot supplies its own preset"):
+        spawn.spawn_session(
+            slot_config(fake_lmer), request_for(slot="webapp", preset="webapp_dev")
+        )
+
+
+@pytest.mark.parametrize("bad", ["", "   ", 7])
+def test_an_unusable_slot_value_is_refused_before_anything_is_created(
+    platform_root, fake_lmer, slot_host, bad
+):
+    with pytest.raises(spawn.SpawnError, match="slot must be non-empty text"):
+        spawn.spawn_session(slot_config(fake_lmer), request_for(slot=bad))
+
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_the_slot_gate_and_the_cap_refuse_independently(
+    platform_root, fake_lmer, slot_host
+):
+    """Spec §6.4: two gates, not one combined number.
+
+    A free slot on a capped host still refuses, and an occupied slot on an idle
+    host still refuses — each naming which gate closed.
+    """
+    capped = cfg.load({
+        "lmer_bin": str(fake_lmer),
+        "max_concurrent_sessions": 1,
+        "slots": [{"name": "webapp", "preset": "webapp_dev"}],
+    })
+    # A live worker that holds no slot: the host is full, the slot is free.
+    registry.register("s-worker", pid=os.getpid())
+
+    with pytest.raises(spawn.CapacityError, match="1/1"):
+        spawn.spawn_session(capped, request_for(slot="webapp"))
+
+    # The mirror image: room on the host, but the slot is taken.
+    roomy = cfg.load({
+        "lmer_bin": str(fake_lmer),
+        "max_concurrent_sessions": 10,
+        "slots": [{"name": "webapp", "preset": "webapp_dev"}],
+    })
+    registry.register("s-holder", pid=os.getpid(), slot="webapp")
+
+    with pytest.raises(spawn.SlotOccupied, match="s-holder"):
+        spawn.spawn_session(roomy, request_for(slot="webapp"))
+
+
+def test_a_refused_slot_spawn_leaves_nothing_behind(
+    platform_root, fake_lmer, slot_host
+):
+    """The gate runs before the port is drawn and the directories are made."""
+    registry.register("s-holder", pid=os.getpid(), slot="webapp")
+    before = sorted(p.name for p in platform_root.rglob("*") if p.is_file())
+
+    with pytest.raises(spawn.SlotOccupied):
+        spawn.spawn_session(slot_config(fake_lmer), request_for(slot="webapp"))
+
+    assert sorted(p.name for p in platform_root.rglob("*") if p.is_file()) == before
+
+
+def test_a_slot_spawn_records_the_service_it_resolved(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """So occupancy by service reads what this session took, not what the
+    presets file says later (review iteration 2)."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(
+        slot_config(fake_lmer), request_for(slot="webapp")
+    )
+
+    try:
+        task = registry.read_session(result.session_id)["task"]
+        assert task["slot_service"] == "webapp-web"
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_an_ordinary_spawn_records_no_slot_service(config, monkeypatch):
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for())
+
+    try:
+        assert registry.read_session(result.session_id)["task"]["slot_service"] is None
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_a_spawn_is_refused_when_its_service_is_held_under_another_slot(
+    platform_root, fake_lmer, slot_host, monkeypatch, tmp_path
+):
+    """The iteration-2 residual, at the gate: a 409, because it clears when the
+    holding session ends."""
+    presets = tmp_path / "hot.json"
+    presets.write_text(json.dumps({
+        "clean": {"checkout": "/srv/w", "service": "web"},
+        "p_a": {"checkout": "/srv/w", "service": "web"},
+    }), encoding="utf-8")
+    monkeypatch.setenv("LMER_PRESETS_FILE", str(presets))
+    config = cfg.load({
+        "lmer_bin": str(fake_lmer),
+        "slots": [{"name": "a", "preset": "p_a"}, {"name": "b", "preset": "clean"}],
+    })
+    registry.register(
+        "s-b", pid=os.getpid(), slot="b",
+        task={"preset": "clean", "slot_service": "web"},
+    )
+
+    with pytest.raises(spawn.SlotOccupied, match="already in use by s-b"):
+        spawn.spawn_session(config, request_for(slot="a"))

@@ -1668,7 +1668,14 @@ class TestTtyInputPending:
                 "a partial line is invisible to the count, so it must stay unknown"
             )
             os.write(master, b"\r")
-            pending = supervisor._tty_input_pending(path)
+            # Through _settled, for the reason its own docstring gives: the line
+            # discipline is fed by deferred work, so the probe straight after
+            # this write legitimately reads zero and asserting on the first
+            # reading is asserting on that race. It passed on an idle runner and
+            # failed twice on a loaded one (MR !203 CI), which is the shape of a
+            # test measuring arrival latency rather than the kernel fact it is
+            # about.
+            pending = self._settled(path, 1)
             assert pending is not None and pending > 0, (
                 f"a complete line is countable in canonical mode too: {pending}"
             )
