@@ -262,13 +262,24 @@ class SessionManager:
 
         A token-selected *preset* also **displaces** any listener-wide default
         (see :func:`listener_default_preset`) rather than stacking with it:
-        every preset selector is removed from the child's environment, so the
-        spawned CLI resolves no preset of its own. Displacement is total by
-        construction — the default is never loaded, so none of its values
-        survive and none of its keys are inherited where the token's preset
-        leaves them unset (issue #181). Without this the two merged under two
-        different rules: the token's env won conflicts while the default
-        silently filled every gap.
+        every preset selector is set to the empty string in the child's
+        environment, so the spawned CLI resolves no preset of its own. Blank is
+        the selector contract's "unset" (see
+        :func:`~lmer_cli.presets.select_preset_name`), and it is blank rather
+        than absent because the child seeds its environment first-wins from
+        ``.env`` files — the forwarded ``--env-file`` included. An absent key is
+        one a file may re-supply, which would hand the child the very default
+        this displaces; a present-but-blank key is not seeded at any file tier
+        of the spawned CLI's own environment. The container environment that
+        CLI then builds merges the forwarded ``--env-file`` under different
+        rules and can still carry the selector — a tier this displacement does
+        not reach, and safe only while nothing inside the container reads the
+        selectors (see issue #259 for the family of blind spots).
+        Displacement is total by construction — the default is never loaded, so
+        none of its values survive and none of its keys are inherited where the
+        token's preset leaves them unset (issue #181). Without this the two
+        merged under two different rules: the token's env won conflicts while
+        the default silently filled every gap.
 
         Raises:
             RuntimeError: If a running session already exists for the
@@ -298,13 +309,15 @@ class SessionManager:
         displaced_name, displaced_source = (None, None)
         if preset is not None:
             # Whatever the environment would have selected is displaced, so
-            # read it before stripping — the spawn log names it.
+            # read it before blanking — the spawn log names it.
             displaced_name, displaced_source = listener_default_preset(env)
-            # Stripping runs before the preset's own env, so a preset that
-            # deliberately sets a selector (an operator chaining a default)
-            # still takes effect.
+            # Blank, not absent: the child seeds its environment from .env
+            # files first-wins, so deleting a selector only invites a file to
+            # put the default back. Blanking runs before the preset's own env,
+            # so a preset that deliberately sets a selector (an operator
+            # chaining a default) still takes effect.
             for var in preset_selector_vars(CHAT_TASK_ID):
-                env.pop(var, None)
+                env[var] = ""
             # Preset options are `chat` subcommand flags / args, appended after.
             cmd += preset.cli_tokens()
             env.update(preset.env)

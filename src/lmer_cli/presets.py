@@ -237,11 +237,11 @@ def preset_selector_vars(task_id: str | None) -> list[str]:
     derivable name (see :func:`task_preset_env_name`).
 
     This is the single home of the candidate list, shared by the selector
-    itself and by spawners that need to *remove* the selectors from a child's
-    environment: the Slack listener strips them when a ``$preset:`` token
+    itself and by spawners that need to *unset* the selectors in a child's
+    environment: the Slack listener blanks them when a ``$preset:`` token
     selected a preset, so the token displaces the listener-wide default whole
     rather than stacking with it (issue #181). Keeping both callers on one
-    list is what stops "what selects" and "what gets stripped" from drifting
+    list is what stops "what selects" and "what gets unset" from drifting
     apart when a future selector is added.
     """
     task_env = task_preset_env_name(task_id)

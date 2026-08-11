@@ -4,8 +4,8 @@ changed:
   `lmer chat` invocation inheriting the listener's environment, so a
   `LMER_CHAT_PRESET` there selects a preset for all of them; when a token also
   selected one, the two merged under two different rules — the token's `env` won
-  conflicts while the default silently filled every gap. A token now removes every
-  preset selector from the spawned session's environment, so the default is never
+  conflicts while the default silently filled every gap. A token now blanks every
+  preset selector in the spawned session's environment, so the default is never
   loaded: none of its values survive and none of its keys are inherited where the
   token's preset leaves them unset (#181)"
 - "Slack listener: the connecting ack now names the preset actually in effect — the

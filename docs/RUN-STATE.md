@@ -354,7 +354,7 @@ quietly claim the work is safe:
 {"ts": "…", "session": "…", "type": "commit_deferred",
  "note": "work-repo commit deferred while gate-check was in flight",
  "data": {"gate": "gate-check", "pid": 1952,
-          "paths": ["git.20c.com/agents/global/runs/develop-issue-201"]}}
+          "paths": ["gitlab.example.com/group/project/runs/develop-issue-123"]}}
 ```
 
 It is parked outside the work repo (beside the markers) until a commit is
