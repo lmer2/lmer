@@ -1,2 +1,0 @@
-fixed:
-- "Control UI chat: a sent message the session had already received and answered could keep the 'not confirmed' caption for the rest of the run — the transcript poll could race the send and leave the pending bubble unable to settle (#237)"

@@ -1,2 +1,0 @@
-added:
-- "Claude output styles ship through agent-files (#249): a style in agent-files/claude/output-styles/ (lmer tree) or /work/agent-files/claude/output-styles/ (work repo) is linked into ~/.claude/output-styles/, work-repo entries winning on name collision. Selecting the active style remains the outputStyle settings key, which a work-repo settings.json cannot set."

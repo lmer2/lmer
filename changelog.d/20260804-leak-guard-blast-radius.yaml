@@ -1,3 +1,0 @@
-fixed:
-- "The test suite's work-repo leak guard no longer fails a whole run over the launching session's own `work` writes: write-shaped `work` invocations inside a gate window journal themselves with a process-ancestry verdict, the guard excuses non-suite writes and reports them informationally, and a write that provably descends from the suite fails the run naming the leaking command (#233)"
-- "Work-repo durability commits now defer during bare `pytest` runs of the suite, not only gate-command runs: the suite holds its own gate-in-flight marker for its whole duration (#233)"
