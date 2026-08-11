@@ -115,16 +115,17 @@ class TestParseRepoUrl:
 # used to remove the `.git` suffix with rstrip(".git"), which strips a character
 # *class* and so ate those too: `group/project` came back as `group/projec`, and
 # LMER_REPO_PROJECT — the run directory, the memory dir, the log path — was filed
-# under the mangled name. Real projects in the work repo look like this
-# (`docs/lmer-doc-bot`, `openpipes/openpipes.net`), so it is not a corner case.
+# under the mangled name. The shapes are ordinary rather than contrived:
+# hyphenated tool-style names end in `-bot`, and a project named after a domain
+# ends in `.net`, so it is not a corner case.
 #
 # Both spellings are checked for every name because only the SSH branch was
 # broken: the HTTPS branch removes the suffix with a regex. A test that passed on
 # both would prove nothing about either.
 GIT_CHAR_TAILED_PROJECTS = [
     "group/project",
-    "docs/lmer-doc-bot",
-    "openpipes/openpipes.net",
+    "group/example-doc-bot",
+    "group/example.net",
     "group/tooling",
 ]
 

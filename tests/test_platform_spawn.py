@@ -444,8 +444,9 @@ def test_session_without_run_identity_is_still_registered(config, caplog, monkey
 #: T48 the shared parser's SSH branch removed the suffix with ``rstrip(".git")``,
 #: so this one's identity was the truncated `group/subgroup/projec` — on *both*
 #: sides, which is precisely why parity held while the name was wrong. Not a
-#: corner case either: the work repo holds `docs/lmer-doc-bot` and
-#: `openpipes/openpipes.net`.
+#: corner case either: hyphenated tool-style names (`group/example-doc-bot`) and
+#: projects named after a domain (`group/example.net`) end that way as a matter
+#: of course.
 GIT_CHAR_TAILED_TARGET = (
     "https://gitlab.example.com/group/subgroup/project/-/issues/12"
 )
@@ -563,7 +564,7 @@ def test_a_project_name_ending_in_a_git_character_is_not_truncated(
     """The literal name, which is the one thing parity above cannot check (T48).
 
     ``group/subgroup/project`` used to be filed as ``group/subgroup/projec``, so
-    every run of such a project — `openpipes/openpipes.net`, `docs/lmer-doc-bot`
+    every run of such a project — `group/example.net`, `group/example-doc-bot`
     — lived under a directory named after a mangled identity. Both token states,
     because only the token-less SSH spelling was broken and a test that passed on
     both spellings for the wrong reason would prove nothing.
