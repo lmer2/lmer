@@ -562,10 +562,14 @@ class TestTokenPresetDisplacesListenerDefault:
         return spawn_manager
 
     @pytest.mark.asyncio
-    async def test_token_preset_strips_every_selector(
+    async def test_token_preset_blanks_every_selector(
         self, manager, captured, monkeypatch
     ):
-        """Both selectors go, so the child resolves no preset of its own."""
+        """Both selectors are blanked, so the child resolves no preset of its own.
+
+        Blank rather than absent: blank is the selector contract's "unset", and
+        it is what survives the child's first-wins ``.env`` seeding.
+        """
         monkeypatch.setenv("LMER_CHAT_PRESET", "listener-wide")
         monkeypatch.setenv("LMER_PRESET", "operator-choice")
         session = await manager.spawn(
@@ -574,8 +578,8 @@ class TestTokenPresetDisplacesListenerDefault:
         os.close(session.master_fd)
 
         child_env = captured["kwargs"]["env"]
-        assert "LMER_CHAT_PRESET" not in child_env
-        assert "LMER_PRESET" not in child_env
+        assert child_env["LMER_CHAT_PRESET"] == ""
+        assert child_env["LMER_PRESET"] == ""
         assert select_preset_name(None, CHAT_TASK_ID, child_env) == (None, None), (
             "with a token in play the child must resolve no preset at all"
         )
@@ -626,7 +630,7 @@ class TestTokenPresetDisplacesListenerDefault:
             "leaves unset — displacement is total, not a merge"
         )
         assert "LMER_REASONING_EFFORT" not in child_env
-        assert "LMER_CHAT_PRESET" not in child_env, (
+        assert child_env["LMER_CHAT_PRESET"] == "", (
             "and the child must not be able to load the default itself"
         )
 
@@ -634,7 +638,7 @@ class TestTokenPresetDisplacesListenerDefault:
     async def test_preset_env_may_set_a_selector_for_the_child(
         self, manager, captured, monkeypatch
     ):
-        """Stripping runs before the preset's own env, so an operator who
+        """Blanking runs before the preset's own env, so an operator who
         deliberately chains a default from a preset still gets it."""
         monkeypatch.setenv("LMER_CHAT_PRESET", "listener-wide")
         preset = Preset(name="from-token", env={"LMER_CHAT_PRESET": "chained"})
@@ -642,6 +646,71 @@ class TestTokenPresetDisplacesListenerDefault:
         os.close(session.master_fd)
 
         assert captured["kwargs"]["env"]["LMER_CHAT_PRESET"] == "chained"
+
+    @pytest.mark.asyncio
+    async def test_displacement_survives_the_childs_env_file_seeding(
+        self, manager, captured, monkeypatch, tmp_path
+    ):
+        """The default cannot come back through the child's ``.env`` seeding.
+
+        The whole chain, end to end: the listener forwards its deployment
+        ``.env`` as ``--env-file``, and the spawned CLI seeds its environment
+        from that file first-wins (then the cwd's, then the state dir's), which
+        only skips a variable that is *present*. A displacement that deleted the
+        selectors would therefore be undone by the very file this spawn hands
+        the child: it would resolve the default itself and both presets would
+        apply. One file tier is enough to prove it — the seeding rule is the
+        same at every tier.
+
+        Regression contract: with the selector deleted rather than blanked, the
+        seeding below re-supplies ``house-default`` and both assertions fail.
+        """
+        from lmer_cli.cli import apply_env_file_defaults
+
+        env_file = tmp_path / "deploy.env"
+        env_file.write_text("LMER_CHAT_PRESET=house-default\n", encoding="utf-8")
+        # The deployment shape this regression is about: the default lives only
+        # in the file the listener forwards, never in the listener's own
+        # environment.
+        manager.lmer_env_file = str(env_file)
+        monkeypatch.delenv("LMER_CHAT_PRESET", raising=False)
+        monkeypatch.delenv("LMER_PRESET", raising=False)
+        session = await manager.spawn(
+            "C1", "1.1", PERMALINK, preset=Preset(name="from-token")
+        )
+        os.close(session.master_fd)
+
+        argv = list(captured["args"])
+        assert "--env-file" in argv, f"argv={argv}"
+        assert argv[argv.index("--env-file") + 1] == str(env_file), (
+            "the child is handed the file the seeding below reads"
+        )
+        child_env = captured["kwargs"]["env"]
+
+        # Run the child's real seeding against the environment it was handed.
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "environ", child_env)
+            apply_env_file_defaults([("forwarded --env-file", env_file)])
+
+        assert child_env["LMER_CHAT_PRESET"] == "", (
+            "a blank selector is present, so first-wins seeding must skip it"
+        )
+        assert select_preset_name(None, CHAT_TASK_ID, child_env) == (None, None), (
+            "the displaced default must stay displaced after the child seeds "
+            "its environment from the forwarded env file"
+        )
+
+        # Control: the same file does seed an environment that lacks the key,
+        # so the assertions above rest on the blanking, not on a no-op seeding.
+        without_selector: dict[str, str] = {}
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(os, "environ", without_selector)
+            apply_env_file_defaults([("forwarded --env-file", env_file)])
+        assert without_selector["LMER_CHAT_PRESET"] == "house-default"
+        assert select_preset_name(None, CHAT_TASK_ID, without_selector) == (
+            "house-default",
+            "LMER_CHAT_PRESET",
+        )
 
     @pytest.mark.asyncio
     async def test_no_token_keeps_the_listener_wide_default(

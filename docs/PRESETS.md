@@ -156,8 +156,8 @@ LMER_CHAT_PRESET=house_default
 ```
 
 **A `$preset:` token displaces the default entirely.** It is a replacement,
-not an overlay: when a token selects a preset, the listener removes every
-preset selector from the spawned session's environment, so the default is
+not an overlay: when a token selects a preset, the listener blanks every
+preset selector in the spawned session's environment, so the default is
 never loaded. None of its values survive, and none of its keys are inherited
 where the token's preset leaves them unset. (Before issue #181 the two stacked
 under two different rules — the token's `env` won conflicts while the default
