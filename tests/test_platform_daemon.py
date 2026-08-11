@@ -357,7 +357,7 @@ def test_runs_candidates_lists_the_shared_repo(platform_root, capsys, monkeypatc
     run_index.track("gitlab.example.com", "agents/global", "mine")
     monkeypatch.setattr(daemon, "run_dirs", lambda config: [
         RunDirRef("gitlab.example.com", "agents/global", "mine", platform_root),
-        RunDirRef("gitlab.example.com", "grizz/home", "theirs", platform_root),
+        RunDirRef("gitlab.example.com", "colleague/home", "theirs", platform_root),
     ])
 
     daemon.main(["runs", "--candidates"])
@@ -365,7 +365,7 @@ def test_runs_candidates_lists_the_shared_repo(platform_root, capsys, monkeypatc
 
     assert "these are everyone's, not the fleet view" in out
     assert "tracked] gitlab.example.com/agents/global/runs/mine" in out
-    assert "-] gitlab.example.com/grizz/home/runs/theirs" in out
+    assert "-] gitlab.example.com/colleague/home/runs/theirs" in out
 
 
 def test_runs_candidates_empty_mirror_is_explained(platform_root, capsys):

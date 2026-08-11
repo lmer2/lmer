@@ -335,7 +335,7 @@ def _plant_mirror_run(config, slug, *, host="gitlab.example.com", project="agent
 def test_untracked_mirror_runs_are_invisible(platform_root):
     """A colleague's blocked run must never show up as needing your input."""
     config = cfg.load()
-    _plant_mirror_run(config, "someone-elses-run", project="grizz/home",
+    _plant_mirror_run(config, "someone-elses-run", project="colleague/home",
                       stop_reason="question")
 
     payload = api.build_state(config)
@@ -350,7 +350,7 @@ def test_tracked_run_appears_with_its_state(platform_root):
 
     config = cfg.load()
     _plant_mirror_run(config, "mine", stop_reason="question")
-    _plant_mirror_run(config, "theirs", project="grizz/home", stop_reason="question")
+    _plant_mirror_run(config, "theirs", project="colleague/home", stop_reason="question")
     run_index.track("gitlab.example.com", "agents/global", "mine", taskdef="develop")
 
     payload = api.build_state(config)
@@ -389,7 +389,7 @@ def test_candidates_lists_everyone_and_flags_tracked(client, platform_root, conf
     from lmer_platform import runs as run_index
 
     _plant_mirror_run(config, "mine")
-    _plant_mirror_run(config, "theirs", project="grizz/home")
+    _plant_mirror_run(config, "theirs", project="colleague/home")
     run_index.track("gitlab.example.com", "agents/global", "mine")
 
     payload = client.get("/api/runs/candidates", headers=bearer_header()).json()
