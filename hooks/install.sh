@@ -131,16 +131,28 @@ cat > "$GLOBAL_DIR/.git/hooks/pre-push" << 'EOF'
 # POSIX sh, no python/lmer_cli available), so it mirrors the allow-list
 # check from lmer_cli.gates.GateSystem.run_push_gate rather than
 # delegating to `gate-push`. Grammar: comma-separated entries, each
-# either `repo` (substring of the remote URL, branch refs ONLY) or
-# `repo|refpattern` (glob against the fully-qualified ref, e.g.
-# refs/tags/*). Malformed entries — empty half, more than one `|` — are
-# IGNORED (never fail open). The repo half matches as a substring for a
-# CONFIGURED remote and ANCHORED (host/path or the bare host — both pin
-# the host) when the push named a URL instead; a path-only entry
-# authorizes nothing on that branch, and ref deletions are refused
-# outright. Keep in sync
+# either `repo` (branch refs ONLY) or `repo|refpattern` (glob against the
+# fully-qualified ref, e.g. refs/tags/*). Malformed entries — empty half,
+# more than one `|` — are IGNORED (never fail open). For a CONFIGURED
+# remote the repo half matches under the #107 grammar (repo_grants: exact
+# repo, whole host, `*.domain` wildcard, host + project prefix at segment
+# boundaries, legacy host-less path); when the push named a URL instead it
+# matches ANCHORED (host/path or the bare host — both pin the host), where
+# a path-only, wildcard or prefix entry authorizes nothing. Ref deletions
+# are refused outright. Keep in sync
 # with gates.py; the mirror is guarded by
 # tests/test_push_allow_grammar_parity.py (#116).
+#
+# The GRAMMAR is mirrored; the SOURCES are not. gate-push unions
+# LMER_PUSH_ALLOW_LIST with the active taskdef's `push_allow` list, which
+# this hook cannot resolve — so a taskdef-granted target is allowed by
+# gate-push and refused here. That is the safe direction (this hook is
+# stricter, never laxer).
+#
+# ROLLOUT: this hook is generated at install time and is NOT self-updating
+# — the container entrypoint runs install.sh only when no pre-commit hook
+# exists yet. A checkout set up before the #116 grammar landed keeps the
+# older, more permissive body until install.sh is re-run there.
 
 # git passes the remote URL as $2 (for push-by-URL, $1 IS the URL and no
 # configured remote exists) — prefer it, fall back to resolving $1, and
@@ -180,6 +192,37 @@ fi
 
 trim() {
     printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# split_bracketed AUTHORITY: sets $_sb_host / $_sb_path for a BRACKETED
+# IPv6 authority, and leaves both empty when the text is not a well-formed
+# one. Mirrors lmer_cli.push_allow._split_bracketed.
+#
+# Outside a `scheme://` URL git REQUIRES an IPv6 literal to be bracketed
+# ("to avoid ambiguity with a local path containing a colon"), and the
+# bracket is the host's boundary: the address's own colons are NOT the
+# `host:path` delimiter. The normalized host is the address WITHOUT the
+# brackets — what urlsplit reports for the `scheme://` spelling — so every
+# spelling of one IPv6 repository is one identity at every enforcement
+# point. Splitting on the first `:` instead collapses every `2001:…`
+# address to the single host `[2001`, which authorizes pushes to hosts the
+# operator never named: laxer than gate-push, i.e. a permission leak.
+split_bracketed() {
+    _sb_host=""
+    _sb_path=""
+    case $1 in
+        \[*\]*) ;;
+        *) return 0 ;;            # unclosed or absent bracket: no host
+    esac
+    _sb_rest=${1#\[}
+    _sb_tail=${_sb_rest#*\]}
+    _sb_host=${_sb_rest%%\]*}
+    [ -n "$_sb_host" ] || return 0
+    case $_sb_tail in
+        '')    _sb_path="" ;;
+        :*|/*) _sb_path=${_sb_tail#?} ;;
+        *)     _sb_host=""; _sb_path="" ;;   # junk between `]` and the path
+    esac
 }
 
 # normalize_url URL: prints `host/path` (scheme, userinfo, port and a
@@ -223,9 +266,45 @@ normalize_url() {
             esac
             # Userinfo, then port — both live in the authority ONLY.
             case $_authority in *@*) _authority=${_authority##*@} ;; esac
-            case $_authority in *:*) _authority=${_authority%%:*} ;; esac
-            _host=$_authority ;;
+            case $_authority in
+                \[*|*\]*)
+                    # Bracketed IPv6 literal (see split_bracketed). What
+                    # may follow the `]` here is a port — the authority was
+                    # cut at the first `/` above — and ports are dropped.
+                    split_bracketed "$_authority"
+                    [ -n "$_sb_host" ] || return 0
+                    _host=$_sb_host ;;
+                *)
+                    case $_authority in *:*) _authority=${_authority%%:*} ;; esac
+                    _host=$_authority ;;
+            esac ;;
         *)
+            # A bracketed IPv6 host, optionally behind userinfo, is the one
+            # shape whose colons are not delimiters — resolve it first.
+            _cand=$_rest
+            case $_rest in
+                *@*)
+                    _maybe_user=${_rest%%@*}
+                    case $_maybe_user in
+                        ''|*/*) ;;
+                        *) case ${_rest#*@} in
+                               \[*) _cand=${_rest#*@} ;;
+                           esac ;;
+                    esac ;;
+            esac
+            case ${_cand%%/*} in
+                \[*|*\]*)
+                    split_bracketed "$_cand"
+                    [ -n "$_sb_host" ] || return 0
+                    _host=$_sb_host
+                    _path=$_sb_path
+                    _path=${_path#/}
+                    _path=${_path%/}
+                    case $_path in *.git) _path=${_path%.git} ;; esac
+                    [ -n "$_path" ] || return 0
+                    printf '%s/%s' "$_host" "$_path" | tr '[:upper:]' '[:lower:]'
+                    return 0 ;;
+            esac
             # scp-like `[user@]host:path`: userinfo may contain neither `@`
             # nor `/`, and the host neither `:` nor `/`, so the `@` and `:`
             # matched here are the real delimiters rather than characters
@@ -284,6 +363,21 @@ url_entry_authorizes() {
     _candidate=$(trim "$1")
     case $_candidate in
         *://*|*@*) _candidate=$(normalize_url "$_candidate") ;;
+        \[*)
+            # A bracketed IPv6 ENTRY (`[addr]`, `[addr]/path`). The URL side
+            # normalizes to the address WITHOUT brackets, so the entry must
+            # too or the two sides can never compare equal — and a bare
+            # `[addr]` host entry has no path for normalize_url to accept.
+            split_bracketed "$_candidate"
+            [ -n "$_sb_host" ] || return 1
+            if [ -n "$_sb_path" ]; then
+                _candidate="$_sb_host/$_sb_path"
+            else
+                _candidate=$_sb_host
+            fi
+            _candidate=${_candidate%/}
+            case $_candidate in *.git) _candidate=${_candidate%.git} ;; esac
+            _candidate=$(printf '%s' "$_candidate" | tr '[:upper:]' '[:lower:]') ;;
         *)
             _candidate=${_candidate#/}
             _candidate=${_candidate%/}
@@ -294,6 +388,166 @@ url_entry_authorizes() {
     _url_host=${_normalized%%/*}
     [ "$_candidate" = "$_normalized" ] ||
         [ "$_candidate" = "$_url_host" ]
+}
+
+# split_target TEXT: sets $_st_host (lowercased) and $_st_path (original
+# case — paths are case-sensitive) for a repo URL or `host/path` string.
+# Mirrors lmer_cli.push_allow.split_target, which is DELIBERATELY more
+# lenient than normalize_url above: this one serves the CONFIGURED-remote
+# branch, where the URL came from the operator's git config.
+split_target() {
+    _st_host=""
+    _st_path=""
+    _st=$(trim "$1")
+    _st=${_st%/}
+    case $_st in
+        *://*)
+            # Only a VALID scheme introduces an authority (same rule as
+            # normalize_url above): `://host/path` names no host and git
+            # refuses it, so it must not be read as one.
+            _st_scheme=${_st%%://*}
+            case $_st_scheme in
+                ''|*[!A-Za-z0-9+.-]*) return 0 ;;
+                [!A-Za-z]*) return 0 ;;
+            esac
+            _st_rest=${_st#*://}
+            _st_rest=${_st_rest%%#*}
+            _st_rest=${_st_rest%%\?*}
+            case $_st_rest in
+                */*) _st_auth=${_st_rest%%/*}; _st_path=${_st_rest#*/} ;;
+                *)   _st_auth=$_st_rest;       _st_path="" ;;
+            esac
+            case $_st_auth in *@*) _st_auth=${_st_auth##*@} ;; esac
+            case $_st_auth in
+                \[*|*\]*)
+                    # Bracketed IPv6 literal (see split_bracketed); what may
+                    # follow the `]` here is a port, which is dropped.
+                    split_bracketed "$_st_auth"
+                    [ -n "$_sb_host" ] || { _st_path=""; return 0; }
+                    _st_host=$_sb_host ;;
+                *)
+                    case $_st_auth in *:*) _st_auth=${_st_auth%%:*} ;; esac
+                    _st_host=$_st_auth ;;
+            esac ;;
+        *)
+            _st_head=$_st
+            _st_path=""
+            # A bracketed IPv6 host, optionally behind userinfo, is the one
+            # shape whose colons are not delimiters — resolve it first.
+            _st_cand=$_st
+            case $_st in
+                *@*)
+                    _st_user=${_st%%@*}
+                    case $_st_user in
+                        ''|*/*) ;;
+                        *) case ${_st#*@} in
+                               \[*) _st_cand=${_st#*@} ;;
+                           esac ;;
+                    esac ;;
+            esac
+            case ${_st_cand%%/*} in
+                \[*|*\]*)
+                    split_bracketed "$_st_cand"
+                    _st_host=$_sb_host
+                    _st_path=$_sb_path
+                    [ -n "$_st_host" ] || { _st_path=""; return 0; }
+                    _st_path=${_st_path#/}
+                    _st_path=${_st_path%/}
+                    case $_st_path in *.git) _st_path=${_st_path%.git} ;; esac
+                    _st_path=${_st_path#/}
+                    _st_path=${_st_path%/}
+                    _st_host=$(printf '%s' "$_st_host" | tr '[:upper:]' '[:lower:]')
+                    return 0 ;;
+            esac
+            _st_first=${_st%%/*}
+            case $_st_first in
+                *:*) _st_head=${_st%%:*}; _st_path=${_st#*:}
+                     # scp-like `[user@]host:path`: userinfo legally
+                     # precedes the host, so strip it.
+                     case $_st_head in *@*) _st_head=${_st_head##*@} ;; esac ;;
+                *)   case $_st in
+                         */*) _st_head=${_st%%/*}; _st_path=${_st#*/} ;;
+                     esac
+                     # No scheme and no `:` before the first `/`: git reads
+                     # the whole string as a local PATH, so there is no
+                     # authority and no userinfo to strip — `@` here names
+                     # no host at all (mirrors normalize_url's check).
+                     case $_st_head in
+                         *@*) _st_head=""; _st_path="" ;;
+                     esac ;;
+            esac
+            _st_host=$_st_head ;;
+    esac
+    _st_path=${_st_path#/}
+    _st_path=${_st_path%/}
+    case $_st_path in *.git) _st_path=${_st_path%.git} ;; esac
+    _st_path=${_st_path#/}
+    _st_path=${_st_path%/}
+    _st_host=$(printf '%s' "$_st_host" | tr '[:upper:]' '[:lower:]')
+}
+
+# repo_grants ENTRY URL: repo half of one entry against a CONFIGURED
+# remote's URL, under the #107 grammar — exact repo, whole host,
+# `*.domain` wildcard (subdomains only, dot boundary enforced), host +
+# project prefix, or the legacy host-less path. Prefixes match at SEGMENT
+# boundaries (`group` grants `group/project`, never `groupfoo/x`), hosts
+# compare case-insensitively and paths case-sensitively. Mirrors
+# lmer_cli.push_allow.entry_allows.
+repo_grants() {
+    _rg_entry=$(trim "$1")
+    [ -n "$_rg_entry" ] || return 1
+    _rg_first=${_rg_entry%%/*}
+    _rg_hostless=0
+    case $_rg_entry in
+        *://*) ;;
+        *)
+            case $_rg_first in
+                *@*|*:*) ;;
+                *)
+                    case $_rg_entry in
+                        */*)
+                            # A first segment that names no host (no dot,
+                            # not localhost, no wildcard) makes this the
+                            # legacy host-less `org/repo` form.
+                            case $_rg_first in
+                                *.*|localhost|\**) ;;
+                                *) _rg_hostless=1 ;;
+                            esac ;;
+                    esac ;;
+            esac ;;
+    esac
+    if [ "$_rg_hostless" = "1" ]; then
+        _rg_host=""
+        _rg_prefix=${_rg_entry%/}
+        case $_rg_prefix in *.git) _rg_prefix=${_rg_prefix%.git} ;; esac
+    else
+        split_target "$_rg_entry"
+        _rg_host=$_st_host
+        _rg_prefix=$_st_path
+        [ -n "$_rg_host" ] || return 1
+    fi
+    split_target "$2"
+    [ -n "$_st_host" ] && [ -n "$_st_path" ] || return 1
+    if [ -n "$_rg_host" ]; then
+        case $_rg_host in
+            \*.*)
+                # `*.example.com` -> host must END with `.example.com`;
+                # the leading dot is what keeps `evilexample.com` out.
+                _rg_suffix=${_rg_host#\*}
+                case $_st_host in
+                    *"$_rg_suffix") ;;
+                    *) return 1 ;;
+                esac ;;
+            *)
+                [ "$_st_host" = "$_rg_host" ] || return 1 ;;
+        esac
+    fi
+    [ -n "$_rg_prefix" ] || return 0   # host-only rule: any project there
+    [ "$_st_path" = "$_rg_prefix" ] && return 0
+    case $_st_path in
+        "$_rg_prefix"/*) return 0 ;;
+    esac
+    return 1
 }
 
 # ref_allowed REF: succeeds if some allow-list entry authorizes pushing
@@ -325,10 +579,7 @@ ref_allowed() {
         if [ "$push_by_url" = "1" ]; then
             url_entry_authorizes "$_repo" "$remote_url" || continue
         else
-            case $remote_url in
-                *"$_repo"*) ;;
-                *) continue ;;
-            esac
+            repo_grants "$_repo" "$remote_url" || continue
         fi
         case $_ref in
             $_pattern)

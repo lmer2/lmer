@@ -33,10 +33,13 @@ harness_session_id() {
 }
 
 # ── Self-development mode ──
-# When /workspace IS the lmer repository, export LMER_SELF_DEV=1 and point the
-# venv's editable install at /workspace/src first (with /Agents/global/src as
-# fallback) so the whole runtime — entry-point scripts AND pytest — resolves
-# lmer_cli/work_repo/etc. from the dev checkout. Mirrors claude-runner.sh.
+# When /workspace IS the lmer repository, export LMER_SELF_DEV=1 and make the
+# dev checkout win for every import: point the venv's editable install at
+# /workspace/src first (with /Agents/global/src as fallback) AND prepend
+# /workspace/src to PYTHONPATH, which otherwise beats the .pth outright (#198).
+# Both halves are needed — see the fuller comment in claude-runner.sh. Then
+# state the resolved path so the session can be checked rather than trusted.
+# Mirrors claude-runner.sh.
 harness_detect_self_dev() {
     LMER_SELF_DEV=0
     if [ -f "/workspace/pyproject.toml" ]; then
@@ -52,6 +55,18 @@ exit(0 if data.get('project', {}).get('name') in ('lmer', 'lmer-cli') else 1)
             for pth in /Agents/global/.venv/lib/python*/site-packages/__editable__.lmer*.pth; do
                 [ -f "$pth" ] && printf '/workspace/src\n/Agents/global/src\n' > "$pth"
             done
+            PYTHONPATH="/workspace/src${PYTHONPATH:+:$PYTHONPATH}"
+            export PYTHONPATH
+            local resolved
+            resolved="$("${LMER_PYTHON:-python3}" -c 'import lmer_cli; print(lmer_cli.__file__)' 2>/dev/null)"
+            if [ -z "$resolved" ]; then
+                echo "⚠️  lmer_cli is not importable — cannot confirm which tree this session tests"
+            elif [ "${resolved#/workspace/}" = "$resolved" ]; then
+                echo "⚠️  lmer_cli resolves to $resolved — NOT the /workspace checkout"
+                echo "   Tests and tooling here would exercise the operational runtime (#198)"
+            else
+                echo "✅ lmer_cli resolves to $resolved"
+            fi
         fi
     fi
 }
@@ -148,6 +163,29 @@ harness_render_global_context() {
         fi
     fi
 
+    # Orchestrated sessions get the ask-channel contract (issue #141). Gated on
+    # LMER_ASK_DIR, which the orchestrator sets only when it has actually mounted
+    # the channel — so a session that can't reach an operator is never told to
+    # try. A prompt fragment rather than a taskdef block because the orchestrator
+    # spawns existing taskdefs (develop, review, followup) that know nothing
+    # about it, and this reaches all of them without forking any.
+    if [ -n "$(printf '%s' "$LMER_ASK_DIR" | tr -d '[:space:]')" ]; then
+        local ask_template ask_renderer
+        ask_template="$(harness_find_resource "prompts/orchestrator-ask.md.jinja2")"
+        ask_renderer="$(harness_find_resource "libexec/render-prompt-fragment.py")"
+        if [ -n "$ask_template" ] && [ -n "$ask_renderer" ]; then
+            printf '\n' >> "$tmp"
+            if "${LMER_PYTHON:-python3}" "$ask_renderer" "$ask_template" >> "$tmp"; then
+                have_content=1
+                echo "✅ Operator ask channel added to global context"
+            else
+                echo "⚠️  Failed to render ask-channel template at $ask_template"
+            fi
+        else
+            echo "⚠️  LMER_ASK_DIR set but ask-channel template/renderer not found"
+        fi
+    fi
+
     # Agent memory usage instructions — the memory store is harness-neutral,
     # but the non-claude harnesses have no built-in memory feature, so the
     # read/write/persist contract is delivered as context. Only rendered when
@@ -164,6 +202,25 @@ harness_render_global_context() {
                 echo "✅ Agent memory instructions added to global context"
             else
                 echo "⚠️  LMER_PERSIST_AGENT_MEMORY set but agent-memory fragment not found"
+            fi
+            ;;
+    esac
+
+    # Non-interactive marker — the rule text has to travel with the session,
+    # not just the variable. Nothing puts an LMER_* value in front of a model
+    # on its own, so a session that is told "no human is attached" only knows
+    # it because this fragment is in its context (issue #137).
+    case "${LMER_NONINTERACTIVE,,}" in
+        1|true|yes)
+            local noninteractive_fragment
+            noninteractive_fragment="$(harness_find_resource "prompts/non-interactive.md")"
+            if [ -n "$noninteractive_fragment" ]; then
+                printf '\n' >> "$tmp"
+                cat "$noninteractive_fragment" >> "$tmp"
+                have_content=1
+                echo "✅ Non-interactive session notice added to global context"
+            else
+                echo "⚠️  LMER_NONINTERACTIVE set but non-interactive fragment not found"
             fi
             ;;
     esac
@@ -290,10 +347,23 @@ harness_map_effort() {
 # ── Final exec through the supervisor ──
 # Run the harness through lmer-supervisor when available (PTY wrapper: FastAPI
 # endpoint, auto start-command injection — profile selected via LMER_HARNESS),
-# falling back to a direct exec. Mirrors the tail of claude-runner.sh.
+# falling back to a direct exec. Mirrors the tail of claude-runner.sh —
+# including the operational-tree pin: the supervisor must run the image's code
+# even when self-dev repoints imports at /workspace (#236), and the pin is a
+# sys.path insert rather than an env override so the harness child keeps the
+# self-dev view (#198).
 #   harness_exec <binary> [args...]
 harness_exec() {
     if [ "${LMER_DISABLE_SUPERVISOR:-0}" != "1" ] && command -v lmer-supervisor >/dev/null 2>&1; then
+        # Interpreter default is the operational venv, not a bare `python3` —
+        # see the matching block in claude-runner.sh for why.
+        SUPERVISOR_PYTHON="${LMER_PYTHON:-/Agents/global/.venv/bin/python3}"
+        if [ -x "$SUPERVISOR_PYTHON" ] && [ -d /Agents/global/src/lmer_cli ]; then
+            echo "✅ lmer-supervisor pinned to /Agents/global/src (operational tree)"
+            exec "$SUPERVISOR_PYTHON" -c 'import sys; sys.path.insert(0, "/Agents/global/src"); from lmer_cli.supervisor import main; sys.exit(main())' -- "$@"
+        fi
+        # Said out loud — see the matching block in claude-runner.sh.
+        echo "⚠️  supervisor pin skipped (no usable interpreter or operational tree) — running unpinned"
         exec lmer-supervisor -- "$@"
     fi
     exec "$@"

@@ -20,6 +20,7 @@ import time
 
 import yaml
 
+from lmer_cli import push_allow
 from work_repo.utils import project_info_dir, task_info_dir
 
 
@@ -1146,15 +1147,17 @@ class GateSystem:
 
         return passed
 
-    def _get_push_allow_list(self) -> list[str]:
-        """Get the push allow list from LMER_PUSH_ALLOW_LIST env var.
+    def _parse_push_allow_entry(self, entry: str) -> Optional[Tuple[str, str]]:
+        """Parse one allow-list entry into (repo, ref_pattern).
 
-        Returns an empty list if not configured (no repos auto-allowed).
-        The env var is a comma-separated list of entries; each entry is
-        either a bare repo substring or ``repo|refpattern``:
+        An entry is either a bare repo spec or ``repo|refpattern``:
 
-        - ``repo`` is matched as a substring of the remote URL (unchanged
-          from the original grammar).
+        - ``repo`` is matched by the :mod:`lmer_cli.push_allow` grammar —
+          exact repo, whole host, ``*.domain`` wildcard, host + project
+          prefix, or a legacy host-less project path (#107). It replaced
+          the original unanchored substring rule, which also matched a
+          host that merely EMBEDDED the allowed path. That module's
+          docstring is the authoritative statement of the repo half.
         - ``refpattern`` is an fnmatch pattern tested against the
           fully-qualified target ref, e.g. ``refs/tags/*`` or
           ``refs/heads/main``.
@@ -1167,20 +1170,10 @@ class GateSystem:
         only (``refs/heads/*``). Tag pushes must be granted explicitly with
         ``repo|refs/tags/*`` — no pre-existing allow list silently gains
         tag-push rights.
-        """
-        allow_list_str = os.environ.get("LMER_PUSH_ALLOW_LIST", "")
-        if not allow_list_str.strip():
-            return []
-        return [repo.strip() for repo in allow_list_str.split(",") if repo.strip()]
 
-    def _parse_push_allow_entry(self, entry: str) -> Optional[Tuple[str, str]]:
-        """Parse one allow-list entry into (repo_substring, ref_pattern).
-
-        Bare entries get the branch-only default pattern ``refs/heads/*``
-        (see _get_push_allow_list). Malformed entries — empty repo half,
-        empty ref half, or more than one delimiter — return None and are
-        IGNORED by the caller: an unparseable grant must never fail open
-        and widen what is allowed.
+        Malformed entries — empty repo half, empty ref half, or more than
+        one delimiter — return None and are IGNORED by the caller: an
+        unparseable grant must never fail open and widen what is allowed.
         """
         if PUSH_ALLOW_REF_DELIMITER not in entry:
             return (entry, "refs/heads/*")
@@ -1236,12 +1229,34 @@ class GateSystem:
             # never leaks into the path.
             host, path = parts.hostname or "", parts.path
         else:
-            # scp-like `[user@]host:path`: userinfo may contain neither `@`
-            # nor `/`, and the host neither `:` nor `/` — so the `@` and the
-            # `:` this matches are the real delimiters, never ones sitting
-            # inside the path.
-            match = re.match(r"^(?:[^@/]+@)?([^:/]+):(.+)$", rest)
-            if match is not None:
+            # An IPv6 literal must be BRACKETED outside a `scheme://` URL
+            # (git: "to avoid ambiguity with a local path containing a
+            # colon"), and the bracket is the host's boundary — the
+            # address's own colons are not the `host:path` delimiter. The
+            # normalized host is the address without brackets, which is
+            # what urlsplit reports for the scheme spelling, so every
+            # spelling of one IPv6 repository is one identity. An
+            # unclosed/empty/junk-trailing bracket names no host, exactly
+            # as urlsplit refuses those.
+            authority = rest
+            userinfo = re.match(r"^[^@/]+@(\[.*)$", rest)
+            if userinfo is not None:
+                authority = userinfo.group(1)
+            bracketed = (authority.startswith("[")
+                         or "]" in authority.split("/", 1)[0])
+            match = None if bracketed else re.match(
+                # scp-like `[user@]host:path`: userinfo may contain neither
+                # `@` nor `/`, and the host neither `:` nor `/` — so the
+                # `@` and the `:` this matches are the real delimiters,
+                # never ones sitting inside the path.
+                r"^(?:[^@/]+@)?([^:/]+):(.+)$", rest)
+            if bracketed:
+                bracket = re.fullmatch(r"\[([^\[\]/]+)\](?:[:/](.*))?",
+                                       authority)
+                if bracket is None:
+                    return None
+                host, path = bracket.group(1), bracket.group(2) or ""
+            elif match is not None:
                 host, path = match.group(1), match.group(2)
             else:
                 # Bare `host/path`. No userinfo is legal here, so a host
@@ -1281,22 +1296,20 @@ class GateSystem:
         a path-only grant still have one for CONFIGURED remotes (see
         run_push_gate — that URL came from the operator's own git config);
         for push-by-URL the entry must say which host.
+
+        The #107 grammar additions (wildcard domains, host+project
+        prefixes) are deliberately INERT here for the same reason: neither
+        names the single host git will dial. Delegates to
+        ``push_allow.entry_allows(..., exact_identity=True)``, which is the
+        one implementation of that rule.
         """
-        normalized = self._normalize_remote_url(remote_url)
-        if normalized is None:
+        if self._normalize_remote_url(remote_url) is None:
+            # Not a repository identity at all (filesystem path, bare host,
+            # fragment-only URL) — nothing to authorize.
             return False
-        candidate = entry.strip()
-        if "://" in candidate or "@" in candidate:
-            candidate = self._normalize_remote_url(candidate) or ""
-        else:
-            candidate = candidate.strip("/")
-            if candidate.endswith(".git"):
-                candidate = candidate[:-len(".git")]
-            candidate = candidate.lower()
-        if not candidate:
-            return False
-        host, _, _path = normalized.partition("/")
-        return candidate in (normalized, host)
+        host, path = push_allow.split_target(remote_url)
+        return push_allow.entry_allows(entry, host, path,
+                                       exact_identity=True)
 
     def _resolve_push_target_ref(self, ref: str) -> Optional[str]:
         """The fully-qualified ref an explicit refspec lands on, or None.
@@ -1340,6 +1353,124 @@ class GateSystem:
             return None
         return ref
 
+    def _push_repo_half_grants(self, repo: str, url: str,
+                               by_url: bool) -> bool:
+        """Repo half of one allow-list entry against one push URL.
+
+        The two branches are NOT the same rule. Push-by-URL keeps the
+        pre-#107 anchored check verbatim (_url_entry_authorizes, which also
+        REFUSES a string that is not a repository identity at all —
+        ``user@host/path``, ``https://host/`` with no path). A configured
+        remote — a URL the operator put in git config — gets the #107
+        grammar. Routing both through the grammar would quietly widen the
+        adversarial branch, since the grammar accepts entry shapes
+        (host-less paths, wildcard domains, prefixes) that name no single
+        host for git to dial.
+        """
+        if by_url:
+            return self._url_entry_authorizes(repo, url)
+        host, path = push_allow.split_target(url)
+        if not host or not path:
+            return False  # unidentifiable target: fail closed
+        return push_allow.entry_allows(repo, host, path)
+
+    def _push_granting_source(
+            self, url: str, target_ref: str,
+            sources: List[Tuple[List[str], str]],
+            by_url: bool) -> Optional[Tuple[str, str]]:
+        """The (entry, source) that authorizes ``url`` for ``target_ref``.
+
+        BOTH halves of an entry must grant: the repo half through the
+        push_allow grammar (#107), the ref half through the fnmatch pattern
+        (bare entries default to refs/heads/*). Checking them together per
+        entry — rather than "some entry matches the repo and some entry
+        matches the ref" — is what keeps a branch-only grant for repo A
+        from authorizing a tag push to repo B.
+        """
+        for entries, source in sources:
+            for entry in entries:
+                parsed = self._parse_push_allow_entry(entry)
+                if parsed is None:
+                    continue  # malformed: ignored, never fails open
+                repo, ref_pattern = parsed
+                if not fnmatch.fnmatch(target_ref, ref_pattern):
+                    continue
+                if self._push_repo_half_grants(repo, url, by_url):
+                    return entry, source
+        return None
+
+    def _authorize_push_urls(
+            self, remote_urls: List[str], target_ref: str,
+            sources: List[Tuple[List[str], str]],
+            by_url: bool) -> Tuple[Dict[str, Tuple[str, str]], List[str]]:
+        """``(grants, denied)`` over every push URL of the remote.
+
+        EVERY push URL must be granted: git sends the ref to all of them,
+        so one unallowlisted pushurl is one unauthorized push.
+
+        The refusals are collected as a LIST rather than inferred from the
+        grants dict. A remote may carry the SAME pushurl twice (``git
+        remote set-url --add --push`` run twice — a re-run setup script),
+        and a dict keyed by URL then holds one entry for two list members,
+        so ``len(grants) == len(remote_urls)`` could never be satisfied:
+        the push would be refused however wide the allow list, with no URL
+        marked as the reason.
+        """
+        grants: Dict[str, Tuple[str, str]] = {}
+        denied: List[str] = []
+        for url in remote_urls:
+            granted = self._push_granting_source(
+                url, target_ref, sources, by_url)
+            if granted is not None:
+                grants[url] = granted
+            else:
+                denied.append(url)
+        return grants, denied
+
+    def _report_push_refusal(self, remote: str, remote_urls: List[str],
+                             denied: List[str], target_ref: str,
+                             env_entries: List[str],
+                             taskdef_entries: List[str],
+                             taskdef_manifest: Optional[Path]) -> None:
+        """Print why the push was refused: the checked target(s), which of
+        them were not granted, every source consulted, and a
+        copy-pasteable entry that would grant the first refused URL."""
+        print(f"{Colors.RED}❌ Push not allowed to this repository{Colors.NC}")
+        for url in remote_urls:
+            mark = "  <-- not allowed" if url in denied else ""
+            print(f"Repository ({remote}): {url}{mark}")
+        print(f"Target ref: {target_ref}")
+        print("Sources checked:")
+        if env_entries:
+            print(f"  LMER_PUSH_ALLOW_LIST: {', '.join(env_entries)}")
+        else:
+            print("  LMER_PUSH_ALLOW_LIST: (not set)")
+        if taskdef_entries:
+            print(f"  taskdef task.yaml push_allow ({taskdef_manifest}): "
+                  f"{', '.join(taskdef_entries)}")
+        else:
+            print("  taskdef task.yaml push_allow: (none declared)")
+        if denied:
+            host, path = push_allow.split_target(denied[0])
+            if host and path:
+                example = push_allow.example_entry(denied[0])
+                # A bare entry authorizes branches only, so an example
+                # offered for a TAG push must carry the ref half —
+                # otherwise copy-pasting it earns a second refusal.
+                ref_half = "" if target_ref.startswith("refs/heads/") \
+                    else f"|{target_ref}"
+                print("Example entry that would allow this push: "
+                      f"{example}{ref_half}")
+            else:
+                # No host+path to name: the target is not a repository
+                # identity the grammar can authorize (a filesystem remote,
+                # say). Say so rather than printing an entry that cannot
+                # be written.
+                print("(The target does not parse into host/path, so no "
+                      "allow-list entry can name it — push it with plain "
+                      "git if that is really what you want.)")
+        print("Get explicit permission before pushing.")
+
     def run_push_gate(self, ref: Optional[str] = None, remote: str = "origin") -> bool:
         """Run checks for push gate.
 
@@ -1361,6 +1492,14 @@ class GateSystem:
         Frozen flag names for bin/gate-push (R5): ``--tag NAME`` maps to
         ``ref="refs/tags/NAME"`` and ``--remote NAME`` maps to
         ``remote=NAME``.
+
+        The allow list is the UNION of ``LMER_PUSH_ALLOW_LIST`` and the
+        active taskdef's ``push_allow`` (trusted taskdef tiers only — never
+        the agent-writable work-repo tiers). Each entry must grant with
+        BOTH halves: repo (the :mod:`lmer_cli.push_allow` grammar) and ref
+        (the fnmatch pattern, branch-only unless stated). Every push URL of
+        the remote must be granted, and both the grant and the refusal name
+        the target, the granting entry and its source (#107).
         """
         # `--push`, NOT the bare form: `git remote get-url <remote>` returns
         # the FETCH url, while `git push <remote>` uses
@@ -1370,12 +1509,18 @@ class GateSystem:
         # checkout would be enough to send a signed release tag elsewhere
         # with the gate green. `--push` falls back to the fetch url when no
         # pushurl is set, so this is the same answer git itself will use.
+        #
+        # `--all`, because a remote may carry SEVERAL pushurls and `git push`
+        # sends to every one of them. Without it git prints only the first,
+        # so a second, unallowlisted pushurl would receive the push with the
+        # gate green (#107).
         code, stdout, _ = self.run_command(
-            ["git", "remote", "get-url", "--push", remote])
+            ["git", "remote", "get-url", "--push", "--all", remote])
         by_url = False
 
         if code == 0 and stdout.strip():
-            remote_url = stdout.strip()
+            remote_urls = [line.strip() for line in stdout.splitlines()
+                           if line.strip()]
         elif any(marker in remote for marker in ("://", "@", "/")):
             # Push-by-URL (`gate-push --remote https://...`): gate on the URL
             # itself, so a raw-URL push faces exactly the same allow list as
@@ -1383,7 +1528,7 @@ class GateSystem:
             # here (_url_entry_authorizes) — this URL is agent-supplied, and
             # a substring rule written for operator-configured remotes would
             # authorize any host embedding the allowed path.
-            remote_url = remote
+            remote_urls = [remote]
             by_url = True
         else:
             # A named remote git cannot resolve: FAIL CLOSED. The previous
@@ -1425,29 +1570,29 @@ class GateSystem:
                 return False
             target_ref = resolved
 
-        allow_list = self._get_push_allow_list()
-        entries = [self._parse_push_allow_entry(e) for e in allow_list]
+        env_entries = push_allow.env_allow_list()
+        taskdef_entries, taskdef_manifest = push_allow.taskdef_allow_source()
+        sources = [(env_entries, "LMER_PUSH_ALLOW_LIST"),
+                   (taskdef_entries, f"task.yaml @ {taskdef_manifest}")]
 
-        def repo_matches(repo: str) -> bool:
-            if by_url:
-                return self._url_entry_authorizes(repo, remote_url)
-            return repo in remote_url
+        grants, denied = self._authorize_push_urls(
+            remote_urls, target_ref, sources, by_url)
 
-        allowed = any(
-            repo_matches(repo) and fnmatch.fnmatch(target_ref, ref_pattern)
-            for repo, ref_pattern in (e for e in entries if e is not None)
-        )
-
-        if not allowed:
-            print(f"{Colors.RED}❌ Push not allowed to this repository{Colors.NC}")
-            print(f"Repository: {remote_url}")
-            print(f"Target ref: {target_ref}")
-            if allow_list:
-                print(f"Allow list: {', '.join(allow_list)}")
-            else:
-                print("No repositories in allow list. Set LMER_PUSH_ALLOW_LIST env var.")
-            print("Get explicit permission before pushing.")
+        if denied or not remote_urls:
+            self._report_push_refusal(remote, remote_urls, denied, target_ref,
+                                      env_entries, taskdef_entries,
+                                      taskdef_manifest)
             return False
+
+        # Success is as transparent as refusal: name the entry that granted
+        # each push URL and where that entry came from. A grant arriving
+        # from a taskdef manifest rather than the operator's env is exactly
+        # the case worth seeing.
+        for url in remote_urls:
+            entry, source = grants[url]
+            print(f"{Colors.GREEN}✅ Push target allowed{Colors.NC} "
+                  f"({remote}): {url} [{target_ref}]")
+            print(f"   granted by '{entry}' from {source}")
 
         # Run commit gate checks first
         return self.run_commit_gate()

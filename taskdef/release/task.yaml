@@ -33,11 +33,16 @@ needs:
     # Release SSH signing key for tag signing — always a reference, never
     # key material.
     - release_signing_key
-  # Push-allow targets the session's push gate must be opened for. These
-  # are roles, not URLs: the concrete repositories are per-adopter
-  # parameters (the `release:` mapping in an onboarded tier), never
-  # defaulted here.
-  push_allow:
+  # Push targets the session's push gate must be opened for. These are
+  # roles, not URLs: the concrete repositories are per-adopter parameters
+  # (the `release:` mapping in an onboarded tier), never defaulted here.
+  #
+  # Deliberately NOT named `push_allow`: the TOP-LEVEL `push_allow` key is
+  # a live push grant read by lmer_cli.push_allow, and a documentation
+  # block sharing its name is one stray dedent — a diff that reads as
+  # whitespace — away from becoming one. The names are kept distinct so
+  # that mistake cannot be made silently.
+  push_targets:
     # The adopter's GitHub mirror: `main` first, then the release tag.
     - target: github_mirror
       refs:

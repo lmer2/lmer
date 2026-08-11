@@ -35,6 +35,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -746,11 +747,19 @@ def load_state(rdir: Path) -> Optional[dict]:
 
 
 def write_state(rdir: Path, state: dict) -> None:
-    """Atomic tmp+rename write. The ONLY writer of state.yaml (spec §3.4)."""
+    """Atomic tmp+rename write. The ONLY writer of state.yaml (spec §3.4).
+
+    The temp name carries the writer's identity — process *and* thread — for the
+    reason spelled out in :func:`lmer_platform.store.write_json`: two writers
+    sharing one temp path is worse than losing a write, because the second's
+    truncation lands inside the first's file and the first then publishes the
+    hole. Single-writer discipline is a contract on the destination, not a
+    guarantee that only one process is executing this function.
+    """
     rdir.mkdir(parents=True, exist_ok=True)
     state = dict(state)
     state["updated"] = utc_now_iso()
-    tmp = rdir / f".{STATE_FILE}.tmp"
+    tmp = rdir / f".{STATE_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     tmp.write_text(yaml.safe_dump(state, sort_keys=False), encoding="utf-8")
     tmp.replace(rdir / STATE_FILE)
     # Lazy migration: state.yaml now exists (and wins on read), so a leftover
@@ -818,9 +827,10 @@ def load_ledger(rdir: Path) -> Optional[dict]:
 
 def write_ledger(rdir: Path, ledger: dict) -> None:
     """Atomic tmp+rename write. The ONLY writer of ledger.yaml (issue #89:
-    single-writer contract, same as state.yaml)."""
+    single-writer contract, same as state.yaml) — including its temp naming,
+    which carries pid and thread id for the reason :func:`write_state` gives."""
     rdir.mkdir(parents=True, exist_ok=True)
-    tmp = rdir / f".{LEDGER_FILE}.tmp"
+    tmp = rdir / f".{LEDGER_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     tmp.write_text(yaml.safe_dump(ledger, sort_keys=False), encoding="utf-8")
     tmp.replace(rdir / LEDGER_FILE)
 
@@ -947,7 +957,7 @@ def format_ledger(ledger: Optional[dict]) -> str:
 
 
 def answer_question(rdir: Path, state: dict, answer: str) -> dict:
-    """Apply a human's answer to the run's recorded open question (issue #98).
+    """Apply a human's answer to the run's open question (issue #98).
 
     Appends a `question_answered` event carrying both texts (secret-redacted
     like every other free-text writer), clears `open_question`, and clears
@@ -956,12 +966,20 @@ def answer_question(rdir: Path, state: dict, answer: str) -> dict:
     run is never flipped back silently — reopening goes through the #96
     completed-run directive. Persists through the single writer
     (write_state) and returns the updated state.
+
+    A question stop that never recorded its text is answerable too (T24):
+    `work state set --stop-reason=question` without `--question` is the
+    common shape in the wild, and refusing there dropped the answer and left
+    the stop in place. The event then carries `question: None` — the stop is
+    the fact that matters, and a missing text is not a reason to keep a run
+    blocked. `stop_reason` still has to be `question`: without a question
+    stop there is nothing an answer resolves.
     """
     question = state.get("open_question")
-    if not question:
+    if not question and state.get("stop_reason") != "question":
         raise RunStateError("no open question recorded — nothing to answer")
     data = {
-        "question": redact_secrets(str(question)),
+        "question": redact_secrets(str(question)) if question else None,
         "answer": redact_secrets(answer),
     }
     state["open_question"] = None
@@ -1447,8 +1465,17 @@ def format_brief(
     # A question answered on the way in (issue #98) leads everything: the
     # previous session stopped on it, and the answer is the new direction.
     if answered:
-        lines.append("✅ ANSWERED QUESTION (this run's blocking question has its answer):")
-        lines.append(f"Q: {answered.get('question')}")
+        # A question stop whose text was never recorded still gets its answer
+        # (T24). No Q line then — there is nothing to put on it, and "Q: None"
+        # would read as the question rather than as its absence.
+        if answered.get("question"):
+            lines.append("✅ ANSWERED QUESTION (this run's blocking question has its answer):")
+            lines.append(f"Q: {answered.get('question')}")
+        else:
+            lines.append(
+                "✅ ANSWERED QUESTION (the question's text was never recorded — "
+                "this is the answer to it):"
+            )
         lines.append(f"A: {answered.get('answer')}")
         lines.append("Proceed accordingly — record the follow-up goal/phase as you go.")
         lines.append("")

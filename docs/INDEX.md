@@ -4,6 +4,21 @@ This directory contains comprehensive documentation for the LMER (LLM Environmen
 
 ## Documentation Files
 
+### [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md)
+**Platform Quickstart**
+
+The short path to running the lmer platform (web control plane + supervising
+assistant) on a host:
+- Install, `setup-ui`, first run, the shared secret
+- Reaching it remotely: direct bind vs an nginx reverse proxy (WebSocket
+  upgrade + timeouts included)
+- `LMER_PLATFORM_CONTAINER_URL` and the surviving-assistant restart gotcha
+- A tour of the fleet view, spawning, answering, wind down vs exit, uber lmer
+
+**Best for**: Getting the platform running and usable in a few minutes.
+
+---
+
 ### [CONTAINER.md](./CONTAINER.md)
 **Container Runtime Support**
 
@@ -17,6 +32,25 @@ Complete guide to using Docker and Podman with LMER. Covers:
 - Performance considerations and security benefits
 
 **Best for**: Understanding how containers work in this project, troubleshooting container issues, and learning about FIPS compliance.
+
+---
+
+### [PLATFORM-CONTAINER.md](./PLATFORM-CONTAINER.md)
+**Platform Container Image**
+
+Running the orchestrator platform (control plane + UI) as a container image
+built from `Dockerfile.platform`, instead of installing it on the host:
+- What the image is, against the session image and against a bare-host install
+- The path-identity invariant (`$HOME/.lmer` mounted at the identical absolute
+  path) and exactly what a renamed mount breaks
+- What to mount, including the credential paths that live outside `~/.lmer`
+- Why `--network=host`, the bind-address opt-in, and sessions dialing back
+- Upgrades, the restart semantics of a containerized daemon, and the session
+  re-attach limitation that is still open
+- Spike runbook: build, run, spawn, restart, and the predictions to confirm
+
+**Best for**: Deploying the platform as a pull rather than a Node build, and
+walking the container-platform spike.
 
 ---
 
@@ -43,6 +77,7 @@ User guide for the `lmer` command-line interface:
 - Task-based workflows (built-in `chat`, plus tasks loaded from the work-repo or `LMER_TASKDEF_PATHS`)
 - Basic usage examples and command-line options
 - Repository targeting (URLs, local paths, PR/MR/issue URLs)
+- Canonical source configuration (`sources.yaml`)
 - Exec mode and debugging options
 
 **Best for**: Learning how to use the `lmer` CLI tool, understanding task workflows, and getting started with LMER.
@@ -127,9 +162,9 @@ Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume b
 ### [SERVICE-MODE.md](./SERVICE-MODE.md)
 **Service Mode**
 
-How `--service` and `--checkout` let lmer run against an already-running containerized project (Docker Compose stack, Podman pod, etc.) by `docker exec`-ing into the project's container instead of cloning a fresh copy.
+How `--service` and `--checkout` let lmer run against an already-running containerized project (Docker Compose stack, Podman pod, etc.) by `docker exec`-ing into the project's container instead of cloning a fresh copy. Plus **service slots**: named single-occupancy bindings from a runner to one of this host's dev services, declared in the platform's `config.json`, so several agents can share a host without two of them landing on one database.
 
-**Best for**: Working with projects whose tests require their own runtime environment (database fixtures, Django settings, etc.).
+**Best for**: Working with projects whose tests require their own runtime environment (database fixtures, Django settings, etc.), and handing out one dev stack across a fleet.
 
 ---
 

@@ -1,11 +1,19 @@
 """Tests for lmer_cli.supervisor."""
 from __future__ import annotations
 
+import contextlib
+import errno
+import hashlib
+import math
 import os
 import socket
+import stat
 import termios
 import threading
 import time
+import tty
+from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 import pytest
 
@@ -77,6 +85,126 @@ class TestOutputBuffer:
         assert data == b""
         assert cursor == 0
         assert elapsed >= 0.1
+
+
+# ---------------------------------------------------------------------------
+# The idle clock (T95)
+# ---------------------------------------------------------------------------
+#
+# The fact only this process can know: the host cannot tell a harness that is
+# working from one that finished and is sitting at its prompt, because run state
+# moves when a session *ends* (spec D24). So the supervisor times the gap since the
+# last byte the wrapped process produced, and /healthz reports it.
+#
+# The clock is injected rather than slept against — this suite runs on a one-CPU
+# box, where a timing assertion is a flake — and it is monotonic, so an NTP step
+# cannot produce a negative idle.
+
+
+class _FakeClock:
+    """A monotonic clock a test advances by hand. Seconds, arbitrary origin."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestIdleClock:
+    def test_nothing_produced_yet_reports_no_idleness_at_all(self):
+        """``None``, not zero: zero says the harness just wrote something.
+
+        It is also the same answer an image too old to have this feature gives the
+        platform, which is what makes one absent case on the read side instead of
+        two.
+        """
+        buf = supervisor.OutputBuffer(limit=1024, clock=_FakeClock())
+        assert buf.idle_seconds is None
+
+    def test_the_clock_starts_at_the_first_byte_and_counts_from_the_last(self):
+        clock = _FakeClock()
+        buf = supervisor.OutputBuffer(limit=1024, clock=clock)
+
+        buf.append(b"first")
+        assert buf.idle_seconds == 0.0
+        clock.advance(90)
+        assert buf.idle_seconds == 90.0
+
+        # A second chunk resets it: idleness is measured from the *last* output.
+        buf.append(b"second")
+        assert buf.idle_seconds == 0.0
+        clock.advance(1320)
+        assert buf.idle_seconds == 1320.0
+
+    def test_reading_the_buffer_is_not_activity(self):
+        """The mixed-fleet guard, from the side that has to hold it.
+
+        The platform's re-attach drain polls ``/output`` every twenty seconds for
+        the life of a detached session (:class:`lmer_platform.reattach
+        .ControlDrain`), and the host-side fallback must never be able to make a
+        quiet session look busy. It cannot, structurally: the reader's path is
+        ``read_since``, and only ``append`` touches the clock. This is the test
+        that says so, because the property is invisible in either function.
+        """
+        clock = _FakeClock()
+        buf = supervisor.OutputBuffer(limit=1024, clock=clock)
+        buf.append(b"the harness said this once")
+        clock.advance(600)
+
+        for _ in range(3):
+            buf.read_since(0)
+            buf.read_since(buf.end_offset)
+            clock.advance(0)
+
+        assert buf.idle_seconds == 600.0, (
+            "polling the output buffer moved the idle clock, so a session nobody "
+            "is watching would look busy for as long as the drain kept reading it"
+        )
+
+    def test_an_empty_append_is_not_activity(self):
+        """``append(b"")`` returns early, and it must return early *first*.
+
+        The forwarding loop treats an empty read as EOF and breaks, so this is a
+        direct call's problem rather than a production path — but a clock that
+        moved on nothing would still be recording an event that did not happen.
+        """
+        clock = _FakeClock()
+        buf = supervisor.OutputBuffer(limit=1024, clock=clock)
+        buf.append(b"")
+        assert buf.idle_seconds is None
+
+    def test_a_clock_that_stepped_backwards_never_reports_a_negative_idle(self):
+        clock = _FakeClock()
+        buf = supervisor.OutputBuffer(limit=1024, clock=clock)
+        buf.append(b"out")
+        clock.advance(-5)
+        assert buf.idle_seconds == 0.0
+
+    def test_the_report_is_null_in_both_spellings_when_nothing_is_known(self):
+        assert supervisor._activity_report(None) == {
+            "last_output_at": None, "idle_seconds": None,
+        }
+
+    def test_the_report_dates_the_last_output_by_subtracting_the_idle(self):
+        """One reading, two spellings, and the wall clock applied exactly once.
+
+        ``now`` is passed so the ISO is exact here; in the route it is read at
+        answer time, which is what keeps the timestamp from being frozen before an
+        NTP correction the way an append-time one would be.
+        """
+        now = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+        assert supervisor._activity_report(1320.0, now=now) == {
+            "last_output_at": "2026-07-28T11:38:00Z",
+            "idle_seconds": 1320.0,
+        }
+
+    def test_the_idle_reading_is_rounded_to_something_a_person_reads(self):
+        report = supervisor._activity_report(12.345678)
+        assert report["idle_seconds"] == 12.3
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +581,44 @@ class TestContainerEnvPassthrough:
             "LMER_QUIT_SEQUENCE entry missing from cli.py container env dict"
 
 
+class TestSetWinsize:
+    """Cover the strict/forgiving split on the TIOCSWINSZ helper."""
+
+    def _non_tty_fd(self, tmp_path) -> int:
+        """An fd whose TIOCSWINSZ fails for real (ENOTTY), no PTY teardown race."""
+        regular = tmp_path / "not-a-tty"
+        regular.write_bytes(b"")
+        return os.open(str(regular), os.O_RDWR)
+
+    def test_applies_geometry_to_a_pty(self):
+        master, slave = os.openpty()
+        try:
+            supervisor._set_winsize(master, 44, 132)
+            assert supervisor._get_winsize(slave) == (44, 132)
+        finally:
+            os.close(master)
+            os.close(slave)
+
+    def test_default_swallows_ioctl_failure(self, tmp_path):
+        # Pins the host-TTY callers' contract: the SIGWINCH handler and the
+        # post-launch recheck timer race a PTY that may already be gone and must
+        # not raise into a signal handler or a timer thread.
+        fd = self._non_tty_fd(tmp_path)
+        try:
+            supervisor._set_winsize(fd, 24, 80)
+        finally:
+            os.close(fd)
+
+    def test_strict_propagates_ioctl_failure(self, tmp_path):
+        # The /resize caller owes the client an answer, so it opts into the raise.
+        fd = self._non_tty_fd(tmp_path)
+        try:
+            with pytest.raises(OSError):
+                supervisor._set_winsize(fd, 24, 80, strict=True)
+        finally:
+            os.close(fd)
+
+
 class TestPreconfigurePtyForInjection:
     """Cover the cooked-mode race fix: ICRNL/ECHO/ICANON cleared pre-fork."""
 
@@ -676,13 +842,15 @@ class TestInjectStartPrompt:
         )
         assert sink == [b"do the thing\r"]
 
-    def test_does_not_double_terminate_lf(self):
+    def test_a_trailing_lf_still_gets_a_real_enter(self):
+        """The caller's newline is kept — it is what they asked for — and the
+        submit CR goes behind it, because LF is not Enter in raw mode."""
         sink: list[bytes] = []
         supervisor._inject_start_prompt(
             lambda data: (sink.append(data), len(data))[1],
             "do the thing\n",
         )
-        assert sink == [b"do the thing\n"]
+        assert sink == [b"do the thing\n\r"]
 
     def test_empty_prompt_is_noop(self):
         sink: list[bytes] = []
@@ -972,6 +1140,287 @@ class TestStartAutoStartThread:
         assert 5.0 not in cancel.waits
 
 
+class TestTheSuiteNeverWritesTheLiveSessionLog:
+    """The leak that put this suite's PTY traffic on an operator's screen (#210).
+
+    ``CONTAINER_SESSION_LOG_DIR`` is the log a running supervisor records its
+    session's terminal into, and the platform serves that file back as the
+    session's terminal view — so a test that wrapped a child without redirecting
+    it appended the child's raw output to what the operator was looking at (120
+    ``tick`` lines from ``TestForwardingLoopUnderContention`` alone, plus
+    ``/start`` injections, a ^C and escape sequences, interleaved with the TUI
+    mid-draw). ``_isolate_session_log_dir`` in ``conftest`` redirects the default;
+    nothing else in the suite would notice if that fixture went away, which is
+    what these two assert.
+    """
+
+    def test_the_ambient_default_opens_no_log_at_all(self):
+        """The property that makes the leak impossible, not just unlikely.
+
+        Asserted through the same call the forwarding loop makes, so it holds for
+        every test that wraps a child without patching the directory itself —
+        including one that fails or is interrupted mid-write.
+        """
+        assert supervisor.SessionLog.open_if_mounted(
+            supervisor.CONTAINER_SESSION_LOG_DIR
+        ) is None, (
+            "the suite's session-log default is a mounted directory, so every "
+            "supervisor test is appending its child's PTY traffic to it"
+        )
+
+    def test_the_default_is_not_the_developer_state_directory(self):
+        """Belt to the above's braces: a redirect into ``~`` would still be a leak
+        on a machine where that path is mounted, so the location is pinned too."""
+        from pathlib import Path
+
+        default = supervisor.CONTAINER_SESSION_LOG_DIR
+        assert not default.startswith(str(Path.home())), (
+            f"session logs are being written under the real home dir: {default}"
+        )
+
+
+class TestSessionLog:
+    """The session's own log — the copy the host cannot take away (#150).
+
+    Three of these are the contract the platform's read path depends on rather
+    than merely nice properties: nothing is written when nothing was mounted (a
+    plain ``lmer`` run on a laptop must be untouched), the directory is never
+    created here (its existence is what the platform asks with), and a log that
+    cannot be appended to is *removed* rather than left frozen — because the file
+    is what tells the reader "this is the record", and a truncated file making that
+    claim is worse than no file at all.
+    """
+
+    def test_nothing_is_written_when_nothing_is_mounted(self, tmp_path):
+        missing = tmp_path / "not-mounted"
+        assert supervisor.SessionLog.open_if_mounted(str(missing)) is None
+        assert not missing.exists(), "the mount point is a question, not ours to create"
+
+    def test_a_file_is_a_mount_point_this_declines(self, tmp_path):
+        """A path that is not a directory is not a mount; it is not written into."""
+        decoy = tmp_path / "decoy"
+        decoy.write_bytes(b"")
+        assert supervisor.SessionLog.open_if_mounted(str(decoy)) is None
+
+    def test_a_mounted_directory_is_opened_before_anything_is_written(self, tmp_path):
+        log = supervisor.SessionLog.open_if_mounted(str(tmp_path))
+        try:
+            assert log is not None
+            assert log.path == str(tmp_path / supervisor.SESSION_LOG_NAME)
+            assert os.path.exists(log.path), "opened at startup, not at the first byte"
+        finally:
+            log.close()
+
+    def test_the_log_is_owner_only(self, tmp_path):
+        """It holds every byte the session drew, in a bind-mounted directory."""
+        log = supervisor.SessionLog.open_if_mounted(str(tmp_path))
+        try:
+            mode = stat.S_IMODE(os.stat(log.path).st_mode)
+            assert mode == supervisor.SESSION_LOG_MODE, f"got {oct(mode)}"
+        finally:
+            log.close()
+
+    def test_bytes_are_readable_before_the_log_is_closed(self, tmp_path):
+        """The reader is another process tailing a running session."""
+        log = supervisor.SessionLog.open_if_mounted(str(tmp_path))
+        try:
+            log.write(b"first")
+            assert (tmp_path / supervisor.SESSION_LOG_NAME).read_bytes() == b"first"
+            log.write(b"second")
+            assert (
+                tmp_path / supervisor.SESSION_LOG_NAME
+            ).read_bytes() == b"firstsecond"
+        finally:
+            log.close()
+
+    def test_an_existing_log_is_appended_to(self, tmp_path):
+        (tmp_path / supervisor.SESSION_LOG_NAME).write_bytes(b"earlier\n")
+        log = supervisor.SessionLog.open_if_mounted(str(tmp_path))
+        try:
+            log.write(b"later")
+        finally:
+            log.close()
+        assert (
+            tmp_path / supervisor.SESSION_LOG_NAME
+        ).read_bytes() == b"earlier\nlater"
+
+    def test_a_write_that_cannot_land_removes_the_log(self, tmp_path, monkeypatch):
+        """The file's claim is withdrawn, so the reader falls back to the host tee."""
+        log = supervisor.SessionLog.open_if_mounted(str(tmp_path))
+        log.write(b"recorded")
+        real_write = os.write
+
+        def refuse(fd, data):
+            # Scoped to this log's fd: everything else in the process (pytest's
+            # own capture included) still has a working os.write.
+            if fd == log._fd:
+                raise OSError(errno.ENOSPC, "no space left on device")
+            return real_write(fd, data)
+
+        monkeypatch.setattr(supervisor.os, "write", refuse)
+        log.write(b"lost")
+
+        assert not (tmp_path / supervisor.SESSION_LOG_NAME).exists()
+
+    def test_writing_to_an_abandoned_log_is_a_no_op(self, tmp_path, monkeypatch):
+        """A session must not die of a second failure to log."""
+        log = supervisor.SessionLog.open_if_mounted(str(tmp_path))
+        monkeypatch.setattr(
+            supervisor.os, "write", lambda *a: (_ for _ in ()).throw(OSError("gone"))
+        )
+        log.write(b"one")
+        log.write(b"two")  # no exception, and nothing reopened
+        log.close()
+        assert not (tmp_path / supervisor.SESSION_LOG_NAME).exists()
+
+    def test_closing_keeps_the_file(self, tmp_path):
+        """The session ended; its log is exactly what somebody now wants to read."""
+        log = supervisor.SessionLog.open_if_mounted(str(tmp_path))
+        log.write(b"history")
+        log.close()
+        log.close()  # idempotent
+        assert (tmp_path / supervisor.SESSION_LOG_NAME).read_bytes() == b"history"
+
+
+class TestWriteAll:
+    """A message reaches the session whole, or the write raises (issue 194).
+
+    The failure this closes is the quietest one in the delivery path: ``os.write``
+    may write less than it was given, and the *last* byte of an ``/input`` payload
+    is the submit CR — so a short write is not a slow PTY, it is a partial message
+    typed into the box and never sent, under a 200 with a byte count over it. The
+    view on the other end had no way to know (:mod:`tests.test_platform_web_chat`
+    holds that half).
+    """
+
+    def test_a_short_write_is_followed_up_until_the_payload_is_gone(self, monkeypatch):
+        chunks = []
+        real_write = supervisor.os.write
+        read_fd, write_fd = os.pipe()
+
+        def stingy(fd, data):
+            # The kernel's prerogative, made deterministic: at most 4 bytes a call.
+            # Scoped to this pipe, because ``supervisor.os`` *is* the os module —
+            # a process-wide truncation would silently clip pytest's own capture
+            # writes and the test that noticed would be some other one (same
+            # discipline as the log's fd-scoped fake above).
+            if fd != write_fd:
+                return real_write(fd, data)
+            head = bytes(data[:4])
+            chunks.append(head)
+            return real_write(fd, head)
+
+        monkeypatch.setattr(supervisor.os, "write", stingy)
+        try:
+            payload = b"a message long enough to be split, and its Enter\r"
+            written = supervisor._write_all(write_fd, payload)
+        finally:
+            monkeypatch.undo()
+            os.close(write_fd)
+            landed = os.read(read_fd, 4096)
+            os.close(read_fd)
+
+        assert landed == payload, (
+            "the session received a truncated message; the tail carries the submit"
+        )
+        assert written == len(payload), (
+            f"the reply would report {written} of {len(payload)} bytes as written"
+        )
+        assert len(chunks) > 1, "the fixture no longer forces a short write"
+
+    def test_a_write_that_moves_nothing_raises_instead_of_spinning(self, monkeypatch):
+        """A 0 the kernel should never answer must not become a wedged session: the
+        write lock is held here, so a spin would take every other writer with it.
+
+        The fake counts its own calls and gives up after a few, so losing the guard
+        surfaces as a failure rather than as a hung suite — there is no
+        ``pytest-timeout`` in this project, so an unbounded loop here would stall
+        CI instead of turning it red. Scoped to a sentinel fd for the same reason
+        the fake above is.
+        """
+        real_write = supervisor.os.write
+        sentinel = 987654
+        calls = []
+
+        def stuck(fd, data):
+            if fd != sentinel:
+                return real_write(fd, data)
+            calls.append(len(data))
+            assert len(calls) < 4, "_write_all is spinning on a zero-length write"
+            return 0
+
+        monkeypatch.setattr(supervisor.os, "write", stuck)
+        with pytest.raises(OSError) as caught:
+            supervisor._write_all(sentinel, b"xyz")
+        assert calls == [3], f"the guard did not stop at the first zero: {calls}"
+        # The diagnostic has to name how much landed, not how much was left: a
+        # message that died 43 bytes into 48 is a different repair from one that
+        # never started, and this string is what reaches the operator through
+        # ``/input``'s 500.
+        assert "0 of 3 bytes" in str(caught.value), str(caught.value)
+
+
+    def test_a_failure_part_way_through_says_how_much_landed(self, monkeypatch):
+        """The one fact nobody downstream can recover for themselves.
+
+        A write that dies between iterations — the child exiting under us — leaves
+        the front of the message typed in the session's input box. "wrote 43 of 48"
+        is the difference between that and a message the session never saw, and it
+        is what ``/input``'s 500 detail carries to the operator.
+        """
+        real_write = supervisor.os.write
+        sentinel = 987655
+        seen = []
+
+        def dies_after_the_first_chunk(fd, data):
+            if fd != sentinel:
+                return real_write(fd, data)
+            if seen:
+                raise OSError(errno.EIO, "the child is gone")
+            seen.append(True)
+            return 4
+
+        monkeypatch.setattr(supervisor.os, "write", dies_after_the_first_chunk)
+        with pytest.raises(OSError) as caught:
+            supervisor._write_all(sentinel, b"a message and its Enter\r")
+        assert "wrote 4 of 24 bytes" in str(caught.value), str(caught.value)
+
+    def test_the_control_plane_write_goes_through_the_loop(self):
+        """The wiring, not just the helper.
+
+        ``TestWriteAll`` above exercises ``_write_all`` directly and the ``/input``
+        route tests write into their own sink, so both halves can pass while the
+        supervisor's real writer calls ``os.write`` once — which is the bug. So the
+        call site itself is pinned: every writer into the child (``/input``, the
+        auto-start injection, the host TTY relay) goes through ``write_to_child``,
+        and ``write_to_child`` has to go through the loop.
+        """
+        import inspect
+
+        source = inspect.getsource(supervisor.run_supervisor)
+        assert "_write_all(master_fd, data)" in source, (
+            "write_to_child no longer writes through _write_all, so a short write "
+            "silently truncates whatever an operator typed"
+        )
+
+    def test_the_session_log_shares_the_loop(self):
+        """One implementation of "write all of it", not two.
+
+        The two had already diverged: only one refused a zero-length write, so the
+        hole this closes on the input path stayed open on the log path. A second
+        copy is how that happens again.
+        """
+        import inspect
+
+        source = inspect.getsource(supervisor.SessionLog.write)
+        assert "_write_all(" in source, (
+            "SessionLog.write hand-rolls the loop again"
+        )
+        assert "os.write(" not in source, (
+            "SessionLog.write still calls os.write directly"
+        )
+
+
 class TestEnsureSubmitCr:
     def test_appends_cr_when_missing(self):
         assert supervisor._ensure_submit_cr("hello") == "hello\r"
@@ -979,11 +1428,763 @@ class TestEnsureSubmitCr:
     def test_does_not_double_cr(self):
         assert supervisor._ensure_submit_cr("hello\r") == "hello\r"
 
-    def test_does_not_double_lf(self):
-        assert supervisor._ensure_submit_cr("hello\n") == "hello\n"
+    def test_an_lf_is_not_a_submit_and_gets_a_cr_behind_it(self):
+        """LF in raw mode is a literal newline in the input box, not Enter, so
+        treating it as "already submitted" left the text typed and unsent."""
+        assert supervisor._ensure_submit_cr("hello\n") == "hello\n\r"
 
     def test_empty_string_gets_cr(self):
         assert supervisor._ensure_submit_cr("") == "\r"
+
+
+class TestTtyInputPending:
+    """The kernel fact the submit path is built on (#210).
+
+    ``TIOCINQ`` on the *slave* reports how many bytes the child has not read yet,
+    which is the only signal that answers "may I press Enter now" without
+    guessing at a timer. It is pinned against a real PTY rather than a mock,
+    because the whole point is that the kernel — not this code — is the one making
+    the claim: if a platform ever answers differently, the fix silently degrades
+    to a bare delay and this is the test that says so.
+    """
+
+    @staticmethod
+    def _settled(path, expected, timeout=1.0):
+        """The queue depth once *expected* bytes have become visible.
+
+        The line discipline is fed by deferred work, so a probe straight after a
+        write legitimately reads zero — a test that asserted on the first reading
+        would be asserting on that race.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            pending = supervisor._tty_input_pending(path)
+            if pending is not None and pending >= expected:
+                return pending
+            time.sleep(0.001)
+        return supervisor._tty_input_pending(path)
+
+    def _pty(self, raw=True):
+        master, slave = os.openpty()
+        if raw:
+            # What every harness TUI does to its own terminal, and the mode in
+            # which the queue count means what this code needs it to mean.
+            tty.setraw(slave)
+        path = os.ttyname(slave)
+        return master, slave, path
+
+    def test_reports_unread_bytes_and_zero_once_read(self):
+        master, slave, path = self._pty()
+        try:
+            assert supervisor._tty_input_pending(path) == 0
+            os.write(master, b"x" * 400)
+            deadline = time.monotonic() + 1.0
+            while (
+                supervisor._tty_input_pending(path) == 0
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            assert supervisor._tty_input_pending(path) == 400, (
+                "the queue must account for bytes nobody has read"
+            )
+            # The reader here stands in for the harness taking its input.
+            assert os.read(slave, 4096) == b"x" * 400
+            assert supervisor._tty_input_pending(path) == 0
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_unaskable_terminal_is_unknown_not_drained(self):
+        """A path that cannot be opened must not read as an empty queue.
+
+        "Drained" is a licence to press Enter immediately; "unknown" is not, and
+        conflating them would put the swallowed-CR bug back on any platform where
+        the probe does not work.
+        """
+        assert supervisor._tty_input_pending("/dev/does-not-exist-lmer") is None
+
+    def test_probing_does_not_consume_or_disturb_the_queue(self):
+        """The probe re-opens the slave; that must not eat the child's input."""
+        master, slave, path = self._pty()
+        try:
+            os.write(master, b"hello")
+            # Wait for the bytes to reach the line discipline before counting
+            # them: the queue legitimately reads zero for a moment after the
+            # write (see test_bytes_in_flight_are_not_mistaken_for_bytes_consumed).
+            deadline = time.monotonic() + 1.0
+            while (
+                supervisor._tty_input_pending(path) == 0
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            for _ in range(3):
+                assert supervisor._tty_input_pending(path) == 5
+            assert os.read(slave, 4096) == b"hello"
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_the_verdict_is_scoped_to_this_write(self):
+        """Arrival is an increase over the pre-write depth, so another writer's
+        leftovers cannot stand in for it — and, unlike a payload-length threshold,
+        an increase stays observable at any message size."""
+        master, slave, path = self._pty()
+        probe = lambda: supervisor._tty_input_pending(path)   # noqa: E731
+        try:
+            os.write(master, b"someone else's bytes")
+            baseline = self._settled(path, 20)
+
+            # Nothing more is written, so no reading can be mistaken for a write
+            # that never happened.
+            verdict = supervisor._wait_for_text_read(
+                probe, baseline, timeout=0.5, arrival_grace=0.1
+            )
+            assert verdict == supervisor.SUBMIT_TEXT_UNKNOWN, (
+                "another writer's bytes were mistaken for this write's"
+            )
+
+            os.write(master, b"z" * 200)
+            verdict = supervisor._wait_for_text_read(
+                probe, baseline, timeout=0.3, arrival_grace=1.0
+            )
+            assert verdict == supervisor.SUBMIT_TEXT_UNREAD, (
+                "bytes seen queued and never read must report unread"
+            )
+            os.read(slave, 4096)
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_a_read_verdict_requires_seeing_the_queue_grow_first(self):
+        """20 rounds of the race that made the original check unsound.
+
+        A scripted probe stands in for the zero the line discipline shows for a
+        few hundred microseconds after a write. The arrival grace is deliberately
+        **shorter** than the timeout here, so the branch that resolves an
+        unconfirmed zero is inside the wait and a mutant that returned ``read``
+        there would fail this test.
+        """
+        for round_ in range(20):
+            probes = iter([0, 0, 0] + [200] * 500)
+            verdict = supervisor._wait_for_text_read(
+                lambda: next(probes, 200), 0, timeout=0.15, arrival_grace=0.03
+            )
+            assert verdict != supervisor.SUBMIT_TEXT_READ, (
+                f"round {round_}: an in-flight zero was resolved as read"
+            )
+
+    def test_an_all_zero_queue_ends_on_the_grace_as_unknown(self):
+        """The other half of the same branch: a queue that never grows resolves as
+        unknown when the grace expires, not as read, and not by waiting out the
+        much longer drain timeout."""
+        started = time.monotonic()
+        verdict = supervisor._wait_for_text_read(
+            lambda: 0, 0, timeout=5.0, arrival_grace=0.05
+        )
+        assert verdict == supervisor.SUBMIT_TEXT_UNKNOWN
+        assert time.monotonic() - started < 1.0, (
+            "the grace bound was not the one that ended the wait"
+        )
+
+    def test_unread_bytes_are_never_reported_read_on_a_real_pty(self):
+        """The original defect's reproduction, kept as a guard.
+
+        Twenty rounds on a real raw-mode PTY with the production configuration:
+        bytes written, nobody reads them. The first shipped shape reported
+        *drained* here in 2 of 20 rounds.
+        """
+        for round_ in range(20):
+            master, slave = os.openpty()
+            tty.setraw(slave)
+            path = os.ttyname(slave)
+            try:
+                probe = lambda: supervisor._tty_input_pending(path)   # noqa: E731
+                baseline = probe()
+                os.write(master, b"z" * 200)
+                verdict = supervisor._wait_for_text_read(
+                    probe, baseline, timeout=0.1
+                )
+                assert verdict in (
+                    supervisor.SUBMIT_TEXT_UNREAD, supervisor.SUBMIT_TEXT_UNKNOWN
+                ), f"round {round_}: unread bytes reported as {verdict!r}"
+            finally:
+                os.close(slave)
+                os.close(master)
+
+    def test_a_partial_read_is_not_enough(self):
+        """Only an empty queue proves *our* bytes are gone.
+
+        The queue is FIFO, so a partial read can consume an earlier writer's bytes
+        while ours sit behind them — which is why READ waits for zero rather than
+        for the depth to fall back to the baseline. Deleted in iteration 3, which
+        left the requirement unpinned: the mutant `elif pending <= baseline:
+        return READ` passed every surviving test in this class, because they all
+        used a zero baseline or never returned to one. This case has neither.
+        """
+        probes = iter([50, 250, 120, 60, 55, 52, 51, 50])   # back to baseline, never 0
+        verdict = supervisor._wait_for_text_read(
+            lambda: next(probes, 50), 50, timeout=0.1, arrival_grace=0.05
+        )
+        assert verdict == supervisor.SUBMIT_TEXT_UNREAD, (
+            "a queue that fell back to the baseline was read as drained"
+        )
+
+    def test_a_queue_seen_emptying_after_arrival_is_read(self):
+        probes = iter([0, 200, 200, 0])
+        verdict = supervisor._wait_for_text_read(
+            lambda: next(probes, 0), 0, timeout=2.0
+        )
+        assert verdict == supervisor.SUBMIT_TEXT_READ
+
+    def test_a_terminal_that_stops_answering_is_unknown(self):
+        assert supervisor._wait_for_text_read(
+            lambda: None, 0, timeout=0.05
+        ) == supervisor.SUBMIT_TEXT_UNKNOWN
+
+    def test_no_baseline_is_unknown_without_probing(self):
+        """No pre-write reading means the comparison has no anchor, so there is
+        nothing to conclude — and nothing is claimed."""
+        calls = []
+        assert supervisor._wait_for_text_read(
+            lambda: calls.append(1) or 0, None, timeout=0.05
+        ) == supervisor.SUBMIT_TEXT_UNKNOWN
+        assert calls == [], "it probed despite having no baseline to compare against"
+
+    def test_a_canonical_terminals_zero_is_unknown_not_empty(self):
+        """The limitation, stated as a test so it cannot be forgotten.
+
+        Canonical mode counts only what a reader could take — complete lines — so
+        an unfinished line reads as zero, which is exactly the reading that must
+        not be trusted as "the child has the text". A non-zero count is still
+        unambiguous and is still reported.
+        """
+        master, slave, path = self._pty(raw=False)
+        try:
+            assert supervisor._tty_input_pending(path) is None, (
+                "an empty-looking canonical queue is unknown, not drained"
+            )
+            os.write(master, b"half a line")
+            assert supervisor._tty_input_pending(path) is None, (
+                "a partial line is invisible to the count, so it must stay unknown"
+            )
+            os.write(master, b"\r")
+            # Through _settled, for the reason its own docstring gives: the line
+            # discipline is fed by deferred work, so the probe straight after
+            # this write legitimately reads zero and asserting on the first
+            # reading is asserting on that race. It passed on an idle runner and
+            # failed twice on a loaded one (MR !203 CI), which is the shape of a
+            # test measuring arrival latency rather than the kernel fact it is
+            # about.
+            pending = self._settled(path, 1)
+            assert pending is not None and pending > 0, (
+                f"a complete line is countable in canonical mode too: {pending}"
+            )
+        finally:
+            os.close(slave)
+            os.close(master)
+
+
+class TestSubmitPayload:
+    """The two-write submit sequence, without a terminal in the way."""
+
+    def _recorder(self):
+        sink: list[bytes] = []
+
+        def write(data: bytes) -> int:
+            sink.append(data)
+            return len(data)
+
+        return sink, write
+
+    def test_text_then_enter_with_the_wait_in_between(self):
+        sink, write = self._recorder()
+        order: list[str] = []
+        # A probe that reports the payload queued and then gone, which is the
+        # only sequence that earns a READ verdict.
+        readings = iter([0, 5, 0])
+
+        def probe():
+            order.append(f"probe after {len(sink)} write(s)")
+            return next(readings, 0)
+
+        with mock.patch.object(
+            supervisor.time, "sleep", lambda s: order.append(f"sleep {s}")
+        ):
+            written, verdict = supervisor._submit_payload(
+                write, "hello", probe=probe, settle=0.2
+            )
+
+        assert sink == [b"hello", b"\r"]
+        assert written == len(b"hello\r"), "the count covers everything written"
+        assert verdict == supervisor.SUBMIT_TEXT_READ
+        # The baseline is read BEFORE the text, and the wait plus the settle both
+        # happen after it and before the Enter: that ordering IS the fix.
+        assert order[0] == "probe after 0 write(s)", (
+            f"the baseline was not taken before the write: {order}"
+        )
+        assert order[-1] == "sleep 0.2", (
+            f"the settle is not the last thing before the Enter: {order}"
+        )
+        assert all("after 1 write(s)" in step for step in order[1:] if "probe" in step), (
+            f"a probe ran at the wrong point in the sequence: {order}"
+        )
+        assert order.count("probe after 1 write(s)") >= 2, (
+            f"the wait did not watch the queue after the write: {order}"
+        )
+
+    def test_a_trailing_cr_becomes_the_separate_enter(self):
+        sink, write = self._recorder()
+        written, _ = supervisor._submit_payload(
+            write, "hello\r", probe=None, settle=0
+        )
+        assert sink == [b"hello", b"\r"], "the caller's own CR must not be doubled"
+        assert written == len(b"hello\r")
+
+    def test_a_lone_enter_skips_the_wait_entirely(self):
+        sink, write = self._recorder()
+        probed = []
+        written, verdict = supervisor._submit_payload(
+            write, "\r", probe=lambda: probed.append(True) or 0, settle=5.0
+        )
+        assert sink == [b"\r"]
+        assert written == 1
+        assert probed == [], "there is no text to be pasted, so nothing to wait for"
+        assert verdict == supervisor.SUBMIT_TEXT_UNKNOWN, (
+            "a keypress with nothing observed must not claim an observation"
+        )
+
+    def test_no_probe_available_reports_unknown(self):
+        sink, write = self._recorder()
+        _, verdict = supervisor._submit_payload(
+            write, "hello", probe=None, settle=0
+        )
+        assert sink == [b"hello", b"\r"]
+        assert verdict == supervisor.SUBMIT_TEXT_UNKNOWN, (
+            "without a probe nothing was observed and nothing may be claimed"
+        )
+
+    def test_a_short_write_is_completed_before_the_enter(self):
+        """A truncated message must never be submitted.
+
+        The old failure was a message not being sent; with the Enter as its own
+        write, a short text write would send whatever landed. So the text write is
+        looped to completion first.
+        """
+        sink, _ = self._recorder()
+
+        def dribbling_write(data: bytes) -> int:
+            chunk = bytes(data[:4])          # the PTY takes 4 bytes at a time
+            sink.append(chunk)
+            return len(chunk)
+
+        written, _ = supervisor._submit_payload(
+            dribbling_write, "abcdefghij", probe=None, settle=0
+        )
+        assert b"".join(sink) == b"abcdefghij\r", (
+            f"the message reached the PTY incomplete: {sink}"
+        )
+        assert written == len(b"abcdefghij\r")
+        assert sink[-1] == b"\r", "the Enter must still be its own write"
+
+    def test_a_write_that_cannot_progress_raises_before_the_enter(self):
+        """Rather than pressing Enter on a partial message.
+
+        The operator then sees the fragment in the input box and the route answers
+        an error, instead of the session receiving half a message as a turn.
+        """
+        sink: list[bytes] = []
+
+        def stalling_write(data: bytes) -> int:
+            if not sink:
+                sink.append(bytes(data[:3]))
+                return 3
+            return 0                          # cannot make progress
+
+        with pytest.raises(OSError) as excinfo:
+            supervisor._submit_payload(
+                stalling_write, "abcdefghij", probe=None, settle=0
+            )
+        assert "wrote 3 of 10" in str(excinfo.value)
+        assert b"\r" not in b"".join(sink), (
+            "Enter was pressed on a message that never fully landed"
+        )
+
+    def test_utf8_payload_is_counted_in_bytes(self):
+        sink, write = self._recorder()
+        written, _ = supervisor._submit_payload(
+            write, "héllo — ✓", probe=None, settle=0
+        )
+        assert sink == ["héllo — ✓".encode("utf-8"), b"\r"]
+        assert written == len("héllo — ✓".encode("utf-8")) + 1
+
+
+class TestMakeSubmit:
+    """The production closure, on a real PTY with a real reader behind it."""
+
+    @staticmethod
+    def _read_until(fd, expected: bytes, timeout: float = 2.0) -> bytes:
+        """Read *fd* until *expected* has arrived, or *timeout* elapses.
+
+        Not a courtesy: bytes written to the master reach the reader's queue
+        through deferred work, so a single read can legitimately return the text
+        without the CR that was already written behind it. Asserting on one read
+        would be asserting on that race, not on the delivery.
+        """
+        got = bytearray()
+        deadline = time.monotonic() + timeout
+        while bytes(got) != expected and time.monotonic() < deadline:
+            try:
+                got.extend(os.read(fd, 4096))
+            except BlockingIOError:
+                time.sleep(0.005)
+        return bytes(got)
+
+    def _pty_with_reader(self):
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        path = os.ttyname(slave)
+        seen = bytearray()
+        stop = threading.Event()
+
+        def drain():
+            while not stop.is_set():
+                try:
+                    chunk = os.read(slave, 4096)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                seen.extend(chunk)
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        return master, slave, path, seen, stop, reader
+
+    def test_a_message_reaches_the_pty_in_full_and_in_order(self, monkeypatch):
+        """What the code guarantees, for a free-running reader.
+
+        Deliberately **not** asserting ``read`` here: with a reader that drains
+        continuously, whether the probe catches the queue holding the payload is a
+        race the implementation does not try to win, and ``unknown`` is the
+        contract's correct answer when the harness consumed the text before the
+        first probe could look (:data:`SUBMIT_TEXT_UNKNOWN` says so). An earlier
+        version of this test asserted ``read`` and red-lit CI at ~22% per run —
+        asserting an observation the contract does not promise. What must hold
+        unconditionally is the delivery: every byte, in order, with the Enter last
+        and alone, and never a verdict claiming the text went unread when a reader
+        took it.
+        """
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0.01")
+        master, slave, path, seen, stop, reader = self._pty_with_reader()
+        try:
+            submit = supervisor._make_submit(master, threading.Lock(), path)
+            message = "a message long enough to be a paste " * 4
+            written, verdict = submit(message)
+            text = message.encode()
+            deadline = time.monotonic() + 2.0
+            while bytes(seen) != text + b"\r" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert bytes(seen) == text + b"\r", (
+                f"the child did not receive text-then-Enter: {bytes(seen)[:80]!r}"
+            )
+            assert written == len(text) + 1
+            assert verdict in (
+                supervisor.SUBMIT_TEXT_READ, supervisor.SUBMIT_TEXT_UNKNOWN
+            ), f"a reader took the text and the verdict says {verdict!r}"
+        finally:
+            stop.set()
+            os.close(slave)
+            os.close(master)
+            reader.join(timeout=1)
+
+    def _submit_with_gated_reader(self, message, *, drain_timeout=1.0):
+        """Submit *message*, releasing the reader only once the **submit's own**
+        probe has seen the payload queued.
+
+        Gating on a second observer (a probe the test runs) does not establish
+        that the submit's probe loop saw anything: if the reader drains between
+        two of its 1 ms polls, ``arrived`` is never set and the verdict is
+        ``unknown``. Replays of that shape landed there ~2-3% of the time. Wrapping
+        the probe the submit itself uses removes the race rather than narrowing it.
+        """
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        path = os.ttyname(slave)
+        release = threading.Event()
+        stop = threading.Event()
+        seen = bytearray()
+
+        def reader():
+            release.wait(5.0)
+            while not stop.is_set():
+                try:
+                    chunk = os.read(slave, 65536)
+                except OSError:
+                    return
+                if not chunk:
+                    return
+                seen.extend(chunk)
+
+        def gated_probe():
+            pending = supervisor._tty_input_pending(path)
+            if pending:
+                release.set()
+            return pending
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        try:
+            written, verdict = supervisor._submit_payload(
+                lambda data: os.write(master, data),
+                message,
+                probe=gated_probe,
+                settle=0,
+                drain_timeout=drain_timeout,
+            )
+            return written, verdict, seen
+        finally:
+            release.set()
+            stop.set()
+            os.close(slave)
+            os.close(master)
+            thread.join(timeout=1)
+
+    def test_a_read_verdict_when_the_reader_is_driven_deterministically(self):
+        """``read`` specifically, with the race removed rather than narrowed."""
+        written, verdict, _seen = self._submit_with_gated_reader("hello there")
+        assert verdict == supervisor.SUBMIT_TEXT_READ, (
+            f"an observed arrival and drain reported {verdict!r}"
+        )
+        assert written == len(b"hello there\r")
+
+    def test_a_message_past_the_queues_ceiling_is_still_measured(self, monkeypatch):
+        """The queue saturates at 4095 bytes, so a check phrased against the
+        payload's length is unsatisfiable above it — which gave every message at or
+        above 4096 bytes no evidence and released its Enter on a timer.
+
+        Both directions are asserted, and both now come from the wait itself rather
+        than from anything upstream of it: an earlier version of this test passed
+        with the measurement stubbed out to ``unknown``, because a separate
+        head-clear override supplied ``unread`` on its own. There is no override
+        now — the verdict is whatever the wait concluded — so stubbing the wait
+        fails this test.
+        """
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        for nbytes in (100, 4095, 4096, 5000):
+            master, slave = os.openpty()
+            tty.setraw(slave)
+            try:
+                submit = supervisor._make_submit(
+                    master, threading.Lock(), os.ttyname(slave), drain_timeout=0.2
+                )
+                _, verdict = submit("x" * nbytes)
+                assert verdict == supervisor.SUBMIT_TEXT_UNREAD, (
+                    f"{nbytes} bytes with no reader reported {verdict!r} — the "
+                    "queue's ceiling is being treated as an answer"
+                )
+            finally:
+                os.close(slave)
+                os.close(master)
+
+        # And the positive direction, which the length-based check could not reach
+        # at all: a harness that does consume a message past the ceiling is
+        # observed doing so.
+        for nbytes in (4096, 5000):
+            _written, verdict, seen = self._submit_with_gated_reader(
+                "x" * nbytes, drain_timeout=2.0
+            )
+            assert verdict == supervisor.SUBMIT_TEXT_READ, (
+                f"{nbytes} bytes taken by a reader reported {verdict!r}"
+            )
+
+    def test_nothing_can_write_between_the_text_and_its_enter(self, monkeypatch):
+        """The property that makes the two-write submit safe.
+
+        The gap between a message and its Enter is a window in which another
+        writer's bytes would be submitted as part of this message. The lock has
+        to be held across the whole sequence, so a concurrent writer waits rather
+        than interleaving — checked from inside the gap itself.
+        """
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0.01")
+        master, slave, path, seen, stop, reader = self._pty_with_reader()
+        lock = threading.Lock()
+        acquired_during_gap = []
+        real_sleep = time.sleep
+
+        def probing_sleep(seconds):
+            # Non-blocking, so a held lock shows up as a refusal instead of a
+            # deadlocked test.
+            got = lock.acquire(blocking=False)
+            acquired_during_gap.append(got)
+            if got:
+                lock.release()
+            real_sleep(seconds)
+
+        try:
+            submit = supervisor._make_submit(master, lock, path)
+            with mock.patch.object(supervisor.time, "sleep", probing_sleep):
+                submit("hello")
+            # Every wait inside the sequence — the drain poll and the settle —
+            # happens with the lock held; not one of them is a window.
+            assert acquired_during_gap, "the sequence never waited at all"
+            assert not any(acquired_during_gap), (
+                "another writer could have written into the middle of a submit: "
+                f"{acquired_during_gap}"
+            )
+            assert not lock.locked(), "the submit did not release the write lock"
+        finally:
+            stop.set()
+            os.close(slave)
+            os.close(master)
+            reader.join(timeout=1)
+
+    def test_a_wedged_child_still_gets_its_enter(self, monkeypatch):
+        """Nobody reads, so the drain never happens — the message must not be
+        held hostage to that. The Enter goes out anyway and the reply says the
+        delivery was not observed."""
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        try:
+            submit = supervisor._make_submit(
+                master, threading.Lock(), os.ttyname(slave), drain_timeout=0.05
+            )
+            started = time.monotonic()
+            written, verdict = submit("hello")
+            assert verdict == supervisor.SUBMIT_TEXT_UNREAD, (
+                "bytes seen queued and never read are unread, not merely unknown"
+            )
+            assert written == len(b"hello\r")
+            assert time.monotonic() - started < 1.0, "the wait was not bounded"
+            assert self._read_until(slave, b"hello\r") == b"hello\r", (
+                "the bytes must all be there, in order, for whenever it reads"
+            )
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_no_terminal_path_still_submits(self, monkeypatch):
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        try:
+            submit = supervisor._make_submit(master, threading.Lock(), None)
+            _, verdict = submit("hello")
+            assert verdict == supervisor.SUBMIT_TEXT_UNKNOWN, "no probe, no claim"
+            assert self._read_until(slave, b"hello\r") == b"hello\r"
+        finally:
+            os.close(slave)
+            os.close(master)
+
+
+class TestSubmitEnterDelayReachesTheContainer:
+    """Guard: the knob is useless if it stops at the container boundary.
+
+    The supervisor that reads it runs *inside* the session container, so an entry
+    missing from the host CLI's env passthrough makes a host-exported value a
+    silent no-op — and the symptom would be the #210 bug still happening with the
+    documented remedy applied. Same guard the project keeps for
+    ``LMER_REASONING_EFFORT`` and ``LMER_QUICK_GATE_COMMIT``.
+    """
+
+    def test_cli_env_dict_declares_submit_enter_delay(self):
+        import re
+        from pathlib import Path
+
+        source = (
+            Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        ).read_text()
+        pattern = re.compile(
+            r"""["']LMER_SUBMIT_ENTER_DELAY["']\s*:\s*os\.environ\.get\("""
+            r"""\s*["']LMER_SUBMIT_ENTER_DELAY["']\s*\)"""
+        )
+        assert pattern.search(source), (
+            "LMER_SUBMIT_ENTER_DELAY missing from cli.py's container env dict, so "
+            "a host-set value would never reach the in-container supervisor"
+        )
+
+    def test_documented_in_the_env_var_reference(self):
+        """The project's env-var convention: every LMER_ var that controls
+        user-visible behavior carries a bullet in docs/LMER-CLI.md."""
+        from pathlib import Path
+
+        docs = (
+            Path(__file__).parent.parent / "docs" / "LMER-CLI.md"
+        ).read_text()
+        assert "**`LMER_SUBMIT_ENTER_DELAY`**" in docs
+
+
+class TestResolveSubmitEnterDelay:
+    """The one knob, and its refusal to let a typo break a session."""
+
+    def test_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("LMER_SUBMIT_ENTER_DELAY", raising=False)
+        assert (
+            supervisor._resolve_submit_enter_delay()
+            == supervisor.DEFAULT_SUBMIT_ENTER_DELAY
+        )
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0.35")
+        assert supervisor._resolve_submit_enter_delay() == 0.35
+
+    def test_zero_is_honored(self, monkeypatch):
+        """An operator who wants the delay gone must be able to say so — the
+        drain wait still carries the fix."""
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        assert supervisor._resolve_submit_enter_delay() == 0.0
+
+    @pytest.mark.parametrize("raw", [
+        "", "   ", "soon", "-1", "0.2s",
+        # Each of these got through a parses-as-a-non-negative-float check and
+        # each breaks something different: nan compares false against every
+        # threshold so the settle was silently skipped; inf (and 1e400, which
+        # parses to it) makes time.sleep raise OverflowError *between* the text
+        # and the Enter, leaving the message typed and unsubmitted under a 500;
+        # 200 is the milliseconds-for-seconds slip, and it would hold the PTY
+        # write lock for three minutes per message.
+        "nan", "NaN", "inf", "-inf", "1e400", "200", "1.01",
+    ])
+    def test_unusable_values_warn_and_fall_back(self, monkeypatch, capsys, raw):
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", raw)
+        assert (
+            supervisor._resolve_submit_enter_delay()
+            == supervisor.DEFAULT_SUBMIT_ENTER_DELAY
+        )
+        if raw.strip():
+            assert "LMER_SUBMIT_ENTER_DELAY" in capsys.readouterr().err, (
+                "a value that was ignored has to say so"
+            )
+
+    def test_the_ceiling_is_the_edge_of_what_is_accepted(self, monkeypatch):
+        """The bound exists because the settle runs under the PTY write lock, so
+        an over-large value freezes the session's terminal I/O for its duration."""
+        monkeypatch.setenv(
+            "LMER_SUBMIT_ENTER_DELAY", str(supervisor.SUBMIT_ENTER_DELAY_MAX)
+        )
+        assert (
+            supervisor._resolve_submit_enter_delay()
+            == supervisor.SUBMIT_ENTER_DELAY_MAX
+        )
+
+    def test_every_accepted_value_is_safe_to_sleep_on(self, monkeypatch):
+        """The contract this function exists for, stated as the property that
+        matters: whatever it returns can be handed to time.sleep without raising,
+        and is never a value that silently disables the margin."""
+        for raw in ("nan", "inf", "1e400", "-inf", "200", "soon", "", "0", "0.35"):
+            monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", raw)
+            value = supervisor._resolve_submit_enter_delay()
+            assert math.isfinite(value), f"{raw!r} produced {value!r}"
+            assert 0 <= value <= supervisor.SUBMIT_ENTER_DELAY_MAX
+            time.sleep(min(value, 0.001))   # would raise on inf/nan
+
+    def test_read_at_call_time_not_cached(self, monkeypatch):
+        """The knob exists for a harness update that moves the window; requiring
+        a session restart to apply it would defeat the point."""
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0.1")
+        assert supervisor._resolve_submit_enter_delay() == 0.1
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0.4")
+        assert supervisor._resolve_submit_enter_delay() == 0.4
 
 
 class TestResolveFastApiPort:
@@ -1070,7 +2271,7 @@ class TestCli:
 
 
 class TestFastApiApp:
-    def _build(self, token="test-token"):
+    def _build(self, token="test-token", **app_kwargs):
         buf = supervisor.OutputBuffer(limit=1024)
         sink: list[bytes] = []
 
@@ -1078,8 +2279,27 @@ class TestFastApiApp:
             sink.append(data)
             return len(data)
 
-        app = supervisor._build_fastapi_app(buf, write_input, token)
+        app = supervisor._build_fastapi_app(buf, write_input, token, **app_kwargs)
         return app, buf, sink
+
+    def _build_resizable(self, token="test-token", resize=None, winsize=(24, 80)):
+        """Build the app with a recording resize callable and a fixed geometry.
+
+        Returns the recorded ``(rows, cols)`` calls so a test can show the route
+        reached the PTY-facing callable — or, for the rejection cases, that it
+        never did.
+        """
+        calls: list[tuple[int, int]] = []
+
+        def record(rows: int, cols: int) -> None:
+            calls.append((rows, cols))
+
+        app, _buf, _sink = self._build(
+            token=token,
+            resize=record if resize is None else resize,
+            get_winsize=lambda: winsize,
+        )
+        return app, calls
 
     def _client(self, app):
         from fastapi.testclient import TestClient
@@ -1094,7 +2314,12 @@ class TestFastApiApp:
             headers={"Authorization": "Bearer test-token"},
         )
         assert resp.status_code == 200
-        assert resp.json() == {"bytes_written": 5}
+        body = resp.json()
+        assert body["bytes_written"] == 5
+        # The delivery receipt (#197): the caller can recompute both values
+        # from what it sent, so agreement proves the payload crossed intact.
+        assert body["payload_sha256"] == hashlib.sha256(b"hello").hexdigest()
+        assert body["payload_length"] == 5
         assert sink == [b"hello"]
 
     def test_input_appends_newline(self):
@@ -1106,9 +2331,13 @@ class TestFastApiApp:
             headers={"Authorization": "Bearer test-token"},
         )
         assert resp.status_code == 200
-        # CR, not LF: claude's TUI in raw mode treats \r as Enter; \n would
-        # only insert a literal newline into the input box.
-        assert sink == [b"/start\r"]
+        # The text, then the submit CR as a write of ITS OWN, and nothing after
+        # it. CR, not LF: raw mode treats \r as Enter. Two writes rather than one
+        # because a CR in the same write as the text is read as part of a paste
+        # and inserted as a newline (#210).
+        assert sink == [b"/start", b"\r"], (
+            f"the submit must be a separate, single CR: {sink}"
+        )
 
     def test_input_does_not_double_terminate(self):
         app, _buf, sink = self._build()
@@ -1120,16 +2349,205 @@ class TestFastApiApp:
             headers={"Authorization": "Bearer test-token"},
         )
         assert resp.status_code == 200
-        assert sink == [b"/start\r"]
+        # The caller's own CR IS the Enter: it is peeled off the typed text and
+        # delivered as the separate submit write, so the same bytes reach the PTY
+        # in the same order and nothing is doubled.
+        assert sink == [b"/start", b"\r"]
         sink.clear()
-        # Same for legacy \n inputs.
+        # A legacy trailing \n keeps its newline and gains a real Enter behind
+        # it. LF in raw mode is a literal newline, so treating it as "already
+        # submitted" meant a caller who passed "text\n" with append_newline=True
+        # got NO submit at all — while the field is documented as "press Enter
+        # after the text". It used to be rescued by the follow-up nudges; with
+        # those gone the CR has to be in the payload. A caller who genuinely
+        # wants a literal newline and no Enter sends append_newline=False, which
+        # is untouched and covered below.
         resp = client.post(
             "/input",
             json={"data": "/start\n", "append_newline": True},
             headers={"Authorization": "Bearer test-token"},
         )
         assert resp.status_code == 200
-        assert sink == [b"/start\n"]
+        assert sink == [b"/start\n", b"\r"], (
+            "a legacy trailing LF is left alone in the typed text (it is what "
+            f"the caller asked for) but a real Enter must follow it: {sink}"
+        )
+
+    def test_a_message_is_never_followed_by_a_blind_enter(self, monkeypatch):
+        """The failure a follow-up CR here would cause, and why the remedy moved.
+
+        A bare CR is a no-op only against an empty input box *with no dialog on
+        screen*: since Claude Code v2.1.119 a CR fires the topmost modal, which
+        is the routing change the auto-start path waits for a readiness marker to
+        avoid. This handler runs mid-session — the moment a tool-permission
+        prompt is up, because the agent raises one while it is working and the
+        operator is watching. An operator typing "no, stop" would have their own
+        message followed by an Enter that takes the prompt's default, with
+        nothing in the transcript saying a CR did it.
+
+        So: exactly ONE Enter, and nothing after it. The Enter is a write of its
+        own (#210 — glued to the text it is read as part of a paste and inserted
+        as a newline), and the wait in between is exactly one, before that single
+        CR: what must never come back is a *second* CR behind a submit that
+        already landed.
+        """
+        # The value slept is resolved from the environment, so an ambient
+        # LMER_SUBMIT_ENTER_DELAY (documented as the operator's remedy, and
+        # forwarded into the container this suite runs in) would fail an
+        # assertion that names the default.
+        monkeypatch.delenv("LMER_SUBMIT_ENTER_DELAY", raising=False)
+        app, _buf, sink = self._build()
+        client = self._client(app)
+        waits = []
+        monkeypatch.setattr(
+            supervisor.time, "sleep",
+            lambda seconds: waits.append((seconds, len(sink))),
+        )
+
+        resp = client.post(
+            "/input",
+            json={"data": "no, stop", "append_newline": True},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+
+        assert sink == [b"no, stop", b"\r"], (
+            f"something else reached the PTY: {sink}"
+        )
+        assert sink.count(b"\r") == 1, f"the Enter was sent more than once: {sink}"
+        # One wait, and it is *before* the Enter (one write had happened when it
+        # fired) — not a nudge timer behind a delivered submit.
+        assert waits == [(supervisor.DEFAULT_SUBMIT_ENTER_DELAY, 1)], (
+            f"unexpected timing on the input path: {waits}"
+        )
+
+        body = resp.json()
+        assert body["bytes_written"] == len(b"no, stop\r")
+        assert body["submit_confirmed"] is False, (
+            "the handler must not claim a submit it cannot observe"
+        )
+        assert "terminal view" in body["note"], (
+            "the reply has to say what the caller can do about it"
+        )
+        # The receipt covers the payload as the caller sent it — the Enter the
+        # handler added on its own is not part of what the caller can recompute.
+        assert body["payload_sha256"] == hashlib.sha256(b"no, stop").hexdigest()
+        assert body["payload_length"] == len(b"no, stop")
+
+    def test_a_keystroke_reply_says_nothing_about_a_submit(self):
+        """``append_newline=False`` presses no Enter, so there is no submit to
+        be unsure about — and the terminal's per-keystroke path must not gain a
+        note it would have to filter out of every reply."""
+        app, _buf, _sink = self._build()
+        client = self._client(app)
+        body = client.post(
+            "/input",
+            json={"data": "\x1b[A", "append_newline": False},
+            headers={"Authorization": "Bearer test-token"},
+        ).json()
+        assert body["bytes_written"] == 3
+        assert "submit_confirmed" not in body
+        assert "note" not in body
+        # Only the write count and the delivery receipt — nothing about a submit.
+        assert set(body) == {"bytes_written", "payload_sha256", "payload_length"}
+
+    def test_input_without_a_submit_is_written_exactly_as_given(self):
+        """The opt-out, and the reason splitting the submit is safe.
+
+        Everything above changes what happens when the caller asks for Enter. A
+        caller that does not — a keystroke, a control byte, an arrow — must still
+        get one write of exactly its own bytes, with nothing stripped and nothing
+        appended. The terminal's key pad and every raw keystroke from the emulator
+        take this path.
+        """
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        for raw in ("\x03", "\x1b[A", "text with a trailing newline\n", "\t"):
+            sink.clear()
+            resp = client.post(
+                "/input",
+                json={"data": raw, "append_newline": False},
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 200
+            assert sink == [raw.encode("utf-8")], (
+                f"{raw!r} was altered on the no-submit path: {sink}"
+            )
+
+    def test_a_long_message_is_submitted_the_same_way_as_a_short_one(
+        self, monkeypatch
+    ):
+        """The bug in #210, at the boundary where it appeared.
+
+        A message and its Enter delivered in ONE write arrive in one read, and
+        past roughly 80 bytes the harness reads that as a paste — where \\r is a
+        newline character, so the text landed in the input box and was never
+        sent. Length must not change the shape of the delivery: the sizes below
+        straddle the observed boundary (60 bytes submitted, 80 did not) and both
+        have to come out as text-then-Enter.
+
+        The settle is pinned to ``0`` rather than left to the environment: the
+        value comes from ``LMER_SUBMIT_ENTER_DELAY``, which this MR documents as
+        the operator's remedy and forwards into the container the suite also runs
+        in, so an ambient setting would otherwise make this sleep for real (four
+        times) and drift with a developer's ``.env``.
+        """
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build(submit=None)
+        client = self._client(app)
+        for length in (60, 80, 200, 5000):
+            sink.clear()
+            message = "x" * length
+            resp = client.post(
+                "/input",
+                json={"data": message, "append_newline": True},
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 200
+            assert sink == [message.encode(), b"\r"], (
+                f"a {length}-byte message was not delivered as text-then-Enter: "
+                f"{[len(part) for part in sink]}"
+            )
+
+    def test_a_lone_enter_is_not_delayed(self):
+        """An operator answering a dialog presses Enter and nothing else.
+
+        There is no text to be mistaken for a paste, so there is nothing to wait
+        for — and making a keypress a fifth of a second slower would be a cost
+        with no bug behind it.
+        """
+        app, _buf, sink = self._build()
+        client = self._client(app)
+        waits: list[float] = []
+        with mock.patch.object(supervisor.time, "sleep", waits.append):
+            resp = client.post(
+                "/input",
+                json={"data": "", "append_newline": True},
+                headers={"Authorization": "Bearer test-token"},
+            )
+        assert resp.status_code == 200
+        assert sink == [b"\r"]
+        assert waits == [], f"a lone Enter waited for something: {waits}"
+
+    def test_submit_reports_what_was_observed_and_nothing_more(self, monkeypatch):
+        """``submit_text`` is evidence, so it must not be fabricated.
+
+        The app is built without a submit closure here, which is the case with no
+        terminal to probe. That has to read as ``unknown`` — neither a clean
+        delivery nor a warning — because the whole value of the field is that its
+        three values mean three different things to whoever reads the reply.
+        """
+        monkeypatch.delenv("LMER_SUBMIT_ENTER_DELAY", raising=False)
+        app, _buf, _sink = self._build()
+        with mock.patch.object(supervisor.time, "sleep", lambda _s: None):
+            body = self._client(app).post(
+                "/input",
+                json={"data": "hello", "append_newline": True},
+                headers={"Authorization": "Bearer test-token"},
+            ).json()
+        assert body["submit_text"] == supervisor.SUBMIT_TEXT_UNKNOWN
+        assert body["submit_confirmed"] is False
 
     def test_output_returns_buffered_data(self):
         app, buf, _sink = self._build()
@@ -1169,6 +2587,325 @@ class TestFastApiApp:
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
 
+    def test_healthz_reports_geometry(self):
+        app, _calls = self._build_resizable(winsize=(30, 100))
+        client = self._client(app)
+        resp = client.get("/healthz", headers={"Authorization": "Bearer test-token"})
+        assert resp.status_code == 200
+        body = resp.json()
+        # The pre-existing keys stay put: lmer-pipe reads ok/cursor from here.
+        assert body["ok"] is True
+        assert body["cursor"] == 0
+        # A browser client needs the geometry before it decides whether to resize.
+        assert body["rows"] == 30
+        assert body["cols"] == 100
+        # Provenance: which file this control plane's code was imported from.
+        # A supervisor running a stale tree looks healthy on every probe until
+        # a route is missing (#236) — this is the field that makes it visible.
+        # Asserted as "a real, absolute path to this module's file" rather than
+        # `== supervisor.__file__` — that comparison reads the same attribute
+        # off the same import and cannot fail on any tree. The wrong-tree
+        # property itself is covered where it lives: the runner launch
+        # (tests/test_harness_runners.py::TestSupervisorPin).
+        assert os.path.isabs(body["source"])
+        assert os.path.isfile(body["source"])
+        assert body["source"].endswith("supervisor.py")
+
+    def test_healthz_geometry_is_null_when_unknown(self):
+        # Nulls rather than missing keys so a client can tell "no geometry
+        # available" from a real size without special-casing the shape.
+        app, _buf, _sink = self._build()
+        client = self._client(app)
+        body = client.get(
+            "/healthz", headers={"Authorization": "Bearer test-token"}
+        ).json()
+        assert body["ok"] is True
+        assert body["rows"] is None
+        assert body["cols"] is None
+
+        app, _calls = self._build_resizable(winsize=None)
+        body = self._client(app).get(
+            "/healthz", headers={"Authorization": "Bearer test-token"}
+        ).json()
+        assert body["rows"] is None
+        assert body["cols"] is None
+
+    def test_healthz_reports_how_long_the_harness_has_been_quiet(self):
+        """The consumer story: "idle 22m", read off the one process that knows.
+
+        Both spellings, because they answer to different readers — the number is
+        what a client acts on without owning a correct clock, the timestamp is what
+        anything writing this down needs.
+        """
+        clock = _FakeClock()
+        buf = supervisor.OutputBuffer(limit=1024, clock=clock)
+        app = supervisor._build_fastapi_app(buf, lambda data: len(data), "test-token")
+        client = self._client(app)
+
+        buf.append(b"the harness drew something")
+        clock.advance(1320)
+        body = client.get(
+            "/healthz", headers={"Authorization": "Bearer test-token"}
+        ).json()
+
+        assert body["idle_seconds"] == 1320.0
+        # The pre-existing keys stay put beside it: lmer-pipe reads ok/cursor here,
+        # and a re-attach reads cursor/rows/cols.
+        assert body["ok"] is True
+        assert body["cursor"] == len(b"the harness drew something")
+        moment = datetime.strptime(
+            body["last_output_at"], "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(tzinfo=timezone.utc)
+        gap = datetime.now(timezone.utc) - moment
+        assert timedelta(seconds=1315) <= gap <= timedelta(seconds=1330), (
+            f"last_output_at is {body['last_output_at']}, which is not 1320s ago"
+        )
+
+    def test_healthz_says_nothing_about_idleness_before_the_first_byte(self):
+        """Nulls, not omitted keys and not zero — the geometry's own rule.
+
+        A reader has one absent case to render as nothing, and it covers both a
+        session that has produced nothing yet and a session whose image never
+        reports this at all.
+        """
+        app, _buf, _sink = self._build()
+        body = self._client(app).get(
+            "/healthz", headers={"Authorization": "Bearer test-token"}
+        ).json()
+        assert body["last_output_at"] is None
+        assert body["idle_seconds"] is None
+
+    def test_typing_into_the_session_is_not_activity(self):
+        """Output, never input — the decision this feature turns on.
+
+        The question is whether the *harness* is doing anything. An operator (or the
+        platform) typing into a session that answers nothing is precisely the idle
+        case, so a POST /input that moved the clock would report the wedged session
+        as the busy one.
+        """
+        clock = _FakeClock()
+        buf = supervisor.OutputBuffer(limit=1024, clock=clock)
+        written: list[bytes] = []
+
+        def write_input(data: bytes) -> int:
+            written.append(data)
+            return len(data)
+
+        client = self._client(
+            supervisor._build_fastapi_app(buf, write_input, "test-token")
+        )
+        buf.append(b"a prompt")
+        clock.advance(900)
+
+        resp = client.post(
+            "/input",
+            json={"data": "an answer"},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert written == [b"an answer"], "the input never reached the child"
+
+        body = client.get(
+            "/healthz", headers={"Authorization": "Bearer test-token"}
+        ).json()
+        assert body["idle_seconds"] == 900.0, (
+            "typing into the session reset its idle clock, so a session that was "
+            "answered and never replied reads as one that is working"
+        )
+
+    def test_healthz_survives_failing_winsize_ioctl(self):
+        # A liveness probe must stay a liveness probe even if the geometry
+        # lookup blows up (master closed after the child exited).
+        def boom():
+            raise OSError("ioctl failed: Bad file descriptor")
+
+        app, _buf, _sink = self._build(get_winsize=boom)
+        resp = self._client(app).get(
+            "/healthz", headers={"Authorization": "Bearer test-token"}
+        )
+        assert resp.status_code == 200
+        # Idleness is null beside the geometry rather than absent: nothing has been
+        # produced, and this route's rule is that an unknown answers as a null key.
+        assert resp.json() == {
+            "ok": True, "cursor": 0, "rows": None, "cols": None,
+            "source": supervisor.__file__,
+            "last_output_at": None, "idle_seconds": None,
+        }
+
+    # ``POST /resize``: the no-host-TTY path for browser-rendered TUIs.
+
+    def test_resize_applies_geometry(self):
+        app, calls = self._build_resizable()
+        client = self._client(app)
+        resp = client.post(
+            "/resize",
+            json={"rows": 40, "cols": 120},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"rows": 40, "cols": 120}
+        assert calls == [(40, 120)]
+
+    def test_resize_accepts_the_documented_bounds(self):
+        app, calls = self._build_resizable()
+        client = self._client(app)
+        resp = client.post(
+            "/resize",
+            json={
+                "rows": supervisor.MAX_WINSIZE_DIMENSION,
+                "cols": supervisor.MIN_WINSIZE_DIMENSION,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert calls == [
+            (supervisor.MAX_WINSIZE_DIMENSION, supervisor.MIN_WINSIZE_DIMENSION)
+        ]
+
+    def test_resize_requires_auth(self):
+        app, calls = self._build_resizable()
+        client = self._client(app)
+        resp = client.post("/resize", json={"rows": 40, "cols": 120})
+        assert resp.status_code == 401
+        resp = client.post(
+            "/resize",
+            json={"rows": 40, "cols": 120},
+            headers={"Authorization": "Bearer wrong"},
+        )
+        assert resp.status_code == 401
+        assert calls == []
+
+    def test_resize_rejects_wedged_and_absurd_geometry(self):
+        # 0 columns is not "unknown", it's a wedged terminal nothing inside the
+        # container would fix — none of these may reach the ioctl.
+        app, calls = self._build_resizable()
+        client = self._client(app)
+        bad_bodies = [
+            ({"rows": 0, "cols": 80}, "rows"),
+            ({"rows": 24, "cols": 0}, "cols"),
+            ({"rows": -1, "cols": 80}, "rows"),
+            ({"rows": 24, "cols": -80}, "cols"),
+            ({"rows": supervisor.MAX_WINSIZE_DIMENSION + 1, "cols": 80}, "rows"),
+            ({"rows": 24, "cols": 100000}, "cols"),
+            ({"rows": 24.5, "cols": 80}, "rows"),
+            ({"rows": "wide", "cols": 80}, "rows"),
+            ({"rows": None, "cols": 80}, "rows"),
+            ({"cols": 80}, "rows"),
+        ]
+        for body, field in bad_bodies:
+            resp = client.post(
+                "/resize",
+                json=body,
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 422, f"{body} was accepted"
+            # The client has to learn which dimension it got wrong.
+            assert field in resp.text, f"{body} -> {resp.text}"
+        assert calls == []
+
+    def test_resize_unavailable_without_a_resize_callable(self):
+        # The app is built without a resize callable by older callers (and by
+        # the pre-existing tests): "nothing to resize" is a deployment fact, so
+        # it must read as 503, not as a crashed handler.
+        app, _buf, _sink = self._build()
+        resp = self._client(app).post(
+            "/resize",
+            json={"rows": 40, "cols": 120},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 503
+        assert "resize unavailable" in resp.json()["detail"]
+
+    def test_resize_reports_ioctl_failure_as_http_error(self):
+        # TestClient re-raises unhandled server exceptions, so this only passes
+        # if the route actually catches the OSError.
+        def boom(rows: int, cols: int) -> None:
+            raise OSError("ioctl failed: Bad file descriptor")
+
+        app, _calls = self._build_resizable(resize=boom)
+        resp = self._client(app).post(
+            "/resize",
+            json={"rows": 40, "cols": 120},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 500
+        assert "ioctl failed" in resp.json()["detail"]
+
+    def test_resize_reports_a_real_ioctl_failure(self, tmp_path):
+        # Wired the way run_supervisor wires it (strict=True) but pointed at a
+        # non-TTY fd, so the ioctl fails for real. The client must hear about it:
+        # a 200 echoing geometry that never landed would leave a browser
+        # rendering at the wrong size with nothing to react to.
+        regular = tmp_path / "not-a-tty"
+        regular.write_bytes(b"")
+        fd = os.open(str(regular), os.O_RDWR)
+        try:
+            app, _buf, _sink = self._build(
+                resize=lambda rows, cols: supervisor._set_winsize(
+                    fd, rows, cols, strict=True
+                ),
+                get_winsize=lambda: supervisor._get_winsize(fd),
+            )
+            resp = self._client(app).post(
+                "/resize",
+                json={"rows": 40, "cols": 120},
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 500
+            assert "cannot set window size" in resp.json()["detail"]
+        finally:
+            os.close(fd)
+
+    def test_supervisor_wires_a_strict_resize_closure(self):
+        """run_supervisor's ``/resize`` closure must keep ``strict=True``.
+
+        The closure is a local inside ``run_supervisor``, so there is nothing to
+        import and call — mirror the cli.py env-dict check and pin the wiring in
+        the source. Without ``strict``, ``_set_winsize`` swallows the ioctl error
+        and the route answers 200 for a resize that never happened.
+        """
+        import re
+        from pathlib import Path
+        source = (
+            Path(__file__).parent.parent / "src" / "lmer_cli" / "supervisor.py"
+        ).read_text()
+        pattern = re.compile(
+            r"_set_winsize\(\s*master_fd,\s*rows,\s*cols,\s*strict=True\s*,?\s*\)"
+        )
+        assert pattern.search(source), \
+            "run_supervisor's /resize closure lost strict=True"
+
+    def test_resize_round_trip_on_a_real_pty(self):
+        """Wired the way run_supervisor wires it, the geometry lands on the PTY."""
+        master, slave = os.openpty()
+        try:
+            app, _buf, _sink = self._build(
+                resize=lambda rows, cols: supervisor._set_winsize(master, rows, cols),
+                get_winsize=lambda: supervisor._get_winsize(master),
+            )
+            client = self._client(app)
+            # A freshly allocated PTY has no geometry yet; healthz reports the
+            # 0x0 it really is, which is the browser client's cue to resize.
+            before = client.get(
+                "/healthz", headers={"Authorization": "Bearer test-token"}
+            ).json()
+            assert (before["rows"], before["cols"]) == (0, 0)
+            resp = client.post(
+                "/resize",
+                json={"rows": 44, "cols": 132},
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 200
+            # The slave end is what the wrapped TUI queries for its layout.
+            assert supervisor._get_winsize(slave) == (44, 132)
+            body = client.get(
+                "/healthz", headers={"Authorization": "Bearer test-token"}
+            ).json()
+            assert (body["rows"], body["cols"]) == (44, 132)
+        finally:
+            os.close(master)
+            os.close(slave)
+
 
 # ---------------------------------------------------------------------------
 # Integration: spawn `cat` under the supervisor and verify forwarding
@@ -1176,6 +2913,115 @@ class TestFastApiApp:
 
 
 @pytest.mark.skipif(os.environ.get("CI_NO_PTY") == "1", reason="PTY not available")
+class TestForwardingLoopUnderContention:
+    """The property the try-acquire rework exists for, which nothing pinned.
+
+    The uncontended path is indistinguishable from the old blocking write, so a
+    refactor that dropped the retry timeout or the "leave stdin out of the select
+    set" condition would still pass the suite. What has to hold while a submit
+    holds the write lock: the child's output keeps being drained (the deadlock
+    chain the rework closed), the keystroke is *retried* rather than lost, and it
+    lands once the lock frees.
+    """
+
+    def test_output_keeps_draining_while_a_keystroke_waits_for_the_lock(self):
+        """The supervisor runs on the main thread (it installs signal handlers),
+        so the *driver* is the thread here: it watches output, feeds a keystroke
+        while the lock is held, releases it, and closes stdin to end the run. The
+        observations are asserted back on the main thread."""
+        ticker = (
+            "i=0; while [ $i -lt 120 ]; do echo tick; i=$((i+1)); "
+            "sleep 0.02; done; exec cat"
+        )
+        opts = {
+            "fastapi": False,
+            "manual_start": True,
+            "port_range": (8700, 8799),
+            "host": "127.0.0.1",
+            "token": "",
+            "auto_start_delay": 0.1,
+            "auto_start_nudge_delay": 0.05,
+            "auto_start_ready_marker": supervisor.DEFAULT_AUTO_START_READY_MARKER,
+            "auto_start_ready_timeout": 0,
+            "auto_start_settle_delay": 0,
+            "winsize_recheck_delay": 0,
+            "start_prompt": "",
+            "start_prompt_delay": 0,
+        }
+        lock = threading.Lock()
+        stdin_r, stdin_w = os.pipe()
+        stdout_r, stdout_w = os.pipe()
+        os.set_blocking(stdout_r, False)
+        collected = bytearray()
+        seen: dict = {}
+
+        def read_available():
+            with contextlib.suppress(BlockingIOError, OSError):
+                chunk = os.read(stdout_r, 65536)
+                if chunk:
+                    collected.extend(chunk)
+
+        def driver():
+            try:
+                # Output must keep flowing with the lock held — the chain the
+                # rework broke is a loop blocked on the lock, which stops reading
+                # master_fd.
+                deadline = time.monotonic() + 6.0
+                while collected.count(b"tick") < 3 and time.monotonic() < deadline:
+                    read_available()
+                    time.sleep(0.01)
+                seen["ticks_before_keystroke"] = collected.count(b"tick")
+
+                os.write(stdin_w, b"hello\n")
+                deadline = time.monotonic() + 0.6
+                while time.monotonic() < deadline:
+                    read_available()
+                    time.sleep(0.01)
+                seen["delivered_while_held"] = b"hello" in collected
+                seen["ticks_after_keystroke"] = collected.count(b"tick")
+
+                lock.release()
+                deadline = time.monotonic() + 6.0
+                while b"hello" not in collected and time.monotonic() < deadline:
+                    read_available()
+                    time.sleep(0.01)
+                seen["delivered_after_release"] = b"hello" in collected
+            finally:
+                with contextlib.suppress(OSError):
+                    os.close(stdin_w)
+                for _ in range(50):
+                    read_available()
+                    time.sleep(0.01)
+
+        lock.acquire()          # stand in for a submit in progress
+        driver_thread = threading.Thread(target=driver, daemon=True)
+        driver_thread.start()
+        try:
+            supervisor.run_supervisor(
+                ["sh", "-c", ticker], opts,
+                stdin_fd=stdin_r, stdout_fd=stdout_w, write_lock=lock,
+            )
+        finally:
+            driver_thread.join(timeout=15)
+            for fd in (stdin_r, stdout_r, stdout_w):
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+
+        assert seen.get("ticks_before_keystroke", 0) >= 3, (
+            "the child's output stopped while the lock was held: "
+            f"{bytes(collected)[:160]!r}"
+        )
+        assert seen.get("delivered_while_held") is False, (
+            "the keystroke was delivered while the lock was held"
+        )
+        assert seen["ticks_after_keystroke"] > seen["ticks_before_keystroke"], (
+            "output stopped draining once a keystroke was queued behind the lock"
+        )
+        assert seen.get("delivered_after_release") is True, (
+            f"the retried keystroke never arrived: {bytes(collected)[:200]!r}"
+        )
+
+
 class TestSupervisorIntegration:
     def _run(self, argv, stdin_data: bytes, options=None):
         """Run the supervisor with two pipes faked as stdin/stdout."""
@@ -1321,6 +3167,39 @@ class TestSupervisorIntegration:
     def test_exit_code_propagated(self):
         rc, _ = self._run(["sh", "-c", "exit 42"], b"")
         assert rc == 42
+
+    def test_the_wrapped_process_output_lands_in_the_session_log(
+        self, tmp_path, monkeypatch
+    ):
+        """The point of the whole feature, exercised through a real PTY.
+
+        The mount point is redirected rather than the writing being stubbed: what
+        has to hold is that bytes coming off the PTY master reach the file, which is
+        a property of the forwarding loop and not of :class:`SessionLog` alone.
+        """
+        mount = tmp_path / "mounted"
+        mount.mkdir()
+        monkeypatch.setattr(supervisor, "CONTAINER_SESSION_LOG_DIR", str(mount))
+
+        rc, output = self._run(["sh", "-c", "echo recorded-by-the-supervisor"], b"")
+
+        assert rc == 0
+        logged = (mount / supervisor.SESSION_LOG_NAME).read_bytes()
+        assert b"recorded-by-the-supervisor" in logged
+        assert b"recorded-by-the-supervisor" in output, "still forwarded to stdout"
+
+    def test_nothing_is_recorded_when_no_directory_was_mounted(
+        self, tmp_path, monkeypatch
+    ):
+        """An unorchestrated ``lmer`` run writes no log and creates no directory."""
+        mount = tmp_path / "never-mounted"
+        monkeypatch.setattr(supervisor, "CONTAINER_SESSION_LOG_DIR", str(mount))
+
+        rc, output = self._run(["sh", "-c", "echo unrecorded"], b"")
+
+        assert rc == 0
+        assert b"unrecorded" in output
+        assert not mount.exists()
 
     def test_supervisor_pid_exported_to_child(self):
         # The supervisor publishes its own PID via LMER_SUPERVISOR_PID before

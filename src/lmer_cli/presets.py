@@ -228,6 +228,26 @@ def preset_env_value(
     return (env.get(var) or "").strip()
 
 
+def preset_selector_vars(task_id: str | None) -> list[str]:
+    """Return every env var that can select a preset for ``lmer <task_id>``.
+
+    Ordered most specific first — ``LMER_<TASK>_PRESET`` then
+    ``LMER_PRESET`` — matching the precedence :func:`select_preset_name`
+    applies. The taskdef-scoped var is omitted when *task_id* has no
+    derivable name (see :func:`task_preset_env_name`).
+
+    This is the single home of the candidate list, shared by the selector
+    itself and by spawners that need to *unset* the selectors in a child's
+    environment: the Slack listener blanks them when a ``$preset:`` token
+    selected a preset, so the token displaces the listener-wide default whole
+    rather than stacking with it (issue #181). Keeping both callers on one
+    list is what stops "what selects" and "what gets unset" from drifting
+    apart when a future selector is added.
+    """
+    task_env = task_preset_env_name(task_id)
+    return ([task_env] if task_env else []) + [PRESET_ENV]
+
+
 def select_preset_name(
     flag: str | None,
     task_id: str | None,
@@ -265,9 +285,7 @@ def select_preset_name(
     stripped_flag = (flag or "").strip()
     if stripped_flag:
         return stripped_flag, "--preset"
-    task_env = task_preset_env_name(task_id)
-    candidates = ([task_env] if task_env else []) + [PRESET_ENV]
-    for var in candidates:
+    for var in preset_selector_vars(task_id):
         value = preset_env_value(var, environ)
         if value:
             return value, var

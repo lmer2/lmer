@@ -1,8 +1,10 @@
 """Command-line interface for GitLab code reviewer."""
 
+import os
 import sys
 import json
 import argparse
+from datetime import datetime
 from typing import List, Tuple, Optional
 
 from .client import (
@@ -447,6 +449,92 @@ def format_mr_creation_result(mr_data: dict, json_output: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _parse_gitlab_timestamp(value) -> Optional[datetime]:
+    """Parse a GitLab ISO-8601 timestamp; return None if missing/unparseable."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+
+
+def build_thread_provenance(reviewer, project: str, mr_id: int, mr_info: dict,
+                            page_size: int = DEFAULT_PAGE_SIZE,
+                            max_pages: int = DEFAULT_MAX_PAGES) -> dict:
+    """Build thread-provenance data for an MR: counts, resolvers, and a
+    resolved-before-head heuristic.
+
+    Only user discussions count as threads — discussions that are pure
+    system notes or standalone individual notes are skipped (they are not
+    resolvable, so they cannot carry resolution provenance).
+
+    Returns a dict: {total, unresolved, resolved, resolvers: {username: n},
+    resolved_before_head: [...ids], partial: bool}. The resolved_before_head
+    key is omitted when the heuristic is skipped (head commit lookup failed
+    or timestamps missing/unparseable).
+    """
+    discussions = reviewer.get_mr_discussions(
+        project, mr_id, unresolved_only=False,
+        page_size=page_size, max_pages=max_pages,
+    )
+    partial = bool(getattr(reviewer.client, 'last_page_capped', False))
+
+    threads = []
+    for discussion in discussions:
+        if discussion.get('individual_note', False):
+            continue
+        notes = discussion.get('notes', [])
+        if not any(not note.get('system', False) for note in notes):
+            continue
+        threads.append(discussion)
+
+    resolved_threads = [d for d in threads if d.get('resolved', False)]
+
+    resolvers = {}
+    for discussion in resolved_threads:
+        for note in discussion.get('notes', []):
+            resolved_by = note.get('resolved_by') or {}
+            username = resolved_by.get('username')
+            if username:
+                resolvers[username] = resolvers.get(username, 0) + 1
+                break  # one resolution action per thread
+
+    provenance = {
+        'total': len(threads),
+        'unresolved': len(threads) - len(resolved_threads),
+        'resolved': len(resolved_threads),
+        'resolvers': resolvers,
+        'partial': partial,
+    }
+
+    # GitLab-only heuristic: flag threads resolved before the MR head
+    # commit's committed date. Fail-soft: on any trouble (commit lookup
+    # failure, missing/unparseable timestamps), omit the heuristic silently.
+    try:
+        head_sha = mr_info.get('sha')
+        head_committed_at = None
+        if head_sha:
+            commit = reviewer.client.get_commit(project, head_sha)
+            head_committed_at = _parse_gitlab_timestamp(commit.get('committed_date'))
+
+        if head_committed_at is not None:
+            resolved_before = []
+            for discussion in resolved_threads:
+                resolved_at = None
+                for note in discussion.get('notes', []):
+                    resolved_at = _parse_gitlab_timestamp(note.get('resolved_at'))
+                    if resolved_at is not None:
+                        break
+                if resolved_at is not None and resolved_at < head_committed_at:
+                    resolved_before.append(discussion.get('id'))
+            provenance['resolved_before_head'] = resolved_before
+    except Exception:
+        provenance.pop('resolved_before_head', None)
+
+    return provenance
+
+
 def format_mr_info(mr_info: dict, json_output: bool = False) -> str:
     """Format MR info for output."""
     if json_output:
@@ -513,6 +601,23 @@ def format_mr_info(mr_info: dict, json_output: bool = False) -> str:
     lines.append(f"Downvotes: {mr_info.get('downvotes', 0)}")
     lines.append(f"Has Conflicts: {'Yes' if mr_info.get('has_conflicts') else 'No'}")
     lines.append(f"Blocking Discussions Resolved: {'Yes' if mr_info.get('blocking_discussions_resolved', True) else 'No'}")
+
+    provenance = mr_info.get('thread_provenance')
+    if provenance:
+        lines.append("")
+        lines.append("=== Threads ===")
+        if provenance.get('partial'):
+            lines.append("⚠️ counts partial — page cap")
+        lines.append(f"Total: {provenance.get('total', 0)}")
+        lines.append(f"Unresolved: {provenance.get('unresolved', 0)}")
+        lines.append(f"Resolved: {provenance.get('resolved', 0)}")
+        resolvers = provenance.get('resolvers') or {}
+        if resolvers:
+            lines.append("Resolved By:")
+            for username, count in sorted(resolvers.items(), key=lambda item: (-item[1], item[0])):
+                lines.append(f"  - {username}: {count}")
+        for discussion_id in provenance.get('resolved_before_head', []):
+            lines.append(f"⚠️ Thread {discussion_id} resolved before the latest change — resolution predates the current code")
 
     lines.append("")
     lines.append(f"Web URL: {mr_info['web_url']}")
@@ -720,6 +825,29 @@ def format_issue_info(issue_info: dict, json_output: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _resolve_thread_policy_error(discussion_id: str) -> Optional[str]:
+    """Return the refusal message when this session may not resolve threads.
+
+    Per the Thread Resolution Policy (rules/git.md) only the reviewer
+    resolves a discussion thread. ``LMER_TASK`` names the session type;
+    any value other than ``review`` (when set) means the caller is a fix
+    author, not the reviewer. Returns None when resolution is allowed
+    (LMER_TASK unset, or a review session).
+    """
+    lmer_task = os.environ.get("LMER_TASK")
+    if not lmer_task or lmer_task == "review":
+        return None
+    return (
+        f"Error: refusing to resolve thread {discussion_id}: "
+        f"LMER_TASK={lmer_task} is not a review session.\n"
+        "Per the Thread Resolution Policy (rules/git.md), the fix author "
+        "replies with the fix and commit SHA and leaves the thread open — "
+        "only the reviewer resolves.\n"
+        "A human can resolve the thread in the GitLab web UI, or run this "
+        "command from a host shell where LMER_TASK is unset."
+    )
+
+
 def main() -> int:
     """Main CLI entry point."""
     parser = create_parser()
@@ -868,6 +996,10 @@ def main() -> int:
 
         # Handle resolve thread request
         if args.resolve_thread:
+            policy_error = _resolve_thread_policy_error(args.resolve_thread)
+            if policy_error:
+                print(policy_error, file=sys.stderr)
+                return 1
             discussion_data = reviewer.resolve_thread(args.project, args.id, args.resolve_thread)
             if not args.quiet:
                 output = format_resolve_thread_result(discussion_data, args.resolve_thread, args.json)
@@ -879,6 +1011,17 @@ def main() -> int:
             mr_info = reviewer.get_mr_info(
                 args.project, args.id, page_size=args.page_size, max_pages=args.max_pages
             )
+            # Thread provenance is best-effort: --info must never fail on it.
+            try:
+                mr_info['thread_provenance'] = build_thread_provenance(
+                    reviewer, args.project, args.id, mr_info,
+                    page_size=args.page_size, max_pages=args.max_pages,
+                )
+            except Exception:
+                # Emit an explicit null rather than omitting the key, so
+                # --json consumers see the same key-presence semantics as
+                # github-review (parity: key always present, null on failure).
+                mr_info['thread_provenance'] = None
             if not args.quiet:
                 output = format_mr_info(mr_info, args.json)
                 print(output)

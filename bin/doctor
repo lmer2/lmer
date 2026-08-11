@@ -274,6 +274,255 @@ else
 fi
 
 # =============================================================================
+# 10. Declared Sources
+# =============================================================================
+section "🔗 Declared Sources"
+
+# Reads ${LMER_WORK_REPO_PATH:-/work}/sources.yaml and reports declared-source
+# reachability via the frozen helper CLI (lmer_cli.container.sources doctor;
+# contract in that module's docstring). Every finding here is a WARNING,
+# never an error — a broken declared source must not flip doctor's exit code.
+# All URLs printed below come pre-scrubbed from the helper's JSON. The
+# unredacted clone_url (--emit-clone-urls opt-in) is never echoed, never
+# written to disk (the record loop is fed by process substitution, not a
+# here-string, which bash backs with a $TMPDIR file), and never passed in
+# argv (/proc/<pid>/cmdline is readable by everything else in this
+# container) — git receives it through ephemeral GIT_CONFIG_* env, the same
+# never-in-argv rule the clone cache follows.
+SOURCES_YAML="${LMER_WORK_REPO_PATH:-/work}/sources.yaml"
+# Renderer-supported taskdef schemas, captured from the helper's doctor
+# document (supported_taskdef_schemas) — never re-derived in shell. Filled
+# by the META record below; the taskdef schema check re-asks the helper if
+# it is still empty (legacy mode: no sources.yaml, but /taskdef cloned via
+# the env-var override path).
+SUPPORTED_TASKDEF_SCHEMAS_CSV=""
+if [[ ! -f "$SOURCES_YAML" ]]; then
+    # Absent file is silent legacy mode (spec G5) — a skip note, not a finding.
+    if ! $QUIET; then
+        echo "  - no sources.yaml at $SOURCES_YAML — silent legacy mode, checks skipped"
+    fi
+else
+    # One helper invocation. --path is passed explicitly even though the
+    # helper's own default resolves to the same $LMER_WORK_REPO_PATH file:
+    # the path checked above is the one reported in the messages below, and
+    # this is the section's test seam. On a validation refusal (exit 2) the
+    # helper still emits one JSON document, so the exit code is deliberately
+    # ignored in favor of the document.
+    SOURCES_JSON="$("${LMER_PYTHON:-python3}" -m lmer_cli.container.sources doctor \
+        --json --emit-clone-urls --path "$SOURCES_YAML" 2>/dev/null)" || true
+    # Flatten the JSON to unit-separator records (jq is not part of the
+    # container contract; python3 is already a required tool above).
+    SOURCES_PARSED=""
+    if [[ -n "${SOURCES_JSON:-}" ]]; then
+        SOURCES_PARSED="$(printf '%s' "$SOURCES_JSON" | "${LMER_PYTHON:-python3}" -c '
+import json, sys
+SEP = chr(31)
+def clean(v):
+    if v is None:
+        return ""
+    return str(v).replace(SEP, " ").replace("\n", " ").replace("\r", " ")
+try:
+    doc = json.load(sys.stdin)
+    if not isinstance(doc, dict):
+        raise ValueError("not a JSON object")
+except Exception:
+    sys.exit(3)
+rows = [["META",
+         "1" if doc.get("ok") else "0",
+         clean(doc.get("schema")),
+         ",".join(str(s) for s in doc.get("supported_taskdef_schemas") or [])]]
+for w in doc.get("warnings") or []:
+    rows.append(["WARN", clean(w)])
+for e in doc.get("errors") or []:
+    rows.append(["ERR", clean(e)])
+srcs = doc.get("sources")
+if isinstance(srcs, dict):
+    for name, entry in srcs.items():
+        if not isinstance(entry, dict):
+            continue
+        rows.append(["SRC", clean(name), clean(entry.get("mode")),
+                     "1" if entry.get("anonymous") else "0",
+                     clean(entry.get("ref")), clean(entry.get("repo")),
+                     clean(entry.get("clone_url"))])
+for row in rows:
+    print(SEP.join(row))
+' 2>/dev/null)" || true
+    fi
+    if [[ -z "$SOURCES_PARSED" ]]; then
+        # Degrade to a single warning: python3/the helper module unavailable,
+        # or the helper emitted nothing parseable.
+        warn "sources.yaml present but the sources helper is unavailable or its output was unparseable — declared sources unchecked"
+        detail "tried: ${LMER_PYTHON:-python3} -m lmer_cli.container.sources doctor --json --path $SOURCES_YAML"
+    else
+        LS_REMOTE_CMD=(git ls-remote --)
+        if command -v timeout &>/dev/null; then
+            LS_REMOTE_CMD=(timeout 20 git ls-remote --)
+        fi
+        while IFS=$'\x1f' read -r REC_TAG REC_1 REC_2 REC_3 REC_4 REC_5 REC_6; do
+            case "$REC_TAG" in
+                META)
+                    if [[ "$REC_1" == "1" ]]; then
+                        pass "sources.yaml valid (schema $REC_2)"
+                    fi
+                    SUPPORTED_TASKDEF_SCHEMAS_CSV="$REC_3"
+                    detail "supported taskdef schemas: $REC_3"
+                    ;;
+                WARN|ERR)
+                    # Helper findings (load warnings, refusal errors) are all
+                    # warnings here — doctor's exit semantics stay unchanged.
+                    warn "$REC_1"
+                    ;;
+                SRC)
+                    SRC_NAME="$REC_1"; SRC_MODE="$REC_2"; SRC_ANON="$REC_3"
+                    SRC_REF="$REC_4"; SRC_REPO="$REC_5"; SRC_CLONE_URL="$REC_6"
+                    if [[ -z "$SRC_CLONE_URL" ]]; then
+                        # No derivation (no work-repo URL) — the helper's own
+                        # warning above already covers it once.
+                        detail "$SRC_NAME: clone URL not derived — reachability not checked"
+                        continue
+                    fi
+                    LS_REMOTE_OUT=""
+                    # argv carries the SCRUBBED declared URL; the credentialed
+                    # form reaches git as an ephemeral url.<credentialed>
+                    # .insteadOf rewrite in the subshell's environment, so the
+                    # token never lands in /proc/<pid>/cmdline. Numbered
+                    # entries are appended after any inherited GIT_CONFIG_*
+                    # so an outer numbered config is never clobbered.
+                    GIT_CFG_N="${GIT_CONFIG_COUNT:-0}"
+                    [[ "$GIT_CFG_N" =~ ^[0-9]+$ ]] || GIT_CFG_N=0
+                    if LS_REMOTE_OUT="$(
+                        export GIT_TERMINAL_PROMPT=0
+                        export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10'
+                        export GIT_CONFIG_COUNT="$((GIT_CFG_N + 1))"
+                        export "GIT_CONFIG_KEY_${GIT_CFG_N}=url.${SRC_CLONE_URL}.insteadOf"
+                        export "GIT_CONFIG_VALUE_${GIT_CFG_N}=${SRC_REPO}"
+                        "${LS_REMOTE_CMD[@]}" "$SRC_REPO" 2>/dev/null </dev/null
+                    )"; then
+                        pass "$SRC_NAME source reachable: $SRC_REPO (mode: $SRC_MODE)"
+                        if [[ -n "$SRC_REF" ]]; then
+                            # Accept branch, tag, full ref path, or full SHA.
+                            # Matched in-shell rather than through a
+                            # `printf | cut | grep -q` pipeline ON PURPOSE:
+                            # under `set -o pipefail` an early-exiting matcher
+                            # leaves the upstream writer holding unwritten
+                            # output, it dies of SIGPIPE, and 141 becomes the
+                            # pipeline's status — so a ref that IS present
+                            # reads as absent as soon as ls-remote output
+                            # outgrows the pipe buffer (~1000 refs). The
+                            # process substitution below is not part of the
+                            # `if` condition's status, so an early break here
+                            # cannot be mistaken for "not found".
+                            REF_PRESENT=false
+                            while IFS=$'\t' read -r LS_SHA LS_REF; do
+                                if [[ "$LS_REF" == "refs/heads/$SRC_REF" ||
+                                      "$LS_REF" == "refs/tags/$SRC_REF" ||
+                                      "$LS_REF" == "$SRC_REF" ||
+                                      "$LS_SHA" == "$SRC_REF" ]]; then
+                                    REF_PRESENT=true
+                                    break
+                                fi
+                            done < <(printf '%s\n' "$LS_REMOTE_OUT")
+                            if $REF_PRESENT; then
+                                pass "$SRC_NAME ref '$SRC_REF' present on remote"
+                            else
+                                warn "$SRC_NAME ref '$SRC_REF' not found on $SRC_REPO — fix sources.taskdef.ref in $SOURCES_YAML or push the ref"
+                            fi
+                        fi
+                    else
+                        SRC_REMEDY="check host reachability and that the work-repo credential grants read access"
+                        # Both anonymous modes clone credential-less, but for
+                        # different reasons; naming the wrong one sends the
+                        # operator to look at the wrong thing.
+                        if [[ "$SRC_MODE" == "anonymous-other-port" ]]; then
+                            SRC_REMEDY="the declaration names a different port than the work repo, so the work-repo credential was withheld — the repo must be publicly readable on that port, or use the env var override"
+                        elif [[ "$SRC_ANON" == "1" ]]; then
+                            SRC_REMEDY="anonymous derivation (credential-less work-repo URL) — the repo must be publicly readable, or use the env var override"
+                        fi
+                        warn "$SRC_NAME source unreachable: $SRC_REPO (mode: $SRC_MODE) — git ls-remote failed; $SRC_REMEDY"
+                    fi
+                    ;;
+            esac
+        done < <(printf '%s\n' "$SOURCES_PARSED")
+    fi
+fi
+
+# --- Taskdef schema (local manifest vs renderer support) ---
+# Reads the ROOT taskdef.yaml of the /taskdef clone LOCALLY — no remote
+# fetch of any kind. An absent clone is a skip note (nothing to check);
+# a clone with no root taskdef.yaml is schema 1 (grandfather clause,
+# hooks/start.py read_taskdef_schema). Findings stay warnings, never errors.
+# The dir is a variable only as a test seam; the real clone path is /taskdef
+# (clone_and_exec._SOURCE_DESTS).
+TASKDEF_CLONE_DIR="${LMER_DOCTOR_TASKDEF_DIR:-/taskdef}"
+TASKDEF_MANIFEST="$TASKDEF_CLONE_DIR/taskdef.yaml"
+if [[ ! -d "$TASKDEF_CLONE_DIR" ]]; then
+    if ! $QUIET; then
+        echo "  - no taskdef clone at $TASKDEF_CLONE_DIR — taskdef schema check skipped"
+    fi
+elif [[ ! -f "$TASKDEF_MANIFEST" ]]; then
+    pass "taskdef clone has no root taskdef.yaml — schema 1 (grandfather clause)"
+else
+    if [[ -z "$SUPPORTED_TASKDEF_SCHEMAS_CSV" ]]; then
+        # Legacy mode or earlier parse failure — one extra helper call for
+        # the supported set only (emitted even when sources.yaml is absent).
+        SUPPORTED_TASKDEF_SCHEMAS_CSV="$("${LMER_PYTHON:-python3}" -m lmer_cli.container.sources doctor \
+            --json --path "$SOURCES_YAML" 2>/dev/null \
+            | "${LMER_PYTHON:-python3}" -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+    if not isinstance(doc, dict):
+        raise ValueError("not a JSON object")
+except Exception:
+    sys.exit(3)
+print(",".join(str(s) for s in doc.get("supported_taskdef_schemas") or []))
+' 2>/dev/null)" || true
+    fi
+    # Same guarded-python3 approach as the sources parse; PyYAML so the
+    # YAML-bool trap is handled (`schema: true` must NOT pass — mirrors
+    # hooks/start.py read_taskdef_schema, which rejects bools explicitly).
+    TASKDEF_SCHEMA="$("${LMER_PYTHON:-python3}" -c '
+import sys
+try:
+    import yaml
+except Exception:
+    print("NOYAML"); sys.exit(0)
+try:
+    with open(sys.argv[1]) as f:
+        data = yaml.safe_load(f)
+except Exception:
+    print("UNPARSEABLE"); sys.exit(0)
+schema = data.get("schema") if isinstance(data, dict) else None
+if isinstance(schema, bool) or not isinstance(schema, int):
+    print("INVALID"); sys.exit(0)
+print(schema)
+' "$TASKDEF_MANIFEST" 2>/dev/null)" || true
+    case "$TASKDEF_SCHEMA" in
+        "")
+            warn "$TASKDEF_MANIFEST present but python3 unavailable — taskdef schema not verified"
+            ;;
+        NOYAML)
+            warn "$TASKDEF_MANIFEST present but PyYAML unavailable — taskdef schema not verified"
+            ;;
+        UNPARSEABLE)
+            warn "$TASKDEF_MANIFEST is not readable/parseable YAML — the taskdef renderer will refuse it; fix or remove the manifest"
+            ;;
+        INVALID)
+            warn "$TASKDEF_MANIFEST must declare an integer \`schema:\` (a YAML bool like \`schema: true\` does not count) — the renderer will refuse it; declare one of: ${SUPPORTED_TASKDEF_SCHEMAS_CSV:-unknown}"
+            ;;
+        *)
+            if [[ -z "$SUPPORTED_TASKDEF_SCHEMAS_CSV" ]]; then
+                warn "taskdef declares schema $TASKDEF_SCHEMA but the sources helper is unavailable — supported set unknown, schema not verified"
+            elif [[ ",$SUPPORTED_TASKDEF_SCHEMAS_CSV," == *",$TASKDEF_SCHEMA,"* ]]; then
+                pass "taskdef schema $TASKDEF_SCHEMA supported by this renderer (supports: $SUPPORTED_TASKDEF_SCHEMAS_CSV)"
+            else
+                warn "taskdef declares schema $TASKDEF_SCHEMA but this renderer supports only: $SUPPORTED_TASKDEF_SCHEMAS_CSV — upgrade the container image, or pin sources.taskdef.ref (in $SOURCES_YAML) to a ref using a supported schema"
+            fi
+            ;;
+    esac
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 echo ""

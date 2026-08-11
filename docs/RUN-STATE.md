@@ -307,6 +307,92 @@ convention, §1) — and claiming a task complete requires a matching
 the finish/retro step compares claims to receipts; a guard-hook nudge is
 deliberately deferred (§8).
 
+### Gate-in-flight coordination (`commit_deferred`)
+
+Receipts are why this exists: a `gate` event appends to `events.jsonl`, so
+**every gate run leaves the run dir dirty**. A full suite takes ~14 minutes,
+which makes gating in the background the normal pattern — and yielding inside
+that window fires the Stop hook, whose mandated `work commit` sweeps tracked
+run-dir files into a commit underneath the running suite, failing its `/work`
+isolation guard (`tests/conftest.py`). Self-sustaining, too: the receipt dirties
+the run dir, which arms the nudge, which lands a commit inside the next gate's
+window. Issue #201.
+
+The three mechanisms now know about each other, through one marker:
+
+- **Producers.** `gate-check`, `gate-commit`, `gate-push` and
+  `work verify -- <cmd>` hold a marker (`lmer_cli.gate_lock`) for their whole
+  run — one `<pid>.json` under `LMER_GATE_LOCK_DIR` (default
+  `/tmp/lmer-gate-inflight`), removed in a `finally`. Liveness is the OS's
+  answer, not a promise about how long a gate "should" take: a marker counts
+  only while its pid is alive, dead ones are pruned on read, and the six-hour
+  age cap is a pid-reuse backstop, never a gate timeout. Writing a marker is
+  fail-soft — no lock problem can change a gate's exit code, exactly like
+  receipt emission.
+- **Commits defer.** `work_repo.git_ops.commit_work_path` — the single choke
+  point behind `work commit` *and* the implicit pushes in `work state set` /
+  `goal` / `artifact` / `ledger set` — skips add/commit/push while a marker is
+  live, leaves every file on disk, and returns 0. Two exemptions: the release
+  CAS claim path (arbitration, not durability — it never routes through this
+  function) and `work session-end` (`allow_during_gate=True`: the container is
+  going away, so the gate whose window a deferral would protect is being torn
+  down with it, and there is no later commit to flush into).
+- **The Stop hook stands down.** `work resume --json` reports `gate_in_flight`
+  (derived server-side, like `run_dir_url`), and `hooks/run_state_guard.py`
+  suppresses **every** trigger while it is true — not just the push nudge:
+  triggers 1 and 3 mandate `work goal` / `work state set` / `work ledger set`,
+  which write the work repo too. No sentinel is burned and no counter consumed,
+  so the nudges return in full the moment the gate ends. The suppression is
+  bounded by the gate's life, which is what keeps "a session cannot stop with
+  unpushed artifacts" true: deferred work leaves the run dir dirty, so trigger 2
+  fires as soon as the window closes.
+
+A deferral is recorded as a **`commit_deferred`** event so an exit-zero cannot
+quietly claim the work is safe:
+
+```json
+{"ts": "…", "session": "…", "type": "commit_deferred",
+ "note": "work-repo commit deferred while gate-check was in flight",
+ "data": {"gate": "gate-check", "pid": 1952,
+          "paths": ["gitlab.example.com/group/project/runs/develop-issue-123"]}}
+```
+
+It is parked outside the work repo (beside the markers) until a commit is
+allowed through, then flushed into `events.jsonl` by that commit — writing it
+into the run dir at deferral time would dirty a possibly-clean tracked file and
+be reported by the running suite's leak guard as an appearance, which is the
+same failure in a new costume.
+
+Bare writes take the other path: **commits defer around a gate, bare writes
+attribute themselves** (issue #233). `work log` and `work event` write the run
+dir without committing, so instead of deferring, a write-shaped `work`
+invocation running inside a gate window journals its intent beside the markers
+— the paths it may write, plus a per-marker verdict on whether the marker's
+holder (pytest, for a suite) is among the writer's process ancestors, read
+from `/proc` at write time. The suite's leak guard consumes that journal at
+teardown and partitions the drift: entries under the write scope a
+**non-ancestor** invocation declared (the session that launched the suite,
+doing its job) are excused and reported informationally; a journaled write
+that **descends from the suite** fails the run naming the leaking command (a
+test reached the real `work` CLI — issue #93); anything unattributed and any
+HEAD move keeps the hard failure. **Removals are held to a stricter test**:
+whether a path was removed is read from the porcelain status code (`D` in
+either column), not from which side of the snapshot diff the line landed on —
+deleting a tracked file *adds* a ` D path` line — and a removal is excused
+only when the same tail reappears under a *different* declared prefix, which
+is what the session's own run-dir rename (`work goals freeze`, `work name`)
+produces and what a test's `rmtree` never does. The excuse is otherwise
+prefix-scoped, not per-file: a write from any source that lands inside an
+excused prefix rides that excuse for the suite's window — the granularity
+trade-off is documented at `cli._write_intent_rel_paths`, and outside excused
+prefixes hand edits still fail the run. The suite also holds a `pytest-suite` gate
+marker of its own (written by the conftest lock-dir fixture into the
+operational dir), so commit deferral covers bare `pytest` runs, not only
+gate-command runs.
+
+`LMER_GATE_INFLIGHT_GUARD=0` restores the pre-#201 behavior for every consumer
+at once (markers are still written); see [LMER-CLI.md](./LMER-CLI.md).
+
 ### `ledger.yaml` — per-task execution ledger
 
 The ledger (issue #89) is what makes a crashed orchestrated run recoverable

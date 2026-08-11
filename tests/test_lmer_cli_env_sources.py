@@ -1,24 +1,29 @@
 """Test environment variable display and redaction."""
 import io
 import re
+import subprocess
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from lmer_cli import cli, clone_cache
 from lmer_cli.cli import (
     REHEARSAL_CREDENTIAL_ENVS,
     RELEASE_GITHUB_TOKEN_ENV,
     RELEASE_SIGNING_KEY_ENV,
     RELEASE_TASK_ID,
     _display_env_config_cli,
+    _display_sources_config_cli,
     _redact_env_value,
     _release_credential_env,
     _resolve_napkin_path,
 )
 from lmer_cli.mounts import CONTAINER_RELEASE_SIGNING_KEY_PATH
 from lmer_cli.runtime import _is_selinux_enforcing
+
+from tests.conftest import strip_lmer_env
 
 CLI_PY = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
 
@@ -368,3 +373,605 @@ class TestDisplayEnvConfigCli:
 
         output = f.getvalue()
         assert ".env (working directory)" in output
+
+
+WORK_REPO = "https://git.example.com/org/work.git"
+
+VALID_SOURCES_YAML = """\
+schema: 1
+sources:
+  taskdef:
+    repo: https://git.example.com/org/taskdefs.git
+    ref: v2
+  napkin:
+    repo: https://git.example.com/org/napkin.git
+"""
+
+CROSS_HOST_SOURCES_YAML = """\
+schema: 1
+sources:
+  taskdef:
+    repo: https://elsewhere.example.net/org/taskdefs.git
+"""
+
+CREDENTIALED_SOURCES_YAML = """\
+schema: 1
+sources:
+  taskdef:
+    repo: https://oauth2:glpat-FAKEdeclared99@git.example.com/org/taskdefs.git
+"""
+
+
+def _render_sources_block(monkeypatch, cached, env=None,
+                          reason=clone_cache.CACHE_NO_MIRROR):
+    """Render the block with a stubbed clone cache and a clean LMER_* env.
+
+    `cached` is what the clone-cache reader pretends the work repo's cached
+    sources.yaml contains (None = miss, reported with `reason`); `env` is the
+    complete LMER_* environment for the render (everything else is stripped
+    first).
+    """
+    strip_lmer_env(monkeypatch)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(
+        cli,
+        "read_cached_repo_file_status",
+        lambda url, path="sources.yaml": (
+            (cached, clone_cache.CACHE_HIT) if cached is not None else (None, reason)
+        ),
+    )
+    f = io.StringIO()
+    with redirect_stdout(f):
+        _display_sources_config_cli()
+    return f.getvalue()
+
+
+def _sources_row(output, label):
+    """The (value, origin) cells of the rendered table row named *label*."""
+    for line in output.splitlines():
+        parts = re.split(r"\s{2,}", line.strip())
+        if len(parts) == 3 and parts[0] == label:
+            return parts[1], parts[2]
+    raise AssertionError(f"no `{label}` row in output:\n{output}")
+
+
+def _git(*args: str, cwd: Path) -> None:
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+class TestDisplaySourcesConfigCli:
+    """Canonical-sources block for --show-env (plan task 11, issue #105)."""
+
+    def _render(self, monkeypatch, cached, env=None,
+                reason=clone_cache.CACHE_NO_MIRROR):
+        """Render the block with a stubbed clone cache and a clean LMER_* env.
+
+        `cached` is what the clone-cache reader pretends the work repo's
+        cached sources.yaml contains (None = miss, reported with `reason`);
+        `env` is the LMER_* environment for the render.
+        """
+        return _render_sources_block(monkeypatch, cached, env, reason=reason)
+
+    def test_declared_from_cache_labeled_possibly_stale(self, monkeypatch):
+        output = self._render(
+            monkeypatch, VALID_SOURCES_YAML, env={"LMER_WORK_REPO": WORK_REPO}
+        )
+        assert "Canonical Sources" in output
+        assert "https://git.example.com/org/taskdefs.git" in output
+        assert "https://git.example.com/org/napkin.git" in output
+        assert "v2" in output
+        # Every declared row is labeled as coming from a possibly-stale cache.
+        assert output.count("declared (cached, possibly stale)") == 3
+
+    def test_env_override_detected_when_urls_differ(self, monkeypatch):
+        output = self._render(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_TASKDEF_REPO": "https://git.example.com/other/taskdefs.git",
+            },
+        )
+        assert "env-override" in output
+        assert "https://git.example.com/other/taskdefs.git" in output
+
+    def test_normalizer_prevents_false_env_override(self, monkeypatch):
+        """An env var spelling the SAME repo differently (scp form, no .git)
+        is a silent match by the core normalizer, not an env-override."""
+        output = self._render(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_TASKDEF_REPO": "git@git.example.com:org/taskdefs",
+            },
+        )
+        assert "env-override" not in output
+        assert "env-match" in output
+
+    def test_load_warnings_are_rendered(self, monkeypatch):
+        """Iteration-4 review finding: --show-env dropped load_sources'
+        recoverable-findings channel, so a declaration with a typo'd key
+        rendered as a clean `declared:` line on the one surface an operator
+        uses to understand it — while bin/doctor and container startup both
+        warn. The temp copy's path must not leak into the message either.
+        """
+        output = self._render(
+            monkeypatch,
+            "schema: 1\n"
+            "profile: default\n"
+            "sources:\n"
+            "  taskdef:\n"
+            "    repo: https://git.example.com/org/taskdefs.git\n"
+            "    branch: main\n"
+            "  masterplan_mirror:\n"
+            "    repo: https://git.example.com/org/mirror.git\n",
+            env={"LMER_WORK_REPO": WORK_REPO},
+        )
+        assert "unknown top-level key `profile`" in output
+        assert "unknown key `branch`" in output
+        assert "`sources.masterplan_mirror` is reserved" in output
+        # Named by the real filename, never the throwaway temp path.
+        assert "sources.yaml:" in output
+        assert "/tmp" not in output
+        # The valid part of the declaration still renders.
+        assert "https://git.example.com/org/taskdefs.git" in output
+
+    def test_no_warnings_no_warning_lines(self, monkeypatch):
+        output = self._render(
+            monkeypatch, VALID_SOURCES_YAML, env={"LMER_WORK_REPO": WORK_REPO}
+        )
+        assert "⚠️" not in output
+
+    def test_env_match_across_a_custom_ssh_port(self, monkeypatch):
+        """Host/container parity for the sixth iteration-5 finding: the env
+        value that is the DERIVED form of the declaration is env-match on
+        both surfaces, not env-override.
+        """
+        output = self._render(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={
+                "LMER_WORK_REPO": "ssh://git@git.example.com:2222/org/work.git",
+                "LMER_TASKDEF_REPO": "ssh://git@git.example.com:2222/org/taskdefs.git",
+            },
+        )
+        assert "env-match" in output
+        assert "env-override" not in output
+
+    def test_env_only_when_nothing_declared(self, monkeypatch):
+        output = self._render(
+            monkeypatch,
+            None,  # cold cache: no declared side at all
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_NAPKIN_REPO": "https://git.example.com/org/napkin.git",
+            },
+        )
+        assert "declared: unknown (work repo not cached)" in output
+        assert "env-only" in output
+        assert "env-override" not in output
+
+    def test_warm_mirror_without_sources_yaml_is_not_a_cache_miss(self, monkeypatch):
+        """A warm mirror whose repo declares nothing is the expected state
+        until the cutover — it must not be reported as an uncached work repo,
+        which sends the operator debugging clone-cache state that is fine."""
+        output = self._render(
+            monkeypatch,
+            None,
+            env={"LMER_WORK_REPO": WORK_REPO},
+            reason=clone_cache.CACHE_FILE_ABSENT,
+        )
+        assert "declared: none (no sources.yaml in the work repo)" in output
+        assert "not cached" not in output
+        assert output.count("unset-fallback") == 3
+
+    def test_unreadable_cache_is_reported_as_such(self, monkeypatch):
+        """A reader that blew up is neither a declaration nor a cold cache."""
+        output = self._render(
+            monkeypatch,
+            None,
+            env={"LMER_WORK_REPO": WORK_REPO},
+            reason=clone_cache.CACHE_ERROR,
+        )
+        assert "declared: unknown (work-repo cache unreadable)" in output
+        assert output.count("unset-fallback") == 3
+
+    def test_unset_fallback_row_is_explicit(self, monkeypatch):
+        """Decision (b): unset sources print a loud row, never omitted."""
+        output = self._render(
+            monkeypatch, None, env={"LMER_WORK_REPO": WORK_REPO}
+        )
+        assert "taskdef repo" in output
+        assert "taskdef ref" in output
+        assert "napkin repo" in output
+        assert output.count("unset-fallback") == 3
+
+    def test_invalid_cached_sources_yaml_surfaced_not_raised(self, monkeypatch):
+        """Decision (c): a bad cached sources.yaml renders as invalid; the
+        renderer never raises and rows fall back to env-only/unset."""
+        output = self._render(
+            monkeypatch,
+            "schema: 99\nsources: {}\n",
+            env={"LMER_WORK_REPO": WORK_REPO},
+        )
+        assert "declared: invalid (" in output
+        # The throwaway temp path is stripped so the message names the file.
+        assert "sources.yaml declares schema 99" in output
+        assert "unset-fallback" in output
+
+    def test_no_credential_in_any_rendered_row(self, monkeypatch):
+        """Tokened env URLs (https userinfo and scp-form) never reach stdout."""
+        output = self._render(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={
+                "LMER_WORK_REPO": "https://oauth2:glpat-FAKEwork1234@git.example.com/org/work.git",
+                "LMER_TASKDEF_REPO": "https://oauth2:glpat-FAKEtask1234@git.example.com/other/taskdefs.git",
+                "LMER_NAPKIN_REPO": "oauth2:glpat-FAKEnapkin12@git.example.com:other2/napkin",
+            },
+        )
+        assert "glpat-" not in output
+        assert "oauth2" not in output
+
+
+class TestSourcesOriginMatrix:
+    """Remaining cells of the per-field origin matrix (plan task 12): every
+    field reaches every origin, not just the Wave-2 samples (declared-only
+    for all three, env-match/env-override on taskdef repo, env-only on
+    napkin repo, unset-fallback for all three)."""
+
+    def test_taskdef_ref_env_matching_declaration_is_not_an_override(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={"LMER_WORK_REPO": WORK_REPO, "LMER_TASKDEF_REF": "v2"},
+        )
+        assert _sources_row(output, "taskdef ref") == (
+            "v2",
+            "env-match (declaration cached, possibly stale)",
+        )
+        assert "env-override" not in output
+
+    def test_taskdef_ref_env_override_shows_env_value(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={"LMER_WORK_REPO": WORK_REPO, "LMER_TASKDEF_REF": "v9"},
+        )
+        assert _sources_row(output, "taskdef ref") == ("v9", "env-override")
+
+    def test_taskdef_ref_comparison_is_exact_not_normalized(self, monkeypatch):
+        """Refs are opaque strings: only repo fields go through the URL
+        normalizer, so a ref differing only in case IS an override."""
+        output = _render_sources_block(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={"LMER_WORK_REPO": WORK_REPO, "LMER_TASKDEF_REF": "V2"},
+        )
+        assert _sources_row(output, "taskdef ref") == ("V2", "env-override")
+
+    def test_napkin_repo_env_matching_via_normalizer(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_NAPKIN_REPO": "git@git.example.com:org/napkin",
+            },
+        )
+        # The declared spelling renders, labeled as a silent match.
+        assert _sources_row(output, "napkin repo") == (
+            "https://git.example.com/org/napkin.git",
+            "env-match (declaration cached, possibly stale)",
+        )
+
+    def test_napkin_repo_env_override_shows_env_value(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_NAPKIN_REPO": "https://git.example.com/other/napkin.git",
+            },
+        )
+        assert _sources_row(output, "napkin repo") == (
+            "https://git.example.com/other/napkin.git",
+            "env-override",
+        )
+
+    def test_taskdef_repo_env_only_without_declaration(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch,
+            None,  # cache miss
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_TASKDEF_REPO": "https://git.example.com/org/taskdefs.git",
+            },
+        )
+        assert _sources_row(output, "taskdef repo") == (
+            "https://git.example.com/org/taskdefs.git",
+            "env-only",
+        )
+
+    def test_taskdef_ref_env_only_without_declaration(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch,
+            None,
+            env={"LMER_WORK_REPO": WORK_REPO, "LMER_TASKDEF_REF": "v9"},
+        )
+        assert _sources_row(output, "taskdef ref") == ("v9", "env-only")
+        # The untouched rows stay loud unset-fallback rows (decision (b)).
+        assert _sources_row(output, "taskdef repo") == ("(unset)", "unset-fallback")
+        assert _sources_row(output, "napkin repo") == ("(unset)", "unset-fallback")
+
+    def test_one_override_leaves_other_rows_declared(self, monkeypatch):
+        """Rows are independent: overriding napkin never bleeds an
+        env-override label onto the taskdef rows."""
+        output = _render_sources_block(
+            monkeypatch,
+            VALID_SOURCES_YAML,
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_NAPKIN_REPO": "https://git.example.com/other/napkin.git",
+            },
+        )
+        assert _sources_row(output, "taskdef repo") == (
+            "https://git.example.com/org/taskdefs.git",
+            "declared (cached, possibly stale)",
+        )
+        assert _sources_row(output, "taskdef ref") == (
+            "v2",
+            "declared (cached, possibly stale)",
+        )
+
+    def test_whitespace_only_env_value_is_unset(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch,
+            None,
+            env={"LMER_WORK_REPO": WORK_REPO, "LMER_TASKDEF_REF": "   "},
+        )
+        assert _sources_row(output, "taskdef ref") == ("(unset)", "unset-fallback")
+
+    def test_work_repo_unset_renders_without_touching_cache(self, monkeypatch):
+        """No LMER_WORK_REPO: the block still renders (never raises) and the
+        cache reader is never consulted — there is no URL to map."""
+        strip_lmer_env(monkeypatch)
+
+        def _boom(url, path="sources.yaml"):
+            raise AssertionError("cache read without LMER_WORK_REPO")
+
+        monkeypatch.setattr(cli, "read_cached_repo_file_status", _boom)
+        f = io.StringIO()
+        with redirect_stdout(f):
+            _display_sources_config_cli()
+        output = f.getvalue()
+        assert "declared: unknown (LMER_WORK_REPO not set)" in output
+        assert output.count("unset-fallback") == 3
+
+
+class TestSourcesBlockInvalidCachedYaml:
+    """More decision-(c) shapes beyond Wave 2's unsupported-schema case: any
+    untrustable cached sources.yaml becomes a non-fatal `declared: invalid`
+    notice and the rows fall back — never a raise, never a traceback."""
+
+    def test_unparseable_yaml_renders_notice(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch, "sources: [unclosed\n", env={"LMER_WORK_REPO": WORK_REPO}
+        )
+        assert "declared: invalid (" in output
+        # The throwaway temp path is stripped so the notice names the file.
+        assert "unparseable sources.yaml" in output
+        assert output.count("unset-fallback") == 3
+
+    def test_non_mapping_yaml_renders_notice(self, monkeypatch):
+        output = _render_sources_block(
+            monkeypatch, "- taskdef\n- napkin\n", env={"LMER_WORK_REPO": WORK_REPO}
+        )
+        assert "declared: invalid (" in output
+        assert "must be a YAML mapping" in output
+        assert output.count("unset-fallback") == 3
+
+    def test_trust_rule_violation_renders_notice(self, monkeypatch):
+        """A cached file declaring a cross-host repo fails load_sources'
+        schema-1 trust rule; the block reports it and keeps rendering."""
+        output = _render_sources_block(
+            monkeypatch, CROSS_HOST_SOURCES_YAML, env={"LMER_WORK_REPO": WORK_REPO}
+        )
+        assert "declared: invalid (" in output
+        assert "schema-1 trust rule" in output
+        assert output.count("unset-fallback") == 3
+
+    def test_invalid_declaration_still_honors_env_rows(self, monkeypatch):
+        """An invalid cache never suppresses env-side configuration."""
+        output = _render_sources_block(
+            monkeypatch,
+            CROSS_HOST_SOURCES_YAML,
+            env={
+                "LMER_WORK_REPO": WORK_REPO,
+                "LMER_TASKDEF_REPO": "https://git.example.com/org/taskdefs.git",
+            },
+        )
+        assert _sources_row(output, "taskdef repo") == (
+            "https://git.example.com/org/taskdefs.git",
+            "env-only",
+        )
+
+    def test_credentialed_declared_url_never_reaches_stdout(self, monkeypatch):
+        """Declared-side scrubbing: load_sources refuses a credentialed
+        repo URL, and the rendered refusal itself is scrubbed."""
+        output = _render_sources_block(
+            monkeypatch, CREDENTIALED_SOURCES_YAML, env={"LMER_WORK_REPO": WORK_REPO}
+        )
+        assert "declared: invalid (" in output
+        assert "embeds a credential" in output
+        assert "glpat-" not in output
+        assert "oauth2" not in output
+
+
+class TestSourcesBlockRealCloneCache:
+    """Declared side end-to-end against a REAL bare mirror under a temp
+    clone-cache root — no read_cached_repo_file stub: URL→mirror mapping,
+    `git show`, parse, validate, render."""
+
+    def _mirror_work_repo(self, tmp_path, sources_yaml):
+        """A bare mirror for WORK_REPO with *sources_yaml* at HEAD, built at
+        the real mapping's location under a fresh cache root.
+
+        `sources_yaml=None` builds a perfectly good mirror of a work repo
+        that simply declares nothing — the state every work repo is in until
+        the cutover lands.
+        """
+        seed = tmp_path / "seed"
+        seed.mkdir()
+        _git("init", "-b", "main", cwd=seed)
+        _git("config", "user.email", "test@example.com", cwd=seed)
+        _git("config", "user.name", "Test User", cwd=seed)
+        name = "sources.yaml" if sources_yaml is not None else "README.md"
+        (seed / name).write_text(sources_yaml if sources_yaml is not None else "work\n")
+        _git("add", name, cwd=seed)
+        _git("commit", "-m", "declare sources", cwd=seed)
+        cache_root = tmp_path / "clone-cache"
+        mirror = cache_root / "git.example.com" / "org" / "work.git"
+        mirror.parent.mkdir(parents=True)
+        _git("clone", "--bare", "--quiet", str(seed), str(mirror), cwd=tmp_path)
+        return cache_root
+
+    def _render(self, monkeypatch, cache_root, work_repo=WORK_REPO):
+        strip_lmer_env(monkeypatch)
+        monkeypatch.setenv("LMER_CLONE_CACHE_DIR", str(cache_root))
+        monkeypatch.setenv("LMER_WORK_REPO", work_repo)
+        f = io.StringIO()
+        with redirect_stdout(f):
+            _display_sources_config_cli()
+        return f.getvalue()
+
+    def test_real_mirror_rows_labeled_cached_possibly_stale(self, monkeypatch, tmp_path):
+        cache_root = self._mirror_work_repo(tmp_path, VALID_SOURCES_YAML)
+        output = self._render(monkeypatch, cache_root)
+        assert (
+            "declared: sources.yaml from work-repo cache (cached, possibly stale)"
+            in output
+        )
+        assert _sources_row(output, "taskdef repo") == (
+            "https://git.example.com/org/taskdefs.git",
+            "declared (cached, possibly stale)",
+        )
+        assert _sources_row(output, "taskdef ref") == (
+            "v2",
+            "declared (cached, possibly stale)",
+        )
+        assert _sources_row(output, "napkin repo") == (
+            "https://git.example.com/org/napkin.git",
+            "declared (cached, possibly stale)",
+        )
+
+    def test_tokenized_work_repo_url_finds_same_mirror_and_scrubs(
+        self, monkeypatch, tmp_path
+    ):
+        """The URL→mirror mapping scrubs userinfo, so a credentialed
+        LMER_WORK_REPO still hits the mirror — and never reaches stdout."""
+        cache_root = self._mirror_work_repo(tmp_path, VALID_SOURCES_YAML)
+        output = self._render(
+            monkeypatch,
+            cache_root,
+            work_repo="https://oauth2:glpat-FAKEwork5678@git.example.com/org/work.git",
+        )
+        assert output.count("declared (cached, possibly stale)") == 3
+        assert "glpat-" not in output
+        assert "oauth2" not in output
+
+    def test_no_mirror_renders_work_repo_not_cached(self, monkeypatch, tmp_path):
+        # Real reader against an existing-but-empty cache root: a cold cache
+        # is a normal miss, rendered as such.
+        cache_root = tmp_path / "clone-cache"
+        cache_root.mkdir()
+        output = self._render(monkeypatch, cache_root)
+        assert "declared: unknown (work repo not cached)" in output
+        assert output.count("unset-fallback") == 3
+
+    def test_warm_mirror_without_declaration_renders_none(self, monkeypatch, tmp_path):
+        """Real mirror, real `git show` miss: a warm cache for a repo that
+        declares nothing is told apart from a cold cache by the reader, not
+        guessed at by the renderer."""
+        cache_root = self._mirror_work_repo(tmp_path, None)
+        output = self._render(monkeypatch, cache_root)
+        assert "declared: none (no sources.yaml in the work repo)" in output
+        assert "not cached" not in output
+        assert output.count("unset-fallback") == 3
+
+
+class TestShowEnvSourcesBlockSmoke:
+    """The sources block is part of real `lmer --show-env` output — at the
+    normal call site and at the UnknownHarnessError fail-fast branch (the
+    sibling-renderer placement, decision (a))."""
+
+    def _isolate(self, monkeypatch, tmp_path):
+        strip_lmer_env(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.lmer/.env leakage
+        monkeypatch.chdir(tmp_path)  # no stray cwd .env in the early load
+        monkeypatch.setattr(
+            cli,
+            "read_cached_repo_file_status",
+            lambda url, path="sources.yaml": (None, clone_cache.CACHE_NO_MIRROR),
+        )
+
+    def test_show_env_output_contains_sources_block(self, monkeypatch, tmp_path, capsys):
+        self._isolate(monkeypatch, tmp_path)
+
+        rc = cli.main(["--show-env"])
+        out = capsys.readouterr().out
+
+        assert rc == 0
+        assert "Canonical Sources" in out
+        # One origin row per source, loud even with nothing configured.
+        assert "taskdef repo" in out
+        assert "taskdef ref" in out
+        assert "napkin repo" in out
+        assert out.count("unset-fallback") == 3
+        assert "declared: unknown (LMER_WORK_REPO not set)" in out
+
+    def test_block_renders_even_when_env_table_early_returns(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """A typo'd LMER_HARNESS takes the fail-fast branch; the block must
+        still render there (and the exit code stays the harness error's 2)."""
+        self._isolate(monkeypatch, tmp_path)
+        monkeypatch.setenv("LMER_HARNESS", "not-a-harness")
+
+        rc = cli.main(["--show-env"])
+        out = capsys.readouterr().out
+
+        assert rc == 2
+        assert "Unknown harness 'not-a-harness'" in out
+        assert "Canonical Sources" in out
+        assert "unset-fallback" in out
+
+
+class TestShowEnvBackwardCompat:
+    """Pre-#105 invariant: with no cached work repo and neither
+    LMER_TASKDEF_REPO nor LMER_NAPKIN_REPO set, --show-env keeps its exit
+    code and renders the env table byte-identically — the sources block
+    only appends after it."""
+
+    def test_exit_code_and_env_table_unchanged(self, monkeypatch, tmp_path, capsys):
+        strip_lmer_env(monkeypatch)
+        monkeypatch.setenv("HOME", str(tmp_path))  # default cache root: absent
+        monkeypatch.chdir(tmp_path)  # no stray cwd .env
+        monkeypatch.setenv("LMER_TASK", "review")
+
+        rc = cli.main(["--show-env"])
+        out = capsys.readouterr().out
+
+        # The pre-existing table, rendered directly with the same inputs
+        # main() computes (LMER_TASK is the only host LMER_* var).
+        f = io.StringIO()
+        with redirect_stdout(f):
+            _display_env_config_cli(host_lmer_vars={"LMER_TASK"}, env_file_sources={})
+        expected_table = f.getvalue()
+
+        assert rc == 0
+        assert expected_table in out  # byte-identical env table
+        # The sources block strictly follows the table, never replaces it.
+        assert out.index(expected_table) < out.index("Canonical Sources")

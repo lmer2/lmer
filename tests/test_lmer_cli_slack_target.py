@@ -413,8 +413,9 @@ def _make_main_mocks(captured_env: dict | None = None):
     without a real container runtime.  Patches are applied in the caller via
     ``unittest.mock.patch`` calls so the test controls what is returned.
 
-    ``captured_env`` — if provided, the mock for ``env_args`` stores the env
-    dict that main() passes into it so tests can inspect the container env.
+    ``captured_env`` — if provided, the mock for ``build_container_env`` stores
+    the env dict that main() passes into it so tests can inspect the container
+    env.
     """
     import tempfile
     from contextlib import ExitStack
@@ -479,7 +480,7 @@ def _make_main_mocks(captured_env: dict | None = None):
         patch("lmer_cli.cli.resolve_host_clone_cache_dir", return_value=MagicMock())
     )
     stack.enter_context(
-        patch("lmer_cli.cli.build_clone_cache_mount", return_value=[])
+        patch("lmer_cli.cli.build_clone_cache_mounts", return_value=([], []))
     )
     # The host-side cache updater forks a detached real process; never let a
     # test run spawn it (its child would resolve and write the REAL cache).
@@ -504,18 +505,24 @@ def _make_main_mocks(captured_env: dict | None = None):
         )
     )
 
-    # --- env_args: optionally capture what the CLI hands in ---
+    # --- build_container_env: optionally capture what the CLI hands in.
+    # A real (empty) ContainerEnv is returned rather than a stub so the CLI's
+    # .args / .subprocess_env() / .cleanup() calls exercise the real contract.
+    from lmer_cli.runtime import ContainerEnv
+
     if captured_env is not None:
 
-        def _capture_env_args(env):
+        def _capture_container_env(env):
             captured_env.update(env)
-            return []
+            return ContainerEnv()
 
         stack.enter_context(
-            patch("lmer_cli.cli.env_args", side_effect=_capture_env_args)
+            patch("lmer_cli.cli.build_container_env", side_effect=_capture_container_env)
         )
     else:
-        stack.enter_context(patch("lmer_cli.cli.env_args", return_value=[]))
+        stack.enter_context(
+            patch("lmer_cli.cli.build_container_env", return_value=ContainerEnv())
+        )
 
     # --- subprocess.call: prevent actually launching a container ---
     stack.enter_context(

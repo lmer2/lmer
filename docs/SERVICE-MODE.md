@@ -201,6 +201,174 @@ lmer chat --service web --checkout ~/project/dev-env --match-uid ...
 - `--checkout` can be used alone (without `--service`) to skip cloning and
   use an existing checkout.
 
+## Service slots (several agents, one dev stack)
+
+A dev service is a single-occupancy resource: two agents running migrations
+against one database is a data-corruption story, not a concurrency story. A
+**service slot** is how the platform makes that rule enforceable — a named
+binding from one runner to one dev service, which a session either holds or
+does not.
+
+Slots are declared once per host in `~/.lmer/platform/config.json`:
+
+```json
+{
+  "slots": [
+    {
+      "name": "webapp-dev",
+      "preset": "webapp_dev",
+      "description": "Web app dev stack"
+    }
+  ]
+}
+```
+
+| key | meaning |
+|---|---|
+| `name` | what you spawn into, and what the fleet view calls the row |
+| `preset` | a preset from this host's presets file (see [PRESETS.md](PRESETS.md)); it must set `service`, must not override `--service`/`--checkout` in its own `args`, and it is what puts the session into service mode |
+| `description` | optional, shown on the row |
+
+**One service, one slot.** The resource a slot protects is the dev service, not
+the name written over it, so two slots resolving to the same `service` would
+each read free and each grant — and the sessions would land in one container.
+The second one therefore loads *unusable*, naming the slot that bound the
+service first. The first slot that **resolves** wins — which is declaration
+order among slots that resolve at all, so an earlier slot that is itself
+unusable reserves nothing and a later one can take the service.
+
+That rule is derived from the presets file, and the presets file is hot — so it
+is backed by a second check that measures rather than predicts: a spawn is also
+refused (409) when a **live session** is running against the slot's service,
+whatever slot name that session claimed. Without it, fixing an unusable slot's
+preset while a session runs under a different slot on the same service would
+hand the fixed slot a service already in use.
+
+**Two operational preconditions**, both easy to miss:
+
+- **`slots` is read when the daemon starts.** `config.json` is resolved once at
+  boot, so a slot you add to a running platform is invisible until you restart
+  it. Fixes to the *presets* file stay hot — which is what makes the
+  `misconfigured` row below recoverable without touching `config.json`.
+- **The daemon's own environment must set `LMER_PRESETS_FILE`.** It is read
+  where the daemon runs, not where `lmer` runs. Without it no presets load at
+  all and every slot reports so by name — a daemon started from systemd or a
+  fresh shell is the usual way to hit this, while `lmer --preset X` keeps
+  working fine in your terminal.
+
+A slot points at a **preset** rather than spelling out the service and
+checkout itself. That keeps host paths in the presets file — the one place
+they already live — and makes occupying a slot and running in service mode the
+same act rather than two settings that have to agree.
+
+### Spawning into one
+
+From the fleet view's spawn dialog (the picker lists free slots only), or:
+
+```bash
+lmer-ctl spawn develop https://git.example.com/g/p/-/issues/7 --slot webapp-dev
+```
+
+`--slot` and `--preset` are exclusive — the slot supplies its own.
+
+### Occupancy is derived, never stored
+
+Nothing writes down which slot is taken. A slot reads **occupied** while a live
+session's registry entry names it, and **free** the moment that entry stops
+being live. Two things follow, and both are the reason it works this way:
+
+- it survives a daemon restart, because liveness is a stateless PID probe over
+  files on disk;
+- it cannot strand a slot. A session that dies without cleaning up — crash,
+  `kill -9`, host reboot — leaves a dead PID behind, and a dead PID reads as
+  free. There is nothing to reset and no reconciler to run.
+
+So a slot frees when the session's process ends, whatever ended it. There is no
+release verb because there is nothing to release.
+
+### What a row can say
+
+| state | meaning | fix |
+|---|---|---|
+| `free` | nothing holds it and its service is running | — |
+| `in use` | a live session holds it; the row links to that run | wait, or use another slot |
+| `service not running` | the definition is fine, the dev service is not up | start the stack |
+| `misconfigured` | see below | fix the presets file — the slot recovers without a config edit |
+
+A slot is `misconfigured` when:
+
+- no presets are loaded at all — the row says *which* cause rather than blaming
+  the preset name: the daemon's `LMER_PRESETS_FILE` is unset (above), or it is
+  set and the file is missing, unreadable or not a JSON object;
+- the named preset does not exist on this host;
+- the preset sets no `service`, so it cannot put a session into service mode;
+- the preset's `args` set `--service` or `--checkout` — **including any
+  abbreviation** argparse accepts (`--serv`, `--se`, `--che=…`), since `lmer`
+  leaves `allow_abbrev` on. `lmer` re-parses the preset's own tokens followed by
+  its `args` and the last occurrence wins, so the slot would probe, display and
+  guard one service while the session ran against another. The binding a slot
+  claims has to be the one the session gets. Decided by handing the `args` to
+  the real parser rather than by matching spellings, so this cannot drift from
+  what `lmer` does;
+- the preset's `args` do not parse at all, since the session could not start;
+- the preset's `service` is already bound by an earlier slot (one service, one
+  slot — above).
+
+A slot whose preset this host cannot resolve **loads anyway**, unusable and
+with the reason on its row. It is not dropped, because it can become true again
+by fixing the presets file, and a slot that silently vanished would explain
+nothing to the operator who typed the name.
+
+The service state comes from a probe that is cached for 30 seconds — the fleet
+view is polled every ten, and a container query per slot per poll is a cost the
+row does not need. A spawn re-probes without the cache, because an action taken
+on the answer cannot afford a stale one.
+
+### Refusals
+
+Each names the gate that closed:
+
+| condition | status | class |
+|---|---|---|
+| slot is held by a live session | 409 | `SlotOccupied` |
+| slot's **service** is held by a live session under another slot name | 409 | `SlotOccupied` |
+| no such slot on this host | 400 | `SpawnError` |
+| slot is `misconfigured` — any cause in the list above | 400 | `SpawnError` |
+| slot's service is not running | 400 | `SpawnError` |
+| host is at `max_concurrent_sessions` | 429 | `CapacityError` |
+
+The slot gate and the concurrency cap are **independent**: a free slot on a
+full host still refuses, and a held slot on an idle host still refuses.
+
+### Not in this slice
+
+- **Queueing.** A spawn into an occupied slot is refused now, not queued.
+- **`park` / `hold`.** A slot frees when its session's process ends.
+- **Editing slots in the UI.** They are declared in `config.json`; the fleet
+  view only reads them.
+- **Exactly tracking sessions that predate this version.** Occupancy by service
+  is read from the service each session recorded at spawn time. A session that
+  started before that field existed has it inferred instead, from both the preset
+  its entry names and the slot's current resolution — so an inferred service
+  blocks both candidates rather than picking one. If the *preset itself* is edited
+  while such a session runs, neither candidate is the service it actually holds
+  and that service is not blocked. This drains as those sessions end and cannot
+  recur: every new spawn records the service.
+- **Service-mode sessions that hold no slot.** A session started with a preset
+  but no slot — or `lmer --service web` on the host — is not visible to slot
+  occupancy and blocks nothing. Slots enforce sharing among sessions that use
+  slots.
+- **Reclaiming a slot on resume.** Resuming a run starts a fresh session that
+  carries no slot and no service mode, so the slot it held is genuinely free and
+  the new session is an ordinary one. Pre-existing: resume has never carried
+  `--preset` either.
+- **An atomic claim.** The occupancy check and the registry write that records it
+  are separated by the session's process start, so two spawns racing for one free
+  slot can both pass — the same window the concurrency cap and the
+  one-run-one-session rule have. It is *reported* rather than prevented: a
+  contended row names every holder and says how many there are, and the daemon
+  logs `slot_double_occupancy` when the set of colliding sessions changes.
+
 ## Customizing `gate-check` Tests
 
 By default `gate-check` runs `pytest tests/` from `/workspace`. This won't work

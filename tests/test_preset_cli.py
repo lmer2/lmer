@@ -20,7 +20,7 @@ task; an unknown preset name fails fast (exit 2) listing the available names.
 
 The behavioral tests run the real ``main()`` with the container runtime mocked
 out (reusing the harness from ``test_lmer_cli_slack_target``) and inspect the
-env dict the CLI hands to ``env_args``.
+env dict the CLI hands to ``build_container_env``.
 """
 
 import json
@@ -29,7 +29,11 @@ from unittest.mock import patch
 
 import pytest
 
-from lmer_cli.presets import select_preset_name, task_preset_env_name
+from lmer_cli.presets import (
+    preset_selector_vars,
+    select_preset_name,
+    task_preset_env_name,
+)
 from tests.test_lmer_cli_slack_target import (
     _BASE_ENV,
     _make_main_mocks,
@@ -571,6 +575,39 @@ class TestTaskPresetEnvName:
         }
         assert names == {"LMER_CODE_REVIEW_PRESET"}, (
             f"Separator variants must all derive one name; got {names!r}"
+        )
+
+
+class TestPresetSelectorVars:
+    """The shared candidate list behind selection and stripping (issue #181)."""
+
+    def test_scoped_var_precedes_generic(self):
+        assert preset_selector_vars("chat") == ["LMER_CHAT_PRESET", "LMER_PRESET"], (
+            "selector vars must be ordered most specific first, matching the "
+            "precedence select_preset_name applies"
+        )
+
+    def test_unusable_task_id_yields_generic_only(self):
+        """An id with no derivable scoped name still has LMER_PRESET."""
+        for task_id in (None, "", "   ", "-", "レビュー"):
+            assert preset_selector_vars(task_id) == ["LMER_PRESET"], (
+                f"preset_selector_vars({task_id!r}) must be the generic var alone"
+            )
+
+    def test_covers_every_var_select_preset_name_reads(self):
+        """The list is what a spawner strips to displace an env-selected
+        preset, so a selector missing from it would survive the strip and
+        silently re-apply in the child. Pin the two functions together."""
+        task_id = "chat"
+        for var in preset_selector_vars(task_id):
+            name, source = select_preset_name(None, task_id, {var: "picked"})
+            assert (name, source) == ("picked", var), (
+                f"{var} is in preset_selector_vars but does not select; "
+                f"got {(name, source)!r}"
+            )
+        stripped: dict[str, str] = {}
+        assert select_preset_name(None, task_id, stripped) == (None, None), (
+            "with every selector var stripped nothing may select a preset"
         )
 
 

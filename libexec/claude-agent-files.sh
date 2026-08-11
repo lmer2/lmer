@@ -1,29 +1,39 @@
 #!/bin/bash
-# Helpers for laying out commands/skills/settings under ~/.claude.
+# Helpers for laying out commands/skills/agents/output-styles/settings under
+# ~/.claude.
 #
 # Both the lmer global tree (typically /Agents/global/agent-files/claude)
 # and — when present — the work repository (/work/agent-files/claude) can
-# contribute slash commands, skills, and permission grants. Earlier versions
-# of claude-runner.sh symlinked ~/.claude/commands as a single directory
-# pointing at the global tree, which made it impossible to overlay work-repo
-# contributions. The helpers below replace that with per-entry symlinks so
-# multiple sources can coexist, with the work repository taking precedence
-# on name collisions.
+# contribute slash commands, skills, subagent definitions, output styles, and
+# permission grants. Earlier versions of claude-runner.sh symlinked
+# ~/.claude/commands as a single directory pointing at the global tree, which
+# made it impossible to overlay work-repo contributions. The helpers below
+# replace that with per-entry symlinks so multiple sources can coexist, with
+# the work repository taking precedence on name collisions.
 #
 # This file is sourced by claude-runner.sh and by tests.
 
 # claude_link_agent_files <home_claude> <global_src> <work_src>
-#   Populate <home_claude>/commands/, skills/, and agents/ with symlinks
-#   from each source's corresponding subdirectory. <global_src> and
-#   <work_src> may each be empty. <home_claude> is taken as a parameter so
-#   tests can target a temporary directory.
+#   Populate <home_claude>/commands/, skills/, agents/, and output-styles/
+#   with symlinks from each source's corresponding subdirectory.
+#   <global_src> and <work_src> may each be empty. <home_claude> is taken as
+#   a parameter so tests can target a temporary directory.
+#
+#   output-styles/ is a delivery mechanism only (Issue #249): a style file here
+#   is inert until the outputStyle settings key selects it, which a work-repo
+#   settings.json cannot do (claude_merge_work_settings takes only
+#   permissions.allow, per Issue #48 — asserted by
+#   tests/test_claude_agent_files.py::test_does_not_merge_work_repo_output_style,
+#   tracked as Issue #252).
+#   docs/LMER-CLI.md "Output styles: shipping one and selecting one are
+#   separate" is the full account; keep it the only one.
 claude_link_agent_files() {
     local home_claude="$1"
     local global_src="$2"
     local work_src="$3"
     local subdir target item linked_global linked_work
 
-    for subdir in commands skills agents; do
+    for subdir in commands skills agents output-styles; do
         target="$home_claude/$subdir"
         # An older runner may have left ~/.claude/$subdir as a directory
         # symlink pointing at the global tree. Replace it with a real

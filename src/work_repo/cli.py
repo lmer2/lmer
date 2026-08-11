@@ -15,6 +15,8 @@ from pathlib import Path
 from datetime import datetime
 import yaml
 
+from lmer_cli import gate_lock
+
 from .loggers import get_logger
 from .info_reader import read_project_info
 from .git_ops import (
@@ -32,7 +34,7 @@ from .git_ops import (
     stageable_paths,
     web_url_for,
 )
-from . import goals, plan_index, release_run, run_state, specs_index
+from . import goals, plan_index, release_run, run_state, specs_index, write_journal
 from .memory import persist_memory, restore_memory
 from .utils import redact_secrets, task_target_dir
 
@@ -1231,13 +1233,23 @@ def cmd_state(args) -> int:
 def cmd_answer(text: str) -> int:
     """Execute answer command (issue #98 — resume-on-answer).
 
-    Applies a human's answer to the run's recorded open question through
+    Applies a human's answer to the run's open question through
     run_state.answer_question (appends `question_answered`, clears
     `open_question` + `stop_reason`; status untouched), then pushes the run
     dir — the answer is exactly the record a fresh session resumes from, so
     it must not stay local. Mutating-verb rules: no run context and no open
-    question recorded are errors (exit 1). No auto-seed: an answer can only
-    land on a run that already asked something.
+    question are errors (exit 1). No auto-seed: an answer can only land on a
+    run that already asked something.
+
+    What counts as answerable is the *question stop*, not the recorded text
+    (T24) — and this must agree with _apply_pushed_answer, because the two
+    are one feature seen from two sides: `lmer --answer` on the host and
+    `work answer` in the container answer the same question on the same run,
+    and an operator who is told the two are equivalent (they are documented
+    that way) must not find one recording the answer and the other refusing
+    it. A question stop whose text was never recorded is still a question
+    the run is waiting on; refusing to record its answer loses the answer,
+    which is the failure this verb exists to prevent.
     """
     if not text.strip():
         print("❌ answer requires a non-empty text", file=sys.stderr)
@@ -1251,15 +1263,21 @@ def cmd_answer(text: str) -> int:
     except (run_state.RunStateError, OSError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
-    if state is None or not state.get("open_question"):
-        print("❌ No open question recorded — nothing to answer", file=sys.stderr)
+    if state is None or (
+        not state.get("open_question") and state.get("stop_reason") != "question"
+    ):
+        print(
+            "❌ No open question — the run is not stopped on one, so there is "
+            "nothing to answer",
+            file=sys.stderr,
+        )
         return 1
     try:
         run_state.answer_question(rdir, state, text)
     except (run_state.RunStateError, OSError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
-    print("✅ Question answered — open question and question stop cleared")
+    print("✅ Question answered — question stop cleared")
     _push_run_dir(state, "question answered", saved="answer")
     return 0
 
@@ -1274,6 +1292,18 @@ def _last_non_empty_line(tail: bytes) -> str | None:
 
 
 def cmd_verify(name: str, command: list[str]) -> int:
+    """Run a verify command while holding the gate-in-flight marker (#201).
+
+    A verify command is the same shape of hazard as a gate — it is usually the
+    same long suite — so work-repo commits must defer around it exactly as they
+    do around `gate-check`. The marker never defers THIS process (see
+    `gate_lock.active_gate`'s self-exclusion), so the receipt still lands.
+    """
+    with gate_lock.hold_gate_lock(f"work verify {name.strip() or 'verify'}"):
+        return _run_verify(name, command)
+
+
+def _run_verify(name: str, command: list[str]) -> int:
     """Execute verify command (issue #88 D2 — receipts for non-gate validation).
 
     Runs the command with stderr merged into stdout (so the hashed tail sees
@@ -2004,6 +2034,17 @@ def cmd_resume(as_json: bool = False) -> int:
         run_dir_url = web_url_for(rdir)
         if run_dir_url:
             decision["run_dir_url"] = run_dir_url
+        # Issue #201: the Stop hook must not mandate work-repo writes while a
+        # gate is in flight — its own nudge is what lands a commit inside the
+        # running suite's window. Derived here, server-side, for the same
+        # reason run_dir_url is: hooks import no project code, so the one
+        # definition of "a gate is running" stays in lmer_cli.gate_lock.
+        # Present only when true, so a hook reading an older work CLI sees the
+        # same thing an idle one does.
+        active = gate_lock.active_gate()
+        if active is not None:
+            decision["gate_in_flight"] = True
+            decision["gate_in_flight_detail"] = gate_lock.describe_marker(active)
     if as_json:
         print(json.dumps(decision, ensure_ascii=False))
     else:
@@ -3044,20 +3085,24 @@ def _answer_marker_path(answer: str) -> Path:
 
 
 def _apply_pushed_answer(rdir: Path, state: dict) -> tuple[dict, dict | None]:
-    """Apply a pushed LMER_ANSWER to the run's recorded open question (issue #98); returns (state, answered)."""
+    """Apply a pushed LMER_ANSWER to the run's question stop (issue #98); returns (state, answered)."""
     # Resume-on-answer: a pushed answer (LMER_ANSWER, set by
-    # `lmer --answer "<text>"` on the host) to the run's recorded open
-    # question is applied BEFORE deciding, so the brief leads with the
-    # answered pair instead of the stale question block. Fail-soft: a
-    # problem applying it degrades to the plain brief, never a failure.
-    # Consume-once: _answer_marker_path guards against the container-lived
-    # env var replaying into a later question (review on !126).
+    # `lmer --answer "<text>"` on the host) to the run's open question is
+    # applied BEFORE deciding, so the brief leads with the answered pair
+    # instead of the stale question block. Fail-soft: a problem applying it
+    # degrades to the plain brief, never a failure. Consume-once:
+    # _answer_marker_path guards against the container-lived env var
+    # replaying into a later question (review on !126).
+    #
+    # The question stop is the trigger, not the recorded text (T24): a run
+    # that stopped with `--stop-reason=question` and no `--question` is the
+    # common shape, and requiring the text meant the answer was silently
+    # dropped for exactly those runs — no event, stop still standing.
     answered = None
     answer = (os.environ.get("LMER_ANSWER") or "").strip()
     if (
         answer
         and state.get("stop_reason") == "question"
-        and state.get("open_question")
         and not _answer_marker_path(answer).exists()
     ):
         try:
@@ -3243,7 +3288,15 @@ def cmd_session_end() -> int:
         specs_rel = specs_index.specs_rel_path()
         if specs_rel and specs_rel not in rels:
             rels.append(specs_rel)
-        rc = commit_work_path(rels, f"run-state: session end {state['slug']}")
+        # The one durability push that does NOT defer to an in-flight gate
+        # (issue #201): the session and its container are going away, so the
+        # gate whose window a deferral would protect is being torn down with
+        # them — and a deferral here has no later commit to flush it.
+        rc = commit_work_path(
+            rels,
+            f"run-state: session end {state['slug']}",
+            allow_during_gate=True,
+        )
         if rc != 0:
             print("⚠️  Warning: run-state push failed at session end (state saved locally)")
     except Exception as exc:
@@ -3251,8 +3304,111 @@ def cmd_session_end() -> int:
     return 0
 
 
+def _write_intent_rel_paths(args) -> list[str] | None:
+    """The work-repo-relative paths this invocation may write; None if read-only.
+
+    Feeds the write-attribution journal (issue #233), so precision here is
+    about the *scope* a command may touch, not which file each one actually
+    wrote: the leak guard excuses drift at prefix granularity, and one honest
+    `work log` already attributes the whole run dir for the suite's window.
+    Commands whose writes land somewhere this map does not know about are
+    simply not excused — the guard then treats their drift exactly as it did
+    before the journal existed. `commit` is deliberately absent: commits
+    defer around a live gate (issue #201) rather than being attributed.
+    """
+    command = args.command
+
+    def run_candidates() -> list[str]:
+        try:
+            return list(run_state.run_rel_path_candidates())
+        except Exception:
+            return []
+
+    if command == "log":
+        return None if args.message is None else run_candidates()
+    if command == "goal":
+        return None if args.description is None else run_candidates()
+    if command == "name":
+        return None if args.value is None else run_candidates()
+    if command in ("event", "answer", "verify", "report",
+                   "session-start", "session-end"):
+        return run_candidates()
+    if command == "release":
+        action = getattr(args, "release_action", None)
+        if action in ("claim", "unclaim", "abort", "record"):
+            return run_candidates()
+        return None
+    if command in ("state", "ledger"):
+        return run_candidates() if getattr(args, "action", None) == "set" else None
+    if command == "goals":
+        action = getattr(args, "goals_action", None)
+        return run_candidates() if action in ("freeze", "amend", "assess") else None
+    if command == "artifact":
+        rels = run_candidates()
+        specs_rel = specs_index.specs_rel_path()
+        if specs_rel:
+            rels.append(specs_rel)
+        return rels
+    if command == "specs-index":
+        if not getattr(args, "rebuild", False):
+            return None
+        specs_rel = specs_index.specs_rel_path()
+        return [specs_rel] if specs_rel else []
+    if command == "seed":
+        try:
+            slug = run_state.derive_slug(args.taskdef, args.target)
+            rel = run_state.run_rel_for_dir_name(slug)
+            return [rel] if rel else []
+        except Exception:
+            return []
+    if command == "memory":
+        if getattr(args, "memory_action", None) != "persist":
+            return None
+        host = os.environ.get("LMER_REPO_HOST")
+        project = os.environ.get("LMER_REPO_PROJECT")
+        return [f"{host}/{project}/memory"] if host and project else []
+    return None
+
+
+def _journal_write_intent(args) -> None:
+    """Journal a write-shaped invocation while a gate/suite is in flight (#233).
+
+    An EMPTY scope is nothing-to-journal, not a record with no paths: a
+    write-shaped command that cannot name any work-repo path has no run
+    context (`run_rel_path_candidates()` came back empty), so it cannot
+    address the operational repo and will error before writing. Journaling it
+    anyway would hand the leak guard a record whose ancestry can be blamed
+    while there is nothing the record could have written — the suite's own
+    no-context CLI tests produce exactly that shape in-process (MR !200
+    review, critical finding).
+
+    Fail-soft in the gate_lock spirit: nothing here may change the command's
+    behavior or exit code — an unjournaled write only means the leak guard
+    cannot excuse it, which is the pre-#233 status quo.
+    """
+    try:
+        rel_paths = _write_intent_rel_paths(args)
+        if not rel_paths:
+            return
+        write_journal.record_write_intent(args.command, rel_paths)
+    except Exception:
+        pass
+
+
 def main() -> int:
-    """Main entry point for work CLI."""
+    """Main entry point for work CLI.
+
+    The write-intent journal is written TWICE around dispatch (issue #233).
+    Before, because a test-descendant invocation must be blamed whether or
+    not its write survived validation; after, because a command can move the
+    very paths it declared — `work goals freeze` and the lazy rename behind
+    `work name` rename the run dir mid-command, and only a post-dispatch
+    reading of `run_rel_path_candidates()` sees BOTH addresses, which is what
+    lets the suite's guard tell that rename from a test deleting run-dir
+    files. Journaling only before left the last write of a renaming session
+    declaring the old address alone, and the run failed on its own rename
+    (MR !200 review round 3).
+    """
     parser = create_parser()
     args = parser.parse_args()
 
@@ -3260,6 +3416,15 @@ def main() -> int:
         parser.print_help()
         return 1
 
+    _journal_write_intent(args)
+    try:
+        return _dispatch(args, parser)
+    finally:
+        _journal_write_intent(args)
+
+
+def _dispatch(args, parser) -> int:
+    """Route a parsed invocation to its handler."""
     if args.command == "read-project-info":
         return cmd_read_project_info()
     elif args.command == "log":

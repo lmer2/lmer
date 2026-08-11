@@ -20,7 +20,12 @@ security boundary; see :class:`lmer_cli.harness.ExecProfile`).
 Child environment: parent env, overlaid with the agent's preset ``env``,
 overlaid with ``--env KEY=VAL`` pairs (last wins). ``LMER_AGENTS`` /
 ``LMER_AGENTS_CONFIG`` are stripped from the child so children cannot fan
-out further (no grandchildren, structurally). The agent's own overlay
+out further (no grandchildren, structurally), and
+``LMER_NONINTERACTIVE=1`` is set on every child. The rule the marker stands
+for is delivered in-band, at the head of the child's prompt
+(:data:`NONINTERACTIVE_NOTICE`), so a child reports a gate-worthy problem
+instead of ending its turn on an unanswerable approval question whatever
+harness it runs on (issue #137). The agent's own overlay
 selects the harness (its ``LMER_HARNESS``, else the model hint from its
 ``LMER_LLM_NAME``, else the session's inherited harness — see
 :func:`lmer_cli.harness.implied_harness_name`), and the effective child
@@ -57,6 +62,7 @@ from typing import Dict, Optional
 from lmer_cli.harness import (
     HARNESS_ENV,
     LLM_NAME_ENV,
+    NONINTERACTIVE_ENV,
     Harness,
     build_exec_argv,
     harness_for_model,
@@ -84,6 +90,26 @@ STDERR_TAIL_LINES = 40
 #: ("no findings", 11 characters) must survive, so the floor only catches
 #: stubs like "ok" or "n/a" (issue #139).
 DEGENERATE_MIN_CHARS = 10
+
+#: In-band non-interactive notice, prepended to every child prompt.
+#:
+#: :data:`~lmer_cli.harness.NONINTERACTIVE_ENV` marks the child *process*, but
+#: an environment variable reaches no model on its own — and the ``AGENTS.md``
+#: rule it keys on does not reach every child either: a claude child execs the
+#: binary directly with no runner script, and Claude Code discovers only
+#: ``CLAUDE.md`` natively, so nothing appends ``AGENTS.md`` to its system
+#: prompt (``libexec/claude-runner.sh`` does that for full sessions). Session
+#: launches get the same text from the ``prompts/non-interactive.md`` fragment;
+#: children get it here, in the one channel every harness reads the same way
+#: (issue #137).
+NONINTERACTIVE_NOTICE = (
+    "[non-interactive session] No human is attached to this run and nobody "
+    "can answer a question. Do not end your turn asking for approval or "
+    "confirmation: if a gate would stop you for approval you were not already "
+    "given, state in your final output what you would have asked, why you "
+    "stopped, and what you completed — and do not perform the gated action "
+    "either. Approval the prompt below already carries is still approval."
+)
 
 
 def _fail(message: str) -> "SystemExit":
@@ -151,12 +177,23 @@ def build_child_env(
 
     The fan-out variables are stripped so a child cannot spawn further
     children — the no-grandchildren rule is structural, not advisory.
+
+    ``LMER_NONINTERACTIVE`` is set last, so neither the preset overlay nor an
+    ``--env`` pair can unset it: a child harness process has no human attached
+    by construction (issue #137). The variable declares the fact to anything
+    the child itself spawns or shells out to; what steers the child's *own*
+    agent is :data:`NONINTERACTIVE_NOTICE`, carried in the prompt, because no
+    environment value reaches a model's context on its own. A child that ends
+    its turn on ``Shall I proceed? (yes/no)`` exits 0 with a near-empty output
+    file, so the orchestrator consolidates from N-1 agents with nothing to
+    show it lost one.
     """
     child = dict(parent_env)
     child.update(agent_env)
     child.update(extra_env)
     child.pop(AGENTS_ENV, None)
     child.pop(AGENTS_CONFIG_ENV, None)
+    child[NONINTERACTIVE_ENV] = "1"
     return child
 
 
@@ -292,12 +329,18 @@ def resolve_prompt(ns: argparse.Namespace, agent: dict) -> str:
     or used alone when the caller supplies none — a canned persona can be a
     complete task. An empty caller prompt (or none at all with no preamble)
     fails loudly.
+
+    :data:`NONINTERACTIVE_NOTICE` leads the result, ahead of the preset's own
+    preamble: the prompt is the only channel every harness reads identically,
+    so it is where the "nobody can answer you" rule is guaranteed to land
+    (issue #137). Emptiness is judged on the caller's and preset's text alone —
+    the notice never turns an empty prompt into a valid one.
     """
     preamble = agent.get("prompt", "")
     if ns.prompt is None and ns.prompt_file is None:
         if not preamble.strip():
             raise _fail("A prompt is required: --prompt or --prompt-file")
-        return preamble
+        return f"{NONINTERACTIVE_NOTICE}\n\n{preamble}"
     if ns.prompt_file is not None:
         try:
             with open(ns.prompt_file) as handle:
@@ -309,8 +352,8 @@ def resolve_prompt(ns: argparse.Namespace, agent: dict) -> str:
     if not prompt.strip():
         raise _fail("The prompt is empty")
     if preamble.strip():
-        return f"{preamble}\n\n{prompt}"
-    return prompt
+        prompt = f"{preamble}\n\n{prompt}"
+    return f"{NONINTERACTIVE_NOTICE}\n\n{prompt}"
 
 
 def _pump_stderr(stream, tail: "deque") -> None:

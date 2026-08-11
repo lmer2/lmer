@@ -74,6 +74,38 @@ class TestWorkRepoLeakGuardHelper:
         assert any("tracked.txt" in line and not line.startswith("??")
                    for line in leaked)
 
+    def test_non_ascii_paths_snapshot_unquoted_and_parse(self, tmp_path):
+        """`quotePath=false` keeps non-ASCII paths literal rather than
+        octal-escaped. The decoder handles the escaped form too, so this is
+        not the only thing standing between an accented session artifact and
+        a false whole-run failure — it keeps the common case exact, and the
+        raw bytes it produces are what `errors="surrogateescape"` above then
+        has to survive."""
+        from tests.conftest import porcelain_entry_path
+
+        _git(tmp_path, "init", "-q")
+        (tmp_path / "résumé.md").write_text("x\n")
+        lines = _work_repo_status_lines(tmp_path)
+        entry = next(line for line in lines if "sum" in line)
+        assert entry == "?? résumé.md"
+        assert porcelain_entry_path(entry) == "résumé.md"
+
+    def test_a_non_utf8_filename_does_not_disarm_the_snapshot(self, tmp_path):
+        """With quotePath=false git emits raw bytes, so one undecodable name
+        used to raise UnicodeDecodeError → None → "no work repo to guard",
+        silently skipping the entire run including the blame path. Every
+        other degradation here fails loud (MR !200 review round 2)."""
+        _git(tmp_path, "init", "-q")
+        (tmp_path / "ordinary.md").write_text("x\n")
+        try:
+            with open(bytes(tmp_path) + b"/bad\xffname.md", "wb") as fh:
+                fh.write(b"x")
+        except OSError:
+            pytest.skip("filesystem rejects non-UTF-8 filenames")
+        lines = _work_repo_status_lines(tmp_path)
+        assert lines is not None, "one odd filename must not disarm the guard"
+        assert any("ordinary.md" in line for line in lines)
+
     def test_sees_new_file_inside_already_untracked_dir(self, tmp_path):
         # Without --untracked-files=all, porcelain collapses untracked
         # dirs to one "?? runs/" line and a new file inside one would not
@@ -124,11 +156,29 @@ class TestIsolationFixtureSourceGuard:
             "vars (issue #93)."
         )
 
+    def test_conftest_explains_an_outdated_tree_instead_of_a_bare_importerror(self):
+        """On a pre-#233 image a bare `pytest` resolves lmer from the
+        operational install, which lacks write_journal — the failure must say
+        the image is outdated (and how to run the suite anyway), not surface
+        a bare ImportError (or a TypeError from fixture setup for the
+        gate_lock signature half of the same skew)."""
+        source = (TESTS_DIR / "conftest.py").read_text()
+        assert re.search(
+            r"except ImportError.*\n\s*raise ImportError\(_OUTDATED_TREE_MSG\)",
+            source,
+        ), "conftest.py must wrap the write_journal import in the outdated-tree guard"
+        assert "inspect.signature(gate_lock.hold_gate_lock).parameters" in source, (
+            "conftest.py must also catch a pre-#233 gate_lock (signature skew)"
+        )
+        assert "gate-check" in source and "#198" in source, (
+            "the outdated-tree message must say how to run the suite and why"
+        )
+
     def test_conftest_keeps_leak_guard(self):
         source = (TESTS_DIR / "conftest.py").read_text()
         assert re.search(
             r'@pytest\.fixture\(autouse=True, scope="session"\)\s*\n'
-            r"def _work_repo_leak_guard\(\):",
+            r"def _work_repo_leak_guard\(_isolate_gate_lock_dir\):",
             source,
         ), (
             "tests/conftest.py must keep the session-scoped "

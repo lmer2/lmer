@@ -10,6 +10,8 @@ from hooks.start import (
     main,
     read_and_display_instructions,
     check_task_context,
+    configured_taskdef_root,
+    detect_shadowed_taskdefs,
     _is_github_host,
     _redact_url_credentials,
     _target_provider_flags,
@@ -322,6 +324,27 @@ class TestTargetProviderFlags:
             assert "use gitlab-review" not in output
 
 
+class TestSupportedTaskdefSchemasMirror:
+    """Guard against drift between hooks/start.py and the sources module.
+
+    lmer_cli.container.sources surfaces SUPPORTED_TASKDEF_SCHEMAS in its
+    `doctor` document as a module-local mirror of this file's constant:
+    importing hooks/start.py from there is banned (start.py hard-imports
+    yaml and jinja2 at module scope, which would break the sources module's
+    import-cleanly-without-PyYAML contract). Same drift-guard idea as
+    test_is_github_host_body_matches_canonical above — an edit to either
+    constant must fail here until the other side is updated.
+    """
+
+    def test_sources_module_mirror_matches_canonical(self):
+        from hooks.start import SUPPORTED_TASKDEF_SCHEMAS as canonical
+        from lmer_cli.container.sources import (
+            SUPPORTED_TASKDEF_SCHEMAS as mirrored,
+        )
+
+        assert mirrored == canonical
+
+
 class TestRedactUrlCredentials:
     """The /start task-context banner must not leak clone-URL credentials."""
 
@@ -622,6 +645,321 @@ class TestTaskdefSchemaVersioning:
         root, schema = check_taskdef_schema(taskdef / "instructions.txt")
         assert root == tmp_path
         assert schema == 2
+
+
+def _mk_taskdef(root, name):
+    """Create <root>/<name>/instructions.txt (the marker of a taskdef)."""
+    d = root / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "instructions.txt").write_text("# x\n")
+    return d
+
+
+class TestShadowDetection:
+    """detect_shadowed_taskdefs(): configured-taskdef-repo shadow warnings.
+
+    The configured repo tier is identified as the LAST LMER_TASKDEF_PATHS
+    entry, gated on LMER_TASKDEF_REPO being non-empty (cli.py appends the
+    container clone path as the final PATHS entry when a repo is set).
+    Detection is read-only and must stay silent for legacy sessions.
+    """
+
+    REPO_URL = "https://git.example.com/org/taskdefs.git"
+
+    def _configure(self, monkeypatch, tmp_path, before=()):
+        """Set up a configured taskdef repo root, optionally preceded by
+        external PATHS entries, and return the root."""
+        root = tmp_path / "taskdef-repo"
+        root.mkdir(exist_ok=True)
+        entries = [*before, root]
+        monkeypatch.setenv("LMER_TASKDEF_REPO", self.REPO_URL)
+        monkeypatch.setenv(
+            "LMER_TASKDEF_PATHS", ":".join(str(p) for p in entries)
+        )
+        return root
+
+    def _work_repo(self, monkeypatch, tmp_path, project=False):
+        """Create a work repo with global (and optionally project) taskdef
+        tiers; return (project_dir_or_None, global_dir)."""
+        work = tmp_path / "work"
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        global_dir = work / "taskdef"
+        global_dir.mkdir(parents=True)
+        project_dir = None
+        if project:
+            monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+            monkeypatch.setenv("LMER_REPO_PROJECT", "group/proj")
+            project_dir = work / "git.example.com" / "group/proj" / "taskdef"
+            project_dir.mkdir(parents=True)
+        return project_dir, global_dir
+
+    # ── Configured-root identification ──────────────────────────────
+
+    def test_unconfigured_returns_none_and_empty(self, monkeypatch, tmp_path):
+        """Legacy sessions (no LMER_TASKDEF_REPO) get no detection at all,
+        even when PATHS entries and work-repo tiers are present."""
+        ext = tmp_path / "ext"
+        _mk_taskdef(ext, "develop")
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(ext))
+        self._work_repo(monkeypatch, tmp_path)
+        assert configured_taskdef_root() is None
+        assert detect_shadowed_taskdefs() == []
+
+    def test_repo_configured_but_no_paths_is_silent(self, monkeypatch):
+        monkeypatch.setenv("LMER_TASKDEF_REPO", self.REPO_URL)
+        monkeypatch.delenv("LMER_TASKDEF_PATHS", raising=False)
+        assert configured_taskdef_root() is None
+        assert detect_shadowed_taskdefs() == []
+
+    def test_root_is_last_paths_entry(self, monkeypatch, tmp_path):
+        ext = tmp_path / "ext"
+        ext.mkdir()
+        root = self._configure(monkeypatch, tmp_path, before=[ext])
+        assert configured_taskdef_root() == root
+
+    # ── Each tier shadowing a name individually ─────────────────────
+
+    def test_project_tier_shadow(self, monkeypatch, tmp_path):
+        root = self._configure(monkeypatch, tmp_path)
+        project_dir, _ = self._work_repo(monkeypatch, tmp_path, project=True)
+        _mk_taskdef(root, "develop")
+        _mk_taskdef(project_dir, "develop")
+        assert detect_shadowed_taskdefs() == [
+            ("develop", project_dir, "work-repo project tier")
+        ]
+
+    def test_global_tier_shadow(self, monkeypatch, tmp_path):
+        root = self._configure(monkeypatch, tmp_path)
+        _, global_dir = self._work_repo(monkeypatch, tmp_path)
+        _mk_taskdef(root, "develop")
+        _mk_taskdef(global_dir, "develop")
+        assert detect_shadowed_taskdefs() == [
+            ("develop", global_dir, "work-repo global tier")
+        ]
+
+    def test_earlier_paths_entry_shadow_label_includes_path(
+        self, monkeypatch, tmp_path
+    ):
+        ext = tmp_path / "ext"
+        root = self._configure(monkeypatch, tmp_path, before=[ext])
+        _mk_taskdef(root, "develop")
+        _mk_taskdef(ext, "develop")
+        assert detect_shadowed_taskdefs() == [
+            ("develop", ext, f"LMER_TASKDEF_PATHS entry {ext}")
+        ]
+
+    # ── Aggregation and precedence ───────────────────────────────────
+
+    def test_multiple_shadowed_names_reported(self, monkeypatch, tmp_path):
+        ext = tmp_path / "ext"
+        root = self._configure(monkeypatch, tmp_path, before=[ext])
+        _, global_dir = self._work_repo(monkeypatch, tmp_path)
+        for name in ("develop", "review", "chat"):
+            _mk_taskdef(root, name)
+        _mk_taskdef(ext, "develop")
+        _mk_taskdef(global_dir, "review")
+        assert detect_shadowed_taskdefs() == [
+            ("develop", ext, f"LMER_TASKDEF_PATHS entry {ext}"),
+            ("review", global_dir, "work-repo global tier"),
+        ]
+
+    def test_name_only_in_configured_root_not_reported(
+        self, monkeypatch, tmp_path
+    ):
+        root = self._configure(monkeypatch, tmp_path)
+        _, global_dir = self._work_repo(monkeypatch, tmp_path)
+        _mk_taskdef(root, "develop")
+        _mk_taskdef(root, "unshadowed")
+        _mk_taskdef(global_dir, "develop")
+        result = detect_shadowed_taskdefs()
+        assert [name for name, _, _ in result] == ["develop"]
+
+    def test_project_tier_wins_over_global_and_paths_entry(
+        self, monkeypatch, tmp_path
+    ):
+        """When several tiers shadow the same name, only the highest-
+        precedence winner is reported (first match in search order)."""
+        ext = tmp_path / "ext"
+        root = self._configure(monkeypatch, tmp_path, before=[ext])
+        project_dir, global_dir = self._work_repo(
+            monkeypatch, tmp_path, project=True
+        )
+        _mk_taskdef(root, "develop")
+        _mk_taskdef(ext, "develop")
+        _mk_taskdef(global_dir, "develop")
+        _mk_taskdef(project_dir, "develop")
+        assert detect_shadowed_taskdefs() == [
+            ("develop", project_dir, "work-repo project tier")
+        ]
+
+    def test_paths_entry_after_root_is_not_a_shadow(
+        self, monkeypatch, tmp_path
+    ):
+        """Only entries PRECEDING the configured root count. With today's
+        cli.py propagation the repo tier is always the last PATHS entry, so
+        the root is passed explicitly here to pin the precede-only contract
+        for any future identification change (e.g. sources.yaml naming the
+        root directly)."""
+        before = tmp_path / "before"
+        after = tmp_path / "after"
+        root = tmp_path / "taskdef-repo"
+        root.mkdir()
+        monkeypatch.setenv(
+            "LMER_TASKDEF_PATHS", f"{before}:{root}:{after}"
+        )
+        _mk_taskdef(root, "develop")
+        _mk_taskdef(root, "review")
+        _mk_taskdef(after, "develop")   # after the root: never a shadow
+        _mk_taskdef(before, "review")   # before the root: reported
+        result = detect_shadowed_taskdefs(configured_root=root)
+        assert result == [
+            ("review", before, f"LMER_TASKDEF_PATHS entry {before}")
+        ]
+        assert all(d != after for _, d, _ in result)
+
+
+class TestShadowWarningEmission:
+    """/start end-to-end: shadow warnings in the session output.
+
+    Contract (plan task 14): one ``⚠️  TASKDEF SHADOW: taskdef '<name>' in
+    the configured taskdef repo is shadowed by <tier label>`` line per
+    shadowed name, emitted after the 📍 Location line and before the
+    ``taskdef source:`` banner — between the task-context block and the
+    rendered instructions, where it cannot be missed. Advisory only:
+    rendering is unaffected and legacy sessions (no LMER_TASKDEF_REPO)
+    print zero new output.
+    """
+
+    REPO_URL = "https://git.example.com/org/taskdefs.git"
+
+    def _run_start(self, tmp_path):
+        """Run the full /start flow (main()) and return captured stdout."""
+        with patch("hooks.start.Path.home", return_value=tmp_path), \
+                patch("hooks.start.run_state_session_start", return_value=""), \
+                patch("sys.argv", ["start.py"]):
+            f = io.StringIO()
+            with redirect_stdout(f):
+                main()
+        return f.getvalue()
+
+    def _configure_repo(self, monkeypatch, tmp_path, before=()):
+        """Configured taskdef repo carrying 'develop', active as LMER_TASK."""
+        root = tmp_path / "taskdef-repo"
+        root.mkdir(exist_ok=True)
+        entries = [*before, root]
+        monkeypatch.setenv("LMER_TASKDEF_REPO", self.REPO_URL)
+        monkeypatch.setenv(
+            "LMER_TASKDEF_PATHS", ":".join(str(p) for p in entries)
+        )
+        monkeypatch.setenv("LMER_TASK", "develop")
+        _mk_taskdef(root, "develop")
+        return root
+
+    @staticmethod
+    def _warning_lines(output):
+        return [l for l in output.splitlines() if "TASKDEF SHADOW" in l]
+
+    def test_project_tier_shadow_warns_with_placement(
+        self, monkeypatch, tmp_path
+    ):
+        self._configure_repo(monkeypatch, tmp_path)
+        work = tmp_path / "work"
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "group/proj")
+        project_dir = work / "git.example.com" / "group/proj" / "taskdef"
+        _mk_taskdef(project_dir, "develop")
+
+        out = self._run_start(tmp_path)
+        assert self._warning_lines(out) == [
+            "⚠️  TASKDEF SHADOW: taskdef 'develop' in the configured "
+            "taskdef repo is shadowed by work-repo project tier"
+        ]
+        # Placement: after the Location line, before the source banner.
+        assert (
+            out.index("📍 Location:")
+            < out.index("TASKDEF SHADOW")
+            < out.index("taskdef source:")
+        )
+        # Advisory only: the shadowing copy still renders, /start succeeds.
+        assert "✅ Task instructions loaded" in out
+
+    def test_global_tier_shadow_warns(self, monkeypatch, tmp_path):
+        self._configure_repo(monkeypatch, tmp_path)
+        work = tmp_path / "work"
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        _mk_taskdef(work / "taskdef", "develop")
+
+        out = self._run_start(tmp_path)
+        assert self._warning_lines(out) == [
+            "⚠️  TASKDEF SHADOW: taskdef 'develop' in the configured "
+            "taskdef repo is shadowed by work-repo global tier"
+        ]
+        assert "✅ Task instructions loaded" in out
+
+    def test_earlier_paths_entry_shadow_warns(self, monkeypatch, tmp_path):
+        ext = tmp_path / "ext"
+        self._configure_repo(monkeypatch, tmp_path, before=[ext])
+        _mk_taskdef(ext, "develop")
+
+        out = self._run_start(tmp_path)
+        assert self._warning_lines(out) == [
+            "⚠️  TASKDEF SHADOW: taskdef 'develop' in the configured "
+            f"taskdef repo is shadowed by LMER_TASKDEF_PATHS entry {ext}"
+        ]
+        assert "✅ Task instructions loaded" in out
+
+    def test_one_line_per_shadowed_name(self, monkeypatch, tmp_path):
+        ext = tmp_path / "ext"
+        root = self._configure_repo(monkeypatch, tmp_path, before=[ext])
+        _mk_taskdef(root, "review")
+        work = tmp_path / "work"
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        _mk_taskdef(ext, "develop")
+        _mk_taskdef(work / "taskdef", "review")
+
+        out = self._run_start(tmp_path)
+        assert self._warning_lines(out) == [
+            "⚠️  TASKDEF SHADOW: taskdef 'develop' in the configured "
+            f"taskdef repo is shadowed by LMER_TASKDEF_PATHS entry {ext}",
+            "⚠️  TASKDEF SHADOW: taskdef 'review' in the configured "
+            "taskdef repo is shadowed by work-repo global tier",
+        ]
+
+    def test_configured_repo_without_shadows_prints_no_warnings(
+        self, monkeypatch, tmp_path
+    ):
+        root = self._configure_repo(monkeypatch, tmp_path)
+        _mk_taskdef(root, "review")
+        work = tmp_path / "work"
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        _mk_taskdef(work / "taskdef", "unrelated")
+
+        out = self._run_start(tmp_path)
+        assert self._warning_lines(out) == []
+        assert "✅ Task instructions loaded" in out
+
+    def test_legacy_mode_prints_zero_new_output(self, monkeypatch, tmp_path):
+        """Backward compat: with LMER_TASKDEF_REPO unset the /start output
+        is byte-identical to a run with the warning path disabled — the
+        feature adds ZERO output for legacy sessions, even with PATHS
+        entries and a work-repo tier carrying overlapping names."""
+        ext = tmp_path / "ext"
+        _mk_taskdef(ext, "develop")
+        monkeypatch.delenv("LMER_TASKDEF_REPO", raising=False)
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(ext))
+        monkeypatch.setenv("LMER_TASK", "develop")
+        work = tmp_path / "work"
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        _mk_taskdef(work / "taskdef", "develop")
+
+        out = self._run_start(tmp_path)
+        assert "TASKDEF SHADOW" not in out
+        with patch(
+            "hooks.start.taskdef_shadow_warning_lines", return_value=[]
+        ):
+            baseline = self._run_start(tmp_path)
+        assert out == baseline
 
 
 class TestBlockLint:

@@ -16,6 +16,12 @@ from lmer_cli import user_harnesses
 from lmer_cli.harness import get_harness
 from lmer_cli.runtime import _is_selinux_enforcing
 
+# The container's URL→mirror mapping, reused verbatim so the host's per-mirror
+# binds land exactly where the container's own lookup will search for them
+# (the same reuse lmer_cli.clone_cache makes; the container module imports
+# nothing from lmer_cli, so this direction is the safe one).
+from lmer_cli.container.clone_and_exec import _mirror_path
+
 EXTERNAL_TASKDEF_MOUNT_BASE = "/Agents/taskdefs"
 
 # Path inside the container where uv looks for its cache by default
@@ -423,6 +429,39 @@ class FileMountSpec(NamedTuple):
     mode: str = "ro"
 
 
+class DirMountSpec(NamedTuple):
+    """A single host-directory → container-destination bind mount.
+
+    The directory counterpart of :class:`FileMountSpec`, produced by
+    ``cli.parse_dir_mount_specs`` (which owns all validation): by the time a
+    spec exists, ``host`` is an existing *directory*, ``container`` is an
+    absolute path, and ``mode`` is ``ro`` or ``rw``.
+
+    A separate type rather than a ``kind`` field on ``FileMountSpec`` because
+    the two are validated against different host predicates, and mixing them
+    in one list is how a directory eventually reaches the file validator.
+    """
+
+    host: Path
+    container: str
+    mode: str = "ro"
+
+
+def _build_bind_mounts(runtime: str, specs: Iterable) -> List[str]:
+    """``-v host:container:mode`` per spec, with the SELinux label when needed.
+
+    Shared body of :func:`build_file_mounts` and :func:`build_dir_mounts`:
+    Docker and Podman need no distinction between binding a file and binding a
+    directory, so the arg shape is written once — two copies would let the
+    SELinux labeling drift between the two flags.
+    """
+    se = selinux_opt(runtime)
+    args: List[str] = []
+    for spec in specs:
+        args += ["-v", f"{spec.host}:{spec.container}:{spec.mode}{se}"]
+    return args
+
+
 def build_file_mounts(runtime: str, specs: Iterable[FileMountSpec]) -> List[str]:
     """
     Build volume mounts for explicit per-file mounts (--mount-file).
@@ -438,11 +477,33 @@ def build_file_mounts(runtime: str, specs: Iterable[FileMountSpec]) -> List[str]
     Returns:
         List of Docker/Podman arguments for the file mounts
     """
-    se = selinux_opt(runtime)
-    args: List[str] = []
-    for spec in specs:
-        args += ["-v", f"{spec.host}:{spec.container}:{spec.mode}{se}"]
-    return args
+    return _build_bind_mounts(runtime, specs)
+
+
+def build_dir_mounts(runtime: str, specs: Iterable[DirMountSpec]) -> List[str]:
+    """
+    Build volume mounts for explicit per-directory mounts (--mount-dir).
+
+    Bind-mounts each host directory at its container destination, ``ro``
+    unless the spec asks for ``rw``. Mounted as-is, never copied, exactly like
+    :func:`build_file_mounts`.
+
+    Two consequences of binding a *directory* the caller should know, since
+    neither is visible in the arg: the mount **shadows** whatever the image
+    has at that destination (the container sees the host tree, not the baked
+    one), and an ``rw`` mount is writable by the container user — which only
+    works when that uid can write the host directory (rootless Podman's
+    ``--userns=keep-id`` and the image's ``BUILD_UID`` are what make that hold
+    for the usual single-user install).
+
+    Args:
+        runtime: Container runtime ('docker' or 'podman')
+        specs: Validated directory-mount specs
+
+    Returns:
+        List of Docker/Podman arguments for the directory mounts
+    """
+    return _build_bind_mounts(runtime, specs)
 
 
 def _find_container_socket(runtime: str) -> Optional[Path]:
@@ -576,9 +637,14 @@ def resolve_host_clone_cache_dir() -> Path:
       (`cache:/clone-cache:ro`) would be read by Docker/Podman as a *named
       volume* while the host-side updater created and populated a real
       `./cache` directory — the container would never see the mirrors.
-    - An obviously **broad root** (`/`, `$HOME`) is refused: the whole cache
-      root is bind-mounted into the container, so pointing it at a home
-      directory would mount that entire tree (read-only, but readable).
+    - An obviously **broad root** (`/`, `$HOME`) is refused. Since #135 the
+      container never sees the root itself — only the individual mirrors a
+      launch needs — so this is no longer a confidentiality guard; it is a
+      guard on the *host* side of the feature: the updater creates
+      `<host>/<group>/<project>.git` mirror trees directly under this path,
+      and a home directory (let alone `/`) is not a directory to scatter
+      those through, nor one where a mirror-shaped path is guaranteed not to
+      collide with real content.
 
     Either case warns and falls back to the default, which is always safe:
     a fresh cache costs one direct clone, never correctness.
@@ -608,29 +674,110 @@ def resolve_host_clone_cache_dir() -> Path:
     return candidate
 
 
-def build_clone_cache_mount(runtime: str, host_cache_dir: Path) -> List[str]:
+def plan_clone_cache_mirror_mounts(
+    host_cache_dir: Path, repo_urls: Iterable[Optional[str]]
+) -> List[Tuple[Path, str]]:
     """
-    Build the read-only mount for the persistent git clone cache.
+    Resolve a launch's repo URLs to the cache mirrors it may borrow from.
 
-    Mounts the host cache directory at the container's fixed clone-cache
-    location so the container's clone script (clone_and_exec.py) can borrow
-    objects from the host-maintained bare mirrors via ``--reference
-    <mirror> --dissociate``. All mirror maintenance is host-side
-    (lmer_cli.clone_cache, forked at launch); the container only ever
-    reads, so the mount is ``:ro`` — a session structurally cannot write a
-    token into, or corrupt, the shared cache. A stale or empty cache is
-    fine: the clone still talks to the real origin and fetches whatever the
-    mirror lacks.
+    Returns ``(host_mirror_path, container_path)`` pairs — one per **existing**
+    mirror, deduplicated, in first-seen order — for the caller to bind-mount.
+    The container path keeps the mirror at the same position under
+    ``/clone-cache`` that the whole-root mount used to give it, so the
+    container's own ``_mirror_path`` lookup finds it unchanged.
+
+    Only mirrors that already exist are returned (issue #135):
+
+    - A mirror the cache has not built yet is simply absent from the list.
+      The container then clones directly while the host-side updater builds
+      the mirror for next time — the cold-cache path, unchanged. The runtime
+      must never be handed a missing bind source: Docker and Podman would
+      create it, root-owned, on the host.
+    - "Exists" means the mirror carries a ``HEAD``, which is the same test
+      the container applies before it will reference a mirror at all — so
+      a directory the cache could never use is not mounted either.
+    - A mirror whose resolved path escapes the cache root (a symlink planted
+      under it) is skipped: with per-mirror binds the symlink is followed
+      **host-side**, so honoring it would mount an arbitrary host directory.
+      A path containing ``:`` is skipped for the same class of reason — the
+      runtime's ``-v`` syntax would mis-split it.
+
+    Deduplication is by mirror path rather than by URL, which also collapses
+    the same repo reached by different URL spellings (the work repo and the
+    napkin repo are frequently one URL, tokenized differently).
+
+    Args:
+        host_cache_dir: Path to the clone-cache root on the host
+        repo_urls: Clone URLs this launch will use (None/empty entries ignored)
+
+    Returns:
+        List of (host mirror path, container mount path) pairs
+    """
+    try:
+        root_resolved = host_cache_dir.resolve()
+    except OSError:
+        return []
+
+    pairs: List[Tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for url in repo_urls:
+        if not url:
+            continue
+        mirror = _mirror_path(host_cache_dir, url)
+        if mirror is None or mirror in seen:
+            continue
+        seen.add(mirror)
+        if ":" in str(mirror):
+            continue
+        try:
+            if not (mirror / "HEAD").is_file():
+                continue
+            if not mirror.resolve().is_relative_to(root_resolved):
+                continue
+            relative = mirror.relative_to(host_cache_dir)
+        except (OSError, ValueError):
+            continue
+        pairs.append((mirror, f"{CONTAINER_CLONE_CACHE_DIR}/{relative.as_posix()}"))
+    return pairs
+
+
+def build_clone_cache_mounts(
+    runtime: str, host_cache_dir: Path, repo_urls: Iterable[Optional[str]]
+) -> Tuple[List[str], List[Tuple[Path, str]]]:
+    """
+    Build the read-only mounts for the persistent git clone cache.
+
+    Mounts **only the mirrors this launch needs** — one bind per repo it is
+    about to clone — at their usual place under the container's fixed
+    clone-cache location, so the container's clone script
+    (clone_and_exec.py) can borrow objects from the host-maintained bare
+    mirrors via ``--reference <mirror> --dissociate``. Mounting the cache
+    *root* instead (what lmer did before issue #135) handed every session
+    the full history of every repo the user had ever cached, including
+    private repos that session was never given credentials for; ``:ro``
+    protects the cache's integrity, not its confidentiality.
+
+    All mirror maintenance stays host-side (lmer_cli.clone_cache, forked at
+    launch); the container only ever reads, so each mount is ``:ro`` — a
+    session structurally cannot write a token into, or corrupt, the shared
+    cache. A stale or missing mirror is fine: the clone still talks to the
+    real origin and fetches whatever the mirror lacks.
 
     Args:
         runtime: Container runtime ('docker' or 'podman')
-        host_cache_dir: Path to the clone-cache directory on the host
+        host_cache_dir: Path to the clone-cache root on the host
+        repo_urls: Clone URLs this launch will use (None/empty entries ignored)
 
     Returns:
-        List of Docker/Podman arguments for the clone cache mount
+        (Docker/Podman arguments, the (host, container) pairs they mount) —
+        both empty when no mirror for this launch exists yet
     """
     se = selinux_opt(runtime)
-    return ["-v", f"{host_cache_dir}:{CONTAINER_CLONE_CACHE_DIR}:ro{se}"]
+    pairs = plan_clone_cache_mirror_mounts(host_cache_dir, repo_urls)
+    args: List[str] = []
+    for mirror, container_path in pairs:
+        args += ["-v", f"{mirror}:{container_path}:ro{se}"]
+    return args, pairs
 
 
 def build_release_signing_key_mount(

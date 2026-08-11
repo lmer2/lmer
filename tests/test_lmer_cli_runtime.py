@@ -18,7 +18,7 @@ from lmer_cli.runtime import (
     repo_root_path,
     lmer_state_dir,
     base_run_args,
-    env_args,
+    build_container_env,
     _available_controllers,
     _resolve_pids_limit,
     _user_cgroup_controllers_path,
@@ -302,51 +302,85 @@ class TestResolvePidsLimit:
             assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
 
 
-class TestEnvArgs:
-    """Test environment variable arguments"""
+class TestContainerEnv:
+    """The container env transport (issue #158).
 
-    def test_env_args_empty_dict(self):
-        """Test env_args with empty dictionary"""
-        args = env_args({})
-        assert args == []
+    These are the direct successors of the old ``env_args`` cases: the same
+    inputs, now asserted against the env file the transport writes instead of
+    the ``-e NAME=value`` argv pairs it replaced. Transport behaviour beyond
+    this table lives in ``tests/test_container_env_transport.py``.
+    """
 
-    def test_env_args_single_var(self):
-        """Test env_args with single variable"""
-        args = env_args({"FOO": "bar"})
-        assert args == ["-e", "FOO=bar"]
+    def _lines(self, container_env):
+        """The env file's lines, or [] when no file was written."""
+        if container_env.env_file_dir is None:
+            return []
+        path = container_env.env_file_dir / "container.env"
+        return path.read_text(encoding="utf-8").splitlines()
 
-    def test_env_args_multiple_vars(self):
-        """Test env_args with multiple variables"""
-        args = env_args({"FOO": "bar", "BAZ": "qux"})
+    def test_empty_dict_writes_no_file(self):
+        """An empty env dict produces no args and no env file at all."""
+        container_env = build_container_env({})
+        try:
+            assert container_env.args == []
+            assert container_env.env_file_dir is None
+            assert container_env.subprocess_env() is None
+        finally:
+            container_env.cleanup()
 
-        # Order might vary, so check both possibilities
-        assert len(args) == 4
-        assert "-e" in args
-        assert "FOO=bar" in args or "BAZ=qux" in args
+    def test_single_var_rides_the_env_file(self):
+        """A single variable becomes one --env-file line, never argv."""
+        container_env = build_container_env({"FOO": "bar"})
+        try:
+            assert container_env.args[0] == "--env-file"
+            assert self._lines(container_env) == ["FOO=bar"]
+            assert "bar" not in " ".join(container_env.args[1:])
+        finally:
+            container_env.cleanup()
 
-    def test_env_args_skips_none_values(self):
-        """Test env_args skips None values"""
-        args = env_args({"FOO": "bar", "NULL": None, "BAZ": "qux"})
+    def test_multiple_vars_all_ride_one_file(self):
+        """Every variable lands in the same file; only one flag pair is added."""
+        container_env = build_container_env({"FOO": "bar", "BAZ": "qux"})
+        try:
+            assert len(container_env.args) == 2
+            assert sorted(self._lines(container_env)) == ["BAZ=qux", "FOO=bar"]
+        finally:
+            container_env.cleanup()
 
-        assert "-e" in args
-        assert "FOO=bar" in args
-        assert "BAZ=qux" in args
-        assert "NULL" not in " ".join(args)
+    def test_skips_none_values(self):
+        """None values are skipped, exactly as env_args did."""
+        container_env = build_container_env({"FOO": "bar", "NULL": None, "BAZ": "qux"})
+        try:
+            lines = self._lines(container_env)
+            assert "FOO=bar" in lines
+            assert "BAZ=qux" in lines
+            assert not any(line.startswith("NULL") for line in lines)
+        finally:
+            container_env.cleanup()
 
-    def test_env_args_preserves_empty_string(self):
-        """Test env_args preserves empty string values"""
-        args = env_args({"EMPTY": ""})
-        assert args == ["-e", "EMPTY="]
+    def test_preserves_empty_string(self):
+        """An empty value stays a set-but-empty variable."""
+        container_env = build_container_env({"EMPTY": ""})
+        try:
+            assert self._lines(container_env) == ["EMPTY="]
+        finally:
+            container_env.cleanup()
 
-    def test_env_args_handles_special_characters(self):
-        """Test env_args handles special characters"""
-        args = env_args({"PATH": "/usr/bin:/usr/local/bin"})
-        assert args == ["-e", "PATH=/usr/bin:/usr/local/bin"]
+    def test_handles_special_characters(self):
+        """A colon-separated path value survives verbatim."""
+        container_env = build_container_env({"PATH": "/usr/bin:/usr/local/bin"})
+        try:
+            assert self._lines(container_env) == ["PATH=/usr/bin:/usr/local/bin"]
+        finally:
+            container_env.cleanup()
 
-    def test_env_args_handles_numbers(self):
-        """Test env_args handles numeric values"""
-        args = env_args({"PORT": 8080})
-        assert args == ["-e", "PORT=8080"]
+    def test_handles_numbers(self):
+        """Non-string values are stringified, exactly as env_args did."""
+        container_env = build_container_env({"PORT": 8080})
+        try:
+            assert self._lines(container_env) == ["PORT=8080"]
+        finally:
+            container_env.cleanup()
 
 
 class TestAvailableControllers:

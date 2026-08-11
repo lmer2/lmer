@@ -1,5 +1,6 @@
 """Git operations for work repository."""
 
+import json
 import os
 import re
 import subprocess
@@ -8,11 +9,34 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit
 
-from .run_state import run_rel_path_candidates
+# The host classification rule, not a second copy of it: this is the function
+# that decides which provider a hostname belongs to for token lookup, and a forge
+# that reads as GitHub for credentials but GitLab for URLs would be a bug with no
+# symptom until someone clicked. ``lmer_cli.tokens`` costs nothing to import
+# (stdlib only), and ``work_repo.memory`` already reaches into ``lmer_cli`` the
+# same way.
+from lmer_cli.tokens import _is_github_host
+
+# The gate-in-flight marker (issue #201). Same reasoning as the token import
+# above: the decision "is a long gate running right now?" has exactly one
+# definition, and a second copy here would drift from the gates that write it.
+from lmer_cli import gate_lock
+
+from .run_state import append_event, run_dir, run_rel_path_candidates
 from .specs_index import specs_rel_path
 from .utils import sanitize_task_target
 
 PUSH_RETRIES = 3
+
+#: Where a deferred commit parks its trace until a commit can actually land
+#: (issue #201). It lives beside the gate markers in /tmp, NOT in the run dir,
+#: because writing the trace into the work repo is the very thing the deferral
+#: exists to avoid: appending to a currently-clean tracked file adds a porcelain
+#: entry, and the running suite's leak guard would report it as an appearance —
+#: the same failure in a new costume. Flushed into ``events.jsonl`` by the next
+#: commit that is allowed to proceed, so the trace lands *with* the commit that
+#: resolves it and is pushed where the reviewer can see it.
+DEFERRAL_QUEUE_NAME = "deferred-commits.jsonl"
 
 # Outcomes of :func:`claim_push_once` — the claim-by-push compare-and-swap
 # leg (docs/RUN-STATE.md §7). String constants rather than an enum so the
@@ -30,6 +54,28 @@ _NON_FAST_FORWARD_MARKERS = ("[rejected]", "non-fast-forward", "fetch first")
 # collapsing the rest into a "... and N more" line, so a large dirty tree can
 # never flood ``work commit``'s output.
 UNTRACKED_REPORT_CAP = 10
+
+#: The forges whose web path layout is known. Anything else is unknown, and
+#: :func:`forge_web_url` answers None for it — see that function for why a guess
+#: is worse than no link.
+FORGE_GITLAB = "gitlab"
+FORGE_GITHUB = "github"
+
+#: The ONE definition of each forge's blob/tree path shape. GitLab namespaces
+#: repository browsing under ``/-/`` (so a branch called ``blob`` cannot collide
+#: with the route), GitHub does not. A second copy of this map is how one forge
+#: keeps a bug the other one fixed, which is why the platform imports this module
+#: instead of building URLs of its own.
+_FORGE_PATH_PREFIX = {
+    FORGE_GITLAB: "/-/",
+    FORGE_GITHUB: "/",
+}
+
+#: What a checkout's branch reads as when git will not say — a detached HEAD, a
+#: directory that is not a repo. Wrong on a work repo whose default branch is
+#: named something else, and deliberately: a link to the wrong branch is fixable
+#: by the human looking at it, while no link at all loses the artifact.
+DEFAULT_WEB_BRANCH = "main"
 
 
 def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int, str]:
@@ -97,8 +143,98 @@ def _web_base_from_remote(remote: str) -> Optional[str]:
     return f"https://{host}/{project}"
 
 
+def detect_forge(host: Optional[str]) -> Optional[str]:
+    """Which forge a hostname belongs to (:data:`FORGE_GITLAB` /
+    :data:`FORGE_GITHUB`), or None when it cannot be told.
+
+    GitHub is classified by :func:`lmer_cli.tokens._is_github_host` — the same
+    rule token lookup uses, so a host cannot be GitHub for credentials and
+    something else for URLs. GitLab is ``gitlab.com``, its subdomains, and the
+    self-hosted convention of naming the instance ``gitlab.<domain>`` or
+    ``gitlab-<something>.<domain>``.
+
+    Everything else — ``git.example.com``, a GitHub Enterprise Server on a
+    custom name — is None, because the only honest thing to say about an
+    unrecognised host is that its path layout is unknown. A port is accepted
+    and ignored, so a base URL's authority can be passed straight in.
+    """
+    if not host:
+        return None
+    name = host.strip().lower().split(":", 1)[0]
+    if not name:
+        return None
+    if _is_github_host(name):
+        return FORGE_GITHUB
+    if name == "gitlab.com" or name.endswith(".gitlab.com"):
+        return FORGE_GITLAB
+    first = name.split(".", 1)[0]
+    if first == "gitlab" or first.startswith("gitlab-"):
+        return FORGE_GITLAB
+    return None
+
+
+def forge_web_url(
+    base: str,
+    ref: str,
+    rel_path: str = "",
+    *,
+    is_dir: bool = False,
+    forge: Optional[str] = None,
+    default_forge: Optional[str] = None,
+) -> Optional[str]:
+    """A forge's browse URL for *rel_path* at *ref*, or None for an unknown forge.
+
+    *base* is ``https://<host>/<project>`` — the credential-free form
+    :func:`_web_base_from_remote` produces, and the only form that may be passed
+    here, since whatever this returns is rendered as a clickable link. The forge
+    is derived from *base*'s host (:func:`detect_forge`); *rel_path* empty means
+    the repository root, which is always a tree.
+
+    *forge* names the forge outright and skips detection, because the operator
+    setting it exists for the cases detection gets wrong in *either* direction:
+    a GitHub Enterprise Server sits on any hostname, and a self-hosted GitLab
+    could be named after either. A value that is no known forge — the platform's
+    ``work_repo_forge=none`` — resolves to no prefix and therefore no URL, which
+    is how that setting switches links off.
+
+    *default_forge* is what an unrecognised host falls back to when *forge* is
+    unset, and both callers that build these links pass GitLab: a work repo on a
+    hostname that says nothing about it (``git.example.com``) is a self-hosted
+    GitLab in every deployment either has met, and the two surfaces disagreeing
+    about the same run dir — linked in ``work``, plain names in the platform —
+    was worse than either answer alone. Passing nothing still yields None, which
+    is what a caller with no configured opt-out to offer should do.
+    """
+    forge = forge or detect_forge(urlsplit(base).hostname) or default_forge
+    prefix = _FORGE_PATH_PREFIX.get(forge)
+    if not base or prefix is None:
+        return None
+    ref_q = quote(ref or DEFAULT_WEB_BRANCH, safe="/")
+    if not rel_path:
+        return f"{base}{prefix}tree/{ref_q}"
+    kind = "tree" if is_dir else "blob"
+    return f"{base}{prefix}{kind}/{ref_q}/{quote(rel_path, safe='/')}"
+
+
+def checkout_branch(repo_path) -> str:
+    """The branch *repo_path* is on, or :data:`DEFAULT_WEB_BRANCH`.
+
+    ``symbolic-ref`` (not ``rev-parse``) so an unborn initial branch still names
+    itself; a detached HEAD, a directory that is not a repo and a missing
+    directory all fall back. Never raises — this only ever decides which ref a
+    link points at.
+    """
+    try:
+        rc, branch = run_git_command(
+            ["symbolic-ref", "--short", "HEAD"], Path(repo_path), check=False
+        )
+    except Exception:
+        return DEFAULT_WEB_BRANCH
+    return branch.strip() if rc == 0 and branch.strip() else DEFAULT_WEB_BRANCH
+
+
 def web_url_for(path) -> Optional[str]:
-    """GitLab web URL for a path inside the work-repo checkout, or None.
+    """Forge web URL for a path inside the work-repo checkout, or None.
 
     Maps an absolute path under ``LMER_WORK_REPO_PATH`` (default ``/work``)
     to ``https://<host>/<project>/-/blob/<branch>/<relpath>`` for files and
@@ -107,6 +243,12 @@ def web_url_for(path) -> Optional[str]:
     web base comes from the checkout's ``origin`` remote with credentials
     stripped (:func:`_web_base_from_remote`); the branch is the current
     branch, falling back to ``main`` when detection fails (detached HEAD).
+
+    The path shape comes from :func:`forge_web_url`, so a work repo on GitHub
+    gets GitHub's ``/blob/`` rather than GitLab's ``/-/blob/``. A host that
+    classifies as neither keeps GitLab's shape, which is what these links have
+    always produced — a self-hosted GitLab is commonly at ``git.<domain>``, and
+    dropping its links would be a regression for the deployments that have them.
 
     Fail-soft by contract: any problem — no work repo, no origin remote, a
     remote with no host, a path outside or missing from the checkout —
@@ -129,18 +271,16 @@ def web_url_for(path) -> Optional[str]:
         base = _web_base_from_remote(remote.strip())
         if base is None:
             return None
-        # symbolic-ref (not rev-parse) so an unborn initial branch still
-        # names itself; a detached HEAD fails and falls back to main.
-        rc, branch = run_git_command(
-            ["symbolic-ref", "--short", "HEAD"], work_repo_path, check=False
+        rel = "" if target == work_repo_path else target.relative_to(
+            work_repo_path
+        ).as_posix()
+        return forge_web_url(
+            base,
+            checkout_branch(work_repo_path),
+            rel,
+            is_dir=target.is_dir(),
+            default_forge=FORGE_GITLAB,
         )
-        branch = branch.strip() if rc == 0 else ""
-        branch_q = quote(branch or "main", safe="/")
-        if target == work_repo_path:
-            return f"{base}/-/tree/{branch_q}"
-        kind = "tree" if target.is_dir() else "blob"
-        rel = quote(target.relative_to(work_repo_path).as_posix(), safe="/")
-        return f"{base}/-/{kind}/{branch_q}/{rel}"
     except Exception:
         return None
 
@@ -210,7 +350,138 @@ def stageable_paths(work_repo_path: Path, paths: list[str]) -> list[str]:
     ]
 
 
-def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
+def _deferral_queue_path() -> Path:
+    """The parked-deferrals file, beside the gate markers it belongs to."""
+    return gate_lock.lock_dir() / DEFERRAL_QUEUE_NAME
+
+
+def _current_run_dir() -> Optional[Path]:
+    """The run dir, or None — a broken/absent run must never break a commit."""
+    try:
+        return run_dir()
+    except Exception:
+        return None
+
+
+def _queue_deferral(rdir: Optional[Path], marker: dict, paths: list[str]) -> None:
+    """Park one deferral record for the next commit to flush. Fail-soft.
+
+    A deferral that left no trace would be a lie of omission: the caller was
+    told "0" and its files are still only on disk. The record carries which
+    gate caused it and what was not committed, so the flushed event answers
+    both questions the reviewer will have.
+    """
+    if rdir is None:
+        return
+    try:
+        record = {
+            "run_dir": str(rdir),
+            "gate": marker.get("gate"),
+            "pid": marker.get("pid"),
+            "started_at": marker.get("started_at"),
+            "paths": list(paths),
+        }
+        path = _deferral_queue_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _flush_deferrals(rdir: Optional[Path]) -> int:
+    """Append parked deferrals for *rdir* as `commit_deferred` events.
+
+    Called on the way into a commit that is *allowed* to proceed, so the events
+    are staged by that same commit and reach the work repo with it. Records for
+    other run dirs are kept for their own runs. Fail-soft; returns how many
+    events were written so the caller can say so.
+    """
+    if rdir is None:
+        return 0
+    path = _deferral_queue_path()
+    try:
+        if not path.exists():
+            return 0
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+    mine: list[dict] = []
+    others: list[str] = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue  # torn line — drop it rather than replay it forever
+        if isinstance(record, dict) and record.get("run_dir") == str(rdir):
+            mine.append(record)
+        else:
+            others.append(line)
+
+    if not mine:
+        return 0
+
+    written = 0
+    for record in mine:
+        try:
+            gate = record.get("gate") or "a gate"
+            append_event(
+                rdir,
+                "commit_deferred",
+                note=f"work-repo commit deferred while {gate} was in flight",
+                data={
+                    "gate": gate,
+                    "pid": record.get("pid"),
+                    "paths": record.get("paths") or [],
+                },
+            )
+            written += 1
+        except (OSError, ValueError, TypeError):
+            break  # leave the rest parked rather than losing them
+
+    try:
+        if written >= len(mine) and not others:
+            path.unlink()
+        else:
+            remaining = others + [
+                json.dumps(r, ensure_ascii=False) for r in mine[written:]
+            ]
+            path.write_text(
+                "\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8"
+            )
+    except (OSError, ValueError, TypeError):
+        pass
+    return written
+
+
+def _report_deferral(marker: dict, paths: list[str]) -> None:
+    """Tell the session, in the moment, why nothing was committed."""
+    print(f"⏸️  Work-repo commit deferred: {gate_lock.describe_marker(marker)}")
+    print(
+        "   Committing now would move tracked files under the running gate and "
+        "fail its /work isolation guard (issue #201)."
+    )
+    print(f"   Left on disk, uncommitted: {', '.join(paths)}")
+    print(
+        "   Run `work commit` once the gate finishes — the stop hook will not "
+        "let the session end until it lands."
+    )
+    print(
+        "   Other work-repo writes (`work log`, `work event`, state updates) "
+        "are safe meanwhile: they journal themselves and the suite's guard "
+        "attributes them to this session, not to the tests (issue #233)."
+    )
+
+
+def commit_work_path(
+    target_path,
+    commit_message: Optional[str] = None,
+    allow_during_gate: bool = False,
+) -> int:
     """
     Sync one or more paths in the work repo: add -> commit -> rebase -> push.
 
@@ -237,9 +508,17 @@ def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
             staged and the move lands as a move, not a duplicate.
         commit_message: Optional commit message (defaults to auto-generated
             from the first path).
+        allow_during_gate: Commit even while a gate holds the in-flight marker
+            (issue #201). Two callers set it, both deliberately: the release
+            CAS claim path (arbitration, not durability — deferring it would
+            wedge a release) and ``work session-end`` (the session and its
+            container are going away, so the gate whose window we would be
+            protecting is being torn down with them; durability wins).
 
     Returns:
-        Exit code (0 for success, non-zero for failure)
+        Exit code (0 for success, non-zero for failure). A deferral is 0 — it
+        is not a failure — but it leaves a ``commit_deferred`` trace behind
+        rather than passing silently as success.
     """
     work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
 
@@ -252,6 +531,35 @@ def commit_work_path(target_path, commit_message: Optional[str] = None) -> int:
     if not paths:
         print("✅ No existing paths to commit in work repository")
         return 0
+
+    # 0. Gate-in-flight check (issue #201), BEFORE any git write. A gate leaves
+    # the run dir dirty via its own receipt, which arms the stop hook, whose
+    # mandated commit then sweeps tracked files out from under the running
+    # suite and fails its /work isolation guard. Deferring here covers every
+    # durability push — `work commit` and the implicit ones behind `work state
+    # set` / `goal` / `artifact` / `ledger set` — not just the one path that
+    # happened to bite first.
+    marker = None if allow_during_gate else gate_lock.active_gate()
+    if marker is not None:
+        # Read-only: a run whose paths are already clean has nothing to defer,
+        # so it must not print a deferral for a no-op commit.
+        rc, pending = run_git_command(
+            ["status", "--porcelain", "--", *paths], work_repo_path, check=False
+        )
+        if rc != 0 or not pending.strip():
+            return 0
+        _report_deferral(marker, paths)
+        _queue_deferral(_current_run_dir(), marker, paths)
+        return 0
+
+    # Parked deferrals land as events now, so this commit carries the trace of
+    # the commits it is standing in for.
+    flushed = _flush_deferrals(_current_run_dir())
+    if flushed:
+        print(
+            f"↩️  Recording {flushed} commit deferred during a gate window "
+            "(issue #201); this commit carries the trace."
+        )
 
     # 1. Stage first — committing before any pull keeps the tree clean for
     # the rebase below (a dirty tree makes `git pull` refuse outright).

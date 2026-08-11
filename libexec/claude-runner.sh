@@ -75,18 +75,42 @@ exit(0 if data.get('project', {}).get('name') in ('lmer', 'lmer-cli') else 1)
         fi
 
         # Point the venv's editable install at /workspace/src first, with
-        # /Agents/global/src as a fallback. The whole runtime (entry-point
-        # scripts AND pytest) now resolves lmer_cli/work_repo/etc. from
-        # the dev checkout — and top-level packages absent from /workspace
-        # (e.g. integrations/, which lives only on certain refs) still
-        # resolve via /Agents/global/src instead of vanishing from sys.path.
-        # The earlier approach prepended /workspace/src to PYTHONPATH only,
-        # leaving entry points and pytest with different views of lmer_cli
-        # when the two trees diverged.
+        # /Agents/global/src as a fallback, so top-level packages absent from
+        # /workspace (e.g. integrations/, which lives only on certain refs)
+        # still resolve via /Agents/global/src instead of vanishing from
+        # sys.path.
         for pth in /Agents/global/.venv/lib/python*/site-packages/__editable__.lmer*.pth; do
             [ -f "$pth" ] && printf '/workspace/src\n/Agents/global/src\n' > "$pth"
         done
         echo "✅ Editable install redirected to /workspace/src (with /Agents/global/src fallback)"
+
+        # The .pth above is NOT sufficient on its own. The container entrypoint
+        # exports PYTHONPATH=/Agents/global/src:…, and PYTHONPATH precedes
+        # site-packages — so it beats the .pth and the operational tree wins
+        # anyway (#198). Prepend the dev checkout, in the same order as the
+        # .pth, so entry-point scripts and pytest share ONE view of
+        # lmer_cli/work_repo/etc. rather than two that disagree when the trees
+        # diverge. (An earlier fix set PYTHONPATH only, with no .pth — that is
+        # what left the two views out of step; both halves together are what
+        # make the dev checkout win consistently.)
+        PYTHONPATH="/workspace/src${PYTHONPATH:+:$PYTHONPATH}"
+        export PYTHONPATH
+
+        # State the resolved path unconditionally. A developer should be able
+        # to CHECK which tree this session imports, at startup, instead of
+        # inferring it from an AttributeError several commands later — which is
+        # how #198 was found. The suite asserts the same invariant
+        # (tests/test_import_provenance.py); this line is what makes it visible
+        # before any test runs.
+        RESOLVED_LMER="$("${LMER_PYTHON:-python3}" -c 'import lmer_cli; print(lmer_cli.__file__)' 2>/dev/null)"
+        if [ -z "$RESOLVED_LMER" ]; then
+            echo "⚠️  lmer_cli is not importable — cannot confirm which tree this session tests"
+        elif [ "${RESOLVED_LMER#/workspace/}" = "$RESOLVED_LMER" ]; then
+            echo "⚠️  lmer_cli resolves to $RESOLVED_LMER — NOT the /workspace checkout"
+            echo "   Tests and tooling here would exercise the operational runtime (#198)"
+        else
+            echo "✅ lmer_cli resolves to $RESOLVED_LMER"
+        fi
 
         # No --add-dir: Claude only sees /workspace (the development checkout)
         EXTRA_ARGS=""
@@ -140,11 +164,12 @@ else
     fi
 fi
 
-# ── Lay out commands, skills, and settings under ~/.claude ──
+# ── Lay out commands, skills, agents, output styles, settings under ~/.claude ──
 # Symlink settings.json from the global tree first (if discovered above),
 # then merge in the work-repo's permissions.allow. Then populate
-# ~/.claude/commands/ and ~/.claude/skills/ with per-entry symlinks from
-# the global tree and the work repo (work overrides on name collision).
+# ~/.claude/commands/, skills/, agents/ and output-styles/ with per-entry
+# symlinks from the global tree and the work repo (work overrides on name
+# collision).
 WORK_AGENT_FILES="/work/agent-files/claude"
 [ -d "$WORK_AGENT_FILES" ] || WORK_AGENT_FILES=""
 
@@ -337,6 +362,108 @@ if [ -n "$(printf '%s' "$LMER_HUMAN_IDENTITY" | tr -d '[:space:]')" ]; then
     fi
 fi
 
+# ── Operator ask channel (orchestrated sessions) ──
+# When the lmer orchestrator started this session it mounts an ask channel and
+# sets LMER_ASK_DIR to its container path (issue #141). Render the fragment that
+# tells the model to use `lmer-ask` instead of asking into a terminal nobody is
+# watching. Gated on the env var, so an ordinary session is told nothing.
+#
+# The template/renderer search and the append are factored into a function here
+# rather than copied from the human-identity block above: that block is left
+# byte-for-byte intact (its stability is this script's compatibility contract),
+# and a second inline copy of the same 40 lines is how they drift apart.
+append_prompt_fragment() {
+    local rel="$1" label="$2" template="" renderer="" candidate
+
+    for candidate in \
+        "$(dirname "$0")/../prompts/$rel" \
+        "/workspace/prompts/$rel" \
+        "$LMER_HOME/prompts/$rel" \
+        "/Agents/global/prompts/$rel"; do
+        if [ -f "$candidate" ]; then
+            template="$candidate"
+            break
+        fi
+    done
+
+    for candidate in \
+        "$(dirname "$0")/render-prompt-fragment.py" \
+        "/workspace/libexec/render-prompt-fragment.py" \
+        "$LMER_HOME/libexec/render-prompt-fragment.py" \
+        "/Agents/global/libexec/render-prompt-fragment.py"; do
+        if [ -f "$candidate" ]; then
+            renderer="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$template" ] || [ -z "$renderer" ]; then
+        echo "⚠️  $label requested but its template/renderer was not found"
+        return 1
+    fi
+
+    if [ -z "$AGENTS_COMBINED" ]; then
+        AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+        if [ -n "$WORKSPACE_AGENTS" ]; then
+            cat "$WORKSPACE_AGENTS" > "$AGENTS_COMBINED"
+        elif [ -n "$USER_AGENTS" ]; then
+            cat "$USER_AGENTS" > "$AGENTS_COMBINED"
+        fi
+    fi
+    printf '\n\n' >> "$AGENTS_COMBINED"
+    if "${LMER_PYTHON:-python3}" "$renderer" "$template" >> "$AGENTS_COMBINED"; then
+        AGENTS_PROMPT_ARGS="--append-system-prompt-file $AGENTS_COMBINED"
+        echo "✅ $label injected into system prompt"
+        return 0
+    fi
+    echo "⚠️  Failed to render $label template at $template"
+    return 1
+}
+
+if [ -n "$(printf '%s' "$LMER_ASK_DIR" | tr -d '[:space:]')" ]; then
+    append_prompt_fragment "orchestrator-ask.md.jinja2" "Operator ask channel" || true
+fi
+
+# ── Non-interactive session notice ──
+# Claude Code discovers only CLAUDE.md natively, so AGENTS.md — and with it the
+# NON-INTERACTIVE SESSIONS rule — reaches the model solely through the system
+# prompt assembled above. Setting LMER_NONINTERACTIVE in the environment tells
+# no agent anything on its own (no path renders LMER_* values into a session's
+# context), so the rule text itself is appended here for headless launches.
+# Plain markdown, no renderer needed — the fragment carries no session values.
+case "${LMER_NONINTERACTIVE,,}" in
+    1|true|yes)
+        NONINTERACTIVE_FRAGMENT=""
+        for candidate in \
+            "$(dirname "$0")/../prompts/non-interactive.md" \
+            "/workspace/prompts/non-interactive.md" \
+            "$LMER_HOME/prompts/non-interactive.md" \
+            "/Agents/global/prompts/non-interactive.md"; do
+            if [ -f "$candidate" ]; then
+                NONINTERACTIVE_FRAGMENT="$candidate"
+                break
+            fi
+        done
+
+        if [ -n "$NONINTERACTIVE_FRAGMENT" ]; then
+            if [ -z "$AGENTS_COMBINED" ]; then
+                AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+                if [ -n "$WORKSPACE_AGENTS" ]; then
+                    cat "$WORKSPACE_AGENTS" > "$AGENTS_COMBINED"
+                elif [ -n "$USER_AGENTS" ]; then
+                    cat "$USER_AGENTS" > "$AGENTS_COMBINED"
+                fi
+            fi
+            printf '\n\n' >> "$AGENTS_COMBINED"
+            cat "$NONINTERACTIVE_FRAGMENT" >> "$AGENTS_COMBINED"
+            AGENTS_PROMPT_ARGS="--append-system-prompt-file $AGENTS_COMBINED"
+            echo "✅ Non-interactive session notice injected into system prompt"
+        else
+            echo "⚠️  LMER_NONINTERACTIVE set but non-interactive.md not found"
+        fi
+        ;;
+esac
+
 # ── Agent memory restore ──
 # When LMER_PERSIST_AGENT_MEMORY is enabled, restore previously-saved
 # per-project agent memory from the work repo into Claude's memory directory
@@ -388,7 +515,30 @@ fi
 # (e.g. older containers built before this feature shipped) or if the
 # user opts out with LMER_DISABLE_SUPERVISOR=1 (escape hatch for
 # bisecting rendering issues attributable to the PTY wrapper).
+#
+# The supervisor is operational infrastructure — the platform's only way to
+# reach this session — so it must run the image's code even when the self-dev
+# block above repoints imports at /workspace (#236: a supervisor imported from
+# the agent's checkout of `main` served a control plane with no /resize route
+# and the pre-#210 submit path). The pin is a sys.path insert rather than a
+# PYTHONPATH override because the harness is the supervisor's *child*: an env
+# pin would be inherited and silently undo the self-dev view the agent's own
+# tooling depends on (#198).
 if [ "${LMER_DISABLE_SUPERVISOR:-0}" != "1" ] && command -v lmer-supervisor >/dev/null 2>&1; then
+    # The interpreter default is the operational venv, not a bare `python3`:
+    # PATH may resolve python3 to an active workspace venv without the
+    # supervisor's deps, and a failed exec here ends the session with no
+    # harness at all. If neither interpreter exists this is not a container
+    # layout the pin understands — fall through to the console script.
+    SUPERVISOR_PYTHON="${LMER_PYTHON:-/Agents/global/.venv/bin/python3}"
+    if [ -x "$SUPERVISOR_PYTHON" ] && [ -d /Agents/global/src/lmer_cli ]; then
+        echo "✅ lmer-supervisor pinned to /Agents/global/src (operational tree)"
+        exec "$SUPERVISOR_PYTHON" -c 'import sys; sys.path.insert(0, "/Agents/global/src"); from lmer_cli.supervisor import main; sys.exit(main())' -- claude $EXTRA_ARGS $AGENTS_PROMPT_ARGS "$@"
+    fi
+    # Said out loud because under self-dev an unpinned supervisor is exactly
+    # the #236 configuration — the absence of the pin line must not be the
+    # only signal.
+    echo "⚠️  supervisor pin skipped (no usable interpreter or operational tree) — running unpinned"
     exec lmer-supervisor -- claude $EXTRA_ARGS $AGENTS_PROMPT_ARGS "$@"
 fi
 exec claude $EXTRA_ARGS $AGENTS_PROMPT_ARGS "$@"

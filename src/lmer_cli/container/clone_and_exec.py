@@ -23,9 +23,18 @@ from lmer_cli or work_repo modules — it executes before the package is
 guaranteed importable. ``setup_workspace()`` is only ever invoked from the
 ``work`` CLI (where the package *is* importable), but it too is kept
 stdlib-only here so all container-side setup logic lives in one place.
+The single guaranteed non-stdlib import is PyYAML: parsing the canonical
+source config ``{work_repo}/sources.yaml`` (issue #105) needs a YAML
+parser, and the Containerfile guarantees PyYAML for the invoking
+interpreter. Even so the import is lazy and guarded (``_import_yaml``) so
+the entrypoint still runs stdlib-only when no ``sources.yaml`` exists;
+when one IS present and the import fails, startup is refused
+(``_refuse_start_if_sources_unreadable``) — a present config that cannot
+be read must never be silently ignored.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import random
 import re
@@ -65,6 +74,44 @@ KNOWN_HARNESS_RUNNERS = {
     "codex-runner",
     "pi-runner",
 }
+
+# The canonical source config (sources.yaml, issue #105) file name at the
+# work-repo root (single source of truth for the refusal check and the
+# resolution step — see the section banner further down).
+SOURCES_CONFIG_NAME = "sources.yaml"
+
+# Env var carrying the taskdef ref override. Participates in the per-field
+# resolution matrix for the taskdef source only — there is no napkin ref
+# (spec: `ref` is valid under `sources.taskdef` in schema 1).
+_TASKDEF_REF_ENV = "LMER_TASKDEF_REF"
+
+# Fixed in-container clone destinations for the resolved sources — the same
+# paths clone_aux_repos targets for the env-var forms (which is what makes
+# the seam's loud declared clone idempotent with the later aux-clone pass:
+# ensure_clone no-ops once .git exists).
+_SOURCE_DESTS = {"taskdef": "/taskdef", "napkin": "/napkin"}
+
+# Resolution origins, printed in the greppable banner
+# ``source <name>: <scrubbed-url> (<origin>)`` (spec §3, the container-side
+# authoritative record and smoke-test hook). ENV_MATCH is row 2 of the
+# matrix — the env value is the credentialed form of the declaration, not a
+# genuine override — kept distinct from ENV_OVERRIDE (a real mismatch
+# resolved in env's favor) so this banner agrees with the host-side
+# --show-env display, which labels the matching case env-match too.
+# ORIGIN_UNSET_FALLBACK never prints a banner — silent legacy mode is
+# literally zero output (spec G5) — but stays in the shared vocabulary for
+# --show-env parity.
+ORIGIN_DECLARED = "declared"
+ORIGIN_ENV_MATCH = "env-match"
+ORIGIN_ENV_OVERRIDE = "env-override"
+ORIGIN_ENV_ONLY = "env-only"
+ORIGIN_UNSET_FALLBACK = "unset-fallback"
+
+# Sentinel _prompt_source_choice returns when stdin hits EOF before the
+# operator answers. Not an origin and never a resolution — the caller
+# treats it exactly like the headless mismatch row (refuse start, exit 2),
+# because an unanswered mismatch has no safe default.
+PROMPT_ABORTED = "aborted"
 
 
 def run(cmd: list[str]) -> int:
@@ -108,6 +155,517 @@ def _scrub_credentials(text: str) -> str:
     if not text:
         return text
     return re.sub(r"(://)[^/\s]*@", r"\1", text)
+
+
+# --- Canonical source config (sources.yaml, issue #105) ---------------------
+# {work_repo}/sources.yaml declares the canonical taskdef/napkin sources.
+# Reading it needs PyYAML — the one sanctioned non-stdlib import in this
+# module (see the docstring contract above). The import seam below keeps the
+# entrypoint runnable stdlib-only when no sources.yaml exists, while a
+# present-but-unreadable config refuses start instead of being silently
+# ignored. Resolution (_resolve_declared_sources and helpers, further down)
+# runs in main() between the work-repo clone and clone_aux_repos, where
+# sources.yaml is guaranteed present and fresh. The section's constants
+# (SOURCES_CONFIG_NAME, _TASKDEF_REF_ENV, _SOURCE_DESTS, ORIGIN_*) live in
+# the top-of-file constants block, per house style.
+
+
+def _import_yaml():
+    """Import PyYAML lazily, reporting unavailability instead of raising.
+
+    Returns the ``yaml`` module, or None when it is not importable. Guarded
+    so merely loading this module (and every session without a
+    ``sources.yaml``) stays stdlib-only — the Containerfile guarantees
+    PyYAML for the invoking interpreter, but this script must also survive
+    interpreters that lack it (host-side test runs, older images).
+    """
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    return yaml
+
+
+def _refuse_start_if_sources_unreadable(work_repo_path: Path) -> int:
+    """Refuse start when ``{work_repo}/sources.yaml`` exists but PyYAML doesn't.
+
+    A present config that cannot be read must never be silently ignored —
+    running without the declared canonical sources is exactly the failure
+    class sources.yaml exists to kill. Returns 0 when startup may proceed
+    (no sources.yaml, or PyYAML importable) and 2 (the refuse-start exit
+    code, matching existing CLI refusals) after printing a
+    credential-scrubbed error otherwise. Called by the resolution step
+    (later task) after the work-repo clone, before ``clone_aux_repos``.
+    """
+    sources = Path(work_repo_path) / SOURCES_CONFIG_NAME
+    if not sources.exists():
+        # No declaration — silent legacy mode, stdlib-only path untouched.
+        return 0
+    if _import_yaml() is not None:
+        return 0
+    print(
+        _scrub_credentials(
+            f"❌ {sources} is present but PyYAML is not importable in the "
+            f"container interpreter — refusing to start rather than silently "
+            f"ignoring the declared sources. Rebuild the image with a lmer "
+            f"version that guarantees PyYAML: lmer build. (Or remove "
+            f"{SOURCES_CONFIG_NAME} from the work repo to run without "
+            f"declarations.)"
+        ),
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _load_sources_module():
+    """Load the sibling ``sources.py`` standalone (never via lmer_cli).
+
+    The loader recipe from the sources.py module docstring: a
+    spec_from_file_location import under the namespaced name
+    ``lmer_container_sources`` — indifferent to PYTHONSAFEPATH, immune to a
+    stray ``sources.py`` in the cwd, and never touching ``sys.path``. Only
+    called once a sources.yaml is known to exist, so sessions without one
+    stay on the stdlib-only path.
+    """
+    name = "lmer_container_sources"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = Path(__file__).resolve().parent / "sources.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _prompt_source_choice(name, field, declared_value, env_value, env_var, input_fn=input) -> str:
+    """Mismatch-row prompt (spec §2 row 3): ask once which value wins.
+
+    Returns ``"declared"``, ``"env"``, or ``PROMPT_ABORTED`` when stdin
+    reaches EOF before an answer (review finding). Interactivity is decided
+    by ``sys.stdin.isatty()`` while the host allocates ``-it`` from its OWN
+    stdin, so a session can be classified interactive and still hit EOF —
+    detached container, closed pty, a wrapper closing stdin. That must take
+    the same refuse-start path as the headless row rather than escaping as
+    a traceback: an unanswered mismatch has no safe default.
+
+    Callers must pass *declared_value* and *env_value* already
+    credential-scrubbed — everything this function prints is
+    operator-visible. Kept separate from the matrix so a fake-TTY unit test
+    can drive it via *input_fn* (and so the matrix stays pure-ish).
+    """
+    print(
+        f"⚠️  source {name}: {field} mismatch —\n"
+        f"     sources.yaml declares: {declared_value}\n"
+        f"     {env_var} is set to:   {env_value}",
+        file=sys.stderr,
+    )
+    while True:
+        try:
+            raw = input_fn(f"Use [d]eclared or [e]nv value for {name} {field}? ")
+        except EOFError:
+            return PROMPT_ABORTED
+        answer = (raw or "").strip().lower()
+        if answer in ("d", "declared"):
+            return "declared"
+        if answer in ("e", "env"):
+            return "env"
+        print("Please answer 'd' (declared) or 'e' (env).", file=sys.stderr)
+
+
+def _prompt_continue_legacy(name, input_fn=input) -> bool:
+    """Declared-clone-failure prompt (spec N3): continue in legacy mode
+    (reverting that source's propagation mutations) or abort. Defaults to
+    abort — silently running without the canonical source is the failure
+    class sources.yaml exists to kill. EOF on stdin (an interactive-classified
+    session whose stdin is closed — review finding) is the unanswered case,
+    which the documented default already covers: abort."""
+    while True:
+        try:
+            raw = input_fn(f"Continue in legacy mode without the {name} source? [y/N] ")
+        except EOFError:
+            return False
+        answer = (raw or "").strip().lower()
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("", "n", "no"):
+            return False
+        print("Please answer 'y' or 'n'.", file=sys.stderr)
+
+
+def _legacy_env_state(name, env) -> dict:
+    """Env state for *name*'s legacy (undeclared, no env var) mode.
+
+    Continue-legacy after a declared-source clone failure must leave the
+    session exactly as if the source had never been configured (spec N3):
+    no dangling ``LMER_NAPKIN_PATH=/napkin`` with no clone behind it, no
+    ``/taskdef`` search-path entry, and no repo env var for clone_aux_repos
+    to retry (and warn-and-continue) with. ``None`` means "unset". Computed
+    from the pre-resolution env snapshot.
+    """
+    if name == "taskdef":
+        paths = [p for p in (env.get("LMER_TASKDEF_PATHS") or "").split(":") if p and p != "/taskdef"]
+        return {
+            "LMER_TASKDEF_REPO": None,
+            _TASKDEF_REF_ENV: None,
+            "LMER_TASKDEF_PATHS": ":".join(paths) if paths else None,
+        }
+    work_repo_path = env.get("LMER_WORK_REPO_PATH", "/work")
+    return {
+        "LMER_NAPKIN_REPO": None,
+        "LMER_NAPKIN_PATH": f"{work_repo_path}/napkin",
+    }
+
+
+def _resolve_sources_matrix(config, env, isatty, work_repo_url, sources_mod, input_fn=input) -> dict:
+    """Resolve declared vs env sources — the five-row matrix (spec §2).
+
+    Per source (taskdef, napkin), per field (repo; ref for taskdef only):
+    declared-only wins; normalized-equal → env wins silently (it is the
+    credentialed form); mismatch → prompt on a TTY / refuse-start headless;
+    env-only → one-line note; neither → silent legacy, zero output.
+
+    Pure-ish and directly testable: reads only its inputs (*config* from
+    load_sources, *env* mapping snapshot, *isatty*, *work_repo_url*) and, on
+    mismatch rows with a TTY, drives the prompt layer through *input_fn*.
+    Performs no env mutation, no filesystem I/O, and no cloning — main()
+    applies the returned plan via _apply_sources_resolution.
+
+    Returns a dict:
+    - ``exit_code``: 0 (proceed) or 2 (headless mismatch — refuse start
+      before any aux clone)
+    - ``errors``: refuse-start lines (credential-scrubbed)
+    - ``notes``: informational lines (env-only notes)
+    - ``banners``: one greppable ``source <name>: <url> (<origin>)`` line
+      per resolved source (never for unset-fallback)
+    - ``origins``: {source: origin} for every source
+    - ``env_updates``: {var: value} propagation mutations (spec N1) —
+      resolved repo/ref vars, the ``/taskdef`` LMER_TASKDEF_PATHS append,
+      the ``LMER_NAPKIN_PATH`` separate-mode recompute
+    - ``clones``: declared-source resolutions (origins declared, env-match,
+      env-override) main() must clone LOUDLY
+      (spec N3), each carrying the scrubbed URL for messages, the
+      derivation mode (either anonymous mode drives the anonymous hint,
+      each with its own reason), and
+      the ``legacy_env`` state continue-legacy reverts to.
+    """
+    result = {
+        "exit_code": 0,
+        "errors": [],
+        "notes": [],
+        "banners": [],
+        "origins": {},
+        "env_updates": {},
+        "clones": [],
+    }
+    scrub = sources_mod.scrub_credentials
+    declared_sources = (config or {}).get("sources") or {}
+    for name, env_var in sources_mod.SOURCE_ENV_OVERRIDES.items():
+        declared = declared_sources.get(name)
+        env_repo = (env.get(env_var) or "").strip() or None
+        if declared is None:
+            if env_repo:
+                # Row 4: env-only — use the env value, one-line note that no
+                # declaration exists (plus the greppable banner).
+                result["origins"][name] = ORIGIN_ENV_ONLY
+                result["notes"].append(
+                    f"ℹ️  source {name}: no declaration in {SOURCES_CONFIG_NAME} — "
+                    f"using {env_var} (env-only)"
+                )
+                result["banners"].append(
+                    f"source {name}: {scrub(env_repo)} ({ORIGIN_ENV_ONLY})"
+                )
+            else:
+                # Row 5: silent legacy — literally zero output.
+                result["origins"][name] = ORIGIN_UNSET_FALLBACK
+            continue
+
+        declared_repo = declared["repo"]
+        conflicts = []  # (field, declared_value, env_value, env_var)
+
+        # repo field, rows 1-3.
+        repo_env_matched = False
+        if env_repo is None:
+            repo_choice = "declared"
+        elif sources_mod.env_matches_declared(env_repo, declared_repo, work_repo_url):
+            # Row 2: env wins silently — it is the credentialed form; the
+            # declared side is clean, so using it would break auth. Not an
+            # override: the banner origin is env-match, not env-override.
+            repo_choice = "env"
+            repo_env_matched = True
+        else:
+            conflicts.append(("repo", declared_repo, env_repo, env_var))
+            repo_choice = None
+
+        # ref field (taskdef only), same rows. Fields resolve independently:
+        # a ref-only mismatch is still a mismatch.
+        declared_ref = declared.get("ref") if name == "taskdef" else None
+        env_ref = ((env.get(_TASKDEF_REF_ENV) or "").strip() or None) if name == "taskdef" else None
+        ref_choice = None
+        ref_note = None
+        if declared_ref or env_ref:
+            if env_ref is None:
+                ref_choice = "declared"
+            elif declared_ref is None:
+                ref_choice = "env"
+                ref_note = (
+                    f"ℹ️  source taskdef: no ref declared in {SOURCES_CONFIG_NAME} — "
+                    f"using {_TASKDEF_REF_ENV} (env-only)"
+                )
+            elif declared_ref == env_ref:
+                ref_choice = "env"
+            else:
+                conflicts.append(("ref", declared_ref, env_ref, _TASKDEF_REF_ENV))
+
+        if conflicts:
+            aborted = False
+            answered: set = set()
+            if isatty:
+                # Row 3 interactive: prompt once per conflicting field.
+                for field, declared_value, env_value, var in conflicts:
+                    choice = _prompt_source_choice(
+                        name, field, scrub(declared_value), scrub(env_value), var, input_fn
+                    )
+                    if choice == PROMPT_ABORTED:
+                        # Stdin closed mid-prompt: stop asking and fall into
+                        # the headless refusal below with the same errors.
+                        aborted = True
+                        break
+                    answered.add(field)
+                    if field == "repo":
+                        repo_choice = choice
+                    else:
+                        ref_choice = choice
+            if not isatty or aborted:
+                # Row 3 headless (and the EOF-aborted interactive case):
+                # refuse start (exit 2) before any aux clone, naming both
+                # values (scrubbed) and the fix. Keep scanning so every
+                # conflict is reported in one pass.
+                #
+                # The per-field clause and the fix clause both depend on how
+                # this was reached (review nit): after an EOF the operator IS
+                # interactive, so "launch interactively to choose" is advice
+                # they already took, and a field they answered before the EOF
+                # was not the one that had no answer.
+                for field, declared_value, env_value, var in conflicts:
+                    if not aborted:
+                        note = ""
+                    elif field in answered:
+                        note = (
+                            " Your answer for this field was discarded: a later"
+                            " prompt reached EOF on stdin, so the session"
+                            " refuses rather than resolve half the conflict."
+                        )
+                    else:
+                        note = (
+                            " No answer was possible: stdin reached EOF during"
+                            " the prompt."
+                        )
+                    fix = (
+                        f" Fix: update {SOURCES_CONFIG_NAME}, or change or unset"
+                        f" {var} to match."
+                        if aborted
+                        else f" Fix: update {SOURCES_CONFIG_NAME}, change or"
+                        f" unset {var} to match, or launch interactively to"
+                        " choose."
+                    )
+                    result["errors"].append(
+                        f"source {name}: {field} mismatch — {SOURCES_CONFIG_NAME} "
+                        f"declares {scrub(declared_value)} but {var} is set to "
+                        f"{scrub(env_value)}.{note}{fix}"
+                    )
+                result["exit_code"] = 2
+                continue
+
+        # Assemble the resolved source: propagation env updates (spec N1),
+        # banner, and the loud clone entry (spec N3).
+        derived_mode = None
+        if repo_choice == "declared":
+            clone_url, derived_mode = sources_mod.derive_clone_url(declared_repo, work_repo_url)
+            origin = ORIGIN_DECLARED
+            result["env_updates"][env_var] = clone_url
+            if name == "taskdef":
+                # The host appends /taskdef to LMER_TASKDEF_PATHS only when
+                # the env var was set at launch (cli.py) — declared-only
+                # resolution replays that append here.
+                paths = [p for p in (env.get("LMER_TASKDEF_PATHS") or "").split(":") if p]
+                if "/taskdef" not in paths:
+                    result["env_updates"]["LMER_TASKDEF_PATHS"] = ":".join(paths + ["/taskdef"])
+            else:
+                # Separate-mode recompute so setup_napkin_and_links links
+                # ~/napkin to /napkin rather than the work-repo subdir.
+                result["env_updates"]["LMER_NAPKIN_PATH"] = "/napkin"
+        else:
+            clone_url = env_repo
+            origin = ORIGIN_ENV_MATCH if repo_env_matched else ORIGIN_ENV_OVERRIDE
+        resolved_ref = None
+        if ref_choice == "declared":
+            resolved_ref = declared_ref
+            result["env_updates"][_TASKDEF_REF_ENV] = declared_ref
+        elif ref_choice == "env":
+            resolved_ref = env_ref
+            if ref_note:
+                result["notes"].append(ref_note)
+        result["origins"][name] = origin
+        result["banners"].append(f"source {name}: {scrub(clone_url)} ({origin})")
+        result["clones"].append(
+            {
+                "name": name,
+                "dest": _SOURCE_DESTS[name],
+                "url": clone_url,
+                "scrubbed_url": scrub(clone_url),
+                "ref": resolved_ref,
+                "derived_mode": derived_mode,
+                "env_var": env_var,
+                "legacy_env": _legacy_env_state(name, env),
+            }
+        )
+    return result
+
+
+def _apply_sources_resolution(result, env, sources_mod, isatty, input_fn=input) -> int:
+    """Apply a _resolve_sources_matrix plan: propagate env, print banners,
+    clone declared sources LOUDLY.
+
+    Env propagation happens BEFORE the clones so downstream setup
+    (clone_aux_repos re-reads the vars; setup_napkin_and_links sees /napkin)
+    behaves exactly as if the host had set them (spec N1). A declared-source
+    clone failure is never the aux-clone warn-and-continue (spec N3):
+    interactive sessions get a continue-in-legacy / abort prompt — continue
+    REVERTS that source's propagation mutations so nothing downstream points
+    at a clone that does not exist — and headless sessions refuse start
+    (exit 2) with remediation. Returns 0 to proceed, 2 to refuse.
+    """
+    for line in result["notes"]:
+        print(line, file=sys.stderr)
+    for var, value in result["env_updates"].items():
+        env[var] = value
+    for line in result["banners"]:
+        print(line, file=sys.stderr)
+    for clone in result["clones"]:
+        try:
+            ensure_clone(Path(clone["dest"]), clone["url"], None, clone["ref"])
+        except Exception as e:
+            name = clone["name"]
+            detail = sources_mod.scrub_credentials(str(e))
+            if clone["derived_mode"] == sources_mod.DERIVED_ANONYMOUS:
+                anon_hint = (
+                    " The work-repo URL carries no credential, so the clone "
+                    "was attempted anonymously."
+                )
+            elif clone["derived_mode"] == sources_mod.DERIVED_ANONYMOUS_OTHER_PORT:
+                # Distinct reason: the work repo DOES have a credential, and
+                # it was deliberately withheld. Saying "carries no credential"
+                # here would send the operator to look at the wrong thing.
+                anon_hint = (
+                    " The declared URL names a different port than the "
+                    "work-repo URL, so the work-repo credential was withheld "
+                    "and the clone was attempted anonymously."
+                )
+            else:
+                anon_hint = ""
+            remediation = (
+                f"verify {clone['scrubbed_url']} exists and the work-repo "
+                f"credential can read it, set {clone['env_var']} to an "
+                f"accessible URL, or remove the {name} declaration from "
+                f"{SOURCES_CONFIG_NAME}."
+            )
+            if not isatty:
+                print(
+                    f"❌ declared source {name} clone failed: {detail}.{anon_hint} "
+                    f"Refusing to start without the declared canonical source — "
+                    f"{remediation}",
+                    file=sys.stderr,
+                )
+                return 2
+            print(
+                f"⚠️  declared source {name} clone failed: {detail}.{anon_hint}",
+                file=sys.stderr,
+            )
+            if _prompt_continue_legacy(name, input_fn):
+                for var, value in clone["legacy_env"].items():
+                    if value is None:
+                        env.pop(var, None)
+                    else:
+                        env[var] = value
+                print(
+                    f"⚠️  continuing in legacy mode for {name}: declared source "
+                    f"NOT available; its propagation was reverted",
+                    file=sys.stderr,
+                )
+                continue
+            print(
+                f"❌ aborting: declared source {name} unavailable — {remediation}",
+                file=sys.stderr,
+            )
+            return 2
+    return 0
+
+
+def _resolve_declared_sources(work_repo_path, work_repo_url, env=None, isatty=None, input_fn=input) -> int:
+    """Container-side canonical source resolution (spec §2) — the seam
+    main() calls between the work-repo clone and clone_aux_repos.
+
+    Absent ``sources.yaml`` → silent legacy mode: return 0 with literally
+    zero output and no imports beyond stdlib. Present → load it through the
+    standalone sources module (never via lmer_cli), resolve the matrix, and
+    apply propagation plus the loud declared clones. Returns 0 to proceed
+    or 2 to refuse start (before any aux clone). *env*/*isatty*/*input_fn*
+    default to the real process environment, ``sys.stdin.isatty()`` (the
+    headless predicate), and ``input`` — injectable for tests.
+    """
+    work_repo_path = Path(work_repo_path)
+    rc = _refuse_start_if_sources_unreadable(work_repo_path)
+    if rc:
+        return rc
+    sources_path = work_repo_path / SOURCES_CONFIG_NAME
+    if not sources_path.exists():
+        # Silent legacy mode: the matrix never engages (spec G5).
+        return 0
+    try:
+        sources_mod = _load_sources_module()
+    except Exception as e:
+        # Same failure class as the PyYAML guard above — a present
+        # sources.yaml we cannot read — so it takes the same refuse-start
+        # path instead of a raw traceback after the work-repo clone
+        # (review finding). The realistic trigger is a dev session
+        # live-mounting a partial src/ tree over the baked image.
+        print(
+            _scrub_credentials(
+                f"❌ {sources_path} is present but the resolver "
+                f"({Path(__file__).resolve().parent / 'sources.py'}) could not "
+                f"be loaded: {type(e).__name__}: {e}. Refusing to start rather "
+                f"than silently ignoring the declared sources. Rebuild or "
+                f"un-mount a partial source checkout (see LMER_SOURCE_COMMIT in "
+                f"bin/doctor), or remove {SOURCES_CONFIG_NAME} from the work "
+                f"repo to run without declarations."
+            ),
+            file=sys.stderr,
+        )
+        return 2
+    if env is None:
+        env = os.environ
+    if isatty is None:
+        isatty = sys.stdin.isatty()
+    try:
+        config, warnings = sources_mod.load_sources(sources_path, work_repo_url)
+    except sources_mod.SourcesConfigError as e:
+        print(f"❌ {sources_mod.scrub_credentials(str(e))}", file=sys.stderr)
+        return 2
+    for warning in warnings:
+        print(f"⚠️  {sources_mod.scrub_credentials(warning)}", file=sys.stderr)
+    result = _resolve_sources_matrix(
+        config, env, isatty, work_repo_url, sources_mod, input_fn=input_fn
+    )
+    if result["exit_code"]:
+        for line in result["errors"]:
+            print(f"❌ {line}", file=sys.stderr)
+        return result["exit_code"]
+    return _apply_sources_resolution(result, env, sources_mod, isatty, input_fn=input_fn)
 
 
 def _git_lfs_available() -> bool:
@@ -165,10 +723,14 @@ def _clone_cmd(
 
 
 # --- Persistent clone cache (issue #112) ------------------------------------
-# The host CLI bind-mounts a persistent host directory (default
-# ~/.lmer/clone-cache, see LMER_CLONE_CACHE / LMER_CLONE_CACHE_DIR in
-# docs/LMER-CLI.md) **read-only** at the container path carried in
-# LMER_CLONE_CACHE_PATH. All mirror maintenance is host-side
+# The host CLI bind-mounts, **read-only** and one per mirror, the bare
+# mirrors this launch's own repos have in its persistent cache directory
+# (default ~/.lmer/clone-cache, see LMER_CLONE_CACHE / LMER_CLONE_CACHE_DIR
+# in docs/LMER-CLI.md) — under the container path carried in
+# LMER_CLONE_CACHE_PATH, at the same relative position this script's
+# _mirror_path computes, so the lookup below is indifferent to whether the
+# host mounted the mirrors individually (issue #135) or the whole cache root
+# (before it). All mirror maintenance is host-side
 # (lmer_cli/clone_cache.py, forked detached at launch); this script is a
 # pure consumer: when a bare mirror (<host>/<project>.git) exists, working
 # clones are made with ``--reference <mirror> --dissociate`` — origin stays
@@ -362,6 +924,19 @@ def clone_aux_repos(
     The URLs already carry credentials (baked in host-side by the launching
     CLI), so they clone as-is. Clone failures are non-fatal — warn and continue,
     matching the secondary-MR clone behavior.
+
+    Failure-signal design (sources.yaml seam, issue #105): the loud failure
+    signal lives on the RESOLVING side, never here. A declared source is
+    cloned by _apply_sources_resolution before this runs —
+    headless failure refuses start (exit 2), interactive failure prompts
+    continue-legacy/abort. By the time this function runs, a declared URL
+    either has its clone in place (ensure_clone's .git check makes the
+    re-clone here a no-op) or its repo env var was reverted to unset by
+    continue-legacy (so there is nothing to retry or double-report). The
+    warn-and-continue below therefore only ever fires for env-sourced
+    (env-only, undeclared) or absent URLs, whose legacy best-effort
+    contract is intentionally unchanged — which is why this function keeps
+    returning None instead of growing a failure return value.
     """
     if napkin_repo_url:
         try:
@@ -1503,6 +2078,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"❌ work repo clone failed: {_scrub_credentials(str(e))}", file=sys.stderr)
         return e.returncode or 1
 
+    # Canonical source resolution (sources.yaml, issue #105): runs here —
+    # after the work-repo clone (the declaration is now present and fresh)
+    # and before every aux clone below. Propagates declared sources
+    # into the env vars the aux-clone and napkin/link steps read, and
+    # refuses start (exit 2) on a headless mismatch or an untrustable
+    # config. Absent sources.yaml is silent legacy mode: zero output.
+    rc = _resolve_declared_sources(work_repo_path, work_repo_url)
+    if rc:
+        return rc
+
     # Clone secondary MRs if any
     secondary_targets_str = os.environ.get("LMER_SECONDARY_TARGETS")
     if secondary_targets_str:
@@ -1537,6 +2122,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"⚠️  Failed to provision documentation: {e}", file=sys.stderr)
 
     # --- Optional napkin/taskdef auxiliary repos + stable home symlinks ---
+    # Declared sources were already cloned LOUDLY by the resolution seam
+    # above; this pass is an idempotent no-op for them and is the sole
+    # (warn-and-continue) clone path for env-only/absent URLs — see the
+    # clone_aux_repos docstring for the failure-signal split.
     napkin_repo_url = os.environ.get("LMER_NAPKIN_REPO")
     taskdef_repo_url = os.environ.get("LMER_TASKDEF_REPO")
     taskdef_ref = os.environ.get("LMER_TASKDEF_REF")

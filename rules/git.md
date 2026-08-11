@@ -52,25 +52,49 @@ The gate checks warn when a staged file that names a spec-class deliverable (any
   3. Block push if not allowed or checks fail
 
 **Repository Allow List**:
-The push allow list is configured via the `LMER_PUSH_ALLOW_LIST` environment variable.
-Set it to a comma-separated list of entries, each either `repo` or `repo|refpattern`:
+The push allow list is the **union of two sources** — any single entry granting
+the target allows the push:
+1. The `LMER_PUSH_ALLOW_LIST` environment variable (comma-separated)
+2. The active taskdef's top-level `push_allow` list in its `task.yaml`,
+   resolved from the **trusted taskdef tiers only** — never the
+   agent-writable work-repo tiers (see docs/TASKDEFS.md)
+
+Each entry is either `repo` or `repo|refpattern`:
 ```bash
-LMER_PUSH_ALLOW_LIST="org/repo1,org/repo2|refs/tags/*"
+LMER_PUSH_ALLOW_LIST="org/repo1,gitlab.example.com/group,*.example.com|refs/tags/*"
 ```
-- A bare `repo` entry is matched as a substring of the remote URL and authorizes
-  **branch refs only** (`refs/heads/*`) — bare entries never grant tag pushes.
+- A bare `repo` entry authorizes **branch refs only** (`refs/heads/*`) — bare
+  entries never grant tag pushes.
 - A `repo|refpattern` entry matches `refpattern` (a glob) against the
   fully-qualified target ref: `org/repo|refs/tags/*` grants tag pushes,
   `org/repo|refs/heads/main` grants exactly one branch.
 - Malformed entries (empty half, more than one `|`) are ignored — the list
   fails closed, never open.
-- The substring rule applies to **configured remotes**, whose URL the operator
-  set up. When git is handed a **URL** instead of a remote name, the match is
-  anchored on the parsed identity and the entry must name `host/path` or the
-  bare `host` — `org/repo` alone authorizes nothing there, because any forge
-  can serve that path.
 
-By default, no repositories are auto-allowed for push.
+The **repo half** is matched by the grammar in `lmer_cli.push_allow` — not by a
+substring test. It is one of:
+- Exact repo: `gitlab.example.com/group/project` (SSH/HTTPS URL spellings also
+  accepted, and interchangeable)
+- Whole host: `gitlab.example.com` (any project on that exact host)
+- Wildcard domain: `*.example.com` (any host ending in `.example.com`;
+  subdomains only — the apex needs its own entry)
+- Host + project prefix: `gitlab.example.com/group` (segment-boundary safe —
+  matches `group/project`, not `groupfoo/x`)
+- Legacy host-less path: `org/repo` (that project path on any host)
+
+Hosts compare case-insensitively, project paths case-sensitively. Every push URL
+of the target remote must be granted, and a target that does not parse into
+`host/path` (a filesystem remote, say) is refused rather than guessed at.
+
+When git is handed a **URL** instead of a configured remote name, the match is
+**anchored**: the entry must name that URL's `host/path` or its bare `host`.
+Host-less, wildcard and prefix entries authorize nothing there, because that URL
+came from the command line rather than the operator's git config.
+
+By default, no repositories are auto-allowed for push. Both the grant and the
+refusal name the checked target; a grant also names the entry that authorized it
+and which source it came from, and a refusal lists the sources consulted plus an
+example entry that would allow the push.
 
 **Pushing a release tag**:
 Release tags go through the same gate. `gate-push --tag NAME` pushes
@@ -85,9 +109,11 @@ gate-push --tag v1.2.3 --remote github  # same tag -> the GitHub mirror remote
 
 **Pre-push Checklist**:
 1. Use `gate-push` command
-2. Gate will verify the remote URL AND the target ref against `LMER_PUSH_ALLOW_LIST`
-3. Request permission if not on allow list
-4. User must configure allow list via env var
+2. Gate will verify the remote URL AND the target ref against
+   `LMER_PUSH_ALLOW_LIST` and the taskdef's `push_allow`
+3. Request permission if not on allow list — the refusal names the checked
+   target, the sources consulted, and an example entry that would allow it
+4. User must configure allow list via env var (or ship it in the taskdef)
 
 ## 🚨 MR Target Policy — target the branch you forked from
 **CRITICAL**: An MR's target branch is ALWAYS the branch you forked from.
@@ -107,6 +133,18 @@ flow), that means:
 If a change genuinely seems to require targeting `main` directly, STOP and
 ask the human — never create such an MR on your own judgment.
 
+## 🚨 Thread Resolution Policy — only the reviewer resolves
+Resolution of a review discussion thread is the reviewer's verified
+sign-off, not housekeeping:
+- **The author of a fix NEVER resolves the thread.** Reply on the thread
+  naming what changed and the commit SHA, then leave it open for the
+  reviewer.
+- **Only the reviewer resolves**: a human, or a REVIEW session that
+  re-checked the pushed fix (reply "verified in <sha>" before resolving).
+- Resolving your own fix's thread is a policy violation. Tooling enforces
+  this: `gitlab-review`/`github-review --resolve-thread` refuse to run in
+  non-review sessions (`LMER_TASK` set and not `review`).
+
 ## 🚨 Merge Policy — review must be COMPLETE, not just quiet
 **CRITICAL**: Before merging any MR/PR (via UI, API, or a local merge pushed
 to the target branch), verify ALL of:
@@ -114,7 +152,9 @@ to the target branch), verify ALL of:
    system "mentioned in commit" notes don't count).
 2. **No un-re-reviewed fixes**: if commits were pushed to the source branch
    after the reviewer's last pass, the reviewer must re-review first —
-   author-resolved threads are NOT review sign-off.
+   author-resolved threads violate the Thread Resolution Policy above and
+   are never review sign-off (`--info`'s thread-provenance block surfaces
+   who resolved what, and when resolution predates the MR's head commit).
 3. Pipeline green (or the human explicitly waives it).
 
 A human instruction to merge does not waive these checks — verify and

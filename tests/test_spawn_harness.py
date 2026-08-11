@@ -1,9 +1,11 @@
 """Tests for spawn-harness (lmer_cli.container.spawn_harness).
 
 Covers config parsing, agent resolution UX, child-env composition (including
-the structural no-grandchildren strip), harness selection from the child env,
-end-to-end child execution against stub binaries (argv/env capture, output
-redirection, exit-code mirroring, timeout), and the bin/ wrapper.
+the structural no-grandchildren strip and the non-interactive marker), prompt
+composition (including the in-band non-interactive notice), harness selection
+from the child env, end-to-end child execution against stub binaries
+(argv/env capture, output redirection, exit-code mirroring, timeout), and the
+bin/ wrapper.
 """
 
 import argparse
@@ -22,13 +24,15 @@ import pytest
 
 from lmer_cli.container import spawn_harness
 from lmer_cli.container.spawn_harness import (
+    NONINTERACTIVE_NOTICE,
     build_child_env,
     load_agents_config,
     parse_env_pairs,
     resolve_agent,
+    resolve_prompt,
     select_harness,
 )
-from lmer_cli.harness import HARNESSES
+from lmer_cli.harness import HARNESSES, NONINTERACTIVE_ENV, build_exec_argv
 
 BIN_WRAPPER = Path(__file__).parent.parent / "bin" / "spawn-harness"
 
@@ -121,6 +125,27 @@ class TestBuildChildEnv:
         )
         assert "LMER_AGENTS" not in child
         assert "LMER_AGENTS_CONFIG" not in child
+
+    def test_child_is_marked_non_interactive(self):
+        """Children carry LMER_NONINTERACTIVE=1 — nobody is attached to answer."""
+        child = build_child_env({}, {}, {})
+        assert child["LMER_NONINTERACTIVE"] == "1"
+
+    @pytest.mark.parametrize("source", ["parent", "agent", "cli"])
+    def test_non_interactive_cannot_be_unset(self, source):
+        """No overlay turns it off: a child harness process has no human, period."""
+        off = {"LMER_NONINTERACTIVE": "0"}
+        envs = {
+            "parent": (off, {}, {}),
+            "agent": ({}, off, {}),
+            "cli": ({}, {}, off),
+        }[source]
+        assert build_child_env(*envs)["LMER_NONINTERACTIVE"] == "1"
+
+    def test_non_interactive_env_uses_shared_constant(self):
+        """The name is the registry constant, so host and container cannot drift."""
+        assert NONINTERACTIVE_ENV == "LMER_NONINTERACTIVE"
+        assert NONINTERACTIVE_ENV in build_child_env({}, {}, {})
 
 
 class TestSelectHarness:
@@ -263,17 +288,23 @@ class TestResolvePrompt:
         return argparse.Namespace(prompt=prompt, prompt_file=prompt_file)
 
     def test_caller_prompt_alone(self):
-        assert spawn_harness.resolve_prompt(self._ns(prompt="task"), {}) == "task"
+        assert (
+            spawn_harness.resolve_prompt(self._ns(prompt="task"), {})
+            == f"{NONINTERACTIVE_NOTICE}\n\ntask"
+        )
 
     def test_preamble_alone(self):
         agent = {"prompt": "canned persona"}
-        assert spawn_harness.resolve_prompt(self._ns(), agent) == "canned persona"
+        assert (
+            spawn_harness.resolve_prompt(self._ns(), agent)
+            == f"{NONINTERACTIVE_NOTICE}\n\ncanned persona"
+        )
 
     def test_preamble_prepended_to_caller_prompt(self):
         agent = {"prompt": "persona"}
         assert (
             spawn_harness.resolve_prompt(self._ns(prompt="task"), agent)
-            == "persona\n\ntask"
+            == f"{NONINTERACTIVE_NOTICE}\n\npersona\n\ntask"
         )
 
     def test_prompt_file_combined_with_preamble(self, tmp_path):
@@ -281,7 +312,7 @@ class TestResolvePrompt:
         path.write_text("from file")
         agent = {"prompt": "persona"}
         result = spawn_harness.resolve_prompt(self._ns(prompt_file=str(path)), agent)
-        assert result == "persona\n\nfrom file"
+        assert result == f"{NONINTERACTIVE_NOTICE}\n\npersona\n\nfrom file"
 
     def test_no_prompt_and_no_preamble_exits_2(self):
         with pytest.raises(SystemExit) as exc:
@@ -299,6 +330,52 @@ class TestResolvePrompt:
                 self._ns(prompt_file=str(tmp_path / "nope.md")), {}
             )
         assert exc.value.code == 2
+
+    @pytest.mark.parametrize(
+        "ns_kwargs, agent",
+        [
+            ({"prompt": "task"}, {}),
+            ({}, {"prompt": "persona"}),
+            ({"prompt": "task"}, {"prompt": "persona"}),
+        ],
+    )
+    def test_notice_leads_every_prompt_shape(self, ns_kwargs, agent):
+        """The rule must reach the child whatever the prompt is composed from.
+
+        LMER_NONINTERACTIVE marks the process, but no path renders an env value
+        into a model's context — and a claude child gets no AGENTS.md at all
+        (it execs the binary with no runner script). The prompt is the only
+        channel every harness reads the same way (#137).
+        """
+        result = spawn_harness.resolve_prompt(self._ns(**ns_kwargs), agent)
+        assert result.startswith(NONINTERACTIVE_NOTICE)
+
+    def test_notice_states_the_rule_not_just_the_flag(self):
+        """A bare "you are non-interactive" would leave the agent to infer the rule."""
+        assert "no human is attached" in NONINTERACTIVE_NOTICE.lower()
+        assert "Do not end your turn asking for approval" in NONINTERACTIVE_NOTICE
+        assert "do not perform the gated action" in NONINTERACTIVE_NOTICE
+        assert "is still approval" in NONINTERACTIVE_NOTICE
+
+    def test_notice_does_not_rescue_an_empty_prompt(self):
+        """Emptiness is judged on the caller's/preset's text, never on the notice."""
+        with pytest.raises(SystemExit) as exc:
+            spawn_harness.resolve_prompt(self._ns(prompt=""), {})
+        assert exc.value.code == 2
+
+    def test_notice_shields_a_dash_leading_prompt(self):
+        """Side effect worth pinning: the notice removes the leading-dash hazard.
+
+        ``build_exec_argv`` rejects a prompt starting with ``-`` for a harness
+        with no ``--`` sentinel (pi), because the child CLI would parse it as
+        flags. With the notice leading, the composed prompt never starts with a
+        dash, so the child sees prompt text — the guard stays in place for
+        direct callers, it just cannot trip on this path any more.
+        """
+        composed = spawn_harness.resolve_prompt(self._ns(prompt="--version"), {})
+        assert not composed.lstrip().startswith("-")
+        argv, _ = build_exec_argv(HARNESSES["pi"], composed, unattended=True)
+        assert argv[-1] == composed
 
 
 def _make_stub(
@@ -369,7 +446,7 @@ class TestMainEndToEnd:
         )
         assert code == 0
         argv = argv_file.read_text().splitlines()
-        assert argv == [
+        assert argv[:8] == [
             "-p",
             "--no-session-persistence",
             "--dangerously-skip-permissions",
@@ -378,10 +455,15 @@ class TestMainEndToEnd:
             "--effort",
             "max",
             "--",
-            "review the diff",
         ]
+        # The prompt is the notice plus the caller's text; the stub writes argv
+        # one entry per line, so the notice's own newlines land as extra lines.
+        assert "\n".join(argv[8:]) == f"{NONINTERACTIVE_NOTICE}\n\nreview the diff"
         env_lines = env_file.read_text().splitlines()
         assert "LMER_LLM_NAME=opus" in env_lines
+        # The marker must survive all the way to the spawned process, not just
+        # to build_child_env's return value.
+        assert f"{NONINTERACTIVE_ENV}=1" in env_lines
         # Line-anchored on purpose: in CI the child inherits variables like
         # CI_MERGE_REQUEST_DESCRIPTION whose *text* mentions LMER_AGENTS —
         # only actual fan-out variables must be absent.
@@ -399,6 +481,9 @@ class TestMainEndToEnd:
         assert argv[0] == "exec"
         assert "--dangerously-bypass-approvals-and-sandbox" in argv
         assert argv[-1] == "p"
+        # The notice reaches a cross-harness child too — it rides the prompt,
+        # which every harness passes through identically.
+        assert NONINTERACTIVE_NOTICE.splitlines()[0] in argv
 
     def test_env_flag_overrides_preset_env(self, tmp_path):
         code, _, env_file = _run_main(

@@ -5,6 +5,7 @@ Enforces that commit gate was passed before allowing commit.
 """
 import fnmatch
 import os
+import re
 import sys
 import subprocess
 import time
@@ -18,17 +19,180 @@ from datetime import datetime
 # runs standalone in-container and cannot import lmer_cli (same constraint
 # as container/clone_and_exec.py, cf. lmer_cli/tokens.py), so instead of
 # delegating to `gate-push` it mirrors the allow-list check from
-# lmer_cli.gates.GateSystem.run_push_gate / _parse_push_allow_entry.
+# lmer_cli.gates.GateSystem.run_push_gate / _parse_push_allow_entry and the
+# repo-half grammar in lmer_cli.push_allow (#107).
 # Keep the bodies in sync; the mirror is guarded by
 # tests/test_push_allow_grammar_parity.py (#116).
+#
+# The GRAMMAR is mirrored; the SOURCES are not. gate-push unions
+# LMER_PUSH_ALLOW_LIST with the active taskdef's `push_allow` list, which
+# needs the taskdef search this hook cannot run. So a taskdef-granted
+# target is allowed by gate-push and refused here — the safe direction
+# (this hook is stricter, never laxer), and what the parity suite pins is
+# the grammar, not the source set.
+
+
+def _looks_like_scheme(text):
+    """True when `text` is a legal URL scheme.
+
+    RFC 3986 (and `urlsplit`, which is what the lmer_cli side gets this
+    from for free): ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+    """
+    return re.fullmatch(r"[A-Za-z][A-Za-z0-9+.\-]*", text) is not None
+
+
+def _split_bracketed(authority):
+    """(host, path) for a BRACKETED IPv6 authority, ("", "") if not one —
+    mirrors lmer_cli.push_allow._split_bracketed.
+
+    The bracket is the host's boundary, so the address's own colons are
+    not the `host:path` delimiter; the normalized host is the address
+    WITHOUT brackets, which is what urlsplit reports on the lmer_cli side.
+    Only `:path`, `/path` or nothing may follow the `]`; an unclosed or
+    empty bracket names no host.
+    """
+    close = authority.find("]")
+    if close < 0:
+        return "", ""
+    host = authority[1:close]
+    if not host:
+        return "", ""
+    tail = authority[close + 1:]
+    if tail == "":
+        return host, ""
+    if tail[0] in ":/":
+        return host, tail[1:]
+    return "", ""
+
+
+def _split_target(text):
+    """(host, path) for a repo URL or `host/path` — mirrors
+    lmer_cli.push_allow.split_target. Host lowercased, path left alone
+    (paths are case-sensitive), trailing `.git` and slashes dropped.
+    ("", "") for a string that names no host."""
+    t = text.strip().rstrip("/")
+    scheme = t.split("://", 1)[0] if "://" in t else None
+    if scheme is not None and _looks_like_scheme(scheme):
+        # Strip the scheme, then fragment/query, then the authority's
+        # userinfo and port — userinfo may only appear inside the
+        # authority, so a host embedding `@` in its PATH cannot borrow the
+        # identity that follows it.
+        rest = t.split("://", 1)[1].split("#", 1)[0].split("?", 1)[0]
+        authority, _, path = rest.partition("/")
+        authority = authority.rsplit("@", 1)[-1]
+        if authority.startswith("[") or "]" in authority:
+            # A bracketed IPv6 literal: the `]` closes the host and only a
+            # `:port` may follow. Splitting on the first `:` instead would
+            # cut the address in half — every `2001:…` address would
+            # become the single host `[2001` — which is laxer than
+            # urlsplit on the lmer_cli side, i.e. a permission leak.
+            # (the authority was split off at the first `/` above, so what
+            # can follow the `]` here is a port, which is dropped)
+            host, _port = _split_bracketed(authority)
+            if not host:
+                return "", ""
+        else:
+            host = authority.split(":", 1)[0]
+    elif scheme is not None:
+        # `://host/path` and other non-scheme prefixes are not URLs — git
+        # refuses them ("protocol '' is not supported") and urlsplit finds
+        # no authority, so the text after `://` must not be read as a host.
+        return "", ""
+    else:
+        authority = t
+        if "@" in t:
+            user, _, after_at = t.partition("@")
+            if after_at.startswith("[") and "/" not in user:
+                authority = after_at          # scp-like [user@][ipv6]:path
+        if authority.startswith("["):
+            host, path = _split_bracketed(authority)
+            if not host:
+                return "", ""
+        elif "]" in authority.split("/", 1)[0]:
+            return "", ""                     # stray `]`: not an authority
+        else:
+            head, path = t, ""
+            first_seg = t.split("/", 1)[0]
+            if ":" in first_seg:
+                head, path = t.split(":", 1)  # scp-like [user@]host:path
+                if "@" in head:
+                    head = head.rsplit("@", 1)[1]
+            else:
+                if "/" in t:
+                    head, path = t.split("/", 1)
+                if "@" in head:
+                    # No scheme and no `:` before the first `/`: git reads
+                    # the whole string as a local PATH, so there is no
+                    # authority and no userinfo to strip.
+                    return "", ""
+            host = head
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-len(".git")]
+    return host.lower(), path.strip("/")
+
+
+def _entry_rule(entry):
+    """(host_pattern | None, path_prefix) for one entry, or None.
+
+    `None` as the host marks a legacy host-less project path (`org/repo`),
+    which matches that path on any host.
+    """
+    e = entry.strip()
+    if not e:
+        return None
+    first_seg = e.split("/", 1)[0]
+    explicit_host = "://" in e or "@" in first_seg or ":" in first_seg
+    looks_like_host = ("." in first_seg or first_seg == "localhost"
+                       or first_seg.startswith("*"))
+    if not explicit_host and "/" in e and not looks_like_host:
+        prefix = e.rstrip("/")
+        if prefix.endswith(".git"):
+            prefix = prefix[:-len(".git")]
+        return None, prefix
+    host, path = _split_target(e)
+    if not host:
+        return None
+    return host, path
+
+
+def _repo_grants(repo, remote_url):
+    """Repo half of one entry against a CONFIGURED remote's URL.
+
+    Grammar: exact repo, whole host, `*.domain` wildcard (subdomains only,
+    dot boundary enforced), host + project prefix, and the legacy host-less
+    path — all at segment boundaries, host case-insensitive, path
+    case-sensitive. pc.py has no push-by-URL path (its URL always comes
+    from `git remote get-url --push origin`), so the anchored
+    exact-identity branch that gates.py carries has no mirror here.
+    """
+    rule = _entry_rule(repo)
+    if rule is None:
+        return False
+    entry_host, entry_prefix = rule
+    host, path = _split_target(remote_url)
+    if not host or not path:
+        return False  # unidentifiable target: fail closed
+    if entry_host is not None:
+        if entry_host.startswith("*."):
+            if not host.endswith(entry_host[1:]):
+                return False
+        elif host != entry_host:
+            return False
+    return (not entry_prefix or path == entry_prefix
+            or path.startswith(entry_prefix + "/"))
+
+
 def push_allowed(remote_url, ref, allow_list_str=None):
     """True if the allow list authorizes pushing `ref` to `remote_url`.
 
-    Grammar (authoritative docs live in lmer_cli/gates.py): comma-separated
-    entries, each either `repo` (substring of the remote URL, branch refs
-    ONLY) or `repo|refpattern` (fnmatch against the fully-qualified ref,
-    e.g. refs/tags/*). Malformed entries — empty half, more than one `|` —
-    are IGNORED: an unparseable grant must never fail open.
+    Grammar (authoritative docs live in lmer_cli/push_allow.py and
+    lmer_cli/gates.py): comma-separated entries, each either `repo` (branch
+    refs ONLY) or `repo|refpattern` (fnmatch against the fully-qualified
+    ref, e.g. refs/tags/*). The repo half is matched by the #107 grammar
+    (see _repo_grants), not by a substring test. Malformed entries — empty
+    half, more than one `|` — are IGNORED: an unparseable grant must never
+    fail open.
     """
     if allow_list_str is None:
         allow_list_str = os.environ.get("LMER_PUSH_ALLOW_LIST", "")
@@ -45,7 +209,7 @@ def push_allowed(remote_url, ref, allow_list_str=None):
             if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
                 continue
             repo, ref_pattern = parts[0].strip(), parts[1].strip()
-        if repo in remote_url and fnmatch.fnmatch(ref, ref_pattern):
+        if _repo_grants(repo, remote_url) and fnmatch.fnmatch(ref, ref_pattern):
             return True
     return False
 

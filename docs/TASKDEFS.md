@@ -26,15 +26,31 @@ Tasks are discovered from multiple sources, in this precedence order
 2. **Work-repo global** — `{work_repo}/taskdef/`, applies to every project.
 3. **`LMER_TASKDEF_PATHS`** — colon-separated list of extra directories
    passed via the environment.
-4. **`/taskdef`** — the clone of `LMER_TASKDEF_REPO`, when configured. The
-   CLI appends it after any user-supplied `LMER_TASKDEF_PATHS` entries;
-   `LMER_TASKDEF_REF` pins the clone to a branch/tag/SHA (the rollback
-   lever).
+4. **`/taskdef`** — the dedicated taskdef content repo clone, when
+   configured. The **canonical source** of the clone's URL and ref is the
+   work repo's `sources.yaml` declaration (`sources.taskdef.repo` /
+   `ref`) when present; `LMER_TASKDEF_REPO` / `LMER_TASKDEF_REF` act as
+   mismatch-checked overrides of that declaration — when both are set and
+   disagree, the session stops and asks rather than silently picking one
+   (headless sessions refuse to start). With no declaration and no env
+   var, behavior is unchanged legacy: nothing is cloned and this tier is
+   simply absent. `/taskdef` is appended after any user-supplied
+   `LMER_TASKDEF_PATHS` entries; the resolved ref pins the clone to a
+   branch/tag/SHA (the rollback lever). For the `sources.yaml` schema,
+   resolution table, and trust rule, see the sources.yaml section in
+   [LMER-CLI.md](./LMER-CLI.md).
 5. **Built-in** — the `taskdef/` directory shipped with this repository.
 
 This lets a project ship a customised taskdef in its work-repo project
 directory that shadows the built-in one (or adds a new task type) without
 touching the agents/global repo.
+
+When a taskdef repo *is* configured (declared in `sources.yaml` or via the
+env var) and a higher-precedence tier — work-repo project, work-repo
+global, or an `LMER_TASKDEF_PATHS` entry — shadows one of its taskdef
+names, `/start` prints a loud per-name warning naming the winning tier.
+Shadowing stays a supported override feature (see below); the warning
+makes it deliberate rather than accidental.
 
 ## The per-task manifest (`task.yaml`)
 
@@ -68,6 +84,53 @@ Notes:
   it does not veto a taskdef declaration.
 - Distinct from the source-root `taskdef.yaml` (schema versioning, below):
   `task.yaml` sits inside one task's directory and describes that task.
+
+### `push_allow:` — taskdef-declared push targets
+
+A taskdef that knows where its sessions must push can declare it, so the
+operator does not have to configure `LMER_PUSH_ALLOW_LIST` for a target the
+task requires by definition:
+
+```yaml
+push_allow:
+  - gitlab.example.com/group/project
+  - github.com/group/mirror|refs/tags/*
+```
+
+The entries use exactly the `LMER_PUSH_ALLOW_LIST` grammar (see
+[LMER-CLI.md](./LMER-CLI.md) and the `lmer_cli.push_allow` module docstring),
+and the two sources are **unioned** — any single entry granting the target
+allows the push. A bare entry still authorizes branch refs only.
+
+**This key does NOT follow normal tier precedence.** It resolves from the
+**trusted tiers only** — the `LMER_TASKDEF_PATHS` directories, then the
+shipped taskdef root. The work-repo tiers
+(`{work_repo}/{host}/{project}/taskdef/` and `{work_repo}/taskdef/`) are
+excluded, and so are the pre-resolved `LMER_TASKDEF_DIR` /
+`LMER_TASK_INSTRUCTIONS` fallbacks, which may point into one. The reason is
+the threat model, not tidiness: every agent session pushes to the work repo
+through routine `work commit`, so a `task.yaml` landed there would let one
+session grant push targets to every later session of that task type,
+org-wide, without ever passing review. Those tiers keep their normal
+first-match precedence for benign keys like `masterplan:` — the exclusion is
+specific to `push_allow`.
+
+Resolution is fail-soft in the same way as `masterplan:`: a missing,
+unreadable, malformed or wrongly-typed manifest contributes **no entries**
+and never breaks the gate. Only a top-level list of **strings** counts;
+anything else (a mapping, a nested list) is ignored rather than stringified
+into a junk entry.
+
+> **The name is reserved for the grant.** `taskdef/release/task.yaml`
+> records the *roles* a release session must be able to push to
+> (`target: github_mirror`, whose concrete repositories are per-adopter
+> parameters) — that block is documentation-only, nothing parses it, and it
+> is called **`needs.push_targets`**, not `push_allow`. The distinct name is
+> the point: a documentation block sharing the grant's name would be one
+> stray dedent — a diff that reads as whitespace, in a file whose reviewers
+> have no reason to read it as a permission change — away from becoming a
+> live push grant. Only the **top-level** `push_allow` key grants, and only
+> a list of strings there counts.
 
 ## Tier ownership
 

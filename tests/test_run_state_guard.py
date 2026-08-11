@@ -18,6 +18,7 @@ from hooks.run_state_guard import (
     build_ledger_reason,
     build_push_reason,
     build_state_reason,
+    derive_gate_in_flight,
     derive_run_dir,
     derive_run_dir_url,
     detect_activity,
@@ -955,6 +956,125 @@ class TestMainFailOpen:
         r = _run_hook({"cwd": str(tmp_path)}, _guard_env(bin_dir, session, work_repo))
         assert r.returncode == 0
         assert r.stdout.strip() == ""
+
+
+# ---- gate-in-flight stand-down (issue #201) --------------------------------------
+
+class TestDeriveGateInFlight:
+    """Read off `work resume --json`, never from the marker dir: hooks import
+    no project code, so the one definition of "a gate is running" stays in
+    lmer_cli.gate_lock (the run_dir_url pattern)."""
+
+    def test_true_when_reported(self):
+        assert derive_gate_in_flight(_decision(gate_in_flight=True)) is True
+
+    @pytest.mark.parametrize(
+        "decision",
+        [
+            _decision(),                          # absent — an idle machine
+            _decision(gate_in_flight=False),
+            _decision(gate_in_flight=None),
+            {},
+            None,
+            "not a dict",
+        ],
+    )
+    def test_absent_or_false_reads_as_idle(self, decision):
+        """An older work CLI omits the field entirely; that must read exactly
+        like an idle one (the pre-#201 behavior), never as "in flight"."""
+        assert derive_gate_in_flight(decision) is False
+
+
+class TestEvaluateStandsDownDuringAGate:
+    def _loud_inputs(self):
+        """Inputs that would fire all three triggers at once."""
+        return dict(
+            missing_fields=["phase", "goal", "name"],
+            activity=True,
+            state_already_nudged=False,
+            run_dir_dirty=True,
+            run_dir_unpushed=True,
+            push_nudge_count=0,
+            ledger_needed=True,
+            ledger_already_nudged=False,
+        )
+
+    def test_every_trigger_is_suppressed(self):
+        """Not just trigger 2: triggers 1 and 3 mandate `work goal` /
+        `work state set` / `work ledger set`, which write the work repo too."""
+        verdict = evaluate(**self._loud_inputs(), gate_in_flight=True)
+        assert verdict == {
+            "state_reason": None,
+            "ledger_reason": None,
+            "push_reason": None,
+        }
+
+    def test_the_same_inputs_fire_when_no_gate_is_running(self):
+        verdict = evaluate(**self._loud_inputs(), gate_in_flight=False)
+        assert all(verdict.values())
+
+    def test_default_is_no_suppression(self):
+        """Callers that never gathered the flag keep the old behavior."""
+        assert all(evaluate(**self._loud_inputs()).values())
+
+
+class TestMainGateStandDown:
+    def _env(self, tmp_path, session, work_repo, gate_in_flight):
+        decision = _decision(gate_in_flight=True) if gate_in_flight else _decision()
+        return _guard_env(_make_work_cli(tmp_path, decision), session, work_repo)
+
+    def test_dirty_run_dir_does_not_block_while_a_gate_runs(self, tmp_path, session):
+        work_repo, run_dir = _make_work_repo(tmp_path)
+        (run_dir / "scratch.md").write_text("uncommitted\n")
+        r = _run_hook(
+            {"cwd": str(tmp_path)}, self._env(tmp_path, session, work_repo, True)
+        )
+        assert r.returncode == 0
+        assert r.stdout.strip() == ""
+
+    def test_the_nudge_returns_the_moment_the_gate_ends(self, tmp_path, session):
+        """The property "a session cannot stop with unpushed artifacts" rests
+        on this: suppression is bounded by the gate's life, not open-ended."""
+        work_repo, run_dir = _make_work_repo(tmp_path)
+        (run_dir / "scratch.md").write_text("uncommitted\n")
+
+        during = _run_hook(
+            {"cwd": str(tmp_path)}, self._env(tmp_path, session, work_repo, True)
+        )
+        assert during.stdout.strip() == ""
+
+        after = _run_hook(
+            {"cwd": str(tmp_path)}, self._env(tmp_path, session, work_repo, False)
+        )
+        out = json.loads(after.stdout)
+        assert out["decision"] == "block"
+        assert "Push-before-stop check" in out["reason"]
+
+    def test_a_suppressed_stop_spends_no_nudges(self, tmp_path, session):
+        """The counter is the budget for stops the session was actually told
+        about; a suppressed stop must not eat into it."""
+        work_repo, run_dir = _make_work_repo(tmp_path)
+        (run_dir / "scratch.md").write_text("uncommitted\n")
+        for _ in range(PUSH_NUDGE_CAP + 2):
+            _run_hook(
+                {"cwd": str(tmp_path)}, self._env(tmp_path, session, work_repo, True)
+            )
+        assert not Path(COUNTER_TEMPLATE.format(session=session)).exists()
+
+        after = _run_hook(
+            {"cwd": str(tmp_path)}, self._env(tmp_path, session, work_repo, False)
+        )
+        assert json.loads(after.stdout)["decision"] == "block"
+
+    def test_state_trigger_is_suppressed_and_keeps_its_sentinel(self, tmp_path, session):
+        ws = _make_workspace(tmp_path, active=True)
+        bin_dir = _make_work_cli(
+            tmp_path, _decision(phase=None, name=None, gate_in_flight=True)
+        )
+        env = _guard_env(bin_dir, session, tmp_path / "no-work-repo")
+        r = _run_hook({"cwd": str(ws)}, env)
+        assert r.stdout.strip() == ""
+        assert not Path(SENTINEL_TEMPLATE.format(session=session)).exists()
 
 
 # ---- settings.json wiring (drift guard) -------------------------------------------

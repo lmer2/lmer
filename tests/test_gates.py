@@ -4,6 +4,7 @@ Tests for the gate system and gate commands
 """
 
 import pytest
+import re
 import subprocess
 import os
 import sys
@@ -598,6 +599,10 @@ class TestGateSystem:
                     return MagicMock(returncode=2, stdout="", stderr=f"error: No such remote '{remote}'")
                 if "--push" in command:
                     url = pushurls.get(remote, url)
+                # A remote may carry several pushurls; `get-url --push
+                # --all` prints one per line and `git push` dials them all.
+                if isinstance(url, (list, tuple)):
+                    url = "\n".join(url)
                 return MagicMock(returncode=0, stdout=url + "\n", stderr="")
             if command[:3] == ["git", "branch", "--show-current"]:
                 return MagicMock(returncode=0, stdout=branch + "\n", stderr="")
@@ -614,8 +619,9 @@ class TestGateSystem:
         success = self.gate.run_push_gate()
         assert success == False
 
-    # NB: SSH remote URLs spell the repo `github.com:user/other-repo` — the
-    # repo half is a plain substring, so entries name the path (`user/repo`).
+    # NB: SSH remote URLs spell the repo `github.com:user/other-repo`, which
+    # the grammar parses into host `github.com` + path `user/other-repo`; a
+    # host-less entry names the path (#107).
     @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "user/other-repo"})
     @patch('subprocess.run')
     def test_run_push_gate_allowed(self, mock_run):
@@ -1755,12 +1761,143 @@ class TestGateStructure:
         content = main_config.read_text()
         assert "## 🛑 ERROR GATE" in content
 
-        # Check for required elements
+        # Check for required elements — the report block survives the
+        # risk-based rewrite, scoped to the STOP cases.
         assert "❌ ERROR ENCOUNTERED:" in content
         assert "📍 WHERE:" in content
         assert "🔍 ANALYSIS:" in content
         assert "🔧 PROPOSED FIX:" in content
         assert "💭 WHY THIS FIX:" in content
+
+    def test_error_gate_triggers_on_fix_cost_not_on_failure(self):
+        """The gate keys on what the fix costs, not on any error occurring (#137).
+
+        Gating every failure halts an agent on its own malformed commands — in a
+        headless child that is a dropped result, not a pause. Visibility stays
+        unconditional; only the narrow authorization cases stop.
+        """
+        content = (Path(__file__).parent.parent / "AGENTS.md").read_text()
+        # Whitespace-normalized: these rules must survive a reflow or a
+        # markdown formatter pass, which line-wrap columns and bullet indents
+        # would not.
+        flat = " ".join(content.split())
+
+        assert "## 🛑 ERROR GATE - When a fix needs authorization" in content
+        assert "## 🛑 ERROR GATE - When Something Fails" not in content
+
+        # The no-gate classes must stay explicitly no-gate.
+        assert "**Your own malformed command**" in flat
+        assert "fix it and continue" in flat
+        assert "**Environment or capability gap**" in flat
+
+        # A missing binary is a capability gap (class 2), never class 1 —
+        # class 2 carries the worked example that decides it.
+        assert "missing shortcut binary" not in flat
+        assert "`grep` for a missing `rg`" in flat
+
+        # The gated classes, and the churn trigger the gate exists for.
+        assert "when the fix would mutate state, is hard to reverse" in flat
+        assert "when you do not understand the cause" in flat
+
+        # Showing the error is never conditional on stopping.
+        assert "Visibility is unconditional in all four cases" in flat
+
+    def test_error_gate_report_has_non_interactive_closing(self):
+        """The STOP template must not hand a headless agent a question to emit.
+
+        The template is the most local, most concrete instruction at a STOP,
+        so a bare `(yes/no)` closing line would out-argue the general rule 130
+        lines above it (#137).
+        """
+        content = (Path(__file__).parent.parent / "AGENTS.md").read_text()
+        flat = " ".join(content.split())
+
+        assert "Shall I proceed with this fix? (yes/no)" in flat
+        assert "In a non-interactive session, replace that closing question" in flat
+        assert "⏸️ STOPPED — would have asked" in flat
+
+        # The override has to follow the template it overrides.
+        assert content.index("Shall I proceed with this fix?") < content.index(
+            "In a non-interactive session, replace that closing question"
+        )
+
+    def test_non_interactive_section(self):
+        """A headless session must report instead of ending its turn on a question."""
+        content = (Path(__file__).parent.parent / "AGENTS.md").read_text()
+        flat = " ".join(content.split())
+
+        assert "## 🤖 NON-INTERACTIVE SESSIONS" in content
+        assert "LMER_NONINTERACTIVE" in flat
+        assert "no gate below may end your turn with a question" in flat
+        # Not asking must not decay into doing it anyway.
+        assert "Do NOT perform the gated action either" in flat
+
+        # The clause has to precede the gates it governs.
+        assert content.index("## 🤖 NON-INTERACTIVE SESSIONS") < content.index(
+            "## 🛑 COMMIT GATE"
+        )
+
+    def test_non_interactive_section_states_truthy_contract(self):
+        """The prose is the parsing contract — no Python reads this var (#137).
+
+        Every other boolean LMER_* var documents `1`/`true`/`yes` on and
+        `0`/`false`/`no` off; a strict `=1` reading would make `=true` silently
+        mean "a human is present", which is the failure class this section is
+        about.
+        """
+        flat = " ".join((Path(__file__).parent.parent / "AGENTS.md").read_text().split())
+
+        assert "`1`, `true`, `yes`, case-insensitive" in flat
+        assert "A falsy value (`0`, `false`, `no`) or an unset variable" in flat
+
+    def test_non_interactive_section_carves_out_advance_approval(self):
+        """Composed with the COMMIT GATE, no carve-out makes headless runs useless.
+
+        cron/CI launches are exactly the runs whose purpose is to produce
+        committed work, so the section has to say that approval granted before
+        the session started still counts (#137).
+        """
+        flat = " ".join((Path(__file__).parent.parent / "AGENTS.md").read_text().split())
+
+        assert "Approval already granted before the session started is still approval" in flat
+        assert "covers approvals you would have to obtain *now*" in flat
+        # And it must say what each gate does instead of stopping.
+        assert "**CONTEXT SWITCH GATE** — state the switch" in flat
+        assert "**COMMIT GATE** — run `gate-check`" in flat
+
+    def test_cli_env_dict_declares_non_interactive(self):
+        """Guard: LMER_NONINTERACTIVE must be in cli.py's container env dict.
+
+        Without this entry, a cron wrapper exporting LMER_NONINTERACTIVE=1 on
+        the host has no effect on the agent inside the container, where the
+        AGENTS.md section above is what reads it. Lives beside that section's
+        tests rather than in the spawn-harness module: the reader is AGENTS.md,
+        not child-env composition.
+        """
+        cli_py = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
+        pattern = re.compile(
+            r"""["']LMER_NONINTERACTIVE["']\s*:\s*os\.environ\.get\(\s*"""
+            r"""["']LMER_NONINTERACTIVE["']\s*\)"""
+        )
+        assert pattern.search(cli_py.read_text()), \
+            "LMER_NONINTERACTIVE entry missing from cli.py container env dict"
+
+    def test_non_interactive_fragment_carries_the_rule(self):
+        """The fragment is how the rule reaches a session at all (#137).
+
+        Nothing renders an LMER_* value into a model's context, and claude
+        discovers only CLAUDE.md natively — so for headless launches this file,
+        not the variable, is the delivery. It must therefore restate the rule
+        rather than point at AGENTS.md.
+        """
+        fragment = Path(__file__).parent.parent / "prompts" / "non-interactive.md"
+        assert fragment.is_file(), "prompts/non-interactive.md is missing"
+        flat = " ".join(fragment.read_text().split())
+
+        assert "No gate may end your turn with a question" in flat
+        assert "do not perform the gated action either" in flat
+        assert "is still approval" in flat
+
 
     def test_context_switch_gate(self):
         """Verify CONTEXT SWITCH GATE exists."""
@@ -1954,6 +2091,450 @@ class TestResolvePrecommitCommand:
         (tmp_path / "poetry.lock").write_text("")
         self.gate.project_root = tmp_path
         assert self.gate._resolve_precommit_command() == ["pre-commit"]
+
+
+class TestPushAllowGrammar:
+    """The repo half of an allow-list entry (#107).
+
+    The verdicts every enforcement point must agree on live in
+    tests/test_push_allow_grammar_parity.py; this class pins the module's
+    own API, including the push-by-URL branch that has no mirror in
+    hooks/pc.py.
+    """
+
+    @pytest.mark.parametrize("entry,url,expected", [
+        # Exact repo — SSH/HTTPS/bare spellings are interchangeable.
+        ("git@gitlab.example.com:group/project.git",
+         "git@gitlab.example.com:group/project.git", True),
+        ("gitlab.example.com/group/project",
+         "https://gitlab.example.com/group/project.git", True),
+        ("https://gitlab.example.com/group/project",
+         "git@gitlab.example.com:group/project.git", True),
+        ("gitlab.example.com/group/project",
+         "git@gitlab.example.com:group/other.git", False),
+        # Whole host — any project on the EXACT host, not a suffix of it.
+        ("gitlab.example.com", "git@gitlab.example.com:anything/at/all.git", True),
+        ("gitlab.example.com", "git@sub.gitlab.example.com:x/y.git", False),
+        ("gitlab.example.com", "git@github.com:user/repo.git", False),
+        # Wildcard domain — subdomains only, dot boundary enforced.
+        ("*.example.com", "git@gitlab.example.com:x/y.git", True),
+        ("*.example.com", "https://code.example.com/a/b", True),
+        ("*.example.com", "git@example.com:x/y.git", False),      # apex
+        ("*.example.com", "git@evilexample.com:x/y.git", False),  # dot boundary
+        # Host + project prefix — segment-boundary safe.
+        ("gitlab.example.com/group", "git@gitlab.example.com:group/project.git", True),
+        ("gitlab.example.com/group",
+         "https://gitlab.example.com/group/project/sub.git", True),
+        ("gitlab.example.com/group", "git@gitlab.example.com:groupfoo/x.git", False),
+        ("gitlab.example.com/group", "git@other.example.com:group/project.git", False),
+        ("*.example.com/group", "git@code.example.com:group/project.git", True),
+        # Legacy host-less project path — any host, segment boundary.
+        ("org/repo1", "git@github.com:org/repo1.git", True),
+        ("org/repo1", "https://gitlab.example.com/org/repo1", True),
+        ("org/repo1", "git@github.com:org/repo10.git", False),
+        # Hosts compare case-insensitively, project paths do not.
+        ("GITLAB.example.COM", "git@gitlab.example.com:x/y.git", True),
+        ("gitlab.example.com/Group/Project",
+         "git@gitlab.example.com:group/project.git", False),
+        # A host that merely EMBEDS the allowed path grants nothing — the
+        # substring rule this grammar replaced allowed exactly this.
+        ("org/repo1", "https://evil.example.com/mirror/org/repo1.git", False),
+        # IPv6 literals: the bracket bounds the host, so the address's own
+        # colons are not the `host:path` delimiter. Cutting at the first
+        # colon instead makes every `2001:…` address one host.
+        ("[2001:db8::1]/group/project",
+         "https://[2001:db8::1]/group/project", True),
+        ("[2001:db8::1]/group/project",
+         "git@[2001:db8::1]:group/project.git", True),
+        ("[2001:db8::1]", "https://[2001:db8::1]/anything/at/all", True),
+        ("[2001:db8::1]", "https://[2001:db8::9999]/group/project", False),
+        ("[::1]/group/project", "https://[::2]/group/project", False),
+        ("[2001", "https://[2001:db8::1]/group/project", False),
+        # An unclosed bracket names no host, in the entry or in the target.
+        ("[2001:db8::1", "https://[2001:db8::1]/group/project", False),
+        ("group/project", "https://[::1/group/project", False),
+    ])
+    def test_matrix(self, entry, url, expected):
+        from lmer_cli import push_allow
+        assert push_allow.target_allowed(url, [entry]) is expected
+
+    def test_union_any_entry_grants(self):
+        from lmer_cli import push_allow
+        entries = ["nope.example.com", "org/repo", "other.example.com"]
+        assert push_allow.target_allowed("git@github.com:org/repo.git", entries)
+
+    def test_granting_entry_names_the_winner(self):
+        from lmer_cli import push_allow
+        entries = ["nope.example.com", "org/repo"]
+        assert push_allow.granting_entry(
+            "git@github.com:org/repo.git", entries) == "org/repo"
+
+    def test_empty_allow_list_refuses(self):
+        from lmer_cli import push_allow
+        assert not push_allow.target_allowed("git@github.com:org/repo.git", [])
+
+    @pytest.mark.parametrize("url", [
+        "/srv/git/repo.git",          # filesystem remote: no host
+        "https://gitlab.example.com", # host but no project
+    ])
+    def test_unidentifiable_target_refuses(self, url):
+        """A target that does not parse into host+path cannot be named by
+        any entry, so it is refused rather than guessed at. (#107's first
+        cut fell back to a substring test here; that fallback is gone —
+        the gate says so in its refusal message instead.)"""
+        from lmer_cli import push_allow
+        assert not push_allow.target_allowed(url, ["repo", "gitlab.example.com"])
+
+    def test_example_entry_rebrackets_an_ipv6_host(self):
+        """The refusal's copy-pasteable example must PARSE as an entry. The
+        normalized host is the bare address, but the bare spelling is not a
+        legal entry — `2001:db8::1/group/project` reads as host `2001`
+        under the scp-like rule — so the example has to re-bracket it, or
+        pasting it earns a second refusal."""
+        from lmer_cli import push_allow
+        example = push_allow.example_entry(
+            "https://[2001:db8::1]/group/project.git")
+        assert example == "[2001:db8::1]/group/project"
+        # ...and it round-trips: the entry it prints grants the push.
+        assert push_allow.target_allowed(
+            "https://[2001:db8::1]/group/project.git", [example])
+        # IPv4 and DNS hosts are untouched by the re-bracketing.
+        assert push_allow.example_entry(
+            "git@gitlab.example.com:x/y.git") == "gitlab.example.com/x/y"
+
+    @pytest.mark.parametrize("entry,expected", [
+        ("[2001:db8::1]/group/project", True),   # full host/path
+        ("[2001:db8::1]", True),                 # bare host
+        ("[2001:db8::9999]/group/project", False),  # a different address
+        ("[2001", False),                        # not a host prefix
+    ])
+    def test_push_by_url_pins_the_ipv6_address(self, entry, expected):
+        """The anchored branch pins the whole address, not its first
+        hextet: the entry must name the identity git will dial."""
+        from lmer_cli import push_allow
+        assert push_allow.target_allowed(
+            "https://[2001:db8::1]/group/project", [entry],
+            exact_identity=True) is expected
+
+    @pytest.mark.parametrize("entry,expected", [
+        ("gitlab.example.com/group/project", True),   # full host/path
+        ("gitlab.example.com", True),                 # bare host
+        ("group/project", False),                     # host-less: no host pinned
+        ("*.example.com", False),                     # wildcard: no host pinned
+        ("gitlab.example.com/group", False),          # prefix: not the identity
+    ])
+    def test_push_by_url_requires_the_exact_identity(self, entry, expected):
+        """On the push-by-URL branch the URL is agent-supplied, so only an
+        entry naming the exact identity git will dial grants. The grammar
+        added by #107 must never widen this branch."""
+        from lmer_cli import push_allow
+        assert push_allow.target_allowed(
+            "https://gitlab.example.com/group/project.git", [entry],
+            exact_identity=True) is expected
+
+
+class TestPushGateTaskdefUnion:
+    """gate-push unions LMER_PUSH_ALLOW_LIST with the taskdef's task.yaml
+    push_allow list — resolved from the trusted taskdef tiers only, never
+    the agent-writable work-repo tiers (#107)."""
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+
+    def _isolate(self, monkeypatch, tmp_path, task="pushtask",
+                 manifest=None, work_manifest=None):
+        """Point the taskdef search at tmp tiers, away from ambient config.
+
+        ``manifest`` lands in a trusted tier (an LMER_TASKDEF_PATHS dir);
+        ``work_manifest`` lands in BOTH work-repo tiers (project-scoped and
+        work-global), which must never contribute push grants. Returns the
+        trusted manifest path.
+        """
+        trusted = tmp_path / "trusted-taskdefs"
+        trusted_task = trusted / task
+        trusted_task.mkdir(parents=True, exist_ok=True)
+        if manifest is not None:
+            (trusted_task / "task.yaml").write_text(manifest)
+
+        work = tmp_path / "work"
+        host, project = "git.example.com", "group/proj"
+        for tier in (work / host / project / "taskdef", work / "taskdef"):
+            task_dir = tier / task
+            task_dir.mkdir(parents=True, exist_ok=True)
+            if work_manifest is not None:
+                (task_dir / "task.yaml").write_text(work_manifest)
+
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(trusted))
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        monkeypatch.setenv("LMER_REPO_HOST", host)
+        monkeypatch.setenv("LMER_REPO_PROJECT", project)
+        monkeypatch.setenv("LMER_TASK", task)
+        monkeypatch.delenv("LMER_PUSH_ALLOW_LIST", raising=False)
+        for var in ("LMER_TASKDEF_DIR", "LMER_TASK_INSTRUCTIONS", "LMER_TASKDEF"):
+            monkeypatch.delenv(var, raising=False)
+        return trusted_task / "task.yaml"
+
+    def _mock_git(self, url="git@gitlab.example.com:x/y.git", branch="feature-x"):
+        def fake_run(command, **kwargs):
+            if command[:3] == ["git", "remote", "get-url"]:
+                return MagicMock(returncode=0, stdout=url + "\n", stderr="")
+            if command[:3] == ["git", "branch", "--show-current"]:
+                return MagicMock(returncode=0, stdout=branch + "\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return fake_run
+
+    def test_reads_trusted_task_yaml(self, monkeypatch, tmp_path):
+        from lmer_cli import push_allow
+        self._isolate(monkeypatch, tmp_path,
+                      manifest="push_allow:\n  - gitlab.example.com\n  - org/repo\n")
+        assert push_allow.taskdef_allow_list() == ["gitlab.example.com", "org/repo"]
+
+    def test_reports_manifest_path(self, monkeypatch, tmp_path):
+        from lmer_cli import push_allow
+        manifest_path = self._isolate(monkeypatch, tmp_path,
+                                      manifest="push_allow:\n  - org/repo\n")
+        assert push_allow.taskdef_allow_source() == (["org/repo"], manifest_path)
+
+    def test_work_repo_tier_manifest_never_grants(self, monkeypatch, tmp_path):
+        """The work repo is pushed to by every session, so a task.yaml
+        smuggled into it must not be able to grant itself push targets."""
+        from lmer_cli import push_allow
+        self._isolate(monkeypatch, tmp_path,
+                      work_manifest="push_allow:\n  - '*.example.com'\n")
+        assert push_allow.taskdef_allow_source() == ([], None)
+
+    def test_trusted_tier_wins_over_work_repo_override(self, monkeypatch, tmp_path):
+        from lmer_cli import push_allow
+        self._isolate(monkeypatch, tmp_path,
+                      manifest="push_allow:\n  - org/trusted\n",
+                      work_manifest="push_allow:\n  - '*.example.com'\n")
+        assert push_allow.taskdef_allow_list() == ["org/trusted"]
+
+    def test_pre_resolved_dir_fallback_never_grants(self, monkeypatch, tmp_path):
+        """LMER_TASKDEF_DIR may point into a work-repo tier, so it is not a
+        grant source either."""
+        from lmer_cli import push_allow
+        self._isolate(monkeypatch, tmp_path)
+        work_task = tmp_path / "work" / "taskdef" / "pushtask"
+        (work_task / "task.yaml").write_text("push_allow:\n  - '*.example.com'\n")
+        monkeypatch.setenv("LMER_TASKDEF_DIR", str(work_task))
+        assert push_allow.taskdef_allow_source() == ([], None)
+
+    @pytest.mark.parametrize("manifest", [
+        "",                                   # empty file
+        "not-a-mapping\n",                    # scalar document
+        "push_allow: {}\n",                   # wrong node type
+        "push_allow:\n  - [a, b]\n",          # non-string member
+        "push_allow: [unclosed\n",            # malformed YAML
+    ])
+    def test_fail_soft(self, monkeypatch, tmp_path, manifest):
+        """A bad manifest must never grant, and never crash the gate."""
+        from lmer_cli import push_allow
+        self._isolate(monkeypatch, tmp_path, manifest=manifest)
+        assert push_allow.taskdef_allow_source()[0] == []
+
+    @pytest.mark.parametrize("key", ["push_targets", "push_allow"])
+    def test_nested_block_is_never_a_grant(self, monkeypatch, tmp_path, key):
+        """taskdef/release/task.yaml carries a documentation-only list of
+        ROLE mappings nested under `needs:`. It is spelled
+        `needs.push_targets` so it cannot be confused with the grant key at
+        all (docs/TASKDEFS.md) — but the resolver must ignore a nested
+        block under EITHER spelling, and the mapping shape must not be
+        stringified into a junk entry if one ever moved to the top level."""
+        from lmer_cli import push_allow
+        self._isolate(monkeypatch, tmp_path, manifest=(
+            "needs:\n"
+            f"  {key}:\n"
+            "    - target: github_mirror\n"
+            "      refs:\n"
+            "        - refs/tags/*\n"
+        ))
+        assert push_allow.taskdef_allow_source() == ([], None)
+
+    @patch('subprocess.run')
+    def test_gate_allows_via_taskdef_grant(self, mock_run, monkeypatch,
+                                           tmp_path, capsys):
+        manifest_path = self._isolate(
+            monkeypatch, tmp_path,
+            manifest="push_allow:\n  - gitlab.example.com/x\n")
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate() is True
+        out = capsys.readouterr().out
+        assert "granted by 'gitlab.example.com/x'" in out
+        assert f"task.yaml @ {manifest_path}" in out
+
+    @patch('subprocess.run')
+    def test_gate_refuses_work_repo_tier_grant(self, mock_run, monkeypatch,
+                                               tmp_path):
+        self._isolate(monkeypatch, tmp_path,
+                      work_manifest="push_allow:\n  - '*.example.com'\n")
+        mock_run.side_effect = self._mock_git()
+        assert self.gate.run_push_gate() is False
+
+    @patch('subprocess.run')
+    def test_taskdef_entry_is_branch_only_unless_ref_scoped(
+            self, mock_run, monkeypatch, tmp_path):
+        """A taskdef grant obeys the same ref rule as an env one: bare
+        entries authorize branches, never tags."""
+        self._isolate(monkeypatch, tmp_path,
+                      manifest="push_allow:\n  - gitlab.example.com\n")
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(ref="refs/tags/v1.0") is False
+        assert self.gate.run_push_gate(ref="refs/heads/main") is True
+
+    @patch('subprocess.run')
+    def test_taskdef_entry_may_scope_a_tag_push(self, mock_run, monkeypatch,
+                                                tmp_path):
+        self._isolate(
+            monkeypatch, tmp_path,
+            manifest="push_allow:\n  - 'gitlab.example.com|refs/tags/*'\n")
+        mock_run.side_effect = self._mock_git()
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate(ref="refs/tags/v1.0") is True
+
+
+class TestPushGateTransparency:
+    """Both the grant and the refusal name the target, the sources consulted
+    and the entry involved (#107). The grant path matters most: a grant
+    arriving from a taskdef manifest rather than the operator's env is
+    exactly the case worth seeing."""
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+
+    @pytest.fixture(autouse=True)
+    def _no_ambient_taskdef(self, monkeypatch, tmp_path):
+        """The taskdef half of the union must not be whatever happens to be
+        installed: `test_refusal_names_sources_and_an_example_entry` asserts
+        "(none declared)", and an ambient `push_allow` would union into
+        every verdict here. Same isolation as
+        TestPushGateTaskdefUnion._isolate."""
+        monkeypatch.setenv("LMER_TASKDEF_PATHS", str(tmp_path / "empty"))
+        for var in ("LMER_TASK", "LMER_TASKDEF", "LMER_TASKDEF_DIR",
+                    "LMER_TASK_INSTRUCTIONS"):
+            monkeypatch.delenv(var, raising=False)
+
+    def _mock_git(self, urls, branch="feature-x"):
+        def fake_run(command, **kwargs):
+            if command[:3] == ["git", "remote", "get-url"]:
+                return MagicMock(returncode=0, stdout="\n".join(urls) + "\n",
+                                 stderr="")
+            if command[:3] == ["git", "branch", "--show-current"]:
+                return MagicMock(returncode=0, stdout=branch + "\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return fake_run
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "gitlab.example.com"})
+    @patch('subprocess.run')
+    def test_grant_names_entry_and_source(self, mock_run, capsys):
+        mock_run.side_effect = self._mock_git(["git@gitlab.example.com:x/y.git"])
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate() is True
+        out = capsys.readouterr().out
+        assert "Push target allowed" in out
+        assert "granted by 'gitlab.example.com' from LMER_PUSH_ALLOW_LIST" in out
+        assert "refs/heads/feature-x" in out
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "other.example.com"})
+    @patch('subprocess.run')
+    def test_refusal_names_sources_and_an_example_entry(self, mock_run, capsys):
+        mock_run.side_effect = self._mock_git(["git@gitlab.example.com:x/y.git"])
+
+        assert self.gate.run_push_gate() is False
+        out = capsys.readouterr().out
+        assert "Sources checked:" in out
+        assert "LMER_PUSH_ALLOW_LIST: other.example.com" in out
+        assert "taskdef task.yaml push_allow: (none declared)" in out
+        assert "Example entry that would allow this push: gitlab.example.com/x/y" in out
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "gitlab.example.com"})
+    @patch('subprocess.run')
+    def test_refusal_example_carries_the_ref_half_for_a_tag(self, mock_run, capsys):
+        """A bare entry authorizes branches only, so the example offered for
+        a refused TAG push must carry the ref half — otherwise copy-pasting
+        it produces a second refusal."""
+        mock_run.side_effect = self._mock_git(["git@other.example.com:x/y.git"])
+
+        assert self.gate.run_push_gate(ref="refs/tags/v1.0") is False
+        out = capsys.readouterr().out
+        assert "other.example.com/x/y|refs/tags/v1.0" in out
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "repo"})
+    @patch('subprocess.run')
+    def test_refusal_explains_an_unidentifiable_target(self, mock_run, capsys):
+        """A filesystem remote parses into no host/path, so no entry can
+        name it. Say that, instead of printing an example that cannot work."""
+        mock_run.side_effect = self._mock_git(["/srv/git/repo.git"])
+
+        assert self.gate.run_push_gate() is False
+        assert "does not parse into host/path" in capsys.readouterr().out
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "gitlab.example.com"})
+    @patch('subprocess.run')
+    def test_every_push_url_must_be_granted(self, mock_run, capsys):
+        """`git push` sends the ref to EVERY pushurl of the remote, so one
+        unallowlisted pushurl is one unauthorized push — even though the
+        other one is allowed."""
+        mock_run.side_effect = self._mock_git([
+            "git@gitlab.example.com:x/y.git",
+            "git@evil.example.org:x/y.git",
+        ])
+
+        assert self.gate.run_push_gate() is False
+        out = capsys.readouterr().out
+        assert "evil.example.org" in out
+        assert "not allowed" in out
+
+    @patch.dict(os.environ,
+                {"LMER_PUSH_ALLOW_LIST": "gitlab.example.com,evil.example.org"})
+    @patch('subprocess.run')
+    def test_all_push_urls_granted_passes(self, mock_run):
+        mock_run.side_effect = self._mock_git([
+            "git@gitlab.example.com:x/y.git",
+            "git@evil.example.org:x/y.git",
+        ])
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate() is True
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "gitlab.example.com"})
+    @patch('subprocess.run')
+    def test_the_same_pushurl_listed_twice_still_passes(self, mock_run):
+        """`git remote set-url --add --push origin <url>` run twice — a
+        re-run setup script — leaves the SAME pushurl on the remote twice,
+        and `get-url --push --all` prints both lines. The verdict must key
+        on whether any URL was REFUSED, not on a count: grants are keyed by
+        URL, so two identical lines collapse to one grant and a count
+        comparison could never be satisfied — refusing a push whose every
+        target is allowed, with no URL marked as the reason."""
+        dup = "git@gitlab.example.com:x/y.git"
+        mock_run.side_effect = self._mock_git([dup, dup])
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+        assert self.gate.run_push_gate() is True
+
+    @patch.dict(os.environ, {"LMER_PUSH_ALLOW_LIST": "other.example.com"})
+    @patch('subprocess.run')
+    def test_refusal_marks_every_denied_url_including_duplicates(
+            self, mock_run, capsys):
+        """The refusal must remain explainable when a duplicate pushurl is
+        the one refused: every denied line marked, and an example entry
+        offered (both are driven off the denial list, which is why it is a
+        list rather than the complement of the grants dict)."""
+        dup = "git@gitlab.example.com:x/y.git"
+        mock_run.side_effect = self._mock_git([dup, dup])
+
+        assert self.gate.run_push_gate() is False
+        out = capsys.readouterr().out
+        assert out.count("<-- not allowed") == 2
+        assert ("Example entry that would allow this push: "
+                "gitlab.example.com/x/y") in out
 
 
 if __name__ == "__main__":

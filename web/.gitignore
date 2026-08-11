@@ -1,0 +1,4 @@
+# Build output is not committed (spec D10): the host builds it with
+# `lmer platform setup-ui`, which fetches a pinned standalone Node itself.
+dist/
+node_modules/

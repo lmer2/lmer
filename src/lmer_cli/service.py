@@ -44,7 +44,9 @@ def _docker_ps(runtime: str, filter_arg: str) -> list[tuple[str, str]]:
     return out
 
 
-def resolve_container(runtime: str, service_name: str) -> str:
+def resolve_container(
+    runtime: str, service_name: str, *, announce: bool = True
+) -> str:
     """
     Find a running container matching the given service name.
 
@@ -60,6 +62,13 @@ def resolve_container(runtime: str, service_name: str) -> str:
     Args:
         runtime: Container runtime ('docker' or 'podman')
         service_name: Compose service name OR exact container name
+        announce: Whether a successful resolution prints its line to stderr.
+            True for the interactive path, where the line confirms that
+            `--service` found what the user meant. False for a polled caller —
+            `lmer_platform.slots` probes every slot on a schedule, and a success
+            line per slot per poll would bury the daemon's log. A flag rather
+            than a second resolver, so the polled answer cannot drift from the
+            interactive one.
 
     Returns:
         Container ID of the running container
@@ -73,11 +82,12 @@ def resolve_container(runtime: str, service_name: str) -> str:
     )
     if len(label_matches) == 1:
         cid, name = label_matches[0]
-        print(
-            f"✅ Resolved service '{service_name}' → container {name} "
-            f"({cid[:12]}) [compose label]",
-            file=sys.stderr,
-        )
+        if announce:
+            print(
+                f"✅ Resolved service '{service_name}' → container {name} "
+                f"({cid[:12]}) [compose label]",
+                file=sys.stderr,
+            )
         return cid
     if len(label_matches) > 1:
         names = ", ".join(n for _, n in label_matches)
@@ -95,10 +105,11 @@ def resolve_container(runtime: str, service_name: str) -> str:
     ]
     if len(name_matches) == 1:
         cid, name = name_matches[0]
-        print(
-            f"✅ Resolved service '{service_name}' → container {name} ({cid[:12]})",
-            file=sys.stderr,
-        )
+        if announce:
+            print(
+                f"✅ Resolved service '{service_name}' → container {name} ({cid[:12]})",
+                file=sys.stderr,
+            )
         return cid
 
     # No match — list running containers for the error message.

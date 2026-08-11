@@ -33,12 +33,20 @@ import os
 import pty
 import signal
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from lmer_cli.presets import Preset
+from lmer_cli.presets import Preset, preset_selector_vars, select_preset_name
 
 logger = logging.getLogger("lmer_slack.sessions")
+
+# The taskdef every spawned session runs: the listener's command is always
+# `lmer chat <permalink>`. Named because it is also what decides which
+# taskdef-scoped env var can select a preset for those sessions
+# (`LMER_CHAT_PRESET`, issue #140) — the command and the selector must stay
+# the same taskdef or the listener would strip the wrong variable (#181).
+CHAT_TASK_ID = "chat"
 
 # How often the reaper loop wakes up to check sessions, in seconds.
 REAP_INTERVAL_SECONDS = 15.0
@@ -50,6 +58,27 @@ SHUTDOWN_GRACE_SECONDS = 10.0
 def _kv(**fields) -> str:
     """Render ``key=value`` pairs for a structured-ish stdlib log line."""
     return " ".join(f"{k}={v}" for k, v in fields.items())
+
+
+def listener_default_preset(
+    environ: Mapping[str, str] | None = None,
+) -> tuple[str | None, str | None]:
+    """Return the ``(name, source)`` of the listener-wide default preset.
+
+    Every session the listener spawns is an ``lmer chat`` invocation
+    inheriting the listener's environment, so ``LMER_CHAT_PRESET`` (and,
+    failing that, ``LMER_PRESET``) selects a preset for all of them — the
+    taskdef-scoped selector from issue #140 landing on the one taskdef this
+    spawner ever runs. That is a supported listener-wide default, not an
+    accident, but it is only honest if callers can *name* it: the ack tells
+    the Slack user which preset their session actually got, and the spawn log
+    records the one a ``$preset:`` token displaced (issue #181).
+
+    Returns ``(None, None)`` when no variable selects anything. Resolving the
+    name against the presets file is the caller's job — an undefined name is
+    still "what is selected".
+    """
+    return select_preset_name(None, CHAT_TASK_ID, environ)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -231,6 +260,27 @@ class SessionManager:
         are appended to the command, and its ``env`` is merged over the
         inherited environment (the preset wins on conflict).
 
+        A token-selected *preset* also **displaces** any listener-wide default
+        (see :func:`listener_default_preset`) rather than stacking with it:
+        every preset selector is set to the empty string in the child's
+        environment, so the spawned CLI resolves no preset of its own. Blank is
+        the selector contract's "unset" (see
+        :func:`~lmer_cli.presets.select_preset_name`), and it is blank rather
+        than absent because the child seeds its environment first-wins from
+        ``.env`` files — the forwarded ``--env-file`` included. An absent key is
+        one a file may re-supply, which would hand the child the very default
+        this displaces; a present-but-blank key is not seeded at any file tier
+        of the spawned CLI's own environment. The container environment that
+        CLI then builds merges the forwarded ``--env-file`` under different
+        rules and can still carry the selector — a tier this displacement does
+        not reach, and safe only while nothing inside the container reads the
+        selectors (see issue #259 for the family of blind spots).
+        Displacement is total by construction — the default is never loaded, so
+        none of its values survive and none of its keys are inherited where the
+        token's preset leaves them unset (issue #181). Without this the two
+        merged under two different rules: the token's env won conflicts while
+        the default silently filled every gap.
+
         Raises:
             RuntimeError: If a running session already exists for the
                 thread or the manager is at capacity.
@@ -255,9 +305,20 @@ class SessionManager:
         # is a scratch dir with no .env of its own (issue #75).
         if self.lmer_env_file:
             cmd += ["--env-file", self.lmer_env_file]
-        cmd += ["chat", permalink]
-        # Preset options are `chat` subcommand flags / args, appended after.
+        cmd += [CHAT_TASK_ID, permalink]
+        displaced_name, displaced_source = (None, None)
         if preset is not None:
+            # Whatever the environment would have selected is displaced, so
+            # read it before blanking — the spawn log names it.
+            displaced_name, displaced_source = listener_default_preset(env)
+            # Blank, not absent: the child seeds its environment from .env
+            # files first-wins, so deleting a selector only invites a file to
+            # put the default back. Blanking runs before the preset's own env,
+            # so a preset that deliberately sets a selector (an operator
+            # chaining a default) still takes effect.
+            for var in preset_selector_vars(CHAT_TASK_ID):
+                env[var] = ""
+            # Preset options are `chat` subcommand flags / args, appended after.
             cmd += preset.cli_tokens()
             env.update(preset.env)
 
@@ -294,18 +355,29 @@ class SessionManager:
         session.drain_task = asyncio.create_task(self._drain(session))
         self._sessions[session.key] = session
 
-        logger.info(
-            "lmer_session_spawned %s",
-            _kv(
-                channel=channel,
-                thread_ts=thread_ts,
-                pid=process.pid,
-                permalink=permalink,
-                preset=preset.name if preset else "-",
-                log_path=log_path,
-                active_sessions=self.active_count(),
+        # Name every preset in effect so a spawn log can never hide one
+        # (issue #181): the token-selected preset, plus the listener-wide
+        # default — logged as `displaced_default` when a token replaced it, and
+        # as `default_preset` when it is the one actually applying.
+        if preset is not None:
+            default_key = "displaced_default"
+            default_name, default_source = displaced_name, displaced_source
+        else:
+            default_key = "default_preset"
+            default_name, default_source = listener_default_preset(env)
+        fields = {
+            "channel": channel,
+            "thread_ts": thread_ts,
+            "pid": process.pid,
+            "permalink": permalink,
+            "preset": preset.name if preset else "-",
+            default_key: (
+                f"{default_name}({default_source})" if default_name else "-"
             ),
-        )
+            "log_path": log_path,
+            "active_sessions": self.active_count(),
+        }
+        logger.info("lmer_session_spawned %s", _kv(**fields))
         return session
 
     async def _drain(self, session: Session) -> None:

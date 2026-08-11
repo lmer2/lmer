@@ -127,8 +127,18 @@ _KNOWN_KEYS = frozenset(
 # repeated resolutions neither re-read files nor repeat warnings.
 _cache: Dict[str, Dict[str, Harness]] = {}
 
+# Messages already printed, so "warnings print once per process" survives
+# :func:`refresh_user_harnesses` re-scanning the directory: before the refresh
+# existed the cache alone enforced it (load once, warn once), and a long-lived
+# daemon refreshing per validation would otherwise re-emit every malformed
+# drop-in's warning on every config read.
+_warned: set = set()
+
 
 def _warn(message: str) -> None:
+    if message in _warned:
+        return
+    _warned.add(message)
     print(f"⚠️  {message}", file=sys.stderr)
 
 
@@ -440,6 +450,37 @@ def load_user_harnesses(root: Optional[Path] = None) -> Dict[str, Harness]:
     return _cache[key]
 
 
+def refresh_user_harnesses(root: Optional[Path] = None) -> Dict[str, Harness]:
+    """Re-read the drop-in directory now, replacing the cache entry in place.
+
+    For long-lived processes: :func:`load_user_harnesses` caches for process
+    life — including caching "no directory" from before a first drop-in was
+    installed — which is right for a session-scoped CLI and wrong for a daemon
+    validating harness names against what a *freshly spawned* ``lmer`` (a new
+    process, a new cache) would accept.
+
+    Deliberately **assignment, never deletion**: ``load_user_harnesses`` is an
+    unlocked check-store-return, and these run concurrently from a server's
+    threadpool — a clear landing between another thread's store and its
+    ``return _cache[key]`` would raise ``KeyError`` out of a code path every
+    caller treats as infallible. An assignment leaves every concurrent reader
+    holding either the old mapping or the new one, both complete. Repeated
+    warnings from the re-scan are deduped by :func:`_warn`, so the module's
+    once-per-process promise holds.
+    """
+    directory = root if root is not None else user_harnesses_dir()
+    key = str(directory)
+    _cache[key] = _load_dir(directory) if directory.is_dir() else {}
+    return _cache[key]
+
+
 def clear_user_harness_cache() -> None:
-    """Drop the per-directory load cache (test isolation)."""
+    """Drop the per-directory load cache and the warn-once set (test isolation).
+
+    Test-only, and staying that way: production code that needs fresh results
+    uses :func:`refresh_user_harnesses`, which cannot race concurrent loads —
+    this can (see there), and a test's single thread is the one place that is
+    fine.
+    """
     _cache.clear()
+    _warned.clear()

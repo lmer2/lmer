@@ -11,6 +11,41 @@
 - **NEVER** commit without explicit user approval or request
 - **NEVER** expose API keys, tokens, or secrets in code or logs
 
+## 🤖 NON-INTERACTIVE SESSIONS - when there is nobody to ask
+`LMER_NONINTERACTIVE` set to a truthy value (`1`, `true`, `yes`, case-insensitive)
+means no human is attached to this session — a `spawn-harness` child, a cron run, any
+headless launch. A falsy value (`0`, `false`, `no`) or an unset variable means a human
+is present and the gates below ask normally. You do not have to go looking for the
+variable: when it is set, this session was told so in its prompt or its global context.
+The situations it names are also self-identifying — an agent that already knows it is
+headless applies this section whether or not it ever saw the flag.
+
+In such a session **no gate below may end your turn with a question**. An unanswered
+prompt is not a pause, it is a dropped result: the caller gets a near-empty output file
+and your work vanishes from the fan-out with no error surfaced.
+
+**Approval already granted before the session started is still approval.** The launch
+prompt, the taskdef instructions, and `/gate-commit` all authorize what they name — a
+headless run whose whole purpose is to produce committed work still commits, and still
+runs the gate's checks first. This section covers approvals you would have to obtain
+*now*, from someone who is not there.
+
+When a gate would stop you for approval you do not already have:
+- Do NOT ask for approval as your final answer.
+- Do NOT perform the gated action either — approval you cannot get is approval you do
+  not have.
+- Stop that line of work and state plainly in your final output what you would have
+  asked, why you stopped, and what you completed before stopping. The caller needs a
+  report, not a prompt.
+
+Per-gate, in a non-interactive session:
+- **COMMIT GATE** — run `gate-check`, show its output, and commit under the approval
+  the launch already carries. Without such approval, stop at the checks and report.
+- **CONTEXT SWITCH GATE** — state the switch (completed / new objective / files) in
+  your output and proceed; do not stop for the confirmation step.
+- **ERROR GATE** — for the STOP cases, use the report format below with its
+  non-interactive closing line.
+
 ## 🛑 COMMIT GATE - MANDATORY CHECKS
 Before EVERY commit, you MUST:
 1. Run gate check: `gate-check`
@@ -78,6 +113,13 @@ Use these focused commands:
 - Document what was done for each task
 - Include context for future reference
 
+### Error Handling & Recovery
+- Always provide clear error messages with context
+- Include suggested fixes for common errors
+- Log errors appropriately (never expose secrets)
+- Implement graceful degradation where possible
+- Clean up resources on failure
+
 ## 🛑 CONTEXT SWITCH GATE
 **When switching between tasks, STOP and:**
 - [ ] Summarize what was just completed
@@ -96,24 +138,34 @@ Will modify: src/auth.py, tests/test_auth.py
 Is this correct?
 ```
 
-### Error Handling & Recovery
-- Always provide clear error messages with context
-- Include suggested fixes for common errors
-- Log errors appropriately (never expose secrets)
-- Implement graceful degradation where possible
-- Clean up resources on failure
+## 🛑 ERROR GATE - When a fix needs authorization
 
-## 🛑 ERROR GATE - When Something Fails
-**STOP and follow these steps:**
-1. Show the FULL error message (don't truncate or summarize)
-2. Explain what likely caused it
-3. Propose fix with rationale
-4. STOP: Get user approval before attempting fix
-5. Show results of fix attempt
+Always show the full error, never summarize it away (see Show Your Work Policy).
+Whether you STOP depends on what the *fix* costs, not on the fact that something
+failed:
 
-**NO silent retries - user must see and approve every fix attempt**
+- **Your own malformed command** (bad regex, wrong flag, wrong path) — fix it and
+  continue; report it in one line.
+- **Environment or capability gap** (dependency absent, host unreachable, credential
+  missing) — always report it, then keep working the problem. An equivalent substitute
+  (`grep` for a missing `rg`) or another sound route to the same result is normal work;
+  you do not need permission per attempt — just name what you used. **STOP and ask**
+  when only the human can supply what is missing — credentials, network access, an
+  install — or when every remaining route degrades the deliverable: stubbing, skipping
+  a check, faking data, a tool whose semantics differ. Auth failures are always the
+  human's call (see Authentication & Access).
+- **STOP and get approval** when the fix would mutate state, is hard to reverse, or
+  touches something a gate protects: force-pushing after a rejected push, editing
+  production code so a test passes, re-running a half-applied migration.
+- **STOP and get approval** when you do not understand the cause, or when you have run
+  out of approaches you can justify — you are guessing, or each remaining option is
+  worse than the last. Grinding on without a diagnosis is the churn this gate exists to
+  prevent.
 
-**Format your error report like this:**
+Visibility is unconditional in all four cases; only the STOP cases wait for a human.
+No silent retries — every fix attempt is reported, and undiagnosed ones need approval.
+
+**For the STOP cases, format your error report like this:**
 ```
 ❌ ERROR ENCOUNTERED:
 [Paste the complete error message here]
@@ -128,6 +180,10 @@ Is this correct?
 
 Shall I proceed with this fix? (yes/no)
 ```
+
+In a non-interactive session, replace that closing question with
+`⏸️ STOPPED — would have asked: "…". Not proceeding.` and end the turn there. Never
+emit the `(yes/no)` line when nobody is attached to answer it.
 
 ## Authentication & Access
 

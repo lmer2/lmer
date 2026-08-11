@@ -15,7 +15,7 @@ separate code path: the credential exported in the host environment, present
 only in a cwd ``.env``, only in ``~/.lmer/.env``, only in an explicit
 ``--env-file``, and supplied by a selected preset's ``env`` (the preset
 seeding loop). Each test asserts on BOTH halves of the surface — the
-container env dict handed to ``env_args`` AND the assembled ``-v`` mount
+container env dict handed to ``build_container_env`` AND the assembled ``-v`` mount
 arguments — so a refactor cannot satisfy the suite by moving the credential
 from one channel to the other.
 
@@ -25,7 +25,7 @@ env-borne only (spec R3/F5/F6).
 
 The behavioral tests run the real ``main()`` with the container runtime
 mocked out (reusing the harness from ``test_lmer_cli_slack_target``) and
-inspect the env dict the CLI hands to ``env_args`` plus the full run command
+inspect the env dict the CLI hands to ``build_container_env`` plus the full run command
 handed to ``subprocess.call``.
 """
 

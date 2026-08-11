@@ -4,6 +4,8 @@
 import re
 import sys
 from pathlib import Path
+
+import pytest
 from unittest.mock import patch
 
 from lmer_cli.cli import parse_args
@@ -108,3 +110,51 @@ class TestAnswerFlag:
                 pass
         help_text = capsys.readouterr().out
         assert "(env: LMER_ANSWER" not in help_text
+
+
+# --- the quiet parser seam (issue #245, review iteration 3) -------------------
+
+def test_quiet_parse_raises_instead_of_printing():
+    """For callers that parse on a server path.
+
+    ``lmer_platform.slots`` asks "would these preset args rebind the slot?" on
+    every fleet-view poll. argparse's default is to print usage to stderr and
+    raise SystemExit; capturing that with ``contextlib.redirect_stderr`` swaps a
+    process-global stream, which two overlapping threadpool requests can leave
+    permanently pointed at an in-memory buffer.
+    """
+    import sys
+
+    from lmer_cli.cli import ParseRefused, parse_args
+
+    before_out, before_err = sys.stdout, sys.stderr
+    with pytest.raises(ParseRefused):
+        parse_args(["--ports"], quiet=True)
+    assert sys.stdout is before_out and sys.stderr is before_err
+
+
+def test_quiet_parse_silences_help_too():
+    """``-h`` reaches exit() through print_help, not through error()."""
+    from lmer_cli.cli import ParseRefused, parse_args
+
+    with pytest.raises(ParseRefused):
+        parse_args(["-h"], quiet=True)
+
+
+def test_quiet_parse_returns_normally_on_good_argv():
+    from lmer_cli.cli import parse_args
+
+    namespace, rest = parse_args(["--service", "web", "chat"], quiet=True)
+
+    assert namespace.service == "web"
+    assert namespace.task == "chat"
+    assert rest == []
+
+
+def test_the_command_line_still_exits_the_way_it_did(capsys):
+    """The flag is off by default, so nothing about the CLI changes."""
+    from lmer_cli.cli import parse_args
+
+    with pytest.raises(SystemExit):
+        parse_args(["--ports"])
+    assert "usage:" in capsys.readouterr().err

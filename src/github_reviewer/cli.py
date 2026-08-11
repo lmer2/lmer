@@ -178,6 +178,12 @@ def _norm_pr_info(pr: Dict[str, Any]) -> Dict[str, Any]:
         issue_comments + review_comments if isinstance(review_comments, int) else issue_comments
     )
 
+    # Thread-resolution provenance computed alongside the review-thread
+    # fetch (see cmd_pr_info). None when thread data was unavailable.
+    provenance = pr.get("_thread_provenance")
+    if not isinstance(provenance, dict):
+        provenance = None
+
     return {
         "iid": pr.get("number"),
         "title": pr.get("title", ""),
@@ -192,7 +198,16 @@ def _norm_pr_info(pr: Dict[str, Any]) -> Dict[str, Any]:
         "draft": bool(pr.get("isDraft")),
         "work_in_progress": bool(pr.get("isDraft")),
         "has_conflicts": (pr.get("mergeable") or "").upper() == "CONFLICTING",
-        "blocking_discussions_resolved": True,  # github has no direct equivalent
+        # Derived from the fetched review threads (github exposes no
+        # server-side flag): False when any thread is unresolved, and
+        # fail-CLOSED on a page-cap-truncated walk — a partial count must
+        # never claim "all resolved" (unfetched pages may hold unresolved
+        # threads). Fail-soft True only when thread data is unavailable
+        # entirely.
+        "blocking_discussions_resolved": (
+            provenance["unresolved"] == 0 and not provenance["partial"]
+            if provenance else True
+        ),
         "description": pr.get("body", "") or "",
         "approvals": {
             "approved": approved,
@@ -207,6 +222,7 @@ def _norm_pr_info(pr: Dict[str, Any]) -> Dict[str, Any]:
         "upvotes": 0,
         "downvotes": 0,
         "changes_count": pr.get("changedFiles"),
+        "thread_provenance": provenance,
         "web_url": pr.get("url", ""),
     }
 
@@ -326,22 +342,28 @@ def _norm_issue_comment_to_discussion(comment: Dict[str, Any]) -> Dict[str, Any]
 # ---------------------------------------------------------------------------
 
 
-def _count_review_thread_comments(
+def _fetch_review_thread_stats(
     project: str,
     pr_id: int,
     host: str,
     token: Optional[str],
     page_size: int,
     max_pages: int,
-) -> int:
-    """Return the total number of inline review-thread comments on a PR.
+) -> Dict[str, Any]:
+    """Walk PR review threads collecting count-only statistics.
+
+    Returns ``{"comment_count": int, "threads": [...], "partial": bool}``
+    where each thread carries ``isResolved`` and ``resolvedBy.login`` and
+    ``partial`` is True when the ``max_pages`` cap stopped the walk early.
 
     Uses ``comments(first: 0) { totalCount }`` per thread so we never
     transfer comment bodies — only their counts. Thread pages are walked
     with the same cursor pagination as ``_fetch_all_review_threads`` so
     PRs with many threads are not silently undercounted. This is the
     cheap path used by ``cmd_pr_info`` to compute ``user_notes_count``
-    without paying for full thread bodies.
+    and thread-resolution provenance without paying for thread bodies.
+    Note: GitHub's schema exposes no ``resolvedAt`` timestamp, so unlike
+    gitlab-review there is no resolved-before-last-push heuristic here.
     """
     owner, name = _split_project(project)
     query = """
@@ -351,6 +373,8 @@ def _count_review_thread_comments(
           reviewThreads(first: $page, after: $cursor) {
             pageInfo { hasNextPage endCursor }
             nodes {
+              isResolved
+              resolvedBy { login }
               comments(first: 0) { totalCount }
             }
           }
@@ -358,7 +382,9 @@ def _count_review_thread_comments(
       }
     }
     """
-    total = 0
+    comment_count = 0
+    threads: List[Dict[str, Any]] = []
+    partial = False
     cursor: Optional[str] = None
     pages = 0
     while True:
@@ -386,20 +412,47 @@ def _count_review_thread_comments(
             .get("reviewThreads", {})
         ) or {}
         for thread in rt.get("nodes") or []:
-            total += (thread.get("comments") or {}).get("totalCount", 0) or 0
+            comment_count += (thread.get("comments") or {}).get("totalCount", 0) or 0
+            threads.append(thread)
         pages += 1
         page_info = rt.get("pageInfo") or {}
         if not page_info.get("hasNextPage"):
             break
         if pages >= max_pages:
+            partial = True
             print(
                 f"⚠️  github-review: reviewThreads page cap ({max_pages}) reached "
-                f"while counting comments; user_notes_count may undercount.",
+                f"while counting threads; user_notes_count may undercount and "
+                f"thread provenance is partial.",
                 file=sys.stderr,
             )
             break
         cursor = page_info.get("endCursor")
-    return total
+    return {"comment_count": comment_count, "threads": threads, "partial": partial}
+
+
+def _compute_thread_provenance(threads: List[Dict[str, Any]], partial: bool) -> Dict[str, Any]:
+    """Summarize review-thread resolution provenance.
+
+    Shape matches gitlab-review's ``thread_provenance`` block:
+    ``{total, unresolved, resolved, resolvers: {login: n}, partial}``.
+    Resolved threads whose resolver is missing count under ``"unknown"``.
+    """
+    total = len(threads)
+    resolved = 0
+    resolvers: Dict[str, int] = {}
+    for t in threads:
+        if t.get("isResolved"):
+            resolved += 1
+            login = (t.get("resolvedBy") or {}).get("login") or "unknown"
+            resolvers[login] = resolvers.get(login, 0) + 1
+    return {
+        "total": total,
+        "unresolved": total - resolved,
+        "resolved": resolved,
+        "resolvers": resolvers,
+        "partial": bool(partial),
+    }
 
 
 def _fetch_all_review_threads(
@@ -588,13 +641,29 @@ def cmd_pr_info(
     pr["participants"] = participants
 
     # Count inline review-thread comments so user_notes_count matches
-    # gitlab's "all notes on the MR" semantics. Uses the count-only path
+    # gitlab's "all notes on the MR" semantics, and collect thread
+    # resolution provenance in the same walk. Uses the count-only path
     # (``comments(first: 0) { totalCount }``) so --info doesn't transfer
     # comment bodies — only counts. Thread pages are still walked under
-    # the same --max-pages cap, with a stderr warning if hit.
-    pr["_review_comment_count"] = _count_review_thread_comments(
-        project, pr_id, host, token, page_size=page_size, max_pages=max_pages
-    )
+    # the same --max-pages cap, with a stderr warning if hit. Fail-soft:
+    # --info must never fail on provenance trouble, so a failed thread
+    # fetch degrades to issue-comment counts and no provenance block.
+    try:
+        stats = _fetch_review_thread_stats(
+            project, pr_id, host, token, page_size=page_size, max_pages=max_pages
+        )
+    except GitHubError as e:
+        print(
+            f"⚠️  github-review: review-thread fetch failed ({e}); "
+            f"thread provenance omitted and user_notes_count may undercount.",
+            file=sys.stderr,
+        )
+        stats = None
+    if stats is not None:
+        pr["_review_comment_count"] = stats["comment_count"]
+        pr["_thread_provenance"] = _compute_thread_provenance(
+            stats["threads"], stats["partial"]
+        )
 
     return _norm_pr_info(pr)
 
@@ -828,6 +897,27 @@ def load_review_from_file(
     return parsed, summary, event
 
 
+def _resolve_thread_policy_error() -> Optional[str]:
+    """Return the refusal message when this session may not resolve threads.
+
+    Per the Thread Resolution Policy (rules/git.md) only the reviewer
+    resolves a discussion thread. ``LMER_TASK`` names the session type;
+    any value other than ``review`` (when set) means the caller is a fix
+    author, not the reviewer. Returns None when resolution is allowed
+    (LMER_TASK unset, or a review session).
+    """
+    task = os.environ.get("LMER_TASK")
+    if not task or task == "review":
+        return None
+    return (
+        f"❌ Refusing to resolve thread: this is a '{task}' session, not a review session.\n"
+        "Per the Thread Resolution Policy (rules/git.md), the author of a fix replies on\n"
+        "the thread with the fix and the commit SHA and leaves the thread open — only the\n"
+        "reviewer resolves. A human can resolve the thread in the GitHub web UI, or run\n"
+        "this command from a host shell where LMER_TASK is unset."
+    )
+
+
 def cmd_resolve_thread(thread_id: str, host: str, token: Optional[str]) -> Dict[str, Any]:
     """Resolve a PR review thread by node id via GraphQL."""
     query = "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id isResolved } } }"
@@ -907,6 +997,22 @@ def format_pr_info(info: Dict[str, Any], json_output: bool) -> str:
         f"Changes: {info.get('changes_count', 'N/A')}",
         f"Comments: {info.get('user_notes_count', 0)}",
         f"Has Conflicts: {'Yes' if info.get('has_conflicts') else 'No'}",
+    ]
+    prov = info.get("thread_provenance")
+    if prov:
+        lines += [
+            "",
+            "=== Threads ===",
+            f"Total: {prov.get('total', 0)} "
+            f"({prov.get('resolved', 0)} resolved, {prov.get('unresolved', 0)} unresolved)",
+        ]
+        if prov.get("resolvers"):
+            lines.append("Resolved By:")
+            for login in sorted(prov["resolvers"]):
+                lines.append(f"  - @{login}: {prov['resolvers'][login]}")
+        if prov.get("partial"):
+            lines.append("⚠️  counts partial — page cap")
+    lines += [
         "",
         f"Web URL: {info['web_url']}",
     ]
@@ -1167,6 +1273,10 @@ def main() -> int:
             return 0
 
         if args.resolve_thread:
+            policy_error = _resolve_thread_policy_error()
+            if policy_error:
+                print(policy_error, file=sys.stderr)
+                return 1
             result = cmd_resolve_thread(args.resolve_thread, host=host, token=token)
             if not args.quiet:
                 if args.json:

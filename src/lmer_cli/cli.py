@@ -16,8 +16,11 @@ import argparse
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 import re
@@ -25,17 +28,25 @@ from typing import Iterable, Mapping
 from dotenv import dotenv_values
 
 from . import resolve
+from .clone_cache import (
+    CACHE_ERROR,
+    CACHE_FILE_ABSENT,
+    read_cached_repo_file_status,
+)
+from .container import sources as container_sources
 from .container_home import ensure_container_home
 from .log import error, info, success, warning
 from .mounts import (
     CONTAINER_CLONE_CACHE_DIR,
     CONTAINER_RELEASE_SIGNING_KEY_PATH,
+    DirMountSpec,
     FileMountSpec,
     PlannedCredentialMount,
     build_checkout_mount,
-    build_clone_cache_mount,
+    build_clone_cache_mounts,
     build_release_signing_key_mount,
     build_container_home_mounts,
+    build_dir_mounts,
     build_external_taskdef_mounts,
     build_file_mounts,
     build_global_mount,
@@ -79,7 +90,14 @@ from .presets import (
     select_preset_name,
     task_preset_env_name,
 )
-from .runtime import base_run_args, detect_runtime, env_args, lmer_state_dir, repo_root_path
+from .runtime import (
+    base_run_args,
+    build_container_env,
+    ContainerEnvError,
+    detect_runtime,
+    lmer_state_dir,
+    repo_root_path,
+)
 from .service import ServiceError, resolve_container, inspect_container_workdir
 from .tokens import (
     _get_gitlab_token,
@@ -89,6 +107,12 @@ from .tokens import (
 )
 from .util import get_bool_env, resolve_human_identity
 from .targets import SlackThreadTargets, partition_targets, special_target_env
+
+# Default range the --fastapi endpoint's host port is picked from. Spelled as a
+# string because that is the shape --fastapi-port-range / LMER_FASTAPI_PORT_RANGE
+# arrive in; it is the same span as supervisor.DEFAULT_PORT_RANGE, which is what
+# the in-container side falls back to.
+DEFAULT_FASTAPI_PORT_RANGE = "8700-8799"
 
 # Default pool for general port passthrough (--ports / --port-pool). Kept
 # distinct from the FastAPI range (8700-8799) so both features can be used in
@@ -189,6 +213,44 @@ def _resolve_port_bind(cli_bind: str | None, env: Mapping[str, str]) -> str:
     return env_bind or DEFAULT_PORT_BIND
 
 
+def _resolve_fastapi_host_port(
+    cli_range: str | None,
+    env: Mapping[str, str],
+) -> int:
+    """Resolve the host port to publish the ``--fastapi`` endpoint on.
+
+    ``LMER_FASTAPI_PORT`` wins over picking one, because a caller that already
+    set it has *committed* to that port: the platform orchestrator picks a port,
+    writes it into the session's registry entry, and only then spawns lmer
+    (issue #141). Quietly binding somewhere else would leave a session whose
+    recorded address is wrong — reachable, but not where anyone is looking.
+
+    With nothing preset, a free port is picked from ``--fastapi-port-range``
+    (default ``DEFAULT_FASTAPI_PORT_RANGE``) on loopback, exactly as before.
+
+    Raises :class:`ValueError` for a non-integer or out-of-range
+    ``LMER_FASTAPI_PORT`` and for an unparseable range, and :class:`RuntimeError`
+    (from ``_pick_port``) when the range has no free port. A preset value is
+    *not* probed for availability: the caller chose it, and a container that
+    cannot publish it fails loudly at start rather than silently landing
+    elsewhere.
+    """
+    raw = (env.get("LMER_FASTAPI_PORT") or "").strip()
+    if raw:
+        try:
+            port = int(raw)
+        except ValueError:
+            raise ValueError(f"LMER_FASTAPI_PORT must be an integer, got {raw!r}")
+        if not 1 <= port <= 65535:
+            raise ValueError(f"LMER_FASTAPI_PORT must be 1-65535, got {port}")
+        return port
+
+    from .supervisor import _parse_port_range, _pick_port
+
+    port_range = _parse_port_range(cli_range or DEFAULT_FASTAPI_PORT_RANGE)
+    return _pick_port(port_range, "127.0.0.1")
+
+
 def _publish_host_ports(
     run: list[str], ports: list[int], bind: str = DEFAULT_PORT_BIND
 ) -> None:
@@ -203,6 +265,49 @@ def _publish_host_ports(
     """
     for port in ports:
         run += ["-p", f"{bind}:{port}:{port}"]
+
+
+def _make_sigterm_cleanup_handler(container_env):
+    """SIGTERM handler that deletes the env file, then dies as SIGTERM would.
+
+    Python's default SIGTERM disposition terminates without unwinding, which
+    strands the session's mode-0600 env file in ``$TMPDIR`` holding the
+    tokenized work-repo URL and every forwarded token (issue #158).
+
+    It deliberately does NOT raise. ``subprocess.call`` is::
+
+        with Popen(...) as p:
+            try:
+                return p.wait(timeout=timeout)
+            except:          # bare — catches SystemExit too
+                p.kill()
+                raise
+
+    so raising ``SystemExit`` here would unwind through that bare ``except``
+    and SIGKILL the ``docker``/``podman run`` client. In a non-TTY spawn the
+    client forwarding SIGTERM is exactly what stops the container (docker's
+    ``--sig-proxy`` is non-TTY-only), and ``--rm`` removal is daemon-side and
+    conditional on that exit — so killing the client leaves a running
+    container behind. That is why this restores the default disposition and
+    re-raises the signal at itself instead: process semantics stay identical
+    to having no handler at all, and the file still gets deleted.
+
+    "Identical to having no handler" is exact for the CLI, whose SIGTERM
+    disposition IS the default. It is not exact for a hypothetical in-process
+    caller that had installed ``SIG_IGN`` or a handler of its own before
+    calling ``main()``: this restores ``SIG_DFL``, so such a parent would die
+    where it previously ignored the signal. Nothing calls ``main()`` that way
+    today, and preserving the caller's disposition would mean either returning
+    from the handler (the file survives a second signal) or raising (the
+    unwinding this exists to avoid).
+    """
+
+    def _handler(signum, frame) -> None:
+        container_env.cleanup()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    return _handler
 
 
 def _apply_port_passthrough(
@@ -251,15 +356,169 @@ def _apply_port_passthrough(
     published = ", ".join(str(p) for p in picked_ports)
     info(f"🔌 Publishing {len(picked_ports)} port(s) on {port_bind}: {published}")
     info("   (exposed inside the container via LMER_PORTS; bind services to 0.0.0.0)")
+    _record_published_ports(picked_ports, port_bind)
     return None
 
 
-def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+def apply_env_file_defaults(candidates: list[tuple[str, Path]]) -> dict[str, str]:
+    """Seed ``os.environ`` from ``.env`` files, first-wins, and report the sources.
+
+    First-wins means an already-exported variable is never overwritten: the
+    process environment outranks any file. Earlier candidates outrank later ones,
+    so callers pass them highest-priority first.
+
+    Shared by ``main()`` and by ``lmer platform`` (issue #141), which dispatches
+    before ``main()``'s own argument parsing and would otherwise never see
+    ``~/.lmer/.env`` — leaving the daemon without the work-repo URL and token an
+    operator had perfectly reasonably put there.
+
+    Returns ``{var: "…description…"}`` for ``--show-env`` attribution.
+    """
+    sources: dict[str, str] = {}
+    for location, env_file in candidates:
+        if not env_file.exists():
+            continue
+        for key, value in dotenv_values(dotenv_path=str(env_file)).items():
+            if key not in os.environ and value is not None:
+                os.environ[key] = value
+                sources[key] = f".env ({location})"
+    return sources
+
+
+def default_env_file_candidates(
+    *, state_dir: Path | None = None, cwd: Path | None = None
+) -> list[tuple[str, Path]]:
+    """The standard ``.env`` search order: working directory, then the state dir."""
+    from .runtime import lmer_state_dir
+
+    return [
+        ("working directory", (cwd or Path.cwd()) / ".env"),
+        ("lmer state dir", (state_dir or lmer_state_dir()) / ".env"),
+    ]
+
+
+def _record_platform_facts(**facts) -> None:
+    """Merge *facts* into ``$LMER_PLATFORM_PORTS_FILE`` when the platform set it.
+
+    The orchestrator platform (issue #141) hands a spawned ``lmer`` this path to
+    report back things it can only learn at launch — the ports it published (free
+    ports are picked *here*, so the spawning platform cannot know them in advance)
+    and the model actually driving the session, which is resolved after preset
+    application and would be a guess anywhere else (T50/T51). The platform folds
+    whatever it finds into the session's registry entry
+    (``lmer_platform.spawn.absorb_ports``).
+
+    A file rather than an import keeps the dependency pointing the right way:
+    ``lmer_platform`` depends on ``lmer_cli``, never the reverse. Merged rather
+    than overwritten because the two facts are recorded at different points in a
+    launch — the model before the container is built, the ports while it starts —
+    and the second writer must not erase the first. Best-effort by design:
+    failing to record an annotation must never fail the launch it annotates, so a
+    file that cannot be read is treated as empty rather than as an error.
+
+    Keeps its ``…PORTS_FILE`` name: the variable is set by whatever platform
+    spawned this process, which may be an older daemon, and a name is not worth a
+    launch that reports nothing.
+    """
+    target = os.environ.get("LMER_PLATFORM_PORTS_FILE", "").strip()
+    if not target:
+        return
+    path = Path(target)
+    payload: dict = {}
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(existing, dict):
+            payload = existing
+    except (OSError, ValueError):
+        # Absent is the normal first write; corrupt or unreadable is worth no
+        # more than starting over, since every fact in here is re-derivable.
+        payload = {}
+    payload.update(facts)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # pid *and* thread id: two writers sharing a temp path is worse than
+        # losing a write (see lmer_platform.store.write_json), and the launch
+        # records more than one fact at more than one point.
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        warning(f"⚠️  Could not record session facts to {target}: {exc}")
+
+
+def _record_published_ports(ports: list[int], bind: str) -> None:
+    """Report the published port mapping to the spawning platform.
+
+    The mapping is what lets the platform's UI link "what this session is
+    serving"; see :func:`_record_platform_facts` for the channel and why it
+    merges.
+    """
+    _record_platform_facts(
+        bind=bind,
+        # Host and container port are the same number (see _publish_host_ports).
+        ports=[{"host": p, "container": p} for p in ports],
+    )
+
+
+def _record_session_model(model: str | None) -> None:
+    """Report the model this session resolved to, if it resolved to one.
+
+    The platform cannot work this out for itself and must not guess: it applies
+    preset environment only over keys its own environment leaves unset, so an
+    exported ``LMER_LLM_NAME`` beats a preset's — meaning a daemon inferring the
+    model from its own environment would be wrong for precisely the runs that
+    named a preset (``lmer_platform.inventory.RunView.model``). Here the value is
+    resolved: flag, then preset env, then the ambient environment.
+
+    Nothing is written when there is no model, rather than a ``None``: unset is
+    the harness running its own default, and recording that as a fact would put a
+    name on a row that never chose one.
+    """
+    if model:
+        _record_platform_facts(model=model)
+
+
+class ParseRefused(Exception):
+    """Raised instead of exiting when a *quiet* parse rejects its argv.
+
+    argparse prints usage and raises ``SystemExit``, which is right for a
+    command line and wrong for a caller that parses on a server path:
+    ``lmer_platform.slots`` asks "would these preset args rebind the slot?" on
+    every fleet-view poll, where the usage block would land in the daemon's log
+    and a swapped ``sys.stderr`` would be a process-global mutation on a
+    threadpool route.
+    """
+
+
+class _QuietParser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` that raises rather than printing and exiting.
+
+    Every output path is closed, not just ``error()``: ``-h`` reaches
+    :meth:`exit` through ``print_help``, and both write through
+    ``_print_message``.
+    """
+
+    def error(self, message: str):  # pragma: no cover - exercised via parse_args
+        raise ParseRefused(message)
+
+    def exit(self, status: int = 0, message: str | None = None):
+        raise ParseRefused(message or f"parser exited with status {status}")
+
+    def _print_message(self, message, file=None):
+        return
+
+
+def parse_args(
+    argv: list[str], *, quiet: bool = False
+) -> tuple[argparse.Namespace, list[str]]:
     """
     Parse command-line arguments for lmerpy.
 
     Args:
         argv: List of command-line arguments to parse
+        quiet: Raise :class:`ParseRefused` instead of printing usage and
+            exiting, for callers that parse on a server path. Off by default, so
+            the command line behaves exactly as it did.
 
     Returns:
         Tuple of (parsed namespace, remaining args after known args)
@@ -274,7 +533,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         rest = argv[idx + 1:]
         argv = argv[:idx]
 
-    parser = argparse.ArgumentParser(prog="lmerpy", add_help=True)
+    parser_class = _QuietParser if quiet else argparse.ArgumentParser
+    parser = parser_class(prog="lmerpy", add_help=True)
     # Task is optional when --no-task is provided; otherwise required
     parser.add_argument("task", nargs="?", help="Task type (e.g., chat, review, develop, modernize)")
     parser.add_argument("target", nargs="*", help="Repository URL/path or PR/MR/issue URL. First target is primary (sets env vars), additional targets are cloned but don't override env vars.")
@@ -295,6 +555,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
                         help="Alias for --verbose (sets LMER_VERBOSE=1).")
     parser.add_argument("--show-env", dest="show_env", action="store_true", help="Display LMER environment variable configuration on startup")
     parser.add_argument("--mount-file", dest="mount_file", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a single host file into the container at an explicit destination (repeatable). HOST supports ~ and $VAR expansion and must be an existing file; CONTAINER must be an absolute path; MODE is ro (default) or rw. Invalid entries abort the run. (env: LMER_MOUNT_FILES, comma-separated entries)")
+    parser.add_argument("--mount-dir", dest="mount_dir", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a host directory into the container at an explicit destination (repeatable). Same grammar and strictness as --mount-file, but HOST must be an existing directory; MODE is ro (default) or rw. The mount shadows whatever the image has at CONTAINER. Invalid entries abort the run. (env: LMER_MOUNT_DIRS, comma-separated entries)")
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
     parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_<TASK>_PRESET for one taskdef, e.g. LMER_REVIEW_PRESET, then LMER_PRESET for any task; the flag wins over both). The preset's checkout/service/env/args are applied as defaults: flags and exported environment variables in the actual invocation override them.")
     parser.add_argument("--list-presets", dest="list_presets", action="store_true", help="List the presets available from LMER_PRESETS_FILE and exit")
@@ -310,6 +571,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
     parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
+    parser.add_argument("--model", dest="model", help="Model the harness runs, exported to the container as LMER_LLM_NAME (env: LMER_LLM_NAME; the flag wins over it, and over a preset's env). Forwarded verbatim to the harness's own --model flag by the runner scripts — lmer never validates it, the harness rejects what it does not know. Also implies the harness when neither --harness nor LMER_HARNESS is set (e.g. --model gpt-5.5 selects codex).")
     parser.add_argument("--fastapi-port-range", dest="fastapi_port_range", help="Port range LOW-HIGH the FastAPI endpoint may bind to (default 8700-8799)")
     parser.add_argument("--fastapi-host", dest="fastapi_host", help="Host for the FastAPI endpoint to bind (default 127.0.0.1)")
     parser.add_argument("--fastapi-token", dest="fastapi_token", help="Bearer token for the FastAPI endpoint (auto-generated if omitted)")
@@ -399,7 +661,11 @@ def _parse_repo_url(repo_url: str) -> tuple[str | None, str | None]:
         if len(parts) != 2:
             return None, None
         host = parts[0].replace("git@", "")
-        project_path = parts[1].rstrip(".git")
+        # removesuffix, not rstrip: rstrip(".git") strips a character *class*, so
+        # it ate any trailing run of `.`, `g`, `i` or `t` — `group/project` came
+        # back as `group/projec`, and LMER_REPO_PROJECT (hence the run directory,
+        # the memory dir and the log path) was filed under the mangled name.
+        project_path = parts[1].removesuffix(".git")
         return host, project_path
 
     # Handle HTTPS format: https://host/path
@@ -568,14 +834,22 @@ def _resolve_taskdef_dir(task_id: str, taskdef_paths: list[Path]) -> Path | None
     return None
 
 
-def parse_file_mount_specs(
-    flag_values: list[str], env_value: str
-) -> list[FileMountSpec]:
-    """Parse and validate --mount-file / LMER_MOUNT_FILES entries.
+def _parse_mount_specs(
+    flag_values: list[str], env_value: str, *, flag: str, env_name: str, want_dir: bool
+) -> list:
+    """Shared parser for the ``host:container[:mode]`` mount grammar.
+
+    One body for ``--mount-file`` and ``--mount-dir`` because they are one
+    grammar: the only differences are which host predicate must hold, which
+    spec type comes out, and the names quoted back in an error. Duplicating it
+    would let the two flags drift apart — on `$VAR` expansion, on the
+    env-before-flags order, on the duplicate-destination rule — in ways a user
+    would read as a bug in whichever half they tried second.
 
     Each entry is ``host:container[:mode]``: ``host`` gets ``~`` and ``$VAR``
-    expansion and must resolve to an existing file; ``container`` must be an
-    absolute path; ``mode`` is ``ro`` (default) or ``rw``.
+    expansion and must resolve to an existing file (or directory, per
+    *want_dir*); ``container`` must be an absolute path; ``mode`` is ``ro``
+    (default) or ``rw``.
 
     ``env_value`` is split on commas (the entry separator — ``:`` is taken by
     the field grammar, cf. LMER_TASKDEF_PATHS choosing its own separator) and
@@ -593,13 +867,13 @@ def parse_file_mount_specs(
     for raw in env_value.split(","):
         raw = raw.strip()
         if raw:
-            entries.append(("LMER_MOUNT_FILES", raw))
+            entries.append((env_name, raw))
     for raw in flag_values:
         raw = raw.strip()
         if raw:
-            entries.append(("--mount-file", raw))
+            entries.append((flag, raw))
 
-    by_container: dict[str, FileMountSpec] = {}
+    by_container: dict[str, object] = {}
     for source, raw in entries:
         parts = raw.split(":")
         if len(parts) == 2:
@@ -613,7 +887,12 @@ def parse_file_mount_specs(
             )
 
         host = Path(os.path.expandvars(host_raw)).expanduser()
-        if not host.is_file():
+        if want_dir and not host.is_dir():
+            raise ValueError(
+                f"{source} entry {raw!r}: host path {str(host)!r} is not an "
+                f"existing directory"
+            )
+        if not want_dir and not host.is_file():
             raise ValueError(
                 f"{source} entry {raw!r}: host path {str(host)!r} is not an "
                 f"existing file"
@@ -633,9 +912,69 @@ def parse_file_mount_specs(
                 f"⚠️  Duplicate mount destination {container} — "
                 f"{source} entry {raw!r} overrides the earlier one (last wins)"
             )
-        by_container[container] = FileMountSpec(host=host, container=container, mode=mode)
+        spec_type = DirMountSpec if want_dir else FileMountSpec
+        by_container[container] = spec_type(host=host, container=container, mode=mode)
 
     return list(by_container.values())
+
+
+def parse_file_mount_specs(
+    flag_values: list[str], env_value: str
+) -> list[FileMountSpec]:
+    """Parse and validate --mount-file / LMER_MOUNT_FILES entries.
+
+    Grammar, ordering, dedup and fail-fast rules: :func:`_parse_mount_specs`.
+    ``host`` must be an existing **file** — a directory is refused here so it
+    cannot arrive at a destination the user meant to hold one file.
+    """
+    return _parse_mount_specs(
+        flag_values,
+        env_value,
+        flag="--mount-file",
+        env_name="LMER_MOUNT_FILES",
+        want_dir=False,
+    )
+
+
+def parse_dir_mount_specs(
+    flag_values: list[str], env_value: str
+) -> list[DirMountSpec]:
+    """Parse and validate --mount-dir / LMER_MOUNT_DIRS entries.
+
+    Grammar, ordering, dedup and fail-fast rules: :func:`_parse_mount_specs`.
+    ``host`` must be an existing **directory** — lmer does not create it,
+    because a typo would otherwise be answered with an empty directory the
+    container happily mounts instead of an error naming the typo.
+
+    The default mode is ``ro``, the same as ``--mount-file``: one rule to
+    remember for one grammar, and the narrow default is the right one for a
+    flag whose blast radius is a whole subtree rather than a single file. The
+    cases that need to write — the platform's transcript mount is the first —
+    say ``:rw`` out loud.
+    """
+    return _parse_mount_specs(
+        flag_values,
+        env_value,
+        flag="--mount-dir",
+        env_name="LMER_MOUNT_DIRS",
+        want_dir=True,
+    )
+
+
+def conflicting_mount_destinations(file_specs: list, dir_specs: list) -> list[str]:
+    """Container destinations claimed by both a file mount and a dir mount.
+
+    The two parsers dedupe within themselves (last wins), but neither can see
+    the other, and Docker/Podman refuse a duplicate ``-v`` destination
+    outright — so without this check the only symptom of ``--mount-file
+    a:/x`` plus ``--mount-dir b:/x`` is the runtime aborting the launch with
+    its own message about a destination the user has to trace back to two
+    different flags. Returns the clashing destinations, sorted; the caller
+    turns that into the same fail-fast refusal an invalid entry gets.
+    """
+    return sorted(
+        {spec.container for spec in file_specs} & {spec.container for spec in dir_specs}
+    )
 
 
 def _check_ssh_setup(container_home: Path, ssh_agent_enabled: bool) -> None:
@@ -805,6 +1144,161 @@ def _display_env_config_cli(
     print(f"  {'─' * name_width}  {'─' * value_width}  {'─' * 20}")
     for name, value, source in rows:
         print(f"  {name:<{name_width}}  {value:<{value_width}}  {source}")
+    print("---")
+
+
+def _display_sources_config_cli() -> None:
+    """Render the canonical-sources block (sources.yaml, issue #105) for --show-env.
+
+    Placement decisions (recorded for plan task 11):
+
+    (a) Sibling renderer called from BOTH --show-env call sites (the normal
+        path and the UnknownHarnessError fail-fast branch), NOT from inside
+        _display_env_config_cli: that function returns early when no LMER_*
+        vars are set, which would drop this block exactly when it is most
+        useful (nothing overridden means the declared/unset picture IS the
+        answer), and folding it in would break that function's tested
+        no-LMER-vars no-output contract.
+
+    (b) A source with neither a declaration nor an env var prints an explicit
+        `unset-fallback` row rather than being omitted — issue #105's "loud
+        when unset" requirement is satisfied HERE, in the host-side display.
+
+    (c) A cached sources.yaml that fails validation is surfaced as
+        `declared: invalid (<scrubbed reason>)` and the rows fall back to
+        env-only/unset-fallback; nothing raises and the exit code is
+        untouched — this renderer is strictly display-only. The recoverable
+        half of the same channel — load_sources' warnings list — prints as
+        `⚠️` lines under the `declared:` line, matching what bin/doctor and
+        container startup surface for the same file.
+
+    Declared side: the work repo's sources.yaml is read from the local clone
+    cache (read_cached_repo_file_status — no network, fail-soft) against the
+    RAW LMER_WORK_REPO env value, because the work-repo URL derivation further
+    down main() has not run yet at either call site. A cache hit is labeled
+    `(cached, possibly stale)`. A miss is phrased from the reason the reader
+    reports rather than from the bare None the plain reader returns: a warm
+    mirror whose repo carries no sources.yaml renders `declared: none (no
+    sources.yaml in the work repo)` — the expected state until the cutover —
+    and only a genuinely cold/unusable cache renders `unknown (work repo not
+    cached)`. Parse/validate/normalize/redact all come from the core
+    library (lmer_cli.container.sources) — nothing is reimplemented here;
+    the normalizer decides declared-vs-env equality so an env var that
+    silently matches the declaration is labeled `env-match` (the same origin
+    the container banner prints for that row), never `env-override`.
+    """
+    work_repo_url = os.environ.get("LMER_WORK_REPO", "")
+    config: "dict | None" = None
+    # Recoverable findings from load_sources (unknown keys, reserved keys,
+    # forward-compat notices). bin/doctor and container startup both print
+    # them; dropping them here would render a typo'd declaration as a clean
+    # `declared:` line on the one surface an operator uses to understand
+    # what their declaration is doing (review finding).
+    load_warnings: "list[str]" = []
+    if not work_repo_url:
+        declared_status = "unknown (LMER_WORK_REPO not set)"
+    else:
+        cached, cache_reason = read_cached_repo_file_status(
+            work_repo_url, container_sources.SOURCES_FILENAME
+        )
+        if cached is None:
+            if cache_reason == CACHE_FILE_ABSENT:
+                # Warm mirror, no declaration — the expected state for every
+                # work repo until the cutover lands, so it must not read as a
+                # clone-cache problem the operator should go debug.
+                declared_status = (
+                    f"none (no {container_sources.SOURCES_FILENAME} in the work repo)"
+                )
+            elif cache_reason == CACHE_ERROR:
+                declared_status = "unknown (work-repo cache unreadable)"
+            else:
+                declared_status = "unknown (work repo not cached)"
+        else:
+            tmp: "Path | None" = None
+            try:
+                # load_sources reads a file path; hand the cached bytes to it
+                # as a throwaway sources.yaml so schema/credential/trust-rule
+                # validation runs exactly as the container will run it.
+                with tempfile.TemporaryDirectory() as td:
+                    tmp = Path(td) / container_sources.SOURCES_FILENAME
+                    tmp.write_text(cached, encoding="utf-8")
+                    config, raw_warnings = container_sources.load_sources(
+                        tmp, work_repo_url=work_repo_url
+                    )
+                # Warnings name the file by the path load_sources was given
+                # — the throwaway copy. Rewrite it to the real filename, the
+                # same substitution the SourcesConfigError branch does.
+                load_warnings = [
+                    w.replace(str(tmp), container_sources.SOURCES_FILENAME)
+                    for w in raw_warnings
+                ]
+                declared_status = "sources.yaml from work-repo cache (cached, possibly stale)"
+            except container_sources.SourcesConfigError as exc:
+                # Decision (c): render, never raise. Strip the throwaway temp
+                # path so the message names the real file, and scrub before
+                # printing — the reason may echo (scrubbed) repo URLs.
+                reason = str(exc)
+                if tmp is not None:
+                    reason = reason.replace(str(tmp), container_sources.SOURCES_FILENAME)
+                declared_status = f"invalid ({container_sources.scrub_credentials(reason)})"
+                config = None
+            except Exception as exc:  # display-only: never break --show-env
+                declared_status = f"unknown (cache read failed: {type(exc).__name__})"
+                config = None
+
+    declared_sources = (config or {}).get("sources") or {}
+    rows = []
+    for label, name, key, env_var in (
+        ("taskdef repo", "taskdef", "repo", "LMER_TASKDEF_REPO"),
+        ("taskdef ref", "taskdef", "ref", "LMER_TASKDEF_REF"),
+        ("napkin repo", "napkin", "repo", "LMER_NAPKIN_REPO"),
+    ):
+        declared_value = (declared_sources.get(name) or {}).get(key)
+        env_value = (os.environ.get(env_var) or "").strip() or None
+        if declared_value and env_value:
+            if key == "repo":
+                # Core predicate, not string equality: `git@h:o/x.git` and
+                # `https://h/o/x` are the same source, not an override — and
+                # so is the URL the container would derive from the
+                # declaration, which is what an SSH-on-a-custom-port work
+                # repo produces. Shared with the container's matrix so both
+                # surfaces call this row env-match.
+                same = container_sources.env_matches_declared(
+                    env_value, declared_value, work_repo_url
+                )
+            else:
+                same = env_value == declared_value  # refs are opaque strings
+            if same:
+                value, origin = declared_value, "env-match (declaration cached, possibly stale)"
+            else:
+                value, origin = env_value, "env-override"
+        elif declared_value:
+            value, origin = declared_value, "declared (cached, possibly stale)"
+        elif env_value:
+            value, origin = env_value, "env-only"
+        else:
+            # Decision (b): loud, explicit unset row.
+            value, origin = "(unset)", "unset-fallback"
+        # A valid config never carries credentials (load_sources refuses),
+        # but env values can — scrub every rendered value unconditionally
+        # (core-library redactor; _redact_env_value is the same host-side
+        # pattern but misses scp-form credentials).
+        rows.append((label, container_sources.scrub_credentials(value), origin))
+
+    name_width = max(len(r[0]) for r in rows)
+    value_width = max(len(r[1]) for r in rows)
+    print("---")
+    print("📚 Canonical Sources (sources.yaml):\n")
+    print(f"  declared: {declared_status}\n")
+    for warning in load_warnings:
+        # Scrub unconditionally, the same rule the rows below follow.
+        print(f"  ⚠️  {container_sources.scrub_credentials(warning)}")
+    if load_warnings:
+        print()
+    print(f"  {'Source':<{name_width}}  {'Value':<{value_width}}  Origin")
+    print(f"  {'─' * name_width}  {'─' * value_width}  {'─' * 20}")
+    for label, value, origin in rows:
+        print(f"  {label:<{name_width}}  {value:<{value_width}}  {origin}")
     print("---")
 
 
@@ -1174,6 +1668,45 @@ def _agents_child_harnesses(
     return list(extra.values())
 
 
+def _apply_model_selection(
+    explicit: str | None, env_sources: dict[str, str]
+) -> str | None:
+    """Make ``--model`` the session's ``LMER_LLM_NAME``. Returns the effective model.
+
+    The flag spelling of a variable that until now could only be exported. It
+    wins over the environment, matching the ``--harness``/``LMER_HARNESS``
+    convention, and it is applied to ``os.environ`` rather than carried in the
+    namespace because that is where every consumer already reads it: the harness
+    autoselection hint (:func:`lmer_cli.harness.resolve_harness_selection`), the
+    fan-out children's implied harnesses (:func:`_agents_child_harnesses`) and
+    the container env dict all read the variable, so a second channel would be a
+    second answer.
+
+    Must therefore run *after* preset application and *before* harness
+    resolution. After, because a preset's env is applied only over keys the
+    environment leaves unset — setting the variable first would make the flag
+    look like an export and silently disable the preset's own model. Before,
+    because a model is allowed to pick the harness that serves it.
+
+    Blank is not a value: ``--model ''`` leaves the environment alone, the same
+    way an empty ``--harness`` falls through to ``LMER_HARNESS``. Surrounding
+    whitespace is stripped (the value ends up as a container env var and then as
+    a harness's ``--model`` argument, where a stray space is a model name nobody
+    has); the case is not touched — model ids are case-sensitive to the harness
+    that resolves them.
+
+    *env_sources* is the ``--show-env`` attribution map: without an entry the
+    table would report a flag-set value as coming from the environment, which is
+    the one thing that table exists to tell apart.
+    """
+    model = (explicit or "").strip()
+    if not model:
+        return os.environ.get(LLM_NAME_ENV) or None
+    os.environ[LLM_NAME_ENV] = model
+    env_sources[LLM_NAME_ENV] = "--model flag"
+    return model
+
+
 def _resolve_afk_timeout_ms(explicit_value: str | None, slack_bridged: bool) -> str | None:
     """Resolve the CLAUDE_AFK_TIMEOUT_MS value forwarded into the container.
 
@@ -1364,6 +1897,14 @@ def main(argv: list[str] | None = None) -> int:
     if argv and argv[0] == "rebuild":
         error("'lmer rebuild' has been renamed to 'lmer build'. Please use 'lmer build' instead.")
         return 1
+    # The orchestrator platform (issue #141) owns its own argument grammar, so it
+    # is dispatched before task parsing like `build` is. Imported lazily: the
+    # daemon pulls in FastAPI/uvicorn, and every other lmer invocation should
+    # keep paying nothing for that.
+    if argv and argv[0] == "platform":
+        from lmer_platform.daemon import main as platform_main
+
+        return platform_main(argv[1:])
 
     ns, rest = parse_args(argv)
 
@@ -1400,25 +1941,17 @@ def main(argv: list[str] | None = None) -> int:
     explicit_env_file = Path(ns.env_file).expanduser() if ns.env_file else None
     if explicit_env_file is not None and not explicit_env_file.is_file():
         warning(f"⚠️  --env-file not found, skipping: {explicit_env_file}")
-    early_env_file_sources: dict[str, str] = {}
     env_file_candidates = []
-    # Gate on .is_file() (not the loop's .exists()) so a path that exists but
-    # isn't a regular file — e.g. a directory — is skipped here too, keeping
-    # this consistent with the warning above and the container-merge guard
-    # below (all three agree, and the "skipping" warning stays accurate).
+    # Gate on .is_file() (not apply_env_file_defaults' .exists()) so a path that
+    # exists but isn't a regular file — e.g. a directory — is skipped here too,
+    # keeping this consistent with the warning above and the container-merge
+    # guard below (all three agree, and the "skipping" warning stays accurate).
     if explicit_env_file is not None and explicit_env_file.is_file():
         env_file_candidates.append(("--env-file", explicit_env_file))
-    env_file_candidates += [
-        ("working directory", cwd_env_file),
-        ("lmer state dir", state_dir / ".env"),
-    ]
-    for location, env_file in env_file_candidates:
-        if env_file.exists():
-            env_vars = dotenv_values(dotenv_path=str(env_file))
-            for key, value in env_vars.items():
-                if key not in os.environ and value is not None:
-                    os.environ[key] = value
-                    early_env_file_sources[key] = f".env ({location})"
+    env_file_candidates += default_env_file_candidates(
+        state_dir=state_dir, cwd=cwd_env_file.parent
+    )
+    early_env_file_sources = apply_env_file_defaults(env_file_candidates)
 
     # Handle --list-presets: a pure query, so it runs before any preset is
     # resolved or a task is required — but after the early .env load so an
@@ -1460,6 +1993,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         container_user = os.environ.get("LMER_CONTAINER_USER", "developer")
 
+    # Apply --model to LMER_LLM_NAME (after preset application, so the flag beats
+    # a preset's env rather than being mistaken for an export; before harness
+    # resolution, so the model can imply the harness that serves it).
+    session_model = _apply_model_selection(ns.model, early_env_file_sources)
+
     # Resolve the agent harness (--harness > LMER_HARNESS > LMER_LLM_NAME
     # model hint > claude). Must run AFTER the early .env load above so
     # LMER_HARNESS/LMER_LLM_NAME from a .env file are honored (docs promise
@@ -1472,8 +2010,12 @@ def main(argv: list[str] | None = None) -> int:
         # Fail fast — but under --show-env render the env table first: that
         # table is exactly the diagnostic for finding where a typo'd
         # LMER_HARNESS value comes from (host export vs. which .env file).
+        # The sources block is a sibling call (not inside the env renderer)
+        # so it still prints when no LMER_* vars are set — see
+        # _display_sources_config_cli's decision record.
         if ns.show_env:
             _display_env_config_cli(host_lmer_vars, early_env_file_sources)
+            _display_sources_config_cli()
         error(f"❌ {e}")
         return 2
     user_tag = " [user-installed]" if harness.source_dir is not None else ""
@@ -1490,6 +2032,12 @@ def main(argv: list[str] | None = None) -> int:
             f"rebuild with: lmer build)"
         )
 
+    # Tell the spawning platform which model this session settled on (T51). Here
+    # rather than anywhere earlier because this is the first point the answer is
+    # final: the flag, the preset's env and the ambient environment have all had
+    # their say. A plain terminal launch sets no ports file and writes nothing.
+    _record_session_model(session_model)
+
     # Harnesses the --agents fan-out children imply beyond the session's
     # (issue #131): their credential files union into build_user_mounts
     # below, and a child harness with no host credential file warns here,
@@ -1498,9 +2046,12 @@ def main(argv: list[str] | None = None) -> int:
         _agents_child_harnesses(resolved_agents, harness) if resolved_agents else []
     )
 
-    # Handle --show-env: display env config table
+    # Handle --show-env: display env config table, then the canonical-sources
+    # block (sibling call so it renders even when the env table early-returns
+    # with no LMER_* vars set — see _display_sources_config_cli).
     if ns.show_env:
         _display_env_config_cli(host_lmer_vars, early_env_file_sources)
+        _display_sources_config_cli()
         # Without a task, just show env and exit
         if not ns.task and not ns.no_task:
             return 0
@@ -1569,9 +2120,21 @@ def main(argv: list[str] | None = None) -> int:
             error(f"❌ --checkout path is not a directory: {checkout_path}")
             return 2
 
-    # Skip repo resolution when --no-clone or --no-task
+    # Repo-less session as a *host input*: LMER_NO_REPO in the environment (a
+    # preset's env and the early .env load both land in os.environ before this
+    # point, so either can set it). The caller this exists for is the
+    # orchestrating assistant (issue #141, D17), which must run with no checkout
+    # so that it structurally cannot edit code — a prompt saying "don't" is not
+    # the same guarantee. Read once and used twice, below and in the container
+    # env dict, so the two cannot disagree about what was asked for.
+    no_repo_env = get_bool_env("LMER_NO_REPO")
+
+    # Skip repo resolution when --no-clone or --no-task, or when the session
+    # deliberately has no repository: there is nothing to resolve, and resolving
+    # would fail on a target that is not a repo (which is exactly the shape a
+    # repo-less session's target has).
     # Note: --checkout skips cloning but still resolves repo URL for MR/git metadata
-    skip_repo_resolve = bool(ns.no_clone or ns.no_task)
+    skip_repo_resolve = bool(ns.no_clone or ns.no_task or no_repo_env)
     repo_url: str | None = None
     host_repo_path = None
     # Session without a repository (set when the only targets are special
@@ -1697,10 +2260,34 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         error(f"❌ Invalid file mount: {exc}")
         return 1
+
+    # Explicit per-directory mounts: --mount-dir flags + LMER_MOUNT_DIRS env.
+    # Same grammar and same fail-fast rule (see parse_dir_mount_specs).
+    try:
+        dir_mount_specs = parse_dir_mount_specs(
+            ns.mount_dir or [], os.environ.get("LMER_MOUNT_DIRS", "")
+        )
+    except ValueError as exc:
+        error(f"❌ Invalid directory mount: {exc}")
+        return 1
+
+    clashes = conflicting_mount_destinations(file_mount_specs, dir_mount_specs)
+    if clashes:
+        error(
+            "❌ Invalid mount: a file mount and a directory mount both claim "
+            f"{', '.join(clashes)} — the container runtime refuses a duplicate "
+            "mount destination, so drop one of them"
+        )
+        return 1
+
     if file_mount_specs:
         run += build_file_mounts(runtime, file_mount_specs)
         for spec in file_mount_specs:
             success(f"✅ Mounting file: {spec.host} → {spec.container} ({spec.mode})")
+    if dir_mount_specs:
+        run += build_dir_mounts(runtime, dir_mount_specs)
+        for spec in dir_mount_specs:
+            success(f"✅ Mounting directory: {spec.host} → {spec.container} ({spec.mode})")
 
     # Release credential gate (release-flow spec §4/§5): production release
     # credentials — the fine-grained GitHub PAT and the release SSH signing
@@ -1735,23 +2322,24 @@ def main(argv: list[str] | None = None) -> int:
         else:
             info(f"⚠️  Host uv cache not found at {host_uv_cache}, skipping mount")
 
-    # Persistent git clone cache (#112): mount a host directory so the
-    # container's clone script keeps bare repo mirrors across sessions and
-    # later sessions fetch only what changed instead of re-cloning. On by
-    # default; LMER_CLONE_CACHE=0 disables. LMER_CLONE_CACHE_DIR overrides
-    # the host location (default ~/.lmer/clone-cache). Fail-soft: an
-    # unusable cache dir skips the mount and the container clones directly.
+    # Persistent git clone cache (#112): the mirrors themselves are mounted
+    # further down, once every repo URL this launch will clone is known —
+    # only those mirrors are mounted (#135), never the whole cache root.
+    # On by default; LMER_CLONE_CACHE=0 disables. LMER_CLONE_CACHE_DIR
+    # overrides the host location (default ~/.lmer/clone-cache). Fail-soft:
+    # an unusable cache dir disables the feature and the container clones
+    # directly.
     clone_cache_container_dir: str | None = None
+    host_clone_cache: Path | None = None
     if get_bool_env("LMER_CLONE_CACHE", default=True):
-        host_clone_cache = resolve_host_clone_cache_dir()
+        candidate_clone_cache = resolve_host_clone_cache_dir()
         try:
-            host_clone_cache.mkdir(parents=True, exist_ok=True)
+            candidate_clone_cache.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            info(f"⚠️  Clone cache dir unusable at {host_clone_cache} ({e}), skipping mount")
+            info(f"⚠️  Clone cache dir unusable at {candidate_clone_cache} ({e}), skipping mount")
         else:
-            run += build_clone_cache_mount(runtime, host_clone_cache)
+            host_clone_cache = candidate_clone_cache
             clone_cache_container_dir = CONTAINER_CLONE_CACHE_DIR
-            success(f"✅ Mounting git clone cache: {host_clone_cache} → {CONTAINER_CLONE_CACHE_DIR}")
 
     # Workspace mount removed - using /workspace directory from image instead
     # This avoids root:root ownership issues with Docker/Podman mounts
@@ -1846,10 +2434,52 @@ def main(argv: list[str] | None = None) -> int:
     # Host-side cache maintenance (#112): freshen/build the mirrors for every
     # repo this session will clone, in a detached background updater. The
     # session never waits on it; the container consumes the cache read-only.
-    if clone_cache_container_dir is not None:
-        _spawn_clone_cache_updater(
-            [repo_url, work_repo_url, napkin_repo_url, taskdef_repo_url]
+    #
+    # ACCEPTED GAP (#105): only the env-var forms are warmed. A taskdef/napkin
+    # source configured purely in the work repo's sources.yaml has no
+    # LMER_TASKDEF_REPO/LMER_NAPKIN_REPO here, so no mirror is ever built for
+    # it and the container's cache lookup misses every session — declaring a
+    # source is slower than exporting one. Deliberate, not an oversight: the
+    # declaration is only knowable host-side through the best-effort clone
+    # cache (the same possibly-stale read --show-env labels as such), and
+    # resolution is authoritative container-side, after this point. Documented
+    # in docs/LMER-CLI.md under Canonical Source Declarations.
+    if clone_cache_container_dir is not None and host_clone_cache is not None:
+        clone_cache_urls = [repo_url, work_repo_url, napkin_repo_url, taskdef_repo_url]
+
+        # Mount only the mirrors for the repos this launch clones (#135), each
+        # at the path the container's own lookup expects. A repo with no mirror
+        # yet contributes no mount: the container clones it directly while the
+        # updater below builds the mirror for next time.
+        #
+        # A secondary MR/PR target is cloned container-side as well
+        # (clone_secondary_mr, from a repo URL derived from the target), so its
+        # mirror joins the mount list — otherwise narrowing the mount would
+        # quietly take away borrowing the whole-root mount used to give it.
+        # It stays out of the updater list below: warming is for the repos the
+        # session works in, and a secondary repo's mirror exists only when some
+        # other session had it as its own project.
+        secondary_repo_urls = [
+            _derive_repo_url_from_task_target(t)
+            for t in secondary_targets
+            if isinstance(t, str)
+        ]
+        cache_mount_args, cache_mounted = build_clone_cache_mounts(
+            runtime, host_clone_cache, clone_cache_urls + secondary_repo_urls
         )
+        run += cache_mount_args
+        if cache_mounted:
+            success(
+                f"✅ Mounting git clone cache mirrors ({len(cache_mounted)}): "
+                + ", ".join(container_path for _, container_path in cache_mounted)
+            )
+        else:
+            info(
+                f"📦 No clone-cache mirrors yet for this session's repos "
+                f"({host_clone_cache}); cloning directly and warming the cache"
+            )
+
+        _spawn_clone_cache_updater(clone_cache_urls)
 
     # Compute the in-container napkin path (separate repo -> /napkin, else a
     # subdir of the work repo). Always injected so agents can use it in any mode.
@@ -1902,6 +2532,11 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_DANGER_ZONE": os.environ.get("LMER_DANGER_ZONE"),
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
         "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
+        # No human attached (cron/scheduled launches): the AGENTS.md gates
+        # report instead of asking when this is set. Never inferred from the
+        # launch shape — only an explicit host value crosses over, while
+        # spawn-harness sets it on its own children (issue #137).
+        "LMER_NONINTERACTIVE": os.environ.get("LMER_NONINTERACTIVE"),
         # Per-lane model+effort dispatch for Claude subagent defs
         # (model[:effort] per lane; parsed in-container by
         # lmer_cli.container.dispatch_agents via claude-agent-files.sh).
@@ -1939,6 +2574,14 @@ def main(argv: list[str] | None = None) -> int:
         # together a session can answer "what code am I actually running?".
         "LMER_SOURCE_COMMIT": checkout_commit(repo_root_path()),
         "LMER_RUN_STATE_GUARD": os.environ.get("LMER_RUN_STATE_GUARD"),
+        # Gate-in-flight coordination (issue #201): the kill switch for the
+        # work-repo commit deferral and the Stop hook's matching nudge
+        # suppression, and the marker directory both sides read. Both must
+        # cross into the container — the gates, the work CLI and the hook all
+        # run there, and a host-side value that stopped at the boundary would
+        # silently leave the deferral on.
+        "LMER_GATE_INFLIGHT_GUARD": os.environ.get("LMER_GATE_INFLIGHT_GUARD"),
+        "LMER_GATE_LOCK_DIR": os.environ.get("LMER_GATE_LOCK_DIR"),
         # Opt-in to the masterplan workflow. Truthy (get_bool_env) turns on the
         # session-start plugin provisioning in claude-runner.sh; LMER_TASK=masterplan
         # implies it. MASTERPLAN_RUNS_DIR is computed in-container from the run
@@ -2052,20 +2695,44 @@ def main(argv: list[str] | None = None) -> int:
         # Without this delay /start can fail to register before the prompt is
         # typed on slow systems, landing both on one input line (issue #65).
         "LMER_START_PROMPT_DELAY": os.environ.get("LMER_START_PROMPT_DELAY"),
+        # The margin between a submitted message's text and its Enter, covering
+        # what the kernel cannot answer once the harness has read the text — a
+        # harness still coalescing input in userspace (issue #210). It has to reach
+        # the in-container supervisor, or retuning that window needs a release.
+        "LMER_SUBMIT_ENTER_DELAY": os.environ.get("LMER_SUBMIT_ENTER_DELAY"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
         # only works if the container-side bind is 0.0.0.0. The host CLI
         # publishes to 127.0.0.1 on the host, so it is not network-exposed.
         "LMER_FASTAPI_HOST": ns.fastapi_host or ("0.0.0.0" if ns.fastapi else None),
-        "LMER_FASTAPI_TOKEN": ns.fastapi_token,
+        # Flag > env, as everywhere else. The env fallback exists because a
+        # process that spawns lmer may need to know the bearer token *before* the
+        # session exists — the platform orchestrator mints one, records where it
+        # put it, and hands it down here (issue #141). Without the fallback the
+        # supervisor would generate its own and the spawner's copy would be
+        # wrong, which is worse than having none: everything downstream looks
+        # wired and fails only when someone tries to drive the session. Passing it
+        # as a flag instead would put the credential in `ps` output.
+        "LMER_FASTAPI_TOKEN": ns.fastapi_token or os.environ.get("LMER_FASTAPI_TOKEN"),
+        # Container-side path of the orchestrator's ask channel (issue #141):
+        # the directory the platform bind-mounts so a session can ask its
+        # operator a question through `lmer-ask` instead of posing it in a
+        # terminal nobody is watching. Set by lmer_platform.spawn on the host
+        # process, and forwarded here because the value is a *container* path the
+        # in-container CLI and the prompt fragment both read. Deliberately no
+        # flag: it is not an operator control, it is one half of a mount the
+        # spawner made, and a value without the matching mount is a session that
+        # blocks forever on answers nobody can write.
+        "LMER_ASK_DIR": os.environ.get("LMER_ASK_DIR"),
         # Env contributed by special target types (Slack tokens + parsed
         # thread context today). Keys of types with no matching target are
         # seeded with None so the .env merge below cannot forward them.
         **special_target_env(special_targets),
-        # Repo-less session (special targets were the only targets and no
-        # git origin could be inferred): tells clone_and_exec to skip the
-        # workspace clone instead of failing on the missing LMER_REPO_URL.
-        "LMER_NO_REPO": "1" if no_repo_session else None,
+        # Repo-less session: tells clone_and_exec to skip the workspace clone
+        # instead of failing on the missing LMER_REPO_URL. Either inferred
+        # (special targets were the only targets and no git origin could be
+        # found) or asked for by the host — see no_repo_env above.
+        "LMER_NO_REPO": "1" if (no_repo_session or no_repo_env) else None,
     }
 
     # Slack-bridged sessions (a SlackThreadTargets handler contributed
@@ -2145,16 +2812,16 @@ def main(argv: list[str] | None = None) -> int:
         success(f"⚠️  .env file not found at: {' or '.join(searched)}")
 
     # Publish the FastAPI port so the endpoint is reachable from the host.
-    # We pick one free port from the configured range on the host before the
-    # container starts and publish only that port (rather than the whole
-    # range) so multiple `lmer ... --fastapi` sessions can coexist on the
-    # same host with default flags. The chosen port is passed into the
-    # container via LMER_FASTAPI_PORT so the supervisor inside binds to it.
+    # Only that one port is published (rather than the whole range) so multiple
+    # `lmer ... --fastapi` sessions can coexist on the same host with default
+    # flags. The resolved port is passed into the container via
+    # LMER_FASTAPI_PORT so the supervisor inside binds to it.
     if ns.fastapi:
-        from .supervisor import _parse_port_range, _pick_port
-        port_range_spec = ns.fastapi_port_range or "8700-8799"
-        port_range = _parse_port_range(port_range_spec)
-        host_port = _pick_port(port_range, "127.0.0.1")
+        try:
+            host_port = _resolve_fastapi_host_port(ns.fastapi_port_range, os.environ)
+        except (ValueError, RuntimeError) as exc:
+            error(f"❌ {exc}")
+            return 2
         env["LMER_FASTAPI_PORT"] = str(host_port)
         _publish_host_ports(run, [host_port])
         info(f"🛰  FastAPI endpoint will be published on http://127.0.0.1:{host_port}")
@@ -2165,72 +2832,108 @@ def main(argv: list[str] | None = None) -> int:
     if port_rc is not None:
         return port_rc
 
-    run += env_args(env)
-
-    # Image name was resolved earlier (before ensure_image)
-    run += [image]
-
-    # Container command
-    # Service mode and checkout mode still use clone_and_exec.py for work repo
-    # and MR branch handling — only --no-clone/--no-task skip it entirely.
-    use_clone_script = not (ns.no_clone or ns.no_task)
-    if not use_clone_script:
-        # Skip clone script entirely, run command directly
-        cmd_tokens = rest if rest else ["bash"]
-        run += cmd_tokens
-    else:
-        # Call the container clone+exec script from mounted repo
-        clone_script = "/Agents/global/src/lmer_cli/container/clone_and_exec.py"
-
-        if exec_mode:
-            # Remaining tokens after --exec are the command to run; if empty, default to bash
-            cmd_tokens = rest if rest else ["bash"]
-            run += [
-                "python3",
-                clone_script,
-                "--",
-                *cmd_tokens,
-            ]
-        else:
-            # Default to the harness runner (historically the literal
-            # "claude-runner" token, kept for claude so a new host CLI still
-            # works against older images).
-            run += [
-                "python3",
-                clone_script,
-                "--",
-                harness.runner_command,
-            ]
-
-    info("Running: " + shlex.join(run))
-
-    # A real interactive session (the default claude-runner path) attached to a
-    # special target announces itself via its handler's lifecycle hooks while it
-    # runs, so peers can tell the target is already taken. For a Slack thread
-    # this records the attachment in the host-side registry the listener
-    # consults, so it won't connect a second lmer to a thread that already has
-    # one — including this session if it was started manually (issue #74).
-    # --exec / --no-task one-shots are not interactive sessions, so they don't
-    # announce.
-    announce_session = use_clone_script and not exec_mode
-    if announce_session:
-        for handler in special_targets:
-            handler.on_session_start()
-
-    success(f"🚀 Launching container ({runtime} run {image})")
-    if runtime == "podman":
-        success(
-            "   (first run with this image may take several minutes "
-            "while podman remaps UIDs for --userns=keep-id)"
-        )
+    # Container environment. Values ride a mode-0600 --env-file (plus bare
+    # -e NAME inheritance markers for the few that a line-oriented file
+    # cannot carry), never argv — /proc/<pid>/cmdline is world-readable and
+    # used to expose every token a session carries (issue #158). A variable
+    # neither leg can carry aborts the launch rather than falling back to an
+    # inline -e NAME=value, so the invariant cannot be quietly violated.
     try:
-        return subprocess.call(run)
-    except KeyboardInterrupt:
-        return 130
-    finally:
+        container_env = build_container_env(env)
+    except ContainerEnvError as exc:
+        error(f"❌ {exc}")
+        return 2
+    # Installed immediately after the file exists — before the args are even
+    # appended — so the create→install window a signal could slip through is as
+    # narrow as possible. SIGTERM here is routine rather than an operator
+    # mishap: a reaped session (systemd KillMode=control-group, an orchestrator,
+    # the Slack reaper's ladder) gets one before SIGKILL. Unavailable off the
+    # main thread, where an embedded caller owns signal disposition anyway.
+    try:
+        previous_sigterm = signal.signal(
+            signal.SIGTERM, _make_sigterm_cleanup_handler(container_env)
+        )
+    except ValueError:
+        previous_sigterm = None
+    run += container_env.args
+    try:
+        # Image name was resolved earlier (before ensure_image)
+        run += [image]
+
+        # Container command
+        # Service mode and checkout mode still use clone_and_exec.py for work repo
+        # and MR branch handling — only --no-clone/--no-task skip it entirely.
+        use_clone_script = not (ns.no_clone or ns.no_task)
+        if not use_clone_script:
+            # Skip clone script entirely, run command directly
+            cmd_tokens = rest if rest else ["bash"]
+            run += cmd_tokens
+        else:
+            # Call the container clone+exec script from mounted repo
+            clone_script = "/Agents/global/src/lmer_cli/container/clone_and_exec.py"
+
+            if exec_mode:
+                # Remaining tokens after --exec are the command to run; if empty, default to bash
+                cmd_tokens = rest if rest else ["bash"]
+                run += [
+                    "python3",
+                    clone_script,
+                    "--",
+                    *cmd_tokens,
+                ]
+            else:
+                # Default to the harness runner (historically the literal
+                # "claude-runner" token, kept for claude so a new host CLI still
+                # works against older images).
+                run += [
+                    "python3",
+                    clone_script,
+                    "--",
+                    harness.runner_command,
+                ]
+
+        # No environment VALUE appears here: build_container_env emits only
+        # --env-file plus bare -e NAME markers (enforced by its postcondition).
+        # The one inline -e in the command comes from mounts.py's
+        # SSH_AUTH_SOCK=/ssh-agent, a fixed container-side socket path.
+        info("Running: " + shlex.join(run))
+
+        # A real interactive session (the default claude-runner path) attached to a
+        # special target announces itself via its handler's lifecycle hooks while it
+        # runs, so peers can tell the target is already taken. For a Slack thread
+        # this records the attachment in the host-side registry the listener
+        # consults, so it won't connect a second lmer to a thread that already has
+        # one — including this session if it was started manually (issue #74).
+        # --exec / --no-task one-shots are not interactive sessions, so they don't
+        # announce.
+        announce_session = use_clone_script and not exec_mode
         if announce_session:
             for handler in special_targets:
-                handler.on_session_end()
+                handler.on_session_start()
+
+        success(f"🚀 Launching container ({runtime} run {image})")
+        if runtime == "podman":
+            success(
+                "   (first run with this image may take several minutes "
+                "while podman remaps UIDs for --userns=keep-id)"
+            )
+        try:
+            return subprocess.call(run, env=container_env.subprocess_env())
+        except KeyboardInterrupt:
+            return 130
+        finally:
+            if announce_session:
+                for handler in special_targets:
+                    handler.on_session_end()
+    finally:
+        # Cleanup BEFORE restoring the disposition: in the other order a
+        # SIGTERM landing between the two statements gets the default
+        # disposition and strands the file — in the one window where it is
+        # guaranteed to still exist, and the reaper's ladder makes a second
+        # SIGTERM unexceptional.
+        container_env.cleanup()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":
