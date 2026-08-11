@@ -5,6 +5,179 @@ unreleased:
   deprecated: []
   removed: []
   security: []
+0.7.0:
+  added:
+  - Resolving a review thread is the reviewer's verified sign-off, so `--resolve-thread`
+    now refuses in non-review sessions; the policy is in rules/git.md (#128)
+  - gitlab-review/github-review `--info` gained a thread-provenance block, and github-review
+    no longer hardcodes `blocking_discussions_resolved` to True (#128)
+  - 'Platform container image (#150): `Dockerfile.platform` ships the control plane
+    and its Vue UI as one artifact, with the UI baked in so a pull replaces `lmer
+    platform setup-ui`'
+  - 'Platform container operator guide (#150): `docs/PLATFORM-CONTAINER.md` covers
+    the mounts and upgrade-by-pull, and `scripts/platform-container-run.sh` encodes
+    it, with `--print` to show the `docker run` it would issue'
+  - 'Canonical source declarations (#105): the work repo can name its taskdef/napkin
+    source repos in a root `sources.yaml`, making env vars mismatch-checked overrides;
+    an absent file changes nothing'
+  - taskdefs may declare push targets in `task.yaml`, resolved from the trusted tiers
+    only so a manifest landed in the work repo cannot grant them (#107)
+  - gate-push names the granting entry and its source on success, not only on refusal
+    (#107)
+  - 'Orchestrated sessions can ask their operator a question (#141): a platform-spawned
+    session gets an ask channel and an `lmer-ask` CLI, answered from the run''s detail
+    page'
+  - 'Slack listener: a listener-wide default naming a preset that does not exist is
+    now reported in the thread, instead of the session dying with the reason only
+    in the log (#181)'
+  - docs/PRESETS.md documents the listener-wide default and its precedence over `LMER_PRESET`
+    (#181)
+  - '`LMER_GATE_INFLIGHT_GUARD` kill switch and `LMER_GATE_LOCK_DIR` override for
+    gate-in-flight coordination'
+  - "`LMER_SUBMIT_ENTER_DELAY` \u2014 extra margin between a submitted message's text\
+    \ and its Enter, for a harness still coalescing input; default `0.2` seconds,\
+    \ capped at 1"
+  - "`POST /input` also reports `submit_text` \u2014 `read`, `unread` or `unknown`:\
+    \ whether the harness was seen taking the text before Enter"
+  - 'Platform: the orchestrating assistant''s model, harness, preset and agents fan-out
+    are configurable per instance and take effect on its next incarnation (#234)'
+  - 'Platform API: `/api/assistant/config` reports each launch setting with the layer
+    that decided it, and persists patches into `config.json` only (#234)'
+  - 'Control UI: a settings dialog in the uber lmer drawer, with per-key provenance
+    and a restart offer to apply changes now (#234)'
+  - 'Delivery receipts for writes into a session (#197): the supervisor returns the
+    sha256 and length of what it received, and the daemon verifies it against what
+    it sent'
+  - The supervisor reports which file its code came from at startup and in `/healthz`,
+    so a stale control plane is visible rather than inferred (#236)
+  - 'A session halted by a Claude API error now shows as needing attention instead
+    of reading as healthy (#243): the run carries a `stalled` attention reason and
+    the orchestrating assistant gets a digest naming it. `LMER_PLATFORM_STALL_IDLE_SECONDS`
+    (600) and `LMER_PLATFORM_STALL_BACKSTOP_SECONDS` (3600) tune the thresholds. **On
+    upgrade:** rebuild or re-pull the UI bundle with the daemon restart, or the fleet
+    view shows the raw word `stalled`; the restart is what makes the config fields
+    take effect. No migration. See ''stopped responding'' in docs/PLATFORM-QUICKSTART.md'
+  - The platform tells the orchestrating assistant which runs nobody has looked at,
+    on a timer (`checkin_window_seconds`, default one hour, `0` disables)
+  - The fleet view shows when each run was last read by the orchestrator, and marks
+    those past the check-in window
+  - "Platform: service slots \u2014 named single-occupancy bindings from a runner\
+    \ to a dev service, declared in `config.json` and spawnable from the fleet view,\
+    \ API or `lmer-ctl` (#245)"
+  - "Platform: one dev service takes one slot \u2014 a slot whose preset cannot back\
+    \ it is refused, and contending for a held service gets a 409 (#245)"
+  - 'lmer CLI: `parse_args(..., quiet=True)` raises `ParseRefused` instead of printing
+    usage and exiting (#245)'
+  - 'Claude output styles ship through agent-files (#249): a style in `agent-files/claude/output-styles/`
+    is linked into `~/.claude/output-styles/`; selecting the active one remains the
+    `outputStyle` settings key, which a work-repo `settings.json` cannot set'
+  fixed:
+  - 'The clone-cache updater no longer loses a mirror to a credential the remote rejects
+    (#157): a failed credentialed fetch is retried once with lmer''s own credential
+    dropped, so a public repo mirrors anyway'
+  - A credentialed clone-cache fetch now sends only its own `Authorization` header.
+    **Trade-off:** this clears git's whole header list for that URL, so an `http.extraHeader`
+    carrying a *required non-auth* header is dropped there (#179)
+  - '`lmer-ask` no longer refuses to post at roughly a third of the channel cap (#191):
+    the check counted the sidecars a healthy question accumulates, so 167 exchanges
+    read as 500 entries'
+  - 'SELinux detection no longer needs `getenforce` installed (#150): sessions spawned
+    from inside the platform container were losing their relabel options and dying
+    on AVC denials'
+  - '`POST /input` presses Enter once and says so (#141): the bare-CR nudges it used
+    to send fire the topmost modal in current Claude Code, where a permission prompt
+    may sit'
+  - 'A non-ASCII credential answers 401 instead of 500 (#141): `compare_digest` refuses
+    non-ASCII `str`, so one accented character raised `TypeError` and the browser
+    never re-prompted'
+  - 'The control UI''s composers can be sent from a phone (issue 194): the send control
+    moves onto its own labelled, full-width row, replacing a 28px icon and a chord
+    no phone keyboard has'
+  - 'The chat no longer reports a message as sent when the submit could not be confirmed
+    (issue 194): it names both outcomes and points at the terminal view, where they
+    can be told apart'
+  - 'A message written to a session''s PTY can no longer be silently truncated: the
+    control-plane write now loops, so a short write cannot strand the submit CR that
+    is its last byte'
+  - 'A `v*` tag pipeline now publishes the images its build stage actually built (#189):
+    each is built once and pushed by digest, not rebuilt by the publish job'
+  - 'Gating in the background no longer fails when the session yields mid-run: gate
+    commands hold an in-flight marker and work-repo commits defer while one is live
+    (#201)'
+  - The /work isolation guard now names a concurrent writer when the work repo's HEAD
+    moved during a run, instead of blaming `LMER_*` env isolation (#201)
+  - Self-development sessions now import lmer from the `/workspace` checkout rather
+    than the operational runtime (#198), and a test fails the suite if the resolved
+    path lies outside it
+  - 'Messages sent into a session submit again, at any length (#210): the Enter is
+    now its own write, so a message past roughly 80 bytes no longer lands unsent'
+  - 'Known still-broken, tracked separately: a message with many embedded newlines
+    does not submit (#230), and on a loaded host a send can still land unsent (#231)'
+  - 'control UI: returning to the browser tab now repaints the run terminal, so a
+    rendering that went stale in the background no longer stays until something is
+    resized'
+  - 'control UI: a mid-transition layout can no longer shrink the run terminal to
+    two columns and make it rewrap its own scrollback to the sliver width'
+  - 'Self-dev sessions ran the supervisor from the /workspace checkout instead of
+    the image''s code, serving whatever routes it had (#236, #230; the #231 measurements
+    need re-running). Running sessions keep the stale supervisor until respawned'
+  - A 404 from a session's `/resize` is no longer misreported as "the image predates
+    the route"; the daemon reports what it observed (#236)
+  - 'Control UI chat: a message the session had already answered could keep the ''not
+    confirmed'' caption for the whole run, because the transcript poll could race
+    the send (#237)'
+  - The suite's work-repo leak guard no longer fails a run over the launching session's
+    own `work` writes; only a write that provably descends from the suite fails it
+    (#233)
+  - Work-repo durability commits now defer during bare `pytest` runs of the suite
+    too, not only gate-command runs (#233)
+  changed:
+  - 'The agent-facing ERROR GATE in AGENTS.md now gates on what a fix costs rather
+    than on the fact that something failed (#137): agents fix their own malformed
+    commands and carry on, stopping only when the human must supply what is missing
+    or the cause is unclear. Showing the error stays unconditional'
+  - "New companion rule for sessions with no human attached (#137): no gate may end\
+    \ the turn with a question \u2014 the agent states what it would have asked and\
+    \ skips the gated action. `LMER_NONINTERACTIVE` delivers the rule to every harness"
+  - 'gate-push allow list: the repo half of an entry is now matched by a documented
+    grammar instead of an unanchored substring test, so `group/project` no longer
+    authorizes `https://evil.example.com/mirror/group/project` (#107)'
+  - "gate-push now requires every push URL of the target remote to be allowed, not\
+    \ just the first \u2014 a remote with several pushurls sends the ref to all of\
+    \ them (#107)"
+  - gate-push refuses a push target that does not parse into host/path rather than
+    falling back to a substring match, and says so (#107)
+  - the release taskdef's documentation-only push-role block is renamed `needs.push_targets`,
+    so sharing the live `push_allow` key's name can no longer turn a stray dedent
+    into a grant (#107)
+  - 'Slack listener: a `$preset:<name>` token now DISPLACES the listener-wide default
+    instead of stacking with it, where the default used to silently fill every gap
+    the token left (#181)'
+  - 'Slack listener: the connecting ack names the preset actually in effect, and `lmer_session_spawned`
+    records the same pair, so no spawn can hide a second preset (#181)'
+  - The orchestrating assistant now runs on a credential minted for its incarnation
+    and revoked when it stops, so a stopped incarnation's environment file is no longer
+    a live key
+  security:
+  - 'Session container environment no longer travels in the `docker`/`podman run`
+    command line (#158): every variable was a `-e NAME=value` argument, exposing the
+    credentialed work-repo clone URL, tokens and the release PAT through world-readable
+    `/proc/<pid>/cmdline`. Values now arrive by a mode-0600 `--env-file` or a bare
+    `-e NAME` marker, with no inline fallback. See docs/CONTAINER.md'
+  - 'push allow-list entries and remote URLs now agree on IPv6 hosts: the two hooks
+    used to cut the authority at its first colon, so an entry naming one address authorized
+    pushes to a DIFFERENT one (#116)'
+  - "the push allow-list grammar is now enforced identically at all three enforcement\
+    \ points \u2014 `gate-push`, the `pc` hook, and the generated pre-push hook \u2014\
+    \ closing the window where a mirror was more permissive than the gate (#116).\
+    \ DEPLOY NOTE: existing checkouts keep the previously generated pre-push hook,\
+    \ which still uses the old substring repo test \u2014 the container entrypoint\
+    \ runs `hooks/install.sh` only when `.git/hooks/pre-commit` is absent. Re-run\
+    \ `hooks/install.sh` in any existing checkout to pick up the new grammar; until\
+    \ then a raw `git push` there is gated more permissively than `gate-push`"
+  - 'A session now sees only the clone-cache mirrors of the repos it actually clones
+    (#135): the whole cache root used to be bind-mounted, so an agent could read the
+    full history of every repo ever cached'
 0.6.0:
   added:
   - "GitLab-driven release flow: the new built-in `release` taskdef runs a tracked,\
