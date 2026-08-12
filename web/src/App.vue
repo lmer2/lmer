@@ -141,8 +141,9 @@ const calm = computed(() => runs.value.filter((run) => !run.attention))
 const totals = computed(() => state.value?.totals || { runs: 0, live: 0, attention: 0 })
 const mirror = computed(() => state.value?.mirror || null)
 // Service slots (#245). Empty on a host that declares none, and the section
-// below then renders nothing rather than an explanatory card — a fixture nobody
-// configured is not news.
+// below then says so in a line rather than disappearing (#254): a feature that
+// renders nothing on the hosts that have not got it yet is one the operator
+// cannot ask the assistant to set up, because they never learn it is there.
 const slots = computed(() => state.value?.slots || [])
 // Filtered here rather than in the dialog, so the row's wording and the
 // dialog's list come from one predicate.
@@ -687,7 +688,7 @@ onUnmounted(() => {
                is to say who is asking. Outside the runs/empty-state branch
                above, because a fleet tracking nothing is the state you are most
                likely to be about to spawn into a slot from. -->
-          <template v-if="!loading && slots.length">
+          <template v-if="!loading">
             <div class="section-title">service slots</div>
             <SlotRow
               v-for="slot in slots"
@@ -696,6 +697,21 @@ onUnmounted(() => {
               :runs="runs"
               @open="open"
             />
+            <!-- A host that declares none says so (#254), quietly: the title and
+                 one muted line are what tell an operator the feature exists, and
+                 asking the assistant to set a slot up is the next step from here.
+                 Gated on `state` as well, because `slots` is empty both when the
+                 host declares none and when the payload was never read at all —
+                 a daemon that is down, or a 401 on the first load, leaves `state`
+                 null while `loading` clears in `finally`, and this line would
+                 then make a confident claim about a config it never saw, printed
+                 directly under the error alert. A *later* failed refresh keeps
+                 the previous payload, and saying so from stale-but-real data is
+                 how the rest of this page treats a refresh that did not land. -->
+            <p
+              v-if="!slots.length && state"
+              class="text-body-small text-medium-emphasis"
+            >No service slots configured.</p>
           </template>
         </template>
       </v-container>

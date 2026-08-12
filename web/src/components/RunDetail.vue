@@ -639,6 +639,27 @@ async function forget() {
         class="scroll-x"
         :title="run.target"
       >{{ targetLabel }}</span>
+      <!-- What the run published, on the line every tab can see. For a run that
+           built something to look at, opening it is the reason the operator came —
+           and inside the overview's session card it was a tab away from the
+           terminal they were watching it from.
+           No gate on the session is needed beyond the array itself: the daemon
+           reads these off the live session's registry entry (inventory's
+           `RunView.ports`), so a run with nothing running has no ports and the
+           line ends at the target. -->
+      <template v-if="run.ports?.length">
+        <v-chip
+          v-for="port in run.ports"
+          :key="port.host"
+          :href="portUrl(port)"
+          target="_blank"
+          rel="noopener"
+          :append-icon="mdiOpenInNew"
+          color="primary"
+          size="small"
+          variant="tonal"
+        >:{{ port.host }}</v-chip>
+      </template>
     </div>
 
     <!-- The note is prose an agent wrote — it quotes a path, emphasises a word,
@@ -813,19 +834,6 @@ async function forget() {
                 class="text-body-small text-medium-emphasis mt-2"
                 :title="session.activity?.last_output_at || ''"
               >{{ idle }}</div>
-
-              <div v-if="run.ports.length" class="d-flex flex-wrap ga-2 mt-3">
-                <v-chip
-                  v-for="port in run.ports"
-                  :key="port.host"
-                  :href="portUrl(port)"
-                  target="_blank"
-                  rel="noopener"
-                  :append-icon="mdiOpenInNew"
-                  color="primary"
-                  variant="tonal"
-                >:{{ port.host }}</v-chip>
-              </div>
             </v-card-text>
           </v-card>
         </template>

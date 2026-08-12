@@ -783,6 +783,43 @@ def test_append_newline_defaults_off(platform_root, control_plane):
     assert control_plane.calls[0]["body"]["append_newline"] is False
 
 
+def test_a_chat_message_is_marked_as_one_for_the_supervisor(
+    platform_root, control_plane
+):
+    """The flag the chat pane sets, carried to the session's own control plane.
+
+    It says a human typed this into a composer — nothing about what to do with
+    it, which is the supervisor's call because only that end knows which harness
+    is running (a leading ``!`` is Claude Code's bash escape, #254). This layer
+    forwards the fact and touches the payload not at all.
+    """
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.send_input(
+        "s-1", "!206 was merged", append_newline=True, sanitize=True
+    )
+
+    assert control_plane.calls[0]["body"] == {
+        "data": "!206 was merged",
+        "append_newline": True,
+        "sanitize": True,
+    }
+
+
+def test_input_nobody_flagged_puts_nothing_new_on_the_wire(
+    platform_root, control_plane
+):
+    """Absent rather than ``false``, so every caller that types on something
+    else's behalf — the terminal's keystrokes, an injected command — sends the
+    body it has always sent, and a session running an older image sees a request
+    it already understands."""
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.send_input("s-1", "!ls", append_newline=True)
+
+    assert "sanitize" not in control_plane.calls[0]["body"]
+
+
 def test_the_input_payload_is_never_logged(platform_root, control_plane, caplog):
     plant_session("s-1", port=control_plane.port)
     caplog.set_level("DEBUG")
@@ -1328,6 +1365,29 @@ def test_input_route_proxies_to_the_control_plane(
     assert response.status_code == 200
     assert response.json() == {"session": "s-1", "bytes_written": 7}
     assert control_plane.calls[0]["authorization"] == f"Bearer {CONTROL_TOKEN}"
+
+
+def test_the_route_forwards_the_chat_flag_and_invents_it_for_nobody(
+    client, platform_root, control_plane
+):
+    """The client is the only end that knows a human typed the message in a
+    composer, so the route relays that and never infers it: a payload that looks
+    like a command is exactly what the terminal's own callers send on purpose."""
+    plant_session("s-1", port=control_plane.port)
+
+    client.post(
+        "/api/sessions/s-1/input",
+        headers=bearer_header(),
+        json={"data": "!206 was merged", "append_newline": True, "sanitize": True},
+    )
+    client.post(
+        "/api/sessions/s-1/input",
+        headers=bearer_header(),
+        json={"data": "!206 was merged", "append_newline": True},
+    )
+
+    assert control_plane.calls[0]["body"]["sanitize"] is True
+    assert "sanitize" not in control_plane.calls[1]["body"]
 
 
 def test_an_unconfirmed_submit_reaches_the_caller(

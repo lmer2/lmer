@@ -73,7 +73,7 @@ from typing import Callable, Iterable, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
-from .harness import UnknownHarnessError, resolve_harness
+from .harness import UnknownHarnessError, resolve_harness, resolve_harness_name
 from .util import decode_escape_bytes
 
 
@@ -520,6 +520,13 @@ class SessionLog:
 class _InputBody(BaseModel):
     data: str
     append_newline: bool = False
+    #: "A human typed this into a chat composer" — the one fact only the client
+    #: knows, and the whole of what this flag asserts. Everything else (which
+    #: harness is running, what its TUI does with the text) is decided here, in
+    #: :func:`_sanitize_user_chat`. Off by default, so every caller that types
+    #: bytes on someone's behalf — the web terminal's keystrokes, ``lmerctl
+    #: send``, the lifecycle injections — keeps delivering them exactly as given.
+    sanitize: bool = False
 
 
 class _OutputResponse(BaseModel):
@@ -866,6 +873,62 @@ def _split_submit_cr(payload: str) -> str:
     return payload[:-1] if _ends_with_submit_cr(payload) else payload
 
 
+def _sanitize_user_chat(payload: str, harness: str) -> str:
+    """Defuse a chat message the TUI would run as a command instead of reading.
+
+    Claude Code's bash escape fires on a literal ``!`` as the **first character
+    of the input box**: the rest of the line is executed as a shell command. A
+    message typed into the platform's chat pane travels through the same input
+    box, so "!206 was merged" — a sentence — becomes a command. A ``.`` in front
+    of it takes the first column, and the harness reads the sentence with its
+    ``!`` still in it, which is why this transforms rather than refuses: the
+    operator meant the words.
+
+    A dot, not the leading space this was first written with. The space rested on
+    the input box *preserving* it, which nobody promised: any implementation that
+    trims leading whitespace before testing the first character sees the ``!``
+    again, and that defusal would be a silent no-op — the write succeeds, the
+    receipt covers the pre-transform bytes, the chat pane assumes delivery, and
+    the only detector is a human seeing shell output in the terminal view. A
+    ``.`` cannot be trimmed away: skipping whitespace before the test is exactly
+    what leaves a ``.`` as the character being tested, so on either kind of
+    implementation the ``!`` is definitively not in the first column.
+
+    One assumption is left — that ``.`` is not itself a first-column escape for
+    this harness — and it is strictly weaker than the one it replaces, because it
+    is answered by reading the harness's escape set (``!`` bash, ``#`` memory,
+    ``/`` commands; none of them ``.``) rather than by an experiment on an input
+    box whose whitespace handling is unstated.
+
+    The space after the dot is for whoever reads the conversation back: the
+    message is recorded as ". !206 was merged", a sentence behind a prefix rather
+    than a typo glued to a word. Nothing hides the prefix and nothing should —
+    the operator accepted a visible one.
+
+    Only claude has this escape, so every other harness gets its payload back
+    untouched: the flag says "a human typed this in a chat composer", and what to
+    do about that is decided here and nowhere else. Refusing such a payload
+    instead of transforming it is a change to this function alone.
+    """
+    if harness != "claude" or not payload.startswith("!"):
+        return payload
+    return ". " + payload
+
+
+def _active_harness_name() -> str:
+    """The resolved harness name (``LMER_HARNESS``), for the routes that differ.
+
+    Degrades like :func:`_resolve_harness_profile` — inside the container a
+    broken env var must not take the session down, and claude is the historical
+    behavior — but silently: that function already warns about the same variable
+    at startup, and this one is read per request.
+    """
+    try:
+        return resolve_harness_name()
+    except UnknownHarnessError:
+        return "claude"
+
+
 def _submit_payload(
     write: Callable[[bytes], int],
     payload: str,
@@ -1139,6 +1202,15 @@ def _build_fastapi_app(
             "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
             "payload_length": len(payload_bytes),
         }
+        # After the receipt, deliberately: the receipt exists to prove the wire
+        # was clean, and the sender checks it against the hash of what IT sent
+        # (``session_io.send_input``, which refuses a mismatch loudly). Hashing
+        # the transformed text would turn every sanitized message into that
+        # alarm. What this line does is not corruption in transit — it is what
+        # the caller asked for by setting the flag.
+        if body.sanitize:
+            payload = _sanitize_user_chat(payload, _active_harness_name())
+            payload_bytes = payload.encode("utf-8")
         # Append CR (\r), not LF (\n): claude's TUI runs in raw mode where
         # the Enter key arrives as \r. \n would be inserted as a literal
         # newline in the input box and never submit. The field is named

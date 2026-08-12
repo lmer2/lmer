@@ -38,6 +38,12 @@ to a name, a one-line hint and whether it failed. A failed tool is the
 interesting case, which is why ``tool_use`` is correlated with its
 ``tool_result`` rather than just listed.
 
+Being an allowlist, it drops whole record families: ``queue-operation`` rows of
+every operation, ``file-history-delta``, ``attachment`` rows other than the one
+below that carries a delivered message, and the system records that carry no
+prose. The one thing that costs is a *delivery* dropped by accident — see the
+queued message, further down.
+
 How a session id becomes a file
 -------------------------------
 The two ids do not match, and cannot: a session's platform id (``s-<stamp>-<hex>``,
@@ -177,6 +183,38 @@ passed off as something a party said. Its text is the readable half of the marku
 — the condition and the event, entity-decoded — because the view is deliberately
 dumb about provenance and cannot be the place that learns to parse a harness's
 injection format.
+
+A turn the operator said and the transcript filed elsewhere: the queued message
+--------------------------------------------------------------------------------
+Type into a session that is mid-turn and the harness *queues* the message rather
+than refusing it — and it then writes no ``user`` record for it at all. What it
+writes is three rows: a ``queue-operation`` enqueue holding the text, the
+matching ``remove`` when the queue is drained, and an ``attachment`` of type
+``queued_command`` carrying the same text at the point in the file where the
+model actually received it.
+
+So the delivery is the attachment, and that is the row this normaliser turns into
+a ``user`` turn (#275). The other two are the queue's bookkeeping and would each
+duplicate it; and a message that waits for the turn *boundary* instead comes back
+as an ordinary ``user`` record with no attachment beside it, measured over a real
+session's 24 queued messages with zero overlap in either direction. File order is
+delivery order, so nothing is reordered — several messages queued into one turn
+are several attachments, in the order the model got them.
+
+The queue is not the operator's alone, though: the harness pushes its own task
+notifications through it, so a delivery becomes a turn only when the attachment's
+``origin`` says a keyboard produced it (``{"kind": "human"}``). That is the
+positive marker rather than a blocklist of machinery kinds, for the reason the
+monitor section above gives — an internal turn drawn as the operator's words is
+the failure mode this module keeps having to close, and a marker that must be
+*present* cannot be walked through by a record shape a later release invents.
+
+Dropping it was not cosmetic. The chat view holds a message the operator sent as
+*pending* until the transcript shows it, and settles that bubble only on a
+matching ``user`` turn — deliberately (#254, and #238 for the other way that
+evidence can go missing). A delivery this module never emits therefore leaves a
+bubble that can never settle, pinned below everything said after it, one more per
+mid-turn message.
 """
 
 from __future__ import annotations
@@ -364,6 +402,20 @@ _TASK_NOTIFICATION_ORIGIN = "task-notification"
 #: from a keyboard. Broader than the field above and checked as well, since either
 #: one being present is enough to know a keyboard was not involved.
 _INJECTED_PROMPT_SOURCE = "system"
+
+#: ``origin.kind`` the harness puts on a queued delivery a *keyboard* produced.
+#: The same ``origin`` shape :func:`_injected_by_harness` reads on user records,
+#: used in the opposite direction: there the machinery kinds are recognised, here
+#: the human one is *required*. See :func:`_message_from_record`.
+_HUMAN_ORIGIN = "human"
+
+#: ``attachment.type`` on the record that delivers a message the operator typed
+#: while the session was mid-turn. The harness queues such a message and writes
+#: three records for it — a ``queue-operation`` enqueue, its ``remove``, and this
+#: attachment — of which only the attachment is the *delivery*, written at the
+#: point in the file where the model received the text. See
+#: :func:`_message_from_record` for why the other two stay dropped.
+_QUEUED_COMMAND_ATTACHMENT = "queued_command"
 
 #: How a background monitor's injection reads once :func:`_strip_wrappers` has
 #: taken the ``<task-notification>`` wrapper off it, from the live incident:
@@ -1123,6 +1175,63 @@ def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
             return None
         return Message(
             role="system", kind="notice", text=text, at=timestamp,
+            truncated=truncated,
+        )
+
+    if kind_of_record == "attachment":
+        # The one attachment that is a turn: a message the operator typed while
+        # the session was mid-turn, which the harness queues and then delivers
+        # here. Three records are written for such a message — the
+        # ``queue-operation`` enqueue, its ``remove``, and this attachment — and
+        # the attachment is the delivery: it sits where the model actually
+        # received the text, exactly once per queued message, while the other two
+        # are the queue's own bookkeeping carrying the same string twice over. A
+        # message that instead waits for the turn boundary arrives as an ordinary
+        # ``user`` record and gets no attachment at all (measured across a
+        # session's 24 queued messages: zero overlap in either direction), so
+        # taking the delivery here cannot double a turn.
+        #
+        # Emitting it is #275. The chat's pending bubble settles only on a
+        # matching user turn — by design (#254), and #238 is the other way that
+        # evidence goes missing — so a delivery the normaliser drops leaves a
+        # bubble that never settles, pinned below everything said afterwards, one
+        # per mid-turn message for the life of the view.
+        attachment = record.get("attachment")
+        if not isinstance(attachment, dict):
+            return None
+        if attachment.get("type") != _QUEUED_COMMAND_ATTACHMENT:
+            return None
+        # The queue is not the operator's alone: the harness pushes its own task
+        # notifications through the same mechanism, and those carry kilobytes of
+        # task ids and tool-use ids that :func:`_strip_wrappers` only takes the
+        # outer tag off (verified on a live transcript: of four queued
+        # deliveries, two were typed and carried ``origin {"kind": "human"}``
+        # with ``commandMode: "prompt"``; two were machinery, with ``origin``
+        # null and ``commandMode: "task-notification"``).
+        #
+        # So the producer's own positive assertion that a keyboard wrote it is
+        # required, rather than the machinery kinds being blocklisted — a future
+        # release adding a fifth internal ``commandMode`` would walk straight
+        # through a blocklist and be drawn as something the operator said, which
+        # is the failure :data:`MONITOR_ROLE` exists to prevent one level up.
+        # Requiring the marker fails the other way: an odd build that stops
+        # emitting it costs a bubble that does not settle, which is exactly
+        # today's behavior and nothing worse.
+        origin = attachment.get("origin")
+        if not isinstance(origin, dict) or origin.get("kind") != _HUMAN_ORIGIN:
+            return None
+        prompt = attachment.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None
+        # The operator's own words, so through exactly what a typed turn's text
+        # goes through below: wrappers off, then the scrub-and-cap chokepoint.
+        text, truncated = _present(
+            _strip_wrappers(prompt), TEXT_LIMIT, keep="tail"
+        )
+        if not text:
+            return None
+        return Message(
+            role="user", kind="said", text=text, at=timestamp,
             truncated=truncated,
         )
 

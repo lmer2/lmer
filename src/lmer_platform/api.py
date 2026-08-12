@@ -1583,7 +1583,14 @@ def create_app(
             )
         try:
             reply = session_io.send_input(
-                session_id, data, append_newline=bool(body.get("append_newline"))
+                session_id, data,
+                append_newline=bool(body.get("append_newline")),
+                # Forwarded, never inferred: the flag says a human typed this
+                # into a chat composer, which is a fact about the client and
+                # not something this route could read off the payload. What is
+                # done about it belongs to the session's own supervisor, which
+                # is the only place that knows which harness is running.
+                sanitize=bool(body.get("sanitize")),
             )
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc

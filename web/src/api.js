@@ -279,12 +279,21 @@ export function fetchSessionMessages(sessionId, { since = 0, limit } = {}) {
 // this types into the live session's control plane, while what comes back arrives
 // through the transcript whenever the harness writes it. `appendNewline` is the
 // control plane's "and press Enter", which a TUI reads as submit — without it the
-// text sits in the session's prompt unsent.
-export function sendSessionInput(sessionId, data, { appendNewline = true } = {}) {
+// text sits in the session's prompt unsent. `sanitize` asserts the one thing only
+// a client knows — a human typed this into a chat composer, rather than it being
+// keystrokes or a command something is typing on their behalf — which is what
+// lets the supervisor defuse a message a TUI would otherwise run as a shell
+// command (a leading `!` in Claude Code). Off unless a caller says so, so every
+// other path puts the same bytes on the wire it always has.
+export function sendSessionInput(
+  sessionId, data, { appendNewline = true, sanitize = false } = {},
+) {
+  const body = { data, append_newline: appendNewline }
+  if (sanitize) body.sanitize = true
   return request(`api/sessions/${encodeURIComponent(sessionId)}/input`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ data, append_newline: appendNewline }),
+    body: JSON.stringify(body),
   })
 }
 

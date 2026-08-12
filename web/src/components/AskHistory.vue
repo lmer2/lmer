@@ -35,7 +35,7 @@ import {
 } from 'vue'
 import { mdiCommentQuestionOutline, mdiInformationOutline } from '@mdi/js'
 import { fetchSessionAsk } from '../api.js'
-import { ago, askEntryLabel } from '../format.js'
+import { ago, askEntryLabel, askPartColor } from '../format.js'
 
 // Deferred into its own chunk, like every other consumer of it — Markdown.vue's
 // header says why, and why nothing is drawn until it lands.
@@ -128,51 +128,87 @@ watch(() => props.live, start)
 
     <v-card v-else class="mb-3">
       <v-card-text>
-        <div v-for="entry in entries" :key="entry.id" class="entry">
-          <div class="d-flex ga-2 align-center text-body-small text-medium-emphasis">
-            <v-icon
-              :icon="entry.kind === 'note' ? mdiInformationOutline : mdiCommentQuestionOutline"
-              size="small"
-            />
-            <span>{{ askEntryLabel(entry, live) }}</span>
-            <span :title="entry.at || ''">{{ ago(entry.at, now) }}</span>
-          </div>
+        <!-- One card per entry, inside the pane's own (#254). The operator, on the
+             list this used to be: "messages look like the kinda flow into each
+             other". They were separated by a margin and nothing else, so a note
+             followed by a question read as one long thing with a dim line in the
+             middle of it. Outlined rather than elevated or tonal: the outer card is
+             the pane and carries the shadow, so an entry needs an edge rather than a
+             second one — and a wash under half a dozen of them would repaint the
+             pane. Same shape in the dock, which renders the same entries. -->
+        <v-card
+          v-for="entry in entries"
+          :key="entry.id"
+          class="entry"
+          variant="outlined"
+        >
+          <v-card-text class="py-2">
+            <div class="d-flex ga-2 align-center text-body-small text-medium-emphasis">
+              <v-icon
+                :icon="entry.kind === 'note' ? mdiInformationOutline : mdiCommentQuestionOutline"
+                size="small"
+              />
+              <span>{{ askEntryLabel(entry, live) }}</span>
+              <span :title="entry.at || ''">{{ ago(entry.at, now) }}</span>
+            </div>
 
-          <Markdown :text="entry.text" class="text-body-medium said" />
+            <!-- Which half of the exchange starts here, in a word, coloured from
+                 format.js so the dock cannot disagree with it. Not on a note: a note
+                 is one voice saying one thing, and labelling it "QUESTION" would
+                 promise an answer that is never coming. -->
+            <div
+              v-if="entry.kind !== 'note'"
+              class="part"
+              :class="`text-${askPartColor('question')}`"
+            >QUESTION</div>
 
-          <p
-            v-if="options(entry)"
-            class="text-body-small text-medium-emphasis said plain"
-          >it offered: {{ options(entry) }}</p>
+            <Markdown :text="entry.text" class="text-body-medium said" />
 
-          <p v-if="entry.answer" class="text-body-medium said plain reply">
-            you: {{ entry.answer.text }}
-          </p>
+            <p
+              v-if="options(entry)"
+              class="text-body-small text-medium-emphasis said plain"
+            >it offered: {{ options(entry) }}</p>
 
-          <!-- Only when there is no answer: one that raced the close is the
-               answer to show, and saying "stopped waiting" under it would read as
-               if the reply had been thrown away. The agent's own reason is
-               rendered inline — it is prose, and this is a line. -->
-          <p
-            v-if="entry.closed && !entry.answered"
-            class="text-body-small text-medium-emphasis mb-0"
-          >
-            The session stopped waiting for this<template
-              v-if="closureReason(entry)"
-            >: <Markdown
-              :text="closureReason(entry)"
-              inline
-            /></template>.
-          </p>
+            <!-- The label leans with the words it labels, so the reply reads as one
+                 block on its own side rather than as a heading over a stray line.
+                 "you" stays on the line under it: the label says which half of the
+                 exchange this is, and that is not the same fact as whose words they
+                 are. -->
+            <template v-if="entry.answer">
+              <div
+                class="part reply"
+                :class="`text-${askPartColor('answer')}`"
+              >ANSWER</div>
+              <p class="text-body-medium said plain reply">
+                you: {{ entry.answer.text }}
+              </p>
+            </template>
 
-          <!-- Carried by the protocol rather than raised, so one unreadable pair
-               cannot empty the record (ask_channel/protocol.py). Shown as it was
-               written: it is the platform's sentence, not the agent's. -->
-          <p
-            v-if="entry.problem"
-            class="text-body-small text-medium-emphasis mb-0"
-          >{{ entry.problem }}</p>
-        </div>
+            <!-- Only when there is no answer: one that raced the close is the
+                 answer to show, and saying "stopped waiting" under it would read as
+                 if the reply had been thrown away. The agent's own reason is
+                 rendered inline — it is prose, and this is a line. -->
+            <p
+              v-if="entry.closed && !entry.answered"
+              class="text-body-small text-medium-emphasis mb-0"
+            >
+              The session stopped waiting for this<template
+                v-if="closureReason(entry)"
+              >: <Markdown
+                :text="closureReason(entry)"
+                inline
+              /></template>.
+            </p>
+
+            <!-- Carried by the protocol rather than raised, so one unreadable pair
+                 cannot empty the record (ask_channel/protocol.py). Shown as it was
+                 written: it is the platform's sentence, not the agent's. -->
+            <p
+              v-if="entry.problem"
+              class="text-body-small text-medium-emphasis mb-0"
+            >{{ entry.problem }}</p>
+          </v-card-text>
+        </v-card>
       </v-card-text>
     </v-card>
   </div>
@@ -182,6 +218,19 @@ watch(() => props.live, start)
 .entry {
   margin-bottom: 12px;
   min-width: 0;
+}
+
+/* The word that names a half of the exchange (#254). Small, spaced and heavier than
+   the body, so it reads as a label rather than as the first line of the message —
+   which is also why it is the label that is coloured and the message never is: the
+   operator asked for exactly that ("i don't think color code the text entirely").
+   The colour itself comes from format.js, because the dock says the same words in
+   the same ink. Same rule there, like every other rule these two views share. */
+.part {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  margin-top: 6px;
 }
 
 /* Every part of an entry sits in the same column with the same spacing; the class
@@ -202,8 +251,10 @@ watch(() => props.live, start)
   white-space: pre-wrap;
 }
 
-/* The reply leans right, matching the conversation view's "what you said" side,
-   so every view of a session reads the same way at a glance. */
+/* The reply leans right — the label above it with it — matching the conversation
+   view's "what you said" side, so every view of a session reads the same way at a
+   glance. The text leans rather than a bubble: an entry's card holds both halves of
+   one exchange rather than one turn each. */
 .reply {
   text-align: end;
 }

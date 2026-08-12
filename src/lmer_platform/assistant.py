@@ -156,11 +156,15 @@ module, nothing here imports detection, and no path here polls anything.
 Since T122 that tick delivers a *second* kind of digest through the same call: a
 milestone a session announced with ``lmer-signal`` ("pushed MR !167", "the review
 is finished"), carrying :data:`lmer_platform.detect.SIGNAL_DIGEST_KIND` as its
-``kind``. Nothing in this module distinguishes it, and that is the point — ``kind``
-is a label on a spooled note, not an enum, so a new class of event costs the seam
-nothing. What it is *not* is an attention reason: those mean a human has to act
-and each one becomes a digest class automatically, while a milestone is addressed
-to the orchestrator and stays off the operator's badge.
+``kind``. Since issue #254 there is a third, on the same terms: a question whose
+condition cleared while its run stayed in the fleet — answered or withdrawn
+somewhere the daemon was not watching — carrying
+:data:`lmer_platform.detect.QUESTION_ANSWERED_KIND`. Nothing in this module
+distinguishes them, and that is the point — ``kind`` is a label on a spooled
+note, not an enum, so a new class of event costs the seam nothing. What they are
+*not* is attention reasons: those mean a human has to act and each one becomes a
+digest class automatically, while these are addressed to the orchestrator and
+stay off the operator's badge.
 
 Nothing pushes. The spool waits to be taken (T89)
 --------------------------------------------------

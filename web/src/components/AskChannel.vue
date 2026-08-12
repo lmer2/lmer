@@ -78,7 +78,7 @@ import { mdiInformationOutline, mdiNotificationClearAll } from '@mdi/js'
 import AskBox from './AskBox.vue'
 import { fetchSessionAsk } from '../api.js'
 import { clearedIds, rememberCleared } from '../dismissals.js'
-import { ago, askEntryLabel } from '../format.js'
+import { ago, askEntryLabel, askPartColor } from '../format.js'
 
 // Deferred into its own chunk, like every other consumer of it — Markdown.vue's
 // header says why, and why nothing is drawn until it lands.
@@ -254,36 +254,74 @@ watch(() => props.live, start)
 
     <v-card v-if="recent.length" class="mb-3">
       <v-card-text>
-        <div v-for="entry in recent" :key="entry.id" class="entry">
-          <div class="d-flex ga-2 align-center text-body-small text-medium-emphasis">
-            <v-icon
-              v-if="entry.kind === 'note'"
-              :icon="mdiInformationOutline"
-              size="small"
-            />
-            <span>{{ askEntryLabel(entry, live) }}</span>
-            <span :title="entry.at || ''">{{ ago(entry.at, now) }}</span>
-          </div>
-          <Markdown :text="entry.text" class="text-body-medium said" />
-          <p v-if="entry.answer" class="text-body-medium said plain reply">
-            you: {{ entry.answer.text }}
-          </p>
-          <!-- Only when there is no answer: one that raced the close is the
-               answer to show, and saying "stopped waiting" under it would read
-               as if the reply had been thrown away. The agent's own reason is
-               rendered inline — it is prose, and this is a line. -->
-          <p
-            v-if="entry.closed && !entry.answered"
-            class="text-body-small text-medium-emphasis mb-0"
-          >
-            The session stopped waiting for this<template
-              v-if="closureReason(entry)"
-            >: <Markdown
-              :text="closureReason(entry)"
-              inline
-            /></template>. A reply can no longer reach it.
-          </p>
-        </div>
+        <!-- One card per entry, inside the dock's own (#254). They were separated
+             by a margin and nothing else, and the operator read the result as one
+             thing: "messages look like the kinda flow into each other". Outlined
+             rather than elevated or tonal, and the record's own reasoning — the
+             outer card is the container and carries the shadow, so an entry needs
+             an edge rather than a second one. The same shape as AskHistory.vue,
+             because these are the same entries. -->
+        <v-card
+          v-for="entry in recent"
+          :key="entry.id"
+          class="entry"
+          variant="outlined"
+        >
+          <v-card-text class="py-2">
+            <div class="d-flex ga-2 align-center text-body-small text-medium-emphasis">
+              <v-icon
+                v-if="entry.kind === 'note'"
+                :icon="mdiInformationOutline"
+                size="small"
+              />
+              <span>{{ askEntryLabel(entry, live) }}</span>
+              <span :title="entry.at || ''">{{ ago(entry.at, now) }}</span>
+            </div>
+
+            <!-- Which half of the exchange starts here, in a word, coloured from
+                 format.js so the record cannot disagree with it. Not on a note: a
+                 note is one voice saying one thing, and labelling it "QUESTION"
+                 would promise an answer that is never coming. -->
+            <div
+              v-if="entry.kind !== 'note'"
+              class="part"
+              :class="`text-${askPartColor('question')}`"
+            >QUESTION</div>
+
+            <Markdown :text="entry.text" class="text-body-medium said" />
+
+            <!-- The label leans with the words it labels, so the reply reads as one
+                 block on its own side rather than as a heading over a stray line.
+                 "you" stays on the line under it: the label says which half of the
+                 exchange this is, and that is not the same fact as whose words they
+                 are. -->
+            <template v-if="entry.answer">
+              <div
+                class="part reply"
+                :class="`text-${askPartColor('answer')}`"
+              >ANSWER</div>
+              <p class="text-body-medium said plain reply">
+                you: {{ entry.answer.text }}
+              </p>
+            </template>
+
+            <!-- Only when there is no answer: one that raced the close is the
+                 answer to show, and saying "stopped waiting" under it would read
+                 as if the reply had been thrown away. The agent's own reason is
+                 rendered inline — it is prose, and this is a line. -->
+            <p
+              v-if="entry.closed && !entry.answered"
+              class="text-body-small text-medium-emphasis mb-0"
+            >
+              The session stopped waiting for this<template
+                v-if="closureReason(entry)"
+              >: <Markdown
+                :text="closureReason(entry)"
+                inline
+              /></template>. A reply can no longer reach it.
+            </p>
+          </v-card-text>
+        </v-card>
 
         <!-- Clearing is a view operation and the button says which view: what
              leaves is this dock, and the channel is untouched. Offered only when
@@ -315,6 +353,19 @@ watch(() => props.live, start)
   min-width: 0;
 }
 
+/* The word that names a half of the exchange (#254). Small, spaced and heavier than
+   the body, so it reads as a label rather than as the first line of the message —
+   which is also why it is the label that is coloured and the message never is: the
+   operator asked for exactly that ("i don't think color code the text entirely").
+   The colour itself comes from format.js, because the record says the same words in
+   the same ink. Same rule there, like every other rule these two views share. */
+.part {
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  margin-top: 6px;
+}
+
 /* Both halves of an entry sit in the same column with the same spacing; the class
    reaches the rendered one because a child component's root element carries its
    parent's scope attribute too. `anywhere` so a path or URL in a note does not
@@ -333,12 +384,13 @@ watch(() => props.live, start)
   white-space: pre-wrap;
 }
 
-/* The reply leans right, so "you" and the agent read as two sides here the way they
-   do in the conversation. It is the text that leans because there is no bubble to
-   lean: these entries are rows in a card rather than turns in a column. That is also
-   the whole of what makes it acceptable — a reply here is one short line, while the
-   conversation's own turns lean as containers and keep their words left-aligned,
-   because justified prose is what the operator has to read back. */
+/* The reply leans right — the label above it with it — so "you" and the agent read
+   as two sides here the way they do in the conversation. It is the text that leans
+   because there is still no bubble to lean: an entry's card holds both halves of one
+   exchange rather than one turn each. That is also the whole of what makes it
+   acceptable — a reply here is one short line, while the conversation's own turns
+   lean as containers and keep their words left-aligned, because justified prose is
+   what the operator has to read back. */
 .reply {
   text-align: end;
 }

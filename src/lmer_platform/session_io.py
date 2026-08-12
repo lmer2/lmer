@@ -898,7 +898,8 @@ def _record_attempt(
 
 
 def send_input(
-    session_id: str, data: str, *, append_newline: bool = False
+    session_id: str, data: str, *, append_newline: bool = False,
+    sanitize: bool = False,
 ) -> dict:
     """Type *data* into a running session. Returns the control plane's answer.
 
@@ -910,6 +911,13 @@ def send_input(
     *append_newline* defaults off, matching the control plane it forwards to — a
     caller that means "and press Enter" says so. The payload itself is never
     logged: an answer routinely contains whatever the operator was asked for.
+
+    *sanitize* says the payload is a message a human typed into a chat composer,
+    which lets the supervisor defuse the one shape a TUI reads as a command
+    rather than as text (``lmer_cli.supervisor._sanitize_user_chat``). Off by
+    default and only put on the wire when set: a caller typing bytes on
+    something else's behalf — the terminal's keystrokes, an injected command —
+    sends exactly the body it sends today.
 
     The reply carries ``submit_confirmed`` and a ``note`` when Enter was asked
     for, and both are passed to the caller rather than dropped: the supervisor
@@ -924,18 +932,21 @@ def send_input(
     # Hashed before the wire so the receipt is independent of everything past
     # this line: the control plane answers with the hash of what *it* received
     # (``payload_sha256``, #197), and the two agreeing is what "delivered
-    # intact" means. The raw hash lives only in memory for that comparison —
-    # what is *recorded* is an HMAC (:func:`_payload_hmac` has why).
+    # intact" means — including under *sanitize*, which the supervisor applies
+    # after taking that hash, so the receipt keeps saying what crossed the wire
+    # rather than what was typed. The raw hash lives only in memory for that
+    # comparison — what is *recorded* is an HMAC (:func:`_payload_hmac` has why).
     payload_bytes = data.encode("utf-8")
     sent_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+    body = {"data": data, "append_newline": bool(append_newline)}
+    if sanitize:
+        body["sanitize"] = True
     endpoint: Optional[ControlEndpoint] = None
     reply: Optional[_ControlReply] = None
     error: Optional[str] = None
     try:
         endpoint = control_endpoint(session_id)
-        reply = _post(
-            endpoint, "/input", {"data": data, "append_newline": bool(append_newline)}
-        )
+        reply = _post(endpoint, "/input", body)
     except SessionIOError as exc:
         error = str(exc)[:_DETAIL_LIMIT]
         raise
