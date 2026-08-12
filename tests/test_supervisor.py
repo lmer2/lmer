@@ -2549,6 +2549,181 @@ class TestFastApiApp:
         assert body["submit_text"] == supervisor.SUBMIT_TEXT_UNKNOWN
         assert body["submit_confirmed"] is False
 
+    def test_a_chat_message_that_would_run_as_a_command_is_defused(self, monkeypatch):
+        """The reported failure (#254): "!206 was merged" ran a shell command.
+
+        Claude Code reads a literal ``!`` in the first column of its input box as
+        its bash escape, and the chat pane types into that same box — so a
+        sentence about a merge request became a command in the operator's
+        session. The message goes through rather than being refused (they meant
+        the words), defused by giving the first column to a ``.`` — with the
+        ``!`` and the rest of the sentence untouched behind it. A dot rather than
+        a space because a space is only a defusal if the input box preserves it,
+        and whitespace is the one thing a first-character test may skip; the
+        space that follows the dot is for the reader of the transcript.
+
+        Both paths, because what decides is the flag and not the route: the
+        composer always asks for Enter, but a caller that sets the flag without
+        it is saying the same thing about the same text.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        resp = client.post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": True,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [b". !206 was merged", b"\r"], (
+            f"the message reached the TUI as a command: {sink}"
+        )
+
+        sink.clear()
+        resp = client.post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": False,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [b". !206 was merged"], (
+            f"the flag was honored only on the submit path: {sink}"
+        )
+
+    def test_the_receipt_covers_what_was_sent_and_not_what_was_typed(
+        self, monkeypatch
+    ):
+        """The receipt is the sender's proof the wire was clean (#197), and the
+        sender hashes what IT sent — so the transform has to happen after the
+        hash is taken. Hashing the defused text instead would make every
+        sanitized message a "the control plane acknowledged different bytes"
+        alarm in :func:`lmer_platform.session_io.send_input`, which is worded to
+        mean corruption in transit.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+
+        body = self._client(app).post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": True,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        ).json()
+
+        assert sink[0] == b". !206 was merged", "the transform did not run at all"
+        assert body["payload_sha256"] == hashlib.sha256(b"!206 was merged").hexdigest()
+        assert body["payload_length"] == len(b"!206 was merged")
+        # And the gap that leaves between the receipt and the write is the
+        # transform, two bytes of it, plus this path's submit CR. Pinned because
+        # somebody reconciling a write against a receipt has to be able to read
+        # the difference as deliberate rather than as a partial write.
+        assert body["bytes_written"] == body["payload_length"] + len(b". ") + 1, (
+            f"the write is a different size than the defused message: {body}"
+        )
+
+    @pytest.mark.parametrize("harness", ["codex", "pi"])
+    def test_only_claudes_input_box_reads_a_leading_bang_as_a_command(
+        self, monkeypatch, harness
+    ):
+        """The flag says "a human typed this in a chat composer" — true whatever
+        is running — and this is where that fact meets the harness. The escape is
+        Claude Code's; another TUI takes the ``!`` as the first character of a
+        sentence, and a prefix this end added would be a message the operator did
+        not write.
+        """
+        monkeypatch.setenv("LMER_HARNESS", harness)
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+
+        resp = self._client(app).post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": True,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [b"!206 was merged", b"\r"], (
+            f"{harness} got a message nobody typed: {sink}"
+        )
+
+    def test_a_flagged_message_that_is_no_command_is_typed_as_written(
+        self, monkeypatch
+    ):
+        """Every chat message carries the flag, so the transform has to be the
+        exception. A ``!`` anywhere but the first character is punctuation, and
+        text that came out with ``. `` in front of it would be a quiet edit of the
+        operator's words on the way through — visible in the transcript, and about
+        a trigger that was never there.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        for message in ("206 was merged", "merged !206", "yes!", ""):
+            sink.clear()
+            resp = client.post(
+                "/input",
+                json={
+                    "data": message,
+                    "append_newline": True,
+                    "sanitize": True,
+                },
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 200
+            assert sink == [part for part in (message.encode(), b"\r") if part], (
+                f"{message!r} was altered on the way to the TUI: {sink}"
+            )
+
+    def test_input_nobody_flagged_is_delivered_byte_for_byte(self, monkeypatch):
+        """The bash escape is a *feature* for everyone else on this route.
+
+        The web terminal's keystrokes, ``lmerctl send`` and the lifecycle
+        injections all type on something's behalf rather than carrying words a
+        person wrote, and an operator who opens the terminal view and types
+        ``!ls`` means the escape. Without the flag the payload is untouched, which
+        is also what an older client — one that has never heard of it — sends.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        resp = client.post(
+            "/input",
+            json={"data": "!ls -la", "append_newline": True},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [b"!ls -la", b"\r"], f"an unflagged payload was edited: {sink}"
+
+        sink.clear()
+        resp = client.post(
+            "/input",
+            json={"data": "!", "append_newline": False},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [b"!"], f"a keystroke was edited: {sink}"
+
     def test_output_returns_buffered_data(self):
         app, buf, _sink = self._build()
         buf.append(b"banana")

@@ -520,6 +520,274 @@ def test_a_monitor_event_is_scrubbed_like_every_other_string():
     assert "hunter2hunter2" not in message.text
 
 
+# --- a message typed into a busy session (#275) -------------------------------
+#
+# Type while the session is mid-turn and Claude Code queues the message — and
+# writes no `user` record for it at all. Three rows go down instead: the
+# `queue-operation` enqueue, its `remove`, and an `attachment` of type
+# `queued_command` at the point the model actually received the text. The
+# normaliser dropped all three, so the chat's pending bubble — which settles only
+# on a matching user turn (#254) — never settled, and one more stuck bubble piled
+# up per mid-turn message. Shapes below are the ones a live transcript carried.
+#
+# That queue carries the harness's own task notifications too, told apart by the
+# attachment's `origin`: a typed message says `{"kind": "human"}`, machinery
+# carries no `origin` key at all (the captured fixture below; a null would fail
+# the same check). So the tests come in pairs — the message has to arrive, and the
+# machinery must not arrive wearing the operator's role.
+
+QUEUE_SESSION = "11111111-2222-3333-4444-555555555555"
+
+
+def queue_operation(text, operation="enqueue", at="2026-08-11T10:00:01.000Z"):
+    """One row of the queue's bookkeeping. ``dequeue`` carries no ``content``."""
+    record = {
+        "type": "queue-operation",
+        "operation": operation,
+        "timestamp": at,
+        "sessionId": QUEUE_SESSION,
+    }
+    if operation != "dequeue":
+        record["content"] = text
+    return record
+
+
+#: What the harness pushes through the same queue for its own purposes, and the
+#: shape a live transcript carried it in: no origin at all and a commandMode of
+#: its own, wrapping kilobytes of task ids that ``_strip_wrappers`` only takes the
+#: outer tag off. Pinned as a captured artifact, like ``MONITOR_INJECTION``.
+TASK_NOTIFICATION_PROMPT = (
+    "<task-notification>\n"
+    "<task-id>b63lu8hv2</task-id>\n"
+    "<tool-use-id>toolu_01AAAABBBBCCCCDDDD</tool-use-id>\n"
+    "<summary>Agent stopped</summary>\n"
+    "</task-notification>"
+)
+
+
+def queued_delivery(text, at="2026-08-11T10:00:04.000Z", uuid="q-1", **attachment):
+    """The attachment row: the queued message arriving where the model got it.
+
+    ``origin`` defaults to the harness's own marker for a keyboard, which is what
+    a typed message carries and what makes this a turn at all.
+    """
+    payload = {
+        "type": "queued_command",
+        "prompt": text,
+        "commandMode": "prompt",
+        "origin": {"kind": "human"},
+        "timestamp": at,
+    }
+    payload.update(attachment)
+    return {
+        "type": "attachment",
+        "timestamp": at,
+        "isSidechain": False,
+        "uuid": uuid,
+        "attachment": payload,
+    }
+
+
+def spoken(text, at="2026-08-11T10:00:00.000Z"):
+    """An assistant turn, for placing a queued message among other records."""
+    return {
+        "type": "assistant",
+        "timestamp": at,
+        "message": {"role": "assistant", "content": [{"type": "text", "text": text}]},
+    }
+
+
+def test_a_message_queued_mid_turn_is_one_turn_where_it_was_delivered():
+    """The report, whole: three rows for one message, and exactly one turn out.
+
+    The attachment is the delivery — the enqueue and the remove are the queue
+    talking to itself and carry the same string — so it is the row that becomes
+    the turn, and it stays where the file put it, which is where the model
+    received it.
+    """
+    messages = transcripts.normalise_records([
+        spoken("working on it"),
+        queue_operation("ship it when the suite is green"),
+        queue_operation("ship it when the suite is green", operation="remove"),
+        queued_delivery("ship it when the suite is green"),
+        spoken("understood", at="2026-08-11T10:00:09.000Z"),
+    ])
+
+    assert [(m.role, m.kind, m.text) for m in messages] == [
+        ("assistant", "said", "working on it"),
+        ("user", "said", "ship it when the suite is green"),
+        ("assistant", "said", "understood"),
+    ]
+    assert messages[1].at == "2026-08-11T10:00:04.000Z"
+
+
+def test_three_messages_queued_in_one_turn_are_three_turns_in_order():
+    """The acceptance case: an operator typing while the agent works gets every
+    message back, once each, in the order the model received them."""
+    records_in = [spoken("thinking")]
+    for index, text in enumerate(("first", "second", "third"), start=1):
+        records_in.append(queue_operation(text))
+        records_in.append(queue_operation(text, operation="remove"))
+        records_in.append(
+            queued_delivery(text, at=f"2026-08-11T10:00:0{index}.000Z", uuid=f"q-{index}")
+        )
+
+    messages = transcripts.normalise_records(records_in)
+
+    assert [m.text for m in messages if m.role == "user"] == ["first", "second", "third"]
+    assert len(messages) == 4
+
+
+def test_the_queues_own_bookkeeping_is_not_a_turn():
+    """Without the delivery there is nothing to show: an enqueue is a message the
+    model has not been handed yet, a remove and a dequeue are the queue draining.
+    Emitting any of them would double the message the attachment carries."""
+    assert transcripts.normalise_records([
+        queue_operation("ship it"),
+        queue_operation("ship it", operation="remove"),
+        queue_operation("ship it", operation="dequeue"),
+    ]) == []
+
+
+def test_an_attachment_that_is_not_a_delivered_message_produces_nothing():
+    """The record family stays dropped; one type of it is a turn."""
+    other = queued_delivery("ship it")
+    other["attachment"]["type"] = "deferred_tools_delta"
+
+    assert transcripts.normalise_records([other]) == []
+    assert transcripts.normalise_records([{"type": "attachment", "uuid": "a"}]) == []
+    assert transcripts.normalise_records(
+        [{"type": "attachment", "attachment": "not a mapping"}]
+    ) == []
+
+
+@pytest.mark.parametrize("prompt", [None, "", "   ", 42, {"text": "ship it"}])
+def test_a_delivered_message_with_no_readable_prompt_produces_nothing(prompt):
+    """Another program writes this file (spec D6), so nothing about the shape is
+    assumed: a delivery with nothing readable in it renders as nothing."""
+    record = queued_delivery("ship it")
+    record["attachment"]["prompt"] = prompt
+
+    assert transcripts.normalise_records([record]) == []
+
+
+def test_a_task_notification_pushed_through_the_queue_is_not_the_operator():
+    """The queue is not the operator's alone.
+
+    The harness delivers its own task notifications the same way, with no
+    ``origin`` at all and a ``commandMode`` of their own — the shape the captured
+    fixture carries, which is not the ``origin: null`` this test asserted while it
+    was hand-built. Surfacing one would put kilobytes of task ids and tool-use ids
+    in the chat as a message the operator had typed — the same failure the monitor
+    classification exists to prevent, arriving by a different route.
+    """
+    record = queued_delivery(TASK_NOTIFICATION_PROMPT)
+    record["attachment"].pop("origin")
+    record["attachment"]["commandMode"] = "task-notification"
+
+    assert transcripts.normalise_records([record]) == []
+
+
+def test_a_queued_message_needs_the_harness_to_say_a_keyboard_wrote_it():
+    """The marker is required, not its absence tolerated.
+
+    A blocklist of machinery ``commandMode``s would let the next internal kind a
+    release invents through, drawn as the operator's own words; requiring the
+    positive human marker fails the other way, and that failure is a bubble that
+    does not settle — today's behavior, and nothing worse.
+    """
+    typed = queued_delivery("ship it")
+    assert transcripts.normalise_records([typed])[0].text == "ship it"
+
+    for origin in (None, {}, {"kind": "task-notification"}, "human", ["human"]):
+        record = queued_delivery("ship it", origin=origin)
+        assert transcripts.normalise_records([record]) == [], (
+            f"origin {origin!r} passed as something the operator typed"
+        )
+
+    missing = queued_delivery("ship it")
+    missing["attachment"].pop("origin")
+    assert transcripts.normalise_records([missing]) == []
+
+
+def test_a_queued_message_is_scrubbed_like_every_other_string():
+    """It is operator input like anything else typed into the chat, so it goes
+    through ``_present`` with the rest — this must not become the one path where a
+    pasted credential reaches a browser."""
+    message = transcripts.normalise_records([
+        queued_delivery("try curl http://x:s3cr3t-value-here@127.0.0.1:8620/ again"),
+    ])[0]
+
+    assert "s3cr3t-value-here" not in message.text
+    assert "curl http://127.0.0.1:8620/ again" in message.text
+
+
+def test_a_queued_message_is_trimmed_at_the_same_ceiling():
+    """The cap is the module's, not the record type's."""
+    message = transcripts.normalise_records([
+        queued_delivery("x" * (transcripts.TEXT_LIMIT + 500)),
+    ])[0]
+
+    assert message.truncated is True
+    assert len(message.text) <= transcripts.TEXT_LIMIT
+
+
+def test_a_queued_message_from_a_sidechain_is_still_skipped():
+    """The sidechain gate is above this branch and stays there: a subagent's own
+    queued input is not the operator's conversation."""
+    record = queued_delivery("ship it")
+    record["isSidechain"] = True
+
+    assert transcripts.normalise_records([record]) == []
+
+
+#: The same three rows, off a live Claude Code 2.1.228 instead of built here: an
+#: operator message typed mid-turn (enqueue, delivery attachment, remove), one of
+#: the harness's own task notifications through the same queue, and ordinary
+#: assistant turns around both. Ids, branch and prose are scrubbed; every key,
+#: their order, and the version string are the ones the harness wrote.
+QUEUED_FIXTURE = FIXTURES / "claude-queued-command.jsonl"
+
+
+def test_the_captured_queue_shapes_normalise_as_the_hand_built_ones_claim(platform_root):
+    """Every queued-message test above builds its own records, which pins the fix
+    to the author's model of the format rather than to the format.
+
+    That model being wrong is what produced #275: a record family nobody had
+    looked at, dropped because the normaliser's idea of a transcript did not
+    include it. Spec D6 accepted that the shape is not a contract and named
+    captured fixtures as the mitigation, so this reads a real one end to end — a
+    release that changes the shape is then a diff here rather than a pending
+    bubble that never settles on someone's phone.
+
+    The capture already corrected one hand-built detail: the harness's own
+    delivery carries no ``origin`` key at all, where these tests had been passing
+    ``origin: null``. Both fail the same check, which is why the fix needed no
+    change — but only the capture could say so.
+    """
+    plant_session("s-queued", fixture=QUEUED_FIXTURE)
+    page = transcripts.read_messages("s-queued", limit=100)
+
+    assert [(m.role, m.kind, m.text) for m in page.messages] == [
+        ("assistant", "said", "Running the suite now."),
+        ("assistant", "said", "The first case passes."),
+        ("user", "said", "Queued while you were working: check the second case too."),
+        ("assistant", "said", "The second case passes too."),
+    ]
+    # Position is delivery order and the timestamp is when it was typed: the
+    # attachment carries the enqueue's own time, which is *earlier* than the
+    # assistant turn the file puts before it. Both are as captured, and the view
+    # orders by file position for exactly this reason.
+    assert page.messages[2].at == "2026-07-20T09:00:05.000Z"
+    assert page.messages[2].at < page.messages[1].at
+
+    # The machinery delivery and the queue's bookkeeping produced none of these.
+    for message in page.messages:
+        assert "task-notification" not in message.text
+        assert "toolu_" not in message.text
+    assert len([m for m in page.messages if m.role == "user"]) == 1
+
+
 # --- credential scrubbing ---------------------------------------------------
 #
 # Not defensive theatre: the transcript of the session that wrote this module
@@ -1213,11 +1481,21 @@ def test_the_chat_view_reads_the_transcript_and_writes_the_control_plane():
 
 
 def test_a_sent_message_is_pending_until_the_transcript_has_it():
-    """A slow transcript is not a failed send, and must not be shown as one."""
+    """A slow transcript is not a failed send, and must not be shown as one.
+
+    Since issue #254 the pending bubble carries one caption ("sending…", inside
+    the grace window) and none after it — the message is assumed delivered and
+    the old "not caught up"/"not confirmed" rungs are deliberately gone. The
+    detailed contract lives in test_platform_web_chat.py; this guard only keeps
+    the pending layer itself present.
+    """
     text = CHAT.read_text(encoding="utf-8")
     assert "pending" in text
     assert "sending…" in text
-    assert "the transcript has not caught up" in text
+    # The two retired caption strings, verbatim — prose in comments may still
+    # say "not confirmed" about the control-plane reply, which is a fact.
+    assert "the transcript has not caught up" not in text
+    assert "may not have received" not in text
 
 
 def test_the_composer_has_the_three_states_the_spec_names():

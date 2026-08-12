@@ -15,6 +15,12 @@ What each guard keeps, and why losing it is silent:
   operator is most likely to be about to spawn into a slot from, and the runs
   list is replaced — not merely emptied — in exactly that state, so a section
   nested inside it would disappear at the worst moment;
+- and it renders on a host that declares no slots at all, as a title and one
+  muted line (#254). Nothing at all was the earlier call; it left the feature
+  invisible on precisely the hosts that have not got it yet, and asking the
+  orchestrating assistant to set a slot up is how one comes to exist — but that
+  line waits for a payload, because an empty list is also what a fleet read that
+  failed leaves behind, and the sentence is a claim about the host;
 - the state chip is painted through ``toneColor()`` like every other verdict in
   this app, and each state carries an icon of its own. The ramp alone hands a
   red/green-blind operator the same muddy tone for the slot they can use and
@@ -118,12 +124,64 @@ def test_the_slots_section_is_below_the_runs_and_outside_the_lists():
     )
 
 
-def test_a_host_with_no_slots_renders_no_section():
-    """A fixture nobody configured is not news, so it gets no explanatory card."""
+def test_a_host_with_no_slots_says_so():
+    """#254 reverses the earlier call. A section that renders nothing on a host
+    declaring none is a feature the operator never learns exists — and asking
+    the orchestrating assistant to configure one is the only way it comes to."""
     text = APP.read_text(encoding="utf-8")
 
-    assert re.search(r'v-if="!loading && slots\.length"', text), (
-        "the slots section renders unconditionally"
+    assert 'v-if="!loading && slots.length"' not in text, (
+        "the section is still gated on there being slots, so a host with none "
+        "renders nothing and the feature stays invisible"
+    )
+
+    # `!loading` and nothing else: an empty payload and an unanswered poll are
+    # different things, and only one of them is worth a sentence. .index() is
+    # the pin — the section is gone the moment that condition changes shape.
+    section = text.index('<template v-if="!loading">')
+    title = text.index('<div class="section-title">service slots</div>')
+    assert "No service slots configured." in text, (
+        "a host with no slots is told nothing"
+    )
+    hint = text.index("No service slots configured.")
+    assert section < title < hint, (
+        "the hint is not inside the slots section, under its title"
+    )
+
+    tag = text[text.rindex("<p", 0, hint):hint]
+    # Conditional on the emptiness, not on the section: a line saying there are
+    # none, printed above rows, is worse than the silence it replaced.
+    assert 'v-if="!slots.length && state"' in tag, (
+        "the hint renders beside real slot rows"
+    )
+    # Quiet, in the tone this app's other empty states use. A slot-less host is
+    # not a fault, and a loud card would compete with the runs above it.
+    assert "text-medium-emphasis" in tag, (
+        "the hint is louder than the app's other empty states"
+    )
+
+
+def test_the_hint_needs_a_payload_before_it_claims_anything():
+    """A read that failed must not be reported as a host with no slots.
+
+    `slots` is `state?.slots || []`, and `load()` clears `loading` in `finally`
+    while leaving `state` where it was — null on a first failure. So a daemon
+    that is down, or a 401 on the first load, reaches this section with an empty
+    list it never read, and `!loading` alone would print a confident sentence
+    about the host's configuration under the error alert. A later failed refresh
+    keeps the previous payload, which is the case this deliberately still shows.
+    """
+    text = APP.read_text(encoding="utf-8")
+
+    hint = text.index("No service slots configured.")
+    tag = text[text.rindex("<p", 0, hint):hint]
+
+    condition = re.search(r'v-if="([^"]*)"', tag)
+    assert condition, "the hint is unconditional"
+    assert re.search(r"\bstate\b", condition.group(1)), (
+        "the hint's condition does not require a payload, so a fleet read that "
+        "failed renders 'No service slots configured.' about a host this app "
+        "never managed to ask"
     )
 
 

@@ -121,6 +121,35 @@ export function askEntryLabel(entry, live = false) {
   return live ? 'open' : 'unanswered'
 }
 
+// The two halves of one exchange, and the ink each label is written in (#254).
+// The operator, reading a channel back: "clearly have a 'QUESTION' and 'ANSWER'
+// label that could be color coded". Here for askEntryLabel's reason — the dock and
+// the record render the same entries, and two views that painted the operator's own
+// words differently would be two accounts of who said what.
+//
+// Colour names off the theme rather than tones off TONE_COLORS, deliberately:
+// success/warning/error are this app's *urgency* vocabulary, and a green ANSWER on
+// every settled question would spend the ramp's loudest ink on the ordinary case —
+// on a view where nothing is urgent, because everything on it has already happened.
+// What is left is the grammar the conversation already reads by (main.js): the warm
+// accent is what *you* sent — `chat-operator` is a wash of `primary`, and AskBox's
+// option chips, which are your words too, are `primary` — and the agent's side is
+// neutral. Both keys are defined in both schemes, so the switcher repaints them.
+//
+// Colour is never the whole signal: the label is a word, and it says which half of
+// the exchange starts there whether or not the two tones are told apart.
+const ASK_PART_COLORS = {
+  question: 'tone-idle',
+  answer: 'primary',
+}
+
+// An unknown part paints itself neutral rather than nothing: an undefined colour
+// renders `text-undefined`, which is a label in the body ink — indistinguishable
+// from the message it is supposed to be labelling.
+export function askPartColor(part) {
+  return ASK_PART_COLORS[part] || ASK_PART_COLORS.question
+}
+
 // Relative time, because "3m ago" answers the question an operator actually has.
 // Absolute timestamps stay available as tooltips.
 export function ago(iso, now = Date.now()) {

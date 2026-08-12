@@ -1,0 +1,10 @@
+fixed:
+- "The orchestrating assistant is now woken when a run's question is answered out of band, instead of believing the run still waits."
+- "Chat messages sent while a session is mid-turn keep their place in history instead of vanishing, and the false unconfirmed-delivery warning is gone."
+- "Mid-turn chat messages now appear in the transcript once delivered, so their bubbles settle in order instead of piling up below the conversation."
+- "Operator chat messages starting with ! reach Claude sessions with a visible '. ' prefix instead of executing as shell commands."
+added:
+- "The fleet view shows a hint when no service slots are configured."
+changed:
+- "Port chips moved from the run overview tab to the run header, visible from every tab."
+- "Operator-channel questions and answers render as separate cards with color-coded QUESTION and ANSWER labels."

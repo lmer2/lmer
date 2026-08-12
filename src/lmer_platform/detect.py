@@ -55,10 +55,62 @@ persists is announced once. A condition that clears and comes back is announced
 again — the second occurrence is a second event, and treating it as a duplicate
 of the first would hide a run that asked, got answered, and asked again.
 
+One *clear* is material, and only one (issue #254)
+---------------------------------------------------
+A run that stops having *any* question on the attention axis is the exception,
+delivered as :data:`QUESTION_ANSWERED_KIND` for the kinds :data:`QUESTION_KINDS`
+names. The consumer is the whole argument: the orchestrating assistant is asleep
+between digests, so an answer given out of band — the UI's survey, ``POST
+/api/runs/answer``, ``work answer`` in a shell someone had open — wakes nothing,
+and it goes on believing the run is blocked on a human who has already replied.
+Every *other* clear stays silent, because nothing is waiting on it: a run that
+stops being crashed needs no next step from anybody.
+
+The clear is keyed on the **run**, and not on the condition key the diff above
+uses — which is the difference between a wake-up and a lie. Two ordinary
+movements change that key while a human is still owed an answer. A run that is
+*re-asked* between two ticks gets a new ``since`` (the new question's own
+timestamp), so the baseline's key is gone from the current tick with the run
+waiting right now. And a live ask most often ends by changing *shape* rather
+than disappearing: a session records its blocking question and exits, turning
+``live_question`` into the stopped run's ``question`` — two spellings of one fact
+(:data:`lmer_platform.inventory.ATTENTION_REASONS` explains why they are two
+reasons and not one name), which is why they are both in
+:data:`QUESTION_KINDS`. Keyed on the tuple, each of those spools "no longer
+waiting" about a run that is waiting, and the assistant drains oldest-first, so
+the false all-clear would be its last word on the subject.
+
+So both sides of the diff are reduced to the set of runs carrying at least one
+:data:`QUESTION_KINDS` condition, and a clear is a run that *left* that set. A
+re-ask and a shape change both keep the run in it, and say nothing here; the
+fresh condition each of them raises still arrives through the diff above, which
+is the digest that is true. What is given up is real and small: a run that has
+one question answered and asks another in the same window is told about the new
+question only, and the assistant learns the old one is gone by the run not being
+on the attention list when it reads.
+
+Three things this deliberately does not claim. A run that left the fleet between
+ticks (archived, deleted) also loses its condition, and is not announced — its
+question was not answered, and naming a run the assistant can no longer address
+is a wake-up with no move behind it. A question can leave the axis without being
+answered at all, if the session holding it dies; that run's ``crashed`` arrives
+on the same tick through the diff above, saying so. And a session can *withdraw*
+its own question — close it unanswered and go on running
+(:func:`ask_channel.protocol.open_questions` drops a closed entry, which is what
+both ask views render as "the session stopped waiting for this") — after which
+the condition clears exactly as an answer clears it, on a run that is still in
+the fleet and still healthy. Nothing in the payload tells those two apart: the
+attention record that carried the question is precisely what is gone. So the
+digest is worded to the strength this can measure — *answered or withdrawn* —
+because "a human replied" is a claim an assistant would act on by skipping the
+read that would have shown nobody had.
+
 The first tick therefore establishes the baseline and notifies **nothing**, which
 is a real choice with a real cost. What it gives up: a question that opened while
-the daemon was down is never announced as an event. What it buys: a daemon
-restart on a host with a long history does not flood a spool bounded at
+the daemon was down is never announced as an event — and, symmetrically, one that
+was *answered* while it was down, since :attr:`Detector._seen` lives in memory
+only and a clear is a diff against a baseline that restarted empty. What it buys:
+a daemon restart on a host with a long history does not flood a spool bounded at
 :data:`lmer_platform.assistant.MAX_PENDING` with digests about runs that finished
 last week — and dropping the oldest to make room for stale ones is the failure
 worth avoiding. The standing list is not lost either way: it is what
@@ -247,7 +299,8 @@ from .workrepo import resolve_run_dir
 logger = logging.getLogger("lmer_platform.detect")
 
 __all__ = [
-    "DETECT_INTERVAL_SECONDS", "MATERIAL_STATES", "SESSION_ENDED_UNWATCHED",
+    "DETECT_INTERVAL_SECONDS", "MATERIAL_STATES", "QUESTION_ANSWERED_KIND",
+    "QUESTION_KINDS", "SESSION_ENDED_UNWATCHED",
     "SESSION_SIGNALLED", "SIGNAL_DIGEST_KIND", "SIGNAL_MARKS_FILE",
     "Signal", "SessionSignal", "Detector", "sweep_finished_sessions",
     "new_signals", "record_ingested_signals",
@@ -295,6 +348,36 @@ SESSION_SIGNALLED = "session_signalled"
 #: orchestrator has a next step to take. The name says which session-side act
 #: produced it, because the assistant's own instructions talk about ``lmer-signal``.
 SIGNAL_DIGEST_KIND = "session_signal"
+
+#: Digest class for a question that is no longer being asked (issue #254). Beside
+#: :data:`SIGNAL_DIGEST_KIND` rather than on the attention axis, and for the same
+#: reason: an answered question means the *orchestrator* has a next step, while
+#: every member of :data:`lmer_platform.inventory.ATTENTION_REASONS` means the
+#: operator does — and this one exists precisely because the operator has already
+#: acted. The name is what happened, not what cleared, because it is what the
+#: assistant's own instructions call the event.
+#:
+#: It names the common case rather than the only one: a session that closes its
+#: own question unanswered clears the condition the same way, and the payload
+#: cannot tell the two apart (module docstring). The *note* says so —
+#: :meth:`Signal.answered_digest` claims answered *or withdrawn* — while this
+#: label stays the one word the spool sorts on and the instructions already use.
+QUESTION_ANSWERED_KIND = "question_answered"
+
+#: The attention reasons whose *disappearance* is material — the exception the
+#: module docstring argues for, and the only one. Both are questions a human
+#: answers (:data:`lmer_platform.inventory.ATTENTION_REASONS` explains why they
+#: are two reasons and not one name), which is what makes their clearing an event
+#: rather than a run merely getting better. Named here rather than derived,
+#: unlike everything else on that axis: nothing on the record says "a person can
+#: answer this", and a reason added there later must not silently start claiming
+#: it was answered.
+#:
+#: Written in *lifecycle* order — the live session's ask first, then the record a
+#: stopped run leaves behind — which is what :func:`_question_rank` reads when it
+#: has to choose between two spellings on one run. The membership is what the
+#: clear is keyed on; the order matters only to that tie-break.
+QUESTION_KINDS = ("live_question", "question")
 
 #: Where the high-water marks live: ``{"sessions": {"<id>": {"seq": N, ...}}}``,
 #: beside the daemon's other snapshots (spec §6.1) and written only from here.
@@ -387,6 +470,29 @@ class Signal:
                 text = f"{text}: {self.note}"
         return _clamp(text, assistant.MAX_NOTE_CHARS)
 
+    @property
+    def answered_digest(self) -> str:
+        """The one line for this condition having *gone* (:data:`QUESTION_KINDS`).
+
+        Names the run and nothing else it would have to be read back to know: the
+        answer's own text is on the run, not in this tick's payload — the
+        attention record that carried the question is exactly what disappeared —
+        and a fleet-wide sweep is what naming the run is here to save.
+
+        "Answered **or withdrawn**" is the strongest thing that record's absence
+        supports, and the weaker word is the load-bearing one: a session can close
+        its own question unanswered and keep running, which clears the condition
+        identically and leaves nothing in the payload to distinguish it (module
+        docstring). Saying "answered" alone would tell the orchestrator a human
+        replied, and the move it makes on that is to *skip* the read that would
+        have shown nobody did.
+        """
+        return _clamp(
+            f"{self.ref} is no longer waiting — its {self.kind} was answered "
+            "or withdrawn",
+            assistant.MAX_NOTE_CHARS,
+        )
+
     def data(self) -> dict:
         """The structured half of the digest: enough to act without a fleet read."""
         return {
@@ -400,6 +506,24 @@ class Signal:
         }
 
 
+def _identity(row: object) -> Optional[tuple]:
+    """``(host, project, slug)`` off one fleet row, or ``None``.
+
+    ``None`` for a row the inventory built from a session with no run identity
+    yet (spawned seconds ago, nothing committed): :func:`lmer_platform.inventory
+    ._view_from_session` fills those fields with :data:`_UNIDENTIFIED`. Nothing
+    here can name such a row to the assistant in a way the assistant could act on
+    — every run route takes host, project and slug — and it will have an identity
+    by the time it has anything material to say.
+    """
+    if not isinstance(row, dict):
+        return None
+    identity = [_text(row.get(field)) for field in ("host", "project", "slug")]
+    if not all(identity) or _UNIDENTIFIED in identity:
+        return None
+    return tuple(identity)
+
+
 def _signals_of_row(row: object) -> list:
     """Every material condition one fleet row carries, or an empty list.
 
@@ -408,15 +532,8 @@ def _signals_of_row(row: object) -> list:
     once (a ``complete`` run has no attention record), and this does not depend on
     that staying true.
     """
-    if not isinstance(row, dict):
-        return []
-    identity = [_text(row.get(field)) for field in ("host", "project", "slug")]
-    if not all(identity) or _UNIDENTIFIED in identity:
-        # A row the inventory built from a session with no run identity yet
-        # (spawned seconds ago, nothing committed). Nothing here can name it to
-        # the assistant in a way the assistant could act on — every run route
-        # takes host, project and slug — and it will have an identity by the time
-        # it has anything material to say.
+    identity = _identity(row)
+    if identity is None:
         return []
     host, project, slug = identity
 
@@ -457,6 +574,51 @@ def _signals(payload: object) -> dict:
     for row in rows if isinstance(rows, list) else []:
         for signal in _signals_of_row(row):
             found.setdefault(signal.key, signal)
+    return found
+
+
+def _question_refs(signals: dict) -> set:
+    """The runs in *signals* carrying at least one :data:`QUESTION_KINDS` condition.
+
+    The whole of what a *clear* is keyed on (module docstring): not the condition
+    key the diff uses, because a run that is re-asked or whose live ask becomes a
+    stopped run's ``question`` changes that key without ceasing to wait on a
+    person.
+    """
+    return {
+        signal.ref for signal in signals.values() if signal.kind in QUESTION_KINDS
+    }
+
+
+def _question_rank(signal: Signal) -> int:
+    """How late in a question's life this spelling is; higher wins a tie.
+
+    Only reached when one run carries both spellings at once, which today's
+    :func:`lmer_platform.inventory.build_inventory` does not produce — a row has
+    at most one attention record, and the one shape that puts two rows on one run
+    (a session entry no run-dir row claims) reads ``crashed``. It is a tie-break
+    rather than an assertion because this module takes the fleet payload as it
+    finds it, and "whichever came first in the payload" is the kind of ordering
+    that changes under an unrelated sort. The stopped run's ``question`` wins: it
+    is the later stage, so it is the condition the run is still remembered by.
+    """
+    return QUESTION_KINDS.index(signal.kind)
+
+
+def _refs(payload: object) -> set:
+    """Every run the payload names, material or not.
+
+    Deliberately not derivable from :func:`_signals`: a run with nothing material
+    to say is absent there and present here, and that difference is the whole of
+    how a question that stopped being asked is told apart from a run that left the
+    fleet (module docstring).
+    """
+    rows = payload.get("runs") if isinstance(payload, dict) else None
+    found = set()
+    for row in rows if isinstance(rows, list) else []:
+        identity = _identity(row)
+        if identity is not None:
+            found.add("/".join(identity))
     return found
 
 
@@ -918,6 +1080,10 @@ class Detector:
         #: Runs named in a check-in digest (issue #244) — runs rather than
         #: digests, because one digest names all of them.
         self.stale_reported = 0
+        #: Questions that cleared while their run stayed in the fleet (issue
+        #: #254), counted apart from ``notified`` because this is the one digest
+        #: class raised by a condition *going away*.
+        self.answered = 0
         self._stop = threading.Event()
         self._sleep = sleep or self._stop.wait
         self._read_state = state_reader or build_state
@@ -1023,7 +1189,9 @@ class Detector:
         Signal ingestion is a third stage on the same terms, and it is *not* in the
         return value: what comes back is the diff's own fresh conditions, because
         that is what the tests of the diff assert on and a milestone is not one of
-        them (:attr:`signalled` is where those are counted).
+        them (:attr:`signalled` is where those are counted). An answered question
+        stays out of it for the same reason, being a condition that has gone
+        rather than one this tick found (:attr:`answered`).
         """
         try:
             self.reconciled += len(sweep_finished_sessions(self.config))
@@ -1072,7 +1240,51 @@ class Detector:
         fresh = [signal for key, signal in current.items() if key not in baseline]
         for signal in fresh:
             self._deliver(signal)
+        # After the fresh ones, so a run whose question cleared *into* another
+        # condition — a session that died holding it — is described by what it
+        # needs now before it is told what it no longer needs. Still the right
+        # order now that the clear is keyed on the run: what that keying removes
+        # is the case the order could not have saved (a stale all-clear beside a
+        # fresh ask *for the same run*, which can no longer both be raised in one
+        # tick), and what it leaves is exactly the case this order is for.
+        for signal in self._answered_questions(baseline, current, payload):
+            self._deliver_answered(signal)
         return fresh
+
+    def _answered_questions(
+        self, baseline: dict, current: dict, payload: object
+    ) -> list:
+        """One signal per run that *stopped* having a question this tick.
+
+        Keyed on the run rather than on the condition key everything else uses,
+        which is the module docstring's argument in code: a run still carrying a
+        question of either spelling is still waiting on a person, however much
+        the ``(run, kind, since)`` tuple moved. So a re-ask and a
+        ``live_question`` → ``question`` shape change produce nothing here, and
+        at most one clear is ever raised per run per tick.
+
+        The signal returned is the baseline's own question for that run, because
+        the digest and its ``data`` describe the condition that *went* — the
+        payload no longer holds it. :func:`_question_rank` picks when a run
+        somehow had both spellings at once.
+
+        The ``payload`` read is the whole of the vanished-run rule: a run that is
+        no longer in the fleet at all lost its question to an archive or a
+        deletion rather than to an answer, and it is not announced.
+        """
+        refs = _refs(payload)
+        outstanding = _question_refs(current)
+        cleared: dict = {}
+        for signal in baseline.values():
+            if signal.kind not in QUESTION_KINDS:
+                continue
+            if signal.ref in outstanding or signal.ref not in refs:
+                continue
+            previous = cleared.get(signal.ref)
+            if previous is None or _question_rank(signal) > _question_rank(previous):
+                cleared[signal.ref] = signal
+        # Baseline order, which is the inventory's own sort (:func:`_signals`).
+        return list(cleared.values())
 
     def _check_ins(self, payload: dict) -> list:
         """Spool one digest naming every run nobody has checked. Returns them.
@@ -1199,6 +1411,28 @@ class Detector:
             return
         logger.info(
             "platform_detection_notified run=%s kind=%s assistant_live=%s",
+            signal.ref, signal.kind, bool(live),
+        )
+
+    def _deliver_answered(self, signal: Signal) -> None:
+        """Hand one *cleared* question to the spool, on :meth:`_deliver`'s terms.
+
+        Its own method rather than a flag, because the two say opposite things
+        about the same run and the digest class is what a reader of the spool
+        sorts on. ``data`` is the question's own — the reason that cleared and
+        when it started — so the assistant can match this against the digest it
+        was woken with when the question opened.
+        """
+        delivered, live = self._spool(
+            signal.answered_digest, QUESTION_ANSWERED_KIND, signal.data()
+        )
+        if not delivered:
+            return
+        self.answered += 1
+        logger.info(
+            "platform_detection_answered run=%s kind=%s assistant_live=%s — the "
+            "condition cleared while the run stayed in the fleet, so it was "
+            "answered or withdrawn somewhere this daemon was not watching",
             signal.ref, signal.kind, bool(live),
         )
 

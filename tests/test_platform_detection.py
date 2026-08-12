@@ -240,11 +240,19 @@ def test_a_standing_condition_is_notified_once(config):
     assert len(spool.calls) == 1, "an unanswered question must not re-notify"
 
 
-def test_a_condition_that_clears_and_returns_is_a_second_event(config):
-    """Asked, answered, asked again — the second ask is not a duplicate.
+def test_a_question_that_clears_is_announced_and_asking_again_is_a_second_event(
+    config
+):
+    """Asked, answered, asked again — three digests, one per thing that happened.
 
-    Suppressing it would hide the run that most needs a human: the one that has
-    now been round twice.
+    The second ask is not a duplicate of the first: suppressing it would hide the
+    run that most needs a human, the one that has now been round twice.
+
+    The clear between them used to say nothing, and this test asserted exactly
+    that (two calls, the answer silent) — which is issue #254 pinned as
+    behaviour: an operator who answered the run directly left the orchestrator
+    believing it was still waiting, because nothing on that route was ever going
+    to wake it.
     """
     waiting = fleet(row("develop-141", reason="question", note=QUESTION,
                         state="waiting_on_you", since="2026-07-28T10:00:00Z"))
@@ -254,11 +262,12 @@ def test_a_condition_that_clears_and_returns_is_a_second_event(config):
 
     tick.tick_once()
     tick.tick_once()
-    tick.tick_once()
+    cleared = tick.tick_once()
     again = tick.tick_once()
 
+    assert cleared == [], "a condition that went away is not a fresh condition"
     assert len(again) == 1
-    assert len(spool.calls) == 2
+    assert spool.kinds == ["question", detect.QUESTION_ANSWERED_KIND, "question"]
 
 
 def test_two_runs_in_the_same_condition_are_two_entries_naming_each_run(config):
@@ -1905,3 +1914,340 @@ def test_the_backstops_digest_does_not_claim_a_diagnosis(config):
     tick.tick_once()
 
     assert "silence alone" in spool.calls[0]["note"]
+
+
+# --- an answered question wakes the orchestrator (#254) -----------------------
+#
+# The one clear the diff announces, and the exception to everything above it: a
+# question that leaves the attention axis while its run stays in the fleet. The
+# consumer is why — the orchestrating assistant is asleep between digests, so an
+# answer given on any of the routes it does not own (the UI's survey,
+# POST /api/runs/answer, `work answer` in a shell) wakes nothing at all, and it
+# goes on treating the run as blocked. What these pin is the *narrowness* of the
+# exception: only questions, only while the run is still there, and never at the
+# cost of what else the run earns.
+
+
+@pytest.mark.parametrize("reason, state", [
+    ("live_question", "running"),
+    ("question", "waiting_on_you"),
+])
+def test_an_answered_question_wakes_the_orchestrator_naming_the_run(
+    config, reason, state
+):
+    """Both ways a run can wait on a person, and one digest shape for the two.
+
+    ``live_question`` is answered into a file the container is already watching
+    and ``question`` respawns an exited run, but the orchestrator's problem is
+    the same either way, so its wake-up is too: the run first, because its next
+    move is an API call against that triple.
+
+    ``data`` describes the condition that *went*, as it was last seen — which is
+    what lets the assistant match this against the digest it was woken with when
+    the question opened, rather than having to sweep the fleet to find out what
+    changed.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-254", reason=reason, note=QUESTION, label="issue 254",
+                  state=state, since="2026-08-11T09:00:00Z")),
+        fleet(row("develop-254", state="running")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+
+    assert tick.answered == 1
+    call = spool.calls[1]
+    assert call["kind"] == detect.QUESTION_ANSWERED_KIND
+    assert call["note"] == (
+        "gitlab.example.com/agents/global/develop-254 is no longer waiting — "
+        f"its {reason} was answered or withdrawn"
+    )
+    assert call["data"] == {
+        "host": "gitlab.example.com",
+        "project": "agents/global",
+        "slug": "develop-254",
+        "label": "issue 254",
+        "kind": reason,
+        "state": state,
+        "since": "2026-08-11T09:00:00Z",
+    }
+
+    tick.tick_once()
+    assert tick.answered == 1, "an answer is an event, not a standing state"
+
+
+def test_a_question_the_session_withdrew_clears_exactly_like_an_answer(config):
+    """The one case the digest's wording has to carry, because nothing can tell.
+
+    A session may close its own question and keep going —
+    ``ask_channel.protocol.open_questions`` drops a closed entry, and both ask
+    views render that state as "the session stopped waiting for this". The row it
+    leaves on the next tick is the one built here: no attention record, still
+    ``running``, still in the fleet. That is byte-for-byte the row an answered
+    question leaves, so this fires the *same* digest as the test above and is
+    meant to — the payload carries nothing that could separate the two.
+
+    What is pinned is therefore the note, not a second code path: it must not
+    tell the orchestrator a human replied, because the move it makes on that is
+    to skip the read that would have shown nobody had.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-254", reason="live_question", note=QUESTION,
+                  state="running", since="2026-08-11T09:00:00Z")),
+        # The session closed it unanswered and carried on working.
+        fleet(row("develop-254", state="running")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+
+    assert tick.answered == 1
+    assert spool.kinds == ["live_question", detect.QUESTION_ANSWERED_KIND]
+    assert spool.calls[1]["note"] == (
+        "gitlab.example.com/agents/global/develop-254 is no longer waiting — "
+        "its live_question was answered or withdrawn"
+    )
+
+
+def test_a_question_re_asked_between_ticks_is_a_fresh_ask_and_never_a_clear(config):
+    """The run is waiting *right now*, so nothing may say it stopped.
+
+    A second question carries its own timestamp, and ``since`` is in a
+    condition's identity — so the baseline's key is gone from this tick while a
+    human is owed an answer. Keyed on the tuple, this spooled the fresh "needs
+    you" and then "no longer waiting" behind it; the assistant drains oldest
+    first, so the false all-clear was its last word about the run.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-254", reason="live_question", note=QUESTION,
+                  state="running", since="2026-08-11T09:00:00Z")),
+        fleet(row("develop-254", reason="live_question", note="and this one?",
+                  state="running", since="2026-08-11T09:05:00Z")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    later = tick.tick_once()
+
+    assert [signal.kind for signal in later] == ["live_question"]
+    assert spool.kinds == ["live_question", "live_question"]
+    assert "and this one?" in spool.notes[1]
+    assert tick.answered == 0, "a run that is still asking has not been answered"
+
+
+def test_a_live_ask_becoming_a_stopped_run_s_question_is_not_a_clear(config):
+    """The ordinary end of a live ask changes the reason's *spelling*, not the fact.
+
+    A session records its blocking question and exits, so ``live_question``
+    (session up, blocked in a poll) becomes ``question`` (stopped run, waiting on
+    you) with the run's ``updated`` for a ``since``. Both are in
+    ``QUESTION_KINDS`` because they are two spellings of one fact — a person owes
+    this run an answer — so the clear must not fire on the change between them.
+    The fresh "needs you — question" still does, through the ordinary diff.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-254", reason="live_question", note=QUESTION,
+                  state="running", since="2026-08-11T09:00:00Z")),
+        fleet(row("develop-254", reason="question", note=QUESTION,
+                  state="waiting_on_you", since="2026-08-11T09:10:00Z")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    stopped = tick.tick_once()
+
+    assert [signal.kind for signal in stopped] == ["question"]
+    assert spool.kinds == ["live_question", "question"]
+    assert tick.answered == 0, "the run is waiting on a person in both rows"
+
+
+def test_the_ordinary_lifecycle_clears_once_when_the_run_stops_asking(config):
+    """Asked live, recorded on exit, answered into a respawn — one clear, at the end.
+
+    The whole of the shape #254 is about, tick by tick: nothing may say the run
+    stopped waiting until it actually has, and then exactly one digest must say
+    so. The clear describes the condition that went, which by then is the stopped
+    run's ``question`` rather than the live ask it began as.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-254", reason="live_question", note=QUESTION,
+                  state="running", since="2026-08-11T09:00:00Z")),
+        fleet(row("develop-254", reason="question", note=QUESTION,
+                  state="waiting_on_you", since="2026-08-11T09:10:00Z")),
+        fleet(row("develop-254", state="running")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+    assert tick.answered == 0, "not until the question is off the run"
+
+    tick.tick_once()
+
+    assert tick.answered == 1
+    assert spool.kinds == [
+        "live_question", "question", detect.QUESTION_ANSWERED_KIND
+    ]
+    assert spool.calls[2]["data"]["kind"] == "question"
+    assert spool.calls[2]["data"]["since"] == "2026-08-11T09:10:00Z"
+
+    tick.tick_once()
+    assert tick.answered == 1, "an answer is an event, not a standing state"
+
+
+def test_a_run_carrying_both_question_spellings_clears_once(config):
+    """One run, one clear, whichever way its rows were assembled.
+
+    Today's ``build_inventory`` cannot produce this — a row carries at most one
+    attention record, and the shape that puts two rows on one run (a session
+    entry no run-dir row claims) reads ``crashed`` — so what is pinned is that
+    the clear is keyed on the *run*: two question rows are one waiting run and
+    one digest, and the one chosen is the later lifecycle stage.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(
+            row("develop-254", reason="live_question", note=QUESTION,
+                state="running", since="2026-08-11T09:00:00Z"),
+            row("develop-254", reason="question", note=QUESTION,
+                state="waiting_on_you", since="2026-08-11T09:10:00Z"),
+        ),
+        fleet(row("develop-254", state="running")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+
+    assert tick.answered == 1
+    assert spool.kinds[-1] == detect.QUESTION_ANSWERED_KIND
+    assert spool.calls[-1]["data"]["kind"] == "question"
+    assert spool.calls[-1]["note"].endswith(
+        "is no longer waiting — its question was answered or withdrawn"
+    )
+
+
+def test_a_cleared_question_leaves_the_run_s_other_conditions_alone(config):
+    """Only the question clears; whatever else the run earns is still its own event.
+
+    The shape is one that really happens: the session holding the question dies,
+    so the reason on the row changes rather than merely going away. The
+    orchestrator needs both halves — the crash to act on, and the question to
+    stop waiting for.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-254", reason="live_question", note=QUESTION,
+                  state="running", since="2026-08-11T09:00:00Z")),
+        fleet(row("develop-254", reason="crashed", note="the session is gone",
+                  state="crashed", since="2026-08-11T09:30:00Z")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    fresh = tick.tick_once()
+
+    assert [signal.kind for signal in fresh] == ["crashed"]
+    assert spool.kinds == ["live_question", "crashed", detect.QUESTION_ANSWERED_KIND]
+
+    tick.tick_once()
+    assert len(spool.calls) == 3, "the crash the run still has is not re-announced"
+
+
+def test_a_condition_that_is_not_a_question_clears_in_silence(config):
+    """A run that stops being crashed has nobody waiting on the news.
+
+    Announcing every clear is the firehose the diff exists to avoid; the question
+    case earns its exception because its consumer is asleep until something wakes
+    it, and no other clear leaves anyone believing something untrue.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-254", reason="crashed", note="the session is gone",
+                  state="crashed", since="2026-08-11T09:00:00Z")),
+        fleet(row("develop-254", state="running")),
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+
+    assert tick.tick_once() == []
+    assert spool.kinds == ["crashed"]
+    assert tick.answered == 0
+
+
+@pytest.mark.parametrize("after", [
+    fleet(),
+    fleet(row("review-254", state="running")),
+], ids=["the fleet empties", "other runs remain"])
+def test_a_run_that_leaves_the_fleet_had_its_question_answered_by_nobody(
+    config, after
+):
+    """Archived or deleted is not answered, and the digest would have no next step.
+
+    Every route the assistant could take is addressed by ``<host>/<project>/<slug>``,
+    and there is no longer a run behind that triple — so this reads the payload's
+    runs rather than its conditions, which is the only place the two cases differ.
+    """
+    spool = Spool()
+    tick = detector(
+        config,
+        fleet(),
+        fleet(row("develop-254", reason="live_question", note=QUESTION,
+                  state="running", since="2026-08-11T09:00:00Z")),
+        after,
+        spool=spool,
+    )
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+
+    assert spool.kinds == ["live_question"]
+    assert tick.answered == 0
+
+
+def test_the_answered_digest_is_not_a_reason_for_the_operator_to_act():
+    """Its own class beside the attention axis, exactly as a milestone is (T122).
+
+    Every member of ``ATTENTION_REASONS`` becomes a digest class automatically and
+    puts a run on the operator's badge; this one says a badge has just gone away,
+    and it is addressed to the orchestrator. The kinds it can be raised for are
+    checked against that axis in the other direction: announcing a clear for a
+    reason nothing can raise would be a promise this makes and never keeps.
+    """
+    assert detect.QUESTION_ANSWERED_KIND not in inventory.ATTENTION_REASONS
+    assert detect.QUESTION_ANSWERED_KIND not in detect.MATERIAL_STATES
+    assert set(detect.QUESTION_KINDS) <= set(inventory.ATTENTION_REASONS)

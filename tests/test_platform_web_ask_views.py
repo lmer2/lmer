@@ -41,6 +41,16 @@ bound, and which nobody could find to undo. The terminal's height preset is the
 precedent for *not* doing it: what earns storage there is a property of the
 operator's screen, unchanged from run to run.
 
+What the two views *disagree* about is the whole of the above. What one entry looks
+like they owe each other, and issue #254 is why that is pinned here too: the
+operator read the old list as one thing ("clearer separation of messages is needed …
+messages look like the kinda flow into each other"), so an entry is a card of its
+own now, with the two halves of the exchange named where each of them starts. Both
+views render that same shape, and the labels take their colour from ``format.js``
+for the reason ``askEntryLabel`` already lives there — a channel that spoke about
+the operator's own words differently in the dock and in the record would be two
+accounts of who said what.
+
 Where each view is mounted, and that the record is not answerable, are pinned
 next door in :mod:`tests.test_platform_web_details_tabs`; the channel's own
 protocol is :mod:`tests.test_platform_ask`. Source-level, like every web test in
@@ -63,6 +73,10 @@ RUN_DETAIL = COMPONENTS / "RunDetail.vue"
 #: Where the cleared ids live: outside the component, so a remount cannot lose them,
 #: and in memory, so a reload cannot keep them.
 STORE = WEB / "src" / "dismissals.js"
+#: The words and the colours both views label an entry with, in one place.
+FORMAT = WEB / "src" / "format.js"
+#: The two schemes those colours have to be defined in, or a label renders unpainted.
+THEME = WEB / "src" / "main.js"
 
 
 def _read(path):
@@ -95,6 +109,32 @@ def _binding(text, name):
     rest = text[text.index(f"const {name} = "):]
     match = re.search(r"\n(?=(?:const|function|//|/\*|onMounted|watch)\s?)", rest)
     return rest[:match.start()] if match else rest
+
+
+def _entry_element(text):
+    """The opening tag of the element one channel entry is rendered as.
+
+    Read off the ``v-for`` rather than looked for by name, because the question
+    here is what an entry *is* — a bare div separated by a margin was the shape the
+    operator read as one long thing.
+    """
+    match = re.search(
+        r'<[\w-]+\b[^>]*\sv-for="entry in \w+"[^>]*>', _without_comments(text), re.S,
+    )
+    assert match, "nothing here renders one element per channel entry"
+    return " ".join(match.group(0).split())
+
+
+def _label_match(text, word):
+    """The element that writes *word* on an entry, as a match on the stripped view."""
+    match = re.search(rf"<div\b[^>]*>{word}</div>", _without_comments(text), re.S)
+    assert match, f"no {word} label is written on an entry"
+    return match
+
+
+def _label_element(text, word):
+    """The element that writes *word* on an entry, whole and whitespace-collapsed."""
+    return " ".join(_label_match(text, word).group(0).split())
 
 
 # --- two views, and which is which -------------------------------------------
@@ -391,3 +431,134 @@ def test_the_run_detail_view_mounts_the_dock_above_the_tabs_and_the_record_below
     dock = dock[:dock.index("/>") + 2]
     for prop in (':session-id="terminalSession"', ':live="!!run.live"'):
         assert prop in dock, f"the dock is mounted without {prop}"
+
+
+# --- what one entry looks like, in both views (issue #254) ---------------------
+
+def test_an_entry_is_a_card_of_its_own_in_both_views():
+    """The operator: "messages look like the kinda flow into each other".
+
+    They were divs in one card, separated by a bottom margin — so a note followed
+    by a question read as one long thing with a dim line somewhere in the middle of
+    it. Each entry is its own card now, which is the operator's own suggestion ("a
+    v-card for the message itself, or a v-divider could help"), and both views get
+    it: they render the same entries, and a dock that separated them where the
+    record did not would be one channel read two ways.
+    """
+    for path in (DOCK, RECORD):
+        element = _entry_element(_read(path))
+        assert element.startswith("<v-card"), (
+            f"{path.name} renders an entry as {element.split()[0]}>, so the "
+            "separation between two messages is whatever margin it carries"
+        )
+        assert 'variant="outlined"' in element, (
+            f"{path.name}'s entry card is elevated or tonal: the pane's own card is "
+            "already the shadow, and a second one — or a wash under every entry — "
+            "repaints the pane rather than separating what is in it"
+        )
+        # Inside the pane's card, not instead of it: the entries are one list, and
+        # the dock hangs its "clear from here" off the same container.
+        text = _without_comments(_read(path))
+        assert text.count("<v-card") >= 2, (
+            f"{path.name} lost the card around the list; the entries are a stack of "
+            "loose cards on the page"
+        )
+
+
+def test_both_views_name_the_question_and_the_answer_where_each_starts():
+    """The operator: "clearly have a 'QUESTION' and 'ANSWER' label".
+
+    Where each half starts, rather than in the header row: the header says what
+    happened to an entry ("answered", "closed by the session") and how long ago,
+    which is a different question from which of two voices the next paragraph is.
+    """
+    for path in (DOCK, RECORD):
+        text = _read(path)
+        stripped = _without_comments(text)
+        question, answer = _label_match(text, "QUESTION"), _label_match(text, "ANSWER")
+
+        # A note is one voice saying one thing: labelling it QUESTION would promise
+        # an answer that is never coming.
+        assert "v-if=\"entry.kind !== 'note'\"" in question.group(0), (
+            f"{path.name} writes QUESTION on every entry, notes included"
+        )
+        assert question.start() < stripped.index(':text="entry.text"'), (
+            f"{path.name} labels the question somewhere other than where it starts"
+        )
+
+        # And the answer's label goes with the answer, which most entries do not
+        # have — an unanswered question with an ANSWER heading over nothing reads
+        # as a reply that was lost.
+        answered = stripped.index('v-if="entry.answer"')
+        assert answered < answer.start() < stripped.index("entry.answer.text"), (
+            f"{path.name} writes ANSWER outside the answer it labels"
+        )
+
+
+def test_the_two_labels_are_painted_from_one_map_the_theme_defines():
+    """Same words in the same ink in both views, and neither picks the ink.
+
+    ``askEntryLabel``'s argument, one line down: two views of one channel that
+    coloured the operator's own words differently would be two accounts of who said
+    what. A colour named in a component is also one the scheme switcher cannot
+    repaint — main.js has to define it, in both schemes.
+    """
+    fmt = _read(FORMAT)
+    assert "export function askPartColor(part)" in fmt, (
+        "the label colours are not shared, so each view picks its own"
+    )
+    block = re.search(r"const ASK_PART_COLORS = \{(.*?)\n\}", fmt, re.S)
+    assert block, "format.js no longer maps a half of an exchange onto a colour"
+    colours = dict(re.findall(r"(\w+): '([^']+)'", block.group(1)))
+    assert set(colours) == {"question", "answer"}, (
+        f"an exchange has two halves here and the map has {sorted(colours)}"
+    )
+    assert colours["question"] != colours["answer"], (
+        "both labels are the same colour, which is the coding the operator asked "
+        "for doing nothing"
+    )
+    theme = _read(THEME)
+    for part, colour in colours.items():
+        assert not colour.startswith("#"), (
+            f"the {part} label is a literal {colour}, which the scheme switcher "
+            "cannot repaint"
+        )
+        schemes = re.findall(rf"^\s+'?{re.escape(colour)}'?: '#", theme, re.M)
+        assert len(schemes) == 2, (
+            f"main.js defines {colour!r} in {len(schemes)} of its two schemes; the "
+            f"{part} label renders as body ink in the other one"
+        )
+
+    for path in (DOCK, RECORD):
+        text = _without_comments(_read(path))
+        assert "askPartColor" in text and "from '../format.js'" in text, (
+            f"{path.name} does not take the label colours from format.js"
+        )
+        for word, part in (("QUESTION", "question"), ("ANSWER", "answer")):
+            label = _label_element(_read(path), word)
+            assert f"askPartColor('{part}')" in label, (
+                f"{path.name}'s {word} label is coloured by something other than "
+                "the shared map"
+            )
+
+
+def test_the_colour_is_on_the_labels_and_never_on_what_was_said():
+    """The operator, in the same breath: "i don't think color code the text
+    entirely".
+
+    A label is a word the eye lands on; the message under it is prose to read back,
+    and painting it recolours a whole channel every time an agent posts. So the
+    entry's two bodies — the rendered text and the verbatim reply — carry the
+    emphasis classes and nothing that names a colour.
+    """
+    for path in (DOCK, RECORD):
+        text = _without_comments(_read(path))
+        said = re.findall(r"<(?:Markdown|p)\b[^>]*\bsaid\b[^>]*>", text, re.S)
+        assert said, f"{path.name} renders neither half of an entry"
+        for element in said:
+            assert "askPartColor" not in element, (
+                f"{path.name} colours what was said: {' '.join(element.split())}"
+            )
+            assert not re.search(r"text-(?:primary|success|warning|error|tone-)", element), (
+                f"{path.name} colours what was said: {' '.join(element.split())}"
+            )
