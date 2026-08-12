@@ -10,6 +10,7 @@ This module handles:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -45,6 +46,16 @@ _LMER_STATE_DIR = Path.home() / ".lmer"
 # counter leak on older kernels (e.g. RHEL 8 / 4.18), where phantom fork
 # entries accumulate and prematurely exhaust the cap.
 DEFAULT_PIDS_LIMIT = "512"
+
+# Default container CPU quota, passed as --cpus. One core is the conservative
+# baseline; overridable via LMER_CPUS — see _resolve_cpus() and
+# docs/LMER-CLI.md — because a single core throttles parallel workloads (test
+# suites, builds) on hosts with cores to spare.
+DEFAULT_CPUS = "1"
+
+# Default container memory cap, passed as --memory. Overridable via
+# LMER_MEMORY — see _resolve_memory() and docs/LMER-CLI.md.
+DEFAULT_MEMORY = "2g"
 
 
 #: The kernel's own answer, read rather than shelled out for. ``1`` is
@@ -259,6 +270,106 @@ def _resolve_pids_limit() -> str:
     return DEFAULT_PIDS_LIMIT
 
 
+# A positive decimal literal, the only shape accepted for --cpus — a deliberate
+# subset of what the runtimes parse (docker also takes 1e2, 3/2, "1."), chosen
+# because a rejected spelling only costs warn-and-default while a passed one
+# must not abort the launch. ASCII-only, since Python's \d otherwise matches
+# non-ASCII digits the runtimes reject; at most 9 fractional digits, since
+# docker's nano-CPU parser rejects finer values as "too precise".
+_CPUS_RE = re.compile(r"^\d+(\.\d{1,9})?$", re.ASCII)
+
+# An integer with an optional unit suffix (bytes when omitted) — a deliberate
+# subset of the runtimes' size grammar (which also takes fractions like 2.5g
+# and t/tb suffixes); same warn-and-default rationale as _CPUS_RE.
+_MEMORY_RE = re.compile(r"^(\d+)(b|k|m|g|kb|mb|gb)?$", re.IGNORECASE | re.ASCII)
+
+# Magnitude bound for --cpus. docker encodes the value as int64 nano-CPUs, and
+# magnitudes near 2**64/1e9 wrap to 0 — the daemon's "unset" encoding — so an
+# in-grammar value could silently remove the CPU bound (measured on the wire in
+# the !211 review). 4096 is orders of magnitude below the wrap and above any
+# real host.
+_MAX_CPUS = 4096.0
+
+# Floor for --memory, docker's documented minimum allocation (6m). Below it the
+# runtime refuses to start the container, so pre-screen to warn-and-default
+# instead of aborting the launch over a forgotten unit suffix.
+_MIN_MEMORY_BYTES = 6 * 1024**2
+
+_MEMORY_UNIT_BYTES = {
+    "": 1,
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+}
+
+
+def _resolve_cpus() -> str:
+    """Resolve the container ``--cpus`` value from ``LMER_CPUS``.
+
+    Returns the value to hand to ``docker``/``podman`` ``--cpus``.
+
+    Rules:
+    - Unset/empty → :data:`DEFAULT_CPUS`.
+    - A positive decimal literal up to :data:`_MAX_CPUS` → that value
+      (fractions like ``0.5`` are valid to both runtimes; raise it to let
+      parallel workloads use more of the host's cores).
+    - Anything else — ``0``, negatives, ``inf``/``nan``/scientific notation,
+      non-numeric, magnitudes past :data:`_MAX_CPUS` (which could wrap to the
+      runtime's "unset" encoding) — is rejected with a warning and falls back
+      to the default. There is no "unlimited" spelling: a misconfigured value
+      must never silently remove the CPU bound.
+    """
+    raw = os.environ.get("LMER_CPUS", "").strip()
+    if not raw:
+        return DEFAULT_CPUS
+    if _CPUS_RE.match(raw) and 0 < float(raw) <= _MAX_CPUS:
+        return raw
+    warning(
+        f"⚠️  Ignoring invalid LMER_CPUS={raw!r} "
+        f"(must be a positive number of cores up to {_MAX_CPUS:g}, "
+        f"e.g. 2 or 0.5); using default {DEFAULT_CPUS}"
+    )
+    return DEFAULT_CPUS
+
+
+def _resolve_memory() -> str:
+    """Resolve the container ``--memory`` value from ``LMER_MEMORY``.
+
+    Returns the value to hand to ``docker``/``podman`` ``--memory``.
+
+    Rules:
+    - Unset/empty → :data:`DEFAULT_MEMORY`.
+    - An integer with an optional unit suffix (``b``/``k``/``m``/``g``, or
+      their two-letter forms, case-insensitive; bytes when omitted) resolving
+      to at least :data:`_MIN_MEMORY_BYTES` → that value.
+    - Anything else — sizes below the runtime's minimum (e.g. a bare ``8``
+      meaning eight bytes), ``0``, negatives, fractions, unknown suffixes,
+      non-numeric — is rejected with a warning and falls back to the default.
+      As with :func:`_resolve_cpus`, there is no "unlimited" spelling: a
+      misconfigured value must never silently remove the memory bound.
+      (Oversized values need no ceiling here: the runtime's int64 saturation
+      is negative, not the "unset" encoding, so they fail loudly at launch.)
+    """
+    raw = os.environ.get("LMER_MEMORY", "").strip()
+    if not raw:
+        return DEFAULT_MEMORY
+    match = _MEMORY_RE.match(raw)
+    if match:
+        size = int(match.group(1)) * _MEMORY_UNIT_BYTES[(match.group(2) or "").lower()]
+        if size >= _MIN_MEMORY_BYTES:
+            return raw
+    warning(
+        f"⚠️  Ignoring invalid LMER_MEMORY={raw!r} "
+        f"(must be a size of at least 6m, e.g. 4g or 512m); "
+        f"using default {DEFAULT_MEMORY}"
+    )
+    return DEFAULT_MEMORY
+
+
 def _resource_limit_args(runtime: str) -> List[str]:
     """
     Resource-limit flags (CPU, memory, PIDs), gated where required.
@@ -272,10 +383,12 @@ def _resource_limit_args(runtime: str) -> List[str]:
     would silently shed the --pids-limit fork-bomb bound on hosts where
     the limits worked fine. Docker (root daemon) always passes the flags.
     """
+    # Resolvers stay unevaluated until a flag is actually passed, so an
+    # invalid override never warns about a default the gate then drops.
     flag_specs = [
-        ("--cpus", "1", "cpu"),
-        ("--memory", "2g", "memory"),
-        ("--pids-limit", _resolve_pids_limit(), "pids"),
+        ("--cpus", _resolve_cpus, "cpu"),
+        ("--memory", _resolve_memory, "memory"),
+        ("--pids-limit", _resolve_pids_limit, "pids"),
     ]
     controllers = None
     if runtime == "podman" and os.geteuid() != 0:
@@ -283,13 +396,13 @@ def _resource_limit_args(runtime: str) -> List[str]:
     if controllers is None:
         # Gate does not apply (docker, root, cgroup v1, unreadable slice) —
         # pass all resource flags.
-        return [arg for flag, value, _controller in flag_specs for arg in (flag, value)]
+        return [arg for flag, resolve, _controller in flag_specs for arg in (flag, resolve())]
 
     args: List[str] = []
     dropped: list[str] = []
-    for flag, value, controller in flag_specs:
+    for flag, resolve, controller in flag_specs:
         if controller in controllers:
-            args += [flag, value]
+            args += [flag, resolve()]
         else:
             dropped.append(controller)
     if dropped:
