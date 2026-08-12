@@ -275,10 +275,10 @@ The container runs with:
 - Non-root user (`developer`)
 - Dropped capabilities (only essential ones retained: CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID)
 - No new privileges flag (`--security-opt no-new-privileges`)
-- Resource limits when running via the `lmer` CLI:
-  - CPU: 1 core
-  - Memory: 2GB
-  - Process limit: 512
+- Resource limits when running via the `lmer` CLI (defaults; each overridable, see [LMER-CLI.md](./LMER-CLI.md)):
+  - CPU: 1 core (`LMER_CPUS`)
+  - Memory: 2GB (`LMER_MEMORY`)
+  - Process limit: 512 (`LMER_PIDS_LIMIT`)
 
 ## Makefile Commands
 
