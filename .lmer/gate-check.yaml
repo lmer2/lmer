@@ -1,0 +1,64 @@
+# gate-check configuration for this repo (read by src/lmer_cli/gates.py).
+#
+# tests.text_diff_subset: the tests that read prose the gate classifies as
+# text (*.md, *.rst, changelog.d/ fragments, CHANGELOG.yaml, LICENSE). A
+# change touching nothing else runs exactly these instead of the ~10-minute
+# full suite (issue #269).
+#
+# The list is not maintained by hand: tests/test_gate_text_diff_subset.py
+# scans tests/ for repo text reads and fails with the paths it is missing.
+# Add what it names.
+#
+# What that scan measures, and what it does not: it models repo-anchored
+# pathlib composition (`REPO / 'docs' / 'x.md'`, `joinpath`, `glob`/`rglob`)
+# and the conftest fixtures that hand out repo paths. It does NOT see
+# `os.path.join`, f-string paths, `os.walk`, `glob.glob`, `iterdir`,
+# cwd-relative `open('README.md')`, or a test that shells out to a repo
+# script which reads a doc. So this list is a FLOOR: a scan that finds
+# nothing new is not proof that the subset is complete.
+#
+# As of this commit the subset IS complete, by hand-audit rather than by
+# mechanism: the undeclared modules that reach a REAL repo path through an
+# unmodelled idiom reach paths this list does not call text
+# (test_fips_compliance.py opens a cwd-relative fips-requirements.txt,
+# test_lmer_cli_gitlab_pipeline.py os.path.joins bin/gitlab-pipeline, the
+# lmer smoke tests exec ./lmer), and every other unmodelled idiom in tests/
+# addresses tmp_path. That is a measurement of today's tests. A test added
+# with an unmodelled idiom against a doc must be listed here by hand —
+# nothing will ask for it.
+tests:
+  text_diff_subset:
+    - tests/test_agent_defs.py
+    - tests/test_consistency.py
+    - tests/test_containerfile.py
+    - tests/test_gate_inflight_hold.py
+    - tests/test_gate_inflight_lock.py
+    - tests/test_gate_text_diff_subset.py
+    - tests/test_gates.py
+    - tests/test_harness.py
+    - tests/test_harness_runners.py
+    - tests/test_import_provenance.py
+    - tests/test_integration.py
+    - tests/test_masterplan_provisioning.py
+    - tests/test_performance.py
+    - tests/test_platform_ask.py
+    - tests/test_platform_image.py
+    - tests/test_platform_web_app.py
+    - tests/test_platform_web_assistant.py
+    - tests/test_platform_web_bundle.py
+    - tests/test_platform_web_composer.py
+    - tests/test_platform_web_markdown.py
+    - tests/test_platform_web_markdown_surfaces.py
+    - tests/test_platform_web_theme.py
+    - tests/test_rehearsal_leg2.py
+    - tests/test_rehearsal_negative_test.py
+    - tests/test_release_taskdef.py
+    - tests/test_rules_structure.py
+    - tests/test_run_state_wiring.py
+    - tests/test_security.py
+    - tests/test_self_dev_pythonpath.py
+    - tests/test_supervisor.py
+    - tests/test_taskdef_render_matrix.py
+    - tests/test_user_harnesses.py
+    - tests/test_work_repo_run_state.py
+    - tests/test_workrepo_isolation_guard.py
