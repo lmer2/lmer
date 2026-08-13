@@ -162,6 +162,41 @@ class TestPyYamlEntrypointGuarantee:
         assert "pyyaml>=6.0" in content, "pyproject.toml no longer requires pyyaml>=6.0"
 
 
+class TestContainerLimitsDerived:
+    """CONTAINER_LIMITS comes from the cgroup at shell startup, not from a literal.
+
+    CPU, memory and pids limits are per-run settings, so any value written into
+    ~/.bashrc at build time is wrong for every run that overrides one.
+    """
+
+    def test_no_baked_container_limits_literal(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert 'CONTAINER_LIMITS="CPU:' not in content, \
+            "Containerfile still bakes a literal CONTAINER_LIMITS value into ~/.bashrc"
+
+    def test_bashrc_sources_container_limits_script(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert ". /home/developer/container-limits.sh /sys/fs/cgroup' >> ~/.bashrc" in content, \
+            "~/.bashrc does not source container-limits.sh with an explicit cgroup root"
+
+    def test_container_limits_script_is_copied_and_executable(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert (
+            "COPY --chown=developer:developer Ctl/container/container-limits.sh "
+            "/home/developer/container-limits.sh"
+        ) in content, "container-limits.sh is not copied into the image"
+        chmod_line = next(
+            line for line in content.splitlines()
+            if line.startswith("RUN chmod +x /home/developer/entrypoint.sh")
+        )
+        assert "/home/developer/container-limits.sh" in chmod_line, \
+            "container-limits.sh is not chmod +x'd alongside the entrypoint"
+
+    def test_script_exists_in_repo(self, project_root):
+        script = project_root / "Ctl" / "container" / "container-limits.sh"
+        assert script.is_file(), "Ctl/container/container-limits.sh not found"
+
+
 class TestBuildProvenanceBaked:
     def test_containerfile_bakes_build_commit(self):
         content = (Path(__file__).parent.parent / "Containerfile").read_text()

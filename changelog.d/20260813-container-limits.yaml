@@ -1,0 +1,2 @@
+fixed:
+- "CONTAINER_LIMITS in the session shell is now derived from the container's cgroup at startup, so it reflects LMER_CPUS/LMER_MEMORY/LMER_PIDS_LIMIT overrides instead of a stale baked-in string"
