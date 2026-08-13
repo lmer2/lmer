@@ -2571,6 +2571,8 @@ def test_a_tool_result_alone_is_not_the_newest_turn(platform_root):
 # Claude Code (2.1.221) was pointed at an endpoint answering 400 with a billing
 # error, and at one answering 529 until its retries were exhausted. What it wrote
 # is claude-api-error.jsonl, and halt detection reads exactly these fields.
+# Message ids and timestamps were normalised to the directory's synthetic
+# convention afterwards (#268); shape and every other value are the capture.
 
 API_ERROR_FIXTURE = FIXTURES / "claude-api-error.jsonl"
 

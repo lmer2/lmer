@@ -873,46 +873,144 @@ def _split_submit_cr(payload: str) -> str:
     return payload[:-1] if _ends_with_submit_cr(payload) else payload
 
 
+#: What each harness's input box grabs when it is the **first character** of
+#: the composer, keyed by resolved harness name. This is the project's record of
+#: those escapes, and the only thing :func:`_sanitize_user_chat` consults — a
+#: newly discovered escape, or a new harness, is an edit to this mapping rather
+#: than to any code.
+#:
+#: An entry needs **both** halves of the mechanic recorded, not just the first:
+#: that the character is a first-column escape in that harness's composer, *and*
+#: that the ``. `` prefix is inert in that same composer. Claude has both — its
+#: escapes are ``!`` (bash, the reported failure in #254), ``#`` (memory) and
+#: ``/`` (slash command), all as reachable from operator prose as each other
+#: ("#254 is done" is a sentence), and the prefix was checked against that input
+#: box in !212.
+#:
+#: Codex and pi have only the first half. Their ``/`` escape is on this tree's
+#: record — lmer installs its own slash commands into those composers
+#: (:mod:`lmer_cli.container.prompt_templates`: pi ``/name``, codex
+#: ``/prompts:name``) and codex's quit sequence is ``/quit`` typed into the same
+#: box (:data:`lmer_cli.harness.HARNESSES`) — but nobody has established what a
+#: leading dot does there. Defusing on a prediction about another program's
+#: input box is how the leading *space* went wrong, so they are deliberately
+#: absent until the prefix half is answered too.
+#:
+#: A harness that is absent — those two, a user-defined one from
+#: ``~/.lmer/harnesses``, or one added to the registry without a line here —
+#: gets an empty set and its payload back byte for byte.
+#:
+#: ``@`` is deliberately in no set: claude reads it as a file reference
+#: *anywhere* in a message, so it is not a first-column escape and prefixing it
+#: would break the reference rather than protect anything.
+HARNESS_FIRST_COLUMN_ESCAPES: dict[str, frozenset[str]] = {
+    "claude": frozenset({"!", "#", "/"}),
+}
+
+#: Put in front of a chat message whose first character is one of the above, so
+#: the escape is no longer in column one. The two characters are load-bearing in
+#: different ways — see :func:`_sanitize_user_chat` for the dot and the space —
+#: and :func:`_check_first_column_escapes` holds the half of what the dot needs
+#: that this project's own data can answer.
+DEFUSAL_PREFIX = ". "
+
+
+def _check_first_column_escapes(
+    escapes: Mapping[str, frozenset[str]], prefix: str
+) -> None:
+    """Fail loudly if the escape data breaks what the defusal rests on.
+
+    Run over the constants at import (below), so a data change that would make
+    every defusal a no-op — or a *different* command — cannot reach a session:
+    the module does not load. The mapping is a literal, so this can only fail on
+    a source edit, never on a runtime input.
+    """
+    first = prefix[:1]
+    if not first or first.isspace():
+        raise RuntimeError(
+            f"defusal prefix {prefix!r} starts with whitespace (or is empty): an "
+            "input box that trims before testing the first character would see "
+            "the escape again, and the defusal would be an invisible no-op"
+        )
+    for harness, chars in escapes.items():
+        if any(len(char) != 1 or char.isspace() for char in sorted(chars)):
+            raise RuntimeError(
+                f"{harness}'s first-column escapes {sorted(chars)} are not all "
+                "single visible characters; the test is against one character, "
+                "so an empty entry would defuse every message and a longer one "
+                "would never match"
+            )
+        if first in chars:
+            raise RuntimeError(
+                f"{first!r} is a first-column escape for {harness}, so the "
+                f"defusal prefix {prefix!r} would hand it a command instead of "
+                "taking the column away from one"
+            )
+
+
+_check_first_column_escapes(HARNESS_FIRST_COLUMN_ESCAPES, DEFUSAL_PREFIX)
+
+
 def _sanitize_user_chat(payload: str, harness: str) -> str:
     """Defuse a chat message the TUI would run as a command instead of reading.
 
-    Claude Code's bash escape fires on a literal ``!`` as the **first character
-    of the input box**: the rest of the line is executed as a shell command. A
-    message typed into the platform's chat pane travels through the same input
-    box, so "!206 was merged" — a sentence — becomes a command. A ``.`` in front
-    of it takes the first column, and the harness reads the sentence with its
-    ``!`` still in it, which is why this transforms rather than refuses: the
-    operator meant the words.
+    A harness TUI reserves the **first character of its input box** for escapes:
+    on claude a ``!`` runs the rest of the line as a shell command, a ``#``
+    writes it to memory, a ``/`` runs a slash command. A message typed into the
+    platform's chat pane travels through that same box, so "!206 was merged" and
+    "#254 is done" — sentences — become commands. Which characters those are is a
+    fact about each input box and lives in
+    :data:`HARNESS_FIRST_COLUMN_ESCAPES`; this function is only the rule applied
+    to it.
+
+    :data:`DEFUSAL_PREFIX` takes the first column, and the harness reads the
+    message with its ``!`` still in it, which is why this transforms rather than
+    refuses: the operator meant the words. The test is on the payload exactly as
+    sent — no stripping — so a message that opens with a space was never in the
+    first column to begin with and is left alone.
 
     A dot, not the leading space this was first written with. The space rested on
     the input box *preserving* it, which nobody promised: any implementation that
-    trims leading whitespace before testing the first character sees the ``!``
+    trims leading whitespace before testing the first character sees the escape
     again, and that defusal would be a silent no-op — the write succeeds, the
     receipt covers the pre-transform bytes, the chat pane assumes delivery, and
     the only detector is a human seeing shell output in the terminal view. A
     ``.`` cannot be trimmed away: skipping whitespace before the test is exactly
     what leaves a ``.`` as the character being tested, so on either kind of
-    implementation the ``!`` is definitively not in the first column.
+    implementation the escape is definitively not in the first column.
 
-    One assumption is left — that ``.`` is not itself a first-column escape for
-    this harness — and it is strictly weaker than the one it replaces, because it
-    is answered by reading the harness's escape set (``!`` bash, ``#`` memory,
-    ``/`` commands; none of them ``.``) rather than by an experiment on an input
-    box whose whitespace handling is unstated.
+    One assumption is left — that ``.`` is not itself a first-column escape —
+    and nothing in this module proves it. The escape sets are this project's
+    *recorded observations* of each harness's input box, not an interface any
+    harness declares: a harness update can change what column one grabs, and no
+    check here would notice. What :func:`_check_first_column_escapes` enforces is
+    the property the data can carry — that no recorded escape set contains the
+    prefix character — which turns a bad edit to the table into a load-time
+    failure. It is a self-consistency check on this project's own record, not a
+    reading of the harness. The evidence for the dot itself is an observation
+    too: the prefix was typed into claude's box in !212, once.
+
+    The failure modes divide along that line. An escape missing from a set is the
+    pre-#254 behavior for that character — the message is read as a command, as
+    it was before any of this. A spurious entry costs a visible ``. `` in front
+    of a message that did not need one. A future build that *starts* reading a
+    leading ``.`` as an escape is the one that cannot be recovered from here: the
+    table would still be self-consistent while every defusal handed the harness a
+    different command.
 
     The space after the dot is for whoever reads the conversation back: the
     message is recorded as ". !206 was merged", a sentence behind a prefix rather
     than a typo glued to a word. Nothing hides the prefix and nothing should —
     the operator accepted a visible one.
 
-    Only claude has this escape, so every other harness gets its payload back
-    untouched: the flag says "a human typed this in a chat composer", and what to
-    do about that is decided here and nowhere else. Refusing such a payload
-    instead of transforming it is a change to this function alone.
+    A harness with no recorded escapes gets its payload back untouched: the flag
+    says "a human typed this in a chat composer", and what to do about that is
+    decided here and nowhere else. Refusing such a payload instead of
+    transforming it is a change to this function alone.
     """
-    if harness != "claude" or not payload.startswith("!"):
-        return payload
-    return ". " + payload
+    if payload[:1] in HARNESS_FIRST_COLUMN_ESCAPES.get(harness, frozenset()):
+        return DEFUSAL_PREFIX + payload
+    return payload
 
 
 def _active_harness_name() -> str:

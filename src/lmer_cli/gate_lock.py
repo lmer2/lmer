@@ -204,13 +204,44 @@ def guard_enabled() -> bool:
     return get_bool_env(GUARD_ENV, default=True)
 
 
+def _is_zombie(pid: int) -> bool:
+    """
+    Whether *pid* is an exited-but-unreaped zombie, where that is knowable.
+
+    A gate is usually run as a *child* of the session that then wants to commit,
+    and a child that has exited but has not been waited on still answers
+    ``kill(pid, 0)``. Without this check its marker reads as live and every
+    work-repo write defers behind a gate that is already over (issue #261) —
+    silently, since a deferral is a success.
+
+    Reads ``/proc/<pid>/stat``. The ``comm`` field is parenthesised and may
+    itself contain spaces or parens, so the state code is taken from the text
+    after the final ``)``. Where ``/proc`` is absent — macOS — the answer is
+    "not a zombie", which degrades to the bare ``kill`` answer rather than
+    erroring; deferring too long is the survivable direction.
+
+    Same rule as :func:`lmer_platform.registry._is_zombie`, restated here
+    because the dependency only runs one way: ``lmer_platform`` imports
+    ``lmer_cli``, never the reverse.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            stat_line = handle.read()
+    except OSError:
+        return False
+    _, _, rest = stat_line.rpartition(")")
+    fields = rest.split()
+    return bool(fields) and fields[0] == "Z"
+
+
 def _pid_alive(pid: int) -> bool:
     """
-    Whether *pid* is a live process, via signal 0.
+    Whether *pid* is a live process, via signal 0 plus a zombie check.
 
     ``PermissionError`` means the process exists but belongs to another user —
     still alive, and still a reason to defer. Anything else (no such process, a
-    pid the platform rejects) reads as dead.
+    pid the platform rejects) reads as dead, as does a pid that only exists as
+    an unreaped exit status (:func:`_is_zombie`).
     """
     try:
         os.kill(pid, 0)
@@ -220,7 +251,7 @@ def _pid_alive(pid: int) -> bool:
         return True
     except (OSError, OverflowError, ValueError):
         return False
-    return True
+    return not _is_zombie(pid)
 
 
 def _marker_path(pid: int, directory: Path | None = None) -> Path:

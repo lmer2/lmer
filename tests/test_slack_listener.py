@@ -6,16 +6,28 @@ Slack calls.
 """
 
 import asyncio
+import json
 import os
 import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from slack_chat import listener
-from lmer_cli.presets import Preset
+from slack_chat.sessions import CHAT_TASK_ID, SessionManager, listener_default_preset
+from lmer_cli.presets import Preset, load_presets, select_preset_name
 
 PERMALINK = "https://x.slack.com/archives/C1/p1112220000000000"
+
+
+def _write_presets(path: Path, *names: str) -> Path:
+    """Write a presets file defining *names* and return its path."""
+    path.write_text(
+        json.dumps({name: {"checkout": f"/co/{name}"} for name in names}),
+        encoding="utf-8",
+    )
+    return path
 
 
 @pytest.fixture
@@ -28,6 +40,20 @@ def manager(monkeypatch) -> MagicMock:
     mgr.spawn = AsyncMock()
     mgr.idle_timeout_minutes = 30
     mgr.max_sessions = 5
+    # The ack asks the manager for the listener-wide default, because only the
+    # manager knows the .env files the spawned CLI reads (issue #259). Keep the
+    # mock on the real environment-only resolver so the ack tests below still
+    # exercise the selector vars they set; the file tiers have their own test.
+    mgr.default_preset.side_effect = lambda environ=None: listener_default_preset(
+        environ
+    )
+    # Same deal for whether that default is *defined*: the manager answers,
+    # because LMER_PRESETS_FILE reaches the child through those same .env tiers
+    # (issue #279). The mock keeps to the environment-only half — a listener
+    # that exports the presets file its child will read, which is the ordinary
+    # deployment — so the ack tests below configure availability the way an
+    # operator does; the file tiers have their own test.
+    mgr.child_presets.side_effect = lambda environ=None: load_presets()
     monkeypatch.setattr(listener, "session_manager", mgr)
     # The external-session registry check defaults to "no one else is here" so
     # these tests exercise the in-memory paths without touching the real
@@ -79,6 +105,18 @@ def isolate_preset_selectors(monkeypatch):
     """
     monkeypatch.delenv("LMER_CHAT_PRESET", raising=False)
     monkeypatch.delenv("LMER_PRESET", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def isolate_presets_file(monkeypatch):
+    """Isolate the presets a default is checked against from the ambient env.
+
+    Whether a listener-wide default is defined is now answered from
+    ``LMER_PRESETS_FILE`` as the spawned CLI resolves it (issue #279), so a
+    real one on the machine running the suite would decide these assertions.
+    Tests that need presets point the variable at a file they wrote.
+    """
+    monkeypatch.delenv("LMER_PRESETS_FILE", raising=False)
 
 
 class TestCsvEnvSet:
@@ -872,10 +910,12 @@ class TestListenerWideDefaultInAck:
     """
 
     @pytest.mark.asyncio
-    async def test_default_alone_is_named(self, manager, slack_app, monkeypatch):
+    async def test_default_alone_is_named(
+        self, manager, slack_app, monkeypatch, tmp_path
+    ):
         """The silently-honoured case: no token, but a preset still applies."""
-        monkeypatch.setattr(
-            listener, "PRESETS", {"wide": Preset(name="wide", checkout="/co")}
+        monkeypatch.setenv(
+            "LMER_PRESETS_FILE", str(_write_presets(tmp_path / "p.json", "wide"))
         )
         monkeypatch.setenv("LMER_CHAT_PRESET", "wide")
         say = AsyncMock()
@@ -942,10 +982,10 @@ class TestListenerWideDefaultInAck:
 
     @pytest.mark.asyncio
     async def test_generic_var_is_named_as_its_own_source(
-        self, manager, slack_app, monkeypatch
+        self, manager, slack_app, monkeypatch, tmp_path
     ):
-        monkeypatch.setattr(
-            listener, "PRESETS", {"wide": Preset(name="wide", checkout="/co")}
+        monkeypatch.setenv(
+            "LMER_PRESETS_FILE", str(_write_presets(tmp_path / "p.json", "wide"))
         )
         monkeypatch.setenv("LMER_PRESET", "wide")
         say = AsyncMock()
@@ -956,13 +996,13 @@ class TestListenerWideDefaultInAck:
 
     @pytest.mark.asyncio
     async def test_undefined_default_warns_but_still_spawns(
-        self, manager, slack_app, monkeypatch
+        self, manager, slack_app, monkeypatch, tmp_path
     ):
         """An operator misconfiguration, not a user error: the child CLI exits
         2 on an unknown preset, so the session dies moments after the ack. Say
         why in the thread rather than only in the listener's log."""
-        monkeypatch.setattr(
-            listener, "PRESETS", {"real": Preset(name="real", checkout="/co")}
+        monkeypatch.setenv(
+            "LMER_PRESETS_FILE", str(_write_presets(tmp_path / "p.json", "real"))
         )
         monkeypatch.setenv("LMER_CHAT_PRESET", "typo")
         say = AsyncMock()
@@ -974,6 +1014,176 @@ class TestListenerWideDefaultInAck:
         assert "`typo`" in text
         assert "is not defined" in text
         assert "real" in text, "the warning lists what is actually available"
+
+
+def _what_the_child_would_do(
+    manager: SessionManager,
+) -> tuple[tuple[str | None, str | None], dict[str, Preset]]:
+    """Run the spawned CLI's own startup over *manager*'s tiers.
+
+    ``apply_env_file_defaults`` then ``select_preset_name`` and
+    ``load_presets()`` is verbatim what ``lmer`` main() does, so this is the
+    session the ack is describing: which preset it selects, and which presets
+    it can find. Runs against a copy of the environment the child inherits, so
+    the seeding — which writes to ``os.environ`` — cannot touch the suite's.
+    """
+    from lmer_cli.cli import apply_env_file_defaults
+
+    child_env = dict(os.environ)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "environ", child_env)
+        apply_env_file_defaults(manager._child_env_file_candidates())
+        return (
+            select_preset_name(None, CHAT_TASK_ID, child_env),
+            load_presets(),
+        )
+
+
+class TestForwardedEnvFileDefaultInAck:
+    """A default that lives only in the forwarded ``--env-file`` is named in
+    the ack too (issue #259) — and judged against the presets file the *child*
+    resolves, not the listener's (issue #279).
+
+    The listener never loads that file into its own environment — it hands the
+    path to the child as ``--env-file`` — so a default living only there
+    applied to the session while the ack said nothing about it. The same gap
+    then made the ack's verdict on that default wrong in the fatal direction:
+    the name was resolved through the child's tiers while "is it defined?" was
+    answered from the listener's own presets.
+    """
+
+    @pytest.fixture(autouse=True)
+    def isolated_state_dir(self, monkeypatch, tmp_path: Path) -> Path:
+        """``~/.lmer/.env`` is one of the tiers the resolution models; a real
+        one on this machine must not configure a preset for these tests."""
+        from lmer_cli import runtime
+
+        state = tmp_path / "state"
+        state.mkdir()
+        monkeypatch.setattr(runtime, "_LMER_STATE_DIR", state)
+        return state
+
+    @pytest.fixture
+    def forward(self, monkeypatch, tmp_path: Path):
+        """Install a listener whose sessions get *body* as ``--env-file``."""
+
+        def _forward(body: str) -> SessionManager:
+            env_file = tmp_path / "deploy.env"
+            env_file.write_text(body, encoding="utf-8")
+            manager = SessionManager(
+                spawn_cwd=str(tmp_path / "cwd"),
+                log_dir=str(tmp_path / "logs"),
+                lmer_env_file=str(env_file),
+            )
+            monkeypatch.setattr(listener, "session_manager", manager)
+            return manager
+
+        return _forward
+
+    def test_ack_names_a_default_only_the_child_would_load(
+        self, monkeypatch, tmp_path, forward
+    ):
+        """#259's case: the selector is in the forwarded file, the presets file
+        is exported the ordinary way."""
+        monkeypatch.setenv(
+            "LMER_PRESETS_FILE", str(_write_presets(tmp_path / "p.json", "house"))
+        )
+        forward("LMER_CHAT_PRESET=house\n")
+
+        clause, warning = listener._preset_ack_parts(None)
+
+        assert "listener default preset `house`" in clause
+        assert "`LMER_CHAT_PRESET`" in clause
+        assert warning == "", "a default that is defined is not a warning"
+
+    def test_a_forwarded_presets_file_is_not_called_undefined(
+        self, monkeypatch, tmp_path, forward
+    ):
+        """#279's repro: selector *and* presets file live only in the forwarded
+        ``--env-file``.
+
+        The listener's own environment sees neither, so its module-level
+        ``PRESETS`` is empty — and answering "is `house` defined?" from there
+        told the person who just typed the message that their session would
+        fail to start, seconds before the child loaded that very preset and
+        started fine.
+        """
+        presets = _write_presets(tmp_path / "p.json", "house")
+        manager = forward(f"LMER_CHAT_PRESET=house\nLMER_PRESETS_FILE={presets}\n")
+        monkeypatch.setattr(listener, "PRESETS", {})
+
+        clause, warning = listener._preset_ack_parts(None)
+
+        assert "listener default preset `house`" in clause
+        assert warning == "", (
+            "the child loads this preset from the forwarded file, so a fatal "
+            "verdict here is confidently wrong"
+        )
+        assert "fail to start" not in clause + warning
+
+        # And that is not just a nicer-sounding claim: the child really does
+        # select `house` and really does find it defined.
+        selected, child_presets = _what_the_child_would_do(manager)
+        assert selected == ("house", "LMER_CHAT_PRESET")
+        assert "house" in child_presets
+
+    def test_a_default_the_child_cannot_resolve_still_warns(
+        self, monkeypatch, tmp_path, forward
+    ):
+        """The warning is not weakened: with no presets file the child finds
+        nothing either, so "will fail to start" is the truth."""
+        manager = forward("LMER_CHAT_PRESET=house\n")
+        monkeypatch.setattr(
+            listener, "PRESETS", {"house": Preset(name="house", checkout="/co")}
+        )
+
+        clause, warning = listener._preset_ack_parts(None)
+
+        assert clause == ""
+        assert "`house`" in warning and "is not defined" in warning
+        assert "(none configured)" in warning
+
+        selected, child_presets = _what_the_child_would_do(manager)
+        assert selected == ("house", "LMER_CHAT_PRESET")
+        assert child_presets == {}, (
+            "the listener holding a `house` preset is beside the point — the "
+            "child is the one that has to find it"
+        )
+
+    def test_a_missing_forwarded_presets_file_still_warns(
+        self, monkeypatch, tmp_path, forward
+    ):
+        """Same for a presets file that is configured but unreadable: the
+        child's loader is forgiving, so the session starts with nothing
+        defined and exits 2 on the unknown name."""
+        forward(
+            "LMER_CHAT_PRESET=house\n"
+            f"LMER_PRESETS_FILE={tmp_path / 'gone.json'}\n"
+        )
+
+        clause, warning = listener._preset_ack_parts(None)
+
+        assert clause == ""
+        assert "is not defined" in warning
+
+    def test_the_warning_lists_the_childs_presets(
+        self, monkeypatch, tmp_path, forward
+    ):
+        """When it does warn, it lists what the *session* would have had — a
+        list from the listener's own presets would send the operator looking
+        for a name their sessions cannot select."""
+        presets = _write_presets(tmp_path / "p.json", "child_only")
+        forward(f"LMER_CHAT_PRESET=typo\nLMER_PRESETS_FILE={presets}\n")
+        monkeypatch.setattr(
+            listener,
+            "PRESETS",
+            {"listener_only": Preset(name="listener_only", checkout="/co")},
+        )
+
+        _clause, warning = listener._preset_ack_parts(None)
+
+        assert "child_only" in warning
+        assert "listener_only" not in warning
 
 
 class TestMainLmerEnvFile:

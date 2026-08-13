@@ -44,9 +44,16 @@ to leg 2.
   — date/actor:
 - [ ] **(5a) Push-allow entries provisioned** — mirror `refs/heads/main` and
   `refs/tags/*`, canonical origin `refs/tags/*`. Mirror entries must be
-  written `host/path|refpattern`: release pushes to the mirror go by URL and
-  the push-by-URL match is anchored, so a path-only entry does not authorize
-  them — date/actor:
+  written `host/path|refpattern` — host-anchored and ref-scoped. Leg 2 adds
+  the mirror as a NAMED remote and pushes through it, and the named-remote
+  half of the grammar accepts a host-less `group/project` entry, which
+  grants on any host serving that path; naming the host confines the grant
+  to the one host git will dial. The ref half matters just as much: a bare
+  entry authorizes `refs/heads/*` only, so the tag push needs
+  `|refs/tags/*` spelled out, and `|refs/heads/main` keeps the branch grant
+  off every other branch. (If a future leg pushes by URL instead, the match
+  there is anchored and a path-only entry would not authorize it at all.) —
+  date/actor:
 - [x] **(7) Production PyPI project trusted publisher registered** — pinned
   to the mirror repo + workflow `.github/workflows/release.yml` +
   environment `pypi`. **Pre-existing.** Evidence: the mirror's `main`

@@ -403,10 +403,16 @@ def test_the_lmer_panes_speak_the_icon_language_the_rest_of_the_app_does():
         f"{TAB_ICONS['lmer']} is this view's word for a run's session, and the "
         "fleet card no longer uses it for the harness driving one"
     )
-    history = _read(components / "AskHistory.vue")
-    assert PANE_ICONS["chat"] in history, (
+    # On the entry component since #274: the record composes it and draws no icon
+    # of its own, so the shape the pane is being matched against is there.
+    entry = _read(components / "AskEntry.vue")
+    assert PANE_ICONS["chat"] in entry, (
         f"the operator-chat pane draws {PANE_ICONS['chat']} and the record it "
         "renders draws something else"
+    )
+    assert "<AskEntry" in _read(components / "AskHistory.vue"), (
+        "the record draws its entries itself again, so the icon this test just "
+        "read is not the one the pane shows"
     )
     # And the two conversations stay apart: reading what the session said and
     # replying to what it asked are different acts, and this is the view where the

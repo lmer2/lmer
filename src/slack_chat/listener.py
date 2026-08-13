@@ -33,7 +33,7 @@ from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.tls import ensure_ca_bundle
 
 from .registry import is_thread_connected
-from .sessions import SessionManager, listener_default_preset
+from .sessions import SessionManager
 
 logger = logging.getLogger("lmer_slack.listener")
 
@@ -111,6 +111,9 @@ DM_ALLOWED_USERS: set[str] = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
 # token (see :mod:`lmer_cli.presets`). Empty when LMER_PRESETS_FILE is
 # unset. Repopulated from env in main() after .env load, mirroring how the
 # session manager and DM allowlist are reconstructed there.
+# Scope: this is the token allowlist, loaded from the *listener's* environment.
+# Whether a listener-wide default is defined is a question about the spawned
+# CLI's environment instead — see SessionManager.child_presets (issue #279).
 PRESETS: dict[str, Preset] = load_presets()
 
 
@@ -135,8 +138,19 @@ def _preset_ack_parts(preset: Preset | None) -> tuple[str, str]:
     error, rejected before spawning — this is an operator misconfiguration of
     the listener itself, so the spawn still goes ahead and only the diagnosis
     is surfaced.
+
+    The default is resolved through the session manager because it owns the
+    ``.env`` files the spawned CLI seeds itself from: a default that lives
+    only in the forwarded ``--env-file`` applies to the session and must be
+    named here too (issue #259). Its *availability* is asked of the manager for
+    the same reason (issue #279): ``LMER_PRESETS_FILE`` travels those same
+    tiers, so checking a file-sourced default against the listener's own
+    ``PRESETS`` — loaded from an environment that never reads that file —
+    warned that a session would fail to start when the child was about to load
+    the very preset being named. ``PRESETS`` still answers for a ``$preset:``
+    token, which is resolved here and must name something this listener holds.
     """
-    default_name, default_source = listener_default_preset()
+    default_name, default_source = session_manager.default_preset()
     if preset is not None:
         if default_name and default_name != preset.name:
             return (
@@ -147,13 +161,14 @@ def _preset_ack_parts(preset: Preset | None) -> tuple[str, str]:
         return f" using preset `{preset.name}`", ""
     if not default_name:
         return "", ""
-    if default_name in PRESETS:
+    child_presets = session_manager.child_presets()
+    if default_name in child_presets:
         return (
             f" using the listener default preset `{default_name}` "
             f"(from `{default_source}`)",
             "",
         )
-    available = ", ".join(sorted(PRESETS)) or "(none configured)"
+    available = ", ".join(sorted(child_presets)) or "(none configured)"
     return "", (
         f"⚠️ The listener default preset `{default_name}` (from "
         f"`{default_source}`) is not defined, so this session will fail to "

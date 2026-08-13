@@ -51,6 +51,15 @@ for the reason ``askEntryLabel`` already lives there — a channel that spoke ab
 the operator's own words differently in the dock and in the record would be two
 accounts of who said what.
 
+They render it by *composing the same component* (``AskEntry.vue``) since issue
+#274, and that is a change to what the guards below can be. The card, both labels
+and five CSS rules were copied into each view, each carrying a comment saying the
+other must not disagree with it — a rule kept by hand, which is how every drift
+starts: the next edit lands in one of the two. So the guards on what an entry *is*
+read that one component, and the guards on which entries a view shows read the
+view; the two are tied together by asserting that each view still hands its entries
+over rather than drawing them again.
+
 Where each view is mounted, and that the record is not answerable, are pinned
 next door in :mod:`tests.test_platform_web_details_tabs`; the channel's own
 protocol is :mod:`tests.test_platform_ask`. Source-level, like every web test in
@@ -69,6 +78,12 @@ WEB = Path(__file__).resolve().parent.parent / "web"
 COMPONENTS = WEB / "src" / "components"
 DOCK = COMPONENTS / "AskChannel.vue"
 RECORD = COMPONENTS / "AskHistory.vue"
+#: What one entry looks like, for both of them (#274). The card, the two labels and
+#: the stylesheet were copied into each view, with a comment in each saying the
+#: other must not disagree — which is a rule kept by hand. Both views compose this
+#: now, so the guards below on what an entry *is* read one file and the guards on
+#: which entries a view shows read that view.
+ENTRY = COMPONENTS / "AskEntry.vue"
 RUN_DETAIL = COMPONENTS / "RunDetail.vue"
 #: Where the cleared ids live: outside the component, so a remount cannot lose them,
 #: and in memory, so a reload cannot keep them.
@@ -115,14 +130,35 @@ def _entry_element(text):
     """The opening tag of the element one channel entry is rendered as.
 
     Read off the ``v-for`` rather than looked for by name, because the question
-    here is what an entry *is* — a bare div separated by a margin was the shape the
-    operator read as one long thing.
+    here is what a view does per entry — which since #274 is "hands it to the one
+    component that knows what an entry looks like".
     """
     match = re.search(
         r'<[\w-]+\b[^>]*\sv-for="entry in \w+"[^>]*>', _without_comments(text), re.S,
     )
     assert match, "nothing here renders one element per channel entry"
     return " ".join(match.group(0).split())
+
+
+def _entry_card(text):
+    """The opening tag of the card an entry *is*, off the entry component's root.
+
+    Its root rather than anything found by name: a comment or a wrapper above it
+    would make this component a fragment, which is a different component from the
+    one that ships, and the class and the variant asserted on it would then be
+    reaching nothing.
+    """
+    template = text[text.index("\n<template>\n"):]
+    match = re.match(r"\n<template>\s*(<[\w-]+\b[^>]*>)", template, re.S)
+    assert match, "the entry component's template does not open with an element"
+    return " ".join(match.group(1).split())
+
+
+def _composes_the_entry(text):
+    """Whether a view draws its entries with the shared component."""
+    return "<AskEntry" in _without_comments(text) and (
+        "from './AskEntry.vue'" in text
+    )
 
 
 def _label_match(text, word):
@@ -193,10 +229,19 @@ def test_the_record_holds_every_entry_the_channel_has():
             f"the record drops entries ({filtering}); it is the one view that must "
             "show all of them"
         )
-    # Each entry keeps what makes it a record rather than a summary.
-    assert "entry.at" in record, "the record carries no timestamps"
-    assert "askEntryLabel(entry, live)" in record, "an entry does not say what it is"
-    assert "entry.answer.text" in record, "your reply is not in the record"
+    # Each entry keeps what makes it a record rather than a summary. Drawn by
+    # AskEntry.vue since #274, so what an entry carries is read there — and the
+    # record is checked to be handing every entry to it, which is what makes that
+    # the same statement as before.
+    assert _composes_the_entry(record), (
+        "the record draws its entries itself again, so what one carries is not "
+        "what the dock shows for the same entry"
+    )
+    entry = _without_comments(_read(ENTRY))
+    assert "entry.at" in entry, "the record carries no timestamps"
+    assert "askEntryLabel(entry, live)" in entry, "an entry does not say what it is"
+    assert 'live="live"' in record, "the record's entries are labelled for no session"
+    assert "entry.answer.text" in entry, "your reply is not in the record"
 
 
 # --- clearing is a view operation --------------------------------------------
@@ -435,6 +480,50 @@ def test_the_run_detail_view_mounts_the_dock_above_the_tabs_and_the_record_below
 
 # --- what one entry looks like, in both views (issue #254) ---------------------
 
+def test_one_component_draws_an_entry_for_both_views():
+    """Issue #274, and the reason every guard under this heading reads one file.
+
+    A copy is not a shared decision. Both views carried the entry card, both label
+    elements and the same five rules verbatim — each with a comment saying the other
+    must not disagree — and by the time that was extracted the copies had already
+    drifted in four places. Composition cannot drift.
+
+    What is *not* here is a prop naming the view: the handful of things one view
+    says about an entry and the other does not are separate props, each with its
+    own argument, because "this is the record" is not a rendering decision and a
+    component that took one would be two presentations one ``v-if`` apart again.
+    """
+    assert ENTRY.is_file(), "there is nowhere for the two views to agree"
+    entry = _without_comments(_read(ENTRY))
+
+    # Presentation and nothing else. A fetch here would be a third reader of the
+    # channel; an emit would be a way for the record to send something.
+    for reaching_out in ("fetchSessionAsk", "defineEmits", "setInterval", "localStorage"):
+        assert reaching_out not in entry, (
+            f"the entry component {reaching_out}s; what it does is draw an entry, "
+            "and everything else belongs to the view that owns the channel"
+        )
+    assert not re.search(r"\bmode\b|\bview:|historic", entry), (
+        "the entry component takes the view it is drawn in as a value, so the two "
+        "presentations are back, one v-if apart"
+    )
+
+    for path in (DOCK, RECORD):
+        text = _read(path)
+        assert _composes_the_entry(text), (
+            f"{path.name} does not draw its entries with {ENTRY.name}, so the two "
+            "views can disagree about what a message looks like again"
+        )
+        # And nothing of the entry is left behind to drift beside it.
+        stripped = _without_comments(text)
+        for copied in (">QUESTION</div>", ">ANSWER</div>", "askEntryLabel",
+                       ".entry {", ".part {", ".said {", ".said.plain {", ".reply {"):
+            assert copied not in stripped, (
+                f"{path.name} still carries {copied!r} of its own, which is the "
+                "copy issue #274 removed"
+            )
+
+
 def test_an_entry_is_a_card_of_its_own_in_both_views():
     """The operator: "messages look like the kinda flow into each other".
 
@@ -444,22 +533,32 @@ def test_an_entry_is_a_card_of_its_own_in_both_views():
     v-card for the message itself, or a v-divider could help"), and both views get
     it: they render the same entries, and a dock that separated them where the
     record did not would be one channel read two ways.
+
+    Which is now a thing they cannot do differently rather than a thing they agree
+    about (#274): each view hands an entry to AskEntry.vue, and the card is that
+    component's root.
     """
+    element = _entry_card(_read(ENTRY))
+    assert element.startswith("<v-card"), (
+        f"an entry is drawn as {element.split()[0]}>, so the separation between "
+        "two messages is whatever margin it carries"
+    )
+    assert 'variant="outlined"' in element, (
+        "the entry card is elevated or tonal: the pane's own card is already the "
+        "shadow, and a second one — or a wash under every entry — repaints the "
+        "pane rather than separating what is in it"
+    )
     for path in (DOCK, RECORD):
-        element = _entry_element(_read(path))
-        assert element.startswith("<v-card"), (
-            f"{path.name} renders an entry as {element.split()[0]}>, so the "
-            "separation between two messages is whatever margin it carries"
-        )
-        assert 'variant="outlined"' in element, (
-            f"{path.name}'s entry card is elevated or tonal: the pane's own card is "
-            "already the shadow, and a second one — or a wash under every entry — "
-            "repaints the pane rather than separating what is in it"
+        entry_element = _entry_element(_read(path))
+        assert entry_element.startswith("<AskEntry"), (
+            f"{path.name} renders an entry as {entry_element.split()[0]}> of its "
+            "own, so the two views can disagree about what a message looks like "
+            "again"
         )
         # Inside the pane's card, not instead of it: the entries are one list, and
         # the dock hangs its "clear from here" off the same container.
         text = _without_comments(_read(path))
-        assert text.count("<v-card") >= 2, (
+        assert "<v-card" in text and text.index("<v-card") < text.index("<AskEntry"), (
             f"{path.name} lost the card around the list; the entries are a stack of "
             "loose cards on the page"
         )
@@ -471,28 +570,37 @@ def test_both_views_name_the_question_and_the_answer_where_each_starts():
     Where each half starts, rather than in the header row: the header says what
     happened to an entry ("answered", "closed by the session") and how long ago,
     which is a different question from which of two voices the next paragraph is.
+
+    Both views, in one file since #274: the labels are written by the component
+    each of them draws an entry with, so the "both" is what is asserted of the
+    views and the placement is asserted of the component.
     """
     for path in (DOCK, RECORD):
-        text = _read(path)
-        stripped = _without_comments(text)
-        question, answer = _label_match(text, "QUESTION"), _label_match(text, "ANSWER")
-
-        # A note is one voice saying one thing: labelling it QUESTION would promise
-        # an answer that is never coming.
-        assert "v-if=\"entry.kind !== 'note'\"" in question.group(0), (
-            f"{path.name} writes QUESTION on every entry, notes included"
-        )
-        assert question.start() < stripped.index(':text="entry.text"'), (
-            f"{path.name} labels the question somewhere other than where it starts"
+        assert _composes_the_entry(_read(path)), (
+            f"{path.name} draws a channel entry itself again, so the labels below "
+            "are one view's and the other's are unpinned"
         )
 
-        # And the answer's label goes with the answer, which most entries do not
-        # have — an unanswered question with an ANSWER heading over nothing reads
-        # as a reply that was lost.
-        answered = stripped.index('v-if="entry.answer"')
-        assert answered < answer.start() < stripped.index("entry.answer.text"), (
-            f"{path.name} writes ANSWER outside the answer it labels"
-        )
+    text = _read(ENTRY)
+    stripped = _without_comments(text)
+    question, answer = _label_match(text, "QUESTION"), _label_match(text, "ANSWER")
+
+    # A note is one voice saying one thing: labelling it QUESTION would promise an
+    # answer that is never coming.
+    assert "v-if=\"entry.kind !== 'note'\"" in question.group(0), (
+        "QUESTION is written on every entry, notes included"
+    )
+    assert question.start() < stripped.index(':text="entry.text"'), (
+        "the question is labelled somewhere other than where it starts"
+    )
+
+    # And the answer's label goes with the answer, which most entries do not have —
+    # an unanswered question with an ANSWER heading over nothing reads as a reply
+    # that was lost.
+    answered = stripped.index('v-if="entry.answer"')
+    assert answered < answer.start() < stripped.index("entry.answer.text"), (
+        "ANSWER is written outside the answer it labels"
+    )
 
 
 def test_the_two_labels_are_painted_from_one_map_the_theme_defines():
@@ -529,17 +637,26 @@ def test_the_two_labels_are_painted_from_one_map_the_theme_defines():
             f"{part} label renders as body ink in the other one"
         )
 
+    entry = _without_comments(_read(ENTRY))
+    assert "askPartColor" in entry and "from '../format.js'" in entry, (
+        "an entry does not take the label colours from format.js"
+    )
+    for word, part in (("QUESTION", "question"), ("ANSWER", "answer")):
+        label = _label_element(_read(ENTRY), word)
+        assert f"askPartColor('{part}')" in label, (
+            f"the {word} label is coloured by something other than the shared map"
+        )
+    # And neither view may name an ink for a label itself: they draw entries with
+    # the component above, and a colour passed in or set beside it is the second
+    # account of who said what that the map exists to prevent.
     for path in (DOCK, RECORD):
         text = _without_comments(_read(path))
-        assert "askPartColor" in text and "from '../format.js'" in text, (
-            f"{path.name} does not take the label colours from format.js"
+        assert _composes_the_entry(_read(path)), (
+            f"{path.name} draws a channel entry itself again"
         )
-        for word, part in (("QUESTION", "question"), ("ANSWER", "answer")):
-            label = _label_element(_read(path), word)
-            assert f"askPartColor('{part}')" in label, (
-                f"{path.name}'s {word} label is coloured by something other than "
-                "the shared map"
-            )
+        assert "askPartColor" not in text, (
+            f"{path.name} paints a label of its own beside the shared component"
+        )
 
 
 def test_the_colour_is_on_the_labels_and_never_on_what_was_said():
@@ -551,14 +668,22 @@ def test_the_colour_is_on_the_labels_and_never_on_what_was_said():
     entry's two bodies — the rendered text and the verbatim reply — carry the
     emphasis classes and nothing that names a colour.
     """
+    text = _without_comments(_read(ENTRY))
+    said = re.findall(r"<(?:Markdown|p)\b[^>]*\bsaid\b[^>]*>", text, re.S)
+    assert said, "an entry renders neither half of itself"
+    for element in said:
+        assert "askPartColor" not in element, (
+            f"an entry colours what was said: {' '.join(element.split())}"
+        )
+        assert not re.search(r"text-(?:primary|success|warning|error|tone-)", element), (
+            f"an entry colours what was said: {' '.join(element.split())}"
+        )
+    # Nothing is said in either view any more, which is what keeps the rule to one
+    # place: a body drawn beside the shared component would be a half of an entry
+    # nothing above has looked at.
     for path in (DOCK, RECORD):
-        text = _without_comments(_read(path))
-        said = re.findall(r"<(?:Markdown|p)\b[^>]*\bsaid\b[^>]*>", text, re.S)
-        assert said, f"{path.name} renders neither half of an entry"
-        for element in said:
-            assert "askPartColor" not in element, (
-                f"{path.name} colours what was said: {' '.join(element.split())}"
-            )
-            assert not re.search(r"text-(?:primary|success|warning|error|tone-)", element), (
-                f"{path.name} colours what was said: {' '.join(element.split())}"
-            )
+        view = _without_comments(_read(path))
+        assert not re.search(r'class="[^"]*\bsaid\b', view), (
+            f"{path.name} draws half of an entry itself, outside the component "
+            "this rule is kept in"
+        )

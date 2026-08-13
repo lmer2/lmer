@@ -177,7 +177,18 @@ listener default `house_default` from `LMER_CHAT_PRESET`)... ⏳
 
 `lmer_session_spawned` records the same pair — `preset=` for the
 token-selected one, plus `default_preset=` or `displaced_default=` for the
-env-selected one.
+default it replaces, resolved the way the child itself resolves it
+(environment first, then the same `.env` file tiers the spawned `lmer`
+reads, including a forwarded `--env-file`).
+
+One residual: a selector whose value uses `${VAR}` interpolation may display
+differently from what the session resolves. The display expands a file's
+`${VAR}` against the listener's live environment, while the child expands it
+against an environment that the *earlier* `.env` tiers have already seeded, so
+a reference to a key introduced by an upper tier resolves for the child and not
+for the display. The failure direction is one-way: the display can lose a name
+this way (falling back to a lower-priority selector, or to no preset), never
+invent one. Avoid `${VAR}` in preset selectors if you want the ack to be exact.
 
 Two more things worth knowing:
 
@@ -192,7 +203,11 @@ Two more things worth knowing:
   default is only discovered by the spawned CLI, which exits 2. The listener
   therefore warns in the thread — naming the variable and listing the
   available presets — rather than leaving a session that dies seconds after
-  connecting with the reason buried in the listener's log.
+  connecting with the reason buried in the listener's log. "Defined" and
+  "available" are judged against `LMER_PRESETS_FILE` as the *spawned CLI*
+  resolves it, through the same `.env` tiers as the selector: a presets file
+  that lives only in a forwarded `--env-file` counts, and the names listed are
+  the ones that session could actually have used.
 
 ## CLI-selected presets
 

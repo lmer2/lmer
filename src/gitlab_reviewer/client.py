@@ -244,6 +244,36 @@ class GitLabClient:
 
         return discussions
 
+    def get_merge_request_discussion(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
+        """Get a single merge request discussion thread.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            mr_id: Merge request ID
+            discussion_id: ID of the discussion thread
+
+        Returns:
+            Discussion data including its notes
+        """
+        project_encoded = project.replace('/', '%2F')
+        return self._request('GET', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions/{discussion_id}")
+
+    def reply_to_merge_request_discussion(self, project: str, mr_id: int, discussion_id: str, body: str) -> Dict[str, Any]:
+        """Reply to an existing discussion thread on a merge request.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            mr_id: Merge request ID
+            discussion_id: Discussion thread ID to reply to
+            body: Reply text
+
+        Returns:
+            Created note data
+        """
+        project_encoded = project.replace('/', '%2F')
+        data = {"body": body}
+        return self._request('POST', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions/{discussion_id}/notes", json=data)
+
     def resolve_merge_request_discussion(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
         """Resolve a merge request discussion thread.
 
@@ -1017,6 +1047,39 @@ class CodeReviewer:
             )
         except GitLabError as e:
             raise GitLabError(f"Failed to get MR discussions: {e}") from e
+
+    def get_mr_discussion(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
+        """Get a single merge request discussion thread.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            mr_id: Merge request ID
+            discussion_id: Discussion ID to fetch
+
+        Returns:
+            Discussion data including its notes
+        """
+        try:
+            return self.client.get_merge_request_discussion(project, mr_id, discussion_id)
+        except GitLabError as e:
+            raise GitLabError(f"Failed to get discussion {discussion_id}: {e}") from e
+
+    def reply_to_thread(self, project: str, mr_id: int, discussion_id: str, body: str) -> Dict[str, Any]:
+        """Reply to an existing discussion thread on a merge request.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            mr_id: Merge request ID
+            discussion_id: Discussion ID to reply to
+            body: Reply text
+
+        Returns:
+            Created note data
+        """
+        try:
+            return self.client.reply_to_merge_request_discussion(project, mr_id, discussion_id, body)
+        except GitLabError as e:
+            raise GitLabError(f"Failed to reply to discussion {discussion_id}: {e}") from e
 
     def resolve_thread(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
         """Resolve a discussion thread.

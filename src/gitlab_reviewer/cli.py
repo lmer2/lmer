@@ -1,6 +1,7 @@
 """Command-line interface for GitLab code reviewer."""
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -88,6 +89,13 @@ Examples:
   # Get all comments/discussions (resolved and unresolved)
   gitlab-review myorg/myproject 123 --all-comments
 
+  # Reply to an MR discussion thread
+  gitlab-review myorg/myproject 123 --reply-thread <discussion_id> --comment-file reply.md
+
+  # Reply to an MR discussion thread and resolve it in one call (reply first)
+  gitlab-review myorg/myproject 123 --reply-thread <discussion_id> --comment-file reply.md \\
+    --resolve-thread <discussion_id>
+
   # Get issue information
   gitlab-review myorg/myproject 456 --issue-info
 
@@ -135,6 +143,13 @@ Examples:
                        help='Get all merge request comments/discussions (resolved and unresolved)')
 
     parser.add_argument('--resolve-thread', help='Resolve a discussion thread by ID')
+
+    parser.add_argument('--reply-thread',
+                       help='Reply to a merge request discussion thread by ID (use with --comment-file); '
+                            'combine with --resolve-thread to reply and then resolve in one call')
+
+    parser.add_argument('--comment-file',
+                       help='Path to file containing the comment body (use with --reply-thread)')
 
     parser.add_argument('--issue-info', action='store_true',
                        help='Get issue information (title, description, labels, assignees)')
@@ -373,6 +388,39 @@ def format_resolve_thread_result(discussion_data: dict, discussion_id: str, json
         return json.dumps(discussion_data, indent=2)
 
     return f"✅ Successfully resolved discussion thread {discussion_id}"
+
+
+def format_reply_thread_result(note_data: dict, discussion_id: str, json_output: bool = False) -> str:
+    """Format reply-to-thread result for output."""
+    if json_output:
+        return json.dumps(note_data, indent=2)
+
+    return f"✅ Successfully replied to discussion thread {discussion_id}"
+
+
+def format_thread_actions_result(reply_note: Optional[dict], reply_id: Optional[str],
+                                 resolved_discussion: Optional[dict], resolved_id: Optional[str],
+                                 json_output: bool = False) -> str:
+    """Format the results of --reply-thread and/or --resolve-thread.
+
+    Both flags can be given in one invocation, so JSON output stays a single
+    document: a lone action keeps its raw API payload (unchanged output for
+    callers that only resolve), while a reply+resolve pair is wrapped under
+    'reply'/'resolve' keys.
+    """
+    if json_output:
+        if reply_note is not None and resolved_discussion is not None:
+            return json.dumps({'reply': reply_note, 'resolve': resolved_discussion}, indent=2)
+        payload = reply_note if reply_note is not None else resolved_discussion
+        return json.dumps(payload, indent=2)
+
+    lines = []
+    if reply_note is not None:
+        lines.append(format_reply_thread_result(reply_note, reply_id))
+    if resolved_discussion is not None:
+        lines.append(format_resolve_thread_result(resolved_discussion, resolved_id))
+
+    return "\n".join(lines)
 
 
 def format_template_list(templates: List[dict], json_output: bool = False) -> str:
@@ -825,6 +873,65 @@ def format_issue_info(issue_info: dict, json_output: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _discussion_id_shape_error(discussion_id: str, flag: str) -> Optional[str]:
+    """Return the refusal message when a thread ID is not a full SHA1.
+
+    GitLab discussion IDs are 40-character SHA1 hex digests. A truncated ID
+    is answered with a bare 404, which reads exactly like a token-scope
+    failure — so the shape is checked before any API call and the real cause
+    is named. Returns None when the ID has the right shape.
+    """
+    if re.fullmatch(r'[0-9a-fA-F]{40}', discussion_id):
+        return None
+    return (
+        f"Error: {flag} got an invalid discussion ID: {discussion_id}\n"
+        f"GitLab discussion IDs are 40-character SHA1 hex strings "
+        f"(got {len(discussion_id)} character(s)) — a truncated ID returns a "
+        "404 that is indistinguishable from a token-scope failure.\n"
+        "Copy the full ID from the 'ID:' field of --comments, or from the "
+        "discussion 'id' field of --comments --json."
+    )
+
+
+_REPLY_NOT_POSTED_NOTICE = (
+    "Your reply was NOT posted — re-run with --reply-thread alone to post it "
+    "and leave the thread open."
+)
+
+
+def _with_reply_not_posted(message: str, replying: bool) -> str:
+    """Append the reply-went-nowhere notice to a resolve-half refusal.
+
+    Every refusal is decided before the first write, so a refused resolve in
+    a composed ``--reply-thread --resolve-thread`` call aborts the reply too.
+    The refusal texts only speak about resolving, which reads as "the reply
+    landed, only the resolve was declined" — say plainly that it did not.
+    Returns the message unchanged when no reply was in flight.
+    """
+    if not replying:
+        return message
+    return f"{message}\n{_REPLY_NOT_POSTED_NOTICE}"
+
+
+def _thread_not_resolvable_error(discussion: dict, discussion_id: str) -> Optional[str]:
+    """Return the refusal message when a thread cannot be resolved.
+
+    Only diff (inline) threads carry resolvable notes; summary/general
+    threads come back with resolvable false and GitLab refuses to resolve
+    them. Say that plainly instead of relaying the raw API refusal. Returns
+    None when the thread is resolvable.
+    """
+    notes = discussion.get('notes', [])
+    if any(note.get('resolvable', False) for note in notes):
+        return None
+    return (
+        f"Error: thread {discussion_id} is not resolvable "
+        "(general threads cannot be resolved).\n"
+        "Only inline diff threads carry a resolved state; summary and "
+        "general comment threads have none."
+    )
+
+
 def _resolve_thread_policy_error(discussion_id: str) -> Optional[str]:
     """Return the refusal message when this session may not resolve threads.
 
@@ -994,15 +1101,71 @@ def main() -> int:
                 print(output)
             return 0
 
-        # Handle resolve thread request
-        if args.resolve_thread:
-            policy_error = _resolve_thread_policy_error(args.resolve_thread)
-            if policy_error:
-                print(policy_error, file=sys.stderr)
+        # A comment file with nothing to attach it to is a silent no-op
+        if args.comment_file and not args.reply_thread:
+            print("Error: --comment-file requires --reply-thread", file=sys.stderr)
+            return 1
+
+        # Handle reply/resolve thread requests. Both may be given at once:
+        # the reply is posted first, then the thread is resolved — the order
+        # a review flow needs (answer the thread, then close it).
+        if args.reply_thread or args.resolve_thread:
+            for flag, discussion_id in (('--reply-thread', args.reply_thread),
+                                        ('--resolve-thread', args.resolve_thread)):
+                if not discussion_id:
+                    continue
+                shape_error = _discussion_id_shape_error(discussion_id, flag)
+                if shape_error:
+                    # A bad resolve ID also kills the reply half; a bad reply
+                    # ID is its own explanation.
+                    print(_with_reply_not_posted(
+                        shape_error,
+                        flag == '--resolve-thread' and bool(args.reply_thread),
+                    ), file=sys.stderr)
+                    return 1
+
+            if args.reply_thread and not args.comment_file:
+                print("Error: --reply-thread requires --comment-file", file=sys.stderr)
                 return 1
-            discussion_data = reviewer.resolve_thread(args.project, args.id, args.resolve_thread)
+
+            # Every refusal is decided before the first write, so a rejected
+            # invocation never leaves a reply behind on the thread.
+            body = None
+            if args.reply_thread:
+                try:
+                    body = read_file_content(args.comment_file)
+                except GitLabError as e:
+                    print(f"Error: {e}", file=sys.stderr)
+                    return 1
+
+            if args.resolve_thread:
+                replying = bool(args.reply_thread)
+                policy_error = _resolve_thread_policy_error(args.resolve_thread)
+                if policy_error:
+                    print(_with_reply_not_posted(policy_error, replying), file=sys.stderr)
+                    return 1
+                discussion = reviewer.get_mr_discussion(args.project, args.id, args.resolve_thread)
+                not_resolvable = _thread_not_resolvable_error(discussion, args.resolve_thread)
+                if not_resolvable:
+                    print(_with_reply_not_posted(not_resolvable, replying), file=sys.stderr)
+                    return 1
+
+            reply_note = None
+            if args.reply_thread:
+                reply_note = reviewer.reply_to_thread(
+                    args.project, args.id, args.reply_thread, body
+                )
+
+            discussion_data = None
+            if args.resolve_thread:
+                discussion_data = reviewer.resolve_thread(args.project, args.id, args.resolve_thread)
+
             if not args.quiet:
-                output = format_resolve_thread_result(discussion_data, args.resolve_thread, args.json)
+                output = format_thread_actions_result(
+                    reply_note, args.reply_thread,
+                    discussion_data, args.resolve_thread,
+                    args.json,
+                )
                 print(output)
             return 0
 

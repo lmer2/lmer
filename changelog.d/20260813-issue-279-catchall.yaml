@@ -1,0 +1,7 @@
+added:
+- "gitlab-review can reply inside an MR discussion thread: --reply-thread with --comment-file, composable with --resolve-thread (#278)"
+fixed:
+- "Gate lock no longer treats a reaped-but-unwaited gate process as alive, which silently deferred every work-repo commit (#261)"
+- "default_preset= in the chat acknowledgement and spawn log now resolves the forwarded env file the way the child does (#259)"
+- "Platform spawn suppressions of LMER_ASK_DIR/LMER_NO_REPO now survive the child's .env seeding (blank instead of deleted) (#260)"
+- "Operator chat messages starting with # or / reach Claude sessions with the visible '. ' prefix instead of triggering memory or slash-command escapes (#272)"

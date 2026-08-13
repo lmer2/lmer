@@ -1,8 +1,9 @@
 """Guards on the one renderer that turns a container's words into markup (T44).
 
 Three views show text produced *inside a container*: the conversation
-(``Chat.vue``, T38), the operator channel's feed (``AskChannel.vue``) and the
-question a live session is blocked on (``AskBox.vue``). Everything else the daemon
+(``Chat.vue``, T38), one entry of the operator channel (``AskEntry.vue``, which is
+what both views of that channel draw an entry with since #274) and the question a
+live session is blocked on (``AskBox.vue``). Everything else the daemon
 serves is written by us; this text is written by an agent, from a repository it was
 pointed at, with tool output pasted into it. So the interesting question about
 "render it as markdown" is not whether the asterisks disappear — that is visible
@@ -68,13 +69,17 @@ COMPONENTS = WEB / "src" / "components"
 MARKDOWN = COMPONENTS / "Markdown.vue"
 CHAT = COMPONENTS / "Chat.vue"
 ASK_CHANNEL = COMPONENTS / "AskChannel.vue"
+# One channel entry, and both views of the channel draw their entries with it
+# (#274). The rendering the guards below are about is here rather than in the two
+# views, which is the whole of what that extraction did.
+ASK_ENTRY = COMPONENTS / "AskEntry.vue"
 ASK_BOX = COMPONENTS / "AskBox.vue"
 APP = WEB / "src" / "App.vue"
 STYLE = WEB / "src" / "style.css"
 
 # Every view that renders words an agent wrote. Named rather than globbed: adding
 # one is a decision, and the decision is "it goes through the shared component".
-CONSUMERS = [CHAT, ASK_CHANNEL, ASK_BOX]
+CONSUMERS = [CHAT, ASK_ENTRY, ASK_BOX]
 
 # The fence around the part of Markdown.vue that is plain JavaScript with no Vue
 # and no DOM in it, so it can be run as-is. Prefixes, because both lines are
@@ -258,9 +263,16 @@ def test_every_view_that_shows_agent_words_renders_them():
         assert "defineAsyncComponent" in text and "import('./Markdown.vue')" in text, (
             f"{path.name} does not use the shared renderer"
         )
-    channel = _read(ASK_CHANNEL)
-    assert re.search(r"<Markdown\s+:text=\"entry\.text\"", channel), (
+    entry = _read(ASK_ENTRY)
+    assert re.search(r"<Markdown\s+:text=\"entry\.text\"", entry), (
         "the operator channel's own feed is still raw text"
+    )
+    # And the feed is drawn with it: the rendering moved into the entry component
+    # (#274), so a view that stopped composing it would show raw text again with
+    # every guard here still green.
+    assert "<AskEntry" in _read(ASK_CHANNEL), (
+        "the operator channel draws its entries with something other than the "
+        "component this file just checked"
     )
     box = _read(ASK_BOX)
     assert re.search(r"<Markdown\s+:text=\"question\.text\"", box), (
@@ -285,11 +297,11 @@ def test_your_own_words_are_never_rendered_anywhere():
     assert 'v-if="message.text && message.role === \'user\'"' in chat, (
         "the user's own turns go through the renderer too"
     )
-    channel = _read(ASK_CHANNEL)
-    assert "you: {{ entry.answer.text }}" in channel, (
+    entry = _read(ASK_ENTRY)
+    assert "you: {{ entry.answer.text }}" in entry, (
         "your reply in the channel history is no longer shown as you wrote it"
     )
-    assert "said plain reply" in channel, (
+    assert "said plain reply" in entry, (
         "the verbatim half of an entry lost the class that keeps its newlines"
     )
     box = _read(ASK_BOX)
@@ -540,12 +552,14 @@ def test_a_single_newline_is_still_a_line_break():
     _probe(body)
     # The operator channel's two halves share a class, so this is the one place
     # where a stray `pre-wrap` would land on rendered markup as well as on the
-    # reply typed beside it.
-    assert "white-space: pre-wrap" not in _rule(".said", ASK_CHANNEL), (
+    # reply typed beside it. One stylesheet since #274, and both views of the
+    # channel are drawn from it — so this reads the entry component rather than
+    # one view's copy of the rule.
+    assert "white-space: pre-wrap" not in _rule(".said", ASK_ENTRY), (
         "pre-wrap is back on the rendered half, which shows the newlines between "
         "block tags as blank lines"
     )
-    assert "white-space: pre-wrap" in _rule(".said.plain", ASK_CHANNEL), (
+    assert "white-space: pre-wrap" in _rule(".said.plain", ASK_ENTRY), (
         "your own reply lost the rule that keeps the newlines you typed"
     )
     box = _read(ASK_BOX)
