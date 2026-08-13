@@ -2586,6 +2586,11 @@ def main(argv: list[str] | None = None) -> int:
         # in the container, so a host-side value that stopped at the boundary
         # would leave the operator unable to demand a full suite.
         "LMER_GATE_NO_FASTPATH": os.environ.get("LMER_GATE_NO_FASTPATH"),
+        # Same reasoning for the gate's test-result cache (#269): the kill
+        # switch that forces a re-run, and the directory the recorded passes
+        # live in. Both are read where the gates run — in the container.
+        "LMER_GATE_NO_CACHE": os.environ.get("LMER_GATE_NO_CACHE"),
+        "LMER_GATE_CACHE_DIR": os.environ.get("LMER_GATE_CACHE_DIR"),
         # Opt-in to the masterplan workflow. Truthy (get_bool_env) turns on the
         # session-start plugin provisioning in claude-runner.sh; LMER_TASK=masterplan
         # implies it. MASTERPLAN_RUNS_DIR is computed in-container from the run

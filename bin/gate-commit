@@ -71,6 +71,12 @@ def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
                 summary=gate.receipt_summary() if gate is not None else None,
                 argv=receipt_argv(),
                 commit_sha=_head_sha() if with_sha else None,
+                # What the tests check actually covered, as data (#269): a
+                # narrowed or cache-served run is a pass with exit code 0
+                # exactly like a full one. No gate (a bypass) and a skipped
+                # suite alike contribute nothing, which is the receipt
+                # saying "cannot tell" rather than claiming a full run.
+                **(gate.receipt_test_fields() if gate is not None else {}),
             )
         except Exception:
             pass

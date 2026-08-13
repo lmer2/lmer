@@ -964,6 +964,53 @@ class TestEmitGateEvent:
             "commit_sha": "a" * 40,
         }
 
+    def test_test_scope_and_targets_are_recorded(self, run_env):
+        """A narrowed run is a pass with exit code 0 exactly like a full one,
+        so the receipt has to carry the difference as data (#269)."""
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        run_state.emit_gate_event(
+            "gate-check", "pass", exit_code=0,
+            test_scope="text-diff subset",
+            test_targets=["tests/test_alpha.py", "tests/test_beta.py"],
+        )
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert data["test_scope"] == "text-diff subset"
+        assert data["test_targets"] == ["tests/test_alpha.py",
+                                        "tests/test_beta.py"]
+
+    @pytest.mark.parametrize("scope", ["full suite", "cached full suite",
+                                       "cached text-diff subset"])
+    def test_every_run_shape_reaches_the_receipt(self, run_env, scope):
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        run_state.emit_gate_event("gate-push", "pass", exit_code=0,
+                                  test_scope=scope, test_targets=["tests/"])
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert data["test_scope"] == scope
+
+    def test_a_caller_that_measured_no_scope_records_none(self, run_env):
+        """Existing callers pass neither; absent must stay absent, since a
+        default would be a coverage claim nobody made."""
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        run_state.emit_gate_event("gate-commit", "pass", exit_code=0,
+                                  summary="1397 passed in 41.8s")
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert "test_scope" not in data
+        assert "test_targets" not in data
+
+    def test_an_empty_target_list_is_not_recorded(self, run_env):
+        """"these paths ran" while naming none is the fabrication this
+        field exists to prevent."""
+        rdir = run_state.run_dir()
+        run_state.write_state(rdir, run_state.seed_state("develop-issue-123", "develop", "t"))
+        run_state.emit_gate_event("gate-check", "pass", exit_code=0,
+                                  test_scope="full suite", test_targets=[])
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert data["test_scope"] == "full suite"
+        assert "test_targets" not in data
+
     def test_exit_code_zero_is_recorded(self, run_env):
         """0 is a value, not an absence — the receipt must record it."""
         rdir = run_state.run_dir()
@@ -981,10 +1028,13 @@ class TestEmitGateEvent:
         run_state.emit_gate_event(
             "gate-commit", "pass",
             summary="token=hunter2", argv=["gate-commit", "-m", "token=hunter2"],
+            test_scope="token=hunter2", test_targets=["token=hunter2"],
         )
         data = run_state.read_events(rdir, last_n=0)[-1]["data"]
         assert data["summary"] == "<redacted>"
         assert data["argv"] == ["<redacted>"] * 3
+        assert data["test_scope"] == "<redacted>"
+        assert data["test_targets"] == ["<redacted>"]
 
 
 def _make_bundle(rdir, mp_slug, *names):
