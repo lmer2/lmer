@@ -2582,6 +2582,10 @@ def main(argv: list[str] | None = None) -> int:
         # silently leave the deferral on.
         "LMER_GATE_INFLIGHT_GUARD": os.environ.get("LMER_GATE_INFLIGHT_GUARD"),
         "LMER_GATE_LOCK_DIR": os.environ.get("LMER_GATE_LOCK_DIR"),
+        # Kill switch for the gate's text-only fast path (#269). The gates run
+        # in the container, so a host-side value that stopped at the boundary
+        # would leave the operator unable to demand a full suite.
+        "LMER_GATE_NO_FASTPATH": os.environ.get("LMER_GATE_NO_FASTPATH"),
         # Opt-in to the masterplan workflow. Truthy (get_bool_env) turns on the
         # session-start plugin provisioning in claude-runner.sh; LMER_TASK=masterplan
         # implies it. MASTERPLAN_RUNS_DIR is computed in-container from the run

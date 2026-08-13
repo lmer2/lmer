@@ -17,6 +17,7 @@ from unittest.mock import patch, MagicMock, call
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lmer_cli.gates import GateSystem, CheckStatus, CheckResult, Colors
+from tests.conftest import strip_lmer_env
 
 
 class TestGateSystem:
@@ -391,6 +392,55 @@ class TestGateSystem:
         self.gate.project_root = tmp_path
         result = self.gate.check_secrets()
         assert result.status == CheckStatus.PASSED
+
+    def test_check_secrets_ignore_is_not_read_from_the_gated_repo(
+            self, tmp_path, monkeypatch):
+        """`.lmer/gate-check.yaml` cannot silence the scan of its own repo.
+
+        The repo-local config was introduced for the text-diff subset (#269)
+        and every project is told to create one. An allowlist read from the
+        tree under review is an allowlist the tree can write, so this key is
+        the work repo's alone.
+        """
+        (tmp_path / "config.py").write_text("API_KEY = 'secret123456'")
+        (tmp_path / ".lmer").mkdir()
+        (tmp_path / ".lmer" / "gate-check.yaml").write_text(
+            "secrets:\n  ignore:\n    - '**/*'\n")
+
+        work_repo = tmp_path / "work"
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work_repo))
+        monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "org/proj")
+
+        self.gate.project_root = tmp_path
+        assert self.gate._load_secrets_ignore_patterns() == []
+        result = self.gate.check_secrets()
+        assert result.status == CheckStatus.FAILED
+
+    def test_check_secrets_ignore_as_a_string_is_ignored(self, tmp_path,
+                                                         monkeypatch):
+        """A bare string is not a one-entry list — iterating it yields `*`.
+
+        `for p in "*.py"` gives the characters, `*` among them, and a lone
+        `*` matches every relative path: one unquoted scalar would have
+        silenced the whole scan.
+        """
+        (tmp_path / "config.py").write_text("API_KEY = 'secret123456'")
+
+        work_repo = tmp_path / "work"
+        info_dir = work_repo / "git.example.com" / "org/proj" / "info"
+        info_dir.mkdir(parents=True)
+        (info_dir / "gate-check.yaml").write_text(
+            "secrets:\n  ignore: '*.py'\n")
+
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work_repo))
+        monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "org/proj")
+
+        self.gate.project_root = tmp_path
+        assert self.gate._load_secrets_ignore_patterns() == []
+        result = self.gate.check_secrets()
+        assert result.status == CheckStatus.FAILED
 
     def test_check_secrets_ignore_malformed_yaml_falls_back(self, tmp_path, monkeypatch):
         """A malformed gate-check.yaml does not crash the check."""
@@ -1124,6 +1174,712 @@ class TestWriteLogFile:
         out = capsys.readouterr().out
         assert str(log_path) in out
         assert "Full check log written to" in out
+
+
+class TestCommitGateOrderAndFailFast:
+    """Cheapest-first check order and the suite fail-fast (#269)."""
+
+    # Everything that runs in seconds; the suite is the only slow check and
+    # is asserted separately as the last one.
+    CHEAP_CHECKS = (
+        "check_git_status", "check_staged_files", "check_branch",
+        "check_secrets", "check_permissions", "check_deliverable_formats",
+        "check_changelog", "check_documentation", "check_code_quality",
+        "check_precommit",
+    )
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+
+    def _stub_checks(self, tmp_path, monkeypatch, outcomes=None):
+        """Replace every check with a recorder; returns the call-order list."""
+        # Redirect the log so the test doesn't clobber the real /tmp/gate-check.log.
+        monkeypatch.setattr("lmer_cli.gates.GATE_CHECK_LOG_PATH",
+                            tmp_path / "gate-check.log")
+        outcomes = outcomes or {}
+        calls = []
+
+        def recorder(attr):
+            outcome = outcomes.get(
+                attr, CheckResult(name=attr, status=CheckStatus.PASSED))
+
+            def run():
+                calls.append(attr)
+                return outcome
+
+            run.__name__ = attr
+            return run
+
+        for attr in self.CHEAP_CHECKS + ("check_tests",):
+            setattr(self.gate, attr, recorder(attr))
+        return calls
+
+    def test_tests_run_last_after_the_cheap_checks(self, tmp_path, monkeypatch):
+        """The ~10-minute suite is only ever reached with everything else green."""
+        calls = self._stub_checks(tmp_path, monkeypatch)
+
+        self.gate.run_commit_gate()
+
+        assert calls[-1] == "check_tests"
+        # pre-commit (~36s) is the most expensive of the cheap ones, so it
+        # sits directly in front of the suite.
+        assert calls[-2] == "check_precommit"
+        assert set(calls[:-1]) == set(self.CHEAP_CHECKS)
+
+    def test_critical_failure_skips_the_suite(self, tmp_path, monkeypatch):
+        """A blocked gate never spends ten minutes confirming it is blocked."""
+        calls = self._stub_checks(tmp_path, monkeypatch, outcomes={
+            "check_secrets": CheckResult(name="Security Check",
+                                         status=CheckStatus.FAILED,
+                                         message="Potential secrets detected"),
+        })
+
+        passed = self.gate.run_commit_gate()
+
+        assert "check_tests" not in calls
+        assert passed is False
+
+    def test_skipped_suite_is_recorded_as_a_result(self, tmp_path, monkeypatch):
+        """The receipt and the log read self.results, not the terminal."""
+        self._stub_checks(tmp_path, monkeypatch, outcomes={
+            "check_secrets": CheckResult(name="Security Check",
+                                         status=CheckStatus.FAILED),
+        })
+
+        self.gate.run_commit_gate()
+
+        skipped = [r for r in self.gate.results if r.name == "Python Tests"]
+        assert len(skipped) == 1
+        assert skipped[0].status == CheckStatus.SKIPPED
+        assert "Security Check" in skipped[0].message
+        # A skipped suite must never look like a passing one in the receipt.
+        assert self.gate.receipt_summary() == "failed: Security Check"
+
+    def test_skip_notice_names_every_blocking_check(self, tmp_path, monkeypatch,
+                                                    capsys):
+        """"Fix those first" is only actionable if it says which."""
+        self._stub_checks(tmp_path, monkeypatch, outcomes={
+            "check_secrets": CheckResult(name="Security Check",
+                                         status=CheckStatus.FAILED),
+            "check_precommit": CheckResult(name="Pre-commit Hooks",
+                                           status=CheckStatus.FAILED),
+        })
+
+        self.gate.run_commit_gate()
+
+        out = capsys.readouterr().out
+        assert "Skipping Python Tests — 2 earlier check(s) failed" in out
+        assert "(Security Check, Pre-commit Hooks)" in out
+        assert "Fix those first; the suite has not been run." in out
+
+    def test_warnings_do_not_skip_the_suite(self, tmp_path, monkeypatch):
+        """Warnings don't block the gate, so they must not block the suite."""
+        calls = self._stub_checks(tmp_path, monkeypatch, outcomes={
+            "check_changelog": CheckResult(name="Changelog",
+                                           status=CheckStatus.WARNING,
+                                           is_critical=False),
+            "check_branch": CheckResult(name="Branch Check",
+                                        status=CheckStatus.WARNING,
+                                        is_critical=False),
+        })
+
+        passed = self.gate.run_commit_gate()
+
+        assert "check_tests" in calls
+        assert passed is True
+
+    def test_non_critical_failure_does_not_skip_the_suite(self, tmp_path,
+                                                          monkeypatch):
+        """A non-critical FAILED (e.g. Code Quality) leaves the gate passable."""
+        calls = self._stub_checks(tmp_path, monkeypatch, outcomes={
+            "check_code_quality": CheckResult(name="Code Quality",
+                                              status=CheckStatus.FAILED,
+                                              is_critical=False),
+        })
+
+        passed = self.gate.run_commit_gate()
+
+        assert "check_tests" in calls
+        assert passed is True
+
+    def test_every_cheap_check_still_runs_after_an_early_failure(
+            self, tmp_path, monkeypatch):
+        """One pass must surface every cheap problem, not one per pass."""
+        calls = self._stub_checks(tmp_path, monkeypatch, outcomes={
+            "check_git_status": CheckResult(name="Git Status",
+                                            status=CheckStatus.FAILED,
+                                            message="Unstaged changes"),
+        })
+
+        self.gate.run_commit_gate()
+
+        assert set(calls) == set(self.CHEAP_CHECKS)
+
+    def test_skipped_suite_shows_in_the_log_file(self, tmp_path, monkeypatch):
+        """Reading the log must distinguish "suite green" from "suite not run"."""
+        log_path = tmp_path / "gate-check.log"
+        self._stub_checks(tmp_path, monkeypatch, outcomes={
+            "check_secrets": CheckResult(name="Security Check",
+                                         status=CheckStatus.FAILED),
+        })
+
+        self.gate.run_commit_gate()
+
+        content = log_path.read_text()
+        assert "[SKIPPED] Python Tests" in content
+        assert "Security Check" in content
+
+    def test_skip_tests_flag_reaches_the_suite_check_unchanged(
+            self, tmp_path, monkeypatch, capsys):
+        """skip_tests=True keeps its own loud path, distinct from fail-fast."""
+        calls = self._stub_checks(tmp_path, monkeypatch)
+
+        self.gate.run_commit_gate(skip_tests=True)
+
+        assert "check_tests" not in calls
+        out = capsys.readouterr().out
+        assert "⚠️  Skipping Python Tests" in out
+        assert "earlier check(s) failed" not in out
+
+
+class TestTextDiffFastPath:
+    """A prose-only change runs the declared text-reading subset (#269).
+
+    Nothing is skipped that the change could break — this repo's own tests
+    read docs, so the honest "safe to skip" list is empty — the win is not
+    asking the other ~8,600 tests.
+    """
+
+    SUBSET = ["tests/test_alpha.py", "tests/test_beta.py"]
+    TEXT_DIFF = ["docs/CONTAINER.md", "README.md",
+                 "changelog.d/20260813-x.yaml"]
+
+    @pytest.fixture(autouse=True)
+    def _clean_lmer_env(self, monkeypatch):
+        # The config loader falls back to the work repo, which the running
+        # session's env points at: without this the operational repo's
+        # gate-check.yaml would decide these assertions.
+        strip_lmer_env(monkeypatch)
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+        self.pytest_calls = []
+
+    def _repo(self, tmp_path, declared=None, subset_exists=True):
+        """A project root with a tests/ dir and (optionally) a declaration."""
+        (tmp_path / "tests").mkdir()
+        if subset_exists:
+            for path in self.SUBSET:
+                (tmp_path / path).write_text("def test_x(): pass\n")
+        if declared is not None:
+            config_dir = tmp_path / ".lmer"
+            config_dir.mkdir()
+            (config_dir / "gate-check.yaml").write_text(
+                "tests:\n  text_diff_subset:\n"
+                + "".join(f"    - {p}\n" for p in declared)
+            )
+        self.gate.project_root = tmp_path
+        return tmp_path
+
+    def _dispatch(self, staged=None, unstaged="", untracked="",
+                  pushed=None, range_resolves=True, pytest_stdout="5 passed in 0.5s"):
+        """subprocess.run stand-in for the git probes and the pytest run."""
+        def side_effect(cmd, *args, **kwargs):
+            joined = " ".join(str(c) for c in cmd)
+            if "-c" in cmd and any(str(a).startswith("import ") for a in cmd):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            if "-m" in cmd and "pytest" in cmd:
+                self.pytest_calls.append(list(cmd))
+                return MagicMock(returncode=0, stdout=pytest_stdout, stderr="")
+            if "rev-parse" in joined:
+                return MagicMock(returncode=0 if range_resolves else 128,
+                                 stdout="", stderr="")
+            if "ls-files" in joined:
+                return MagicMock(returncode=0, stdout=untracked, stderr="")
+            if "--cached" in joined:
+                return MagicMock(returncode=0,
+                                 stdout="\0".join(staged or []), stderr="")
+            if ".." in joined:
+                return MagicMock(returncode=0,
+                                 stdout="\0".join(pushed or []), stderr="")
+            if "diff" in joined:
+                return MagicMock(returncode=0, stdout=unstaged, stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return side_effect
+
+    def _ran(self):
+        """The pytest path arguments of the single pytest invocation."""
+        assert len(self.pytest_calls) == 1
+        argv = self.pytest_calls[0]
+        return [a for a in argv[argv.index("pytest") + 1:]
+                if not a.startswith("-")]
+
+    @patch('subprocess.run')
+    def test_text_only_staged_diff_runs_the_subset(self, mock_run, tmp_path):
+        self._repo(tmp_path, declared=self.SUBSET)
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        result = self.gate.check_tests()
+
+        assert self._ran() == self.SUBSET
+        assert result.status == CheckStatus.PASSED
+
+    @patch('subprocess.run')
+    def test_one_python_file_in_the_diff_runs_the_full_suite(self, mock_run,
+                                                             tmp_path):
+        self._repo(tmp_path, declared=self.SUBSET)
+        mock_run.side_effect = self._dispatch(
+            staged=self.TEXT_DIFF + ["src/lmer_cli/gates.py"])
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_no_declaration_runs_the_full_suite(self, mock_run, tmp_path):
+        """The default in every project that has not declared a subset."""
+        self._repo(tmp_path, declared=None)
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_an_empty_declaration_runs_the_full_suite(self, mock_run, tmp_path):
+        self._repo(tmp_path, declared=[])
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_unstaged_changes_run_the_full_suite(self, mock_run, tmp_path):
+        """Never classify a tree the classifier has not looked at."""
+        self._repo(tmp_path, declared=self.SUBSET)
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF,
+                                              unstaged="src/lmer_cli/gates.py\n")
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_untracked_files_run_the_full_suite(self, mock_run, tmp_path):
+        self._repo(tmp_path, declared=self.SUBSET)
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF,
+                                              untracked="scratch.py\n")
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_nothing_staged_runs_the_full_suite(self, mock_run, tmp_path):
+        """An empty change list is unknown, not "nothing to test"."""
+        self._repo(tmp_path, declared=self.SUBSET)
+        mock_run.side_effect = self._dispatch(staged=[])
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_push_gate_classifies_the_pushed_commits(self, mock_run, tmp_path):
+        self._repo(tmp_path, declared=self.SUBSET)
+        self.gate.in_push_gate = True
+        self.gate.push_diff_base = "origin/feat/docs"
+        mock_run.side_effect = self._dispatch(pushed=self.TEXT_DIFF,
+                                              staged=["src/lmer_cli/gates.py"])
+
+        self.gate.check_tests()
+
+        assert self._ran() == self.SUBSET
+
+    @patch('subprocess.run')
+    def test_push_gate_with_an_unresolvable_range_runs_the_full_suite(
+            self, mock_run, tmp_path):
+        """A first push has no remote-tracking ref to diff against."""
+        self._repo(tmp_path, declared=self.SUBSET)
+        self.gate.in_push_gate = True
+        self.gate.push_diff_base = "origin/feat/new"
+        mock_run.side_effect = self._dispatch(pushed=self.TEXT_DIFF,
+                                              range_resolves=False)
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_push_gate_without_a_base_runs_the_full_suite(self, mock_run,
+                                                          tmp_path):
+        """A tag push names no branch, so there is no range at all."""
+        self._repo(tmp_path, declared=self.SUBSET)
+        self.gate.in_push_gate = True
+        mock_run.side_effect = self._dispatch(pushed=self.TEXT_DIFF)
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_kill_switch_runs_the_full_suite(self, mock_run, tmp_path,
+                                             monkeypatch):
+        self._repo(tmp_path, declared=self.SUBSET)
+        monkeypatch.setenv("LMER_GATE_NO_FASTPATH", "1")
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+
+    @patch('subprocess.run')
+    def test_a_declared_path_that_is_gone_runs_the_full_suite_loudly(
+            self, mock_run, tmp_path, capsys):
+        """A stale declaration must not surface as a pytest usage error."""
+        self._repo(tmp_path, declared=self.SUBSET, subset_exists=False)
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        self.gate.check_tests()
+
+        assert self._ran() == ["tests/"]
+        out = capsys.readouterr().out
+        assert "Ignoring the text-diff subset" in out
+        assert "tests/test_alpha.py" in out
+
+    @patch('subprocess.run')
+    def test_the_notice_names_the_paths_the_subset_and_the_source(
+            self, mock_run, tmp_path, capsys):
+        """A fast path nobody can read is a waiver with better manners."""
+        self._repo(tmp_path, declared=self.SUBSET)
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        self.gate.check_tests()
+
+        out = capsys.readouterr().out
+        assert "Text-only diff — 3 changed path(s), all text" in out
+        for path in self.TEXT_DIFF:
+            assert path in out
+        for path in self.SUBSET:
+            assert path in out
+        assert ".lmer/gate-check.yaml → tests.text_diff_subset" in out
+
+    @patch('subprocess.run')
+    def test_the_result_and_the_receipt_say_a_subset_ran(self, mock_run,
+                                                         tmp_path):
+        """Full suite, subset and not-run have to be three distinct readings."""
+        self._repo(tmp_path, declared=self.SUBSET)
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        result = self.gate.check_tests()
+        self.gate.results.append(result)
+
+        assert result.scope == "text-diff subset"
+        assert result.message == "text-diff subset: 5 tests passed"
+        assert self.gate.receipt_summary() == "text-diff subset: 5 passed in 0.5s"
+
+    @patch('subprocess.run')
+    def test_a_full_run_carries_no_scope(self, mock_run, tmp_path):
+        self._repo(tmp_path, declared=None)
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        result = self.gate.check_tests()
+        self.gate.results.append(result)
+
+        assert result.scope is None
+        assert result.message == "All 5 tests passed"
+        assert self.gate.receipt_summary() == "5 passed in 0.5s"
+
+    @patch('subprocess.run')
+    def test_a_failing_subset_run_names_its_scope(self, mock_run, tmp_path):
+        self._repo(tmp_path, declared=self.SUBSET)
+
+        def failing(cmd, *args, **kwargs):
+            if "-m" in cmd and "pytest" in cmd:
+                self.pytest_calls.append(list(cmd))
+                return MagicMock(returncode=1,
+                                 stdout="FAILED tests/test_alpha.py::test_x",
+                                 stderr="")
+            return self._dispatch(staged=self.TEXT_DIFF)(cmd, *args, **kwargs)
+
+        mock_run.side_effect = failing
+
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.FAILED
+        assert result.message == "Tests failed (text-diff subset)"
+        assert result.details[0] == "ran: tests/test_alpha.py, tests/test_beta.py"
+
+    @patch('subprocess.run')
+    def test_a_custom_test_runner_still_wins(self, mock_run, tmp_path,
+                                             monkeypatch):
+        """The project's own runner owns the invocation; don't second-guess it."""
+        self._repo(tmp_path, declared=self.SUBSET)
+        work_repo = tmp_path / "work"
+        info_dir = work_repo / "git.example.com" / "org/proj" / "info"
+        info_dir.mkdir(parents=True)
+        runner = info_dir / "gate-check-run-tests.sh"
+        runner.write_text("#!/bin/sh\nexit 0\n")
+        runner.chmod(0o755)
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work_repo))
+        monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "org/proj")
+        monkeypatch.setenv("LMER_TASK", "develop")
+        mock_run.side_effect = self._dispatch(staged=self.TEXT_DIFF)
+
+        result = self.gate.check_tests()
+
+        assert self.pytest_calls == []
+        assert "Custom test runner" in result.message
+
+
+class TestChangedPathsAgainstRealGit:
+    """What the classifier is handed, measured against git itself (#269).
+
+    Rename detection is a property of git's output, not of this code, so it
+    is asked of a real repository rather than a mock.
+    """
+
+    SUBSET = ["tests/test_alpha.py"]
+
+    @pytest.fixture(autouse=True)
+    def _clean_lmer_env(self, monkeypatch):
+        strip_lmer_env(monkeypatch)
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+
+    @staticmethod
+    def _git(cwd, *args):
+        subprocess.run(["git", *args], cwd=cwd, check=True,
+                       capture_output=True, text=True)
+
+    def _repo(self, tmp_path, declared=False):
+        """A repo whose HEAD holds a module under src/ and (maybe) a subset."""
+        self._git(tmp_path, "init")
+        self._git(tmp_path, "config", "user.email", "test@test.com")
+        self._git(tmp_path, "config", "user.name", "Test")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "src" / "code.py").write_text("def f():\n    return 1\n")
+        if declared:
+            (tmp_path / "tests").mkdir()
+            for path in self.SUBSET:
+                (tmp_path / path).write_text("def test_x(): pass\n")
+            (tmp_path / ".lmer").mkdir()
+            (tmp_path / ".lmer" / "gate-check.yaml").write_text(
+                "tests:\n  text_diff_subset:\n"
+                + "".join(f"    - {p}\n" for p in self.SUBSET))
+        self._git(tmp_path, "add", "-A")
+        self._git(tmp_path, "commit", "-m", "base")
+        self.gate.project_root = tmp_path
+        return tmp_path
+
+    def test_a_rename_reports_both_sides(self, tmp_path):
+        """`git mv src/code.py docs/notes.md` removes a module.
+
+        With git's default rename detection `--name-only` prints the
+        post-image alone, so the change reads as one markdown file and the
+        module's disappearance is invisible to the classifier.
+        """
+        self._repo(tmp_path)
+        self._git(tmp_path, "mv", "src/code.py", "docs/notes.md")
+
+        assert sorted(self.gate._changed_paths()) == ["docs/notes.md",
+                                                      "src/code.py"]
+
+    def test_a_rename_out_of_code_runs_the_full_suite(self, tmp_path):
+        """The reason the pre-image has to be visible."""
+        self._repo(tmp_path, declared=True)
+        self._git(tmp_path, "mv", "src/code.py", "docs/notes.md")
+
+        assert self.gate._text_diff_fast_path() is None
+
+    def test_a_prose_only_rename_still_takes_the_fast_path(self, tmp_path):
+        """--no-renames widens what is SEEN, not what counts as code."""
+        self._repo(tmp_path, declared=True)
+        (tmp_path / "docs" / "old.md").write_text("# old\n")
+        self._git(tmp_path, "add", "docs/old.md")
+        self._git(tmp_path, "commit", "-m", "doc")
+        self._git(tmp_path, "mv", "docs/old.md", "docs/new.md")
+
+        fast_path = self.gate._text_diff_fast_path()
+
+        assert fast_path is not None
+        assert sorted(fast_path[0]) == ["docs/new.md", "docs/old.md"]
+
+
+class TestGateConfigSources:
+    """Both gate-check.yaml locations, and one loader behind them (#269)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_lmer_env(self, monkeypatch):
+        strip_lmer_env(monkeypatch)
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+
+    @staticmethod
+    def _work_info(tmp_path, monkeypatch, body):
+        info_dir = tmp_path / "work" / "git.example.com" / "org/proj" / "info"
+        info_dir.mkdir(parents=True)
+        (info_dir / "gate-check.yaml").write_text(body)
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tmp_path / "work"))
+        monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "org/proj")
+
+    @staticmethod
+    def _repo_config(tmp_path, body):
+        (tmp_path / ".lmer").mkdir()
+        (tmp_path / ".lmer" / "gate-check.yaml").write_text(body)
+
+    def test_repo_local_declaration_is_preferred(self, tmp_path, monkeypatch):
+        self.gate.project_root = tmp_path
+        self._repo_config(tmp_path,
+                          "tests:\n  text_diff_subset:\n    - tests/near.py\n")
+        self._work_info(tmp_path, monkeypatch,
+                        "tests:\n  text_diff_subset:\n    - tests/far.py\n")
+
+        subset, source = self.gate._text_diff_subset()
+
+        assert subset == ["tests/near.py"]
+        assert source == tmp_path / ".lmer" / "gate-check.yaml"
+
+    def test_work_repo_info_is_the_fallback(self, tmp_path, monkeypatch):
+        self.gate.project_root = tmp_path
+        self._work_info(tmp_path, monkeypatch,
+                        "tests:\n  text_diff_subset:\n    - tests/far.py\n")
+
+        subset, source = self.gate._text_diff_subset()
+
+        assert subset == ["tests/far.py"]
+        assert source.parent.name == "info"
+
+    def test_lookup_is_per_key_not_per_file(self, tmp_path, monkeypatch):
+        """A repo declaring only `tests` must not hide the work repo's
+        `secrets.ignore` — that list is the reason this file already existed."""
+        self.gate.project_root = tmp_path
+        self._repo_config(tmp_path,
+                          "tests:\n  text_diff_subset:\n    - tests/near.py\n")
+        self._work_info(tmp_path, monkeypatch,
+                        "secrets:\n  ignore:\n    - vendor/keys.py\n")
+
+        assert self.gate._load_secrets_ignore_patterns() == ["vendor/keys.py"]
+        assert self.gate._text_diff_subset()[0] == ["tests/near.py"]
+
+    def test_the_repo_local_source_is_scoped_to_the_test_subset(
+            self, tmp_path, monkeypatch):
+        """Only `tests.text_diff_subset` reads the gated repo's own config.
+
+        `secrets.ignore` keeps its pre-#269 work-repo-only lookup: it
+        silences a check, and the repo it would be read from is the repo the
+        check is scanning.
+        """
+        self.gate.project_root = tmp_path
+        self._repo_config(tmp_path,
+                          "tests:\n  text_diff_subset:\n    - tests/near.py\n"
+                          "secrets:\n  ignore:\n    - '**/*'\n")
+        self._work_info(tmp_path, monkeypatch,
+                        "secrets:\n  ignore:\n    - vendor/keys.py\n")
+
+        assert self.gate._text_diff_subset()[0] == ["tests/near.py"]
+        assert self.gate._load_secrets_ignore_patterns() == ["vendor/keys.py"]
+
+    def test_unparseable_repo_config_is_not_fatal(self, tmp_path, monkeypatch):
+        self.gate.project_root = tmp_path
+        self._repo_config(tmp_path, "tests: [::: not valid yaml")
+
+        assert self.gate._text_diff_subset() == ([], None)
+        assert self.gate._load_secrets_ignore_patterns() == []
+
+    def test_a_non_list_subset_is_ignored(self, tmp_path):
+        self.gate.project_root = tmp_path
+        self._repo_config(tmp_path, "tests:\n  text_diff_subset: tests/near.py\n")
+
+        assert self.gate._text_diff_subset() == ([], None)
+
+    def test_no_config_anywhere(self, tmp_path, monkeypatch):
+        self.gate.project_root = tmp_path
+        monkeypatch.delenv("LMER_WORK_REPO_PATH", raising=False)
+
+        assert self.gate._gate_config_sources() == []
+        assert self.gate._text_diff_subset() == ([], None)
+        assert self.gate._load_secrets_ignore_patterns() == []
+
+
+class TestPushGateSetsTheDiffBase:
+    """run_push_gate hands the tests check the range it is about to push."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_lmer_env(self, monkeypatch):
+        strip_lmer_env(monkeypatch)
+
+    def setup_method(self):
+        self.gate = GateSystem(verbose=True)
+        self.gate.run_commit_gate = MagicMock(return_value=True)
+
+    @patch('subprocess.run')
+    def test_branch_push_sets_the_remote_tracking_base(self, mock_run,
+                                                       monkeypatch):
+        monkeypatch.setenv("LMER_PUSH_ALLOW_LIST", "gitlab.example.com")
+        mock_run.side_effect = [
+            MagicMock(returncode=0,
+                      stdout="https://gitlab.example.com/org/proj.git\n",
+                      stderr=""),
+            MagicMock(returncode=0, stdout="feat/docs\n", stderr=""),
+        ]
+
+        assert self.gate.run_push_gate() is True
+        assert self.gate.in_push_gate is True
+        assert self.gate.push_diff_base == "origin/feat/docs"
+
+    @patch('subprocess.run')
+    def test_tag_push_leaves_the_base_unset(self, mock_run, monkeypatch):
+        monkeypatch.setenv("LMER_PUSH_ALLOW_LIST",
+                           "gitlab.example.com|refs/tags/*")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="https://gitlab.example.com/org/proj.git\n",
+            stderr="")
+
+        assert self.gate.run_push_gate(ref="refs/tags/v1.0.0") is True
+        assert self.gate.in_push_gate is True
+        assert self.gate.push_diff_base is None
+
+    @patch('subprocess.run')
+    def test_a_refspec_leaves_the_base_unset(self, mock_run, monkeypatch):
+        """`--ref <src>:<dst>` pushes src, and src need not be HEAD.
+
+        The base would be diffed against HEAD, so a refspec pushing another
+        branch to main would have the CURRENT branch's diff decide how much
+        of the suite runs. bin/gate-push hands the refspec to git verbatim.
+        """
+        monkeypatch.setenv("LMER_PUSH_ALLOW_LIST", "gitlab.example.com")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="https://gitlab.example.com/org/proj.git\n",
+            stderr="")
+
+        assert self.gate.run_push_gate(
+            ref="refs/heads/feat/code:refs/heads/main") is True
+        assert self.gate.in_push_gate is True
+        assert self.gate.push_diff_base is None
+        # No base is what "run everything" is made of: the tests check asks
+        # for the changed paths and is told they are unknown.
+        assert self.gate._changed_paths() is None
+
+    @patch('subprocess.run')
+    def test_an_explicit_branch_ref_leaves_the_base_unset(self, mock_run,
+                                                          monkeypatch):
+        """Same hole without a colon: `--ref refs/heads/<other-branch>`."""
+        monkeypatch.setenv("LMER_PUSH_ALLOW_LIST", "gitlab.example.com")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="https://gitlab.example.com/org/proj.git\n",
+            stderr="")
+
+        assert self.gate.run_push_gate(ref="refs/heads/feat/other") is True
+        assert self.gate.in_push_gate is True
+        assert self.gate.push_diff_base is None
+        assert self.gate._changed_paths() is None
 
 
 class TestCheckChangelog:

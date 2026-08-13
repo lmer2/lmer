@@ -10,6 +10,7 @@ import os
 import re
 import json
 import fnmatch
+import textwrap
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
@@ -21,6 +22,7 @@ import time
 import yaml
 
 from lmer_cli import push_allow
+from lmer_cli.util import get_bool_env
 from work_repo.utils import project_info_dir, task_info_dir
 
 
@@ -45,6 +47,10 @@ class CheckResult:
     # untruncated stdout+stderr, persisted to the gate-check log so failures can
     # be investigated without re-running the slow checks.
     full_output: Optional[str] = None
+    # Set when the check covered less than its name implies (the text-diff
+    # test subset). Receipts and logs read this, so a narrowed run can never
+    # be read back as the full one.
+    scope: Optional[str] = None
 
 
 # Fixed, predictable location for the full gate-check log. Overwritten on every
@@ -78,11 +84,55 @@ BINARY_DOC_EXTENSIONS = {".docx", ".doc", ".pdf", ".odt", ".rtf"}
 # refname in practice, so the split is unambiguous.
 PUSH_ALLOW_REF_DELIMITER = "|"
 
+# Repo-relative fnmatch patterns for paths that carry prose rather than
+# behavior (#269). A diff touching only these can still fail the suite — this
+# repo's own tests read docs and rule files — so matching them never skips
+# tests; it selects the declared subset of tests that READ text
+# (tests.text_diff_subset). fnmatch's `*` crosses `/`, so one `*.<ext>`
+# pattern covers that extension at any depth; there are no depth-specific
+# duplicates here for that reason.
+#
+# The list is global while the subset that compensates for it is per-repo, so
+# a pattern is only carried when the name says prose in ANY project:
+# - `*.txt` is not here: `requirements.txt` pins dependencies and
+#   `taskdef/*/instructions.txt` is agent-facing behavior. `.txt` names a
+#   file format, not a role.
+# - Neither is a whole `docs/` subtree: `docs/conf.py` executes, and a
+#   generator's data files live there too. Prose under `docs/` is already
+#   covered by its extension; a project wanting more must widen this list
+#   knowing every project pays for it.
+TEXT_DIFF_PATTERNS = (
+    "*.md", "*.rst",
+    "changelog.d/*.yaml", "changelog.d/*.yml",
+    "CHANGELOG.yaml", "LICENSE",
+)
+
+# Escape hatch for the above: forces the full suite regardless of the diff.
+TEXT_DIFF_FASTPATH_OFF_ENV = "LMER_GATE_NO_FASTPATH"
+
+# What `CheckResult.scope` says when the tests check ran the declared subset.
+# Read by receipt_summary, so a receipt never presents a subset run as a
+# full-suite pass.
+TEXT_DIFF_SCOPE = "text-diff subset"
+
 # check_changelog() warning hints for repos with a changelog.d/ directory
 CTL_FRAGMENT_HINT = "Or stage a fragment: changelog.d/YYYYMMDD-<topic>.yaml"
 OTHER_TOOL_FRAGMENT_HINT = (
     "Or stage a changelog.d/ fragment in this repo's fragment convention"
 )
+
+
+def is_text_diff_path(path: str) -> bool:
+    """True if `path` (repo-relative, posix) is prose by TEXT_DIFF_PATTERNS.
+
+    Module-level so the gate and the guard test that keeps
+    `tests.text_diff_subset` honest share one definition of "text".
+    """
+    candidate = path.strip()
+    if not candidate:
+        return False
+    return any(fnmatch.fnmatch(candidate, pattern)
+               for pattern in TEXT_DIFF_PATTERNS)
 
 
 def receipt_argv() -> List[str]:
@@ -114,6 +164,12 @@ class GateSystem:
         self.results: List[CheckResult] = []
         self.project_root = Path.cwd()
         self.timestamp = time.time()
+        # Push-gate context for the text-diff fast path (#269). run_push_gate
+        # sets these before delegating to run_commit_gate: what a push changes
+        # is the commit range, not the index, so the classifier has to ask a
+        # different question there.
+        self.in_push_gate = False
+        self.push_diff_base: Optional[str] = None
 
     def run_command(self, command: List[str], check: bool = True) -> Tuple[int, str, str]:
         """Run a command and return exit code, stdout, stderr"""
@@ -327,6 +383,125 @@ class GateSystem:
             full_output=combined_output,
         )
 
+    def _changed_paths(self) -> Optional[List[str]]:
+        """Repo-relative paths this gate is about, or None for "cannot tell".
+
+        Commit gate: the staged paths — but only when the index IS the change.
+        Any unstaged or untracked file means there is a change this method has
+        not looked at, and classifying a tree you have not seen is how a fast
+        path turns into a waiver.
+
+        Push gate: the paths in the commits being pushed, i.e. the diff from
+        the remote-tracking ref to HEAD. A branch with no remote-tracking ref
+        (first push) has no range to diff, so it answers None.
+
+        None is never "nothing changed" — every caller treats it as "run
+        everything".
+        """
+        # `-z`: NUL-separated and unquoted, so a non-ASCII path arrives as the
+        # raw bytes git tracks rather than a C-quoted "caf\303\251.md" that
+        # would match none of the text patterns (same reasoning as
+        # check_secrets' `git ls-files -z`).
+        #
+        # `--no-renames`: with rename detection on, `--name-only` prints only
+        # the POST-image, so `git mv src/foo.py docs/foo.md` reports one text
+        # path and hides that a module was removed. The classifier has to see
+        # both sides of a rename or it classifies half the change.
+        if self.in_push_gate:
+            if not self.push_diff_base:
+                return None
+            code, _, _ = self.run_command(
+                ["git", "rev-parse", "--verify", "--quiet",
+                 f"{self.push_diff_base}^{{commit}}"], check=False)
+            if code != 0:
+                return None
+            code, stdout, _ = self.run_command(
+                ["git", "diff", "--name-only", "--no-renames", "-z",
+                 f"{self.push_diff_base}..HEAD"], check=False)
+            if code != 0:
+                return None
+            return [p for p in stdout.split("\0") if p]
+
+        for probe in (["git", "diff", "--name-only", "-z"],
+                      ["git", "ls-files", "--others", "--exclude-standard", "-z"]):
+            code, stdout, _ = self.run_command(probe, check=False)
+            if code != 0 or [p for p in stdout.split("\0") if p]:
+                return None
+
+        code, stdout, _ = self.run_command(
+            ["git", "diff", "--cached", "--name-only", "--no-renames", "-z"],
+            check=False)
+        if code != 0:
+            return None
+        return [p for p in stdout.split("\0") if p]
+
+    def _text_diff_subset(self) -> Tuple[List[str], Optional[Path]]:
+        """The declared `tests.text_diff_subset` and the file declaring it.
+
+        Undeclared is the default and means there is no fast path at all: a
+        project that has not said which of its tests read text gets the full
+        suite, always.
+        """
+        declared, source = self._gate_config_lookup("tests", "text_diff_subset")
+        if not isinstance(declared, list):
+            return [], None
+        subset = [p.strip() for p in declared
+                  if isinstance(p, str) and p.strip()]
+        return (subset, source) if subset else ([], None)
+
+    def _text_diff_fast_path(self) -> Optional[Tuple[List[str], List[str], Path]]:
+        """(changed paths, subset, declaration file) when the tests check may
+        run the declared text-reading subset instead of the whole tree.
+
+        None means "run the full suite" — for an unclassifiable diff, a diff
+        touching anything that is not prose, a project with no declaration,
+        and for the kill switch.
+        """
+        if get_bool_env(TEXT_DIFF_FASTPATH_OFF_ENV):
+            return None
+
+        subset, source = self._text_diff_subset()
+        if not subset or source is None:
+            return None
+
+        changed = self._changed_paths()
+        if not changed:
+            return None
+        if not all(is_text_diff_path(path) for path in changed):
+            return None
+
+        missing = [p for p in subset if not (self.project_root / p).exists()]
+        if missing:
+            # A stale declaration would make pytest exit on a usage error and
+            # report it as a test failure. Say so and run everything instead.
+            print(f"{Colors.YELLOW}⚠️  Ignoring the text-diff subset declared "
+                  f"in {source}: {', '.join(missing)} does not exist"
+                  f"{Colors.NC}")
+            return None
+
+        return changed, subset, source
+
+    def _print_text_diff_notice(self, changed: List[str], subset: List[str],
+                                source: Path) -> None:
+        """Announce a narrowed run: what changed, what will run, who said so.
+
+        A fast path nobody can read is a waiver with better manners, so this
+        names all three rather than summarizing.
+        """
+        try:
+            declared_in = source.relative_to(self.project_root).as_posix()
+        except ValueError:
+            declared_in = str(source)
+        print(f"{Colors.CYAN}⏭️  Text-only diff — {len(changed)} changed "
+              f"path(s), all text:{Colors.NC}")
+        for line in textwrap.wrap(", ".join(changed), width=68):
+            print(f"    {line}")
+        print(f"    Running the declared text-reading subset "
+              f"({len(subset)} path(s)) instead of the full suite:")
+        for line in textwrap.wrap(", ".join(subset), width=68):
+            print(f"    {line}")
+        print(f"    (declared in {declared_in} → tests.text_diff_subset)")
+
     def check_tests(self) -> CheckResult:
         """Run pytest tests, or a project-supplied custom test runner if present."""
         custom_runner = self._find_custom_test_runner()
@@ -366,9 +541,21 @@ class GateSystem:
                 str(src_dir) + os.pathsep + env.get("PYTHONPATH", "")
             )
 
+        # A text-only diff runs the declared text-reading subset instead of
+        # the whole tree (#269) — nothing that could fail on the change is
+        # skipped, the other ~8,600 tests simply are not asked.
+        fast_path = self._text_diff_fast_path()
+        if fast_path is None:
+            targets = ["tests/"]
+            scope = None
+        else:
+            changed, targets, source = fast_path
+            self._print_text_diff_notice(changed, targets, source)
+            scope = TEXT_DIFF_SCOPE
+
         # Run pytest and capture output
         result = subprocess.run(
-            [python_cmd, "-m", "pytest", "tests/", "-x", "--tb=short", "-q",
+            [python_cmd, "-m", "pytest", *targets, "-x", "--tb=short", "-q",
              "--ignore=tests/test_container_build.py"],
             capture_output=True,
             text=True,
@@ -389,11 +576,20 @@ class GateSystem:
                 if match:
                     test_count = f"{match.group(1)} tests"
 
+            if scope is not None:
+                message = f"{scope}: {test_count} passed"
+                details = [f"ran: {', '.join(targets)}"]
+            else:
+                message = f"All {test_count} passed"
+                details = None
+
             return CheckResult(
                 name="Python Tests",
                 status=CheckStatus.PASSED,
-                message=f"All {test_count} passed",
+                message=message,
+                details=details,
                 full_output=combined_output,
+                scope=scope,
             )
         else:
             # Look for failure patterns in output
@@ -418,12 +614,17 @@ class GateSystem:
             if not failures:
                 failures = ["Test suite failed - run pytest for details"]
 
+            if scope is not None:
+                failures = [f"ran: {', '.join(targets)}"] + failures
+
             return CheckResult(
                 name="Python Tests",
                 status=CheckStatus.FAILED,
-                message="Tests failed",
+                message="Tests failed" if scope is None
+                        else f"Tests failed ({scope})",
                 details=failures[:5],  # Show first 5 failures
                 full_output=combined_output,
+                scope=scope,
             )
 
     @staticmethod
@@ -540,35 +741,89 @@ class GateSystem:
             full_output=combined_output,
         )
 
-    def _load_secrets_ignore_patterns(self) -> List[str]:
-        """Load secrets-check ignore globs from the work-repo project info.
+    def _gate_config_sources(self, repo_local: bool = True
+                             ) -> List[Tuple[Path, Dict[str, Any]]]:
+        """Every readable gate-check config, in precedence order.
 
-        Reads `{LMER_WORK_REPO_PATH}/{LMER_REPO_HOST}/{LMER_REPO_PROJECT}/info/gate-check.yaml`
-        and returns the `secrets.ignore` list. Returns an empty list if the
-        file is absent or the env vars are not set — the config is optional.
+        1. `{project_root}/.lmer/gate-check.yaml` — the target repo's own
+           declaration. Settings that name that repo's files (the text-diff
+           test subset) belong beside them and version with them, and this is
+           the only location a CI runner is guaranteed to have.
+        2. `{LMER_WORK_REPO_PATH}/{host}/{project}/info/gate-check.yaml` — the
+           work repo's project info, where the secrets ignore list lives.
+
+        `repo_local=False` drops source 1, for settings that must NOT be
+        readable from the gated repo: source 1 is inside the tree the agent
+        is editing, so anything read from it is a setting the gated code can
+        rewrite about its own gating. It is right for the test subset (naming
+        a repo's own tests is a claim the guard test re-derives) and wrong for
+        `secrets.ignore`, which silences a check.
+
+        A missing file, unreadable file or unparseable YAML contributes
+        nothing; this never raises. Lookup is per key (_gate_config_lookup),
+        so a repo-local file that declares only `tests` does not hide a
+        `secrets` block in the work repo.
         """
+        search_dirs = [self.project_root / ".lmer"] if repo_local else []
         info_dir = project_info_dir()
-        if info_dir is None:
-            return []
+        if info_dir is not None:
+            search_dirs.append(info_dir)
 
-        config_path = None
-        for candidate in ("gate-check.yaml", "gate-check.yml"):
-            candidate_path = info_dir / candidate
-            if candidate_path.is_file():
-                config_path = candidate_path
+        sources: List[Tuple[Path, Dict[str, Any]]] = []
+        for directory in search_dirs:
+            for candidate in ("gate-check.yaml", "gate-check.yml"):
+                config_path = directory / candidate
+                if not config_path.is_file():
+                    continue
+                try:
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        config = yaml.safe_load(f)
+                except (IOError, OSError, yaml.YAMLError):
+                    break
+                if isinstance(config, dict):
+                    sources.append((config_path, config))
                 break
+        return sources
 
-        if config_path is None:
+    def _gate_config_lookup(self, *keys: str, repo_local: bool = True
+                            ) -> Tuple[Any, Optional[Path]]:
+        """First value found at `keys` across the config sources, and its file.
+
+        `repo_local` is passed through to _gate_config_sources — the caller
+        decides whether the gated repo may answer for this key.
+
+        Returns (None, None) when no source carries the key path.
+        """
+        for config_path, config in self._gate_config_sources(repo_local):
+            value: Any = config
+            for key in keys:
+                if not isinstance(value, dict) or key not in value:
+                    value = None
+                    break
+                value = value[key]
+            if value is not None:
+                return value, config_path
+        return None, None
+
+    def _load_secrets_ignore_patterns(self) -> List[str]:
+        """Load secrets-check ignore globs from the work repo's project info.
+
+        Work-repo-only, deliberately: this list is what silences
+        `check_secrets`, so honoring a copy inside the gated repo would let
+        the repo being scanned (or an agent editing it) add
+        `secrets: {ignore: ["**/*"]}` to `.lmer/gate-check.yaml` and turn the
+        check off. The work repo is outside the tree under review, which is
+        the property the allowlist rests on.
+
+        Returns the `secrets.ignore` list, or an empty list when no config
+        declares one — the setting is optional. A non-list value (a bare
+        string) is ignored rather than iterated: `for p in "*"` yields the
+        pattern `*`, which would match every path and silence the scan.
+        """
+        ignore, _ = self._gate_config_lookup("secrets", "ignore",
+                                             repo_local=False)
+        if not isinstance(ignore, list):
             return []
-
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f) or {}
-        except (IOError, yaml.YAMLError):
-            return []
-
-        secrets_cfg = config.get("secrets") or {}
-        ignore = secrets_cfg.get("ignore") or []
         return [str(p) for p in ignore if isinstance(p, str)]
 
     def check_secrets(self) -> CheckResult:
@@ -976,9 +1231,10 @@ class GateSystem:
 
         On a failing run: the names of the critically failed checks. On a
         passing run: the test runner's own tail line (the pytest summary)
-        when one is parseable from the tests check's captured output. None
-        when neither exists — the receipt's `summary` field is then simply
-        absent, never fabricated.
+        when one is parseable from the tests check's captured output, tagged
+        with the run's scope when it was narrowed (#269) so a reader can tell
+        a subset run from a full one. None when neither exists — the
+        receipt's `summary` field is then simply absent, never fabricated.
         """
         failed = [
             result.name for result in self.results
@@ -991,6 +1247,8 @@ class GateSystem:
                 for line in reversed(result.full_output.splitlines()):
                     line = line.strip().strip("=").strip()
                     if PYTEST_SUMMARY_RE.search(line):
+                        if result.scope:
+                            return f"{result.scope}: {line}"
                         return line
         return None
 
@@ -1104,6 +1362,18 @@ class GateSystem:
             return None
         return path
 
+    def _critical_failures_so_far(self) -> List[str]:
+        """Names of the critical checks that have already failed this run.
+
+        The fail-fast trigger for the test suite (#269): once one of these
+        exists the gate is already blocked, so the suite's verdict cannot
+        change the outcome — only how long the developer waits to hear it.
+        """
+        return [
+            result.name for result in self.results
+            if result.status == CheckStatus.FAILED and result.is_critical
+        ]
+
     def run_commit_gate(self, skip_tests: bool = False) -> bool:
         """Run all checks for commit gate.
 
@@ -1111,18 +1381,24 @@ class GateSystem:
         are responsible for any caller-specific user-facing rationale (e.g.
         gate-commit prints a QUICK_GATE_COMMIT hint before invoking).
         """
+        # Cheapest-first, with the suite always last (#269). The suite is
+        # ~10 minutes and every other check is seconds, so this ordering plus
+        # the fail-fast below is what keeps a formatting failure from costing
+        # a full suite run. Only the suite is short-circuited: every cheap
+        # check still runs to completion, so one pass surfaces every cheap
+        # problem rather than one problem per pass.
         checks = [
             self.check_git_status,
             self.check_staged_files,  # Check for git add -A abuse
             self.check_branch,
-            self.check_tests,
-            self.check_precommit,
             self.check_secrets,
-            self.check_code_quality,
-            self.check_documentation,
-            self.check_changelog,
-            self.check_deliverable_formats,
             self.check_permissions,
+            self.check_deliverable_formats,
+            self.check_changelog,
+            self.check_documentation,
+            self.check_code_quality,
+            self.check_precommit,
+            self.check_tests,
         ]
 
         if skip_tests:
@@ -1133,6 +1409,25 @@ class GateSystem:
             checks.remove(self.check_tests)
 
         for check in checks:
+            if check == self.check_tests:
+                blockers = self._critical_failures_so_far()
+                if blockers:
+                    print(f"{Colors.YELLOW}⏭️  Skipping Python Tests — "
+                          f"{len(blockers)} earlier check(s) failed "
+                          f"({', '.join(blockers)}){Colors.NC}")
+                    print("    Fix those first; the suite has not been run.")
+                    # Recorded as a result, not merely printed: the terminal
+                    # scrolls, but print_results, the gate-check log and the
+                    # receipt all read this list — a reader has to be able to
+                    # tell "suite green" from "suite never ran".
+                    self.results.append(CheckResult(
+                        name="Python Tests",
+                        status=CheckStatus.SKIPPED,
+                        message="Not run — earlier failures: "
+                                + ", ".join(blockers),
+                    ))
+                    continue
+
             print(f"Running {check.__name__.replace('check_', '').replace('_', ' ').title()}...")
             result = check()
             self.results.append(result)
@@ -1593,6 +1888,19 @@ class GateSystem:
             print(f"{Colors.GREEN}✅ Push target allowed{Colors.NC} "
                   f"({remote}): {url} [{target_ref}]")
             print(f"   granted by '{entry}' from {source}")
+
+        # What a push changes is the commit range, so hand the tests check a
+        # base to diff against (#269). Only the current-branch default earns
+        # one: _changed_paths diffs the base against HEAD, and HEAD is the
+        # range being pushed ONLY when the push is "this branch". An explicit
+        # `--ref` may name another branch, or a `<src>:<dst>` refspec whose
+        # src is another branch — bin/gate-push hands that refspec to git
+        # verbatim — so classifying HEAD there would narrow the suite for a
+        # diff the push does not contain. Any explicit ref (branch, tag or
+        # refspec) therefore leaves the base unset and the fast path off.
+        self.in_push_gate = True
+        if ref is None and not by_url:
+            self.push_diff_base = f"{remote}/{target_ref[len('refs/heads/'):]}"
 
         # Run commit gate checks first
         return self.run_commit_gate()
