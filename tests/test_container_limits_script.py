@@ -16,8 +16,24 @@ SCRIPT = REPO_ROOT / "Ctl" / "container" / "container-limits.sh"
 
 
 def _source(root, shell_opts=""):
-    """Source the script against ``root`` and return (returncode, CONTAINER_LIMITS)."""
-    script = f'{shell_opts}. "$1" "$2" && printf %s "$CONTAINER_LIMITS"'
+    """Source the script against ``root`` and return (returncode, CONTAINER_LIMITS).
+
+    The ``.`` is a whole command of the list, not the left side of an ``&&``:
+    a command on the left of ``&&`` runs with errexit suppressed, so under
+    ``set -e`` that shape would swallow the very abort these tests look for.
+    ~/.bashrc sources the script as the right side of one, where errexit is
+    live.
+
+    That shape costs the status, though: the last command of the list is the
+    ``printf``, which succeeds whatever the sourcing returned, so a non-zero
+    status from the script would reach the caller as 0 unless errexit had
+    already aborted the shell. ``rc=$?`` right after the ``.`` keeps it, and
+    the closing ``exit $rc`` makes it the subprocess's status — without
+    putting the ``.`` back where errexit is suppressed.
+    """
+    script = (
+        f'{shell_opts}. "$1" "$2"; rc=$?; printf %s "$CONTAINER_LIMITS"; exit $rc'
+    )
     result = subprocess.run(
         ["bash", "-c", script, "bash", str(SCRIPT), str(root)],
         env={"PATH": "/usr/bin:/bin"},
@@ -163,6 +179,26 @@ def test_sourcing_leaves_no_helper_functions_behind(cgroup_v1):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == "", f"helper functions leaked: {result.stdout}"
+
+
+def test_the_value_reaches_child_processes(cgroup_v1):
+    """The readers are the commands the session shell runs, not the shell.
+
+    Every other test reads the variable in the sourcing shell, where a plain
+    assignment and an export look alike. The env is replaced rather than
+    extended because the ambient container env already carries an exported
+    CONTAINER_LIMITS, which would satisfy the child on its own.
+    """
+    read_in_child = '. "$1" "$2"; bash -c \'printf %s "$CONTAINER_LIMITS"\''
+    result = subprocess.run(
+        ["bash", "-c", read_in_child, "bash", str(SCRIPT), str(cgroup_v1)],
+        env={"PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "CPU:1core Memory:2GiB Processes:32000"
 
 
 def test_executing_prints_the_value(cgroup_v1):

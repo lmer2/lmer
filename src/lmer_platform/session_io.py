@@ -913,7 +913,7 @@ def send_input(
     logged: an answer routinely contains whatever the operator was asked for.
 
     *sanitize* says the payload is a message a human typed into a chat composer,
-    which lets the supervisor defuse the one shape a TUI reads as a command
+    which lets the supervisor defuse the shapes a TUI reads as a command
     rather than as text (``lmer_cli.supervisor._sanitize_user_chat``). Off by
     default and only put on the wire when set: a caller typing bytes on
     something else's behalf — the terminal's keystrokes, an injected command —

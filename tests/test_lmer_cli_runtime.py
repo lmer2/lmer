@@ -21,6 +21,7 @@ from lmer_cli.runtime import (
     build_container_env,
     _available_controllers,
     _resolve_cpus,
+    _resolve_limit_env,
     _resolve_memory,
     _resolve_pids_limit,
     _user_cgroup_controllers_path,
@@ -332,6 +333,20 @@ class TestResolvePidsLimit:
         with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "1024.5"}):
             assert _resolve_pids_limit() == DEFAULT_PIDS_LIMIT
 
+    def test_accepted_value_is_normalised(self):
+        """An in-grammar spelling reaches the runtime as the integer it names,
+        not as typed — the validator returns a value, not a verdict."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "+5"}):
+            assert _resolve_pids_limit() == "5"
+
+    def test_invalid_value_warns(self, capsys):
+        """The rejection is loud: it names the variable and the default used."""
+        with patch.dict(os.environ, {"LMER_PIDS_LIMIT": "0"}):
+            _resolve_pids_limit()
+        out = capsys.readouterr().out
+        assert "LMER_PIDS_LIMIT" in out
+        assert DEFAULT_PIDS_LIMIT in out
+
 
 class TestResolveCpus:
     """Test LMER_CPUS parsing for the container --cpus value."""
@@ -532,6 +547,53 @@ class TestResolveMemory:
         out = capsys.readouterr().out
         assert "LMER_MEMORY" in out
         assert DEFAULT_MEMORY in out
+
+
+class TestResolveLimitEnv:
+    """The shared skeleton the three limit resolvers are built on (issue #271).
+
+    Per-limit grammars are covered by the classes above; these pin the seam
+    the consolidation introduced — what a validator's return value means, and
+    that rejection is still warn-and-default rather than an abort.
+    """
+
+    def test_unset_does_not_consult_the_validator(self):
+        """No override is not a misconfiguration: the default is used and the
+        grammar is never asked, so an unset variable cannot warn."""
+        consulted = []
+
+        def validator(raw):
+            consulted.append(raw)
+            return raw
+
+        with patch.dict(os.environ, {"LMER_FAKE_LIMIT": "   "}):
+            assert _resolve_limit_env("LMER_FAKE_LIMIT", "7", validator, "hint") == "7"
+        assert consulted == []
+
+    def test_validator_return_value_is_what_reaches_the_runtime(self):
+        """The validator returns the value to pass, not a verdict: one that
+        normalises (as _valid_pids_limit does) must not be reduced to
+        pass/fail, or '+5' would reach the runtime as typed."""
+        with patch.dict(os.environ, {"LMER_FAKE_LIMIT": "  +5  "}):
+            resolved = _resolve_limit_env(
+                "LMER_FAKE_LIMIT", "7", lambda raw: str(int(raw)), "hint"
+            )
+        assert resolved == "5"
+
+    def test_rejection_warns_and_defaults(self, capsys):
+        """None means rejected — warn and fall back, never abort the launch and
+        never pass the value through. The warning carries the variable, what
+        was read, the grammar it failed, and the default that took its place."""
+        with patch.dict(os.environ, {"LMER_FAKE_LIMIT": "bogus"}):
+            resolved = _resolve_limit_env(
+                "LMER_FAKE_LIMIT", "7", lambda raw: None, "must be a positive widget"
+            )
+        assert resolved == "7"
+        out = capsys.readouterr().out
+        assert "LMER_FAKE_LIMIT" in out
+        assert "'bogus'" in out
+        assert "must be a positive widget" in out
+        assert "using default 7" in out
 
 
 class TestContainerEnv:

@@ -33,6 +33,21 @@ gitlab-review myorg/myproject 123 --all-comments
 gitlab-review myorg/myproject 123 --resolve-thread <discussion_id>
 ```
 
+### Reply Inside a Thread
+```bash
+# Reply into an existing MR discussion thread (body comes from a file)
+gitlab-review myorg/myproject 123 --reply-thread <discussion_id> --comment-file reply.md
+
+# Reply and resolve in one invocation (reply is posted first)
+gitlab-review myorg/myproject 123 --reply-thread <discussion_id> --comment-file reply.md --resolve-thread <discussion_id>
+```
+
+Discussion IDs are full 40-character SHA1s — copy them from `--comments`
+output. A truncated ID is rejected up front (the API would otherwise return
+a bare 404 that reads like a token-scope failure). Only inline (diff)
+threads are resolvable; resolving a general/summary thread is refused with
+an explanation rather than an API error. Replying works on any thread type.
+
 ### Post Review Comments
 
 Post reviews to merge requests using a JSON file containing all review data:

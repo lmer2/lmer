@@ -63,26 +63,18 @@
 // of a warning underneath a working one. The question itself stays on the page as
 // a record, for the same reason a closed one does.
 //
-// What the agent wrote is rendered, what you replied is not — the same split the
-// conversation view makes, for the same two reasons. A note posted here is written
-// like a message to a person (options as a list, a command in backticks) and shown
-// verbatim it is a wall of punctuation; a reply of yours went to the session as
-// bytes, and a line that quietly ate a pair of asterisks would be misreporting
-// what it got. Markdown.vue is the renderer, shared with the chat, and it is one
-// component for a reason its header explains.
+// What one entry looks like is not decided here: AskEntry.vue draws it, for both
+// views, and its header says why that had to stop being a copy. Which entries are
+// drawn, and what may be done with one, is this file's whole subject.
 
 import {
-  computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch,
+  computed, onBeforeUnmount, onMounted, ref, watch,
 } from 'vue'
-import { mdiInformationOutline, mdiNotificationClearAll } from '@mdi/js'
+import { mdiNotificationClearAll } from '@mdi/js'
 import AskBox from './AskBox.vue'
+import AskEntry from './AskEntry.vue'
 import { fetchSessionAsk } from '../api.js'
 import { clearedIds, rememberCleared } from '../dismissals.js'
-import { ago, askEntryLabel, askPartColor } from '../format.js'
-
-// Deferred into its own chunk, like every other consumer of it — Markdown.vue's
-// header says why, and why nothing is drawn until it lands.
-const Markdown = defineAsyncComponent(() => import('./Markdown.vue'))
 
 const props = defineProps({
   sessionId: { type: String, required: true },
@@ -163,13 +155,6 @@ function clear() {
   dismissed.value = rememberCleared(
     props.sessionId, recent.value.map((entry) => entry.id),
   )
-}
-
-// The reason the agent gave for closing a question, if it gave one — rendered
-// inline inside the sentence below rather than shown alone, because on its own a
-// clause like "took the safe branch" reads as something the operator did.
-function closureReason(entry) {
-  return entry.closure?.reason || ''
 }
 
 async function load() {
@@ -254,74 +239,20 @@ watch(() => props.live, start)
 
     <v-card v-if="recent.length" class="mb-3">
       <v-card-text>
-        <!-- One card per entry, inside the dock's own (#254). They were separated
-             by a margin and nothing else, and the operator read the result as one
-             thing: "messages look like the kinda flow into each other". Outlined
-             rather than elevated or tonal, and the record's own reasoning — the
-             outer card is the container and carries the shadow, so an entry needs
-             an edge rather than a second one. The same shape as AskHistory.vue,
-             because these are the same entries. -->
-        <v-card
+        <!-- One card per entry, inside the dock's own, and drawn by the component
+             the record draws them with (#254, #274): these are the same entries,
+             and a dock that separated them where the record did not would be one
+             channel read two ways. What this view asks it for is the one line the
+             record has no use for — that a reply can no longer be delivered, which
+             here stands where the box would have been. -->
+        <AskEntry
           v-for="entry in recent"
           :key="entry.id"
-          class="entry"
-          variant="outlined"
-        >
-          <v-card-text class="py-2">
-            <div class="d-flex ga-2 align-center text-body-small text-medium-emphasis">
-              <v-icon
-                v-if="entry.kind === 'note'"
-                :icon="mdiInformationOutline"
-                size="small"
-              />
-              <span>{{ askEntryLabel(entry, live) }}</span>
-              <span :title="entry.at || ''">{{ ago(entry.at, now) }}</span>
-            </div>
-
-            <!-- Which half of the exchange starts here, in a word, coloured from
-                 format.js so the record cannot disagree with it. Not on a note: a
-                 note is one voice saying one thing, and labelling it "QUESTION"
-                 would promise an answer that is never coming. -->
-            <div
-              v-if="entry.kind !== 'note'"
-              class="part"
-              :class="`text-${askPartColor('question')}`"
-            >QUESTION</div>
-
-            <Markdown :text="entry.text" class="text-body-medium said" />
-
-            <!-- The label leans with the words it labels, so the reply reads as one
-                 block on its own side rather than as a heading over a stray line.
-                 "you" stays on the line under it: the label says which half of the
-                 exchange this is, and that is not the same fact as whose words they
-                 are. -->
-            <template v-if="entry.answer">
-              <div
-                class="part reply"
-                :class="`text-${askPartColor('answer')}`"
-              >ANSWER</div>
-              <p class="text-body-medium said plain reply">
-                you: {{ entry.answer.text }}
-              </p>
-            </template>
-
-            <!-- Only when there is no answer: one that raced the close is the
-                 answer to show, and saying "stopped waiting" under it would read
-                 as if the reply had been thrown away. The agent's own reason is
-                 rendered inline — it is prose, and this is a line. -->
-            <p
-              v-if="entry.closed && !entry.answered"
-              class="text-body-small text-medium-emphasis mb-0"
-            >
-              The session stopped waiting for this<template
-                v-if="closureReason(entry)"
-              >: <Markdown
-                :text="closureReason(entry)"
-                inline
-              /></template>. A reply can no longer reach it.
-            </p>
-          </v-card-text>
-        </v-card>
+          :entry="entry"
+          :live="live"
+          :now="now"
+          unreachable
+        />
 
         <!-- Clearing is a view operation and the button says which view: what
              leaves is this dock, and the channel is untouched. Offered only when
@@ -346,52 +277,3 @@ watch(() => props.live, start)
     </p>
   </div>
 </template>
-
-<style scoped>
-.entry {
-  margin-bottom: 12px;
-  min-width: 0;
-}
-
-/* The word that names a half of the exchange (#254). Small, spaced and heavier than
-   the body, so it reads as a label rather than as the first line of the message —
-   which is also why it is the label that is coloured and the message never is: the
-   operator asked for exactly that ("i don't think color code the text entirely").
-   The colour itself comes from format.js, because the record says the same words in
-   the same ink. Same rule there, like every other rule these two views share. */
-.part {
-  font-size: 0.72rem;
-  font-weight: 600;
-  letter-spacing: 0.09em;
-  margin-top: 6px;
-}
-
-/* Both halves of an entry sit in the same column with the same spacing; the class
-   reaches the rendered one because a child component's root element carries its
-   parent's scope attribute too. `anywhere` so a path or URL in a note does not
-   scroll the page sideways on a phone (Markdown.vue restates it for the text it
-   injects, which this rule cannot reach). */
-.said {
-  overflow-wrap: anywhere;
-  margin: 2px 0 4px;
-}
-
-/* Only the verbatim half needs this: channel text carries its own newlines, and
-   collapsing them would run a reply typed as a list into one paragraph. On
-   rendered markup it would instead show the newlines *between* block tags as
-   blank lines. Same class name as the conversation view, same meaning. */
-.said.plain {
-  white-space: pre-wrap;
-}
-
-/* The reply leans right — the label above it with it — so "you" and the agent read
-   as two sides here the way they do in the conversation. It is the text that leans
-   because there is still no bubble to lean: an entry's card holds both halves of one
-   exchange rather than one turn each. That is also the whole of what makes it
-   acceptable — a reply here is one short line, while the conversation's own turns
-   lean as containers and keep their words left-aligned, because justified prose is
-   what the operator has to read back. */
-.reply {
-  text-align: end;
-}
-</style>

@@ -2266,6 +2266,85 @@ class TestCli:
 
 
 # ---------------------------------------------------------------------------
+# First-column escapes (the data behind the chat defusal)
+# ---------------------------------------------------------------------------
+
+
+class TestFirstColumnEscapes:
+    """The escape sets are data, so what is tested here is the data's shape.
+
+    ``#272``: the defusal was written against a single literal ``!`` and every
+    other first-column escape of the same input box — ``#`` for memory, ``/``
+    for commands — went through untouched. Which characters a given TUI grabs is
+    a fact about that TUI, so it lives in
+    :data:`~lmer_cli.supervisor.HARNESS_FIRST_COLUMN_ESCAPES` and a newly found
+    one is an edit to that mapping. These tests hold the properties the
+    transform needs from whatever the mapping ends up saying.
+    """
+
+    def test_the_prefix_is_not_itself_an_escape_anywhere(self):
+        """The whole mechanic: the prefix takes the first column, so the prefix's
+        own first character must be a character no input box grabs. Adding one to
+        a set — say a harness that reads a leading ``.`` — turns every defusal
+        into a different command, silently, and this is where that shows up.
+        """
+        first = supervisor.DEFUSAL_PREFIX[:1]
+        for harness, escapes in supervisor.HARNESS_FIRST_COLUMN_ESCAPES.items():
+            assert first not in escapes, (
+                f"{harness} reads {first!r} in the first column, so the defusal "
+                f"prefix would hand it a command"
+            )
+
+    def test_a_prefix_that_is_itself_an_escape_is_refused_loudly(self):
+        """And it shows up at import, not at the next chat message: the check runs
+        over the mapping as written, so a data change that breaks the property
+        cannot reach a session — the module fails to load.
+        """
+        with pytest.raises(RuntimeError, match=r"first-column escape"):
+            supervisor._check_first_column_escapes(
+                {"claude": frozenset({"!", "."})}, ". "
+            )
+
+    def test_a_prefix_that_whitespace_trimming_could_eat_is_refused(self):
+        """The other half of the assumption (#254): a leading space is only a
+        defusal if the input box preserves it. A prefix that starts with
+        whitespace is a no-op against any implementation that trims before
+        testing the first character, and a no-op defusal is invisible.
+        """
+        with pytest.raises(RuntimeError, match=r"whitespace"):
+            supervisor._check_first_column_escapes(
+                supervisor.HARNESS_FIRST_COLUMN_ESCAPES, " "
+            )
+
+    def test_every_escape_is_one_visible_character(self):
+        """An empty string is in every string's prefix set, so an empty entry
+        would defuse *every* message including the empty one; a multi-character
+        entry would never match a single first character and would read as
+        protection that is not there.
+        """
+        with pytest.raises(RuntimeError, match=r"single"):
+            supervisor._check_first_column_escapes({"claude": frozenset({""})}, ". ")
+        with pytest.raises(RuntimeError, match=r"single"):
+            supervisor._check_first_column_escapes(
+                {"claude": frozenset({"/quit"})}, ". "
+            )
+
+    @pytest.mark.parametrize("harness", ["codex", "pi", "acme"])
+    @pytest.mark.parametrize("char", ["!", "#", "/"])
+    def test_a_harness_without_a_recorded_set_is_a_passthrough(self, harness, char):
+        """Absent from the mapping means untouched, whether the harness is a
+        registry one whose set is not established yet (codex, pi — their ``/``
+        escape is recorded but not the inertness of a leading ``. `` in their
+        composers) or a user-defined one from ``~/.lmer/harnesses`` that this
+        mapping has never heard of. Same answer this function gave every
+        non-claude harness before the mapping existed.
+        """
+        assert harness not in supervisor.HARNESS_FIRST_COLUMN_ESCAPES
+        message = f"{char}206 was merged"
+        assert supervisor._sanitize_user_chat(message, harness) == message
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app behavior
 # ---------------------------------------------------------------------------
 
@@ -2600,8 +2679,50 @@ class TestFastApiApp:
             f"the flag was honored only on the submit path: {sink}"
         )
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "#254 is done",
+            "/help me read this backtrace",
+        ],
+    )
+    def test_the_other_first_column_escapes_are_defused_too(
+        self, monkeypatch, message
+    ):
+        """#272: ``!`` was never the only one.
+
+        Claude Code's input box also reads a first-column ``#`` as "write this to
+        memory" and a first-column ``/`` as a slash command, and both are as
+        reachable from operator prose as the bash escape was — "#254 is done" is
+        a sentence about an issue, "/help me read this backtrace" a request. The
+        defusal now asks the harness's escape set rather than testing one
+        literal, so all three take the same ``. `` prefix and the message is read
+        as words.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+
+        resp = self._client(app).post(
+            "/input",
+            json={"data": message, "append_newline": True, "sanitize": True},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [f". {message}".encode(), b"\r"], (
+            f"{message!r} reached the TUI as a command: {sink}"
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "!206 was merged",
+            "#254 is done",
+            "/help me read this backtrace",
+        ],
+    )
     def test_the_receipt_covers_what_was_sent_and_not_what_was_typed(
-        self, monkeypatch
+        self, monkeypatch, message
     ):
         """The receipt is the sender's proof the wire was clean (#197), and the
         sender hashes what IT sent — so the transform has to happen after the
@@ -2609,6 +2730,10 @@ class TestFastApiApp:
         sanitized message a "the control plane acknowledged different bytes"
         alarm in :func:`lmer_platform.session_io.send_input`, which is worded to
         mean corruption in transit.
+
+        Over every escape the harness has (#272), because they all reach the
+        write through this one path: a receipt that described the typed bytes for
+        ``!`` and the transformed bytes for ``#`` would be two contracts.
         """
         monkeypatch.setenv("LMER_HARNESS", "claude")
         monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
@@ -2617,16 +2742,17 @@ class TestFastApiApp:
         body = self._client(app).post(
             "/input",
             json={
-                "data": "!206 was merged",
+                "data": message,
                 "append_newline": True,
                 "sanitize": True,
             },
             headers={"Authorization": "Bearer test-token"},
         ).json()
 
-        assert sink[0] == b". !206 was merged", "the transform did not run at all"
-        assert body["payload_sha256"] == hashlib.sha256(b"!206 was merged").hexdigest()
-        assert body["payload_length"] == len(b"!206 was merged")
+        typed = message.encode()
+        assert sink[0] == b". " + typed, "the transform did not run at all"
+        assert body["payload_sha256"] == hashlib.sha256(typed).hexdigest()
+        assert body["payload_length"] == len(typed)
         # And the gap that leaves between the receipt and the write is the
         # transform, two bytes of it, plus this path's submit CR. Pinned because
         # somebody reconciling a write against a receipt has to be able to read
@@ -2636,14 +2762,29 @@ class TestFastApiApp:
         )
 
     @pytest.mark.parametrize("harness", ["codex", "pi"])
-    def test_only_claudes_input_box_reads_a_leading_bang_as_a_command(
-        self, monkeypatch, harness
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "!206 was merged",
+            "#254 is done",
+            "/workspace/src is where it lives",
+        ],
+    )
+    def test_a_harness_without_a_recorded_set_is_left_alone(
+        self, monkeypatch, harness, message
     ):
         """The flag says "a human typed this in a chat composer" — true whatever
-        is running — and this is where that fact meets the harness. The escape is
-        Claude Code's; another TUI takes the ``!`` as the first character of a
-        sentence, and a prefix this end added would be a message the operator did
-        not write.
+        is running — and this is where that fact meets the harness. The mapping
+        names claude and nothing else, so codex and pi take this path for every
+        character: their payload is written as typed, which is what they got
+        before the mapping existed.
+
+        Their ``/`` is a real escape on this tree's record
+        (:mod:`lmer_cli.container.prompt_templates`), and it is still not defused
+        here — the transform needs the *other* half too, that a leading ``. `` is
+        inert in that composer, and for these two that is unestablished. A prefix
+        added on a guess about another program's input box would be a message the
+        operator did not write.
         """
         monkeypatch.setenv("LMER_HARNESS", harness)
         monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
@@ -2652,14 +2793,14 @@ class TestFastApiApp:
         resp = self._client(app).post(
             "/input",
             json={
-                "data": "!206 was merged",
+                "data": message,
                 "append_newline": True,
                 "sanitize": True,
             },
             headers={"Authorization": "Bearer test-token"},
         )
         assert resp.status_code == 200
-        assert sink == [b"!206 was merged", b"\r"], (
+        assert sink == [message.encode(), b"\r"], (
             f"{harness} got a message nobody typed: {sink}"
         )
 
@@ -2670,14 +2811,36 @@ class TestFastApiApp:
         exception. A ``!`` anywhere but the first character is punctuation, and
         text that came out with ``. `` in front of it would be a quiet edit of the
         operator's words on the way through — visible in the transcript, and about
-        a trigger that was never there.
+        a trigger that was never there. Same for ``#`` and ``/`` (#272): "MR !206"
+        and "fixed in #254" and "src/lmer_cli" are prose wherever the character
+        sits except column one.
+
+        ``@`` is in none of the sets and belongs in none: claude reads it as a
+        file reference *anywhere* in a message, which makes it not a first-column
+        escape at all — it is not hijacking the message, it is doing what the
+        operator typed it for, and defusing it would break the reference.
+
+        The leading-space case is the raw-payload rule (#254): the test is on the
+        payload as sent, without stripping, so ``" !206"`` does not have ``!`` in
+        the first column and is not touched. Anything that trims before typing
+        would make that wrong, which is why the prefix is a ``.`` rather than a
+        space — surviving a trim is the property the transform rests on.
         """
         monkeypatch.setenv("LMER_HARNESS", "claude")
         monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
         app, _buf, sink = self._build()
         client = self._client(app)
 
-        for message in ("206 was merged", "merged !206", "yes!", ""):
+        for message in (
+            "206 was merged",
+            "merged !206",
+            "yes!",
+            "",
+            "fixed in #254",
+            "look in src/lmer_cli/supervisor.py",
+            "@AGENTS.md says otherwise",
+            " !206 was merged",
+        ):
             sink.clear()
             resp = client.post(
                 "/input",

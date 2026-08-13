@@ -243,6 +243,71 @@ def _spawn_and_reap():
     return proc.pid
 
 
+# ---- zombies --------------------------------------------------------------------
+#
+# A gate usually runs as a child of the session that then wants to commit, so a
+# gate that has exited but has not been waited on still answers kill(pid, 0).
+# Counting that as alive deferred every work-repo commit behind a finished gate,
+# and a deferral exits zero, so it did it silently (issue #261).
+
+
+@pytest.fixture
+def zombie_pid():
+    """A real exited-but-unreaped child, reaped when the test is done."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not gate_lock._is_zombie(proc.pid):
+        time.sleep(0.02)
+    try:
+        assert gate_lock._is_zombie(proc.pid) is True, "expected an unreaped zombie"
+        yield proc.pid
+    finally:
+        proc.wait()
+
+
+class TestZombies:
+    def test_a_zombie_pid_reads_as_dead(self, zombie_pid):
+        assert gate_lock._pid_alive(zombie_pid) is False
+
+    def test_a_zombie_gates_marker_is_not_live_and_is_pruned(self, _lock_dir, zombie_pid):
+        path = _write_marker(_lock_dir, zombie_pid, started_at=time.time())
+        assert gate_lock.active_gate() is None
+        assert not path.exists()
+
+    def test_a_running_process_is_not_a_zombie(self):
+        assert gate_lock._is_zombie(os.getpid()) is False
+        assert gate_lock._pid_alive(os.getpid()) is True
+
+    def test_the_probe_degrades_where_proc_is_absent(self, monkeypatch):
+        # macOS has no /proc: fall back to the kill() answer instead of
+        # erroring, which is the pre-#261 behavior — a late deferral, never a
+        # crashed gate.
+        real_open = open
+
+        def no_proc(path, *args, **kwargs):
+            if str(path).startswith("/proc/"):
+                raise FileNotFoundError("/proc")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", no_proc)
+        assert gate_lock._is_zombie(os.getpid()) is False
+
+    def test_the_probe_tolerates_a_comm_containing_parens(self, monkeypatch, tmp_path):
+        # `comm` is parenthesised and may hold spaces and parens of its own, so
+        # the state code is read after the LAST ')'.
+        fake = tmp_path / "stat"
+        fake.write_text("4242 (gate (check) sh) Z 1 1 1\n", encoding="utf-8")
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if str(path).startswith("/proc/"):
+                return real_open(fake, *args, **kwargs)
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        assert gate_lock._is_zombie(4242) is True
+
+
 # ---- hold_gate_lock -------------------------------------------------------------
 
 

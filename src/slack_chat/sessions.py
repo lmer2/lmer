@@ -37,7 +37,15 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from lmer_cli.presets import Preset, preset_selector_vars, select_preset_name
+from dotenv import dotenv_values
+
+from lmer_cli.presets import (
+    PRESETS_FILE_ENV,
+    Preset,
+    load_presets,
+    preset_selector_vars,
+    select_preset_name,
+)
 
 logger = logging.getLogger("lmer_slack.sessions")
 
@@ -77,6 +85,11 @@ def listener_default_preset(
     Returns ``(None, None)`` when no variable selects anything. Resolving the
     name against the presets file is the caller's job — an undefined name is
     still "what is selected".
+
+    Reads *environ* and nothing else. The spawned CLI also seeds itself from
+    ``.env`` files, which is a tier no environment mapping shows;
+    :meth:`SessionManager.default_preset` builds the mapping that includes it
+    (issue #259) and is what callers with a manager in hand should use.
     """
     return select_preset_name(None, CHAT_TASK_ID, environ)
 
@@ -183,6 +196,124 @@ class SessionManager:
         )
         self.lmer_env_file = lmer_env_file or os.getenv("LMER_SLACK_CHAT_ENV_FILE")
         self._sessions: dict[tuple[str, str], Session] = {}
+
+    # ------------------------------------------------------------------
+    # Preset resolution
+    # ------------------------------------------------------------------
+
+    def _child_env_file_candidates(self) -> list[tuple[str, Path]]:
+        """The ``.env`` files the spawned CLI seeds itself from, in its order.
+
+        Mirrors what ``lmer`` builds for a spawn from here: the forwarded
+        ``--env-file`` first (gated on ``is_file()``, because a path that
+        exists but is not a regular file is warned about and skipped there
+        too), then the CLI's own defaults resolved against the *child's* cwd —
+        ``spawn_cwd``, not the listener's directory. The default tiers come
+        from the CLI's own builder so the list here cannot drift from the list
+        the child actually reads.
+        """
+        # Imported lazily: the CLI module is the whole lmer entry point, and
+        # the listener should not pay for it just to import this one.
+        from lmer_cli.cli import default_env_file_candidates
+
+        candidates: list[tuple[str, Path]] = []
+        if self.lmer_env_file:
+            explicit = Path(self.lmer_env_file).expanduser()
+            if explicit.is_file():
+                candidates.append(("--env-file", explicit))
+        return candidates + default_env_file_candidates(cwd=self.spawn_cwd)
+
+    def _seeded_child_env(
+        self, names: list[str], environ: Mapping[str, str] | None = None
+    ) -> dict[str, str]:
+        """Return *environ* with *names* seeded the way the spawned CLI seeds.
+
+        Stage one of the child's startup, modeled: for each candidate file in
+        the child's order, take a key only when it is *absent* from the
+        environment (a present-but-blank key is not seeded, which is what makes
+        the displacement in :meth:`spawn` hold) and its parsed value is not
+        ``None``. First-wins, so the process environment outranks every file
+        and earlier files outrank later ones — ``apply_env_file_defaults``'
+        rule, applied to a copy instead of to ``os.environ``.
+
+        Every variable the display has to reason about goes through here, so
+        "what the child would read" is decided in one place: the selectors for
+        :meth:`default_preset` (issue #259) and ``LMER_PRESETS_FILE`` for
+        :meth:`child_presets` (issue #279). Seeding is per key, so asking for
+        one name or for all of them gives each name the same value.
+
+        The one thing this cannot reproduce is a value that interpolates
+        ``${VAR}``: ``dotenv_values`` expands against the live ``os.environ``,
+        and the child expands against an ``os.environ`` that earlier tiers have
+        already seeded. Only the lower tiers can differ, and only for a
+        reference to a key an upper tier introduced.
+        """
+        env = dict(os.environ if environ is None else environ)
+        for _location, env_file in self._child_env_file_candidates():
+            unseeded = [name for name in names if name not in env]
+            if not unseeded:
+                break
+            try:
+                if not env_file.exists():
+                    continue
+                values = dotenv_values(dotenv_path=str(env_file))
+            except OSError:
+                # A tier that cannot be read cannot be modeled; skipping it
+                # costs at most a name in a log line, while raising would cost
+                # the spawn this resolution only annotates.
+                continue
+            for var in unseeded:
+                if values.get(var) is not None:
+                    env[var] = values[var]
+        return env
+
+    def default_preset(
+        self, environ: Mapping[str, str] | None = None
+    ) -> tuple[str | None, str | None]:
+        """Return the ``(name, source)`` of the default preset the child gets.
+
+        :func:`listener_default_preset` sees only an environment mapping, but
+        the spawned CLI resolves its preset *after* seeding that environment
+        from ``.env`` files — so a default living only in the forwarded
+        ``--env-file`` used to be applied by the child and reported here as
+        "none" (issue #259). This reproduces the child's own two-stage
+        resolution instead: :meth:`_seeded_child_env` for the selectors, then
+        the selector precedence over the seeded mapping, which is the order the
+        child evaluates in too — ``LMER_CHAT_PRESET`` before ``LMER_PRESET``,
+        both after every file tier. Doing it in this order is what makes a
+        scoped selector from a file outrank a generic one already exported,
+        exactly as it does for the child; resolving per tier instead would name
+        the wrong preset.
+
+        Names only. Whether the name is *defined* is :meth:`child_presets`,
+        which has to model the same tiers to answer honestly.
+        """
+        return listener_default_preset(
+            self._seeded_child_env(preset_selector_vars(CHAT_TASK_ID), environ)
+        )
+
+    def child_presets(
+        self, environ: Mapping[str, str] | None = None
+    ) -> dict[str, Preset]:
+        """Return the presets the spawned CLI would load, by its own tiers.
+
+        The availability half of :meth:`default_preset`, and it has to travel
+        the same road: ``LMER_PRESETS_FILE`` reaches the child through exactly
+        the tiers the selectors do — the forwarded ``--env-file`` included —
+        and the child loads its presets only after seeding from them. The
+        listener's own module-level presets come from the listener's
+        environment, which never reads that forwarded file, so a deployment
+        putting *both* the selector and the presets file there had its default
+        named correctly and then declared undefined: a confidently wrong "this
+        session will fail to start" about a session that starts fine (issue
+        #279).
+
+        Loading is forgiving exactly where the child's is: an unset, missing or
+        malformed file yields no presets. The warning that follows from that is
+        then true — the child finds nothing there either.
+        """
+        env = self._seeded_child_env([PRESETS_FILE_ENV], environ)
+        return load_presets(env.get(PRESETS_FILE_ENV, ""))
 
     # ------------------------------------------------------------------
     # Registry queries
@@ -308,9 +439,9 @@ class SessionManager:
         cmd += [CHAT_TASK_ID, permalink]
         displaced_name, displaced_source = (None, None)
         if preset is not None:
-            # Whatever the environment would have selected is displaced, so
-            # read it before blanking — the spawn log names it.
-            displaced_name, displaced_source = listener_default_preset(env)
+            # Whatever the child would have selected is displaced, so read it
+            # before blanking — the spawn log names it.
+            displaced_name, displaced_source = self.default_preset(env)
             # Blank, not absent: the child seeds its environment from .env
             # files first-wins, so deleting a selector only invites a file to
             # put the default back. Blanking runs before the preset's own env,
@@ -358,13 +489,15 @@ class SessionManager:
         # Name every preset in effect so a spawn log can never hide one
         # (issue #181): the token-selected preset, plus the listener-wide
         # default — logged as `displaced_default` when a token replaced it, and
-        # as `default_preset` when it is the one actually applying.
+        # as `default_preset` when it is the one actually applying. Both are
+        # resolved the way the child resolves, forwarded `.env` included, so
+        # the line reports the preset the session really got (issue #259).
         if preset is not None:
             default_key = "displaced_default"
             default_name, default_source = displaced_name, displaced_source
         else:
             default_key = "default_preset"
-            default_name, default_source = listener_default_preset(env)
+            default_name, default_source = self.default_preset(env)
         fields = {
             "channel": channel,
             "thread_ts": thread_ts,

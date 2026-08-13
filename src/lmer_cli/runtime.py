@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import Callable, List
 
 from .log import warning
 
@@ -233,54 +233,89 @@ def lmer_state_dir() -> Path:
     return _LMER_STATE_DIR
 
 
-def _resolve_pids_limit() -> str:
-    """Resolve the container ``--pids-limit`` value from ``LMER_PIDS_LIMIT``.
+def _resolve_limit_env(
+    name: str,
+    default: str,
+    validator: Callable[[str], str | None],
+    hint: str,
+) -> str:
+    """Resolve one container resource limit from ``name``, or warn and default.
 
-    Returns the value to hand to ``docker``/``podman`` ``--pids-limit``.
+    The shared skeleton behind :func:`_resolve_pids_limit`,
+    :func:`_resolve_cpus` and :func:`_resolve_memory`: read the variable,
+    strip it, and hand what remains to ``validator``. Unset or empty (after
+    stripping) is not a misconfiguration — it is the ordinary "no override"
+    case and yields ``default`` silently, without consulting ``validator``.
 
-    Rules:
-    - Unset/empty → :data:`DEFAULT_PIDS_LIMIT`.
-    - Any positive integer → that value (raise the cap on hosts affected by
-      the cgroup-v1 pids-controller leak).
-    - ``-1`` → ``"-1"`` (Docker/Podman "unlimited"; an escape hatch for badly
-      leaking hosts where any finite cap eventually fills with phantom
-      entries).
-    - Anything else — ``0``, other negatives, non-numeric — is rejected with a
-      warning and falls back to the default. A misconfigured value must never
-      silently weaken or disable the safety bound.
+    ``validator`` returns the string to hand the runtime rather than a bool,
+    so a limit whose accepted spelling differs from what was typed can
+    normalise it on the way through (``LMER_PIDS_LIMIT=' +5 '`` resolves to
+    ``5``); ``None`` means rejected. Each validator's docstring is the single
+    home for that limit's grammar and why it is drawn where it is.
+
+    Rejection is always warn-and-default — never an abort, never a
+    pass-through. That is the safety property these limits exist for: a
+    misconfigured value must not silently weaken or remove the bound, and it
+    must not stop a session from launching either. The warning therefore
+    names the variable, quotes what was read, states the grammar (``hint``)
+    and the default it fell back to.
     """
-    raw = os.environ.get("LMER_PIDS_LIMIT", "").strip()
+    raw = os.environ.get(name, "").strip()
     if not raw:
-        return DEFAULT_PIDS_LIMIT
+        return default
+    accepted = validator(raw)
+    if accepted is not None:
+        return accepted
+    warning(f"⚠️  Ignoring invalid {name}={raw!r} ({hint}); using default {default}")
+    return default
+
+
+def _valid_pids_limit(raw: str) -> str | None:
+    """Accept ``raw`` as a ``--pids-limit`` value, or None to reject it.
+
+    The grammar:
+
+    - any positive integer → that value. Raising the cap is the
+      host-kernel-agnostic mitigation for the cgroup-v1 pids-controller
+      counter leak, where phantom fork entries accumulate and prematurely
+      exhaust the cap.
+    - ``-1`` → ``"-1"``, Docker/Podman "unlimited" — an escape hatch for
+      badly leaking hosts where any finite cap eventually fills with phantom
+      entries.
+    - anything else — ``0``, other negatives, non-numeric — is rejected, so a
+      misconfigured value can never silently weaken or disable the fork-bomb
+      safety bound; :func:`_resolve_limit_env` warns and keeps
+      :data:`DEFAULT_PIDS_LIMIT`.
+
+    An accepted value is returned as ``str(int(raw))``, so an in-grammar
+    spelling the runtimes would take anyway (``+5``, ``007``) reaches them
+    normalised.
+    """
     try:
         value = int(raw)
     except ValueError:
-        warning(
-            f"⚠️  Ignoring invalid LMER_PIDS_LIMIT={raw!r} (not an integer); "
-            f"using default {DEFAULT_PIDS_LIMIT}"
-        )
-        return DEFAULT_PIDS_LIMIT
+        return None
     if value > 0 or value == -1:
         return str(value)
-    warning(
-        f"⚠️  Ignoring out-of-range LMER_PIDS_LIMIT={raw!r} "
-        f"(must be a positive integer, or -1 for unlimited); "
-        f"using default {DEFAULT_PIDS_LIMIT}"
+    return None
+
+
+def _resolve_pids_limit() -> str:
+    """The container ``--pids-limit`` value, from ``LMER_PIDS_LIMIT``."""
+    return _resolve_limit_env(
+        "LMER_PIDS_LIMIT",
+        DEFAULT_PIDS_LIMIT,
+        _valid_pids_limit,
+        "must be a positive integer, or -1 for unlimited",
     )
-    return DEFAULT_PIDS_LIMIT
 
 
-# A positive decimal literal, the only shape accepted for --cpus — a deliberate
-# subset of what the runtimes parse (docker also takes 1e2, 3/2, "1."), chosen
-# because a rejected spelling only costs warn-and-default while a passed one
-# must not abort the launch. ASCII-only, since Python's \d otherwise matches
-# non-ASCII digits the runtimes reject; at most 9 fractional digits, since
-# docker's nano-CPU parser rejects finer values as "too precise".
+# The only shape accepted for --cpus; see _valid_cpus for the grammar and why
+# it is drawn where it is.
 _CPUS_RE = re.compile(r"^\d+(\.\d{1,9})?$", re.ASCII)
 
-# An integer with an optional unit suffix (bytes when omitted) — a deliberate
-# subset of the runtimes' size grammar (which also takes fractions like 2.5g
-# and t/tb suffixes); same warn-and-default rationale as _CPUS_RE.
+# The only shape accepted for --memory; see _valid_memory for the grammar and
+# why it is drawn where it is.
 _MEMORY_RE = re.compile(r"^(\d+)(b|k|m|g|kb|mb|gb)?$", re.IGNORECASE | re.ASCII)
 
 # Magnitude bound for --cpus. docker encodes the value as int64 nano-CPUs, and
@@ -307,67 +342,75 @@ _MEMORY_UNIT_BYTES = {
 }
 
 
-def _resolve_cpus() -> str:
-    """Resolve the container ``--cpus`` value from ``LMER_CPUS``.
+def _valid_cpus(raw: str) -> str | None:
+    """Accept ``raw`` as a ``--cpus`` value, or None to reject it.
 
-    Returns the value to hand to ``docker``/``podman`` ``--cpus``.
+    The grammar: a positive decimal literal (:data:`_CPUS_RE`) up to
+    :data:`_MAX_CPUS`, integers and fractions alike — ``2``, ``0.5``, ``1.5``
+    are all valid to both runtimes, and raising the value is what lets
+    parallel workloads use more of the host's cores. Deliberately a subset of
+    what the runtimes parse (docker also takes ``1e2``, ``3/2``, ``"1."``),
+    because a rejected spelling only costs warn-and-default while a passed
+    one must not abort the launch. The pattern is ASCII-only, since Python's
+    ``\\d`` otherwise matches non-ASCII digits the runtimes reject, and takes
+    at most 9 fractional digits, since docker's nano-CPU parser rejects finer
+    values as "too precise".
 
-    Rules:
-    - Unset/empty → :data:`DEFAULT_CPUS`.
-    - A positive decimal literal up to :data:`_MAX_CPUS` → that value
-      (fractions like ``0.5`` are valid to both runtimes; raise it to let
-      parallel workloads use more of the host's cores).
-    - Anything else — ``0``, negatives, ``inf``/``nan``/scientific notation,
-      non-numeric, magnitudes past :data:`_MAX_CPUS` (which could wrap to the
-      runtime's "unset" encoding) — is rejected with a warning and falls back
-      to the default. There is no "unlimited" spelling: a misconfigured value
-      must never silently remove the CPU bound.
+    Anything else — ``0``, negatives, ``inf``/``nan``/scientific notation,
+    non-numeric, magnitudes past :data:`_MAX_CPUS` (which could wrap to the
+    runtime's "unset" encoding) — is rejected and :func:`_resolve_limit_env`
+    warns and keeps :data:`DEFAULT_CPUS`. There is no "unlimited" spelling: a
+    misconfigured value must never silently remove the CPU bound.
     """
-    raw = os.environ.get("LMER_CPUS", "").strip()
-    if not raw:
-        return DEFAULT_CPUS
     if _CPUS_RE.match(raw) and 0 < float(raw) <= _MAX_CPUS:
         return raw
-    warning(
-        f"⚠️  Ignoring invalid LMER_CPUS={raw!r} "
-        f"(must be a positive number of cores up to {_MAX_CPUS:g}, "
-        f"e.g. 2 or 0.5); using default {DEFAULT_CPUS}"
+    return None
+
+
+def _resolve_cpus() -> str:
+    """The container ``--cpus`` value, from ``LMER_CPUS``."""
+    return _resolve_limit_env(
+        "LMER_CPUS",
+        DEFAULT_CPUS,
+        _valid_cpus,
+        f"must be a positive number of cores up to {_MAX_CPUS:g}, e.g. 2 or 0.5",
     )
-    return DEFAULT_CPUS
+
+
+def _valid_memory(raw: str) -> str | None:
+    """Accept ``raw`` as a ``--memory`` value, or None to reject it.
+
+    The grammar: an integer with an optional unit suffix (:data:`_MEMORY_RE`)
+    — ``b``/``k``/``m``/``g`` or their two-letter forms, case-insensitive,
+    bytes when omitted — resolving to at least :data:`_MIN_MEMORY_BYTES`.
+    Deliberately a subset of the runtimes' size grammar (which also takes
+    fractions like ``2.5g`` and ``t``/``tb`` suffixes), on the same
+    warn-and-default rationale as :func:`_valid_cpus`.
+
+    Anything else — sizes below the runtime's minimum (e.g. a bare ``8``
+    meaning eight bytes), ``0``, negatives, fractions, unknown suffixes,
+    non-numeric — is rejected and :func:`_resolve_limit_env` warns and keeps
+    :data:`DEFAULT_MEMORY`. As with :func:`_valid_cpus`, there is no
+    "unlimited" spelling: a misconfigured value must never silently remove
+    the memory bound. (Oversized values need no ceiling here: the runtime's
+    int64 saturation is negative, not the "unset" encoding, so they fail
+    loudly at launch.)
+    """
+    match = _MEMORY_RE.match(raw)
+    if not match:
+        return None
+    size = int(match.group(1)) * _MEMORY_UNIT_BYTES[(match.group(2) or "").lower()]
+    return raw if size >= _MIN_MEMORY_BYTES else None
 
 
 def _resolve_memory() -> str:
-    """Resolve the container ``--memory`` value from ``LMER_MEMORY``.
-
-    Returns the value to hand to ``docker``/``podman`` ``--memory``.
-
-    Rules:
-    - Unset/empty → :data:`DEFAULT_MEMORY`.
-    - An integer with an optional unit suffix (``b``/``k``/``m``/``g``, or
-      their two-letter forms, case-insensitive; bytes when omitted) resolving
-      to at least :data:`_MIN_MEMORY_BYTES` → that value.
-    - Anything else — sizes below the runtime's minimum (e.g. a bare ``8``
-      meaning eight bytes), ``0``, negatives, fractions, unknown suffixes,
-      non-numeric — is rejected with a warning and falls back to the default.
-      As with :func:`_resolve_cpus`, there is no "unlimited" spelling: a
-      misconfigured value must never silently remove the memory bound.
-      (Oversized values need no ceiling here: the runtime's int64 saturation
-      is negative, not the "unset" encoding, so they fail loudly at launch.)
-    """
-    raw = os.environ.get("LMER_MEMORY", "").strip()
-    if not raw:
-        return DEFAULT_MEMORY
-    match = _MEMORY_RE.match(raw)
-    if match:
-        size = int(match.group(1)) * _MEMORY_UNIT_BYTES[(match.group(2) or "").lower()]
-        if size >= _MIN_MEMORY_BYTES:
-            return raw
-    warning(
-        f"⚠️  Ignoring invalid LMER_MEMORY={raw!r} "
-        f"(must be a size of at least 6m, e.g. 4g or 512m); "
-        f"using default {DEFAULT_MEMORY}"
+    """The container ``--memory`` value, from ``LMER_MEMORY``."""
+    return _resolve_limit_env(
+        "LMER_MEMORY",
+        DEFAULT_MEMORY,
+        _valid_memory,
+        "must be a size of at least 6m, e.g. 4g or 512m",
     )
-    return DEFAULT_MEMORY
 
 
 def _resource_limit_args(runtime: str) -> List[str]:

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from lmer_cli.presets import Preset, select_preset_name
+from lmer_cli.presets import Preset, load_presets, select_preset_name
 from slack_chat.sessions import (
     CHAT_TASK_ID,
     Session,
@@ -784,3 +784,368 @@ class TestListenerDefaultPreset:
 
     def test_blank_value_is_unset(self):
         assert listener_default_preset({"LMER_CHAT_PRESET": "  "}) == (None, None)
+
+
+def _childs_own_default(
+    environ: dict[str, str], candidates: list[tuple[str, Path]]
+) -> tuple[str | None, str | None]:
+    """What the spawned CLI itself resolves, run through its own real code.
+
+    ``apply_env_file_defaults`` then ``select_preset_name`` is verbatim the
+    order ``lmer`` main() uses, so a display that agrees with this agrees with
+    the child (issue #259). Runs against a copied environment so the seeding —
+    which writes to ``os.environ`` — cannot touch the suite's.
+    """
+    from lmer_cli.cli import apply_env_file_defaults
+
+    child_env = dict(environ)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "environ", child_env)
+        apply_env_file_defaults(candidates)
+    return select_preset_name(None, CHAT_TASK_ID, child_env)
+
+
+def _childs_own_presets(
+    environ: dict[str, str], candidates: list[tuple[str, Path]]
+) -> dict[str, Preset]:
+    """Which presets the spawned CLI itself loads, through its own real code.
+
+    The availability counterpart of :func:`_childs_own_default` (issue #279):
+    ``apply_env_file_defaults`` then ``load_presets()`` reading the seeded
+    ``LMER_PRESETS_FILE`` is verbatim what ``lmer`` main() does, so a display
+    that agrees with this agrees with the child about what is defined.
+    ``load_presets`` is called inside the patch context because it reads the
+    environment the seeding just wrote.
+    """
+    from lmer_cli.cli import apply_env_file_defaults
+
+    child_env = dict(environ)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "environ", child_env)
+        apply_env_file_defaults(candidates)
+        return load_presets()
+
+
+class TestDefaultPresetMatchesTheChild:
+    """``SessionManager.default_preset()`` reports the preset the spawned CLI
+    actually resolves, ``.env`` tiers included (issue #259), and
+    ``child_presets()`` reports what that same CLI would find *defined*
+    (issue #279).
+
+    Every case asserts the displayed answer twice: literally, and against
+    :func:`_childs_own_default` / :func:`_childs_own_presets` — the child's own
+    seeding, selection and loading code run over the same environment and the
+    same candidate files. The second assertion is the point: a display that
+    only *looks* right is what the bug was, and a trade of a visible ``-`` for
+    a confidently wrong name would be worse than the bug.
+    """
+
+    @pytest.fixture(autouse=True)
+    def isolated_state_dir(self, monkeypatch, tmp_path: Path) -> Path:
+        """Point lmer's state dir at an empty directory.
+
+        ``~/.lmer/.env`` is one of the tiers the spawned CLI seeds from, so it
+        is one of the tiers the display models. A real one on the machine
+        running the suite would otherwise select a preset for these tests.
+        """
+        from lmer_cli import runtime
+
+        state = tmp_path / "state"
+        state.mkdir()
+        monkeypatch.setattr(runtime, "_LMER_STATE_DIR", state)
+        return state
+
+    @pytest.fixture
+    def manager(self, tmp_path: Path) -> SessionManager:
+        return SessionManager(
+            idle_timeout_minutes=30,
+            max_sessions=5,
+            lmer_bin="lmer",
+            spawn_cwd=str(tmp_path / "cwd"),
+            log_dir=str(tmp_path / "logs"),
+        )
+
+    def _forward(self, manager: SessionManager, tmp_path: Path, body: str) -> Path:
+        """Give *manager* a forwarded ``--env-file`` containing *body*."""
+        env_file = tmp_path / "deploy.env"
+        env_file.write_text(body, encoding="utf-8")
+        manager.lmer_env_file = str(env_file)
+        return env_file
+
+    def _assert_agrees(
+        self, manager: SessionManager, environ: dict[str, str], expected: tuple
+    ) -> None:
+        candidates = manager._child_env_file_candidates()
+        assert manager.default_preset(environ) == expected
+        assert manager.default_preset(environ) == _childs_own_default(
+            environ, candidates
+        )
+
+    def _presets_file(self, tmp_path: Path, *names: str) -> Path:
+        """Write a presets file defining *names* and return its path."""
+        path = tmp_path / "presets.json"
+        path.write_text(
+            json.dumps({name: {"checkout": f"/co/{name}"} for name in names}),
+            encoding="utf-8",
+        )
+        return path
+
+    def _assert_presets_agree(
+        self, manager: SessionManager, environ: dict[str, str], expected: set[str]
+    ) -> None:
+        candidates = manager._child_env_file_candidates()
+        assert set(manager.child_presets(environ)) == expected
+        assert set(manager.child_presets(environ)) == set(
+            _childs_own_presets(environ, candidates)
+        )
+
+    def test_default_only_in_the_forwarded_file_is_named(self, manager, tmp_path):
+        """The reported bug: the child loads it, so the display must name it."""
+        self._forward(manager, tmp_path, "LMER_CHAT_PRESET=house-default\n")
+
+        self._assert_agrees(manager, {}, ("house-default", "LMER_CHAT_PRESET"))
+
+    def test_the_environment_beats_the_forwarded_file(self, manager, tmp_path):
+        """First-wins: an exported selector is never overwritten by a file."""
+        self._forward(manager, tmp_path, "LMER_CHAT_PRESET=house-default\n")
+
+        self._assert_agrees(
+            manager,
+            {"LMER_CHAT_PRESET": "exported"},
+            ("exported", "LMER_CHAT_PRESET"),
+        )
+
+    def test_no_selector_anywhere_is_still_nothing(self, manager, tmp_path):
+        self._forward(manager, tmp_path, "GITLAB_TOKEN_example_com=glpat-fixture\n")
+
+        self._assert_agrees(manager, {}, (None, None))
+
+    def test_scoped_selector_from_a_file_outranks_an_exported_generic(
+        self, manager, tmp_path
+    ):
+        """Seeding happens before selection, for the child and so for us.
+
+        The child seeds ``LMER_CHAT_PRESET`` from the file and only then picks
+        the most specific selector, so the file's scoped var beats the exported
+        generic one (the #140 specificity rule). Resolving the environment
+        first and falling back to the file only afterwards would name
+        ``generic`` here — a confidently wrong name, which is worse than the
+        ``-`` this replaces.
+        """
+        self._forward(manager, tmp_path, "LMER_CHAT_PRESET=scoped\n")
+
+        self._assert_agrees(
+            manager, {"LMER_PRESET": "generic"}, ("scoped", "LMER_CHAT_PRESET")
+        )
+
+    def test_a_blank_selector_is_present_so_no_file_can_fill_it(
+        self, manager, tmp_path
+    ):
+        """The displacement contract, seen from the display side.
+
+        spawn() blanks the selectors rather than deleting them precisely
+        because the child's seeding skips a key that is *present*. The display
+        follows the same rule, so a displaced default is reported displaced.
+        """
+        self._forward(manager, tmp_path, "LMER_CHAT_PRESET=house-default\n")
+
+        self._assert_agrees(manager, {"LMER_CHAT_PRESET": ""}, (None, None))
+
+    def test_the_childs_own_cwd_is_a_tier_the_listener_never_sees(
+        self, manager, tmp_path
+    ):
+        """The child's cwd is spawn_cwd, not the listener's directory, so its
+        ``.env`` is a tier no listener environment can show."""
+        manager.spawn_cwd.mkdir(parents=True, exist_ok=True)
+        (manager.spawn_cwd / ".env").write_text(
+            "LMER_CHAT_PRESET=from-spawn-cwd\n", encoding="utf-8"
+        )
+
+        self._assert_agrees(manager, {}, ("from-spawn-cwd", "LMER_CHAT_PRESET"))
+
+    def test_the_forwarded_file_outranks_the_childs_cwd(self, manager, tmp_path):
+        manager.spawn_cwd.mkdir(parents=True, exist_ok=True)
+        (manager.spawn_cwd / ".env").write_text(
+            "LMER_CHAT_PRESET=from-spawn-cwd\n", encoding="utf-8"
+        )
+        self._forward(manager, tmp_path, "LMER_CHAT_PRESET=forwarded\n")
+
+        self._assert_agrees(manager, {}, ("forwarded", "LMER_CHAT_PRESET"))
+
+    def test_a_forwarded_path_that_is_not_a_file_is_skipped(self, manager, tmp_path):
+        """Matching the CLI, which warns and skips a missing or non-regular
+        ``--env-file`` rather than failing — the display must not raise on a
+        path the child merely shrugs at."""
+        manager.lmer_env_file = str(tmp_path / "nowhere.env")
+        assert manager.default_preset({}) == (None, None)
+
+        a_directory = tmp_path / "adir"
+        a_directory.mkdir()
+        manager.lmer_env_file = str(a_directory)
+        assert manager.default_preset({}) == (None, None)
+
+    def test_an_unreadable_tier_loses_a_name_not_the_spawn(
+        self, manager, tmp_path, monkeypatch
+    ):
+        """Reading is best-effort: a display cannot be worth failing a spawn.
+
+        The failure is injected rather than made with ``chmod``, which proves
+        nothing when the suite runs as root.
+        """
+        import slack_chat.sessions as sessions_mod
+
+        self._forward(manager, tmp_path, "LMER_CHAT_PRESET=house\n")
+
+        def unreadable(*args, **kwargs):
+            raise PermissionError("nope")
+
+        monkeypatch.setattr(sessions_mod, "dotenv_values", unreadable)
+        assert manager.default_preset({}) == (None, None)
+
+    def test_a_presets_file_only_in_the_forwarded_file_is_loaded(
+        self, manager, tmp_path
+    ):
+        """The #279 bug, at its source: ``LMER_PRESETS_FILE`` rides the same
+        tiers as the selector, so a deployment that puts both in the forwarded
+        ``--env-file`` has a default that is named *and* defined."""
+        presets = self._presets_file(tmp_path, "house")
+        self._forward(
+            manager,
+            tmp_path,
+            f"LMER_CHAT_PRESET=house\nLMER_PRESETS_FILE={presets}\n",
+        )
+
+        self._assert_agrees(manager, {}, ("house", "LMER_CHAT_PRESET"))
+        self._assert_presets_agree(manager, {}, {"house"})
+
+    def test_a_presets_file_in_the_environment_still_loads(self, manager, tmp_path):
+        """The ordinary deployment, unchanged: the listener exports the path."""
+        presets = self._presets_file(tmp_path, "house", "other")
+        self._forward(manager, tmp_path, "LMER_CHAT_PRESET=house\n")
+
+        environ = {"LMER_PRESETS_FILE": str(presets)}
+        self._assert_agrees(manager, environ, ("house", "LMER_CHAT_PRESET"))
+        self._assert_presets_agree(manager, environ, {"house", "other"})
+
+    def test_the_environment_beats_the_forwarded_presets_file(
+        self, manager, tmp_path
+    ):
+        """First-wins applies to this key like any other: an exported path is
+        the one the child loads, so it is the one the display loads."""
+        exported = self._presets_file(tmp_path, "exported")
+        forwarded = tmp_path / "forwarded-presets.json"
+        forwarded.write_text(
+            json.dumps({"forwarded": {"checkout": "/co"}}), encoding="utf-8"
+        )
+        self._forward(manager, tmp_path, f"LMER_PRESETS_FILE={forwarded}\n")
+
+        self._assert_presets_agree(
+            manager, {"LMER_PRESETS_FILE": str(exported)}, {"exported"}
+        )
+
+    def test_a_presets_file_the_child_cannot_read_defines_nothing(
+        self, manager, tmp_path
+    ):
+        """The warning direction stays available: a name resolves, but the file
+        it would be defined in is missing, so the child finds nothing either and
+        the session really will fail to start."""
+        self._forward(
+            manager,
+            tmp_path,
+            f"LMER_CHAT_PRESET=house\nLMER_PRESETS_FILE={tmp_path / 'gone.json'}\n",
+        )
+
+        self._assert_agrees(manager, {}, ("house", "LMER_CHAT_PRESET"))
+        self._assert_presets_agree(manager, {}, set())
+
+    def test_a_malformed_presets_file_defines_nothing(self, manager, tmp_path):
+        """Loading is forgiving in the same place the child's is — unparseable
+        is empty, not an exception thrown at a spawn this only annotates."""
+        broken = tmp_path / "presets.json"
+        broken.write_text("{not json", encoding="utf-8")
+        self._forward(manager, tmp_path, f"LMER_PRESETS_FILE={broken}\n")
+
+        self._assert_presets_agree(manager, {}, set())
+
+    def test_no_presets_file_anywhere_defines_nothing(self, manager, tmp_path):
+        self._forward(manager, tmp_path, "LMER_CHAT_PRESET=house\n")
+
+        self._assert_presets_agree(manager, {}, set())
+
+    def test_the_childs_own_cwd_is_a_presets_tier_too(self, manager, tmp_path):
+        """Same tier list as the selectors, proven on the one tier the listener
+        can never see from its own environment."""
+        presets = self._presets_file(tmp_path, "from-spawn-cwd")
+        manager.spawn_cwd.mkdir(parents=True, exist_ok=True)
+        (manager.spawn_cwd / ".env").write_text(
+            f"LMER_PRESETS_FILE={presets}\n", encoding="utf-8"
+        )
+
+        self._assert_presets_agree(manager, {}, {"from-spawn-cwd"})
+
+
+class TestSpawnLogNamesFileSourcedDefaults:
+    """The spawn log's preset fields see the forwarded env file too (#259)."""
+
+    @pytest.fixture(autouse=True)
+    def isolated_state_dir(self, monkeypatch, tmp_path: Path) -> Path:
+        from lmer_cli import runtime
+
+        state = tmp_path / "state"
+        state.mkdir()
+        monkeypatch.setattr(runtime, "_LMER_STATE_DIR", state)
+        return state
+
+    @pytest.fixture
+    def manager(self, spawn_manager: SessionManager, tmp_path: Path) -> SessionManager:
+        env_file = tmp_path / "deploy.env"
+        env_file.write_text("LMER_CHAT_PRESET=house-default\n", encoding="utf-8")
+        spawn_manager.lmer_env_file = str(env_file)
+        return spawn_manager
+
+    @pytest.fixture(autouse=True)
+    def no_selectors_in_the_environment(self, monkeypatch):
+        """The deployment shape the bug is about: the default lives only in
+        the file the listener forwards."""
+        monkeypatch.delenv("LMER_CHAT_PRESET", raising=False)
+        monkeypatch.delenv("LMER_PRESET", raising=False)
+
+    @pytest.mark.asyncio
+    async def test_applying_default_from_the_file_is_named(
+        self, manager, captured, caplog
+    ):
+        with caplog.at_level("INFO", logger="lmer_slack.sessions"):
+            session = await manager.spawn("C1", "1.1", PERMALINK)
+        os.close(session.master_fd)
+
+        line = next(
+            r.getMessage()
+            for r in caplog.records
+            if "lmer_session_spawned" in r.getMessage()
+        )
+        assert "default_preset=house-default(LMER_CHAT_PRESET)" in line, (
+            "the child loads this default from the forwarded file, so a log "
+            "line reading `default_preset=-` reports a session that never ran"
+        )
+
+    @pytest.mark.asyncio
+    async def test_displaced_default_from_the_file_is_named(
+        self, manager, captured, caplog
+    ):
+        with caplog.at_level("INFO", logger="lmer_slack.sessions"):
+            session = await manager.spawn(
+                "C1", "1.1", PERMALINK, preset=Preset(name="from-token")
+            )
+        os.close(session.master_fd)
+
+        line = next(
+            r.getMessage()
+            for r in caplog.records
+            if "lmer_session_spawned" in r.getMessage()
+        )
+        assert "preset=from-token" in line
+        assert "displaced_default=house-default(LMER_CHAT_PRESET)" in line
+        assert captured["kwargs"]["env"]["LMER_CHAT_PRESET"] == "", (
+            "and it really is displaced: blanking keeps the child's own "
+            "seeding from putting it back"
+        )

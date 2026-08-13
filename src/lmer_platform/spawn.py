@@ -1436,13 +1436,13 @@ def live_session_for_run(
     the key was spelled. The divergence the triple tolerates is the renamed run
     (:func:`lmer_platform.workrepo.resolve_run_dir`): a run keeps its slug as its
     identity while its *directory* may be named after it (``review-mr-172`` living
-    in ``runs/review-mr-172--review-mr-172``), every session registers under that
-    slug (:func:`derive_run_identity` mirrors the container's
-    ``run_state.derive_slug``), so a renamed run's session is found here whatever
-    its directory is called. What this deliberately does not do is treat a
-    directory name as an identity: a caller holding the run's *tracked* name — which
-    for a renamed run is that directory name — checks it as a second candidate
-    itself, because only the caller knows it.
+    in ``runs/review-mr-172--review-mr-172``, in an internal work repo rather than
+    this one), every session registers under that slug (:func:`derive_run_identity`
+    mirrors the container's ``run_state.derive_slug``), so a renamed run's session
+    is found here whatever its directory is called. What this deliberately does
+    not do is treat a directory name as an identity: a caller holding the run's
+    *tracked* name — which for a renamed run is that directory name — checks it as
+    a second candidate itself, because only the caller knows it.
 
     Liveness is the registry's own lazy reading (``live_only`` →
     :func:`lmer_platform.registry.is_live`, a pid probe on read), so a DEAD entry
@@ -1944,8 +1944,13 @@ def spawn_session(
     else:
         # Never inherited: the daemon's own environment carrying this variable
         # (a daemon started from inside a session, say) would otherwise tell an
-        # agent it has a channel that was never mounted.
-        child_env.pop(ask.ASK_DIR_ENV, None)
+        # agent it has a channel that was never mounted. Blank rather than
+        # absent, because the child is `lmer` and it seeds its own environment
+        # from .env files first-wins — a key that is merely absent is a key a
+        # file may re-supply. Blank already reads as unset on every consumer
+        # (resolve_channel_dir strips it; the runners render the ask fragment
+        # only on a non-blank value).
+        child_env[ask.ASK_DIR_ENV] = ""
     if request.no_repo:
         # Spec D17, structurally: `lmer` skips repo resolution on this and the
         # container skips the workspace clone, so the session has nothing to edit
@@ -1955,8 +1960,12 @@ def spawn_session(
         # Also never inherited, and for the sharper version of the same reason: a
         # daemon whose shell exported LMER_NO_REPO would otherwise hand every
         # worker an empty /workspace while its request still names a repository —
-        # a session that looks like it is working on code it does not have.
-        child_env.pop(NO_REPO_ENV, None)
+        # a session that looks like it is working on code it does not have. Blank
+        # for the same reason as above: deleting the key only hides it from this
+        # environment, and the child's own .env seeding would hand it straight
+        # back. Blank is falsy to get_bool_env on the host and never equals "1"
+        # in the container, so it reads as unset the whole way down.
+        child_env[NO_REPO_ENV] = ""
 
     master_fd, slave_fd = pty.openpty()
     try:

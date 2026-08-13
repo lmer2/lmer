@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from ask_channel import protocol
 from lmer_cli import supervisor
 from lmer_cli.cli import parse_args, parse_dir_mount_specs
 from lmer_platform import config as cfg
@@ -1332,6 +1333,10 @@ def test_an_ordinary_session_never_inherits_the_daemons_no_repo(
     The request still names a repository, so nothing downstream would look wrong
     — the session would simply have no code to work on. Same reasoning as the ask
     channel's variable, one step sharper.
+
+    Blank rather than absent: blank is the "unset" reading everywhere the
+    variable is consumed, and it is what survives the child's first-wins ``.env``
+    seeding (see test_the_blanked_variables_survive_the_childs_env_file_seeding).
     """
     script, dump = env_dumping_lmer
     config = cfg.load({"lmer_bin": str(script)})
@@ -1340,7 +1345,10 @@ def test_an_ordinary_session_never_inherits_the_daemons_no_repo(
     result = spawn.spawn_session(config, request_for())
     try:
         assert wait_for(lambda: dump.is_file() and dump.stat().st_size)
-        assert spawn.NO_REPO_ENV not in env_from_dump(dump)
+        assert env_from_dump(dump).get(spawn.NO_REPO_ENV) == "", (
+            "the daemon's value must not reach the child, and the key must "
+            "still be present so the child's .env cannot re-supply it"
+        )
     finally:
         os.kill(result.pid, 9)
 
@@ -2365,7 +2373,10 @@ def test_a_session_whose_channel_cannot_be_created_still_starts(
 
     result = spawn.spawn_session(config, request_for())
     assert result.session_id
-    assert ask.ASK_DIR_ENV not in captured
+    assert captured[ask.ASK_DIR_ENV] == "", (
+        "blank is the channel protocol's own 'not set', and unlike a deleted "
+        "key it cannot be re-supplied by the child's .env seeding"
+    )
     assert not [
         spec for spec in mount_specs_in(result.command)
         if spec.split(":")[1:2] == [ask.CONTAINER_ASK_DIR]
@@ -2385,7 +2396,75 @@ def test_an_inherited_ask_dir_is_not_passed_through(config, monkeypatch):
     monkeypatch.setattr(spawn.subprocess, "Popen", spy)
     monkeypatch.setattr(spawn.ask, "prepare_ask_dir", lambda sid: None)
     spawn.spawn_session(config, request_for())
-    assert ask.ASK_DIR_ENV not in captured
+    assert captured[ask.ASK_DIR_ENV] == ""
+    with pytest.raises(protocol.ChannelUnavailable):
+        # The value the child's own resolver gets, not just the string: blank
+        # is the "this session was not orchestrated" exit, same as absent.
+        protocol.resolve_channel_dir(env=captured)
+
+
+def test_the_blanked_variables_survive_the_childs_env_file_seeding(
+    config, monkeypatch, tmp_path
+):
+    """Neither withheld variable can come back through the child's ``.env``.
+
+    The child is ``lmer``, and its ``main()`` seeds its own environment from
+    ``.env`` files first-wins — skipping only a variable that is already
+    *present* — before either of these is read. Withholding them by deletion
+    would therefore be undone by the very files the child reads next: a
+    deployment with ``LMER_NO_REPO=1`` in its ``.env`` would get workers running
+    on an empty /workspace while their request names a repository, and the ask
+    variable has the same shape. One file tier is enough to prove it; the
+    seeding rule is the same at every tier.
+
+    Regression contract: with either variable deleted rather than blanked, the
+    seeding below re-supplies it and these assertions fail.
+    """
+    from lmer_cli.cli import apply_env_file_defaults
+    from lmer_cli.util import get_bool_env
+
+    env_file = tmp_path / "deploy.env"
+    env_file.write_text(
+        f"{spawn.NO_REPO_ENV}=1\n{ask.ASK_DIR_ENV}=/somebody/elses/channel\n",
+        encoding="utf-8",
+    )
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    # No channel to mount, and a request that names a repository: the one spawn
+    # where both variables are the daemon's to withhold.
+    monkeypatch.setattr(spawn.ask, "prepare_ask_dir", lambda sid: None)
+    spawn.spawn_session(config, request_for())
+
+    # The child's real seeding, run against the environment it was handed.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "environ", captured)
+        apply_env_file_defaults([("deployment .env", env_file)])
+        no_repo_reading = get_bool_env(spawn.NO_REPO_ENV)
+
+    assert captured[spawn.NO_REPO_ENV] == "", (
+        "a blank value is present, so first-wins seeding must skip it"
+    )
+    assert not no_repo_reading, (
+        "and the child must still resolve a session that has its repository"
+    )
+    assert captured[ask.ASK_DIR_ENV] == ""
+    with pytest.raises(protocol.ChannelUnavailable):
+        protocol.resolve_channel_dir(env=captured)
+
+    # Control: the same file does seed an environment that lacks both keys, so
+    # the assertions above rest on the blanking, not on a no-op seeding.
+    without_them: dict[str, str] = {}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "environ", without_them)
+        apply_env_file_defaults([("deployment .env", env_file)])
+    assert without_them[spawn.NO_REPO_ENV] == "1"
+    assert without_them[ask.ASK_DIR_ENV] == "/somebody/elses/channel"
 
 
 @pytest.mark.parametrize("hijack", [

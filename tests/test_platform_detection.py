@@ -127,7 +127,7 @@ def row(
     updated=None,
     label=None,
     host="gitlab.example.com",
-    project="agents/global",
+    project="group/project",
 ):
     """One fleet row, shaped exactly as :meth:`inventory.RunView.to_dict` builds it.
 
@@ -297,7 +297,7 @@ def test_two_runs_in_the_same_condition_are_two_entries_naming_each_run(config):
     assert sorted(call["data"]["slug"] for call in spool.calls) == [
         "develop-141", "review-141"
     ]
-    assert all("gitlab.example.com/agents/global/" in note for note in spool.notes)
+    assert all("gitlab.example.com/group/project/" in note for note in spool.notes)
     assert len(set(spool.notes)) == 2, "two events must not read as one"
 
 
@@ -423,13 +423,13 @@ def test_the_digest_carries_what_the_assistant_needs_to_act(config):
     call = spool.calls[0]
 
     assert call["note"] == (
-        "gitlab.example.com/agents/global/develop-141 needs you — question: "
+        "gitlab.example.com/group/project/develop-141 needs you — question: "
         f"{QUESTION}"
     )
     assert call["kind"] == "question"
     assert call["data"] == {
         "host": "gitlab.example.com",
-        "project": "agents/global",
+        "project": "group/project",
         "slug": "develop-141",
         "label": "issue 141",
         "kind": "question",
@@ -663,7 +663,7 @@ def test_a_refused_digest_is_not_retried_on_the_next_tick(config):
 DEAD_PID = 2**22
 
 HOST = "gitlab.example.com"
-PROJECT = "agents/global"
+PROJECT = "group/project"
 
 #: A credential shape ``transcripts._scrub`` masks — see
 #: ``tests/test_platform_transcripts.py``, which owns the vocabulary.
@@ -1508,15 +1508,15 @@ def _spawn_result():
 
     return SpawnResult(
         session_id="s-1", pid=4242, log_path="/logs/s-1.log",
-        host="gitlab.example.com", project="agents/global", slug="develop-1",
+        host="gitlab.example.com", project="group/project", slug="develop-1",
         command=["lmer", "develop", "t"],
     )
 
 
 @pytest.mark.parametrize("argv", [
     ["status"], ["status", "--json"], ["rescan"], ["runs"], ["runs", "--candidates"],
-    ["secret"], ["adopt", "gitlab.example.com/agents/global/x"],
-    ["forget", "gitlab.example.com/agents/global/x"],
+    ["secret"], ["adopt", "gitlab.example.com/group/project/x"],
+    ["forget", "gitlab.example.com/group/project/x"],
     ["spawn", "develop", "https://example.com/x"], ["setup-ui"],
 ])
 def test_no_other_subcommand_starts_a_detection_thread(
@@ -1715,12 +1715,12 @@ def test_the_in_memory_announcement_is_dropped_once_the_file_writes(config):
     """
     payload = stale_fleet("review-mr-202")
     tick = detector(config, payload, spool=Spool())
-    tick._announced["gitlab.example.com/agents/global/review-mr-202"] = _hours_ago(4)
+    tick._announced["gitlab.example.com/group/project/review-mr-202"] = _hours_ago(4)
 
     tick.tick_once()
 
     assert not tick._announced, "a successful write has to retire the fallback"
-    marks = checkin.read_marks()["gitlab.example.com/agents/global/review-mr-202"]
+    marks = checkin.read_marks()["gitlab.example.com/group/project/review-mr-202"]
     assert marks.get("announced_at"), "and the record has to be on disk instead"
 
 
@@ -1800,7 +1800,7 @@ def test_a_disabled_window_still_prunes_the_marks_file(config, monkeypatch):
 
     tick.tick_once()
     assert list(checkin.read_marks()) == [
-        "gitlab.example.com/agents/global/kept"
+        "gitlab.example.com/group/project/kept"
     ], "a run that left the fleet kept its entry forever"
 
 # --- a halted session reaches the assistant (#243) ----------------------------
@@ -1841,7 +1841,7 @@ def test_a_halted_session_reaches_the_assistant_naming_run_and_cause(config):
     assert len(spool.calls) == 1
     call = spool.calls[0]
     assert call["kind"] == "stalled"
-    assert "gitlab.example.com/agents/global/develop-243" in call["note"]
+    assert "gitlab.example.com/group/project/develop-243" in call["note"]
     assert "billing_error" in call["note"]
     assert call["data"]["slug"] == "develop-243"
     assert call["data"]["state"] == "running", (
@@ -1965,12 +1965,12 @@ def test_an_answered_question_wakes_the_orchestrator_naming_the_run(
     call = spool.calls[1]
     assert call["kind"] == detect.QUESTION_ANSWERED_KIND
     assert call["note"] == (
-        "gitlab.example.com/agents/global/develop-254 is no longer waiting — "
+        "gitlab.example.com/group/project/develop-254 is no longer waiting — "
         f"its {reason} was answered or withdrawn"
     )
     assert call["data"] == {
         "host": "gitlab.example.com",
-        "project": "agents/global",
+        "project": "group/project",
         "slug": "develop-254",
         "label": "issue 254",
         "kind": reason,
@@ -2015,7 +2015,7 @@ def test_a_question_the_session_withdrew_clears_exactly_like_an_answer(config):
     assert tick.answered == 1
     assert spool.kinds == ["live_question", detect.QUESTION_ANSWERED_KIND]
     assert spool.calls[1]["note"] == (
-        "gitlab.example.com/agents/global/develop-254 is no longer waiting — "
+        "gitlab.example.com/group/project/develop-254 is no longer waiting — "
         "its live_question was answered or withdrawn"
     )
 

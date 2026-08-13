@@ -1303,7 +1303,13 @@ def test_a_dead_session_s_open_question_stays_in_the_record():
     assert "!waiting.value.includes(entry)" in source, (
         "the dock must take in an open question once the session has exited"
     )
-    assert "askEntryLabel(entry, live)" in source, (
+    # The label is written by the component both views draw an entry with (#274),
+    # off the liveness the view hands it — so the dock passing `live` is the half
+    # of it that lives here.
+    assert ':live="live"' in source, (
+        "the dock draws its entries without saying whether the session is alive"
+    )
+    assert "askEntryLabel(entry, live)" in _component("AskEntry.vue"), (
         "and it must not still be labelled as something you can answer"
     )
     # The word itself is in format.js, because two views render the same entries
@@ -1313,7 +1319,7 @@ def test_a_dead_session_s_open_question_stays_in_the_record():
     assert "return live ? 'open' : 'unanswered'" in vocabulary, (
         "a question nothing is reading is still labelled as answerable"
     )
-    assert "askEntryLabel(entry, live)" in _component("AskHistory.vue"), (
+    assert ':live="live"' in _component("AskHistory.vue"), (
         "the record labels its entries with a vocabulary of its own"
     )
 
@@ -1341,7 +1347,14 @@ def test_the_channel_view_shows_a_closed_question_as_unanswerable():
     assert "const recent = computed(() => entries.value.filter(" in source, (
         "the dock no longer shows anything except what is waiting"
     )
-    assert "A reply can no longer reach it." in source
+    # The sentence belongs to the dock and is written in the shared entry
+    # component, which draws it only for the view that asks (#274). The record does
+    # not: it offers no box for any entry, so there is no absence to explain.
+    assert "A reply can no longer reach it." in _component("AskEntry.vue")
+    assert "unreachable" in source, (
+        "the dock stopped asking for the line that says a reply cannot be "
+        "delivered, so a closed question reads as one that could still be answered"
+    )
 
 
 def test_the_channel_view_leads_with_the_answer_when_both_landed():
@@ -1351,9 +1364,13 @@ def test_the_channel_view_leads_with_the_answer_when_both_landed():
     assert vocabulary.index("if (entry.answered)") < vocabulary.index(
         "if (entry.closed)"
     ), "a question that was answered as it was closed reads as closed"
+    assert "entry.closed && !entry.answered" in _component("AskEntry.vue"), (
+        "an entry says the session stopped waiting under an answer it got"
+    )
     for name in ("AskChannel.vue", "AskHistory.vue"):
-        assert "entry.closed && !entry.answered" in _component(name), (
-            f"{name} says the session stopped waiting under an answer it got"
+        assert "<AskEntry" in _component(name), (
+            f"{name} draws a channel entry itself again, so the race decision "
+            "above holds in one view and not in the other"
         )
 
 
