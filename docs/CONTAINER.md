@@ -313,7 +313,7 @@ Set via the host environment, `~/.lmer/.env`, or a project-local `.env` file:
 - `OPENSSL_FIPS=1` - Enable FIPS mode in OpenSSL
 - `PYTHONHASHSEED=0` - Deterministic hashing
 - `CLAUDE_CONTAINER=true` - Container detection flag
-- `CONTAINER_LIMITS=CPU:1core Memory:2GB Processes:512` - Resource limit info
+- `CONTAINER_LIMITS` - **(derived, not settable)** Resource limit info (e.g. `CPU:2cores Memory:2GiB Processes:32000`), composed at shell startup by `Ctl/container/container-limits.sh` from the container's own cgroup (v1 or v2), so it always reflects the limits actually applied — `LMER_CPUS`, `LMER_MEMORY` and `LMER_PIDS_LIMIT` reach it automatically. Any inherited value is overwritten. A limit the kernel does not enforce reads as `unlimited`; a value the cgroup does not expose reads as `unknown`. It is a display string for a human reader, not a machine interface — code that needs a number should read the cgroup files directly. Running the script instead of sourcing it prints the current value
 - `LMER_WORK_REPO_TOKEN` - Provider-agnostic dedicated work-repo token (highest priority for work-repo lookups)
 - `GITLAB_TOKEN_*`, `GITLAB_TOKEN` - GitLab tokens (host-specific via sanitized hostname suffix, plus generic fallback)
 - `GH_TOKEN`, `GITHUB_TOKEN` - GitHub tokens (consulted for `github.com`, `*.github.com`, `*.ghe.com` hosts)
