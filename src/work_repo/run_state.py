@@ -1687,6 +1687,8 @@ def emit_gate_event(
     summary: Optional[str] = None,
     argv: Optional[list] = None,
     commit_sha: Optional[str] = None,
+    test_scope: Optional[str] = None,
+    test_targets: Optional[list] = None,
 ) -> None:
     """Record a gate command outcome ('pass' | 'fail' | 'bypass') on the
     current run, as a machine-written receipt (issue #88): the `data`
@@ -1695,7 +1697,15 @@ def emit_gate_event(
     present; the remaining fields land only when the caller measured them
     (`summary` is best-effort and simply absent when unparseable — never
     fabricated). Guarded so gate behavior is byte-identical when no run
-    exists, and no failure here can ever change a gate's exit code."""
+    exists, and no failure here can ever change a gate's exit code.
+
+    `test_scope`/`test_targets` say WHAT the tests check covered (#269).
+    They are separate structured fields rather than prose in `summary`
+    because `outcome` is 'pass' with exit code 0 whether the whole suite
+    ran, a narrowed subset ran, or nothing ran because an earlier pass on
+    the same tree was reused — a receipt that cannot tell those apart lets
+    a subset green be read back as a full-suite green. Absent means the
+    caller could not say, never 'full'."""
     try:
         rdir = run_dir()
         if rdir is None or _state_path(rdir) is None:
@@ -1714,6 +1724,15 @@ def emit_gate_event(
             data["argv"] = [redact_secrets(str(arg)) for arg in argv]
         if commit_sha is not None:
             data["commit_sha"] = commit_sha
+        if test_scope is not None:
+            data["test_scope"] = redact_secrets(str(test_scope))
+        if test_targets:
+            # Truthiness, not `is not None`: an empty target list would state
+            # "these are the paths that ran" while naming none, which is the
+            # fabricated claim this field exists to prevent.
+            data["test_targets"] = [
+                redact_secrets(str(target)) for target in test_targets
+            ]
         append_event(rdir, "gate", note=f"{gate}: {outcome}", data=data)
     except Exception:
         pass

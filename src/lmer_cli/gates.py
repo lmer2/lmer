@@ -21,7 +21,7 @@ import time
 
 import yaml
 
-from lmer_cli import push_allow
+from lmer_cli import gate_cache, push_allow
 from lmer_cli.util import get_bool_env
 from work_repo.utils import project_info_dir, task_info_dir
 
@@ -51,6 +51,12 @@ class CheckResult:
     # test subset). Receipts and logs read this, so a narrowed run can never
     # be read back as the full one.
     scope: Optional[str] = None
+    # The concrete targets the check selected and ran (the tests check's
+    # pytest paths). None means the check chose no target list at all — a
+    # project's own runner owns its invocation, and a missing tests directory
+    # runs nothing — which the receipt records as "cannot say" rather than
+    # as a full run.
+    scope_targets: Optional[List[str]] = None
 
 
 # Fixed, predictable location for the full gate-check log. Overwritten on every
@@ -115,6 +121,20 @@ TEXT_DIFF_FASTPATH_OFF_ENV = "LMER_GATE_NO_FASTPATH"
 # full-suite pass.
 TEXT_DIFF_SCOPE = "text-diff subset"
 
+# What `CheckResult.scope` says when no suite ran at all because this exact
+# tree was already proven green (lmer_cli.gate_cache). Prefixed to the scope
+# of the run being reused ("cached full suite", "cached text-diff subset"),
+# so both facts stay readable: nothing ran, and what it was that had run.
+CACHE_SCOPE = "cached"
+
+# The name of an unnarrowed run. `CheckResult.scope` stays None for a fresh
+# full suite — there is nothing to disclaim on the terminal — so this is the
+# word used wherever the full run has to be NAMED rather than implied: the
+# cached scope ("cached full suite", never a bare "cached" that a reader has
+# to know covers everything) and the receipt's `test_scope` field, where
+# absence has to keep meaning "this run cannot say".
+FULL_SUITE_SCOPE = "full suite"
+
 # check_changelog() warning hints for repos with a changelog.d/ directory
 CTL_FRAGMENT_HINT = "Or stage a fragment: changelog.d/YYYYMMDD-<topic>.yaml"
 OTHER_TOOL_FRAGMENT_HINT = (
@@ -133,6 +153,20 @@ def is_text_diff_path(path: str) -> bool:
         return False
     return any(fnmatch.fnmatch(candidate, pattern)
                for pattern in TEXT_DIFF_PATTERNS)
+
+
+def pytest_summary_line(output: Optional[str]) -> Optional[str]:
+    """The test runner's own tail line ("8727 passed, 40 skipped in 613.08s").
+
+    The LAST match, since pytest's summary is the last thing it prints. None
+    when the output carries no countable claim — receipts and cache entries
+    then simply have no summary, never a fabricated one.
+    """
+    for line in reversed((output or "").splitlines()):
+        line = line.strip().strip("=").strip()
+        if PYTEST_SUMMARY_RE.search(line):
+            return line
+    return None
 
 
 def receipt_argv() -> List[str]:
@@ -553,10 +587,34 @@ class GateSystem:
             self._print_text_diff_notice(changed, targets, source)
             scope = TEXT_DIFF_SCOPE
 
+        pytest_argv = [python_cmd, "-m", "pytest", *targets, "-x",
+                       "--tb=short", "-q",
+                       "--ignore=tests/test_container_build.py"]
+
+        # A tree already proven green in this environment is not proven again
+        # (#269): the 0.7.0 release ran this suite five times over one
+        # unchanged tree. The key covers the tree, everything uncommitted,
+        # the argv above, the interpreter and what is installed around it, so
+        # the narrowed run selected above composes a different key and can
+        # never answer for a caller that needs the whole suite. The whole
+        # environment the run below is handed is checked too — not just the
+        # PYTHONPATH built above, because pytest reads PYTEST_ADDOPTS and this
+        # suite's own tests read ambient state (tests/_lmer_runtime.py,
+        # GIT_CONFIG_* in test_doctor_sources.py) — but out of the entry, so
+        # a difference is a miss that can name itself. Unknown inputs mean no
+        # key, which means the suite runs.
+        cache_env = gate_cache.cache_environment(env)
+        fingerprint = gate_cache.compute_fingerprint(
+            self.run_command, pytest_argv, cache_env)
+        cached = gate_cache.read_pass(fingerprint)
+        if cached is not None:
+            return self._cached_tests_result(cached, fingerprint, scope,
+                                             targets)
+        self._print_cache_miss_notice(fingerprint)
+
         # Run pytest and capture output
         result = subprocess.run(
-            [python_cmd, "-m", "pytest", *targets, "-x", "--tb=short", "-q",
-             "--ignore=tests/test_container_build.py"],
+            pytest_argv,
             capture_output=True,
             text=True,
             cwd=self.project_root,
@@ -583,6 +641,9 @@ class GateSystem:
                 message = f"All {test_count} passed"
                 details = None
 
+            self._record_passing_suite(fingerprint, pytest_argv, cache_env,
+                                       combined_output)
+
             return CheckResult(
                 name="Python Tests",
                 status=CheckStatus.PASSED,
@@ -590,6 +651,7 @@ class GateSystem:
                 details=details,
                 full_output=combined_output,
                 scope=scope,
+                scope_targets=list(targets),
             )
         else:
             # Look for failure patterns in output
@@ -625,7 +687,93 @@ class GateSystem:
                 details=failures[:5],  # Show first 5 failures
                 full_output=combined_output,
                 scope=scope,
+                scope_targets=list(targets),
             )
+
+    def _print_cache_miss_notice(
+            self, fingerprint: Optional[gate_cache.Fingerprint]) -> None:
+        """Say so when a recorded pass was missed on the environment alone (#269).
+
+        The only miss worth a line: everything else about it is visible from
+        the run that follows. This one is not — it is a suite re-run costing
+        ten minutes because some variable moved, and without the line the
+        answer to "why does the cache never hit?" is another measurement.
+        Names only; the values are the environment's, and it holds tokens.
+        """
+        message = gate_cache.describe_miss(
+            gate_cache.environment_mismatch(fingerprint))
+        if message:
+            print(f"{Colors.CYAN}ℹ️  {message}{Colors.NC}")
+
+    def _cached_tests_result(self, entry: Dict[str, Any],
+                             fingerprint: gate_cache.Fingerprint,
+                             scope: Optional[str],
+                             targets: List[str]) -> CheckResult:
+        """The tests check's result when the cache answered instead (#269).
+
+        Says so in every place a reader looks: on the terminal, in the
+        `scope` field (so nothing has to parse a message to tell a reused
+        pass from a fresh one), and in the captured output the gate-check log
+        and `receipt_summary` read.
+        """
+        lines = gate_cache.describe_hit(entry, fingerprint)
+        print(f"{Colors.GREEN}✅ Python Tests — cached result for this "
+              f"exact tree{Colors.NC}")
+        for line in lines:
+            print(f"   {line}")
+
+        summary = entry.get("summary")
+        # Both halves always named: WHAT was reused is as load-bearing as the
+        # fact that nothing ran, and a bare "cached" would leave a reader (or
+        # a receipt) to assume the reused run was the whole suite.
+        cached_scope = f"{CACHE_SCOPE} {scope or FULL_SUITE_SCOPE}"
+        # The cached suite summary goes LAST: receipt_summary reads the final
+        # countable line, and a receipt saying "cached full suite: 8727
+        # passed, 40 skipped" is the answer to "was this actually tested?".
+        captured = ["The suite did NOT run: a passing result for this exact "
+                    "tree was reused."]
+        captured.extend(lines)
+        captured.append("Cached invocation: " + " ".join(entry.get("argv") or []))
+        if summary:
+            captured.append(summary)
+
+        return CheckResult(
+            name="Python Tests",
+            status=CheckStatus.PASSED,
+            message=f"{cached_scope}: {summary}" if summary
+                    else f"{cached_scope}: earlier passing run reused",
+            full_output="\n".join(captured),
+            scope=cached_scope,
+            scope_targets=list(targets),
+        )
+
+    def _record_passing_suite(self,
+                              fingerprint: Optional[gate_cache.Fingerprint],
+                              pytest_argv: List[str],
+                              cache_env: Dict[str, str], output: str) -> None:
+        """Record a passing suite for the tree it actually ran on (#269).
+
+        The fingerprint is re-taken and must still match, because a suite
+        takes ~10 minutes and the tree can move inside that window. What this
+        catches is an edit that is STILL THERE when the suite ends: the two
+        fingerprints are taken before and after, so an edit made at minute 8
+        and reverted at minute 10 leaves them equal and is not detected. That
+        residual window is accepted rather than closed — closing it would mean
+        watching the tree for the whole run — and the check costs two git
+        commands against a run that just cost minutes.
+        """
+        if fingerprint is None:
+            return
+        confirmed = gate_cache.compute_fingerprint(
+            self.run_command, pytest_argv, cache_env)
+        if confirmed is None or confirmed.key != fingerprint.key:
+            return
+        gate_cache.record_pass(
+            confirmed,
+            summary=pytest_summary_line(output),
+            argv=pytest_argv,
+            gate=receipt_argv()[0],
+        )
 
     @staticmethod
     def _interpreter_can_import(python_cmd: str, module: str = "pytest") -> bool:
@@ -1233,8 +1381,14 @@ class GateSystem:
         passing run: the test runner's own tail line (the pytest summary)
         when one is parseable from the tests check's captured output, tagged
         with the run's scope when it was narrowed (#269) so a reader can tell
-        a subset run from a full one. None when neither exists — the
+        a subset run from a full one — and when the suite did not run at all
+        because the cache answered for it ("cached full suite: 8727 passed,
+        …"), since the receipt is what a reviewer reads later when asking
+        whether this was actually tested. None when neither exists — the
         receipt's `summary` field is then simply absent, never fabricated.
+
+        Prose, and best-effort: `receipt_test_fields` is what a machine
+        reader should use to tell the three run shapes apart.
         """
         failed = [
             result.name for result in self.results
@@ -1244,13 +1398,39 @@ class GateSystem:
             return "failed: " + ", ".join(failed)
         for result in self.results:
             if result.name == "Python Tests" and result.full_output:
-                for line in reversed(result.full_output.splitlines()):
-                    line = line.strip().strip("=").strip()
-                    if PYTEST_SUMMARY_RE.search(line):
-                        if result.scope:
-                            return f"{result.scope}: {line}"
-                        return line
+                line = pytest_summary_line(result.full_output)
+                if line is None:
+                    continue
+                if result.scope:
+                    return f"{result.scope}: {line}"
+                return line
         return None
+
+    def receipt_test_fields(self) -> Dict[str, Any]:
+        """The receipt's structured test-coverage kwargs for this run (#269).
+
+        Shared by the gate bins for the same reason as `receipt_argv`: three
+        callers, one definition of what the fields mean. `emit_gate_event`
+        records `outcome` 'pass' with exit code 0 whether the whole suite
+        ran, the declared text-diff subset ran, or nothing ran because an
+        earlier pass on this exact tree was reused — so the scope has to
+        reach the receipt as data, not as a prefix on the free-text summary.
+
+        Returns no keys at all when this run cannot say what the tests check
+        covered: a project's own runner owns its invocation, a missing tests
+        directory ran nothing, and a gate that skipped tests has no tests
+        result. Absent is "unknown", and unknown must never read as "full".
+        """
+        for result in self.results:
+            if result.name != "Python Tests" or result.scope_targets is None:
+                continue
+            return {
+                # `scope` is None for a fresh full run (nothing to disclaim on
+                # the terminal); the receipt names it instead of implying it.
+                "test_scope": result.scope or FULL_SUITE_SCOPE,
+                "test_targets": list(result.scope_targets),
+            }
+        return {}
 
     def print_results(self):
         """Print all check results"""

@@ -68,6 +68,19 @@ Detailed documentation on authentication mechanisms in containerized environment
 
 ---
 
+### [GATE-FASTPATH.md](./GATE-FASTPATH.md)
+**Gate fast paths**
+
+How the commit and push gates avoid re-running the test suite, and when they refuse to:
+- The text-only fast path and the per-project `tests.text_diff_subset` declaration
+- The test-result cache, its key, and what the key cannot see
+- When the full suite always runs
+- Kill switches and how to read a gate receipt's `test_scope`
+
+**Best for**: Understanding why a gate ran a subset or skipped the suite, and declaring the subset for a new project.
+
+---
+
 ### [LMER-CLI.md](./LMER-CLI.md)
 **LMER Python CLI (lmer)**
 
