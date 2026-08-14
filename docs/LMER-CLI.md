@@ -482,7 +482,7 @@ For cases where a task needs to continue after its initial run (for example, add
 /followup
 ```
 
-The `/followup` command loads `followup.txt` from the active task definition directory and renders it with the same Jinja2 context as `/start` (all `LMER_*` env vars). If a task type does not provide a `followup.txt`, the command exits with an error pointing at where it looked. Task types opt in simply by adding the file — no code change in lmer is required.
+The `/followup` command loads `followup.txt` from the active task definition directory and renders it with the same Jinja2 context as `/start` (the filtered `LMER_*` context — see [TASKDEFS.md](./TASKDEFS.md)). If a task type does not provide a `followup.txt`, the command exits with an error pointing at where it looked. Task types opt in simply by adding the file — no code change in lmer is required.
 
 ```bash
 # Remote repo URL with task

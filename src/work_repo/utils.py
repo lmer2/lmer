@@ -5,6 +5,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 # Minimum length for an env var value to be considered a secret worth redacting.
 # Very short values (e.g., "yes", "dev", "true") stored in secret-named env vars
@@ -113,6 +114,44 @@ def redact_secrets(text: str, secret_values: Optional[list[str]] = None) -> str:
         )
 
     return redacted
+
+
+def is_secret_env_name(name: str) -> bool:
+    """True if an env var name matches the sensitive-name pattern.
+
+    The shared name rule (TOKEN/KEY/SECRET/PASSWORD/CREDENTIALS) behind the
+    redaction sinks and the prompt/taskdef render-context filters, exposed so
+    callers outside this module never grow their own copy of the regex.
+    """
+    return bool(_SECRET_NAME_PATTERNS.search(name))
+
+
+def strip_url_credentials(url):
+    """Strip any embedded ``user:password@`` credentials from a URL.
+
+    Unlike :func:`redact_secrets`, which stamps a redaction marker into free
+    text, this keeps the URL usable: scheme/host/port/path survive and only
+    the userinfo is removed (``https://oauth2:tok@host/p`` →
+    ``https://host/p``). Values that are not credentialed URLs pass through
+    unchanged — including scp-style SSH remotes (``git@host:path``), whose
+    userinfo is protocol plumbing, not a credential.
+    """
+    if not url or "://" not in url or "@" not in url:
+        return url
+    try:
+        parsed = urlparse(url)
+        if parsed.username or parsed.password:
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            return urlunparse(parsed._replace(netloc=netloc))
+        return url
+    except Exception:
+        # Fail closed: never return a value that may still carry the
+        # credential when parsing fails (e.g. an out-of-range port makes
+        # `parsed.port` raise). Strip the userinfo with a regex that cannot
+        # raise instead.
+        return re.sub(r"(://)[^/]*@", r"\1", url)
 
 
 def sanitize_task_target(task_target: str) -> str:

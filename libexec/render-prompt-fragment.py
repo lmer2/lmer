@@ -14,6 +14,13 @@ embedded credentials (e.g. ``https://oauth2:TOKEN@host/...`` in
 ``LMER_REPO_URL`` / ``LMER_WORK_REPO``). This keeps tokens out of the
 rendered system prompt even if a template author references them by name.
 
+The taskdef renderer (``hooks/start.py``) applies the same name rule but
+deliberately *redacts* credentialed URL values in place instead of dropping
+them — taskdefs legitimately print the repo URL; fragments never need it, so
+the simpler drop rule stays here. This renderer also stays self-contained
+(no lmer imports): it must run from any install location the runner scripts
+find it at, with only jinja2 available.
+
 The rendered output is written to stdout. Any error (missing file, render
 failure) is reported on stderr with a non-zero exit status so the caller can
 decide how to handle it.

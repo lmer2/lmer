@@ -84,9 +84,17 @@ the following holds:
 
 This means a template can safely reference any `LMER_*` name: if the value
 is sensitive, the variable will be undefined in the context and standard
-Jinja2 default handling applies (rendering `{{ LMER_FOO_TOKEN }}` with no
-default will fail loudly rather than leak). Non-LMER env vars are never
+Jinja2 default handling applies — rendering `{{ LMER_FOO_TOKEN }}` with no
+default yields an empty string (silent, but leak-free; add
+`| default('...')` for a visible placeholder). Non-LMER env vars are never
 exposed.
+
+The taskdef renderer (`hooks/start.py`, see [TASKDEFS.md](./TASKDEFS.md))
+applies the same name rule but treats credentialed URLs differently: it
+redacts them in place to their tokenless form instead of dropping them,
+because taskdefs legitimately print the repo URL (`{{ LMER_REPO_URL }}` in
+the `chat`/`release` taskdefs). Fragments have no such need, so the simpler
+drop rule stays here.
 
 > **Auto-escape is off.** The renderer produces markdown, not HTML, so
 > values containing `<`, `&`, etc. pass through verbatim. That is the right
