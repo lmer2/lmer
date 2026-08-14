@@ -297,3 +297,49 @@ class TestClaudeRunnerHumanIdentity:
         finally:
             if sentinel.exists():
                 sentinel.unlink()
+
+
+class TestSensitiveNameRuleParity:
+    """The renderer's local name pattern is a deliberate copy of
+    work_repo.utils._SECRET_NAME_PATTERNS (the renderer must stay
+    dependency-free); this guard fails when either side's rule drifts,
+    since the parity is otherwise asserted only in docs (MR !220)."""
+
+    @staticmethod
+    def _load_renderer_module():
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "render_prompt_fragment", RENDERER
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_name_rule_matches_shared_pattern(self):
+        from work_repo.utils import _SECRET_NAME_PATTERNS
+
+        mod = self._load_renderer_module()
+        local = mod._SENSITIVE_NAME_RE
+        # Same alternation set: adding/removing a keyword on one side fails
+        # here even for names no probe below anticipates.
+        split = lambda p: set(p.strip("()").split("|"))  # noqa: E731
+        assert split(local.pattern) == split(_SECRET_NAME_PATTERNS.pattern)
+        assert local.flags & re.IGNORECASE
+        assert _SECRET_NAME_PATTERNS.flags & re.IGNORECASE
+        # Behavioral spot-check on both matching and non-matching names.
+        probes = [
+            "LMER_FOO_TOKEN",
+            "LMER_API_KEY",
+            "MY_SECRET",
+            "DB_PASSWORD",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "lmer_foo_token",
+            "LMER_REPO_URL",
+            "LMER_TASK_TARGET",
+            "HOME",
+        ]
+        for name in probes:
+            assert bool(local.search(name)) == bool(
+                _SECRET_NAME_PATTERNS.search(name)
+            ), name

@@ -8,16 +8,24 @@ Usage:
 """
 import sys
 import os
-import re
 import time
 import shutil
 import subprocess
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse
 import json
 import yaml
 from jinja2 import Environment, FileSystemLoader, Template
 from jinja2 import nodes as jinja_nodes
+
+# Importable in every invocation path: the .sh wrappers export
+# PYTHONPATH=/Agents/global/src, and direct invocation runs the venv python,
+# which has the lmer package installed.
+from work_repo.utils import (
+    is_secret_env_name,
+    redact_secrets,
+    strip_url_credentials,
+)
 
 # Taskdef schema versions this renderer understands (docs/TASKDEFS.md).
 # Schema 1 is the legacy include-style layout (no manifest); schema 2 adds
@@ -602,7 +610,17 @@ def render_taskdef_template(template_file, extra_context=None):
 
     template = env.get_template(str(template_name))
 
-    context = {k: v for k, v in os.environ.items() if k.startswith('LMER_')}
+    # Credentialed URL values are redacted in place, not dropped: taskdefs
+    # legitimately render {{ LMER_REPO_URL }}, so the tokenless URL must
+    # survive and its truthiness guards must keep firing. secret_values=[]
+    # is deliberate: a secret-NAMED var can hold non-secret text
+    # (LMER_GITLAB_TOKEN_HOST is a hostname) that the value sweep would
+    # stamp out of every URL — shape-based passes only.
+    context = {
+        k: redact_secrets(strip_url_credentials(v), secret_values=[])
+        for k, v in os.environ.items()
+        if k.startswith('LMER_') and not is_secret_env_name(k)
+    }
     context['taskdef_name'] = template_file.parent.name
     context['taskdef_file'] = str(template_file)
     is_github, is_gitlab = _target_provider_flags()
@@ -679,31 +697,10 @@ def read_and_display_instructions(instructions_file, work_mode="finish"):
     return True
 
 
-def _redact_url_credentials(url):
-    """Strip any embedded ``user:password@`` credentials from a URL.
-
-    LMER_REPO_URL is typically an https clone URL carrying an ``oauth2:<token>@``
-    prefix; printing it verbatim leaks the token to the console. Rebuild the URL
-    from scheme/host/port/path only. Mirror of the URL branch of
-    ``lmer_cli.cli._redact_env_value`` — kept local because this hook runs under
-    the global venv and does not import the lmer_cli package.
-    """
-    if not url or "://" not in url or "@" not in url:
-        return url
-    try:
-        parsed = urlparse(url)
-        if parsed.username or parsed.password:
-            netloc = parsed.hostname or ""
-            if parsed.port:
-                netloc = f"{netloc}:{parsed.port}"
-            return urlunparse(parsed._replace(netloc=netloc))
-        return url
-    except Exception:
-        # Fail closed: a redaction helper must never emit a value that may still
-        # carry credentials. If urlparse raises (e.g. an out-of-range port makes
-        # `parsed.port` raise ValueError), strip the userinfo with a regex that
-        # cannot raise instead of returning the original token-bearing URL.
-        return re.sub(r"(://)[^/]*@", r"\1", url)
+# The /start banner and the taskdef context filter share one URL-credential
+# rule; the historical local mirror of lmer_cli.cli._redact_env_value's URL
+# branch moved to work_repo.utils.strip_url_credentials (issue #285).
+_redact_url_credentials = strip_url_credentials
 
 
 def check_task_context():

@@ -397,6 +397,137 @@ class TestRedactUrlCredentials:
         assert "git.example.com" in out
 
 
+class TestTaskdefContextFilter:
+    """Issue #285: the taskdef render context must not carry credentials.
+
+    The fragment renderer (libexec/render-prompt-fragment.py) has filtered
+    its context since it shipped; these tests hold the taskdef renderer to
+    the same standard — name-matched keys dropped, credentialed URL values
+    redacted in place so the tokenless URL still renders.
+    """
+
+    FAKE_CRED = "glpat-" + "FAKEtaskdef1234567890abcd"
+
+    def _render(self, tmp_path, monkeypatch, template_text):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        instructions_file = tmp_path / "instructions.txt"
+        instructions_file.write_text(template_text)
+        with patch('hooks.start.Path.home', return_value=tmp_path):
+            f = io.StringIO()
+            with redirect_stdout(f):
+                assert read_and_display_instructions(instructions_file, "finish")
+            return f.getvalue()
+
+    def test_sensitive_named_var_dropped(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMER_FASTAPI_TOKEN", self.FAKE_CRED)
+        output = self._render(
+            tmp_path, monkeypatch,
+            "[{{ LMER_FASTAPI_TOKEN | default('DROPPED') }}]\n",
+        )
+        assert "[DROPPED]" in output
+        assert self.FAKE_CRED not in output
+
+    def test_credentialed_url_renders_tokenless(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(
+            "LMER_REPO_URL",
+            f"https://oauth2:{self.FAKE_CRED}@gitlab.example.com/org/repo.git",
+        )
+        output = self._render(tmp_path, monkeypatch, "URL: {{ LMER_REPO_URL }}\n")
+        assert "URL: https://gitlab.example.com/org/repo.git" in output
+        assert self.FAKE_CRED not in output
+        assert "oauth2" not in output
+
+    def test_credentialed_url_stays_truthy_in_conditionals(
+        self, tmp_path, monkeypatch
+    ):
+        """Redact-in-place (not drop): {% if LMER_REPO_URL %} keeps firing."""
+        monkeypatch.setenv(
+            "LMER_REPO_URL",
+            f"https://oauth2:{self.FAKE_CRED}@gitlab.example.com/org/repo.git",
+        )
+        output = self._render(
+            tmp_path, monkeypatch,
+            "{% if LMER_REPO_URL %}HAS_URL{% else %}NO_URL{% endif %}\n",
+        )
+        assert "HAS_URL" in output
+
+    def test_value_shape_catches_unenumerated_vars(self, tmp_path, monkeypatch):
+        """Any LMER_* URL value is caught, not a name allowlist (#285 comment:
+        LMER_NAPKIN_REPO would slip past a name-by-name fix)."""
+        monkeypatch.setenv(
+            "LMER_NAPKIN_REPO",
+            f"https://oauth2:{self.FAKE_CRED}@gitlab.example.com/org/napkin.git",
+        )
+        output = self._render(
+            tmp_path, monkeypatch, "Napkin: {{ LMER_NAPKIN_REPO }}\n"
+        )
+        assert "Napkin: https://gitlab.example.com/org/napkin.git" in output
+        assert self.FAKE_CRED not in output
+
+    def test_plain_url_passes_through_unchanged(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMER_REPO_URL", "https://gitlab.example.com/org/repo.git")
+        output = self._render(tmp_path, monkeypatch, "URL: {{ LMER_REPO_URL }}\n")
+        assert "URL: https://gitlab.example.com/org/repo.git" in output
+
+    def test_structured_value_secret_caught_by_backstop(
+        self, tmp_path, monkeypatch
+    ):
+        """A token inside a structured value (the LMER_SPAWN_AGENTS_CONFIG
+        shape) matches neither the name rule nor the URL-userinfo shape;
+        the redact_secrets backstop must stamp it (MR !220 review)."""
+        overlay = (
+            '{"reviewer": {"env": {"GITLAB_TOKEN": "%s"}}}' % self.FAKE_CRED
+        )
+        monkeypatch.setenv("LMER_SPAWN_AGENTS_CONFIG", overlay)
+        output = self._render(
+            tmp_path, monkeypatch, "Overlay: {{ LMER_SPAWN_AGENTS_CONFIG }}\n"
+        )
+        assert self.FAKE_CRED not in output
+        assert "***REDACTED***" in output
+        # The rest of the structured value survives readable.
+        assert '"reviewer"' in output
+
+    def test_secret_named_hostname_var_does_not_poison_urls(
+        self, tmp_path, monkeypatch
+    ):
+        """!220 iteration-2 blocker pin: LMER_GITLAB_TOKEN_HOST is
+        secret-NAMED but holds a hostname; the backstop must not sweep that
+        value out of every URL containing it. The var itself is dropped
+        (name rule), the URLs render intact and tokenless."""
+        monkeypatch.setenv("LMER_GITLAB_TOKEN_HOST", "gitlab.example.com")
+        monkeypatch.setenv(
+            "LMER_REPO_URL",
+            f"https://oauth2:{self.FAKE_CRED}@gitlab.example.com/org/repo.git",
+        )
+        monkeypatch.setenv(
+            "LMER_TASK_TARGET",
+            "https://gitlab.example.com/org/repo/-/merge_requests/1",
+        )
+        output = self._render(
+            tmp_path, monkeypatch,
+            "URL: {{ LMER_REPO_URL }}\nTarget: {{ LMER_TASK_TARGET }}\n",
+        )
+        assert "URL: https://gitlab.example.com/org/repo.git" in output
+        assert (
+            "Target: https://gitlab.example.com/org/repo/-/merge_requests/1"
+            in output
+        )
+        assert "***REDACTED***" not in output
+        assert self.FAKE_CRED not in output
+
+    def test_dropped_key_without_default_renders_empty(
+        self, tmp_path, monkeypatch
+    ):
+        """Contract pin: a dropped key with no `| default` renders as an
+        empty string (default Jinja Undefined), silently — not an error."""
+        monkeypatch.setenv("LMER_FASTAPI_TOKEN", self.FAKE_CRED)
+        output = self._render(
+            tmp_path, monkeypatch, "[{{ LMER_FASTAPI_TOKEN }}]\n"
+        )
+        assert "[]" in output
+        assert self.FAKE_CRED not in output
+
+
 class TestRunStateSessionStart:
     """run_state_session_start() — fail-soft subprocess wrapper."""
 

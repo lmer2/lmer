@@ -1085,28 +1085,19 @@ def _remap_taskdef_to_container(
 
 
 def _redact_env_value(name: str, value: str) -> str:
-    """Redact sensitive env var values, showing only a hint."""
-    if re.search(r"TOKEN|KEY|SECRET|PASSWORD|CREDENTIALS", name, re.IGNORECASE):
+    """Redact sensitive env var values, showing only a hint.
+
+    Name rule and URL-credential strip come from work_repo.utils (issue
+    #285); only the ``value[:4] + "***"`` hint for name-matched vars is
+    display behavior of this surface.
+    """
+    from work_repo.utils import is_secret_env_name, strip_url_credentials
+
+    if is_secret_env_name(name):
         if len(value) <= 4:
             return "***"
         return value[:4] + "***"
-    # Strip embedded credentials from URLs
-    if "://" in value and "@" in value:
-        from urllib.parse import urlparse, urlunparse
-        try:
-            parsed = urlparse(value)
-            if parsed.password or parsed.username:
-                cleaned = parsed._replace(
-                    netloc=(parsed.hostname or "") + (f":{parsed.port}" if parsed.port else "")
-                )
-                return urlunparse(cleaned)
-        except Exception:
-            # Fail closed: never return a value that may still carry the
-            # credential when parsing fails (e.g. an out-of-range port makes
-            # `parsed.port` raise). Strip the userinfo with a regex that cannot
-            # raise instead.
-            return re.sub(r"(://)[^/]*@", r"\1", value)
-    return value
+    return strip_url_credentials(value)
 
 
 def _display_env_config_cli(
