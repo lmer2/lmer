@@ -22,6 +22,7 @@ import time
 import yaml
 
 from lmer_cli import gate_cache, push_allow
+from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.util import get_bool_env
 from work_repo.utils import project_info_dir, task_info_dir
 
@@ -1912,8 +1913,20 @@ class GateSystem:
         copy-pasteable entry that would grant the first refused URL."""
         print(f"{Colors.RED}❌ Push not allowed to this repository{Colors.NC}")
         for url in remote_urls:
+            # The workspace origin is a TOKENIZED clone URL
+            # (https://oauth2:<token>@host/path.git), so printing it raw puts
+            # a live credential on stdout and into the agent transcript
+            # (#281). Authorization keeps reading the raw URL — only the
+            # printed form is scrubbed.
+            #
+            # `remote` is scrubbed too: on the push-by-URL branch
+            # (`gate-push --remote https://...`) it IS the tokenized URL,
+            # so scrubbing only `url` left the credential in the
+            # parenthetical. For a named remote ("origin") the scrub is a
+            # no-op, so it is applied unconditionally.
             mark = "  <-- not allowed" if url in denied else ""
-            print(f"Repository ({remote}): {url}{mark}")
+            print(f"Repository ({_scrub_credentials(remote)}): "
+                  f"{_scrub_credentials(url)}{mark}")
         print(f"Target ref: {target_ref}")
         print("Sources checked:")
         if env_entries:
@@ -2065,8 +2078,12 @@ class GateSystem:
         # the case worth seeing.
         for url in remote_urls:
             entry, source = grants[url]
+            # Scrubbed for the same reason as the refusal above (#281): the
+            # granted URL is the tokenized one git will dial, and on the
+            # push-by-URL branch `remote` carries that same URL.
             print(f"{Colors.GREEN}✅ Push target allowed{Colors.NC} "
-                  f"({remote}): {url} [{target_ref}]")
+                  f"({_scrub_credentials(remote)}): {_scrub_credentials(url)} "
+                  f"[{target_ref}]")
             print(f"   granted by '{entry}' from {source}")
 
         # What a push changes is the commit range, so hand the tests check a

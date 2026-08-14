@@ -12,16 +12,36 @@ from typing import Optional
 # Real API tokens are typically 20+ characters; 8 is a conservative floor.
 _MIN_SECRET_LENGTH = 8
 
-# Env var name patterns that indicate sensitive values
+# Env var name patterns that indicate sensitive values.
+# Mirrors the set used by _redact_env_value in lmer_cli/cli.py; the bare KEY
+# subsumes API_KEY (DEPLOY_KEY, SIGNING_KEY, ... all match). Short values are
+# still filtered out by _MIN_SECRET_LENGTH, which is what keeps names like
+# KEY=yes from turning common words into redactions.
 _SECRET_NAME_PATTERNS = re.compile(
-    r"(TOKEN|API_KEY|SECRET|PASSWORD)", re.IGNORECASE
+    r"(TOKEN|KEY|SECRET|PASSWORD|CREDENTIALS)", re.IGNORECASE
 )
 
 # Known token value prefixes — match directly in text regardless of env var name.
 # Each pattern captures the full token (prefix + sufficient trailing characters).
+# High-entropy tails keep the {20,} floor; the shorter {10,} families (Slack,
+# GitLab runner/deploy tokens) are distinctive enough on their prefix alone.
 _SECRET_VALUE_PREFIX_RE = re.compile(
-    r"(glpat-[A-Za-z0-9_\-.]{20,}|sk-[A-Za-z0-9_\-.]{20,})"
+    r"("
+    r"glpat-[A-Za-z0-9_\-.]{20,}"  # GitLab personal access token
+    r"|gl(?:rt|dt)-[A-Za-z0-9_\-.]{10,}"  # GitLab runner / deploy token
+    r"|sk-[A-Za-z0-9_\-.]{20,}"  # LLM API key
+    r"|github_pat_[A-Za-z0-9_]{20,}"  # GitHub fine-grained PAT
+    r"|gh[pousr]_[A-Za-z0-9]{20,}"  # GitHub classic PAT / OAuth / app tokens
+    r"|xox[bp]-[A-Za-z0-9-]{10,}"  # Slack bot / user token
+    r"|xapp-[A-Za-z0-9-]{10,}"  # Slack app-level token
+    r")"
 )
+
+# Backstop for credentials embedded in URLs (https://oauth2:<token>@host/path).
+# Replaces the whole userinfo segment regardless of token shape. The userinfo
+# cannot contain "/", whitespace or "@", so plain URLs and bare email addresses
+# (no "://" before them) are left alone.
+_URL_USERINFO_RE = re.compile(r"(://)[^/\s@]+(@)")
 
 _REDACTED = "***REDACTED***"
 
@@ -31,7 +51,7 @@ def _collect_secret_values() -> list[str]:
     Collect sensitive values from environment variables.
 
     Scans all env vars whose names match common secret patterns
-    (TOKEN, API_KEY, SECRET, PASSWORD) and returns their values,
+    (TOKEN, KEY, SECRET, PASSWORD, CREDENTIALS) and returns their values,
     sorted longest-first so longer tokens are replaced before
     any shorter substrings.
 
@@ -51,8 +71,10 @@ def redact_secrets(text: str, secret_values: Optional[list[str]] = None) -> str:
     Replace any secret values found in text with a redaction marker.
 
     Scans the text for values of environment variables whose names match
-    sensitive patterns (TOKEN, API_KEY, SECRET, PASSWORD). Any matches
-    are replaced with ***REDACTED*** and a warning is printed to stderr.
+    sensitive patterns (TOKEN, KEY, SECRET, PASSWORD, CREDENTIALS), for
+    values carrying a known token prefix, and for credentials embedded in
+    URLs. Any matches are replaced with ***REDACTED*** and a warning is
+    printed to stderr.
 
     Args:
         text: The text to redact
@@ -74,9 +96,14 @@ def redact_secrets(text: str, secret_values: Optional[list[str]] = None) -> str:
             redacted = redacted.replace(secret, _REDACTED)
             found = True
 
-    # Also redact tokens matching known value prefixes (e.g. glpat-, sk-)
+    # Also redact tokens matching known value prefixes (e.g. glpat-, ghp-, xoxb-)
     if _SECRET_VALUE_PREFIX_RE.search(redacted):
         redacted = _SECRET_VALUE_PREFIX_RE.sub(_REDACTED, redacted)
+        found = True
+
+    # Backstop: strip userinfo from URLs, whatever the credential looks like
+    if _URL_USERINFO_RE.search(redacted):
+        redacted = _URL_USERINFO_RE.sub(rf"\g<1>{_REDACTED}\g<2>", redacted)
         found = True
 
     if found:

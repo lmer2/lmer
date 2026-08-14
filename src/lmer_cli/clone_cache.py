@@ -33,9 +33,11 @@ Credential rules (the reason this code lives host-side at all):
   ``credential.helper`` so nothing can substitute other credentials or block a
   detached updater on an interactive unlock.
 - A credential lmer injected may still be one the remote rejects (a
-  ``GITLAB_TOKEN`` fallback reaching a github.com URL). A failed attempt that
-  carried credentials is therefore retried **once without lmer's own
-  injection**, so a public repo mirrors regardless (issue #157). The retry
+  ``GITLAB_TOKEN`` fallback used to reach github.com URLs; since #161 the
+  generic token is scoped to its issuing host, so what remains is an
+  explicitly mis-scoped or per-host token the target refuses). A failed
+  attempt that carried credentials is therefore retried **once without
+  lmer's own injection**, so a public repo mirrors regardless (#157). The retry
   undoes what this process attached and nothing else: it runs the same empty
   env a URL lmer could not credential gets, so the operator's own git config
   — headers and credential helper included — is what remains, exactly as
@@ -471,12 +473,16 @@ def _attempt_with_fallback(
 ) -> None:
     """Run *operation(cred_env)*, retrying once anonymously if it failed (#157).
 
-    A credential lmer injected is not necessarily one the remote accepts: a
-    host with ``GITLAB_TOKEN`` set and no GitHub token gets that PAT injected
-    into github.com URLs by the generic token fallback, and GitHub challenges
-    it even for a **public** repo — which is how a mirror of a public repo
-    failed with "could not read Username" while an anonymous fetch of the same
-    URL would have succeeded (issue #157, seen in the #150 spike).
+    A credential lmer injected is not necessarily one the remote accepts:
+    a host with ``GITLAB_TOKEN`` set and no GitHub token *used to* get that
+    PAT injected into github.com URLs by the generic token fallback, and
+    GitHub challenges it even for a **public** repo — which is how a mirror
+    of a public repo failed with "could not read Username" while an anonymous
+    fetch of the same URL would have succeeded (issue #157, seen in the #150
+    spike). Since #161 the generic token is scoped to its issuing host, so
+    that exact path is closed and the retry now mainly covers explicitly
+    mis-scoped (``LMER_GITLAB_TOKEN_HOST``) or per-host tokens the target
+    rejects — the failure mode is unchanged, only its sources are fewer.
 
     So a failed attempt that *carried* credentials is retried once **with
     lmer's own injection dropped and nothing else changed** — an empty env,

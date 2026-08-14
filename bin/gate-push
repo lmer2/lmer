@@ -14,6 +14,9 @@ src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 sys.path.insert(0, src_dir)
 
 from lmer_cli.gates import GateSystem, Colors, receipt_argv
+# Same import gates.py uses: `--remote` may itself be a tokenized clone URL
+# (push-by-URL), and printing it raw puts a live credential on stdout (#281).
+from lmer_cli.container.clone_and_exec import _scrub_credentials
 
 try:
     from work_repo.run_state import emit_gate_event
@@ -88,7 +91,10 @@ def gate_push(verbose: bool = False, tag: str = None, ref: str = None,
     if target_ref is not None:
         # Explicit ref (tag or refspec): push it verbatim, no upstream
         # tracking involved.
-        print(f"{Colors.CYAN}Pushing ref: {target_ref} -> {remote}{Colors.NC}")
+        # The scrub is a no-op for a named remote ("origin"), so it is
+        # applied unconditionally rather than branching on the form.
+        print(f"{Colors.CYAN}Pushing ref: {target_ref} -> "
+              f"{_scrub_credentials(remote)}{Colors.NC}")
         result = subprocess.run(
             ["git", "push", remote, target_ref],
             check=False

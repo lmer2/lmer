@@ -6,6 +6,11 @@ import requests
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
+# The token lookup rule, not a second copy of it — see _resolve_token.
+# lmer_cli.tokens is stdlib-only and bin/gitlab-review puts src/ on
+# PYTHONPATH, so the import costs nothing and always resolves.
+from lmer_cli.tokens import _get_gitlab_token
+
 
 DEFAULT_PAGE_SIZE = 20
 DEFAULT_MAX_PAGES = 25
@@ -53,7 +58,8 @@ class GitLabClient:
 
         Args:
             host: GitLab host (defaults to GITLAB_HOST env var or gitlab.com)
-            token: API token (defaults to host-specific GITLAB_TOKEN_{host} or GITLAB_TOKEN)
+            token: API token (defaults to host-specific GITLAB_TOKEN_{host}, or
+                GITLAB_TOKEN when this host is the one that issued it)
         """
         self.host = host or os.getenv('GITLAB_HOST', 'gitlab.com')
         self.token = token or self._resolve_token(self.host)
@@ -62,8 +68,9 @@ class GitLabClient:
             import re
             suffix = re.sub(r"[.\-]", "_", self.host.lower())
             raise GitLabError(
-                f"GitLab token required. Set GITLAB_TOKEN_{suffix} or GITLAB_TOKEN "
-                "environment variable or pass token parameter."
+                f"GitLab token required. Set GITLAB_TOKEN_{suffix} (always applies "
+                "to this host) or pass token parameter; a generic GITLAB_TOKEN is "
+                "used only for its issuing host (LMER_GITLAB_TOKEN_HOST)."
             )
 
         self.base_url = f"https://{self.host}/api/v4"
@@ -80,15 +87,14 @@ class GitLabClient:
     def _resolve_token(host: str) -> str | None:
         """Resolve API token for a given host from environment variables.
 
-        Checks host-specific tokens first (GITLAB_TOKEN_{sanitized_host}),
-        then falls back to GITLAB_TOKEN.
+        Delegates to the shared lookup, which keeps the precedence this used
+        to implement inline — host-specific GITLAB_TOKEN_{sanitized_host}
+        first, generic GITLAB_TOKEN after — but hands the generic token out
+        only for the host that issued it (LMER_GITLAB_TOKEN_HOST, defaulting
+        to the LMER_WORK_REPO host). Without that scoping, `--host` alone
+        decided who received the PAT in a PRIVATE-TOKEN header (issue #161).
         """
-        import re
-        suffix = re.sub(r"[.\-]", "_", host.lower())
-        return (
-            os.getenv(f'GITLAB_TOKEN_{suffix}')
-            or os.getenv('GITLAB_TOKEN')
-        )
+        return _get_gitlab_token(host)
 
     def _request(self, method: str, endpoint: str, **kwargs) -> Any:
         """Make API request with error handling."""

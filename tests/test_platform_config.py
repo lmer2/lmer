@@ -13,9 +13,13 @@ import stat
 
 import pytest
 
+from lmer_cli import tokens
 from lmer_platform import config as cfg
 from lmer_platform import store
 from tests.conftest import strip_lmer_env
+
+#: Stand-in for a generic PAT; never a real credential shape in use anywhere.
+STUB_CREDENTIAL = "glpat-notarealcredential"
 
 
 @pytest.fixture(autouse=True)
@@ -176,6 +180,76 @@ def test_config_file_work_repo_url_wins_over_env(platform_root, monkeypatch):
     cfg.save(cfg.PlatformConfig(work_repo_url="https://git.example.com/a/work.git"))
     monkeypatch.setenv(cfg.ENV_WORK_REPO, "git@git.example.com:other/work.git")
     assert cfg.load().work_repo_url == "https://git.example.com/a/work.git"
+
+
+class TestGitlabTokenIssuingHostSeeding:
+    """The generic token's issuing host defaults to the resolved work repo.
+
+    ``lmer_cli.tokens`` scopes a generic ``GITLAB_TOKEN`` to the host that
+    issued it and defaults that host from ``LMER_WORK_REPO`` — a variable a
+    config.json-configured deployment never exports, which would refuse the
+    token for the work repo's own host (issue #161 review).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_token_env(self, monkeypatch):
+        for name in ("GITLAB_TOKEN", "GITLAB_TOKEN_git_example_com"):
+            monkeypatch.delenv(name, raising=False)
+        # The refusal notice is deduped process-wide; a leftover entry would
+        # hide the very lookup these tests drive.
+        tokens._warned.clear()
+        yield
+        tokens._warned.clear()
+
+    def test_config_file_url_seeds_the_issuing_host(self, platform_root,
+                                                    monkeypatch):
+        cfg.save(cfg.PlatformConfig(
+            work_repo_url="https://git.example.com/agents/work.git"))
+        monkeypatch.setenv("GITLAB_TOKEN", STUB_CREDENTIAL)
+
+        cfg.load()
+
+        assert os.environ["LMER_GITLAB_TOKEN_HOST"] == "git.example.com"
+        assert tokens._get_gitlab_token("git.example.com") == STUB_CREDENTIAL
+
+    def test_ssh_form_seeds_the_host_too(self, platform_root, monkeypatch):
+        cfg.save(cfg.PlatformConfig(
+            work_repo_url="git@git.example.com:agents/work.git"))
+
+        cfg.load()
+
+        assert os.environ["LMER_GITLAB_TOKEN_HOST"] == "git.example.com"
+
+    def test_explicit_setting_survives_load(self, platform_root, monkeypatch):
+        monkeypatch.setenv("LMER_GITLAB_TOKEN_HOST", "gitlab.other.com")
+        cfg.save(cfg.PlatformConfig(
+            work_repo_url="https://git.example.com/agents/work.git"))
+
+        cfg.load()
+
+        assert os.environ["LMER_GITLAB_TOKEN_HOST"] == "gitlab.other.com"
+
+    def test_no_work_repo_url_seeds_nothing(self, platform_root):
+        cfg.load()
+
+        assert "LMER_GITLAB_TOKEN_HOST" not in os.environ
+
+    def test_unparseable_work_repo_url_seeds_nothing(self, platform_root):
+        cfg.load({"work_repo_url": "/srv/local/work"})
+
+        assert "LMER_GITLAB_TOKEN_HOST" not in os.environ
+
+    def test_repeated_loads_are_idempotent(self, platform_root, monkeypatch):
+        cfg.save(cfg.PlatformConfig(
+            work_repo_url="https://git.example.com/agents/work.git"))
+        cfg.load()
+        # A second resolution must not overwrite what the first (or an
+        # operator) put there.
+        monkeypatch.setenv("LMER_GITLAB_TOKEN_HOST", "gitlab.other.com")
+
+        cfg.load()
+
+        assert os.environ["LMER_GITLAB_TOKEN_HOST"] == "gitlab.other.com"
 
 
 def test_work_repo_forge_resolves_override_over_env_over_file(

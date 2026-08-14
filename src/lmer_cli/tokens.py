@@ -11,7 +11,56 @@ When updating token logic here, keep that copy in sync.
 
 import os
 import re
+import sys
 from urllib.parse import urlparse
+
+#: Refusal notices already printed by :func:`_get_gitlab_token`. One session
+#: credentials many URLs against the same host, so without this the same
+#: diagnostic would repeat once per lookup.
+_warned: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    """Print ``message`` to stderr the first time it is seen in this process."""
+    if message in _warned:
+        return
+    _warned.add(message)
+    print(message, file=sys.stderr)
+
+
+def _host_from_git_url(url: str) -> str | None:
+    """Extract the lowercased host from a git URL, or None if unparseable.
+
+    Handles ``https://host/path``, ``https://user:pass@host/path`` (the form
+    LMER_WORK_REPO takes once the host CLI has injected a token) and the
+    scp-like ``git@host:path``. Deliberately hand-rolled rather than urlparse:
+    the container copy in clone_and_exec.py must behave identically.
+    """
+    url = (url or "").strip()
+    if not url:
+        return None
+    if "://" in url:
+        authority = url.split("://", 1)[1].split("/", 1)[0]
+    elif ":" in url:
+        authority = url.split(":", 1)[0]
+    else:
+        return None
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    host = authority.split(":", 1)[0].strip().lower()
+    return host or None
+
+
+def _gitlab_token_issuing_host() -> str | None:
+    """Host the generic ``GITLAB_TOKEN`` was issued for, or None if unknown.
+
+    ``LMER_GITLAB_TOKEN_HOST`` names it explicitly; otherwise it defaults to
+    the work-repo host, which is where a single-host setup's PAT comes from.
+    """
+    explicit = os.environ.get("LMER_GITLAB_TOKEN_HOST", "").strip()
+    if explicit:
+        return explicit.lower()
+    return _host_from_git_url(os.environ.get("LMER_WORK_REPO", ""))
 
 
 def _sanitize_hostname(host: str) -> str:
@@ -58,7 +107,12 @@ def _get_gitlab_token(
          doesn't matter; the name is historical)
       4. For github.com / *.github.com / *.ghe.com: ``GH_TOKEN``, then
          ``GITHUB_TOKEN``
-      5. ``GITLAB_TOKEN`` — generic fallback
+      5. ``GITLAB_TOKEN`` — generic fallback, but only for the host that
+         issued it: ``LMER_GITLAB_TOKEN_HOST``, defaulting to the host in
+         ``LMER_WORK_REPO``. Any other host (and any host at all when the
+         issuing host is unknown) is refused with a one-time stderr notice,
+         so a GitLab PAT is never sent to github.com or another third party
+         (issue #161).
 
     Returns the token string, or ``None`` if nothing matches.
     """
@@ -86,7 +140,23 @@ def _get_gitlab_token(
             if token:
                 return token
 
-    return os.environ.get("GITLAB_TOKEN")
+    token = os.environ.get("GITLAB_TOKEN")
+    if not token:
+        return None
+    issuing_host = _gitlab_token_issuing_host()
+    if issuing_host is None:
+        _warn_once(
+            f"⚠️  GITLAB_TOKEN not used for {host}: issuing host unknown — "
+            f"set LMER_GITLAB_TOKEN_HOST or GITLAB_TOKEN_{suffix}"
+        )
+        return None
+    if issuing_host != (host or "").lower():
+        _warn_once(
+            f"⚠️  GITLAB_TOKEN not used for {host}: issued for {issuing_host} — "
+            f"set GITLAB_TOKEN_{suffix} for this host"
+        )
+        return None
+    return token
 
 
 def _prefer_ssh() -> bool:

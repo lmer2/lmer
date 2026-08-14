@@ -235,9 +235,11 @@ GITLAB_HOST=gitlab.example.com gitlab-review myorg/myproject --list
 The tool looks for authentication tokens in this order:
 1. `--token` command line argument
 2. Host-specific variables: `GITLAB_TOKEN_{sanitized_host}` (hostname with dots/hyphens replaced by underscores)
-3. `GITLAB_TOKEN` environment variable (generic fallback)
+3. `GITLAB_TOKEN` environment variable — used **only** for the host that issued it (`LMER_GITLAB_TOKEN_HOST`, defaulting to the host in `LMER_WORK_REPO`)
 
-Example: for `gitlab.example.com`, the tool checks `GITLAB_TOKEN_gitlab_example_com`, then falls back to `GITLAB_TOKEN`.
+Example: for `gitlab.example.com`, the tool checks `GITLAB_TOKEN_gitlab_example_com`, then `GITLAB_TOKEN` if `gitlab.example.com` is its issuing host.
+
+When the generic token is refused, a line like `⚠️  GITLAB_TOKEN not used for <host>: issued for <other host>` goes to stderr. Read that as "this host has no credential", not as a bad token — a 404 or a "token required" error right after it means you need `GITLAB_TOKEN_{sanitized_host}` for that host (or `--token`).
 
 ### Pagination
 
