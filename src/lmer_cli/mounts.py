@@ -9,7 +9,8 @@ SELinux labeling requirements for Podman.
 
 import os
 import sys
-from pathlib import Path
+import uuid
+from pathlib import Path, PurePosixPath
 from typing import Iterable, List, NamedTuple, Optional, Tuple
 
 from lmer_cli import user_harnesses
@@ -33,6 +34,29 @@ CONTAINER_UV_CACHE_DIR = "/home/developer/.cache/uv"
 # LMER_CLONE_CACHE_PATH and keeps one bare mirror per repo under it.
 CONTAINER_CLONE_CACHE_DIR = "/clone-cache"
 
+# The container's home directory (``HOME`` pinned by the container env dict in
+# cli.py). The boundary that decides whether a declared mount destination is
+# staged (_below_container_home) and whether a declared session directory is
+# accepted at all (lmer_platform.spawn imports it for that).
+CONTAINER_HOME = "/home/developer"
+
+# Where user-harness bind mounts below the container home land instead of
+# their declared paths (#293/#290): the runtime creates a mount destination's
+# missing parents root-owned before any container process runs, and the
+# developer-only container cannot chown them, so harness startup writes beside
+# the mount fail with EACCES. The entrypoint (Ctl/container/setup-mount-links.sh)
+# symlinks each declared path to its staged mount as `developer`, which is what
+# leaves the parent chain developer-owned. Built-ins are not staged: the image
+# ships their parents.
+CONTAINER_MOUNT_STAGING_DIR = "/home/developer/.lmer-mounts"
+
+# Name of the internal variable carrying the ``declared:staged`` pairs the
+# container entrypoint turns into symlinks. Set by ``lmer`` (credential
+# mounts) and by ``lmer_platform.spawn`` (harness session directories),
+# consumed only by Ctl/container/setup-mount-links.sh — see
+# :func:`format_mount_links` for the grammar.
+MOUNT_LINKS_ENV = "LMER_MOUNT_LINKS"
+
 # Fixed path inside the container where the release SSH signing key is
 # mounted (release-taskdef sessions only; spec §4/§5 of the release-flow
 # bundle). The release session gate in cli.py forwards this path via
@@ -40,6 +64,33 @@ CONTAINER_CLONE_CACHE_DIR = "/clone-cache"
 # at it; every non-release session must receive neither the mount nor the
 # variable.
 CONTAINER_RELEASE_SIGNING_KEY_PATH = "/release-signing-key"
+
+
+def _below_container_home(container_path: str) -> bool:
+    """Whether *container_path* is strictly below :data:`CONTAINER_HOME`.
+
+    Compared as path components rather than as a string prefix:
+    ``/home/developer2/x`` starts with ``/home/developer`` and is nowhere below
+    it. *Strictly*, so the home directory itself does not qualify — a mount at
+    ``/home/developer`` has no parent to create.
+
+    The same rule ``lmer_platform.spawn`` applies to a declared session
+    directory, spelled here because this module decides it for credential
+    mounts and a reverse import would close a cycle.
+    """
+    parts = PurePosixPath(container_path).parts
+    home = PurePosixPath(CONTAINER_HOME).parts
+    return len(parts) > len(home) and parts[:len(home)] == home
+
+
+def _stage_token() -> str:
+    """A short token making this launch's staged credential paths its own.
+
+    Its own function so a test can pin it; the value is only ever used as one
+    path component, and it needs to be unpredictable-per-launch rather than
+    secret. See :func:`plan_credential_mounts` for what the collision is.
+    """
+    return uuid.uuid4().hex[:8]
 
 
 def selinux_opt(runtime: str) -> str:
@@ -232,6 +283,12 @@ class PlannedCredentialMount(NamedTuple):
     ``is_user`` marks a mount contributed by a user-installed harness (the
     launch-time 🔑 announce shows only these); ``harness_name`` and the
     ``CredentialMount`` fields drive both the ``-v`` arg and the announce.
+
+    ``staged`` is where the bind actually lands when staged; ``None`` means a
+    direct mount at ``container_path`` (every built-in, and user paths outside
+    the container home — :func:`plan_credential_mounts` says why).
+    ``container_path`` always stays the declared path: it is what the announce
+    prints and the left-hand side of the entrypoint's link pair.
     """
 
     harness_name: str
@@ -240,6 +297,7 @@ class PlannedCredentialMount(NamedTuple):
     host_file: Path
     container_path: str
     mode: str
+    staged: Optional[str] = None
 
 
 def plan_credential_mounts(
@@ -261,11 +319,26 @@ def plan_credential_mounts(
     to the "any regular file under the host home" boundary the docs state.
     Built-in harnesses keep the historical exists-only behavior (their
     registry entries are all fixed in-tree, not manifest-supplied).
+
+    A user harness's mount whose declared container path is **strictly below
+    the container home** is also *staged* (:data:`CONTAINER_MOUNT_STAGING_DIR`),
+    reaching its declared path through the entrypoint's symlink — a manifest may
+    name a path whose parents the image does not ship (issue #290). Outside the
+    home it binds directly, as before staging existed: the linker cannot create
+    the parent as ``developer`` (the credential would silently vanish), and
+    root-owned parents only hurt writes beside the mount, which cannot happen
+    outside the home anyway.
+
+    The staged path ``<staging>/creds/<launch token>/<n>`` is launch-unique
+    (:func:`_stage_token`): a bare positional index collided across nested
+    launches, linking one launch's declared path onto another's credential.
     """
     home = Path.home()
     home_resolved = home.resolve()
     to_mount: List[PlannedCredentialMount] = []
     skipped: List[Tuple[str, str]] = []
+    stage_token = _stage_token()
+    staged_count = 0
     seen = set()
     for entry in (harness, *extra_harnesses):
         for cred in entry.credential_mounts:
@@ -284,6 +357,14 @@ def plan_credential_mounts(
                 ):
                     skipped.append((entry.name, cred.host_path))
                     continue
+            staged = None
+            if entry.source_dir is not None and _below_container_home(
+                cred.container_path
+            ):
+                staged = (
+                    f"{CONTAINER_MOUNT_STAGING_DIR}/creds/{stage_token}/{staged_count}"
+                )
+                staged_count += 1
             to_mount.append(
                 PlannedCredentialMount(
                     entry.name,
@@ -292,9 +373,36 @@ def plan_credential_mounts(
                     host_file,
                     cred.container_path,
                     cred.mode,
+                    staged,
                 )
             )
     return to_mount, skipped
+
+
+def credential_mount_links(
+    planned: Iterable[PlannedCredentialMount],
+) -> List[Tuple[str, str]]:
+    """``(declared, staged)`` for every staged mount in *planned*.
+
+    Read off the same plan the mounts are bound from (``cli.py`` computes it
+    once), so the links the entrypoint makes and the destinations the runtime
+    binds cannot describe different sets of paths.
+    """
+    return [(m.container_path, m.staged) for m in planned if m.staged]
+
+
+def format_mount_links(inherited: str, pairs: Iterable[Tuple[str, str]]) -> str:
+    """The :data:`MOUNT_LINKS_ENV` value: ``declared:staged`` pairs, comma-joined.
+
+    Unambiguous because both path grammars that feed it refuse ``:``, ``,`` and
+    whitespace. *inherited* is passed through unvalidated: the entrypoint linker
+    treats every pair defensively, and a lost link costs one mount, not the
+    session. Blank entries are dropped so a stray comma cannot produce an empty
+    pair downstream.
+    """
+    entries = [entry for entry in inherited.split(",") if entry.strip()]
+    entries += [f"{declared}:{staged}" for declared, staged in pairs]
+    return ",".join(entries)
 
 
 def build_user_mounts(
@@ -307,6 +415,12 @@ def build_user_mounts(
     individual files rather than whole config directories, which avoids
     ownership issues with other subdirectories) and the SSH authentication
     socket from the host user's home directory into the container.
+
+    A user harness's credential file binds at the staged destination the plan
+    carries rather than at its declared path (see
+    :data:`CONTAINER_MOUNT_STAGING_DIR`); the caller forwards the link pairs
+    (:func:`credential_mount_links`) so the entrypoint puts the declared path
+    back as a symlink.
 
     Args:
         runtime: Container runtime ('docker' or 'podman')
@@ -345,7 +459,7 @@ def build_user_mounts(
             file=sys.stderr,
         )
     for m in to_mount:
-        args += ["-v", f"{m.host_file}:{m.container_path}:{m.mode}{se}"]
+        args += ["-v", f"{m.host_file}:{m.staged or m.container_path}:{m.mode}{se}"]
 
     # SSH agent
     ssh_sock = os.environ.get("SSH_AUTH_SOCK")

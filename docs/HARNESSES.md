@@ -534,10 +534,37 @@ session. The platform imposes two more conditions at spawn time, with the same
 warn-and-ignore outcome: the directory must sit **strictly below
 `/home/developer`** (the container home — every harness checked keeps its
 sessions under `$HOME`), and it must not be, or contain, a directory the
-platform already mounts. A value outside those bounds means the harness runs
-with no transcript on the host, and the reason appears only in the platform
-daemon's log. What the mount does and does not buy the chat view is
+platform already mounts, nor sit inside the mount staging area described
+below. A value outside those bounds means the harness runs with no transcript
+on the host, and the reason appears only in the platform daemon's log. What the
+mount does and does not buy the chat view is
 [Transcript visibility](#transcript-visibility-orchestrator-chat-view).
+
+**Every user-harness mount below the container home** — both
+`credential_mounts` and `session_dir` — is **delivered via a staged mount plus
+an in-container symlink**, because a manifest may name a path whose parents the
+image does not ship. (Built-in harnesses are not staged: the image ships their
+`~/.claude`, `~/.codex`, `~/.pi` developer-owned.) The bind lands under
+`/home/developer/.lmer-mounts`, and the container entrypoint links the declared
+path to it before any harness starts. The reason is ownership: a bind mount's
+missing parent directories are created by the container runtime as **root**,
+before any container process exists, and the session runs as `developer` with
+no-new-privileges — so nothing inside can chown them. A harness that writes a
+sibling file next to its own mount (kimi's `~/.kimi-code/tui.html` beside
+`~/.kimi-code/sessions`, opencode's `mkdir ~/.local/share/opencode/repos` beside
+its `auth.json`) would die at startup with EACCES. The symlink is created by the
+container user, so the parent chain is developer-owned and those writes work. No
+manifest change is needed — declare the path the harness actually uses; the
+pairs travel as `LMER_MOUNT_LINKS` (see [LMER-CLI.md](./LMER-CLI.md)).
+
+A `credential_mounts[].container_path` **outside** the container home (say
+`/etc/acme/auth.json`) binds directly at its declared path instead: staging
+cannot help there — the container user cannot create `/etc/acme`, so the
+credential would land where the harness never looks — and it is not needed
+either, since root-owned parents only hurt a harness *writing beside* its
+mount, which it cannot do outside `$HOME` in any case. Reading a
+directly-mounted credential is unaffected. (`session_dir` has no such case: a
+declared value outside the container home is refused outright, above.)
 
 ### Runner script (`runner.sh`)
 
@@ -632,7 +659,9 @@ existence.
 Declaring `session_dir` is all a user harness does to become readable from the
 orchestrator's chat view. `lmer platform` creates one host directory per
 declaring harness underneath the session's own transcript directory and mounts
-it read-write at the declared container path, so what the harness writes there
+it read-write into the container — at the declared path for a built-in, at a
+staged path the entrypoint symlinks the declared one to for a user harness (see
+the staged-mount note above) — so what the harness writes there
 survives the `--rm` container; the `.jsonl` files in it get the credential-shape
 scrub when the session ends (a masking pass, not a guarantee) and are what
 `GET /api/sessions/{id}/messages` reads back

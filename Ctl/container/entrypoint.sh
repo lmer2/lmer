@@ -14,6 +14,14 @@ else
     echo ""
 fi
 
+# Staged bind mounts → the paths their harnesses expect (#293/#290); must run
+# before anything reads the home directory. Absolute path so dev-mode sessions
+# pick up linker fixes without an image rebuild. `|| true` because under
+# `set -e` a linker failure would cost the whole session.
+if [ -f /Agents/global/Ctl/container/setup-mount-links.sh ]; then
+    bash /Agents/global/Ctl/container/setup-mount-links.sh || true
+fi
+
 # Verify FIPS mode is enabled
 echo "🔒 Checking FIPS mode status..."
 if [ -f /proc/sys/crypto/fips_enabled ]; then

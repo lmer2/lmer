@@ -940,6 +940,19 @@ class TestCliSourceGuards:
             "LMER_HARNESS_CACHE entry missing from cli.py env dict"
         )
 
+    def test_cli_env_dict_declares_mount_links(self):
+        """Without this entry the staged mounts (#293/#290) arrive with no
+        instruction to link them, so a user harness looks for its credentials
+        and its session directory at a path nothing was mounted at."""
+        from lmer_cli.mounts import MOUNT_LINKS_ENV
+
+        assert MOUNT_LINKS_ENV == "LMER_MOUNT_LINKS"
+        source = CLI_PY.read_text()
+        pattern = re.compile(r"""MOUNT_LINKS_ENV\s*:\s*format_mount_links\(""")
+        assert pattern.search(source), (
+            "LMER_MOUNT_LINKS entry missing from cli.py env dict"
+        )
+
 
 class TestRefresh:
     """refresh_user_harnesses: the long-lived-process escape from the cache.

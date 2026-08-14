@@ -1,0 +1,2 @@
+fixed:
+- "User-harness sessions no longer crash on startup when a declared mount path's parent directory does not exist in the image (#293, #290)"
