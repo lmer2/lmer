@@ -33,6 +33,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1726,6 +1727,23 @@ def test_scrubbing_removes_the_credential_shapes_and_keeps_the_conversation(plat
     assert "run the suite" in text
 
 
+def test_a_transcript_in_a_harness_subdirectory_is_scrubbed_too(platform_root):
+    """A spawn mounts one subdirectory per harness now (#280), so a transcript
+    sits a level deeper than it used to. The scrub walks the same recursive
+    discovery the read path does, and depth must not be what decides whether a
+    credential is removed from disk."""
+    directory = transcripts.session_transcript_dir("s-sub") / "pi" / "-workspace"
+    directory.mkdir(parents=True)
+    target = directory / "session.jsonl"
+    target.write_text(LEAKY_TRANSCRIPT, encoding="utf-8")
+
+    assert transcripts.scrub_session_transcripts("s-sub") == 1
+    text = target.read_text(encoding="utf-8")
+    for leaked in LEAKED:
+        assert leaked not in text, f"{leaked} survived the scrub"
+    assert "the suite passed" in text, "scrubbed, not emptied"
+
+
 def test_a_scrubbed_transcript_is_still_valid_jsonl(platform_root):
     """The chat view reads this file next. Valid lines must stay parseable."""
     target = plant_transcript("s-valid")
@@ -2618,8 +2636,8 @@ def test_last_turn_prefers_the_file_being_appended_to(platform_root):
 
 @pytest.mark.parametrize("plant", ["nothing", "garbage", "empty"])
 def test_no_readable_turn_is_none_rather_than_a_guess(platform_root, plant):
-    """Three ways of not knowing, all ordinary — a codex or pi session (this
-    adapter is Claude-shaped), a file of noise, an empty one.
+    """Three ways of not knowing, all ordinary — a session with no transcript
+    mounted out, a file of noise, an empty one.
 
     ``None`` has to mean "no opinion" here, because the caller is deciding
     whether to put a run on the attention list. Anything that turned "I cannot
@@ -2785,3 +2803,455 @@ def test_last_turn_reports_a_refusal_as_the_newest_turn(platform_root):
     assert turn is not None
     assert turn.api_error == "server_error"
     assert turn.api_error_status == 529
+
+
+# --- the other two harnesses (#280) ------------------------------------------
+#
+# The platform spawns claude, pi and codex, and this adapter spoke one of them —
+# so a pi or a codex run normalised to nothing and the chat view drew an empty
+# page for a session that had said plenty.
+#
+# Fixtures again, captured from pi 0.84.1 and codex-cli 0.147.0 against a fake
+# model endpoint, with paths neutralised and the giant instruction blobs cut to a
+# placeholder. Kept for the reason spec D6 gave: three formats that are not
+# contracts is three times the surface, and a format change has to fail here with
+# a diff rather than on a phone.
+#
+# Two properties carry this section:
+#
+# - **The operator's turns are the operator's.** Codex writes its own injected
+#   context — the environment block, the skills list, a repo's instructions — as
+#   *user-role* records. Rendering any of that as something the operator said is
+#   issue #242's class of bug, and it is the one thing here that is not cosmetic.
+# - **A file nobody can read is not an empty conversation.** An unknown format
+#   (kimi's wire log stands in for one) has to reach the operator as "on disk,
+#   nothing to show", never as a silent blank page.
+
+PI_FIXTURE = FIXTURES / "pi-session.jsonl"
+PI_TOOLS_FIXTURE = FIXTURES / "pi-tools.jsonl"
+CODEX_FIXTURE = FIXTURES / "codex-session.jsonl"
+CODEX_TOOLS_FIXTURE = FIXTURES / "codex-tools.jsonl"
+KIMI_FIXTURE = FIXTURES / "kimi-wire.jsonl"
+
+
+def test_a_pi_conversation_normalises():
+    """Roles, order, text and time, from records captured off a real pi session."""
+    messages = transcripts.normalise_records(records(PI_FIXTURE))
+    assert [(m.role, m.kind, m.text) for m in messages] == [
+        ("user", "said", "say hi"),
+        ("assistant", "said", "Hello from the fake model."),
+    ]
+    assert messages[0].at == "2026-08-14T07:52:30.805Z"
+
+
+def test_pi_session_state_records_are_not_turns():
+    """The header, the model change, the thinking level: session state, not talk."""
+    assert transcripts.normalise_records([
+        {"type": "session", "version": 3, "id": "x", "cwd": "/workspace"},
+        {"type": "model_change", "id": "a", "provider": "fake", "modelId": "m"},
+        {"type": "thinking_level_change", "id": "b", "thinkingLevel": "off"},
+    ]) == []
+
+
+def test_a_pi_tool_call_is_correlated_with_its_result():
+    """pi puts the result in its own ``toolResult`` record, keyed by call id."""
+    messages = transcripts.normalise_records(records(PI_TOOLS_FIXTURE))
+    calls = [tool for message in messages for tool in message.tools]
+    assert [(t.name, t.detail, t.status) for t in calls] == [
+        ("bash", "echo transcript probe", "ok"),
+    ]
+    # The result record is the harness feeding the model, not a turn of its own.
+    assert not [m for m in messages if "transcript probe\n" == m.text]
+
+
+def test_a_failed_pi_tool_is_visible_with_its_reason():
+    """``isError`` is pi's spelling of the case that matters (the captures had
+    only successes, so the failing shape is asserted on its own)."""
+    tool = transcripts.normalise_records([
+        {"type": "message", "id": "a", "timestamp": "2026-08-14T08:22:45.208Z",
+         "message": {"role": "assistant", "content": [
+             {"type": "toolCall", "id": "call_1", "name": "bash",
+              "arguments": {"command": "false"}},
+         ]}},
+        {"type": "message", "id": "b", "timestamp": "2026-08-14T08:22:45.249Z",
+         "message": {"role": "toolResult", "toolCallId": "call_1",
+                     "toolName": "bash", "isError": True,
+                     "content": [{"type": "text", "text": "exit status 1"}]}},
+    ])[0].tools[0]
+    assert tool.status == "failed"
+    assert tool.error == "exit status 1"
+
+
+def test_a_pi_tool_reads_the_key_its_own_tools_use():
+    """pi's file tools name their target ``path``, its shell one ``command``."""
+    messages = transcripts.normalise_records([
+        {"type": "message", "id": "a", "message": {"role": "assistant", "content": [
+            {"type": "toolCall", "id": "c1", "name": "read",
+             "arguments": {"path": "/workspace/src/lmer_platform/transcripts.py"}},
+        ]}},
+    ])
+    assert messages[0].tools[0].detail == "/workspace/src/lmer_platform/transcripts.py"
+
+
+def test_a_codex_conversation_normalises():
+    messages = transcripts.normalise_records(records(CODEX_FIXTURE))
+    assert [(m.role, m.kind) for m in messages] == [
+        ("system", "injected"),      # the harness's own skills instructions
+        ("user", "injected"),        # the environment block, in the user's role
+        ("user", "said"),            # what the operator actually typed
+        ("assistant", "said"),
+    ]
+    assert messages[2].text == "say hi"
+    assert messages[3].text == "Hello from the fake model."
+    assert messages[3].at == "2026-08-14T07:54:56.748Z"
+
+
+def test_a_codex_turn_is_not_rendered_twice():
+    """``event_msg`` duplicates the conversation ``response_item`` already
+    carries — reading both would draw every turn of every codex run twice."""
+    messages = transcripts.normalise_records(records(CODEX_FIXTURE))
+    assert [m.text for m in messages].count("Hello from the fake model.") == 1
+    assert [m.text for m in messages].count("say hi") == 1
+
+
+def test_a_codex_tool_call_is_correlated_by_call_id():
+    """The call and its output are separate ``response_item`` records, and the
+    arguments arrive as a JSON *string* rather than a mapping."""
+    messages = transcripts.normalise_records(records(CODEX_TOOLS_FIXTURE))
+    calls = [tool for message in messages for tool in message.tools]
+    assert [(t.name, t.detail, t.status) for t in calls] == [
+        ("exec_command", "echo transcript probe", "ok"),
+    ]
+    # The output is the model's to read, not a turn: "Chunk ID: …" never renders.
+    assert not [m for m in messages if "Chunk ID" in m.text]
+
+
+@pytest.mark.parametrize("arguments", ['{"cmd": ', "not json at all", None, 7, "[]"])
+def test_a_codex_call_with_unreadable_arguments_still_shows_its_name(arguments):
+    """A blank chip beats a missing one, and a truncated argument blob is a
+    shape this reader will meet — it is written by the model."""
+    tool = transcripts.normalise_records([{
+        "timestamp": "2026-08-14T08:23:07.940Z",
+        "type": "response_item",
+        "payload": {"type": "function_call", "name": "exec_command",
+                    "arguments": arguments, "call_id": "call_1"},
+    }])[0].tools[0]
+    assert tool.name == "exec_command"
+    assert tool.detail is None
+    assert tool.status == "pending"
+
+
+def test_a_codex_call_variant_this_reader_has_no_adapter_for_still_shows():
+    """codex 0.147.0's response items go well past the three read exactly —
+    ``custom_tool_call``, ``tool_search_call``, ``web_search_call`` and more —
+    and an assistant turn made only of them used to render as *nothing*. A run
+    whose page says nothing is read as a run that did nothing, so the miss is
+    made legible: one chip, named by the payload, correlated as usual."""
+    messages = transcripts.normalise_records([
+        {"timestamp": "2026-08-14T08:23:07.940Z", "type": "response_item",
+         "payload": {"type": "custom_tool_call", "name": "apply_patch",
+                     "call_id": "call_9",
+                     "input": {"path": "/workspace/src/lmer_platform/spawn.py"}}},
+        {"timestamp": "2026-08-14T08:23:08.100Z", "type": "response_item",
+         "payload": {"type": "custom_tool_call_output", "call_id": "call_9",
+                     "output": "Success. Updated the following files:\nM spawn.py"}},
+    ])
+    assert [(m.role, m.kind, m.text) for m in messages] == [
+        ("assistant", "said", ""),
+    ]
+    assert [(t.name, t.detail, t.status) for t in messages[0].tools] == [
+        ("apply_patch", "/workspace/src/lmer_platform/spawn.py", "ok"),
+    ]
+
+
+def test_a_codex_call_variant_with_no_name_is_chipped_by_its_type():
+    """``local_shell_call`` carries no ``name``, and "something ran" is the
+    whole point — the type is a truer caption than a blank chip. No output
+    record yet, so it stays pending, exactly as a function call would."""
+    tool = transcripts.normalise_records([{
+        "timestamp": "2026-08-14T08:23:07.940Z", "type": "response_item",
+        "payload": {"type": "local_shell_call", "call_id": "call_3",
+                    "action": {"command": ["bash", "-lc", "ls"]}},
+    }])[0].tools[0]
+    assert (tool.name, tool.detail) == ("local_shell_call", None)
+    assert tool.status == "pending"
+
+
+def test_a_codex_reasoning_record_is_still_dropped():
+    """The one variant the generic rule must not sweep up: private model
+    reasoning, dropped for the reason claude's thinking blocks are."""
+    assert transcripts.normalise_records([{
+        "timestamp": "2026-08-14T08:23:07.940Z", "type": "response_item",
+        "payload": {"type": "reasoning", "summary": [
+            {"type": "summary_text", "text": "The operator wants the login bug fixed."},
+        ]},
+    }]) == []
+
+
+@pytest.mark.parametrize("fixture", [CODEX_FIXTURE, CODEX_TOOLS_FIXTURE])
+def test_codex_injected_context_is_never_an_operator_turn(fixture):
+    """The hold on this task, and the reason the classification is made here.
+
+    Codex writes its environment block, its skills list and a repo's instructions
+    in the *operator's* role, with nothing in the record to tell them from a typed
+    prompt. Whatever else changes, no developer, environment or skills content may
+    reach the view as something a person said.
+    """
+    messages = transcripts.normalise_records(records(fixture))
+    spoken = [m.text for m in messages if m.kind == "said" and m.role == "user"]
+    assert spoken == ["say hi"] or spoken == ["please run the probe"]
+    for text in spoken:
+        assert "environment_context" not in text
+        assert "<cwd>" not in text
+        assert "Skills" not in text
+
+
+def test_a_codex_developer_record_is_the_harness_not_a_person():
+    """Its role is ``developer``; served as the machinery it is."""
+    injected = [
+        m for m in transcripts.normalise_records(records(CODEX_FIXTURE))
+        if m.role == "system"
+    ]
+    assert len(injected) == 1
+    assert injected[0].kind == "injected"
+    assert injected[0].text.startswith("## Skills")
+
+
+def test_the_codex_environment_block_is_kept_but_marked():
+    """Injected is not hidden: it explains what the session was told, and the
+    view has an internals toggle for exactly this. It is only not a turn."""
+    environment = [
+        m for m in transcripts.normalise_records(records(CODEX_FIXTURE))
+        if m.kind == "injected" and m.role == "user"
+    ]
+    assert len(environment) == 1
+    assert "<cwd>/workspace</cwd>" in environment[0].text
+
+
+def test_a_prompt_that_mentions_an_injected_wrapper_stays_the_operators():
+    """The same guard the pasted-monitor-event test makes: quoting the machinery
+    is not being it."""
+    message = transcripts.normalise_records([{
+        "timestamp": "2026-08-14T08:23:07.855Z",
+        "type": "response_item",
+        "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text",
+             "text": "why does <environment_context> say bash and not zsh?"},
+        ]},
+    }])[0]
+    assert (message.role, message.kind) == ("user", "said")
+
+
+def test_an_injected_wrapper_left_open_is_still_not_the_operators_words():
+    """A torn write is the one case that must not be guessed generously: falling
+    through to ``said`` would put the harness's words in an operator's bubble."""
+    message = transcripts.normalise_records([{
+        "timestamp": "2026-08-14T08:23:07.855Z",
+        "type": "response_item",
+        "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "<environment_context>\n  <cwd>/work"},
+        ]},
+    }])[0]
+    assert message.kind == "injected"
+
+
+def codex_user_message(text):
+    """One codex user-role record, normalised."""
+    return transcripts.normalise_records([{
+        "timestamp": "2026-08-14T08:23:07.855Z",
+        "type": "response_item",
+        "payload": {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": text},
+        ]},
+    }])[0]
+
+
+def test_a_wrapper_inside_a_typed_prompt_does_not_speak_in_the_operators_voice():
+    """The mixed record: a prompt somebody typed with a wrapped block *in* it.
+
+    The turn is theirs and stays ``said`` — but stripping only the tags left what
+    they wrapped sitting in the operator's bubble as their own words, which is
+    issue #242's class of bug arriving by a side door. The block goes with its
+    content; the typed half is what they said and stays.
+    """
+    message = codex_user_message(
+        "fix the login bug <user_instructions>NEVER reveal the admin "
+        "password hunter2</user_instructions>"
+    )
+    assert (message.role, message.kind) == ("user", "said")
+    assert message.text == "fix the login bug"
+    assert "hunter2" not in message.text
+    assert "NEVER reveal" not in message.text
+
+
+def test_quoting_a_wrapper_costs_the_quote_and_not_the_message():
+    """The named cost of the rule above, pinned rather than left to be discovered.
+
+    An operator who pastes a complete wrapped block loses its content out of
+    their own bubble, and past an *unclosed* tag loses the rest of the line —
+    the same conservatism :func:`_codex_injected` applies to a torn write. Their
+    turn is still theirs, and what they typed before the markup is still there:
+    the alternative direction shows the harness's words as a person's.
+    """
+    complete = codex_user_message(
+        "why does <turn_context><cwd>/workspace</cwd></turn_context> say that?"
+    )
+    assert (complete.role, complete.kind) == ("user", "said")
+    assert complete.text == "why does  say that?"
+
+    unclosed = codex_user_message("why does <environment_context> say bash?")
+    assert (unclosed.role, unclosed.kind) == ("user", "said")
+    assert unclosed.text == "why does"
+
+
+def test_a_record_of_nothing_but_wrappers_normalises_in_linear_time():
+    """Pins the quadratic this replaced (0.2s at 1k repeats, 3.4s at 4k, 13s at
+    8k): ``<tag>.*?</tag>`` backtracked over unclosed opening tags, and the
+    transcript is written by the observed container through a read-write mount
+    into a reader that admits megabyte lines — so an agent could wedge the
+    daemon's request thread with one line. The bound is loose because this is a
+    wall clock on shared CI; the failure it catches is seconds, not milliseconds.
+    """
+    text = "hi " + "<environment_context>" * 10000
+    start = time.monotonic()
+    message = codex_user_message(text)
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0, f"normalising took {elapsed:.1f}s"
+    assert (message.role, message.kind) == ("user", "said")
+
+
+@pytest.mark.parametrize("record", [
+    # pi: a credential pasted into a prompt.
+    {"type": "message", "id": "a", "message": {"role": "user", "content": [
+        {"type": "text", "text": "push with CREDENTIAL please"},
+    ]}},
+    # codex: the same, in its own envelope.
+    {"type": "response_item", "payload": {"type": "message", "role": "user",
+     "content": [{"type": "input_text", "text": "push with CREDENTIAL please"}]}},
+])
+def test_every_adapter_emits_through_the_scrub(record):
+    """The chokepoint is the module's property, not each adapter's discipline:
+    a new format must not be a new way for a credential to reach a browser."""
+    raw = json.dumps(record).replace("CREDENTIAL", "glpat-" + "a" * 24)
+    message = transcripts.normalise_records([json.loads(raw)])[0]
+    assert "glpat-" not in message.text
+    assert "<redacted>" in message.text
+
+
+def test_dispatch_is_per_record_not_per_file():
+    """Not a file anyone expects on disk — the point is that nothing about the
+    *file* decides which adapter reads a record, so a transcript found through an
+    unexpected route (a pointer, a mounted directory named for another harness)
+    still normalises."""
+    messages = transcripts.normalise_records(
+        records(PI_FIXTURE) + records(CODEX_FIXTURE)
+    )
+    assert [m.text for m in messages if m.kind == "said"] == [
+        "say hi", "Hello from the fake model.",
+        "say hi", "Hello from the fake model.",
+    ]
+
+
+def test_an_unknown_format_is_skipped_rather_than_guessed_at():
+    """kimi's wire log: a fourth harness's records, none of which this build
+    speaks. Every one of them is skipped, including the ones carrying a role and
+    content — guessing at a shape would attribute turns to the wrong party."""
+    assert transcripts.normalise_records(records(KIMI_FIXTURE)) == []
+
+
+@pytest.mark.parametrize("fixture,harness", [
+    (SESSION_FIXTURE, "claude"),
+    (PI_FIXTURE, "pi"),
+    (CODEX_FIXTURE, "codex"),
+])
+def test_the_source_says_which_harness_wrote_the_file(
+    platform_root, fixture, harness
+):
+    """The file's own answer, which beats a label: a pointer's ``harness`` is
+    hand-editable and the derived directory carries none at all."""
+    plant_session("s-h1", fixture=fixture)
+    page = transcripts.read_messages("s-h1")
+    assert [source.harness for source in page.sources] == [harness]
+
+
+def test_a_file_nothing_recognises_keeps_the_label_it_came_with(platform_root):
+    """No evidence, so nothing to correct the default with."""
+    plant_session("s-h2", fixture=KIMI_FIXTURE)
+    page = transcripts.read_messages("s-h2")
+    assert [source.harness for source in page.sources] == ["claude"]
+
+
+@pytest.mark.parametrize("fixture", [PI_FIXTURE, CODEX_FIXTURE])
+def test_a_transcript_of_another_harness_reads_wherever_it_is_found(
+    platform_root, fixture
+):
+    """Planted in the claude-shaped per-session directory, which is where a spawn
+    mounts one — the layout says nothing about the format."""
+    plant_session("s-h3", fixture=fixture)
+    page = transcripts.read_messages("s-h3")
+    assert [m.text for m in page.messages if m.kind == "said"] == [
+        "say hi", "Hello from the fake model.",
+    ]
+    assert page.note is None
+
+
+def test_a_transcript_this_build_cannot_read_says_so(platform_root):
+    """The degradation that must survive: a file on disk that normalises to
+    nothing is "nothing to show yet", never a silent blank page."""
+    plant_session("s-h4", fixture=KIMI_FIXTURE)
+    page = transcripts.read_messages("s-h4")
+    assert page.total == 0
+    assert page.sources, "the file was not even read"
+    assert page.note == transcripts.EMPTY_TRANSCRIPT_NOTE
+
+
+def plant_at(session_id, relative, fixture):
+    """Write *fixture* at *relative* inside the session's transcript directory."""
+    target = transcripts.session_transcript_dir(session_id) / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    return target
+
+
+def test_a_mixed_transcript_layout_reads_each_message_exactly_once(platform_root):
+    """The layout changed under the reader, and the old one has to keep reading.
+
+    A spawn now mounts one subdirectory per harness under the session's transcript
+    directory (#280), while a session spawned before that wrote its files straight
+    into the root. Both are found by the same recursive walk, so the property that
+    matters is that the walk neither doubles a file nor misses one — a doubled
+    transcript reads as the run having said everything twice.
+    """
+    registry.register("s-mixed", pid=DEAD_PID, run=dict(RUN))
+    plant_at("s-mixed", "-workspace/session.jsonl", SESSION_FIXTURE)  # pre-#280
+    plant_at("s-mixed", "claude/-workspace/followup.jsonl", FOLLOWUP_FIXTURE)
+    plant_at("s-mixed", "pi/-workspace/session.jsonl", PI_FIXTURE)
+
+    page = transcripts.read_messages("s-mixed", limit=transcripts.MAX_MESSAGE_LIMIT)
+    expected = [
+        message.text
+        for fixture in (SESSION_FIXTURE, FOLLOWUP_FIXTURE, PI_FIXTURE)
+        for message in transcripts.normalise_records(records(fixture))
+    ]
+    assert [m.text for m in page.messages] == expected
+    assert page.total == len(expected)
+    # And each file is labelled by what is in it rather than by where it was
+    # found: the directory it sits in is a mount destination, not evidence.
+    assert [source.harness for source in page.sources] == ["claude", "claude", "pi"]
+
+
+@pytest.mark.parametrize("fixture", [PI_TOOLS_FIXTURE, CODEX_TOOLS_FIXTURE])
+def test_last_turn_reads_a_pi_or_codex_tail(platform_root, fixture):
+    """Halt detection asks the same question of every harness now. For codex the
+    tail also *ends* in bookkeeping (``token_count``, ``task_complete``), so the
+    answer has to come from the last ``response_item`` rather than the last line.
+    """
+    registry.register("s-h5", pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir("s-h5") / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "session.jsonl").write_text(
+        fixture.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    turn = transcripts.last_turn("s-h5")
+    assert turn is not None
+    assert (turn.role, turn.text) == ("assistant", "Hello from the fake model.")

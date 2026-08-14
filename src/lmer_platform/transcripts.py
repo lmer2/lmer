@@ -19,6 +19,24 @@ Spec D6 took the two costs of that in writing, and both shape this module:
   (:func:`lmer_platform.session_io.send_input`), so the two halves have different
   latencies and the UI has to show a sent message as pending until it appears.
 
+Three harnesses, three record vocabularies
+------------------------------------------
+Claude Code, pi and codex each write their own JSONL, and the platform spawns all
+three — so a view that spoke only the first normalised a pi or a codex run to
+nothing at all (issue #280). The three type vocabularies are disjoint: claude
+writes ``user``/``assistant``/``system``, pi writes ``session``, ``message`` and
+its state changes, codex wraps everything in an envelope of ``session_meta``,
+``response_item`` and ``event_msg``. So the dispatch is per *record* rather than
+per file (:func:`_harness_of_record`), which costs a dict lookup and buys two
+things: a transcript resolved from somewhere unexpected still reads, and a
+:class:`Source` can say which harness wrote it on the evidence of the file rather
+than on a label it was handed.
+
+Each adapter is the allowlist the first one is — role, text, timestamp, tool
+activity — and each of the two new ones carries a hazard the claude one does not,
+stated in its own docstring: a pi session is a tree read here in file order, and
+codex writes its injected context in the *operator's* role.
+
 Tolerance is the contract, not a nicety
 ---------------------------------------
 Every read here is best-effort in the same way :mod:`lmer_platform.store` and
@@ -278,16 +296,22 @@ _DEFAULT_ROOT = Path(".claude") / "projects"
 #: in ``logs/``. Derived from the session id so no recorded state is needed.
 _SESSION_DIR_SUFFIX = ".transcript"
 
-#: Where :func:`session_transcript_dir` is mounted *inside* a spawned session's
-#: container: the harness's own projects directory under the container home
+#: Where claude's transcript subdirectory is mounted *inside* a spawned session's
+#: container: claude's own projects directory under the container home
 #: (``HOME=/home/developer``, pinned by the host CLI's container env dict — the
 #: same fact ``lmer_cli.mounts.CONTAINER_UV_CACHE_DIR`` hardcodes). Derived from
 #: :data:`_DEFAULT_ROOT` so the destination a spawn mounts and the layout this
 #: reader assumes cannot drift apart.
 #:
-#: Claude-shaped, like the rest of this adapter: codex and pi keep their session
-#: files elsewhere, so for those harnesses the mount is simply an unused empty
-#: directory and the chat view keeps answering :data:`NO_TRANSCRIPT_NOTE`.
+#: Claude's alone, and no longer the whole story: a harness declares where it
+#: writes (:attr:`lmer_cli.harness.Harness.session_dir`) and a spawn mounts one
+#: host subdirectory of :func:`session_transcript_dir` at that declared path for
+#: each harness that does, so pi's and codex's transcripts survive too
+#: (#280). It stays here rather than moving into the registry because it is the
+#: container-side half of :data:`_DEFAULT_ROOT`, whose host-side half is what
+#: :func:`transcript_root` contains a recorded pointer against; ``lmer_platform``
+#: keeps the two statements one fact by refusing to spawn at all if no harness
+#: declares this path (``spawn._harness_session_dirs``).
 CONTAINER_TRANSCRIPT_DIR = str(Path("/home/developer") / _DEFAULT_ROOT)
 
 #: Mode for the platform's per-session transcript directory. A transcript holds
@@ -393,6 +417,26 @@ MONITOR_VIA = "monitor"
 #: watch is a third party and the view has to be able to draw it as one.
 MONITOR_ROLE = "monitor"
 
+#: Record ``type`` values each harness writes. Disjoint, which is what makes the
+#: dispatch per record (:func:`_harness_of_record`) rather than per file. Each
+#: set names the harness's *bookkeeping* types as well as its conversation ones,
+#: so a session that has so far written only its header is still labelled by what
+#: wrote it — and so a type this build has never seen stays unrecognised instead
+#: of being handed to whichever adapter guessed first.
+#: ``attachment`` is a turn when it delivers a queued command (see
+#: :data:`_QUEUED_COMMAND_ATTACHMENT`); ``queue-operation`` never is, but it is
+#: still claude's bookkeeping and belongs to claude's vocabulary — leaving it
+#: out would let a queue-heavy transcript open with rows no format claims.
+_CLAUDE_RECORD_TYPES = frozenset({
+    "user", "assistant", "system", "attachment", "queue-operation",
+})
+_PI_RECORD_TYPES = frozenset({
+    "session", "model_change", "thinking_level_change", "message",
+})
+_CODEX_RECORD_TYPES = frozenset({
+    "session_meta", "response_item", "event_msg", "turn_context", "world_state",
+})
+
 #: Wrapper tags Claude Code puts around injected user content. Stripped from
 #: *user* text only, and only these names: a blanket tag strip would eat the
 #: markup in an assistant message that is discussing markup.
@@ -465,12 +509,46 @@ _ENTITY_RE = re.compile("|".join(map(re.escape, _ENTITIES)))
 #: was never markup.
 _MAX_ENTITY_PASSES = 2
 
+#: Wrapper tags codex puts around the context it injects — in the *operator's*
+#: role, which is the whole reason :func:`_codex_injected` exists. Kept apart
+#: from :data:`_WRAPPER_TAGS` so neither harness's names are stripped out of the
+#: other's turns.
+_CODEX_WRAPPER_TAGS = (
+    "environment_context", "skills_instructions", "user_instructions",
+    "turn_context",
+)
+_CODEX_TAG_RE = re.compile(
+    r"</?(?:%s)\b[^>]*>" % "|".join(_CODEX_WRAPPER_TAGS)
+)
+_CODEX_OPENS_RE = re.compile(r"\A\s*<(?:%s)\b" % "|".join(_CODEX_WRAPPER_TAGS))
+
+#: One *opening* wrapper tag, for :func:`_codex_unwrapped`'s scan. Fixed text
+#: and a lookahead, with nothing of variable length in it: the whole point of
+#: that function is that it cannot backtrack, and a pattern is used only to find
+#: the next candidate rather than to match a block. The lookahead admits the
+#: attribute form ``<turn_context foo="1">`` and nothing looser; what it buys
+#: over the ``\b`` of the patterns above is the punctuation-adjacent forms —
+#: ``<turn_context-foo>`` is a wrapper to ``\b`` and prose to this scanner, the
+#: safe direction for a tag nothing writes. (``<environment_contextual>`` is not
+#: an example: ``\b`` does not match between ``x`` and ``t`` either.) ``\Z``
+#: catches a name that runs off the end of a torn write.
+_CODEX_OPEN_RE = re.compile(
+    r"<(?P<tag>%s)(?=[>\s]|\Z)" % "|".join(_CODEX_WRAPPER_TAGS)
+)
+
+#: Content block types that carry prose, per harness. Claude's ``text`` covers pi
+#: too; codex names its own ``input_text`` on the way in and ``output_text`` on
+#: the way out. An allowlist rather than a denylist is what keeps a model's
+#: private reasoning out of the view whatever the next release calls it.
+_CODEX_TEXT_TYPES = ("input_text", "output_text")
+
 #: Keys a tool's input might carry that identify *what* it acted on, most
 #: specific first. A generic pick rather than a per-tool table: the tool set
 #: changes with every harness release, and a table would rot into blank chips.
+#: ``cmd`` is codex's spelling of ``command``; ``path`` is pi's of ``file_path``.
 _DETAIL_KEYS = (
-    "command", "file_path", "path", "pattern", "url", "query", "description",
-    "prompt", "subagent_type",
+    "command", "cmd", "file_path", "path", "pattern", "url", "query",
+    "description", "prompt", "subagent_type",
 )
 
 #: Words that name a credential in a shell argument or a header.
@@ -1039,18 +1117,20 @@ def _first_line(text: str, limit: int = DETAIL_LIMIT) -> Optional[str]:
     return None
 
 
-def _block_text(blocks) -> str:
-    """Join the ``text`` blocks of a content list.
+def _block_text(blocks, types: tuple = ("text",)) -> str:
+    """Join the prose blocks of a content list.
 
     ``thinking`` blocks are dropped: they are long, they are the model's private
     reasoning, and the chat view is the readable summary — the terminal shows
-    everything the session actually drew.
+    everything the session actually drew. *types* is what each harness calls a
+    prose block (:data:`_CODEX_TEXT_TYPES`); everything else is dropped by the
+    same allowlist.
     """
     parts = []
     for block in blocks:
         if not isinstance(block, dict):
             continue
-        if block.get("type") != "text":
+        if block.get("type") not in types:
             continue
         text = block.get("text")
         if isinstance(text, str) and text.strip():
@@ -1154,8 +1234,8 @@ def _api_error_of(record: dict) -> tuple:
     return True, kind, status
 
 
-def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
-    """Normalise one transcript record, or ``None`` when it carries nothing.
+def _claude_message(record: dict, pending: dict) -> Optional[Message]:
+    """Normalise one Claude Code record, or ``None`` when it carries nothing.
 
     *pending* maps ``tool_use`` id to the :class:`ToolCall` awaiting its result,
     and is both read and written here — that is how the single pass correlates a
@@ -1326,6 +1406,344 @@ def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
     return None if result.empty else result
 
 
+def _pi_message(record: dict, pending: dict) -> Optional[Message]:
+    """Normalise one pi record (pi 0.84.1, session format 3).
+
+    Only ``message`` records carry a conversation. The rest of pi's vocabulary is
+    session state — the header, a model change, a thinking-level change, whatever
+    an extension appends — and is skipped for the reason claude's bookkeeping
+    rows are: none of it is anybody talking.
+
+    **The file is read in order, and a pi session is a tree.** Records carry
+    ``id`` and ``parentId``, and ``/tree`` and ``/fork`` branch one, so a forked
+    session renders every branch in the order it was written rather than the path
+    the operator ended up on. Platform-spawned runs are linear, which is what
+    makes reading the file as written good enough here and not in general.
+    """
+    if record.get("type") != "message":
+        return None
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return None
+
+    timestamp = record.get("timestamp")
+    timestamp = timestamp if isinstance(timestamp, str) else None
+    role = message.get("role")
+
+    if role == "toolResult":
+        # The outcome lands on the *calling* message, exactly as claude's
+        # tool_result does, so the record itself is not a turn. A result whose
+        # call is not in this file has nothing to attach to and is dropped.
+        call_id = message.get("toolCallId")
+        call = pending.pop(call_id, None) if isinstance(call_id, str) else None
+        if call is not None:
+            if message.get("isError"):
+                call.status = "failed"
+                call.error = _first_line(_result_text(message.get("content")))
+            else:
+                call.status = "ok"
+        return None
+
+    if role not in ("user", "assistant"):
+        return None
+
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = _block_text(content)
+    else:
+        return None
+
+    tools: list = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "toolCall":
+                continue
+            call = ToolCall(
+                name=str(block.get("name") or "tool"),
+                # pi's arguments are already a mapping — ``command`` for its
+                # bash tool, ``path`` for the file ones — so the same generic
+                # pick reads them.
+                detail=_tool_detail(block.get("arguments")),
+            )
+            tools.append(call)
+            call_id = block.get("id")
+            if isinstance(call_id, str) and call_id:
+                pending[call_id] = call
+
+    # pi 0.84.1 gives extension-injected content its own role ("custom"), not
+    # the operator's, so this strip only bites when a claude-style wrapper tag
+    # turns up in pi user text — quoted, say. Cheap, and the tags are not words
+    # anyone said.
+    text = _strip_wrappers(text) if role == "user" else text.strip()
+
+    text, truncated = _present(text, TEXT_LIMIT, keep="tail")
+    result = Message(
+        role=role, kind="said", text=text, at=timestamp, truncated=truncated,
+        tools=tools,
+    )
+    return None if result.empty else result
+
+
+def _codex_arguments(raw) -> Optional[dict]:
+    """A codex function call's arguments, which arrive as a JSON *string*.
+
+    Parsed defensively, and only ever for the one-line hint: an argument blob
+    that is not JSON, or is JSON but not a mapping, or was truncated by the model
+    reads as "no detail" rather than as a failure — a tool chip with a name and
+    no hint still says what ran.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _codex_unwrapped(text: str) -> str:
+    """*text* minus complete ``<tag>…</tag>`` wrapper blocks, content included.
+
+    An *unclosed* wrapper takes the rest of *text* with it, which is the same
+    direction :func:`_codex_injected` argues for a torn write: what follows an
+    opening tag is the harness's material until something says otherwise, and
+    the alternative is showing it as an operator's words.
+
+    A forward scan rather than one wrapped-block pattern, because this runs on
+    agent-authored input inside the daemon's request thread — the transcript is
+    written by the observed container through a read-write mount, and a
+    ``<tag><tag><tag>…`` line with no closer made the backtracking
+    ``<tag>.*?</tag>`` this replaced quadratic: 0.2s at a thousand repeats, 3.4s
+    at four thousand, on lines the reader admits at up to a megabyte. Here each
+    opener is found once (:data:`_CODEX_OPEN_RE`, fixed width) and its closer
+    once, both cursors only ever move forward, and the closing tag is matched
+    literally — so the work is linear in ``len(text)`` whatever an agent writes.
+    """
+    kept: list = []
+    # Start of the text not yet copied out, and where to look for the next
+    # opener. Neither ever moves backwards.
+    cursor = probe = 0
+    while True:
+        found = _CODEX_OPEN_RE.search(text, probe)
+        if found is None:
+            break
+        kept.append(text[cursor:found.start()])
+        # The closing form takes no attributes, which is what the pattern this
+        # replaced required too: ``</environment_context foo>`` closes nothing.
+        end = text.find("</%s>" % found.group("tag"), found.end())
+        if end < 0:
+            return "".join(kept)
+        cursor = probe = end + len(found.group("tag")) + 3
+    kept.append(text[cursor:])
+    return "".join(kept)
+
+
+def _codex_injected(text: str) -> bool:
+    """Whether a user-role codex record is context the harness injected.
+
+    Codex writes its own material in the *operator's* role: the environment
+    block, the skills list, a repo's instructions, the turn context. Nothing in
+    such a record's role tells it apart from a typed prompt — the same shape as
+    the watch injection above, and the same answer: the classification is made
+    here, from what the record is made of. A record that is nothing but wrapped
+    material is ``injected``; a prompt that merely mentions one of those tags is
+    the operator's own words and stays ``said``.
+
+    A wrapper left open by a torn write counts as injected as well. That is the
+    one direction which must not be guessed generously: a truncated
+    ``<environment_context>`` falling through to ``said`` would put the harness's
+    words in an operator's bubble, while an operator whose prompt happens to open
+    with the tag loses nothing but a caption.
+
+    "Nothing but wrapped material" is answered by :func:`_codex_unwrapped`, whose
+    linear scan is what keeps this question cheap: it is asked of every user
+    record in the daemon's request thread, on text an agent wrote.
+    """
+    if not text.strip():
+        return False
+    if _CODEX_OPENS_RE.match(text):
+        return True
+    return not _codex_unwrapped(text).strip()
+
+
+def _codex_message(record: dict, pending: dict) -> Optional[Message]:
+    """Normalise one codex record (codex-cli 0.147.0 rollout format).
+
+    ``response_item`` is the only record type read. Everything else in a rollout
+    is either session state (``session_meta``, ``turn_context``, ``world_state``)
+    or a *second copy* of the conversation: an ``event_msg`` carries
+    ``user_message`` and ``agent_message`` payloads repeating what a
+    ``response_item`` already said, so reading both would render every turn twice.
+
+    Its payloads are read at two levels of precision. ``message``,
+    ``function_call`` and ``function_call_output`` are read exactly, for prose,
+    the tool chip and its outcome. The rest of codex's response-item family —
+    ``custom_tool_call``, ``tool_search_call``, ``web_search_call``,
+    ``image_generation_call``, ``local_shell_call`` and whatever the next release
+    adds — degrades to a chip named after the call, paired with its ``_output``
+    twin by ``call_id``. A rule rather than an adapter per variant, because
+    without one every variant nobody has written an adapter for yet renders as
+    *nothing*: an assistant turn made only of a freeform ``apply_patch`` was a
+    blank page, and the consumer of this view reads a blank page as a run that
+    said nothing. A named chip with no detail is a small miss; a silent one is a
+    wrong answer to "is this run progressing".
+
+    ``reasoning`` is the one kind dropped on purpose: it is the model's private
+    reasoning, the same call :func:`_block_text` makes for claude's thinking
+    blocks.
+
+    A ``developer`` record is the harness's own instructions to the model, so it
+    is served as ``system``/``injected`` rather than as anybody's turn:
+    :data:`MESSAGE_KINDS` gives ``injected`` to machinery addressed to the model
+    and ``notice`` to what the harness says to the *operator*, and a skills list
+    is the former. What it must not be is a ``user``/``said`` turn, which is what
+    its role would have made it. A ``message`` in any other role is dropped —
+    the safe direction, since nothing here could say whose words they are.
+    """
+    if record.get("type") != "response_item":
+        return None
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    timestamp = record.get("timestamp")
+    timestamp = timestamp if isinstance(timestamp, str) else None
+    kind_of_payload = payload.get("type")
+
+    if kind_of_payload == "function_call":
+        call = ToolCall(
+            name=str(payload.get("name") or "tool"),
+            detail=_tool_detail(_codex_arguments(payload.get("arguments"))),
+        )
+        call_id = payload.get("call_id")
+        if isinstance(call_id, str) and call_id:
+            pending[call_id] = call
+        return Message(
+            role="assistant", kind="said", text="", at=timestamp, tools=[call],
+        )
+
+    if kind_of_payload == "function_call_output":
+        # No error flag was observed in the captures: codex reports a failure
+        # inside the output text ("Process exited with code 1"), so a call that
+        # came back reads as ok. A build that grows a flag is a fixture update.
+        call_id = payload.get("call_id")
+        call = pending.pop(call_id, None) if isinstance(call_id, str) else None
+        if call is not None:
+            call.status = "ok"
+        return None
+
+    if isinstance(kind_of_payload, str) and kind_of_payload.endswith("_output"):
+        # A variant this reader has no adapter for, correlated exactly as
+        # ``function_call_output`` is (same no-error-flag caveat) and rendering
+        # nothing of its own: the chip its call already drew is the record.
+        call_id = payload.get("call_id")
+        call = pending.pop(call_id, None) if isinstance(call_id, str) else None
+        if call is not None:
+            call.status = "ok"
+        return None
+
+    if isinstance(kind_of_payload, str) and kind_of_payload.endswith("_call"):
+        # The generic degrade this function's docstring argues for. The name is
+        # the payload's when it carries one and the variant's own type when it
+        # does not — "local_shell_call" says more than a blank chip. Arguments
+        # are read where a variant happens to spell them the way the exact
+        # adapters do; absent is fine, the chip stands on its name.
+        name = payload.get("name")
+        arguments = payload.get("arguments")
+        if arguments is None:
+            arguments = payload.get("input")
+        call = ToolCall(
+            name=name if isinstance(name, str) and name else kind_of_payload,
+            detail=_tool_detail(_codex_arguments(arguments)),
+        )
+        call_id = payload.get("call_id")
+        if isinstance(call_id, str) and call_id:
+            pending[call_id] = call
+        return Message(
+            role="assistant", kind="said", text="", at=timestamp, tools=[call],
+        )
+
+    if kind_of_payload != "message":
+        # ``reasoning`` lands here, deliberately: private model reasoning, the
+        # same call :func:`_block_text` makes for claude's thinking blocks.
+        return None
+
+    content = payload.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = _block_text(content, types=_CODEX_TEXT_TYPES)
+    else:
+        return None
+
+    role = payload.get("role")
+    if role == "assistant":
+        kind = "said"
+        text = text.strip()
+    elif role == "user":
+        if _codex_injected(text):
+            # Wholesale machinery: the tags go, what they wrapped stays. It is
+            # marked injected, and the view's internals toggle is there for it.
+            kind = "injected"
+            text = _strip_wrappers(_CODEX_TAG_RE.sub("", text))
+        else:
+            # A typed prompt with a wrapped block *in* it — "fix the login bug
+            # <user_instructions>…</user_instructions>". The turn is the
+            # operator's, so it stays said, but taking only the tags off would
+            # leave the harness's words inside their bubble as theirs. The block
+            # goes with its content; the named cost is an operator who quotes a
+            # complete wrapper losing the quote (and, past an unclosed tag, the
+            # rest of the line) out of their own message. That is the direction
+            # :func:`_codex_unwrapped` argues for, and the cheaper mistake.
+            kind = "said"
+            text = _strip_wrappers(_CODEX_TAG_RE.sub("", _codex_unwrapped(text)))
+    elif role == "developer":
+        role, kind = "system", "injected"
+        text = _strip_wrappers(_CODEX_TAG_RE.sub("", text))
+    else:
+        return None
+
+    text, truncated = _present(text, TEXT_LIMIT, keep="tail")
+    result = Message(
+        role=role, kind=kind, text=text, at=timestamp, truncated=truncated,
+    )
+    return None if result.empty else result
+
+
+def _harness_of_record(record: dict) -> Optional[str]:
+    """Which harness's format one record is in, or ``None`` for a shape nobody
+    here recognises — a fourth harness, or a file that is not a transcript."""
+    kind = record.get("type")
+    if kind in _CLAUDE_RECORD_TYPES:
+        return "claude"
+    if kind in _PI_RECORD_TYPES:
+        return "pi"
+    if kind in _CODEX_RECORD_TYPES:
+        return "codex"
+    return None
+
+
+def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
+    """Normalise one transcript record, whichever harness wrote it.
+
+    Per record rather than per file — see the module docstring — and an
+    unrecognised record is skipped in silence, which is what makes an unknown
+    format an empty conversation rather than an error.
+    """
+    harness = _harness_of_record(record)
+    if harness == "claude":
+        return _claude_message(record, pending)
+    if harness == "pi":
+        return _pi_message(record, pending)
+    if harness == "codex":
+        return _codex_message(record, pending)
+    return None
+
+
 def _iter_records(path: Path) -> Iterator[dict]:
     """Yield the JSON objects in a JSONL file, skipping what cannot be read.
 
@@ -1428,9 +1846,10 @@ def last_turn(session_id: str) -> Optional["Message"]:
     paging client — this runs on the fleet-view poll path and reads one file's
     tail (:data:`LAST_TURN_TAIL_BYTES`), newest by mtime when there are several.
 
-    ``None`` for every ordinary way of not knowing — no transcript at all (codex,
-    pi), unreadable, nothing that normalises — and callers must read it as "no
-    opinion", never as "nothing was said".
+    ``None`` for every ordinary way of not knowing — no transcript at all,
+    unreadable, nothing that normalises — and callers must read it as "no
+    opinion", never as "nothing was said". The per-record dispatch means a pi or
+    codex tail answers here too, which it did not while this was Claude-shaped.
     """
     sources = locate_sources(session_id)
     if not sources:
@@ -1446,31 +1865,38 @@ def last_turn(session_id: str) -> Optional["Message"]:
     records = _tail_records(newest.path, tail_bytes=LAST_TURN_TAIL_BYTES)
     if not records:
         return None
-    messages, _ = _normalise(records)
+    messages, _, _ = _normalise(records)
     return messages[-1] if messages else None
 
 
 def _normalise(records: Iterable[dict], *, cap: Optional[int] = None) -> tuple:
-    """Turn records into messages, one pass. Returns ``(messages, capped)``.
+    """Turn records into messages, one pass. ``(messages, capped, harness)``.
 
-    Correlates each ``tool_use`` with its later ``tool_result`` — a tool still
-    without one reads as ``pending``, which is what the session is doing right
-    now. An unforeseen record shape is a format change (spec D6: the format is
-    not a contract), so it costs that one record and not the conversation.
+    Correlates each tool call with its later result — a tool still without one
+    reads as ``pending``, which is what the session is doing right now. An
+    unforeseen record shape is a format change (spec D6: the format is not a
+    contract), so it costs that one record and not the conversation.
+
+    ``harness`` is the first format recognised, or ``None`` when nothing was: the
+    file's own answer to which harness wrote it, for a caller that would otherwise
+    have to trust a label.
     """
     pending: dict = {}
     messages: list = []
+    harness: Optional[str] = None
     for record in records:
         if cap is not None and len(messages) >= cap:
-            return messages, True
+            return messages, True, harness
         try:
+            if harness is None:
+                harness = _harness_of_record(record)
             message = _message_from_record(record, pending)
         except Exception as exc:
             logger.warning("platform_transcript_record_skipped error=%r", exc)
             continue
         if message is not None:
             messages.append(message)
-    return messages, False
+    return messages, False, harness
 
 
 def normalise_records(records: Iterable[dict]) -> list:
@@ -1484,8 +1910,14 @@ def read_source(source: Source) -> tuple:
     The returned :class:`Source` carries the count and whether the per-file
     ceiling was hit, so the caller can say so rather than silently showing a
     prefix of a conversation.
+
+    It also carries the harness the *records* turned out to be from, which beats
+    the label the source arrived with: a pointer's ``harness`` is hand-editable
+    (:mod:`lmer_platform.registry`) and the derived directory has no label at all,
+    while the file says what it is. Nothing recognised keeps what was passed in —
+    there is no evidence to correct it with.
     """
-    messages, capped = _normalise(
+    messages, capped, harness = _normalise(
         _iter_records(source.path), cap=MAX_MESSAGES_PER_SOURCE
     )
     if capped:
@@ -1498,7 +1930,7 @@ def read_source(source: Source) -> tuple:
     return messages, Source(
         path=source.path,
         session=source.session,
-        harness=source.harness,
+        harness=harness or source.harness,
         messages=len(messages),
         capped=capped,
     )

@@ -504,7 +504,8 @@ quit chord, no credential mounts, empty exec profile).
     "dashdash_before_prompt": true
   },
   "model_hints": ["acme"],
-  "extra_env": {"ACME_NO_UPDATE": "1"}
+  "extra_env": {"ACME_NO_UPDATE": "1"},
+  "session_dir": "/home/developer/.acme/sessions"
 }
 ```
 
@@ -520,6 +521,23 @@ start instruction (see `GENERIC_START_COMMAND`); set it only if the harness
 has a native way to load the task instructions. `exec` powers `spawn-harness`
 fan-out children (see the exec-mode section above); leave it minimal if the
 harness won't be used as a fan-out child.
+
+`session_dir` is optional and names the **absolute container directory** the
+harness writes its session JSONL under (`~/.acme/sessions` for the example
+above). The orchestrator (`lmer platform`) mounts a host directory there for
+every harness that declares one, so a spawned session's transcript survives the
+`--rm` container and the chat view can read it back; a harness that declares
+nothing simply has no transcript on the host. An invalid value (relative, or
+containing `..`, `:`, `,` or whitespace) is warned about and ignored — the
+harness still loads, since a mis-declared transcript path must not cost the
+session. The platform imposes two more conditions at spawn time, with the same
+warn-and-ignore outcome: the directory must sit **strictly below
+`/home/developer`** (the container home — every harness checked keeps its
+sessions under `$HOME`), and it must not be, or contain, a directory the
+platform already mounts. A value outside those bounds means the harness runs
+with no transcript on the host, and the reason appears only in the platform
+daemon's log. What the mount does and does not buy the chat view is
+[Transcript visibility](#transcript-visibility-orchestrator-chat-view).
 
 ### Runner script (`runner.sh`)
 
@@ -608,6 +626,59 @@ existence.
 - The empirically fragile bits of TUI driving are the ready marker and quit
   sequence; use the env overrides to iterate, and `--no-supervisor` as the
   escape hatch.
+
+### Transcript visibility (orchestrator chat view)
+
+Declaring `session_dir` is all a user harness does to become readable from the
+orchestrator's chat view. `lmer platform` creates one host directory per
+declaring harness underneath the session's own transcript directory and mounts
+it read-write at the declared container path, so what the harness writes there
+survives the `--rm` container; the `.jsonl` files in it get the credential-shape
+scrub when the session ends (a masking pass, not a guarantee) and are what
+`GET /api/sessions/{id}/messages` reads back
+(`_prepare_transcript_subdirs` / `_transcript_mount_flags` in
+`src/lmer_platform/spawn.py`). A harness that declares nothing runs exactly as
+before and leaves no transcript on the host. The declared directory must sit
+strictly below the container home and must not be, or contain, a directory the
+platform already mounts — a value outside those bounds is skipped with a
+warning in the platform daemon's log, and the harness runs without a
+transcript mount.
+
+**Mounting is not reading**, and there are exactly two tiers of format support:
+
+- **A format the normaliser has a per-record adapter for** renders as a
+  conversation — roles, text, timestamps, tool calls with their outcome. Today
+  that is Claude Code, pi (session format 3) and codex (rollout format).
+- **Any other format** is reported explicitly: the page comes back empty
+  carrying the note *"The transcript for this run is on disk but has nothing to
+  show yet … so does one whose transcript this build cannot read."* Never a
+  silently blank page, which would read as "this run said nothing". The terminal
+  log remains the complete record either way.
+
+Adding a tier is a change to `src/lmer_platform/transcripts.py` (the dispatch is
+per record, keyed on the record's `type` values), not to the harness directory —
+a manifest cannot supply an adapter.
+
+Worked example, kimi code (`@moonshot-ai/kimi-code` 0.36.0). It writes
+`~/.kimi-code/sessions/wd_<cwd-slug>_<hash>/session_<uuid>/agents/main/wire.jsonl`,
+so its manifest line is:
+
+```json
+  "session_dir": "/home/developer/.kimi-code/sessions"
+```
+
+With that one line the `wire.jsonl` files land on the host, are scrubbed, and
+are inspectable — and the chat view answers with the cannot-read note, because
+kimi's wire format has no adapter yet (its records are the unknown-format
+fixture the reader is tested against,
+`tests/fixtures/transcripts/kimi-wire.jsonl`).
+
+Only `.jsonl` files inside the declared directory are discovered, recursively —
+a harness that writes `.json` or `.log` mounts out but never reads back — and a
+symlink there resolving outside the session's own transcript directory is
+refused rather than followed, since the directory is container-writable and the
+link would serve another run's conversation (`_jsonl_files` in
+`src/lmer_platform/transcripts.py`).
 
 ### When the CLI doesn't fit the flag model
 

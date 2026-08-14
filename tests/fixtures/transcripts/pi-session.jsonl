@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"019fff42-1c54-7471-9df6-cfef81d160e0","timestamp":"2026-08-14T07:52:30.548Z","cwd":"/workspace"}
+{"type":"model_change","id":"42a53508","parentId":null,"timestamp":"2026-08-14T07:52:30.779Z","provider":"fake","modelId":"fake-model"}
+{"type":"thinking_level_change","id":"93958eb7","parentId":"42a53508","timestamp":"2026-08-14T07:52:30.780Z","thinkingLevel":"off"}
+{"type":"message","id":"bd4d2d3a","parentId":"93958eb7","timestamp":"2026-08-14T07:52:30.805Z","message":{"role":"user","content":[{"type":"text","text":"say hi"}],"timestamp":1786693950803}}
+{"type":"message","id":"17b35d54","parentId":"bd4d2d3a","timestamp":"2026-08-14T07:52:31.055Z","message":{"role":"assistant","content":[{"type":"text","text":"Hello from the fake model."}],"api":"openai-completions","provider":"fake","model":"fake-model","usage":{"input":10,"output":7,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":17,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1786693950971,"responseId":"chatcmpl-fake","rawStopReason":"stop"}}

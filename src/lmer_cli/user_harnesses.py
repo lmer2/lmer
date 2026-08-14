@@ -119,6 +119,7 @@ _KNOWN_KEYS = frozenset(
         "exec",
         "model_hints",
         "extra_env",
+        "session_dir",
     }
 )
 
@@ -300,6 +301,44 @@ def _parse_exec_profile(raw, name: str) -> Optional[ExecProfile]:
     )
 
 
+def _parse_session_dir(raw, name: str) -> Optional[str]:
+    """Validate the optional ``session_dir`` — where this harness writes its
+    session JSONL inside the container (:attr:`Harness.session_dir`, issue #280).
+
+    Absent or invalid both mean "not declared", and neither skips the entry:
+    the field only buys a transcript mount, so a typo here must cost the chat
+    view's source and not the session — the harness still runs, exactly as
+    every user harness did before this key existed.
+
+    ``..`` is refused because the orchestrator derives a host directory per
+    harness from this, and ':'/','/whitespace because the value goes into a
+    ``host:container[:mode]`` mount argument whose parser fails the whole
+    launch on a malformed entry — a launch on a *different* harness.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        _warn(
+            f"User harness {name!r}: session_dir must be a non-empty string — "
+            "ignored (no transcript will be mounted out)"
+        )
+        return None
+    if not raw.startswith("/") or ".." in Path(raw).parts:
+        _warn(
+            f"User harness {name!r}: session_dir must be an absolute container "
+            f"path without '..' (got {raw!r}) — ignored (no transcript will be "
+            "mounted out)"
+        )
+        return None
+    if re.search(r"[:,\s]", raw):
+        _warn(
+            f"User harness {name!r}: session_dir must not contain ':', ',' or "
+            "whitespace — ignored (no transcript will be mounted out)"
+        )
+        return None
+    return raw
+
+
 def _parse_manifest(name: str, harness_dir: Path, manifest: dict) -> Optional[Harness]:
     """Build a :class:`Harness` from one validated manifest, or ``None``."""
     schema = manifest.get("schema")
@@ -381,6 +420,7 @@ def _parse_manifest(name: str, harness_dir: Path, manifest: dict) -> Optional[Ha
         exec_profile=exec_profile,
         description=description or f"{name} (user-installed harness)",
         extra_env=tuple(sorted(extra_env_raw.items())),
+        session_dir=_parse_session_dir(manifest.get("session_dir"), name),
         source_dir=str(harness_dir),
         model_hints=hints,
     )
