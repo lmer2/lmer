@@ -2604,6 +2604,10 @@ def main(argv: list[str] | None = None) -> int:
         # together a session can answer "what code am I actually running?".
         "LMER_SOURCE_COMMIT": checkout_commit(repo_root_path()),
         "LMER_RUN_STATE_GUARD": os.environ.get("LMER_RUN_STATE_GUARD"),
+        # Kill switch for the signal-reminder Stop hook (issue #289). The hook
+        # runs in the container, so a host-side value that stopped at the
+        # boundary would leave the operator unable to turn the nudge off.
+        "LMER_SIGNAL_GUARD": os.environ.get("LMER_SIGNAL_GUARD"),
         # Gate-in-flight coordination (issue #201): the kill switch for the
         # work-repo commit deferral and the Stop hook's matching nudge
         # suppression, and the marker directory both sides read. Both must

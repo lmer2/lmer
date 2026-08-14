@@ -183,6 +183,10 @@
           {
             "type": "command",
             "command": "python3 /Agents/global/hooks/run_state_guard.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 /Agents/global/hooks/signal_guard.py"
           }
         ]
       }
