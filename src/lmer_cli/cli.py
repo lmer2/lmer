@@ -81,9 +81,12 @@ from .user_harnesses import (
     load_user_harnesses,
 )
 from .presets import (
+    AGENTS_CONFIG_ENV,
     AGENTS_ENV,
     PRESET_ENV,
     PRESETS_FILE_ENV,
+    SPAWN_AGENTS_CONFIG_ENV,
+    SPAWN_AGENTS_ENV,
     load_presets,
     preset_env_value,
     resolve_agent_presets,
@@ -1594,7 +1597,7 @@ def _resolve_agents_cli(ns: argparse.Namespace) -> dict[str, dict] | None | int:
     only spawn what was named at launch.
 
     Returns the resolved ``{name: {"env": {...}, "prompt": ...?}}`` mapping
-    (the ``LMER_AGENTS_CONFIG`` shape, selection-ordered), ``None`` when no
+    (the ``LMER_SPAWN_AGENTS_CONFIG`` shape, selection-ordered), ``None`` when no
     selection was made, or an exit code on failure (unknown name / empty
     selection — spawning fewer agents than asked is never silent).
     """
@@ -2549,8 +2552,25 @@ def main(argv: list[str] | None = None) -> int:
         # names and their env overlays (JSON {name: {"env": {...}}}), consumed
         # in-container by spawn-harness. Host-resolved — the presets file
         # itself never enters the container.
-        "LMER_AGENTS": agents_csv,
-        "LMER_AGENTS_CONFIG": agents_config_json,
+        #
+        # Deliberately NOT forwarded under the host input names (issue #283):
+        # in the container the pair is ambient, so a session launched with
+        # --agents handed its selection to every nested `lmer` and every test
+        # run inside it, which then tried to resolve those names against a
+        # presets file that is not there. The scoped names have exactly one
+        # reader, spawn-harness.
+        SPAWN_AGENTS_ENV: agents_csv,
+        SPAWN_AGENTS_CONFIG_ENV: agents_config_json,
+        # The host *input* names must never cross the boundary under any
+        # route. Seeded None (the LMER_NAPKIN_TOKEN precedent above, dropped
+        # by build_container_env) because presence in this dict — not the
+        # value — is what stops the two fill-in loops below: the preset-env
+        # seeding (`if key not in env`) and the .env merge (`if key not in
+        # env or key in env_file_keys`). Without the seeds an LMER_AGENTS
+        # from ~/.lmer/.env or a preset's env would be forwarded verbatim,
+        # which is exactly the ambient value the scoped pair exists to avoid.
+        AGENTS_ENV: None,
+        AGENTS_CONFIG_ENV: None,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         # User-installed harnesses (issue #132): where the host mounted
         # ~/.lmer/harnesses inside the container (consumed by

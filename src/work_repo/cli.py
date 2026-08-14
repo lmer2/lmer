@@ -67,6 +67,14 @@ RELEASE_CLAIM_ATTEMPTS = 3
 ANSWER_MARKER_DIR: str | None = None
 
 
+#: Overridable directory for the run-less `work goal` fallback file (mirrors
+#: ``ANSWER_MARKER_DIR`` above). ``None`` means /tmp — container-lifetime
+#: scoped, exactly like the goal itself. Tests point it at a temp dir so a
+#: suite run never writes into the operator's real goal file (issue #277).
+#: Consumed by :func:`_goal_file` (next to ``cmd_goal``).
+GOAL_FILE_DIR: str | None = None
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -797,6 +805,25 @@ def cmd_report(file_path: str) -> int:
         return 1
 
 
+def _goal_file() -> Path:
+    """Path of the session-scoped fallback goal file (issue #277).
+
+    /tmp is shared by every process on the host, so a single unscoped path
+    let any other session — a test suite included — overwrite the operator's
+    goal. Same ``LMER_SESSION_ID`` across CLI invocations still means the
+    same file (that persistence is what `work goal` promises); distinct ids
+    never share one. The id comes from the environment, so it is sanitized
+    for path use, and because sanitization is many-to-one a digest of the RAW
+    id keeps two ids that sanitize alike on separate files. The ``"unknown"``
+    default is a session id like any other here.
+    """
+    session_id = run_state.current_session_id()
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", session_id).strip("-.")[:48]
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:8]
+    stem = f"{safe}-{digest}" if safe else digest
+    return Path(GOAL_FILE_DIR or "/tmp") / f"lmer_work_goal.{stem}.txt"
+
+
 def cmd_goal(
     description: str | None,
     estimate_sessions: int | None = None,
@@ -805,8 +832,9 @@ def cmd_goal(
     """
     Execute goal command.
 
-    Sets or displays temporary context/goal. The goal is stored in a temporary file
-    and is not persisted permanently (cleaned up on system restart).
+    Sets or displays temporary context/goal. The goal is stored in a temporary,
+    session-scoped file and is not persisted permanently (cleaned up on system
+    restart).
 
     Args:
         description: Optional goal description. If provided, sets the goal.
@@ -832,9 +860,9 @@ def cmd_goal(
             print("❌ --estimate-time requires a non-empty string", file=sys.stderr)
             return 1
 
-        # Use a temporary file in /tmp for storing the goal
-        # This persists across CLI invocations but is temporary (not permanent)
-        goal_file = Path("/tmp") / "lmer_work_goal.txt"
+        # Session-scoped temporary file: persists across CLI invocations but
+        # is temporary (not permanent), and belongs to this session alone.
+        goal_file = _goal_file()
 
         if description:
             # Set the goal

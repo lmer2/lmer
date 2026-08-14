@@ -28,10 +28,12 @@ The main MCP server configuration is in `.mcp.json` at the project root. This fi
 
 To add personal MCP servers without modifying the shared configuration:
 
-1. Create `.mcp.local.json` in your `~/.lmer/` directory
-2. The runner script will merge this with the base `.mcp.json` at container startup
+1. Get a `.mcp.local.json` to `/home/developer/.mcp.local.json` **inside the container** (or wherever `LMER_MCP_LOCAL_FILE` points)
+2. The runner script merges it with the base `.mcp.json` at container startup
 
-Example `~/.lmer/.mcp.local.json`:
+**Delivering the file is on you:** no lmer mount copies a host `~/.lmer/.mcp.local.json` into the container today, so the merge only sees a file something else placed at that in-container path — e.g. an explicit `--mount-file ~/.lmer/.mcp.local.json:/home/developer/.mcp.local.json` bind (`LMER_MOUNT_FILES` for the persistent form).
+
+Example `/home/developer/.mcp.local.json`:
 ```json
 {
   "mcpServers": {
@@ -172,6 +174,6 @@ At container startup, the runner script merges configuration files:
 | File | Location | Purpose |
 |------|----------|---------|
 | `.mcp.json` | Project root | Shared MCP server config |
-| `.mcp.local.json` | `~/.lmer/` or `/home/developer/` | Personal MCP servers |
+| `.mcp.local.json` | `/home/developer/` (in-container; no mount delivers a host copy) | Personal MCP servers |
 | `.claude/settings.json` | Project root | Shared permissions |
-| `.claude/settings.local.json` | `~/.lmer/.claude/` | Personal permissions |
+| `.claude/settings.local.json` | `/home/developer/.claude/` (in-container; no mount delivers a host copy) | Personal permissions |

@@ -7,8 +7,12 @@ and environment, a scratch HOME, and the work/global agent-files roots pointed
 away from the real container layout so provisioning is fully controlled.
 """
 
+import json
+import os
+import re
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +20,7 @@ import pytest
 
 from lmer_cli.container import clone_and_exec
 from lmer_cli.harness import HARNESSES
-from tests._claude_runner_harness import run_claude_runner
+from tests._claude_runner_harness import run_claude_runner, skip_if_npm_claude_present
 
 LIBEXEC = Path(__file__).parent.parent / "libexec"
 SRC = Path(__file__).parent.parent / "src"
@@ -435,6 +439,155 @@ class TestProvisionConfigFallback:
         target.write_text('{"from": "session"}')
         self._provision(tmp_path, tmp_path / "no-work", tmp_path / "no-global", fallback)
         assert target.read_text() == '{"from": "session"}'
+
+
+@skip_if_npm_claude_present
+class TestPersonalConfigMerge:
+    """claude-runner.sh folds the operator's personal settings.local.json and
+    .mcp.local.json into the base configs (#251).
+
+    Behavioral rather than source-level: both jq filters indexed the *merged*
+    object (`.[0]` after `.[0] * .[1] |`), so jq exited 5, the 2>/dev/null hid
+    it, and the runner announced a fallback to base-only config. Reading the
+    file the runner leaves behind is what tells the two apart.
+    """
+
+    def _run(self, tmp_path, base_name, base, local_name, local, env_keys):
+        """Write base/local config pairs, run the runner, return the base file."""
+        base_file = tmp_path / base_name
+        base_file.write_text(base if isinstance(base, str) else json.dumps(base))
+        local_file = tmp_path / local_name
+        local_file.write_text(local if isinstance(local, str) else json.dumps(local))
+        base_key, local_key = env_keys
+        result = run_claude_runner(
+            tmp_path,
+            env={base_key: str(base_file), local_key: str(local_file)},
+        )
+        return base_file, result
+
+    def _run_settings(self, tmp_path, base, local):
+        return self._run(
+            tmp_path,
+            "settings.json", base,
+            "settings.local.json", local,
+            ("LMER_SETTINGS_FILE", "LMER_SETTINGS_LOCAL_FILE"),
+        )
+
+    def _run_mcp(self, tmp_path, base, local):
+        return self._run(
+            tmp_path,
+            "mcp.json", base,
+            "mcp.local.json", local,
+            ("LMER_MCP_FILE", "LMER_MCP_LOCAL_FILE"),
+        )
+
+    def test_personal_permissions_are_merged_and_deduped(self, tmp_path):
+        base_file, result = self._run_settings(
+            tmp_path,
+            {
+                "model": "sonnet",
+                "permissions": {"allow": ["Bash(ls:*)", "Read"], "deny": ["Bash(rm:*)"]},
+            },
+            {
+                "permissions": {"allow": ["Read", "WebFetch"], "deny": ["Bash(curl:*)"]},
+            },
+        )
+
+        assert "✅ Merged personal permissions into settings.json" in result.output
+        merged = json.loads(base_file.read_text())
+        assert merged["permissions"]["allow"] == ["Bash(ls:*)", "Read", "WebFetch"]
+        assert merged["permissions"]["deny"] == ["Bash(curl:*)", "Bash(rm:*)"]
+        # Keys the local file says nothing about survive the merge.
+        assert merged["model"] == "sonnet"
+
+    def test_malformed_settings_local_falls_back_to_base(self, tmp_path):
+        base = {"model": "sonnet", "permissions": {"allow": ["Read"]}}
+        base_file, result = self._run_settings(tmp_path, base, "{not json")
+
+        assert "⚠️  Failed to merge settings.local.json, using base settings" in result.output
+        assert json.loads(base_file.read_text()) == base
+
+    def test_personal_mcp_servers_are_merged(self, tmp_path):
+        base_file, result = self._run_mcp(
+            tmp_path,
+            {"mcpServers": {"base": {"command": "base-server"}}, "other": 1},
+            {"mcpServers": {"personal": {"command": "personal-server"}}},
+        )
+
+        assert "✅ Merged personal MCP servers into .mcp.json" in result.output
+        merged = json.loads(base_file.read_text())
+        assert merged["mcpServers"] == {
+            "base": {"command": "base-server"},
+            "personal": {"command": "personal-server"},
+        }
+        assert merged["other"] == 1
+
+    def test_malformed_mcp_local_falls_back_to_base(self, tmp_path):
+        base = {"mcpServers": {"base": {"command": "base-server"}}}
+        base_file, result = self._run_mcp(tmp_path, base, "{not json")
+
+        assert "⚠️  Failed to merge .mcp.local.json, using base MCP config" in result.output
+        assert json.loads(base_file.read_text()) == base
+
+
+@skip_if_npm_claude_present
+class TestPromptFileScoping:
+    """A runner's startup cleanup reaches only its own prompt files (#276).
+
+    The files live in the container's shared /tmp and must outlive the shell
+    (it ends in ``exec``), so the cleanup runs at startup — where a bare
+    ``agents-prompt.*.md`` glob deleted the prompt file of a session that was
+    still running, dropping its AGENTS.md injection. This exercises the real
+    script against a seeded stand-in for that concurrent session's file.
+    """
+
+    def _run_with_prompt_file(self, tmp_path):
+        """Run the runner on a path that forces it to mktemp a prompt file."""
+        return run_claude_runner(
+            tmp_path,
+            # The non-interactive fragment is appended to a temp file even when
+            # no AGENTS.md is in play, so a prompt file is always created here.
+            env={"LMER_NONINTERACTIVE": "1", "LMER_GLOBAL_DIR": str(tmp_path / "no-global")},
+        )
+
+    def test_a_concurrent_runners_prompt_file_survives(self, tmp_path):
+        # Named like the files a concurrent runner leaves behind, but created
+        # by mktemp so this never collides with a real session's file. Removed
+        # by exact path — the shared /tmp is never globbed here.
+        fd, seeded = tempfile.mkstemp(prefix="agents-prompt.", suffix=".md", dir="/tmp")
+        os.close(fd)
+        seeded = Path(seeded)
+        seeded.write_text("another runner's AGENTS.md\n")
+        own_prompt = None
+        try:
+            result = self._run_with_prompt_file(tmp_path)
+
+            idx = result.argv.index("--append-system-prompt-file")
+            own_prompt = Path(result.argv[idx + 1])
+            assert own_prompt != seeded
+            assert seeded.exists(), (
+                "the runner's startup cleanup deleted a concurrent session's "
+                f"prompt file ({seeded})"
+            )
+            assert seeded.read_text() == "another runner's AGENTS.md\n"
+        finally:
+            seeded.unlink(missing_ok=True)
+            if own_prompt is not None and str(own_prompt).startswith("/tmp/agents-prompt."):
+                own_prompt.unlink(missing_ok=True)
+
+    def test_the_prompt_file_name_carries_the_runners_pid(self, tmp_path):
+        """Scoping is in the name, so the cleanup glob can be narrowed to it."""
+        own_prompt = None
+        try:
+            result = self._run_with_prompt_file(tmp_path)
+            idx = result.argv.index("--append-system-prompt-file")
+            own_prompt = Path(result.argv[idx + 1])
+            assert re.fullmatch(r"agents-prompt\.\d+\.[A-Za-z0-9]+\.md", own_prompt.name), (
+                f"prompt file {own_prompt.name} is not scoped to one runner"
+            )
+        finally:
+            if own_prompt is not None and str(own_prompt).startswith("/tmp/agents-prompt."):
+                own_prompt.unlink(missing_ok=True)
 
 
 # The pin only exists where an operational tree exists; off-container (e.g.

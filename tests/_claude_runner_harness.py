@@ -97,6 +97,12 @@ def run_claude_runner(tmp_path, env=None, *, expose_python3=False, stub_work=Fal
     run_env = {
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "HOME": str(tmp_path),
+        # The merge blocks key off the *local* files, whose defaults live under
+        # the real /home/developer — a test run must never rewrite the
+        # operator's own settings.json/.mcp.json. Point them at paths that do
+        # not exist so the merges stay inert unless a test opts in.
+        "LMER_SETTINGS_LOCAL_FILE": str(tmp_path / "no-settings.local.json"),
+        "LMER_MCP_LOCAL_FILE": str(tmp_path / "no-mcp.local.json"),
     }
     if env:
         run_env.update(env)

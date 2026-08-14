@@ -35,6 +35,7 @@ from lmer_cli.harness import (
     resolve_harness_selection,
 )
 from lmer_cli.mounts import build_user_mounts
+from tests.conftest import strip_lmer_env
 
 CLI_PY = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
 
@@ -556,6 +557,15 @@ class TestShowEnvWithBadHarness:
     """A typo'd LMER_HARNESS must not kill `lmer --show-env` before the env
     table renders — the table is exactly the diagnostic for finding where the
     bad value comes from (host export vs. which .env file)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_lmer_env(self, monkeypatch):
+        # These two drive the real main(), which resolves every launch input
+        # from the ambient environment — so anything the session carries can
+        # fail the launch before the harness error under test is reached
+        # (a session launched with --agents leaves LMER_AGENTS behind, and
+        # its names resolve against a presets file this process cannot see).
+        strip_lmer_env(monkeypatch)
 
     def test_show_env_renders_table_before_harness_error(self, monkeypatch, tmp_path, capsys):
         from lmer_cli import cli

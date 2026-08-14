@@ -278,6 +278,11 @@ let geometryRetries = 0
 // separately from the retry count because the count stops at the budget while the
 // stale message can outlive it by a long way.
 let geometryDeferred = false
+// The geometry this client last wrote to the PTY, or null for "nothing sent on
+// this socket". A memo of what THIS client said, never of what the session is:
+// it is cleared with the socket, because the PTY's size is not this client's to
+// remember across one.
+let geometrySent = null
 let boxWatcher = null
 let finished = false
 let disposed = false
@@ -566,6 +571,12 @@ function reportGeometry() {
   const rows = clampDimension(term.rows, MIN_ROWS)
   const cols = clampDimension(term.cols, MIN_COLS)
   if (!rows || !cols) return
+  // A geometry this client already sent is not worth writing again: the pass a
+  // return to the view schedules re-fits unconditionally, so without this memo
+  // switching back to the tab resized a session for everyone attached — when a
+  // return is a repaint and never a resize (operator decision, 2026-08-03).
+  if (geometrySent
+      && geometrySent.rows === rows && geometrySent.cols === cols) return
   // Clear a previous "still starting" line as the next attempt goes out. A
   // successful resize is answered with SILENCE by design (the server only speaks
   // up to refuse), so there is no success event to clear it on — which left the
@@ -577,6 +588,7 @@ function reportGeometry() {
     notice.value = null
   }
   socket.send(JSON.stringify({ type: 'resize', rows, cols }))
+  geometrySent = { rows, cols }
 }
 
 function applyGeometry() {
@@ -632,7 +644,18 @@ function setResizeOptIn(enabled) {
   )
   // Turning it off cannot put the session back the way it was — nothing here
   // knows what size it had before — so it only stops sending more.
-  if (resizeOptIn.value) applyGeometry()
+  //
+  // Turning it back ON is a command and not a repaint, so the memo does not get
+  // to answer it. While the fit was off the PTY could have been resized by
+  // anyone else attached, and this client's dimensions have not changed since
+  // the last frame it sent: the memo would match, nothing would go out, and the
+  // switch the operator just flipped would do nothing while the terminal renders
+  // against a PTY it is not sized to. A return to the view still goes through
+  // scheduleGeometryPass and never through here, so it stays a repaint (#218).
+  if (resizeOptIn.value) {
+    geometrySent = null
+    applyGeometry()
+  }
 }
 
 // One debounced pass for both of the things that ask for one, so a return that
@@ -762,6 +785,10 @@ function handleStatus(frame) {
       // that came up seconds later. Retried with backoff, and bounded, because a
       // plane that never answers is a real failure the follower will report.
       geometryDeferred = true
+      // Deferred means the size never reached the harness, so the memo is a
+      // record of a write that did not happen: dropped, or the retry below —
+      // and any later pass proposing that same size — would skip itself.
+      geometrySent = null
       if (geometryRetries >= GEOMETRY_RETRY_DELAYS.length) {
         // Still not a latch: the observer keeps calling reportGeometry on a
         // rotation, a tab switch or a height change, and any of those clears this
@@ -823,6 +850,7 @@ function handleFrame(text) {
     if (term) term.options.disableStdin = !frame.live
     // Re-applies a fit the operator asked for, because this may be a reconnect and
     // the PTY's size is not this client's to remember. A no-op otherwise.
+    geometrySent = null
     reportGeometry()
   }
 }
@@ -837,6 +865,7 @@ function teardownSocket() {
   geometryRetryTimer = null
   geometryRetries = 0
   geometryDeferred = false
+  geometrySent = null
   const closing = socket
   socket = null
   if (!closing) return

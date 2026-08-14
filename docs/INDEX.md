@@ -270,7 +270,7 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - Production PAT issuance and provisioning, bot account signing key, PyPI trusted publisher, GitLab protected tags
 - Mirror PR/collaborator policy and the green-rehearsal gate
 - Split into **gating** receipts and **hardening** items: a release run must refuse leg 2 while any gating item is unchecked; hardening is tracked separately so it neither blocks a release nor passes unnoticed
-- Rehearsal waivers for a given release are recorded here with rationale and accepted residual
+- Rehearsal waivers for a given release are recorded with that release run's records in the work repo — rationale and accepted residual — not in this checklist
 
 **Best for**: The operator completing (and auditors reviewing) the production setup checklist before the first release run.
 
