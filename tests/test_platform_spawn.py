@@ -27,6 +27,7 @@ from ask_channel import protocol
 from lmer_cli import supervisor
 from lmer_cli.cli import parse_args, parse_dir_mount_specs
 from lmer_cli.harness import HARNESSES
+from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINKS_ENV
 from lmer_cli.user_harnesses import HARNESSES_DIR_ENV, clear_user_harness_cache
 from lmer_platform import config as cfg
 from lmer_platform import ask, registry, runs, session_io, spawn, store, transcripts
@@ -2154,15 +2155,46 @@ def test_a_user_harness_that_declares_where_it_writes_gets_a_mount(
 ):
     """Registry-driven, not a list of three: a harness installed without touching
     this codebase (issue #132) says where it writes in its manifest, and that is
-    all the platform needs to keep its transcripts."""
+    all the platform needs to keep its transcripts.
+
+    The mount lands in the staging area rather than at the declared path (#293):
+    ``~/.acme`` is a directory the image never heard of, so binding straight at
+    ``~/.acme/sessions`` has the runtime create ``~/.acme`` root-owned before any
+    container process exists. The declared path is delivered as a symlink by the
+    entrypoint instead — see the link pair asserted below.
+    """
     write_user_harness(_no_user_harnesses, "acme", "/home/developer/.acme/sessions")
     result = spawn.spawn_session(config, request_for())
     root = spawn.transcript_dir_for(result.session_id)
 
-    assert mount_spec_for(result.command, "/home/developer/.acme/sessions") == (
-        f"{root / 'acme'}:/home/developer/.acme/sessions:rw"
-    )
+    staged = f"{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme"
+    assert mount_spec_for(result.command, staged) == f"{root / 'acme'}:{staged}:rw"
+    assert not [
+        spec for spec in mount_specs_in(result.command)
+        if spec.split(":")[1:2] == ["/home/developer/.acme/sessions"]
+    ], "the declared path is where the entrypoint puts the symlink, not a mount"
+    assert spawn._harness_session_links() == [
+        ("/home/developer/.acme/sessions", staged)
+    ]
     assert stat.S_IMODE((root / "acme").stat().st_mode) == 0o700
+
+
+def test_a_built_in_harness_still_mounts_at_the_path_it_declares(config):
+    """Staging is for user harnesses only (#293).
+
+    The image ships ~/.claude, ~/.codex and ~/.pi developer-owned, so those
+    destinations already have the parents they need — there is nothing for the
+    runtime to create root-owned, and a symlink hop would only add a way for the
+    transcript to go missing.
+    """
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+    for name, container_dir in HARNESS_SESSION_DIRS.items():
+        assert mount_spec_for(result.command, container_dir) == (
+            f"{root / name}:{container_dir}:rw"
+        )
+        assert CONTAINER_MOUNT_STAGING_DIR not in container_dir
+    assert spawn._harness_session_links() == [], "no built-in needs a link"
 
 
 @pytest.mark.parametrize("bad", ["acme/sessions", "/home/developer/../acme"])
@@ -2233,7 +2265,11 @@ def test_two_user_harnesses_sharing_a_session_dir_keep_the_first(
     result = spawn.spawn_session(config, request_for())
     root = spawn.transcript_dir_for(result.session_id)
 
-    assert mount_spec_for(result.command, shared) == f"{root / 'acme'}:{shared}:rw"
+    # The collision is decided on the declared path; what the winner then gets
+    # is its staged mount (#293) and the link back to the declared one.
+    staged = f"{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme"
+    assert mount_spec_for(result.command, staged) == f"{root / 'acme'}:{staged}:rw"
+    assert spawn._harness_session_links() == [(shared, staged)]
     assert not [spec for spec in mount_specs_in(result.command) if "bravo" in spec]
     assert any(
         "platform_transcript_session_dir_taken harness=bravo" in r.getMessage()
@@ -2278,6 +2314,85 @@ def test_a_user_harness_declaring_a_directory_above_the_platforms_is_skipped(
         assert mount_spec_for(result.command, container_dir)
     assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
     assert any(event in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("declared", [
+    # The staging root itself, which is a reserved destination like the ask
+    # channel and the workspace.
+    CONTAINER_MOUNT_STAGING_DIR,
+    # And inside it, where the platform generates this very harness's mount
+    # destination — a containment no equality check and no "does it cover a
+    # platform mount" check can see, since it points the other way.
+    f"{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme",
+    f"{CONTAINER_MOUNT_STAGING_DIR}/creds/0",
+])
+def test_a_user_harness_declaring_a_directory_in_the_staging_area_is_skipped(
+    config, _no_user_harnesses, caplog, declared
+):
+    """The staging area is lmer's own (#293), so a manifest may not claim it.
+
+    A declaration in there would have the platform stage a mount on top of its
+    own staging layout, and hand the entrypoint a pair whose two halves name the
+    same tree. Same warn-and-skip cost as every other refused declaration: the
+    harness loses its transcript mount and the session starts.
+    """
+    write_user_harness(_no_user_harnesses, "acme", declared)
+    result = spawn.spawn_session(config, request_for())
+
+    specs = mount_specs_in(result.command)
+    assert not [spec for spec in specs if "acme" in spec]
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+    assert any(
+        "platform_transcript_session_dir_in_staging" in r.getMessage()
+        or "platform_transcript_session_dir_taken" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_the_child_is_told_which_declared_paths_to_link(
+    config, _no_user_harnesses, monkeypatch
+):
+    """The container half of the fix travels as LMER_MOUNT_LINKS (#293).
+
+    The pair is what the entrypoint's linker consumes; without it the staged
+    mount is delivered to a path no harness looks at, which is the same missing
+    transcript the staging was introduced to avoid.
+    """
+    write_user_harness(_no_user_harnesses, "acme", "/home/developer/.acme/sessions")
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    spawn.spawn_session(config, request_for())
+    assert captured[MOUNT_LINKS_ENV] == (
+        f"/home/developer/.acme/sessions:{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme"
+    )
+
+
+def test_a_session_with_nothing_to_link_is_told_that_in_blank(config, monkeypatch):
+    """Blank, not absent — the child is ``lmer`` and it seeds its environment
+    from .env files first-wins, so a deleted key is one a stale file may
+    re-supply (the LMER_ASK_DIR/LMER_NO_REPO precedent). An inherited value is
+    dropped for the sharper version of the same reason: a daemon started from
+    inside a session carries that session's pairs, which name mounts this
+    container does not have."""
+    monkeypatch.setenv(MOUNT_LINKS_ENV, "/somebody/elses:/staged/mount")
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    spawn.spawn_session(config, request_for())
+    assert captured[MOUNT_LINKS_ENV] == "", (
+        "no user harness declared anything, so there is nothing to link"
+    )
 
 
 def test_scrubbing_a_session_that_wrote_no_transcript_is_not_fatal(config):
@@ -2510,6 +2625,60 @@ def test_a_mount_aimed_at_the_session_log_destination_is_refused(config, hijack)
     """
     with pytest.raises(spawn.SpawnError, match="may not target"):
         spawn.spawn_session(config, request_for(extra_args=hijack))
+
+
+@pytest.mark.parametrize("hijack", [
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}:rw"),
+    ("--mount-dir=/tmp/mine:" + CONTAINER_MOUNT_STAGING_DIR,),
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/:rw"),
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/sessions:rw"),
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme:rw"),
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/creds/0:ro"),
+])
+def test_a_mount_aimed_into_the_staging_area_is_refused(config, hijack):
+    """The whole subtree, not one path (#293): the platform's user-harness mounts
+    land at generated paths under it, so a caller's mount anywhere inside can
+    shadow one — or supply the directory the entrypoint links a declared path
+    to, which is a harness reading credentials the caller chose."""
+    with pytest.raises(spawn.SpawnError, match="may not target"):
+        spawn.spawn_session(config, request_for(extra_args=hijack))
+
+
+@pytest.mark.parametrize("hijack", [
+    ("--mount-file", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/creds/0:ro"),
+    ("--mount-file=/tmp/mine:" + f"{CONTAINER_MOUNT_STAGING_DIR}/creds/0",),
+    ("--mount-file", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme/x.jsonl"),
+])
+def test_a_file_mount_aimed_into_the_staging_area_is_refused(config, hijack):
+    """``--mount-file`` reaches the staging area too, and is the flag that fits
+    it: a staged *credential* is a file (``.lmer-mounts/creds/<n>``), so the
+    subtree refusal has to cover the file flag or the session's harness can be
+    handed a credential the caller supplied."""
+    with pytest.raises(spawn.SpawnError, match="may not target"):
+        spawn.spawn_session(config, request_for(extra_args=hijack))
+
+
+def test_an_unrelated_mount_file_is_still_allowed(config):
+    """Only the staging aim is refused; the flag keeps everything else it does —
+    the protected session/ask/log destinations stay a --mount-dir rule, since
+    every one of them is a directory."""
+    result = spawn.spawn_session(
+        config,
+        request_for(extra_args=("--mount-file", "/tmp/mine:/home/developer/.netrc:ro")),
+    )
+    assert "/tmp/mine:/home/developer/.netrc:ro" in result.command
+
+
+def test_a_mount_beside_the_staging_area_is_not_refused(config):
+    """Components, not a string prefix: ``.lmer-mounts-backup`` starts with the
+    staging path and is nowhere inside it."""
+    result = spawn.spawn_session(
+        config,
+        request_for(extra_args=(
+            "--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}-backup:ro",
+        )),
+    )
+    assert f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}-backup:ro" in result.command
 
 
 def test_an_unrelated_mount_dir_is_still_allowed(config):

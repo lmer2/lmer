@@ -132,6 +132,14 @@ from typing import Optional
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.harness import HARNESSES, known_harnesses
+from lmer_cli.mounts import (
+    # Imported rather than restated: credential staging (there) and the
+    # session-dir acceptance rule (here) must read one literal.
+    CONTAINER_HOME,
+    CONTAINER_MOUNT_STAGING_DIR,
+    MOUNT_LINKS_ENV,
+    format_mount_links,
+)
 from lmer_cli.supervisor import (
     CONTAINER_SESSION_LOG_DIR,
     DEFAULT_PORT_RANGE,
@@ -1009,25 +1017,25 @@ def _container_dir_key(container_dir: str) -> str:
     return str(PurePosixPath(container_dir))
 
 
-#: The container's home directory. ``HOME=/home/developer`` is pinned by the
-#: host CLI's container env dict — the same fact
-#: :data:`lmer_cli.mounts.CONTAINER_UV_CACHE_DIR` and
-#: :data:`lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR` are built from.
-#: Written down here because a *user* harness's declared session directory has
-#: to live strictly below it: see :func:`_harness_session_dirs`.
-CONTAINER_HOME = "/home/developer"
+def _below_destination(destination: str, ancestor: str) -> bool:
+    """Whether *destination* is strictly below *ancestor*.
+
+    Compared as path components rather than as a string prefix: ``/home/dev2``
+    starts with ``/home/dev`` and is nowhere below it. *Strictly*, because an
+    equality is a collision and is reported as one, with its own reason.
+    """
+    parts = PurePosixPath(destination).parts
+    top = PurePosixPath(ancestor).parts
+    return len(parts) > len(top) and parts[:len(top)] == top
 
 
 def _below_container_home(destination: str) -> bool:
     """Whether *destination* is strictly below :data:`CONTAINER_HOME`.
 
-    Compared as path components rather than as a string prefix: ``/home/dev2``
-    starts with ``/home/dev`` and is nowhere below it. *Strictly*, because the
-    home directory itself is the case this exists for.
+    Named after the rule it enforces — the container home is the ancestor a
+    declared session directory has to be under.
     """
-    parts = PurePosixPath(destination).parts
-    home = PurePosixPath(CONTAINER_HOME).parts
-    return len(parts) > len(home) and parts[:len(home)] == home
+    return _below_destination(destination, CONTAINER_HOME)
 
 
 def _covered_destination(destination: str, *owners: dict) -> tuple:
@@ -1087,8 +1095,26 @@ def _reserved_session_destinations() -> dict:
         _container_dir_key(ask.CONTAINER_ASK_DIR): "the session's ask channel",
         _container_dir_key(CONTAINER_SESSION_LOG_DIR): "the session's own log",
         _container_dir_key(CONTAINER_HARNESSES_DIR): "the user-harness drop-ins",
+        _container_dir_key(CONTAINER_MOUNT_STAGING_DIR):
+            "the mount staging area (lmer-internal)",
     })
     return reserved
+
+
+def _within_staging_area(destination: str) -> bool:
+    """Whether *destination* is the staging directory or sits below it.
+
+    A declared path in the staging area would put a mount on top of the
+    platform's own staging layout and ask the linker to link a path to itself
+    or to another harness's mount. Equality is answered here (not only by the
+    reserved map) because :func:`_reject_mount_hijack` calls this where no
+    reserved map exists.
+    """
+    staging = _container_dir_key(CONTAINER_MOUNT_STAGING_DIR)
+    return (
+        _container_dir_key(destination) == staging
+        or _below_destination(destination, CONTAINER_MOUNT_STAGING_DIR)
+    )
 
 
 def _harness_session_dirs() -> dict:
@@ -1128,6 +1154,13 @@ def _harness_session_dirs() -> dict:
       ``/home/developer/.pi`` is neither equal to nor outside the home, and
       mounting an empty directory there hides whatever the image keeps beside
       pi's session directory — its configuration and its credentials.
+    * it is not inside the mount staging area (:func:`_within_staging_area`),
+      which is where a user harness's mount is actually bound.
+
+    What passes is *declared*, and stays declared here: the staging of a user
+    harness's mount destination happens afterwards
+    (:func:`_harness_mount_destinations`), on paths these rules have already
+    accepted, so the checks keep reading the path the manifest wrote.
 
     The checks cover the destinations the *platform* mounts, not the image's
     own layout or ``lmer``'s ``-v`` set: a declared directory that shadows,
@@ -1167,6 +1200,17 @@ def _harness_session_dirs() -> dict:
                     "transcript is not mounted out and the session starts "
                     "without it",
                     name, harness.session_dir, owner,
+                )
+                continue
+            if _within_staging_area(destination):
+                logger.warning(
+                    "platform_transcript_session_dir_in_staging harness=%s "
+                    "path=%s staging=%s — that directory is where the platform "
+                    "stages this harness's own mount, so a declaration inside it "
+                    "would collide with the staging layout and with the "
+                    "entrypoint's link; this harness's transcript is not mounted "
+                    "out and the session starts without it",
+                    name, harness.session_dir, CONTAINER_MOUNT_STAGING_DIR,
                 )
                 continue
             if not _below_container_home(destination):
@@ -1211,6 +1255,43 @@ def _harness_session_dirs() -> dict:
     return dirs
 
 
+def _harness_mount_destinations() -> dict:
+    """``{harness name: the container path its transcript subdirectory binds at}``.
+
+    The declared directory (:func:`_harness_session_dirs`) for a built-in; a
+    staged path under :data:`lmer_cli.mounts.CONTAINER_MOUNT_STAGING_DIR` for a
+    user harness, whose declared parents the image may not ship — the runtime
+    would create them root-owned and the harness would EACCES writing beside
+    its mount (issue #293; the why lives on that constant). The declared path
+    comes back as an entrypoint symlink (:func:`_harness_session_links`).
+    """
+    registry_entries = known_harnesses()
+    destinations = {}
+    for name, declared in _harness_session_dirs().items():
+        entry = registry_entries.get(name)
+        if entry is not None and entry.source_dir is not None:
+            destinations[name] = f"{CONTAINER_MOUNT_STAGING_DIR}/sessions/{name}"
+        else:
+            destinations[name] = declared
+    return destinations
+
+
+def _harness_session_links() -> list:
+    """``[(declared, staged)]`` for every harness whose mount is staged.
+
+    The container entrypoint turns each pair into a symlink, so a harness still
+    finds its session directory where its manifest says it is. Derived from the
+    same two functions the mount is built from rather than recomputed, so a link
+    can only ever name a destination this spawn also mounts.
+    """
+    destinations = _harness_mount_destinations()
+    return [
+        (declared, destinations[name])
+        for name, declared in _harness_session_dirs().items()
+        if destinations.get(name) not in (None, declared)
+    ]
+
+
 def _prepare_transcript_subdirs(directory: Path) -> list:
     """One transcript subdirectory per harness under *directory*, 0700.
 
@@ -1233,7 +1314,7 @@ def _prepare_transcript_subdirs(directory: Path) -> list:
     """
     mode = _transcripts().SESSION_DIR_MODE
     prepared = []
-    for name, container_dir in _harness_session_dirs().items():
+    for name, container_dir in _harness_mount_destinations().items():
         subdir = directory / name
         try:
             subdir.mkdir(mode=mode, exist_ok=True)
@@ -1254,10 +1335,11 @@ def _transcript_mount_flags(mounts: list) -> list:
     """``lmer`` flags that mount each *mounts* pair in where its harness writes.
 
     ``rw`` is not optional here: the harness writes its JSONL into its directory
-    for the life of the session. The container-side destinations are the
-    registry's own (:func:`_harness_session_dirs`) rather than spelled out again,
-    so the paths these mount at and the paths the harnesses write to are one
-    fact. Every declared harness is mounted, not just the session's: which
+    for the life of the session. The container-side destinations come from
+    :func:`_harness_mount_destinations` rather than being spelled out again, so
+    the paths these mount at and the paths the harnesses reach — directly for a
+    built-in, through the entrypoint's symlink for a staged user harness — are
+    one fact. Every declared harness is mounted, not just the session's: which
     harness a request resolves to is decided inside the child ``lmer`` (flag,
     env, preset, model hint), so the alternative to a few empty directories is
     guessing — and guessing wrong is a session whose transcript is gone.
@@ -1561,9 +1643,13 @@ def _protected_mount_destinations() -> dict:
     :func:`_transcripts`), and the harnesses that declare a session directory
     include the user drop-ins, which are read from disk.
 
-    Every declared session directory is protected, not just claude's: each one is
-    a destination this spawn mounts (:func:`_transcript_mount_flags`), so each is
-    a place a caller's mount could quietly take over.
+    Every *declared* session directory is protected, not just claude's, and the
+    declared one even where the mount is staged: a caller's mount at the declared
+    path lands exactly where the entrypoint wants to put the harness's symlink,
+    so it would either swallow the transcript or leave the link unmade.
+    :data:`lmer_cli.mounts.CONTAINER_MOUNT_STAGING_DIR` is protected too, but by
+    :func:`_reject_mount_hijack` rather than by an entry here — what has to be
+    refused there is the whole subtree, not one path.
     """
     protected = {
         session_dir: (
@@ -1599,15 +1685,32 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     :func:`_protected_mount_destinations` for what each redirect would cost.
     Rejecting exactly those destinations keeps the permission the flag exists for
     and removes the aims that lie.
+
+    The staging area is refused as a *subtree*, for ``--mount-file`` too (it
+    holds staged credential *files*): a caller's mount in there can hand the
+    session's harness credentials the caller chose. The protected-destination
+    list stays a ``--mount-dir`` rule — those destinations are all directories.
     """
-    if not "--mount-dir".startswith(name):
+    aims_at_dir = "--mount-dir".startswith(name)
+    aims_at_file = "--mount-file".startswith(name)
+    if not (aims_at_dir or aims_at_file):
         return
     spec = arg.split("=", 1)[1] if "=" in arg else (following[0] if following else "")
-    # Grammar is host:container[:mode]; the destination is the second field.
+    # Grammar is host:container[:mode] for both flags; the destination is the
+    # second field.
     parts = str(spec).split(":")
     if len(parts) < 2:
         return
     destination = parts[1].rstrip("/")
+    if _within_staging_area(destination):
+        raise SpawnError(
+            f"{name} may not target {CONTAINER_MOUNT_STAGING_DIR} or anything "
+            "below it: the platform stages its own user-harness mounts there, so a "
+            "mount inside it would shadow one of them — or hand the session's "
+            "harness a file or directory the caller chose"
+        )
+    if not aims_at_dir:
+        return
     for protected, reason in _protected_mount_destinations().items():
         if destination == protected.rstrip("/"):
             raise SpawnError(f"--mount-dir may not target {protected}: {reason}")
@@ -2222,6 +2325,19 @@ def spawn_session(
         # (resolve_channel_dir strips it; the runners render the ask fragment
         # only on a non-blank value).
         child_env[ask.ASK_DIR_ENV] = ""
+    # The declared→staged link pairs for the entrypoint (#293), filtered to
+    # mounts actually prepared. Seeded fresh, never inherited (a daemon's own
+    # environment would carry another session's pairs), and blank rather than
+    # absent for the reason the two variables below give.
+    mounted_destinations = {container_dir for _, container_dir in transcript_mounts}
+    child_env[MOUNT_LINKS_ENV] = format_mount_links(
+        "",
+        [
+            (declared, staged)
+            for declared, staged in _harness_session_links()
+            if staged in mounted_destinations
+        ],
+    )
     if request.no_repo:
         # Spec D17, structurally: `lmer` skips repo resolution on this and the
         # container skips the workspace clone, so the session has nothing to edit

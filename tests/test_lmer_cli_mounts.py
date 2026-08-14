@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for lmer_cli.mounts module"""
 
+import json
 import os
 import pytest
 from pathlib import Path
@@ -8,14 +9,22 @@ from unittest.mock import patch, MagicMock
 import tempfile
 
 from lmer_cli.cli import (
+    _announce_user_credential_mounts,
     conflicting_mount_destinations,
     parse_args,
     parse_dir_mount_specs,
     parse_file_mount_specs,
 )
+from lmer_cli.harness import HARNESSES
+from lmer_cli.user_harnesses import load_user_harnesses
 from lmer_cli.mounts import (
+    CONTAINER_MOUNT_STAGING_DIR,
+    _stage_token as _real_stage_token,
     DirMountSpec,
     FileMountSpec,
+    credential_mount_links,
+    format_mount_links,
+    plan_credential_mounts,
     selinux_opt,
     _is_selinux_enforcing,
     build_workspace_mount,
@@ -401,6 +410,218 @@ class TestBuildUserMounts:
                 # Should include credentials mount
                 credentials_mounted = any(".credentials.json" in str(arg) for arg in args)
                 assert credentials_mounted
+
+
+class TestStagedCredentialMounts:
+    """User-harness credential mounts below the container home are staged (#290).
+
+    A manifest may name a container path whose parents the image does not ship
+    (``~/.local/share/opencode/auth.json``). Binding straight there makes the
+    runtime create ``~/.local/share/opencode`` root-owned before any container
+    process exists, and opencode's own startup ``mkdir`` of ``repos/`` beside it
+    then fails with EACCES — the container is ``developer`` with
+    no-new-privileges, so nothing inside can fix the ownership. So the bind
+    lands under the staging directory and the declared path is delivered by the
+    entrypoint as a symlink, from the pairs surfaced here.
+    """
+
+    DECLARED = "/home/developer/.local/share/acme/auth.json"
+    TOKEN = "deadbeef"
+
+    @pytest.fixture(autouse=True)
+    def _pinned_stage_token(self, monkeypatch):
+        """The per-launch token is random by design; pin it so the assertions
+        can name the whole staged path instead of matching a prefix."""
+        monkeypatch.setattr("lmer_cli.mounts._stage_token", lambda: self.TOKEN)
+
+    @property
+    def stage(self):
+        return f"{CONTAINER_MOUNT_STAGING_DIR}/creds/{self.TOKEN}"
+
+    def _user_harness(self, tmp_path, monkeypatch, container_path=None):
+        """A drop-in harness with one existing credential file."""
+        home = tmp_path / "home"
+        (home / ".acme").mkdir(parents=True)
+        (home / ".acme" / "auth.json").write_text("{}")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        root = tmp_path / "harnesses"
+        directory = root / "acme"
+        directory.mkdir(parents=True)
+        manifest = {
+            "schema": 1,
+            "binary": "acme",
+            "credential_mounts": [{
+                "host_path": ".acme/auth.json",
+                "container_path": container_path or self.DECLARED,
+            }],
+        }
+        (directory / "harness.json").write_text(json.dumps(manifest))
+        (directory / "runner.sh").write_text("#!/bin/bash\nexit 0\n")
+        return load_user_harnesses(root)["acme"]
+
+    def test_user_credentials_bind_in_the_staging_area(self, tmp_path, monkeypatch):
+        acme = self._user_harness(tmp_path, monkeypatch)
+        to_mount, skipped = plan_credential_mounts(acme)
+        assert skipped == []
+        assert [m.staged for m in to_mount] == [f"{self.stage}/0"]
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args, _ = build_user_mounts("docker", acme, plan=(to_mount, skipped))
+        assert [a for a in args if a != "-v"] == [
+            f"{tmp_path / 'home' / '.acme' / 'auth.json'}:{self.stage}/0:rw"
+        ]
+        assert self.DECLARED not in " ".join(args), (
+            "the declared path is where the entrypoint puts the symlink"
+        )
+
+    def test_the_declared_path_is_surfaced_as_a_link_pair(self, tmp_path, monkeypatch):
+        acme = self._user_harness(tmp_path, monkeypatch)
+        to_mount, _ = plan_credential_mounts(acme)
+        assert credential_mount_links(to_mount) == [
+            (self.DECLARED, f"{self.stage}/0")
+        ]
+
+    def test_each_user_credential_gets_its_own_stage(self, tmp_path, monkeypatch):
+        """The index is over the planned user mounts, so two credentials never
+        share a destination — the runtime would bind the second over the first."""
+        home = tmp_path / "home"
+        (home / ".acme").mkdir(parents=True)
+        for leaf in ("auth.json", "models.json"):
+            (home / ".acme" / leaf).write_text("{}")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        root = tmp_path / "harnesses"
+        directory = root / "acme"
+        directory.mkdir(parents=True)
+        (directory / "harness.json").write_text(json.dumps({
+            "schema": 1,
+            "binary": "acme",
+            "credential_mounts": [
+                {"host_path": ".acme/auth.json", "container_path": self.DECLARED},
+                {
+                    "host_path": ".acme/models.json",
+                    "container_path": "/home/developer/.acme/models.json",
+                },
+            ],
+        }))
+        (directory / "runner.sh").write_text("#!/bin/bash\nexit 0\n")
+        acme = load_user_harnesses(root)["acme"]
+        to_mount, _ = plan_credential_mounts(acme)
+        staged = [m.staged for m in to_mount]
+        assert staged == [f"{self.stage}/0", f"{self.stage}/1"]
+        assert len(set(staged)) == len(staged)
+
+    def test_built_in_credentials_are_not_staged(self, tmp_path, monkeypatch):
+        """The image ships ~/.claude developer-owned, so there is no root-owned
+        parent to avoid — and a symlink hop would only add a way to lose the
+        credential."""
+        home = tmp_path / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / ".credentials.json").write_text("{}")
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+        to_mount, _ = plan_credential_mounts(HARNESSES["claude"])
+        assert to_mount, "the fixture credential file must be planned"
+        assert all(m.staged is None for m in to_mount)
+        assert credential_mount_links(to_mount) == []
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args, _ = build_user_mounts(
+                "docker", HARNESSES["claude"], plan=(to_mount, [])
+            )
+        assert any(
+            a.endswith("/home/developer/.claude/.credentials.json:rw") for a in args
+        ), args
+
+    @pytest.mark.parametrize("declared", [
+        "/etc/acme/auth.json",
+        "/opt/acme/auth.json",
+        # Component-wise, not a string prefix — a different directory.
+        "/home/developer2/acme/auth.json",
+        # The home itself is not strictly below itself.
+        "/home/developer",
+    ])
+    def test_a_declared_path_outside_the_home_binds_directly(
+        self, tmp_path, monkeypatch, declared
+    ):
+        acme = self._user_harness(tmp_path, monkeypatch, container_path=declared)
+        to_mount, skipped = plan_credential_mounts(acme)
+        assert skipped == []
+        assert [m.staged for m in to_mount] == [None]
+        assert credential_mount_links(to_mount) == [], (
+            "nothing to link: the mount is already where the manifest asked for it"
+        )
+        with patch("lmer_cli.mounts._is_selinux_enforcing", return_value=False):
+            _is_selinux_enforcing.cache_clear()
+            args, _ = build_user_mounts("docker", acme, plan=(to_mount, skipped))
+        assert [a for a in args if a != "-v"] == [
+            f"{tmp_path / 'home' / '.acme' / 'auth.json'}:{declared}:rw"
+        ]
+
+    def test_a_declared_path_below_the_home_still_stages(self, tmp_path, monkeypatch):
+        """The control for the boundary above: one component deeper than the
+        home is the case staging exists for."""
+        acme = self._user_harness(
+            tmp_path, monkeypatch, container_path="/home/developer/.acme/auth.json"
+        )
+        to_mount, _ = plan_credential_mounts(acme)
+        assert [m.staged for m in to_mount] == [f"{self.stage}/0"]
+
+    def test_the_stage_is_this_launch_s_own(self, tmp_path, monkeypatch):
+        """Two plans must not name one staged path.
+
+        A nested ``lmer`` (a ``--service`` session carries the runtime socket)
+        would otherwise stage its own ``creds/0`` while the inherited pair from
+        the outer launch still named that path — linking the OUTER harness's
+        declared path onto the INNER harness's credential file, and first-wins
+        would drop the inner harness's own pair.
+        """
+        # The real generator, not the pinned one — the point is that two calls
+        # differ.
+        monkeypatch.setattr("lmer_cli.mounts._stage_token", _real_stage_token)
+        acme = self._user_harness(tmp_path, monkeypatch)
+        first, _ = plan_credential_mounts(acme)
+        second, _ = plan_credential_mounts(acme)
+        assert first[0].staged != second[0].staged
+        for planned in (first[0], second[0]):
+            assert planned.staged.startswith(f"{CONTAINER_MOUNT_STAGING_DIR}/creds/")
+            assert planned.staged.endswith("/0"), "the index is still per plan"
+
+    def test_the_announce_names_the_path_the_operator_declared(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Staging is an implementation detail; the 🔑 line has to stay
+        recognisable as the manifest entry it is warning about."""
+        acme = self._user_harness(tmp_path, monkeypatch)
+        to_mount, _ = plan_credential_mounts(acme)
+        monkeypatch.delenv("LMER_VERBOSE", raising=False)
+        _announce_user_credential_mounts(to_mount)
+        out = capsys.readouterr().out
+        assert "🔑 User harness acme: mounting ~/.acme/auth.json (rw)" in out
+        assert CONTAINER_MOUNT_STAGING_DIR not in out
+
+
+class TestMountLinkFormatting:
+    """The LMER_MOUNT_LINKS value: what the entrypoint linker parses."""
+
+    def test_pairs_are_colon_joined_and_comma_separated(self):
+        assert format_mount_links("", [("/a/b", "/staged/0")]) == "/a/b:/staged/0"
+        assert format_mount_links(
+            "", [("/a/b", "/staged/0"), ("/c/d", "/staged/1")]
+        ) == "/a/b:/staged/0,/c/d:/staged/1"
+
+    def test_inherited_pairs_come_first_and_are_kept(self):
+        """The platform stages the session directories and sets the variable on
+        the child ``lmer``; this launch's credential pairs are added to that, not
+        substituted for it."""
+        assert format_mount_links(
+            "/sessions/declared:/staged/sessions/acme", [("/a/b", "/staged/creds/0")]
+        ) == "/sessions/declared:/staged/sessions/acme,/a/b:/staged/creds/0"
+
+    def test_nothing_to_link_is_blank_not_absent(self):
+        assert format_mount_links("", []) == ""
+
+    def test_blank_entries_are_dropped(self):
+        """A stray comma must not reach the linker as an empty pair."""
+        assert format_mount_links(",/a/b:/staged/0,", []) == "/a/b:/staged/0"
 
 
 class TestBuildCheckoutMount:

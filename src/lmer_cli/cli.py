@@ -39,9 +39,12 @@ from .log import error, info, success, warning
 from .mounts import (
     CONTAINER_CLONE_CACHE_DIR,
     CONTAINER_RELEASE_SIGNING_KEY_PATH,
+    MOUNT_LINKS_ENV,
     DirMountSpec,
     FileMountSpec,
     PlannedCredentialMount,
+    credential_mount_links,
+    format_mount_links,
     build_checkout_mount,
     build_clone_cache_mounts,
     build_release_signing_key_mount,
@@ -2579,6 +2582,17 @@ def main(argv: list[str] | None = None) -> int:
             f"{CONTAINER_HARNESS_CACHE_DIR}/{harness.name}"
             if harness.source_dir is not None and harness_cache_mounted
             else None
+        ),
+        # Staged mounts (#293/#290): inherited pairs are concatenated with this
+        # launch's credential pairs, never replaced. Blank means none — a
+        # deleted key would be re-supplied by the .env merge below. Inherited
+        # pairs are harmless because the per-plan token in every staged
+        # credential path (mounts.plan_credential_mounts) means they can never
+        # name a path this launch mounts, and the linker skips unmounted
+        # staged paths.
+        MOUNT_LINKS_ENV: format_mount_links(
+            os.environ.get(MOUNT_LINKS_ENV, ""),
+            credential_mount_links(planned_creds),
         ),
         # Statusline segment list (issue #121), consumed in-container by
         # hooks/statusline.py; unset keeps the default repo,branch,task,ctx.
