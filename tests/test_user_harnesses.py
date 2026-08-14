@@ -107,6 +107,7 @@ FULL = {
     },
     "model_hints": ["acme"],
     "extra_env": {"ACME_NO_UPDATE": "1"},
+    "session_dir": "/home/developer/.acme/sessions",
 }
 
 
@@ -155,6 +156,44 @@ class TestLoader:
         assert h.exec_profile.dashdash_before_prompt is True
         assert h.model_hints == ("acme",)
         assert h.extra_env == (("ACME_NO_UPDATE", "1"),)
+        assert h.session_dir == "/home/developer/.acme/sessions"
+
+    def test_session_dir_is_absent_unless_declared(self, tmp_path, capsys):
+        # Optional: a manifest that says nothing about where it writes is not
+        # a broken one, so it must not warn either.
+        write_harness(tmp_path, "acme", MINIMAL)
+        assert load_user_harnesses(tmp_path)["acme"].session_dir is None
+        assert capsys.readouterr().err == ""
+
+    def test_session_dir_is_a_known_key(self, tmp_path, capsys):
+        write_harness(tmp_path, "acme", dict(MINIMAL, session_dir="/home/developer/.a"))
+        assert load_user_harnesses(tmp_path)["acme"].session_dir == "/home/developer/.a"
+        assert "unknown manifest key" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "sessions",                       # relative: no host dir derives from it
+            "/home/developer/../../sessions",  # traversal out of the container home
+            "",
+            "   ",
+            5,
+            # ':'/','/whitespace would break the host:container[:mode] mount
+            # argument the platform builds from this — and that parser fails the
+            # whole launch, a launch that may not even be on this harness.
+            "/home/developer/.a:rw",
+            "/home/developer/.a,b",
+            "/home/developer/.a b",
+        ],
+    )
+    def test_an_invalid_session_dir_is_ignored_not_fatal(self, tmp_path, capsys, bad):
+        # The field only buys a transcript mount, so a bad one costs the chat
+        # view's source — never the harness, and never the session.
+        write_harness(tmp_path, "acme", dict(MINIMAL, session_dir=bad))
+        loaded = load_user_harnesses(tmp_path)
+        assert set(loaded) == {"acme"}, "a mis-declared session_dir must still load"
+        assert loaded["acme"].session_dir is None
+        assert "session_dir" in capsys.readouterr().err
 
     def test_broken_entry_skipped_others_load(self, tmp_path, capsys):
         broken = write_harness(tmp_path, "broken", None)

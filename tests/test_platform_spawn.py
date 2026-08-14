@@ -13,6 +13,7 @@ actually holds over the sessions it is about — workers, since the orchestratin
 assistant holds its own slot (T75).
 """
 
+import dataclasses
 import json
 import os
 import stat
@@ -25,6 +26,8 @@ import pytest
 from ask_channel import protocol
 from lmer_cli import supervisor
 from lmer_cli.cli import parse_args, parse_dir_mount_specs
+from lmer_cli.harness import HARNESSES
+from lmer_cli.user_harnesses import HARNESSES_DIR_ENV, clear_user_harness_cache
 from lmer_platform import config as cfg
 from lmer_platform import ask, registry, runs, session_io, spawn, store, transcripts
 from tests.conftest import strip_lmer_env
@@ -37,6 +40,25 @@ def _clean_lmer_env(monkeypatch):
     for name in ("LMER_REPO_URL", "LMER_PLATFORM_PORTS_FILE", "LMER_TASK",
                  "LMER_TASK_TARGET"):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_user_harnesses(tmp_path, monkeypatch, _clean_lmer_env):
+    """A spawn reads the harness registry now (#280), user drop-ins included.
+
+    Autouse and empty, so the mounts a spawn builds are this checkout's built-ins
+    and never whatever the developer running the suite happens to have in
+    ``~/.lmer/harnesses`` — which is what the default resolves to once
+    ``strip_lmer_env`` has removed the override. Ordered after that stripping
+    explicitly rather than by definition order, since it is the variable being
+    stripped that this sets.
+    """
+    root = tmp_path / "harnesses"
+    root.mkdir()
+    monkeypatch.setenv(HARNESSES_DIR_ENV, str(root))
+    clear_user_harness_cache()
+    yield root
+    clear_user_harness_cache()
 
 
 @pytest.fixture
@@ -1800,15 +1822,32 @@ SESSION_TRANSCRIPT = "\n".join([
 
 
 def transcript_file(session_id):
-    """Where the stub's transcript lands, one level down like the harness's."""
-    return spawn.transcript_dir_for(session_id) / "-workspace" / "session.jsonl"
+    """Where the stub's transcript lands: claude's subdirectory, one level down.
+
+    The subdirectory is the harness's name (#280) and the level below it is the
+    per-workspace one claude keeps, so this is the full path a real claude session
+    writes through the mount.
+    """
+    return (
+        spawn.transcript_dir_for(session_id) / "claude" / "-workspace" / "session.jsonl"
+    )
+
+
+#: Where each built-in harness writes its session JSONL inside the container, from
+#: the registry rather than restated here — the registry is what the spawn reads,
+#: so a declaration that changes has to change these tests' expectations with it.
+HARNESS_SESSION_DIRS = {
+    name: harness.session_dir
+    for name, harness in HARNESSES.items()
+    if harness.session_dir
+}
 
 
 #: Every container destination a spawn mounts a platform-owned directory at. Held
 #: as a set rather than a count so a test that adds a mount has to say which one,
 #: and so "the mounts do not collide" keeps meaning all of them.
 PLATFORM_MOUNT_DESTINATIONS = {
-    transcripts.CONTAINER_TRANSCRIPT_DIR,
+    *HARNESS_SESSION_DIRS.values(),
     ask.CONTAINER_ASK_DIR,
     supervisor.CONTAINER_SESSION_LOG_DIR,
 }
@@ -1854,6 +1893,80 @@ def test_the_transcript_directory_is_private_to_this_user(config):
     assert mode == 0o700, f"expected 0700, got {oct(mode)}"
 
 
+def test_every_built_in_harness_gets_its_own_transcript_mount(config):
+    """#280: pi and codex do not write where claude does.
+
+    One host subdirectory per harness, each mounted at the path that harness
+    actually writes its session JSONL to — mounting only claude's projects
+    directory left a pi or codex session's transcript to die with its --rm
+    container, and the chat view with nothing to read.
+    """
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+    assert set(HARNESS_SESSION_DIRS) == {"claude", "codex", "pi"}
+    for name, container_dir in HARNESS_SESSION_DIRS.items():
+        assert mount_spec_for(result.command, container_dir) == (
+            f"{root / name}:{container_dir}:rw"
+        )
+
+
+def test_each_harness_transcript_subdirectory_is_private_to_this_user(config):
+    """Each holds everything a session said, and each is rw-mounted into it."""
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+    for name in HARNESS_SESSION_DIRS:
+        mode = stat.S_IMODE((root / name).stat().st_mode)
+        assert mode == 0o700, f"expected 0700 on {name}, got {oct(mode)}"
+
+
+def test_a_transcript_subdirectory_that_cannot_be_made_costs_only_its_harness(
+    tmp_path, caplog
+):
+    """Fail-soft per harness, not per session: the others still mount.
+
+    Blocked with a regular file where the subdirectory would go, which is an
+    OSError from mkdir on any platform and needs no permission games.
+    """
+    (tmp_path / "pi").write_text("x", encoding="utf-8")
+    prepared = spawn._prepare_transcript_subdirs(tmp_path)
+    names = [host_dir.name for host_dir, _ in prepared]
+    assert "pi" not in names
+    assert "claude" in names and "codex" in names
+    assert any(
+        "platform_transcript_subdir_unusable" in r.message for r in caplog.records
+    )
+
+
+def test_a_harness_name_that_is_not_one_path_component_is_refused(monkeypatch, caplog):
+    """A harness name becomes a subdirectory name, and the user-harness loader's
+    name rule ([a-z][a-z0-9_-]*) is what keeps it inside the session's own
+    directory. Checked here rather than trusted across the module boundary: a
+    mount built from '..' would land outside the tree the exit scrub walks."""
+    smuggled = dataclasses.replace(HARNESSES["pi"], name="../evil")
+    monkeypatch.setattr(
+        spawn, "known_harnesses", lambda: {**HARNESSES, "../evil": smuggled}
+    )
+    assert "../evil" not in spawn._harness_session_dirs()
+    assert any(
+        "platform_transcript_harness_name_refused" in r.message for r in caplog.records
+    )
+
+
+def test_a_claude_session_dir_that_drifts_from_the_reader_is_loud(monkeypatch):
+    """One fact in two places: claude's declared session directory and the
+    constant the reader and the redirect refusal are written against. A drift
+    must fail every spawn immediately rather than present later as a chat view
+    reading a directory nothing was mounted at."""
+    moved = dataclasses.replace(
+        HARNESSES["claude"], session_dir="/home/developer/.claude/moved"
+    )
+    monkeypatch.setattr(
+        spawn, "known_harnesses", lambda: {**HARNESSES, "claude": moved}
+    )
+    with pytest.raises(RuntimeError, match="drifted apart"):
+        spawn._harness_session_dirs()
+
+
 def test_the_mount_argument_satisfies_lmer_s_own_validator(config):
     """The two halves of this feature live in different packages.
 
@@ -1865,7 +1978,7 @@ def test_the_mount_argument_satisfies_lmer_s_own_validator(config):
     spec = mount_spec_for(result.command, transcripts.CONTAINER_TRANSCRIPT_DIR)
     specs = parse_dir_mount_specs([spec], "")
     assert len(specs) == 1
-    assert specs[0].host == spawn.transcript_dir_for(result.session_id)
+    assert specs[0].host == spawn.transcript_dir_for(result.session_id) / "claude"
     assert specs[0].container == transcripts.CONTAINER_TRANSCRIPT_DIR
     assert specs[0].mode == "rw", "the harness writes into it for the whole session"
 
@@ -2021,6 +2134,150 @@ def test_a_session_whose_transcript_directory_cannot_be_created_still_starts(
     finally:
         os.kill(result.pid, 9)
     assert any("platform_transcript_dir_unusable" in r.message for r in caplog.records)
+
+
+def write_user_harness(root, name, session_dir=None):
+    """A drop-in harness under *root*, declaring where it writes if asked to."""
+    directory = root / name
+    directory.mkdir()
+    manifest = {"schema": 1, "binary": name}
+    if session_dir is not None:
+        manifest["session_dir"] = session_dir
+    (directory / "harness.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (directory / "runner.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    clear_user_harness_cache()
+    return directory
+
+
+def test_a_user_harness_that_declares_where_it_writes_gets_a_mount(
+    config, _no_user_harnesses
+):
+    """Registry-driven, not a list of three: a harness installed without touching
+    this codebase (issue #132) says where it writes in its manifest, and that is
+    all the platform needs to keep its transcripts."""
+    write_user_harness(_no_user_harnesses, "acme", "/home/developer/.acme/sessions")
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+
+    assert mount_spec_for(result.command, "/home/developer/.acme/sessions") == (
+        f"{root / 'acme'}:/home/developer/.acme/sessions:rw"
+    )
+    assert stat.S_IMODE((root / "acme").stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("bad", ["acme/sessions", "/home/developer/../acme"])
+def test_a_user_harness_with_an_unusable_session_dir_costs_only_its_own_mount(
+    config, _no_user_harnesses, bad
+):
+    """A relative path derives no host directory and a traversal leaves the tree
+    the platform owns. Neither may cost the session — the drop-in still loads,
+    and every other mount is still there."""
+    write_user_harness(_no_user_harnesses, "acme", bad)
+    result = spawn.spawn_session(config, request_for())
+
+    specs = mount_specs_in(result.command)
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+    assert not [spec for spec in specs if "acme" in spec]
+    assert not (spawn.transcript_dir_for(result.session_id) / "acme").exists()
+
+
+@pytest.mark.parametrize("taken", [
+    "/workspace",                          # the unconditional workspace mount
+    "/workspace/",                         # …and the same path spelled loosely
+    "/Agents/global",                      # the agent-files tree
+    HARNESSES["claude"].session_dir,       # a built-in's transcript mount
+])
+def test_a_user_harness_claiming_a_platform_directory_is_skipped_not_obeyed(
+    config, _no_user_harnesses, caplog, taken
+):
+    """One drop-in line must not quietly take over a platform mount — or, for
+    ``lmer``'s own ``-v`` destinations, break every spawn on every harness.
+
+    The transcript mounts are delivered as ``--mount-dir``, whose parser dedupes
+    duplicate destinations itself (warn, last wins), so a manifest naming one of
+    them would silently redirect what lands there. ``/workspace`` and
+    ``/Agents/global`` are ``-v`` mounts that no dedupe sees, and Docker and
+    Podman refuse a duplicate ``-v`` destination outright, so a manifest naming
+    one of those would take the whole fleet down until someone found the file.
+    The field's contract is warn-and-ignore, so either collision costs that
+    harness its transcript mount and nothing else.
+    """
+    write_user_harness(_no_user_harnesses, "acme", taken)
+    result = spawn.spawn_session(config, request_for())
+
+    specs = mount_specs_in(result.command)
+    assert not [spec for spec in specs if "acme" in spec]
+    # The session still started — spawn_session raises when it refuses — and the
+    # built-ins still have all their mounts. (Not asserted via the registry
+    # entry: the stub session can exit and be reaped before the read, and this
+    # test is about the mount set, not the entry's lifetime.)
+    for container_dir in HARNESS_SESSION_DIRS.values():
+        assert mount_spec_for(result.command, container_dir)
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+    assert any(
+        "platform_transcript_session_dir_taken" in r.message for r in caplog.records
+    )
+
+
+def test_two_user_harnesses_sharing_a_session_dir_keep_the_first(
+    config, _no_user_harnesses, caplog
+):
+    """Same refusal, between drop-ins: unchecked, the second mount at that
+    destination would silently displace the first — ``--mount-dir``'s parser
+    dedupes and the last entry wins — so one drop-in would swallow another
+    harness's transcripts. Load order is the drop-in directory sorted by name, so
+    "acme" is the one that keeps its transcript."""
+    shared = "/home/developer/.shared/sessions"
+    write_user_harness(_no_user_harnesses, "acme", shared)
+    write_user_harness(_no_user_harnesses, "bravo", shared)
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+
+    assert mount_spec_for(result.command, shared) == f"{root / 'acme'}:{shared}:rw"
+    assert not [spec for spec in mount_specs_in(result.command) if "bravo" in spec]
+    assert any(
+        "platform_transcript_session_dir_taken harness=bravo" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize("declared, event", [
+    # The container home itself: absolute, no "..", equal to nothing the
+    # platform mounts — and an empty 0700 directory bound over it hides
+    # ~/.npm-global/bin and ~/.local/bin, so no harness could start at all.
+    ("/home/developer", "platform_transcript_session_dir_outside_home"),
+    # Outside the home entirely; /etc and / are the same argument.
+    ("/etc", "platform_transcript_session_dir_outside_home"),
+    # Inside the home, equal to nothing, but the parent of pi's session
+    # directory: mounting it hides pi's configuration beside it.
+    ("/home/developer/.pi", "platform_transcript_session_dir_covers"),
+])
+def test_a_user_harness_declaring_a_directory_above_the_platforms_is_skipped(
+    config, _no_user_harnesses, caplog, declared, event
+):
+    """Passing the manifest parser's shape check is not enough to be mounted.
+
+    The mount is ``rw``, made on every spawn whatever harness the session
+    resolves to, and its host side is an empty directory — so a declaration that
+    is an *ancestor* of the container's own layout hides that layout rather than
+    colliding with it, which no equality check sees. Same warn-and-skip cost as a
+    collision: the harness loses its transcript mount, the session starts.
+    ``/home/developer/.acme/sessions`` is the well-behaved shape and still mounts
+    (test_a_user_harness_that_declares_where_it_writes_gets_a_mount).
+    """
+    write_user_harness(_no_user_harnesses, "acme", declared)
+    result = spawn.spawn_session(config, request_for())
+
+    specs = mount_specs_in(result.command)
+    assert not [spec for spec in specs if "acme" in spec]
+    # The session still started — spawn_session raises when it refuses — and the
+    # built-ins still have all their mounts. (Same reaper-race reasoning as the
+    # platform-directory test above: the stub session's registry entry can be
+    # gone before a read.)
+    for container_dir in HARNESS_SESSION_DIRS.values():
+        assert mount_spec_for(result.command, container_dir)
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+    assert any(event in r.getMessage() for r in caplog.records)
 
 
 def test_scrubbing_a_session_that_wrote_no_transcript_is_not_fatal(config):
@@ -2223,6 +2480,20 @@ def test_sigkilled_session_is_detected_despite_a_grandchild_on_the_pty(
 def test_a_mount_aimed_at_the_transcript_destination_is_refused(config, hijack):
     with pytest.raises(spawn.SpawnError, match="may not target"):
         spawn.spawn_session(config, request_for(extra_args=hijack))
+
+
+@pytest.mark.parametrize("container_dir", sorted(HARNESS_SESSION_DIRS.values()))
+def test_a_mount_aimed_at_any_harness_transcript_destination_is_refused(
+    config, container_dir
+):
+    """The refusal follows the mounts (#280): every declared session directory is
+    a place the platform now mounts, so every one of them is a place a redirect
+    would leave an unscrubbed transcript outside the tree it owns."""
+    with pytest.raises(spawn.SpawnError, match="may not target"):
+        spawn.spawn_session(
+            config,
+            request_for(extra_args=("--mount-dir", f"/tmp/mine:{container_dir}:rw")),
+        )
 
 
 @pytest.mark.parametrize("hijack", [

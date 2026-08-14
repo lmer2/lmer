@@ -126,17 +126,19 @@ import subprocess
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
 from lmer_cli.container.clone_and_exec import _scrub_credentials
+from lmer_cli.harness import HARNESSES, known_harnesses
 from lmer_cli.supervisor import (
     CONTAINER_SESSION_LOG_DIR,
     DEFAULT_PORT_RANGE,
     SESSION_LOG_NAME,
     _pick_port,
 )
+from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
 from . import ask, meta, registry, runs, slots
@@ -997,19 +999,273 @@ def _prepare_transcript_dir(session_id: str) -> Optional[Path]:
     return directory
 
 
-def _transcript_mount_flags(directory: Path) -> list:
-    """``lmer`` flags that mount *directory* in as the harness's projects dir.
+def _container_dir_key(container_dir: str) -> str:
+    """*container_dir* as the runtime will compare it: no trailing slash.
 
-    ``rw`` is not optional here: the harness writes its JSONL into this
-    directory for the life of the session. The container-side destination comes
-    from :data:`lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR` rather than
-    being spelled out again, so the path this mounts at and the path the reader
-    expects are one fact.
+    Exact equality on the normalised path and nothing else. A *nested* path is
+    not a collision — the runtime mounts ``/a`` and ``/a/b`` happily — and
+    guessing at nesting here would refuse mounts that work.
     """
-    return [
-        "--mount-dir",
-        f"{directory}:{_transcripts().CONTAINER_TRANSCRIPT_DIR}:rw",
-    ]
+    return str(PurePosixPath(container_dir))
+
+
+#: The container's home directory. ``HOME=/home/developer`` is pinned by the
+#: host CLI's container env dict — the same fact
+#: :data:`lmer_cli.mounts.CONTAINER_UV_CACHE_DIR` and
+#: :data:`lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR` are built from.
+#: Written down here because a *user* harness's declared session directory has
+#: to live strictly below it: see :func:`_harness_session_dirs`.
+CONTAINER_HOME = "/home/developer"
+
+
+def _below_container_home(destination: str) -> bool:
+    """Whether *destination* is strictly below :data:`CONTAINER_HOME`.
+
+    Compared as path components rather than as a string prefix: ``/home/dev2``
+    starts with ``/home/dev`` and is nowhere below it. *Strictly*, because the
+    home directory itself is the case this exists for.
+    """
+    parts = PurePosixPath(destination).parts
+    home = PurePosixPath(CONTAINER_HOME).parts
+    return len(parts) > len(home) and parts[:len(home)] == home
+
+
+def _covered_destination(destination: str, *owners: dict) -> tuple:
+    """The first destination in *owners* that *destination* contains, and its owner.
+
+    ``(None, None)`` when it contains none of them. An exact match is not
+    "covered" — that is the equality collision, which is reported separately and
+    with its own reason. Components again, for the reason
+    :func:`_below_container_home` gives.
+    """
+    parts = PurePosixPath(destination).parts
+    for mapping in owners:
+        for other, owner in mapping.items():
+            other_parts = PurePosixPath(other).parts
+            if len(other_parts) > len(parts) and other_parts[:len(parts)] == parts:
+                return other, owner
+    return None, None
+
+
+def _reserved_session_destinations() -> dict:
+    """``{container path: what already owns it}`` for a user harness's ``session_dir``.
+
+    Every entry is a destination this spawn (or ``lmer`` itself) already mounts
+    something at, so a drop-in manifest naming one of them is a claim on
+    somebody else's mount. What that costs depends on which flag delivers the
+    mount:
+
+    * the harness session directories, the ask channel and the session log
+      arrive as ``--mount-dir``, and that parser dedupes duplicate destinations
+      itself — warn, last wins (:func:`lmer_cli.cli.parse_dir_mount_specs`). So
+      the drop-in's mount would quietly take over what lands at a platform
+      destination, the same silent redirect :func:`_reject_mount_hijack` refuses
+      for a caller's own ``--mount-dir``.
+    * ``/workspace`` and ``/Agents/global`` are ``lmer``'s own ``-v`` mounts,
+      which no dedupe sees. The docker *client* sends both binds unmerged
+      (measured on 29.6.2), so the refusal is the daemon's — one drop-in line
+      would abort *every* platform spawn, on every harness, until the file was
+      found and edited.
+
+    The manifest field's own contract is warn-and-ignore
+    (:func:`lmer_cli.user_harnesses._parse_session_dir`), so the collision is
+    checked here, at the site that knows what the platform mounts.
+
+    Built from the constants where there are constants and from literals where
+    ``lmer``'s own layout has none. The built-in harnesses' declared directories
+    are in it too: they are mounted on every spawn regardless of which harness
+    the session resolves to (:func:`_transcript_mount_flags`).
+    """
+    reserved = {
+        _container_dir_key(harness.session_dir): f"the built-in {name} harness"
+        for name, harness in HARNESSES.items()
+        if harness.session_dir
+    }
+    reserved.update({
+        _container_dir_key("/workspace"): "the session's workspace",
+        _container_dir_key("/Agents/global"): "the agent-files tree",
+        _container_dir_key(ask.CONTAINER_ASK_DIR): "the session's ask channel",
+        _container_dir_key(CONTAINER_SESSION_LOG_DIR): "the session's own log",
+        _container_dir_key(CONTAINER_HARNESSES_DIR): "the user-harness drop-ins",
+    })
+    return reserved
+
+
+def _harness_session_dirs() -> dict:
+    """``{harness name: the container directory it writes its session JSONL in}``.
+
+    Read out of the registry (:func:`lmer_cli.harness.known_harnesses`, which
+    merges user drop-ins into the built-ins) rather than listed here, because
+    where a harness writes is a fact about that harness. The platform spawns
+    claude, pi and codex but mounted only claude's projects directory, so a pi
+    or a codex session's transcript died with its ``--rm`` container and the
+    chat view drew a blank page for a run that had said plenty (#280).
+
+    Each name becomes a host subdirectory name below, so a name that is not a
+    single path component would put a mount outside the directory this session
+    owns. The user-harness loader already refuses anything but
+    ``[a-z][a-z0-9_-]*`` — this is that guarantee checked where it is depended
+    on rather than trusted across a module boundary.
+
+    A *user* harness's declared directory has to earn its mount, because that
+    mount is made ``rw`` on every spawn whatever harness the session resolves to
+    (:func:`_transcript_mount_flags`), and the host side of it is an empty 0700
+    directory. Three things are asked of it, and failing any of them costs that
+    harness its mount and nothing else:
+
+    * it is not a destination the platform already mounts at
+      (:func:`_reserved_session_destinations`) or one an earlier drop-in claimed.
+      What that collision would cost is in that function's docstring: a silent
+      redirect for the ``--mount-dir`` destinations, an aborted launch for
+      ``lmer``'s own ``-v`` ones.
+    * it is *strictly below* :data:`CONTAINER_HOME`. ``"/home/developer"``
+      itself, ``/etc`` or ``/`` pass the manifest parser's shape check (absolute,
+      no ``..``) and the equality check above, and would bind an empty directory
+      over the container's home or its system tree — hiding the harness binaries
+      in ``~/.npm-global/bin`` and ``~/.local/bin``, so no session on any harness
+      could start.
+    * it does not *contain* another destination this spawn mounts.
+      ``/home/developer/.pi`` is neither equal to nor outside the home, and
+      mounting an empty directory there hides whatever the image keeps beside
+      pi's session directory — its configuration and its credentials.
+
+    The checks cover the destinations the *platform* mounts, not the image's
+    own layout or ``lmer``'s ``-v`` set: a declared directory that shadows,
+    say, ``~/.npm-global`` is below the home, covers nothing in the reserved
+    map, and still mounts — these rules narrow the blast radius, they do not
+    make an arbitrary manifest safe.
+
+    Built-ins are exempt: their declarations are fixed in this repository, so a
+    bad one is not a runtime condition but an edit here, and the
+    ``CONTAINER_TRANSCRIPT_DIR`` drift check below is the one that catches that
+    class.
+    """
+    container_transcript_dir = _transcripts().CONTAINER_TRANSCRIPT_DIR
+    reserved = _reserved_session_destinations()
+    claimed = {}
+    dirs = {}
+    for name, harness in known_harnesses().items():
+        if not harness.session_dir:
+            continue
+        if name in (".", "..") or name != Path(name).name:
+            logger.warning(
+                "platform_transcript_harness_name_refused harness=%r — a name "
+                "that is not one path component cannot be a transcript "
+                "subdirectory; this harness's transcript is not mounted out",
+                name,
+            )
+            continue
+        if harness.source_dir is not None:
+            destination = _container_dir_key(harness.session_dir)
+            owner = reserved.get(destination) or claimed.get(destination)
+            if owner is not None:
+                logger.warning(
+                    "platform_transcript_session_dir_taken harness=%s path=%s "
+                    "owner=%s — a second mount at one container path would "
+                    "silently take over what lands there (or, for lmer's own -v "
+                    "destinations, abort every session); this harness's "
+                    "transcript is not mounted out and the session starts "
+                    "without it",
+                    name, harness.session_dir, owner,
+                )
+                continue
+            if not _below_container_home(destination):
+                logger.warning(
+                    "platform_transcript_session_dir_outside_home harness=%s "
+                    "path=%s home=%s — the platform mounts a session directory "
+                    "rw on every spawn, and an empty host directory bound over "
+                    "the container home or a system path hides what the image "
+                    "put there, harness binaries included; this harness's "
+                    "transcript is not mounted out and the session starts "
+                    "without it",
+                    name, harness.session_dir, CONTAINER_HOME,
+                )
+                continue
+            covered, covered_owner = _covered_destination(
+                destination, reserved, claimed
+            )
+            if covered is not None:
+                logger.warning(
+                    "platform_transcript_session_dir_covers harness=%s path=%s "
+                    "covers=%s owner=%s — an empty directory mounted over one "
+                    "the platform mounts inside of hides what the container "
+                    "keeps beside it, a harness's own configuration included; "
+                    "this harness's transcript is not mounted out and the "
+                    "session starts without it",
+                    name, harness.session_dir, covered, covered_owner,
+                )
+                continue
+            claimed[destination] = f"the {name} harness"
+        dirs[name] = harness.session_dir
+    if container_transcript_dir not in dirs.values():
+        # Not a runtime condition: claude's mount destination, the constant the
+        # reader and the redirect refusal are written against, and claude's
+        # registry entry are one fact — the only way here is an edit to one of
+        # them. Loud on every spawn beats a chat view that quietly reads a
+        # directory nothing was mounted at.
+        raise RuntimeError(
+            f"no harness declares {container_transcript_dir!r} as its session "
+            "directory: lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR and "
+            "lmer_cli.harness's claude entry have drifted apart"
+        )
+    return dirs
+
+
+def _prepare_transcript_subdirs(directory: Path) -> list:
+    """One transcript subdirectory per harness under *directory*, 0700.
+
+    Returns ``[(host_dir, container_dir)]`` for the ones that could be created.
+    Named after the harness, and *under* the session's own transcript directory,
+    so everything a session writes stays inside the one tree the reader scans and
+    the exit scrub rewrites: :func:`lmer_platform.transcripts.locate_sources`
+    walks it recursively, so a file a level down is found without teaching the
+    reader this layout, and a session that predates it — files at the root, from
+    the days when claude's projects dir was mounted straight in — still reads.
+
+    Created with the mode rather than chmod'ed into it, for the reason
+    :func:`_prepare_transcript_dir` gives, and safe from the leaf-only pitfall it
+    names (T93) because *directory* was made through the store there and a
+    harness name is a single path component.
+
+    Fail-soft per harness rather than per session: a subdirectory that cannot be
+    made costs that one harness its transcript mount, the others still mount, and
+    the session starts either way.
+    """
+    mode = _transcripts().SESSION_DIR_MODE
+    prepared = []
+    for name, container_dir in _harness_session_dirs().items():
+        subdir = directory / name
+        try:
+            subdir.mkdir(mode=mode, exist_ok=True)
+            subdir.chmod(mode)
+        except OSError as exc:
+            logger.warning(
+                "platform_transcript_subdir_unusable harness=%s path=%s error=%s "
+                "— a session on this harness leaves no transcript behind; the PTY "
+                "log is its complete record",
+                name, subdir, exc,
+            )
+            continue
+        prepared.append((subdir, container_dir))
+    return prepared
+
+
+def _transcript_mount_flags(mounts: list) -> list:
+    """``lmer`` flags that mount each *mounts* pair in where its harness writes.
+
+    ``rw`` is not optional here: the harness writes its JSONL into its directory
+    for the life of the session. The container-side destinations are the
+    registry's own (:func:`_harness_session_dirs`) rather than spelled out again,
+    so the paths these mount at and the paths the harnesses write to are one
+    fact. Every declared harness is mounted, not just the session's: which
+    harness a request resolves to is decided inside the child ``lmer`` (flag,
+    env, preset, model hint), so the alternative to a few empty directories is
+    guessing — and guessing wrong is a session whose transcript is gone.
+    """
+    flags: list = []
+    for host_dir, container_dir in mounts:
+        flags += ["--mount-dir", f"{host_dir}:{container_dir}:rw"]
+    return flags
 
 
 def ask_dir_for(session_id: str) -> Path:
@@ -1302,14 +1558,22 @@ def _protected_mount_destinations() -> dict:
 
     Resolved at call time rather than at import: the transcript constant lives
     behind the lazy import that breaks this package's one import cycle (see
-    :func:`_transcripts`).
+    :func:`_transcripts`), and the harnesses that declare a session directory
+    include the user drop-ins, which are read from disk.
+
+    Every declared session directory is protected, not just claude's: each one is
+    a destination this spawn mounts (:func:`_transcript_mount_flags`), so each is
+    a place a caller's mount could quietly take over.
     """
-    return {
-        _transcripts().CONTAINER_TRANSCRIPT_DIR: (
+    protected = {
+        session_dir: (
             "the platform mounts the session's transcript there and scrubs it on "
             "exit, so redirecting it would leave an unscrubbed transcript outside "
             "the directory it owns"
-        ),
+        )
+        for session_dir in _harness_session_dirs().values()
+    }
+    protected.update({
         ask.CONTAINER_ASK_DIR: (
             "the platform mounts the session's ask channel there, so redirecting "
             "it would send the session's questions somewhere no operator is "
@@ -1321,7 +1585,8 @@ def _protected_mount_destinations() -> dict:
             "record of everything the session drew in a directory nobody reads "
             "back — and leave the terminal view showing an empty file"
         ),
-    }
+    })
+    return protected
 
 
 def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
@@ -1898,11 +2163,17 @@ def spawn_session(
     except OSError as exc:
         raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
 
-    # The transcript's host home, mounted in as the harness's projects dir so the
-    # JSONL the chat view reads outlives the container (`lmer` runs it --rm). Only
-    # for sessions the platform spawns: persisting every lmer invocation's
-    # transcript is a separate decision, and this is not the place to take it.
+    # The transcript's host home, with one subdirectory per harness mounted in
+    # where that harness writes its session JSONL, so the file the chat view reads
+    # outlives the container (`lmer` runs it --rm) whichever harness ran. Only for
+    # sessions the platform spawns: persisting every lmer invocation's transcript
+    # is a separate decision, and this is not the place to take it.
     transcript_dir = _prepare_transcript_dir(session_id)
+    transcript_mounts = (
+        _prepare_transcript_subdirs(transcript_dir)
+        if transcript_dir is not None
+        else []
+    )
     # The session's ask channel (T23): where it posts questions for the operator
     # and reads the answers back.
     ask_dir = _prepare_ask_dir(session_id)
@@ -1915,8 +2186,8 @@ def spawn_session(
     # --fastapi, so calling it twice would interleave the mounts in reverse and
     # make the command's shape depend on the order of these lines.
     host_flags: list = []
-    if transcript_dir is not None:
-        host_flags += _transcript_mount_flags(transcript_dir)
+    if transcript_mounts:
+        host_flags += _transcript_mount_flags(transcript_mounts)
     if ask_dir is not None:
         host_flags += _ask_mount_flags(ask_dir)
     if container_log_dir is not None:
