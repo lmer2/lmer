@@ -83,6 +83,9 @@ from urllib.parse import urlsplit
 # the same trade :mod:`lmer_platform.workrepo` makes, and it says why there.
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.runtime import RuntimeErrorDetect, detect_runtime
+# The token lookup's own host parser: the issuing-host default seeded below has
+# to agree with what :func:`lmer_cli.tokens._gitlab_token_issuing_host` reads.
+from lmer_cli.tokens import _host_from_git_url
 from lmer_cli.util import get_bool_env
 # The forge names are the URL builder's, imported rather than spelled again here:
 # what ``work_repo_forge`` accepts has to be exactly what
@@ -873,7 +876,31 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
             )
         values.update({k: v for k, v in overrides.items() if v is not None})
 
-    return _validate(PlatformConfig(**values))
+    config = _validate(PlatformConfig(**values))
+    _seed_gitlab_token_host(config.work_repo_url)
+    return config
+
+
+def _seed_gitlab_token_host(work_repo_url: Optional[str]) -> None:
+    """Default the generic token's issuing host to the resolved work repo.
+
+    ``lmer_cli.tokens`` scopes a generic ``GITLAB_TOKEN`` to the host that
+    issued it, and its default for that host reads ``LMER_WORK_REPO`` — which
+    a platform deployment configured through ``config.json`` legitimately never
+    exports, so the token would be refused for the work repo's own host
+    (issue #161 review finding). Seeding the variable here, at the single point
+    where the work-repo URL is resolved, also carries the answer to spawned
+    children through the environment.
+
+    ``setdefault``: an explicit ``LMER_GITLAB_TOKEN_HOST`` is the operator's
+    decision and always wins, and repeated :func:`load` calls stay idempotent.
+    ``LMER_WORK_REPO`` itself is deliberately NOT seeded — other code branches
+    on whether it is set at all.
+    """
+    host = _host_from_git_url(work_repo_url or "")
+    if not host:
+        return
+    os.environ.setdefault("LMER_GITLAB_TOKEN_HOST", host)
 
 
 def save(config: PlatformConfig) -> None:

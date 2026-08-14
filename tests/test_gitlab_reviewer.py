@@ -11,6 +11,9 @@ to catch regressions in:
   - The --info thread-provenance block (counts, resolver breakdown,
     resolved-before-head heuristic, page-cap truncation marker)
   - Fail-soft behavior: --info must never fail on provenance trouble
+  - Token resolution: the client sends whatever it resolves as a PRIVATE-TOKEN
+    header to whatever `--host` it was handed, so the generic GITLAB_TOKEN must
+    stay scoped to its issuing host (issue #161)
 """
 
 from __future__ import annotations
@@ -22,6 +25,8 @@ import pytest
 
 from gitlab_reviewer import cli as gl_cli
 from gitlab_reviewer.client import GitLabClient, GitLabError
+from lmer_cli import tokens
+from tests.conftest import strip_lmer_env
 
 
 # ---------------------------------------------------------------------------
@@ -631,3 +636,85 @@ def test_info_json_provenance_failure_is_null_not_omitted(monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert "thread_provenance" in data
     assert data["thread_provenance"] is None
+
+
+# ---------------------------------------------------------------------------
+# Token resolution (issue #161)
+# ---------------------------------------------------------------------------
+
+
+#: Provider vars the shared lookup consults; cleared so a developer's real
+#: shell cannot satisfy (or defeat) any assertion below.
+_TOKEN_ENV = (
+    "GITLAB_TOKEN",
+    "GITLAB_TOKEN_git_example_com",
+    "GITLAB_TOKEN_gitlab_other_com",
+    "GITLAB_HOST",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+_STUB = "glpat-notarealcredential"
+
+
+@pytest.fixture
+def token_env(monkeypatch):
+    """No run context, no provider vars, no carried-over refusal notices."""
+    strip_lmer_env(monkeypatch)
+    for name in _TOKEN_ENV:
+        monkeypatch.delenv(name, raising=False)
+    tokens._warned.clear()
+    yield
+    tokens._warned.clear()
+
+
+def test_host_specific_token_applies_to_its_own_host(token_env, monkeypatch):
+    monkeypatch.setenv("GITLAB_TOKEN_git_example_com", _STUB)
+    assert GitLabClient._resolve_token("git.example.com") == _STUB
+
+
+def test_host_specific_token_does_not_leak_to_another_host(token_env, monkeypatch):
+    monkeypatch.setenv("GITLAB_TOKEN_git_example_com", _STUB)
+    assert GitLabClient._resolve_token("gitlab.other.com") is None
+
+
+def test_generic_token_applies_to_the_work_repo_host(token_env, monkeypatch):
+    """The single-host setup: one PAT, one host, unchanged behavior."""
+    monkeypatch.setenv("GITLAB_TOKEN", _STUB)
+    monkeypatch.setenv("LMER_WORK_REPO", "https://git.example.com/agents/work.git")
+    assert GitLabClient._resolve_token("git.example.com") == _STUB
+    client = GitLabClient(host="git.example.com")
+    assert client.session.headers["PRIVATE-TOKEN"] == _STUB
+
+
+def test_generic_token_refused_for_another_host(token_env, monkeypatch, capsys):
+    monkeypatch.setenv("GITLAB_TOKEN", _STUB)
+    monkeypatch.setenv("LMER_WORK_REPO", "https://git.example.com/agents/work.git")
+    assert GitLabClient._resolve_token("gitlab.other.com") is None
+    err = capsys.readouterr().err
+    assert "GITLAB_TOKEN not used for gitlab.other.com" in err
+    assert _STUB not in err
+
+
+def test_generic_token_refused_when_the_issuing_host_is_unknown(token_env, monkeypatch):
+    """Default --host is gitlab.com; with no LMER_WORK_REPO nothing vouches for it."""
+    monkeypatch.setenv("GITLAB_TOKEN", _STUB)
+    assert GitLabClient._resolve_token("gitlab.com") is None
+
+
+def test_refused_generic_token_raises_and_names_the_per_host_variable(
+    token_env, monkeypatch, capsys
+):
+    monkeypatch.setenv("GITLAB_TOKEN", _STUB)
+    monkeypatch.setenv("LMER_WORK_REPO", "https://git.example.com/agents/work.git")
+    with pytest.raises(GitLabError) as exc_info:
+        GitLabClient(host="gitlab.other.com")
+    assert "GITLAB_TOKEN_gitlab_other_com" in str(exc_info.value)
+    assert _STUB not in str(exc_info.value)
+    assert _STUB not in capsys.readouterr().err
+
+
+def test_explicit_token_argument_bypasses_the_lookup(token_env):
+    """`--token` is the operator's own call about who gets the credential."""
+    client = GitLabClient("gitlab.other.com", _STUB)
+    assert client.session.headers["PRIVATE-TOKEN"] == _STUB

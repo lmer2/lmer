@@ -2534,6 +2534,11 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_GLOBAL_DIR": os.environ.get("LMER_GLOBAL_DIR", "/home/developer/.lmer"),
         "LMER_DANGER_ZONE": os.environ.get("LMER_DANGER_ZONE"),
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
+        # Which host the generic GITLAB_TOKEN was issued for (issue #161).
+        # The container's own token lookup (clone_and_exec.py) scopes the
+        # generic fallback to that host, so without this passthrough an
+        # explicit host setting would only apply on the host side.
+        "LMER_GITLAB_TOKEN_HOST": os.environ.get("LMER_GITLAB_TOKEN_HOST"),
         "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
         # No human attached (cron/scheduled launches): the AGENTS.md gates
         # report instead of asking when this is set. Never inferred from the

@@ -44,8 +44,15 @@ class TestGetGitlabToken:
             assert token == "token-myorg"
 
     def test_fallback_to_gitlab_token(self):
-        """Should fall back to GITLAB_TOKEN when host-specific not found."""
-        env = {"GITLAB_TOKEN": "generic-token"}
+        """Should fall back to GITLAB_TOKEN when host-specific not found.
+
+        The generic token only applies to its issuing host (issue #161) — see
+        tests/test_tokens_issuing_host.py for that rule in full.
+        """
+        env = {
+            "GITLAB_TOKEN": "generic-token",
+            "LMER_GITLAB_TOKEN_HOST": "unknown.host.com",
+        }
         with patch.dict(os.environ, env, clear=True):
             token = _get_gitlab_token("unknown.host.com")
             assert token == "generic-token"
@@ -265,13 +272,15 @@ class TestConvertSshToHttps:
 
     def test_adds_git_suffix(self):
         """Should add .git suffix if missing."""
-        with patch.dict(os.environ, {"GITLAB_TOKEN": "tok"}, clear=True):
+        env = {"GITLAB_TOKEN": "tok", "LMER_GITLAB_TOKEN_HOST": "gitlab.com"}
+        with patch.dict(os.environ, env, clear=True):
             result = _convert_ssh_to_https_if_token_available("git@gitlab.com:group/project")
             assert result.endswith(".git")
 
     def test_preserves_existing_git_suffix(self):
         """Should not double .git suffix."""
-        with patch.dict(os.environ, {"GITLAB_TOKEN": "tok"}, clear=True):
+        env = {"GITLAB_TOKEN": "tok", "LMER_GITLAB_TOKEN_HOST": "gitlab.com"}
+        with patch.dict(os.environ, env, clear=True):
             result = _convert_ssh_to_https_if_token_available("git@gitlab.com:group/project.git")
             assert result == "https://oauth2:tok@gitlab.com/group/project.git"
 
@@ -322,21 +331,30 @@ class TestInjectGitlabToken:
 
     def test_adds_git_suffix_to_https(self):
         """Should add .git suffix if missing from HTTPS URL."""
-        with patch.dict(os.environ, {"GITLAB_TOKEN": "tok"}, clear=True):
+        env = {"GITLAB_TOKEN": "tok", "LMER_GITLAB_TOKEN_HOST": "gitlab.com"}
+        with patch.dict(os.environ, env, clear=True):
             result = _inject_gitlab_token_if_available("https://gitlab.com/group/project")
             assert result == "https://oauth2:tok@gitlab.com/group/project.git"
 
     def test_works_with_github_no_token(self):
-        """Should keep GitHub URLs unchanged when no token for that host."""
-        with patch.dict(os.environ, {"GITLAB_TOKEN": "gitlab-only"}, clear=True):
-            # GITLAB_TOKEN would apply to github.com too since it's a fallback
+        """Should keep GitHub URLs unchanged when no token for that host.
+
+        A GitLab PAT issued for another host is not a GitHub credential, so it
+        is never baked into a github.com URL (issue #161).
+        """
+        env = {
+            "GITLAB_TOKEN": "gitlab-only",
+            "LMER_GITLAB_TOKEN_HOST": "gitlab.com",
+        }
+        with patch.dict(os.environ, env, clear=True):
             result = _inject_gitlab_token_if_available("https://github.com/org/repo")
-            # Token gets injected since GITLAB_TOKEN is a fallback for all hosts
-            assert "oauth2:gitlab-only" in result
+            assert result == "https://github.com/org/repo"
+            assert "gitlab-only" not in result
 
     def test_nested_groups(self):
         """Should handle GitLab nested groups correctly."""
-        with patch.dict(os.environ, {"GITLAB_TOKEN": "tok"}, clear=True):
+        env = {"GITLAB_TOKEN": "tok", "LMER_GITLAB_TOKEN_HOST": "gitlab.com"}
+        with patch.dict(os.environ, env, clear=True):
             result = _inject_gitlab_token_if_available("https://gitlab.com/group/subgroup/project.git")
             assert result == "https://oauth2:tok@gitlab.com/group/subgroup/project.git"
 

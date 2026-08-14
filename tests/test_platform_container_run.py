@@ -202,6 +202,9 @@ def test_work_repo_and_target_repo_tokens_are_forwarded_by_name(host):
         "LMER_WORK_REPO": "git@gitlab.example.com:team/work-repo.git",
         "LMER_WORK_REPO_TOKEN": "sentinel-work-token",
         "GITLAB_TOKEN": "sentinel-generic-token",
+        # The generic token applies only to its issuing host (#161): dropping
+        # this name forwards the credential and leaves it unusable in-container.
+        "LMER_GITLAB_TOKEN_HOST": "gitlab.example.com",
         "GITLAB_TOKEN_gitlab_example_com": "sentinel-host-token",
     }
     run = host.run(env=values)

@@ -1097,6 +1097,54 @@ def sanitize_task_target(task_target: str) -> str:
     return sanitized if sanitized else "default"
 
 
+#: Refusal notices already printed by _get_gitlab_token — see the identical
+#: set in lmer_cli/tokens.py.
+_warned: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    """Print ``message`` to stderr the first time it is seen in this process."""
+    if message in _warned:
+        return
+    _warned.add(message)
+    print(message, file=sys.stderr)
+
+
+def _host_from_git_url(url: str) -> str | None:
+    """Extract the lowercased host from a git URL, or None if unparseable.
+
+    Handles ``https://host/path``, ``https://user:pass@host/path`` (the form
+    LMER_WORK_REPO takes once the host CLI has injected a token) and the
+    scp-like ``git@host:path``. Standalone copy of the tokens.py helper.
+    """
+    url = (url or "").strip()
+    if not url:
+        return None
+    if "://" in url:
+        authority = url.split("://", 1)[1].split("/", 1)[0]
+    elif ":" in url:
+        authority = url.split(":", 1)[0]
+    else:
+        return None
+    if "@" in authority:
+        authority = authority.rsplit("@", 1)[1]
+    host = authority.split(":", 1)[0].strip().lower()
+    return host or None
+
+
+def _gitlab_token_issuing_host() -> str | None:
+    """Host the generic ``GITLAB_TOKEN`` was issued for, or None if unknown.
+
+    ``LMER_GITLAB_TOKEN_HOST`` names it explicitly; otherwise it defaults to
+    the work-repo host (``LMER_WORK_REPO`` is present in the container env).
+    Standalone copy of the tokens.py helper.
+    """
+    explicit = os.environ.get("LMER_GITLAB_TOKEN_HOST", "").strip()
+    if explicit:
+        return explicit.lower()
+    return _host_from_git_url(os.environ.get("LMER_WORK_REPO", ""))
+
+
 def _get_gitlab_token(host: str) -> str | None:
     """
     Look up an API token for ``host`` from environment variables.
@@ -1106,7 +1154,12 @@ def _get_gitlab_token(host: str) -> str | None:
          in practice; the prefix is historical)
       2. For github.com / *.github.com / *.ghe.com: ``GH_TOKEN``, then
          ``GITHUB_TOKEN``
-      3. ``GITLAB_TOKEN`` — generic fallback
+      3. ``GITLAB_TOKEN`` — generic fallback, but only for the host that
+         issued it: ``LMER_GITLAB_TOKEN_HOST``, defaulting to the host in
+         ``LMER_WORK_REPO``. Any other host (and any host at all when the
+         issuing host is unknown) is refused with a one-time stderr notice,
+         so a GitLab PAT is never sent to github.com or another third party
+         (issue #161).
 
     NOTE: standalone copy of lmer_cli.tokens._get_gitlab_token (this module
     runs inside the container without the lmer_cli import path). The work-repo
@@ -1127,7 +1180,23 @@ def _get_gitlab_token(host: str) -> str | None:
             if token:
                 return token
 
-    return os.environ.get("GITLAB_TOKEN")
+    token = os.environ.get("GITLAB_TOKEN")
+    if not token:
+        return None
+    issuing_host = _gitlab_token_issuing_host()
+    if issuing_host is None:
+        _warn_once(
+            f"⚠️  GITLAB_TOKEN not used for {host}: issuing host unknown — "
+            f"set LMER_GITLAB_TOKEN_HOST or GITLAB_TOKEN_{suffix}"
+        )
+        return None
+    if issuing_host != h:
+        _warn_once(
+            f"⚠️  GITLAB_TOKEN not used for {host}: issued for {issuing_host} — "
+            f"set GITLAB_TOKEN_{suffix} for this host"
+        )
+        return None
+    return token
 
 
 def _derive_repo_url_from_task_target(target: str) -> str | None:
@@ -1313,7 +1382,13 @@ def clone_secondary_mr(target: str, workspace: Path) -> None:
             _fetch_and_checkout_mr(target_dir, mr_id)
             print(f"✅ Checked out secondary MR {mr_id} branch (mr-{mr_id}) in {target_dir}", file=sys.stderr)
         except subprocess.CalledProcessError as e:
-            print(f"⚠️  Failed to checkout secondary MR {mr_id} branch: {e}", file=sys.stderr)
+            # Defensive scrub: the fetch/checkout commands name the remote,
+            # whose URL may be tokenized (see _scrub_credentials).
+            print(
+                f"⚠️  Failed to checkout secondary MR {mr_id} branch: "
+                f"{_scrub_credentials(str(e))}",
+                file=sys.stderr,
+            )
             print(f"   Repository cloned at HEAD in {target_dir}. You may need to manually checkout the source branch.", file=sys.stderr)
 
 
@@ -2026,7 +2101,12 @@ def main(argv: list[str] | None = None) -> int:
                 check_call(_lfs_safe_git("-C", str(ws), "fetch", "--all", "--tags"))
                 check_call(_lfs_safe_git("-C", str(ws), "checkout", "--detach", ref))
             except subprocess.CalledProcessError as e:
-                print(f"⚠️  Failed to checkout ref {ref}: {e}", file=sys.stderr)
+                # Defensive scrub: `fetch --all` reaches the remote, whose URL
+                # may be tokenized (see _scrub_credentials).
+                print(
+                    f"⚠️  Failed to checkout ref {ref}: {_scrub_credentials(str(e))}",
+                    file=sys.stderr,
+                )
         elif branch:
             rc = run(_lfs_safe_git("-C", str(ws), "switch", branch))
             if rc != 0:
@@ -2064,7 +2144,13 @@ def main(argv: list[str] | None = None) -> int:
             _fetch_and_checkout_mr(ws, gitlab_mr_id, git_remote)
             print(f"✅ Checked out MR {gitlab_mr_id} branch (mr-{gitlab_mr_id})", file=sys.stderr)
         except subprocess.CalledProcessError as e:
-            print(f"⚠️  Failed to checkout MR {gitlab_mr_id} branch: {e}", file=sys.stderr)
+            # Defensive scrub: the fetch/checkout commands name the remote,
+            # whose URL may be tokenized (see _scrub_credentials).
+            print(
+                f"⚠️  Failed to checkout MR {gitlab_mr_id} branch: "
+                f"{_scrub_credentials(str(e))}",
+                file=sys.stderr,
+            )
             print(f"   Repository remains at default branch. You may need to manually checkout the source branch.", file=sys.stderr)
     elif gitlab_mr_id and service_mode:
         print(f"📋 Service mode: skipping MR branch auto-checkout (MR {gitlab_mr_id})", file=sys.stderr)

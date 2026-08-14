@@ -46,13 +46,18 @@ FORWARD_EXTRA=(
     # exported (lmer_platform.workrepo._authenticated_url), and the `lmer` this
     # daemon spawns authenticates target-repo clones from the same environment
     # (lmer_cli.tokens.get_token: the work-repo pair, then GITLAB_TOKEN_<host>,
-    # then GH_TOKEN/GITHUB_TOKEN for GitHub hosts, then plain GITLAB_TOKEN).
+    # then GH_TOKEN/GITHUB_TOKEN for GitHub hosts, then plain GITLAB_TOKEN —
+    # which applies only to the host that issued it, LMER_GITLAB_TOKEN_HOST,
+    # defaulting to the work repo's host).
     # Host-specific GITLAB_TOKEN_* names are matched as a prefix below, which is
     # also what carries the deprecated GITLAB_TOKEN_worklog fallback.
     # Alternative to all of this: put them in ~/.lmer/.env, which the daemon
     # loads (daemon._load_env_files) and which rides the state mount.
     LMER_WORK_REPO_TOKEN
     GITLAB_TOKEN
+    # Without this, an operator-exported issuing host is dropped while the token
+    # it scopes is forwarded, and every in-container lookup refuses that token.
+    LMER_GITLAB_TOKEN_HOST
     GH_TOKEN
     GITHUB_TOKEN
     LMER_IMAGE

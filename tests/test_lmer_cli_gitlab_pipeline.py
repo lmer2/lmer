@@ -128,16 +128,34 @@ class TestGetToken:
             assert token == "tok"
 
     def test_get_token_fallback_to_gitlab_token(self):
-        """Test fallback to GITLAB_TOKEN for unknown hosts"""
-        with patch.dict(os.environ, {"GITLAB_TOKEN": "fallback-token"}, clear=True):
+        """Test fallback to GITLAB_TOKEN for the host that issued it.
+
+        The generic fallback is scoped to its issuing host (#161); the
+        cross-host cases live in test_gitlab_pipeline_token_scope.py.
+        """
+        with patch.dict(
+            os.environ,
+            {
+                "GITLAB_TOKEN": "fallback-value",
+                "LMER_GITLAB_TOKEN_HOST": "unknown.gitlab.com",
+            },
+            clear=True,
+        ):
             token = get_token("unknown.gitlab.com")
-            assert token == "fallback-token"
+            assert token == "fallback-value"
 
     def test_get_token_fallback_when_specific_missing(self):
         """Test fallback to GITLAB_TOKEN when specific token missing"""
-        with patch.dict(os.environ, {"GITLAB_TOKEN": "fallback-token"}, clear=True):
+        with patch.dict(
+            os.environ,
+            {
+                "GITLAB_TOKEN": "fallback-value",
+                "LMER_WORK_REPO": "https://gitlab.example.com/agents/work.git",
+            },
+            clear=True,
+        ):
             token = get_token("gitlab.example.com")
-            assert token == "fallback-token"
+            assert token == "fallback-value"
 
     def test_get_token_raises_when_not_found(self):
         """Test TokenNotFoundError when no token available"""
@@ -481,8 +499,12 @@ class TestCliExpectStatus:
         """Run bin/gitlab-pipeline with API responses mocked in call order;
         return the exit code."""
         responses = [self._response(p) for p in payloads]
+        # Per-host entry, not the generic GITLAB_TOKEN: the generic one is
+        # scoped to its issuing host (#161) and would be refused here, turning
+        # every case below into a token error — including the ones that expect
+        # a non-zero exit, which would pass for the wrong reason.
         with patch.dict(
-            os.environ, {"GITLAB_TOKEN": "test-token"}, clear=True
+            os.environ, {"GITLAB_TOKEN_gitlab_example_com": "test-value"}, clear=True
         ), patch("urllib.request.urlopen", side_effect=responses), patch(
             "sys.argv", ["gitlab-pipeline"] + argv
         ):
