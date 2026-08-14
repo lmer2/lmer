@@ -72,7 +72,7 @@ gracefully and are listed explicitly:
 | Slash commands (`agent-files` commands)      | ✅     | ✅⁷   | ✅⁷ |
 | Skills (`agent-files` skills)                | ✅     | ❌    | ❌  |
 | Output styles (`agent-files` output-styles)  | ✅⁹    | ❌    | ❌  |
-| Stop/SessionEnd hook guards                  | ✅     | ❌    | ❌  |
+| Stop/SessionEnd hook guards                  | ✅¹⁰   | ❌¹⁰  | ❌¹⁰ |
 | Agent memory persistence (`work memory`)     | ✅     | ✅⁸   | ✅⁸ |
 | Masterplan workflow                          | ✅     | ❌    | ❌  |
 | Slack chat mode / service mode               | ✅     | ❌    | ❌  |
@@ -120,6 +120,16 @@ gracefully and are listed explicitly:
    mechanisms, and a style reaches neither subagents nor the built-in coding
    instructions by default — see
    [LMER-CLI.md](LMER-CLI.md#output-styles-shipping-one-and-selecting-one-are-separate).
+10. Only the claude harness fires lifecycle hooks, so every Stop-hook guard is
+    claude-only — including the **signal reminder**
+    (`hooks/signal_guard.py`, issue #289), which reminds an orchestrated
+    session that ends a turn on an unreported milestone to run `lmer-signal`.
+    **codex and pi runs have no mechanical signal reminder at all** until the
+    daemon-side watch (issue #294) lands; they keep only the prose instruction
+    in the orchestrator-ask prompt fragment (`prompts/orchestrator-ask.md`),
+    so an unsignalled milestone on those harnesses still surfaces only through
+    the orchestrator's stalled-run digest. The same holds for the run-state and
+    Slack reply guards.
 
 ## Authentication
 

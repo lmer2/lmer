@@ -101,6 +101,47 @@ The hook fails open: unreadable payload, git errors, `work` failures, or
 sentinel/counter I/O errors all result in exit 0 with no output. It only
 reads state and never mutates the run, the workspace, or the work repo.
 
+### signal_guard.py
+
+Registered as the third `Stop` hook in `agent-files/claude/settings.json`.
+In an orchestrated session (`LMER_ASK_DIR` set), it blocks a stop once when
+the turn shows an unreported milestone: a successful milestone-shaped command
+in the transcript (the `_MILESTONE_PATTERNS` list — `gate-push`,
+`gitlab-review --create-mr`/`--review-file`/`--reply-thread`,
+`github-review --review-file`, the `gitlab-review-post-review.sh` /
+`github-review-post-review.sh` wrappers, `work state set --status=complete`)
+or a run record reporting itself complete, with no signal-equivalent act after
+it (a successful `lmer-signal`; a newer signal file in the channel dir, but
+only when the transcript holds no signal of its own — ordered evidence wins
+over a file with no position in the turn; or a newly opened `lmer-ask`
+question). The reminder asks the agent to run `lmer-signal`; the hook **never
+signals on the agent's behalf** — a signal must keep meaning a milestone.
+
+Fires once per distinct milestone, capped at 3 per session via a `/tmp`
+marker keyed on `LMER_SESSION_ID` and written atomically (a torn marker reads
+as corrupt, which would disable the guard for the session). Kill switch:
+`LMER_SIGNAL_GUARD` with `get_bool_env` semantics. Fan-out children
+(`LMER_NONINTERACTIVE`) are skipped entirely — a `claude -p` child's only
+output is its last turn, so a Stop block would replace the result its parent
+is waiting for. Fails open on every error path, including a marker write
+failure (which drops the nudge rather than risk an uncapped one).
+
+Both channel-dir suppressors are bounded against baselines in the marker, so
+one signal (or one long-lived open question) cannot silence every later
+milestone in the session.
+
+Adding a milestone-shaped command to lmer means adding a row to
+`_MILESTONE_PATTERNS` — the list is the single place the guard learns what a
+milestone looks like, and
+`tests/test_signal_guard.py::TestPatternsMatchRealCommands` pins each row's
+flag against the real argparse parser (a row once named a `--post-review`
+flag that no CLI has).
+
+The list is known spellings, not a classifier: a milestone reached through a
+slash command (which produces no Bash `tool_use` block), a subagent, or an MCP
+tool is invisible, so silence from this hook means "nothing to report" rather
+than "nothing happened".
+
 ## Testing
 
 ```bash

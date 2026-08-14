@@ -57,6 +57,7 @@ tests:
     - tests/test_rules_structure.py
     - tests/test_run_state_wiring.py
     - tests/test_security.py
+    - tests/test_signal_guard.py
     - tests/test_self_dev_pythonpath.py
     - tests/test_supervisor.py
     - tests/test_taskdef_render_matrix.py
