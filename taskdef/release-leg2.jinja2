@@ -25,13 +25,49 @@ mismatch check runs every time, even when the gate already recorded the
 merge SHA), then step 2's preconditions, then the tag.
 
 Credentials are provisioned, never fetched: the GitHub fine-grained PAT
-arrives through this session's credential env, and the release SSH signing
-key is mounted read-only at `/release-signing-key` (the path is also
-exported as `LMER_RELEASE_SIGNING_KEY`); `release.signing_key` is the
-REFERENCE resolved in Phase 0.5. Consume these deliveries as-is — do NOT
-hunt for keys elsewhere, generate one, or re-implement provisioning. A
-missing or rejected credential is a hard error naming the credential
-requirement (see HARD RULES), never a workaround.
+arrives through this session's credential env as `LMER_RELEASE_GITHUB_TOKEN`,
+and the release SSH signing key is mounted read-only at
+`/release-signing-key` (the path is also exported as
+`LMER_RELEASE_SIGNING_KEY`); `release.signing_key` is the REFERENCE resolved
+in Phase 0.5. Consume these deliveries as-is — do NOT hunt for keys
+elsewhere, generate one, or re-implement provisioning. A missing or rejected
+credential is a hard error naming the credential requirement (see HARD
+RULES), never a workaround.
+
+`release.github_target` is a bare `https://` URL and the container carries
+NO credential helper for the mirror host, with `~/.gitconfig` a read-only
+mount so one cannot be added persistently. Every operation against the
+`github` remote — the fetch in step 2, both `ls-remote` checks, and both
+`bin/gate-push` invocations — therefore fails unauthenticated. Supply the
+PAT through git's numbered-config environment, which lives only in a
+process's own env, never in a file and never on a command line.
+
+Supply it PER COMMAND, never once for the leg: each command runs in a fresh
+shell, so an `export` in one invocation does not reach the next. The prefix
+below goes in front of EACH `github`-remote command, in the same shell
+invocation as that command — the step-2 fetch, both `ls-remote` checks, and
+both `bin/gate-push` invocations (`bin/gate-push` shells out to `git`, so
+the numbered config reaches git through the environment it inherits):
+
+```
+# <mirror-host> is the host of `release.github_target` — read it off that
+# URL, never typed from memory. `x-access-token` is the fixed username the
+# forge expects for a PAT; the token is the password half.
+# N is the next free index, derived from whatever numbered config this
+# shell inherited, so an inherited entry is never overwritten.
+N="${GIT_CONFIG_COUNT:-0}"
+(
+  export GIT_CONFIG_COUNT="$((N + 1))"
+  export "GIT_CONFIG_KEY_$N=url.https://x-access-token:${LMER_RELEASE_GITHUB_TOKEN}@<mirror-host>/.insteadOf"
+  export "GIT_CONFIG_VALUE_$N=https://<mirror-host>/"
+  <the github-remote command>
+)
+```
+
+The subshell keeps the rewrite scoped to the one command that needs it, and
+`export` is a builtin, so the token never reaches any process's command
+line. Never write the token into the remote URL, a config file, or run
+state — the rewrite is what keeps it in the environment only.
 
 ### Step 1 — `leg2-record-merge` — record the merge SHA
 
@@ -73,7 +109,8 @@ Both checks run through `work verify` so a receipt exists, not just prose:
       Red or still running → do not proceed; wait or investigate.
 - [ ] GitHub `main` is an ancestor of the merge SHA. Add the mirror remote
       once (`git remote add github <release.github_target>` — skip if
-      already present), fetch it, then:
+      already present), fetch it with the credential prefix above in the
+      same shell invocation as the fetch, then:
       `work verify github-ancestry -- git merge-base --is-ancestor <github-main-sha> <merge-sha>`
       where `<github-main-sha>` is `git rev-parse github/main` after the
       fetch.
@@ -95,7 +132,8 @@ else) — never a name remembered from leg 1.
 
 - [ ] Idempotency check FIRST — does the tag already exist? Check locally
       and on both remotes (`git ls-remote origin refs/tags/<tag>`,
-      `git ls-remote github refs/tags/<tag>`). If it exists:
+      `git ls-remote github refs/tags/<tag>` — the `github` one carrying the
+      credential prefix in its own shell invocation). If it exists:
       - pointing at exactly the recorded merge SHA AND carrying a valid
         signature (verification below) → creation is DONE; record
         `work release record tag <tag> --sha <merge-sha>` if not yet
@@ -145,9 +183,17 @@ to report, never something to route around.
       `bin/gate-push --tag <tag> --remote github`
 - [ ] Record: `work release record receipt github-tag-push`
 
-A rejected push (a 403 from a read-only credential, a protection rule) is a
-hard error naming the credential requirement — never an alternative push
-path, per HARD RULES.
+Every `github`-remote command in this step — the `ls-remote` skip check and
+both pushes — carries the credential prefix from the credentials section in
+its own shell invocation; nothing persists from the commands before it.
+`bin/gate-push` shells out to `git`, so the numbered-config environment
+passes through, but nothing else supplies the credential. A
+rejected push (a 403 from a missing or read-only credential, a protection
+rule) is a hard error naming the credential requirement — never an
+alternative push path, per HARD RULES. Note the ordering cost of getting
+this wrong: the tag already exists locally by this point, and the tag is
+immutable, so recovery is fixing the credential and re-entering the leg,
+never re-tagging.
 
 ### Step 5 — `leg2-poll-actions` — the GitHub Actions release run
 

@@ -177,6 +177,17 @@ monitor's own summary shape (:data:`_MONITOR_RE`). Both are required, and the
 first is what keeps an operator who *pastes* that markup into the chat — which is
 how this was reported — from having their own words attributed to the watch.
 
+The monitor is one member of that family and not the whole of it, which is the
+other half of the same report (#242): the harness injects a turn every time a
+background command exits or a subagent stops, in the same role, with the same
+anchor and no ``isMeta`` — and those rendered as the operator's own words, a
+block of task ids and output-file paths per finished task. So
+:func:`_injected_by_harness` decides ``kind`` on its own: anything it recognises
+is ``injected``, and ``said`` is the kind that has to be earned. Only the
+monitor's own shape earns the re-attribution below; the rest stay ``user`` turns
+the view keeps behind its internals toggle, which is where a record the harness
+wrote for the model belongs.
+
 Such a turn is re-attributed to :data:`MONITOR_ROLE` and marked
 :data:`MONITOR_VIA`, the same statement :data:`ASK_CHANNEL_VIA` makes: it is not
 passed off as something a party said. Its text is the readable half of the markup
@@ -1287,11 +1298,14 @@ def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
     via = None
     if role == "user":
         text = _strip_wrappers(text if isinstance(text, str) else "")
-        watched = (
-            _monitor_report(text) if _injected_by_harness(record) else None
-        )
+        injected = _injected_by_harness(record)
+        watched = _monitor_report(text) if injected else None
         if watched is None:
-            kind = "injected" if record.get("isMeta") else "said"
+            # Injected is decided before isMeta and both before "said": the
+            # harness's other injections — a background task finishing, an agent
+            # stopping — carry no isMeta either (#242), so reading isMeta alone
+            # drew every one of them as a turn the operator had typed.
+            kind = "injected" if injected or record.get("isMeta") else "said"
         else:
             # A watch firing, which the harness delivers as a turn in the
             # operator's own role and with no isMeta to hide it behind the

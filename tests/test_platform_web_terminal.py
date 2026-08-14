@@ -1550,6 +1550,80 @@ def test_a_return_that_coalesces_with_a_resize_keeps_its_repaint():
         )
 
 
+def test_a_return_to_the_view_does_not_resend_a_geometry_the_pty_has():
+    """Reported by the operator (#218): coming back to the terminal wrote a resize.
+
+    The return schedules a pass, the pass fits, and ``applyGeometry`` reports —
+    so a tab switch that changed nothing still sent a ``resize`` frame, which
+    reflows the session's TUI for everyone attached. That is the 2026-08-03
+    decision (a return is a repaint, never a resize) lost one call deeper, and
+    the memo is what keeps it: same rows and cols, no write.
+
+    The resets and the one bypass are each load-bearing. The memo belongs to
+    a socket, so it goes with the teardown and again when one opens — the PTY's
+    size is not this client's to remember across a reconnect. And a *deferred*
+    resize never reached the harness, so the retry deliberately resends the same
+    geometry and must not be skipped by a memo of a write that did not land. A
+    refusal or a failure needs no reset: resending a size the daemon has already
+    refused is exactly what this is for.
+
+    The switch is the fourth reset, and the one the memo would otherwise eat:
+    while the fit was off somebody else attached can have resized the PTY, and
+    this client's dimensions did not change meanwhile — so turning fitting back
+    on would match the memo and send nothing, leaving the terminal rendering
+    against a size it never asked for. The opt-in is a command, not a repaint;
+    a return to the view schedules its pass and never reaches this switch, so
+    clearing here does not weaken the return.
+    """
+    text = _read(TERMINAL)
+    assert "let geometrySent = null" in text, "nothing remembers what was sent"
+
+    report = _code(_function_body(text, "function reportGeometry"))
+    assert ("geometrySent.rows === rows" in report
+            and "geometrySent.cols === cols" in report), (
+        "the report compares against no previous geometry, so a return that "
+        "changed nothing still writes to the session"
+    )
+    assert report.index("geometrySent.rows") < report.index("socket.send"), (
+        "the memo is consulted after the frame has already gone out"
+    )
+    assert report.index("socket.send") < report.index("geometrySent = { rows, cols }"), (
+        "the memo records a send that has not happened yet"
+    )
+
+    teardown = _code(_function_body(text, "function teardownSocket"))
+    assert "geometrySent = null" in teardown, (
+        "the memo outlives its socket, so the reconnect skips the fit the "
+        "operator asked for"
+    )
+    opened = _code(_function_body(text, "function handleFrame"))
+    assert "geometrySent = null" in opened, (
+        "a socket that opens without clearing the memo believes the new PTY "
+        "already has this client's size"
+    )
+    assert opened.index("geometrySent = null") < opened.index("reportGeometry()"), (
+        "the reset lands after the report it exists to let through"
+    )
+
+    switch = _code(_function_body(text, "function setResizeOptIn"))
+    assert "geometrySent = null" in switch, (
+        "turning the fit back on is answered by the memo, so the switch sends "
+        "nothing and the operator's opt-in silently does nothing"
+    )
+    assert switch.index("geometrySent = null") < switch.index("applyGeometry()"), (
+        "the reset lands after the apply it exists to let through"
+    )
+
+    deferred = _status_case(text, "resize_deferred")
+    assert "geometrySent = null" in deferred, (
+        "the retry is skipped by a memo of a resize the harness never got"
+    )
+    for event in ("resize_refused", "resize_failed"):
+        assert "geometrySent" not in _status_case(text, event), (
+            f"{event} clears the memo, which re-sends the geometry it answered"
+        )
+
+
 def test_an_unfocused_terminal_says_so_where_the_keyboard_is_real():
     """The hint exists because the failure is invisible: nothing happens.
 

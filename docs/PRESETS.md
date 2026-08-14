@@ -352,10 +352,14 @@ The trust model is preserved by resolving at launch: names are validated
 against `LMER_PRESETS_FILE` on the host — a name that is neither a preset
 nor a routable model fails fast (exit 2) listing the available presets, a
 duplicate warns and keeps the first occurrence — and only the resolved
-config crosses into the container, as `LMER_AGENTS` (names) plus
-`LMER_AGENTS_CONFIG` (JSON `{name: {"env": {...}, "prompt": "..."?}}`).
-The presets file never enters the container, so the agent can only spawn
-what was named at launch. Inside the session:
+config crosses into the container, as `LMER_SPAWN_AGENTS` (names) plus
+`LMER_SPAWN_AGENTS_CONFIG` (JSON `{name: {"env": {...}, "prompt": "..."?}}`).
+The container-side names are scoped away from the `LMER_AGENTS` input on
+purpose (issue #283): container env is ambient, so under the input name a
+nested `lmer` invocation inside the session inherited the outer selection
+and tried to resolve it against a presets file that never crossed the
+boundary. The presets file never enters the container, so the agent can
+only spawn what was named at launch. Inside the session:
 
 ```bash
 spawn-harness --list
@@ -391,9 +395,10 @@ instead of quietly shrinking the consolidation to N-1. Whether prose is a
 see [Non-interactive exec mode in docs/HARNESSES.md](./HARNESSES.md#non-interactive-exec-mode-spawn-harness)).
 Children run permission-free (the
 lmer container is the security boundary), stateless (no run dirs, no
-work-repo writes), and cannot fan out further — `LMER_AGENTS` /
-`LMER_AGENTS_CONFIG` are stripped from the child environment, so there are
-no grandchildren. Every child also gets `LMER_NONINTERACTIVE=1` and a
+work-repo writes), and cannot fan out further — both fan-out pairs
+(`LMER_SPAWN_AGENTS` / `LMER_SPAWN_AGENTS_CONFIG` and the host-input
+`LMER_AGENTS` / `LMER_AGENTS_CONFIG`) are stripped from the child
+environment, so there are no grandchildren. Every child also gets `LMER_NONINTERACTIVE=1` and a
 one-paragraph notice at the head of its prompt — "report a gate-worthy
 problem, never end the turn asking for approval" — because an unanswerable
 question in a child is a dropped result, not a pause. The notice is in-band

@@ -310,9 +310,10 @@ for `build_exec_argv(..., unattended=True)` (which `spawn-harness` passes):
 a future consumer of the exec profiles must opt into permission-free
 children explicitly, never inherit them from neutral registry data.
 Children are also barred
-from fanning out further: `spawn-harness` strips `LMER_AGENTS` /
-`LMER_AGENTS_CONFIG` from the child environment (no grandchildren,
-structurally).
+from fanning out further: `spawn-harness` strips both fan-out pairs — the
+container-side `LMER_SPAWN_AGENTS` / `LMER_SPAWN_AGENTS_CONFIG` it reads and
+the host-input `LMER_AGENTS` / `LMER_AGENTS_CONFIG` — from the child
+environment (no grandchildren, structurally).
 
 Children equally cannot answer *approval* questions, which is a prompt-level
 problem rather than a flag one: a child that obeys a rule telling it to stop

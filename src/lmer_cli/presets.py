@@ -89,16 +89,26 @@ _ENV_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9]")
 # comma-delimited list of preset names (the --agents flag wins over it,
 # matching --preset/LMER_PRESET). Read host-side only: the names are resolved
 # against the presets file before the container starts, and only the resolved
-# env overlays are forwarded inside (as LMER_AGENTS + LMER_AGENTS_CONFIG, for
-# spawn-harness) — the presets file itself never crosses the boundary.
+# env overlays are forwarded inside (under the scoped SPAWN_* names below,
+# for spawn-harness) — the presets file itself never crosses the boundary.
 AGENTS_ENV = "LMER_AGENTS"
 
-# Container env var carrying the resolved per-agent config as JSON
-# (``{name: {"env": {...}}}``), written by the host CLI and consumed by
-# spawn-harness. Defined beside AGENTS_ENV because the two are halves of one
-# contract (host writes both, spawn-harness strips both from children) —
-# every consumer must import them from here so a rename can't split them.
+# The config half of the same host-side input convention: never written by
+# lmer, never read as input, and defined beside AGENTS_ENV because both
+# spellings must be stripped from a fan-out child (a child carrying either
+# one would hand the session's selection to whatever it runs). Every
+# consumer imports them from here so a rename can't split them.
 AGENTS_CONFIG_ENV = "LMER_AGENTS_CONFIG"
+
+# Container-side names the resolved selection is actually forwarded under
+# (issue #283), read by spawn-harness and by nothing host-side. Scoped away
+# from AGENTS_ENV because inside the container the pair is ambient: forwarding
+# the selection under the host *input* name made every nested `lmer` invocation
+# and every test run in the session inherit it, and resolve those names against
+# a presets file that never crosses the boundary. The input convention stays
+# AGENTS_ENV; only what the container sees is renamed.
+SPAWN_AGENTS_ENV = "LMER_SPAWN_AGENTS"
+SPAWN_AGENTS_CONFIG_ENV = "LMER_SPAWN_AGENTS_CONFIG"
 
 # Charset a preset name may use. Shared between the selector token and the
 # load-time name check so a name that loads is always one the token can select.
@@ -403,7 +413,7 @@ def resolve_agent_presets(
 
     Returns ``(resolved, warnings, error)``: ``resolved`` maps name → the
     agent's config entry (``{"env": {...}}`` plus optional ``"prompt"`` —
-    the exact ``LMER_AGENTS_CONFIG`` shape) and is ``None`` when ``error``
+    the exact ``LMER_SPAWN_AGENTS_CONFIG`` shape) and is ``None`` when ``error``
     is set (an empty selection, any unknown name — unknown must fail the
     invocation, mirroring the ``--preset`` UX, never silently spawn fewer
     agents — or an unknown harness, which would otherwise only surface

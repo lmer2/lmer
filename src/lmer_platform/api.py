@@ -244,6 +244,32 @@ def _positive_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+async def _close_quietly(websocket) -> None:
+    """Close a socket whose client may already be gone, without a traceback.
+
+    Two exceptions mean the same harmless thing, and only one of them was
+    handled: starlette raises ``RuntimeError`` when the close frame is sent
+    after its own state already says DISCONNECTED, and ``WebSocketDisconnect``
+    with code 1006 when the frame reaches a transport the peer has hung up on —
+    uvicorn's ``ClientDisconnected`` is an ``OSError``, which starlette's send
+    path converts on a socket it still believes is connected. The second is
+    every closed browser tab (#247), so every terminal a reader closed logged
+    an ASGI traceback in the daemon.
+
+    Nothing wider: an ``OSError`` can only escape ``close`` unconverted before
+    ``accept``, which no caller of this does, and suppressing a class of error
+    the socket has not been shown to raise would hide the next real one.
+
+    The import is local for the reason :func:`create_app` gives for its own —
+    ``starlette.websockets`` costs a third of a second that ``lmer platform
+    status`` must not pay.
+    """
+    from starlette.websockets import WebSocketDisconnect
+
+    with contextlib.suppress(RuntimeError, WebSocketDisconnect):
+        await websocket.close()
+
+
 def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
     """Operator-visible configuration. Carries no secret and no credentialed URL.
 
@@ -2001,9 +2027,8 @@ def create_app(
             logger.warning(
                 "platform_tty_failed session=%s error=%r", session_id, failure
             )
-        # Already-closed is the common case (the client hung up first).
-        with contextlib.suppress(RuntimeError):
-            await websocket.close()
+        # The client having hung up first is the common case, not a failure.
+        await _close_quietly(websocket)
 
     @app.get("/api/runs/candidates", dependencies=guard)
     def candidates() -> dict:

@@ -44,20 +44,25 @@ CONFIG = {
 
 
 def _config_env(config=CONFIG):
-    return {"LMER_AGENTS_CONFIG": json.dumps(config)}
+    return {"LMER_SPAWN_AGENTS_CONFIG": json.dumps(config)}
 
 
 class TestLoadAgentsConfig:
     def test_absent_and_blank_yield_empty(self):
         assert load_agents_config({}) == {}
-        assert load_agents_config({"LMER_AGENTS_CONFIG": "  "}) == {}
+        assert load_agents_config({"LMER_SPAWN_AGENTS_CONFIG": "  "}) == {}
 
     def test_valid_config_parses(self):
         assert load_agents_config(_config_env()) == CONFIG
 
+    def test_host_input_name_is_not_read(self):
+        """The unscoped pair is ambient in the container (issue #283): reading
+        it as a fallback would put the outer session's selection back."""
+        assert load_agents_config({"LMER_AGENTS_CONFIG": json.dumps(CONFIG)}) == {}
+
     def test_invalid_json_exits_2(self, capsys):
         with pytest.raises(SystemExit) as exc:
-            load_agents_config({"LMER_AGENTS_CONFIG": "{nope"})
+            load_agents_config({"LMER_SPAWN_AGENTS_CONFIG": "{nope"})
         assert exc.value.code == 2
         assert "not valid JSON" in capsys.readouterr().err
 
@@ -72,7 +77,7 @@ class TestLoadAgentsConfig:
     )
     def test_wrong_shapes_exit_2(self, payload):
         with pytest.raises(SystemExit) as exc:
-            load_agents_config({"LMER_AGENTS_CONFIG": payload})
+            load_agents_config({"LMER_SPAWN_AGENTS_CONFIG": payload})
         assert exc.value.code == 2
 
 
@@ -118,11 +123,20 @@ class TestBuildChildEnv:
         assert child["CLI"] == "cli"
 
     def test_fanout_vars_stripped_no_grandchildren(self):
+        # Both spellings: the scoped pair spawn-harness reads, and the
+        # host-input pair a child would otherwise hand to a nested `lmer`.
         child = build_child_env(
-            {"LMER_AGENTS": "a,b", "LMER_AGENTS_CONFIG": "{}"},
-            {"LMER_AGENTS": "sneaky"},
+            {
+                "LMER_SPAWN_AGENTS": "a,b",
+                "LMER_SPAWN_AGENTS_CONFIG": "{}",
+                "LMER_AGENTS": "a,b",
+                "LMER_AGENTS_CONFIG": "{}",
+            },
+            {"LMER_SPAWN_AGENTS": "sneaky", "LMER_AGENTS": "sneaky"},
             {},
         )
+        assert "LMER_SPAWN_AGENTS" not in child
+        assert "LMER_SPAWN_AGENTS_CONFIG" not in child
         assert "LMER_AGENTS" not in child
         assert "LMER_AGENTS_CONFIG" not in child
 
@@ -424,7 +438,7 @@ def _run_main(tmp_path, args, config=CONFIG, extra_env=None, stub="claude", **st
     env = {
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "HOME": str(tmp_path),
-        "LMER_AGENTS": ",".join(config),
+        "LMER_SPAWN_AGENTS": ",".join(config),
         **_config_env(config),
         **(extra_env or {}),
     }
@@ -468,7 +482,14 @@ class TestMainEndToEnd:
         # CI_MERGE_REQUEST_DESCRIPTION whose *text* mentions LMER_AGENTS —
         # only actual fan-out variables must be absent.
         assert not any(
-            line.startswith(("LMER_AGENTS=", "LMER_AGENTS_CONFIG="))
+            line.startswith(
+                (
+                    "LMER_SPAWN_AGENTS=",
+                    "LMER_SPAWN_AGENTS_CONFIG=",
+                    "LMER_AGENTS=",
+                    "LMER_AGENTS_CONFIG=",
+                )
+            )
             for line in env_lines
         )
 

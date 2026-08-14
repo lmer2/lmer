@@ -144,7 +144,7 @@ work goal "description of current goal"
 work goal
 ```
 
-The goal is stored temporarily in `/tmp/lmer_work_goal.txt` and persists across CLI invocations but is not permanently saved (cleaned up on system restart). This is useful for tracking the current objective or context during a work session.
+The goal is stored temporarily in `/tmp/lmer_work_goal.<session>.txt` — one file per `LMER_SESSION_ID`, so concurrent sessions on the same host never overwrite each other's goal — and persists across CLI invocations but is not permanently saved (cleaned up on system restart). This is useful for tracking the current objective or context during a work session.
 
 **Examples:**
 ```bash

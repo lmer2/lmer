@@ -520,6 +520,118 @@ def test_a_monitor_event_is_scrubbed_like_every_other_string():
     assert "hunter2hunter2" not in message.text
 
 
+# --- the harness's other injections (#242) ------------------------------------
+#
+# A watch firing is one thing the harness injects; a background command exiting
+# and a subagent stopping are the others, and they arrive in the same role, with
+# the same `origin`/`promptSource` anchors and no `isMeta`. The classification
+# read `isMeta` alone for everything that was not a monitor event, so every
+# finished background task rendered as a block of task ids and output-file paths
+# the operator had apparently typed — the reported bug, one route over from the
+# one the section above closed.
+
+#: A background task notification as Claude Code 2.1.228 writes it, from a live
+#: transcript on this codebase (ids and paths scrubbed). Not a monitor event: the
+#: summary is a different sentence, which is the whole reason the text shape
+#: cannot be what decides whether a turn is the operator's.
+BACKGROUND_TASK_NOTIFICATION = (
+    "<task-notification>\n"
+    "<task-id>t-000000001</task-id>\n"
+    "<tool-use-id>toolu_00000000000000000000</tool-use-id>\n"
+    "<output-file>/tmp/agent-output/t-000000001.output</output-file>\n"
+    "<status>failed</status>\n"
+    '<summary>Background command "Run gate checks on clean state" failed with '
+    "exit code 1</summary>\n"
+    "</task-notification>"
+)
+
+
+def injected_record(text=BACKGROUND_TASK_NOTIFICATION, **extra):
+    """One harness-injected turn that is not a monitor event.
+
+    The monitor's own builder, deliberately: the two records are identical down
+    to the field, and only what the injection *says* differs.
+    """
+    return monitor_record(text, **extra)
+
+
+def test_a_finished_background_task_is_not_a_turn_the_operator_typed():
+    """The report: the harness put it there, so it is not the operator's words.
+
+    ``injected`` rather than the monitor's re-attribution — it is machinery
+    addressing the session, which is what that kind already means, and the view
+    keeps it behind the internals toggle instead of drawing a bubble for it.
+    """
+    message = transcripts.normalise_records([injected_record()])[0]
+
+    assert message.kind == "injected"
+    assert message.kind != "said", "the harness's own turn is drawn as the operator"
+    assert message.role == "user", (
+        "the role is the record's; only a monitor event is re-attributed"
+    )
+    assert message.via is None
+
+
+def test_an_injected_turn_needs_no_isMeta_to_be_injected():
+    """``isMeta`` was the only thing consulted, and a task notification carries
+    none — so the marker that says a keyboard was not involved has to be enough on
+    its own, either spelling of it."""
+    for keep in ("origin", "promptSource"):
+        record = injected_record()
+        assert "isMeta" not in record
+        for field in ("origin", "promptSource"):
+            if field != keep:
+                record.pop(field)
+        message = transcripts.normalise_records([record])[0]
+        assert message.kind == "injected", f"{keep!r} alone no longer classifies"
+
+
+def test_a_turn_the_operator_typed_is_untouched_by_the_injected_classification():
+    """The other half, and the one a wrong fix breaks silently: a real typed turn
+    carries the harness's markers too — ``promptSource: typed``, ``origin.kind:
+    human`` — and those are not what :func:`_injected_by_harness` reads."""
+    typed = injected_record(
+        "the gate failed on the first item, look at that one first",
+        origin={"kind": "human"},
+        promptSource="typed",
+    )
+    message = transcripts.normalise_records([typed])[0]
+
+    assert (message.role, message.kind) == ("user", "said")
+
+
+#: The same records off a live Claude Code 2.1.228: two task notifications (a
+#: background command that failed, a subagent that stopped), one turn the operator
+#: typed, and assistant turns around them. Ids, paths and prose are scrubbed; the
+#: keys, their order and the version string are the ones the harness wrote.
+TASK_NOTIFICATION_FIXTURE = FIXTURES / "claude-task-notification.jsonl"
+
+
+def test_the_captured_notifications_classify_as_the_hand_built_ones_claim(platform_root):
+    """Read end to end, for the reason spec D6 gives: the hand-built records above
+    pin the fix to this author's model of the format, and it was that model being
+    a turn short — ``isMeta`` on everything the harness injects — that produced the
+    bug. A release that changes the anchors is then a diff here."""
+    plant_session("s-notified", fixture=TASK_NOTIFICATION_FIXTURE)
+    page = transcripts.read_messages("s-notified", limit=100)
+
+    assert [(m.role, m.kind) for m in page.messages] == [
+        ("assistant", "said"),
+        ("user", "injected"),
+        ("user", "injected"),
+        ("user", "said"),
+        ("assistant", "said"),
+    ]
+    # Nothing the harness wrote for the model is drawn as something a party said.
+    said = [m for m in page.messages if m.kind == "said" and m.role == "user"]
+    assert [m.text for m in said] == [
+        "the gate failed on the first item, look at that one first"
+    ]
+    for message in said:
+        assert "task-notification" not in message.text
+        assert "toolu_" not in message.text
+
+
 # --- a message typed into a busy session (#275) -------------------------------
 #
 # Type while the session is mid-turn and Claude Code queues the message — and

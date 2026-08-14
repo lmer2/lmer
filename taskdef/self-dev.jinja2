@@ -5,7 +5,7 @@ You are working on the lmer repository itself. Special rules apply:
 
 - **Your development checkout** is `/workspace/` — this is where ALL your edits happen
 - **The operational runtime** at `/Agents/global/` is what is currently running you — **DO NOT modify it**
-- Gate commands (`gate-check`, `gate-commit`, `gate-push`) resolve from `/workspace/bin/` — this is correct
+- Bare gate commands (`gate-check`, `gate-commit`, `gate-push`) resolve from `/Agents/global/bin/`, which the entrypoint puts first on `PATH` — they run the **operational** copy (which also pins its own `/Agents/global/src` ahead of your `PYTHONPATH`). That is fine for gating your work; to exercise gate changes from your branch, invoke them explicitly as `bin/gate-*` from `/workspace/`
 - Hooks and slash commands work normally (symlinked from `/Agents/global/agent-files/`)
 - Changes you make in `/workspace/` will NOT affect your current session — they are development copies, not the operational ones
 - `PYTHONPATH` puts `/workspace/src` ahead of the operational tree, so `pytest` and Python imports use your development code. Do not take this on trust: the startup banner above prints the `lmer_cli` path this session actually resolved, and `tests/test_import_provenance.py` fails the suite if it is not under `/workspace/` (issue #198 — before that fix, this bullet claimed something that was not true)
