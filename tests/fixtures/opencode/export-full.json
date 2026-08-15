@@ -1,0 +1,241 @@
+{
+  "info": {
+    "id": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+    "slug": "mighty-garden",
+    "projectID": "global",
+    "directory": "/home/developer/workspace",
+    "path": "",
+    "title": "lmer transcript capture",
+    "agent": "build",
+    "model": {
+      "id": "fake-model",
+      "providerID": "fake",
+      "variant": "default"
+    },
+    "version": "1.18.18",
+    "summary": {
+      "additions": 0,
+      "deletions": 0,
+      "files": 0
+    },
+    "cost": 0,
+    "tokens": {
+      "input": 22,
+      "output": 14,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1786750343448,
+      "updated": 1786750367059
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1786750343606
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "fake",
+          "modelID": "fake-model"
+        },
+        "summary": {
+          "diffs": []
+        },
+        "id": "msg_0029e99b6001m15lHfgXBECB2a",
+        "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Called the Read tool with the following input: {\"filePath\":\"/home/developer/workspace/README.md\"}",
+          "synthetic": true,
+          "id": "prt_0029e99d0001oJ2hwZUQ1mEURK",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029e99b6001m15lHfgXBECB2a"
+        },
+        {
+          "type": "text",
+          "text": "say hi and run a quick shell command",
+          "id": "prt_0029e99d0002VBzMI17Z6t23ef",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029e99b6001m15lHfgXBECB2a"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_0029e99b6001m15lHfgXBECB2a",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/home/developer/workspace",
+          "root": "/home/developer/workspace"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 18,
+          "input": 11,
+          "output": 7,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 0
+          }
+        },
+        "modelID": "fake-model",
+        "providerID": "fake",
+        "time": {
+          "created": 1786750347266,
+          "completed": 1786750364940
+        },
+        "finish": "tool-calls",
+        "id": "msg_0029ea802001i0c7MDzED7muAj",
+        "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF"
+      },
+      "parts": [
+        {
+          "snapshot": "307cce1474da89117f7a6ebd390087838c156e26",
+          "type": "step-start",
+          "id": "prt_0029ecd51001Nqx5NjPm6DG5Xp",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029ea802001i0c7MDzED7muAj"
+        },
+        {
+          "type": "text",
+          "text": "I will check the working tree.",
+          "time": {
+            "start": 1786750356841,
+            "end": 1786750357021
+          },
+          "id": "prt_0029ecd680013QIDiX100LfGyD",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029ea802001i0c7MDzED7muAj"
+        },
+        {
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call_fake_1",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "sleep 6; echo hello from the fake tool",
+              "description": "Echo a greeting"
+            },
+            "output": "hello from the fake tool\n",
+            "metadata": {
+              "output": "hello from the fake tool\n",
+              "exit": 0,
+              "truncated": false
+            },
+            "title": "sleep 6; echo hello from the fake tool",
+            "time": {
+              "start": 1786750363953,
+              "end": 1786750364105
+            }
+          },
+          "id": "prt_0029ecd7d001fmzQEwQOsHoB5g",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029ea802001i0c7MDzED7muAj"
+        },
+        {
+          "reason": "tool-calls",
+          "snapshot": "307cce1474da89117f7a6ebd390087838c156e26",
+          "type": "step-finish",
+          "tokens": {
+            "total": 18,
+            "input": 11,
+            "output": 7,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "cost": 0,
+          "id": "prt_0029eebc2001MaWotfu5wZJOX0",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029ea802001i0c7MDzED7muAj"
+        }
+      ]
+    },
+    {
+      "info": {
+        "parentID": "msg_0029e99b6001m15lHfgXBECB2a",
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/home/developer/workspace",
+          "root": "/home/developer/workspace"
+        },
+        "cost": 0,
+        "tokens": {
+          "total": 18,
+          "input": 11,
+          "output": 7,
+          "reasoning": 0,
+          "cache": {
+            "write": 0,
+            "read": 0
+          }
+        },
+        "modelID": "fake-model",
+        "providerID": "fake",
+        "time": {
+          "created": 1786750364964,
+          "completed": 1786750367042
+        },
+        "finish": "stop",
+        "id": "msg_0029eed24001bGaNu00vu0LkTO",
+        "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF"
+      },
+      "parts": [
+        {
+          "snapshot": "307cce1474da89117f7a6ebd390087838c156e26",
+          "type": "step-start",
+          "id": "prt_0029ef15c001l6kE2k0McGJu6z",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029eed24001bGaNu00vu0LkTO"
+        },
+        {
+          "type": "text",
+          "text": "The tool reported: hello from the fake tool.",
+          "time": {
+            "start": 1786750366052,
+            "end": 1786750366108
+          },
+          "id": "prt_0029ef164001BQbKYvmPDnI11w",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029eed24001bGaNu00vu0LkTO"
+        },
+        {
+          "reason": "stop",
+          "snapshot": "307cce1474da89117f7a6ebd390087838c156e26",
+          "type": "step-finish",
+          "tokens": {
+            "total": 18,
+            "input": 11,
+            "output": 7,
+            "reasoning": 0,
+            "cache": {
+              "write": 0,
+              "read": 0
+            }
+          },
+          "cost": 0,
+          "id": "prt_0029ef366001KTlmOmMceWzxmf",
+          "sessionID": "ses_ffd6166e7ffe9F2LjXeJrj8wxF",
+          "messageID": "msg_0029eed24001bGaNu00vu0LkTO"
+        }
+      ]
+    }
+  ]
+}

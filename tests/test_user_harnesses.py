@@ -491,13 +491,13 @@ class TestRegistryIntegration:
         # run the harness default instead of what the agent asked for.
         manifest = dict(
             MINIMAL,
-            binary="kimiish",
+            binary="envish",
             exec={"base_args": ["run"]},  # no model_args, no effort_args
         )
-        write_harness(tmp_path, "kimiish", manifest)
-        h = load_user_harnesses(tmp_path)["kimiish"]
+        write_harness(tmp_path, "envish", manifest)
+        h = load_user_harnesses(tmp_path)["envish"]
         argv, warnings = build_exec_argv(h, "go", model="some/model", effort="high")
-        assert argv == ["kimiish", "run", "go"]
+        assert argv == ["envish", "run", "go"]
         # Informational (not alarming): names the model not added to argv and
         # that an env-configured wrapper still delivers it.
         assert any("some/model" in w and "no model flag" in w for w in warnings)

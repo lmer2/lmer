@@ -38,6 +38,7 @@ from pathlib import Path
 
 import pytest
 
+from lmer_cli import user_harnesses
 from lmer_platform import api, registry, runs, spawn, store, transcripts
 from lmer_platform import config as cfg
 from tests.conftest import denied_read, strip_lmer_env
@@ -67,6 +68,20 @@ def platform_root(tmp_path, monkeypatch):
     root = tmp_path / "platform"
     monkeypatch.setattr(store, "PLATFORM_DIR", str(root))
     return root
+
+
+@pytest.fixture(autouse=True)
+def _forget_gated_transcripts():
+    """Start every test with the version gate's memory empty.
+
+    That memory is module state on purpose — a file declaring a canonical format
+    this build cannot read is reported once for the daemon's life, not once per
+    poll — so a test that counts warnings can only count its own if the set does
+    not carry the previous test's files.
+    """
+    transcripts._LMER_FORMAT_WARNED.clear()
+    yield
+    transcripts._LMER_FORMAT_WARNED.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -2824,14 +2839,20 @@ def test_last_turn_reports_a_refusal_as_the_newest_turn(platform_root):
 #   *user-role* records. Rendering any of that as something the operator said is
 #   issue #242's class of bug, and it is the one thing here that is not cosmetic.
 # - **A file nobody can read is not an empty conversation.** An unknown format
-#   (kimi's wire log stands in for one) has to reach the operator as "on disk,
-#   nothing to show", never as a silent blank page.
+#   (a fourth harness's dialect this build does not speak) has to reach the
+#   operator as "on disk, nothing to show", never as a silent blank page.
 
 PI_FIXTURE = FIXTURES / "pi-session.jsonl"
 PI_TOOLS_FIXTURE = FIXTURES / "pi-tools.jsonl"
 CODEX_FIXTURE = FIXTURES / "codex-session.jsonl"
 CODEX_TOOLS_FIXTURE = FIXTURES / "codex-tools.jsonl"
-KIMI_FIXTURE = FIXTURES / "kimi-wire.jsonl"
+
+#: A fourth harness's own JSONL, invented rather than captured: a plausible
+#: agent-log dialect whose record types collide with none of the four
+#: vocabularies this build reads. Its records deliberately carry roles and
+#: content — that is the whole point of the fixture, since a reader that guessed
+#: at those shapes would attribute turns to the wrong party.
+UNKNOWN_FIXTURE = FIXTURES / "unknown-dialect.jsonl"
 
 
 def test_a_pi_conversation_normalises():
@@ -3128,6 +3149,11 @@ def test_a_record_of_nothing_but_wrappers_normalises_in_linear_time():
     # codex: the same, in its own envelope.
     {"type": "response_item", "payload": {"type": "message", "role": "user",
      "content": [{"type": "input_text", "text": "push with CREDENTIAL please"}]}},
+    # the canonical format: a drop-in's converter wrote this one, which is the
+    # case the chokepoint has to hold for most — the text was assembled by code
+    # the daemon has never seen.
+    {"type": "lmer.message", "role": "user", "kind": "said",
+     "text": "push with CREDENTIAL please"},
 ])
 def test_every_adapter_emits_through_the_scrub(record):
     """The chokepoint is the module's property, not each adapter's discipline:
@@ -3153,10 +3179,10 @@ def test_dispatch_is_per_record_not_per_file():
 
 
 def test_an_unknown_format_is_skipped_rather_than_guessed_at():
-    """kimi's wire log: a fourth harness's records, none of which this build
-    speaks. Every one of them is skipped, including the ones carrying a role and
-    content — guessing at a shape would attribute turns to the wrong party."""
-    assert transcripts.normalise_records(records(KIMI_FIXTURE)) == []
+    """A fourth harness's dialect this build does not speak. Every one of its
+    records is skipped, including the ones carrying a role and content — guessing
+    at a shape would attribute turns to the wrong party."""
+    assert transcripts.normalise_records(records(UNKNOWN_FIXTURE)) == []
 
 
 @pytest.mark.parametrize("fixture,harness", [
@@ -3176,7 +3202,7 @@ def test_the_source_says_which_harness_wrote_the_file(
 
 def test_a_file_nothing_recognises_keeps_the_label_it_came_with(platform_root):
     """No evidence, so nothing to correct the default with."""
-    plant_session("s-h2", fixture=KIMI_FIXTURE)
+    plant_session("s-h2", fixture=UNKNOWN_FIXTURE)
     page = transcripts.read_messages("s-h2")
     assert [source.harness for source in page.sources] == ["claude"]
 
@@ -3198,7 +3224,7 @@ def test_a_transcript_of_another_harness_reads_wherever_it_is_found(
 def test_a_transcript_this_build_cannot_read_says_so(platform_root):
     """The degradation that must survive: a file on disk that normalises to
     nothing is "nothing to show yet", never a silent blank page."""
-    plant_session("s-h4", fixture=KIMI_FIXTURE)
+    plant_session("s-h4", fixture=UNKNOWN_FIXTURE)
     page = transcripts.read_messages("s-h4")
     assert page.total == 0
     assert page.sources, "the file was not even read"
@@ -3255,3 +3281,814 @@ def test_last_turn_reads_a_pi_or_codex_tail(platform_root, fixture):
     turn = transcripts.last_turn("s-h5")
     assert turn is not None
     assert (turn.role, turn.text) == ("assistant", "Hello from the fake model.")
+
+
+# --- the canonical format any drop-in can write (#296) ------------------------
+#
+# The fourth vocabulary, and the only one this repo owns. The three above are a
+# closed set: every *other* harness is a drop-in, and a drop-in cannot ship
+# host-side code — so it ships an in-container converter that writes the
+# documented ``lmer.*`` records instead, and this adapter is the whole of what
+# the daemon grows for it, ever.
+#
+# The fixture is therefore *hand-authored* rather than captured, which is the
+# opposite of the sections above and for the opposite reason: this format is a
+# contract, so the fixture is the contract's own worked example (a meta header, a
+# said turn, an injected one, a pending tool resolved by a later update, a failed
+# tool inline, a provider refusal, and a record type from a version that does not
+# exist yet). A change that breaks it is a broken promise to a third party, not a
+# vendor's release note.
+#
+# Two properties carry this section:
+#
+# - **Every field is a claim, and the file is written by the container.** Roles,
+#   kinds, statuses and ``via`` are allowlisted, not echoed; the ask channel's
+#   ``via`` cannot be claimed by a file at all, because that is the platform's
+#   own statement that the operator spoke.
+# - **A version this build predates still reads.** Unknown ``lmer.*`` types are
+#   skipped as *this* format's, not fallen through to "unrecognised" — otherwise
+#   one new record type would turn a whole readable file into a blank page.
+
+LMER_FIXTURE = FIXTURES / "lmer-canonical.jsonl"
+
+
+def lmer_records(*extra):
+    """Canonical records, normalised — the adapter alone."""
+    return transcripts.normalise_records(list(extra))
+
+
+def test_a_canonical_transcript_normalises():
+    """The worked example, end to end: who spoke, in what kind, in what order."""
+    messages = transcripts.normalise_records(records(LMER_FIXTURE))
+    assert [(m.role, m.kind, m.text) for m in messages] == [
+        ("user", "said", "say hi"),
+        ("user", "injected",
+         "Session environment: cwd /workspace, branch prep-release."),
+        ("assistant", "said", "Hello from the fake model."),
+        ("user", "said", "now read the file that is not there"),
+        ("assistant", "said", "That file does not exist."),
+        # A refusal is ``said``, as the claude adapter's own refusal records
+        # normalise: ``notice`` would hide the one turn that explains a stall
+        # behind the view's internal toggle.
+        ("assistant", "said", "API Error: 400 billing_error"),
+        ("assistant", "said", "Done — anything else?"),
+    ]
+    assert messages[0].at == "2026-08-14T19:39:05.101Z"
+
+
+@pytest.mark.parametrize("type_of_record", [
+    "lmer.meta", "lmer.message", "lmer.tool_update",
+    # A version this build predates: still claimed by the namespace.
+    "lmer.turn_metrics",
+])
+def test_the_canonical_vocabulary_is_recognised_per_record(type_of_record):
+    """Claimed by its prefix rather than by a set of known types — which is what
+    keeps a version-2 record from reading as a format nobody speaks."""
+    assert transcripts._harness_of_record({"type": type_of_record}) == "lmer"
+
+
+def test_the_source_reports_the_harness_the_meta_record_declares(platform_root):
+    """A converter's records say only "this is the lmer format"; the drop-in's
+    own name is the one thing the file has to state, and it labels the Source."""
+    plant_session("s-lmer1", fixture=LMER_FIXTURE)
+    page = transcripts.read_messages("s-lmer1")
+    assert [source.harness for source in page.sources] == ["opencode"]
+    assert page.note is None
+
+
+def canonical_file(tmp_path, *lines):
+    """A canonical transcript written by hand, read through ``read_source``."""
+    path = tmp_path / "canonical.jsonl"
+    path.write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+    )
+    return transcripts.read_source(
+        transcripts.Source(path=path, session="s-lmer")
+    )
+
+
+def test_a_canonical_file_with_no_meta_is_labelled_by_its_format(tmp_path):
+    """The fallback, and the truthful one: the format is all such a file says
+    about its writer, so ``lmer`` is the label rather than the claude default."""
+    _, source = canonical_file(tmp_path, {
+        "type": "lmer.message", "role": "assistant", "text": "hello",
+    })
+    assert source.harness == "lmer"
+
+
+def test_a_declared_harness_name_that_is_not_a_harness_name_is_not_a_label(
+    tmp_path
+):
+    """The label reaches an HTTP response and the file is written by the
+    container being observed, so the name is held to the manifest grammar."""
+    _, source = canonical_file(
+        tmp_path,
+        {"type": "lmer.meta", "format": 1, "harness": "../../etc/passwd"},
+        {"type": "lmer.message", "role": "assistant", "text": "hello"},
+    )
+    assert source.harness == "lmer"
+
+
+def test_a_canonical_meta_cannot_relabel_another_harnesss_file(tmp_path):
+    """First format recognised still wins: a claude file that happens to carry a
+    canonical meta row is a claude file, whatever the row claims."""
+    _, source = canonical_file(
+        tmp_path,
+        {"type": "user", "message": {"role": "user", "content": "say hi"}},
+        {"type": "lmer.meta", "format": 1, "harness": "opencode"},
+    )
+    assert source.harness == "claude"
+
+
+def test_a_tool_update_resolves_the_call_it_names():
+    """Append-only correlation: the turn was written while the tool was still
+    running and is never rewritten, so the outcome arrives as its own line."""
+    messages = transcripts.normalise_records(records(LMER_FIXTURE))
+    calls = [tool for message in messages for tool in message.tools]
+    assert [(t.name, t.detail, t.status, t.error) for t in calls] == [
+        ("bash", "echo transcript probe", "ok", None),
+        ("read", "/workspace/missing.txt", "failed",
+         "ENOENT: no such file or directory"),
+    ]
+
+
+def test_a_tool_update_for_a_call_nobody_emitted_is_a_no_op():
+    """The file is read in one pass from wherever it was opened — ``last_turn``
+    seeks into the middle of one — so an update whose call is out of view has
+    nothing to fold onto. Silently nothing, never a raised read."""
+    messages = lmer_records(
+        {"type": "lmer.tool_update", "id": "call_from_an_earlier_page",
+         "status": "failed", "error": "exit 1"},
+        {"type": "lmer.message", "role": "assistant", "text": "carrying on"},
+    )
+    assert [(m.role, m.text, m.tools) for m in messages] == [
+        ("assistant", "carrying on", []),
+    ]
+
+
+def test_a_tool_update_carries_the_failure_text_onto_the_chip():
+    """The interesting case, and the one that lives in a different record from
+    the call it belongs to."""
+    tool = lmer_records(
+        {"type": "lmer.message", "role": "assistant", "text": "running it",
+         "tools": [{"id": "c1", "name": "bash", "detail": "false"}]},
+        {"type": "lmer.tool_update", "id": "c1", "status": "failed",
+         "error": "exit status 1\nand a second line nobody needs"},
+    )[0].tools[0]
+    assert (tool.status, tool.error) == ("failed", "exit status 1")
+
+
+@pytest.mark.parametrize("role", ["user", "assistant", "system", "monitor"])
+def test_the_roles_the_view_can_title_are_the_roles_a_file_may_claim(role):
+    assert lmer_records(
+        {"type": "lmer.message", "role": role, "text": "hello"}
+    )[0].role == role
+
+
+@pytest.mark.parametrize("role", ["tool", "developer", "operator", "", 7, None])
+def test_a_canonical_record_in_a_role_nobody_can_title_is_skipped(role):
+    """The tolerance contract's direction: a record that fails the rules costs
+    itself. Inventing a role would be the view attributing a turn to a party it
+    cannot draw."""
+    assert lmer_records(
+        {"type": "lmer.message", "role": role, "text": "hello"}
+    ) == []
+
+
+def test_a_kind_defaults_to_said_and_an_unknown_one_is_not_guessed_at():
+    """``kind`` is optional, and its absence has an answer the format states.
+    A value outside the three is not that answer: defaulting it to ``said``
+    would draw machinery as a person, which is the failure this whole module
+    keeps closing."""
+    assert lmer_records(
+        {"type": "lmer.message", "role": "user", "text": "say hi"}
+    )[0].kind == "said"
+    assert lmer_records(
+        {"type": "lmer.message", "role": "user", "kind": "whispered",
+         "text": "say hi"}
+    ) == []
+
+
+@pytest.mark.parametrize("kind", transcripts.MESSAGE_KINDS)
+def test_the_three_kinds_a_view_can_draw_are_the_three_a_file_may_claim(kind):
+    """``notice`` earns its own pin now that the worked example's refusal is
+    ``said``: it is still a kind a converter may write, for the harness talking
+    to the operator rather than for the provider refusing."""
+    assert lmer_records(
+        {"type": "lmer.message", "role": "assistant", "kind": kind, "text": "hi"}
+    )[0].kind == kind
+
+
+def test_a_refusal_with_no_prose_of_its_own_is_dropped_with_its_evidence():
+    """Why the document tells a converter to synthesise text for a refusal.
+
+    A native refusal envelope usually carries no prose, and the
+    neither-text-nor-tools rule is applied to the assembled turn — so a record
+    that is nothing but ``api_refusal`` renders as nothing, and takes the stall
+    evidence with it rather than reaching :func:`inventory._stalled`. Pinned
+    because the document now makes a promise about it (synthesise the text), and
+    a promise nothing asserts is one the next change breaks quietly.
+    """
+    bare = {
+        "type": "lmer.message", "role": "assistant", "kind": "said", "text": "",
+        "api_refusal": True, "api_error": "billing_error",
+        "api_error_status": 400,
+    }
+    assert lmer_records(bare) == []
+
+    spoken = lmer_records(dict(bare, text="Provider refusal: billing_error"))[0]
+    assert (spoken.role, spoken.kind, spoken.api_refusal, spoken.api_error) == (
+        # ``said``, so the turn that explains a stalled run is visible without the
+        # view's internal toggle — the same shape claude's own refusals take
+        # (:func:`transcripts._api_error_of`).
+        "assistant", "said", True, "billing_error",
+    )
+
+
+@pytest.mark.parametrize("record, expected", [
+    # The two fields the document calls optional-with-a-default. A serialiser
+    # that emits null for an unset optional is the ordinary case, not a claim —
+    # and reading null as "invalid" cost the whole turn, silently.
+    ({"type": "lmer.message", "role": "user", "kind": None, "text": "say hi"},
+     ("said", [])),
+    ({"type": "lmer.message", "role": "user", "text": "say hi",
+      "tools": [{"name": "bash", "status": None}]},
+     ("said", [("bash", "pending")])),
+])
+def test_an_explicit_null_on_a_defaulted_field_reads_as_the_default(
+    record, expected
+):
+    """``kind: null`` and ``status: null`` are how most serialisers write "not
+    set", which the format already has an answer for. Only these two: every other
+    field's null is still a value this reader will not invent one for."""
+    message = lmer_records(record)[0]
+    assert (message.kind, [(t.name, t.status) for t in message.tools]) == expected
+
+
+def test_a_rejected_canonical_record_says_which_field_cost_it(caplog):
+    """The one vocabulary whose writer can act on the diagnostic: a drop-in's
+    converter is third-party code written against a published contract, so
+    "which field" is the answer its author needs. Debug, because a busy converter
+    with a bug would otherwise write the daemon's log for it."""
+    with caplog.at_level("DEBUG", logger="lmer_platform.transcripts"):
+        assert lmer_records(
+            {"type": "lmer.message", "role": "user", "kind": "whispered",
+             "text": "say hi"},
+            {"type": "lmer.message", "role": "assistant", "text": "running it",
+             "tools": [{"name": "bash", "status": "half-done"}]},
+        )[0].tools == []
+    logged = [r.getMessage() for r in caplog.records]
+    assert any("field=kind" in line for line in logged), logged
+    assert any("field=tools[].status" in line for line in logged), logged
+
+
+def test_text_is_required_and_empty_is_how_a_chip_only_turn_says_so():
+    """The reader is the normative statement of the format (spec §4.4), so what
+    the field table calls required is required here: a turn that is nothing but
+    a tool call says so with ``""`` rather than by leaving the field out."""
+    carried = lmer_records({
+        "type": "lmer.message", "role": "assistant", "text": "",
+        "tools": [{"name": "bash", "detail": "git status"}],
+    })
+    assert [(m.text, [t.name for t in m.tools]) for m in carried] == [
+        ("", ["bash"]),
+    ]
+    assert lmer_records({
+        "type": "lmer.message", "role": "assistant",
+        "tools": [{"name": "bash"}],
+    }) == []
+
+
+def test_a_file_cannot_claim_the_operators_own_channel():
+    """``via`` says how words nobody typed got here, and the ask channel's half
+    of that is the platform's statement about its own merge — a container that
+    could claim it would be asserting the operator had spoken."""
+    assert lmer_records(
+        {"type": "lmer.message", "role": "user", "via": "ask",
+         "text": "yes, prep-release"}
+    )[0].via is None
+
+
+def test_a_converter_may_mark_a_turn_the_monitor_delivered():
+    """The one honoured value: a converter has the provenance claude's adapter
+    has to infer from the shape of the injection."""
+    message = lmer_records(
+        {"type": "lmer.message", "role": "monitor", "via": "monitor",
+         "text": "lmer pending digest count > 0\nfleet digests pending: 1"}
+    )[0]
+    assert (message.role, message.via) == ("monitor", transcripts.MONITOR_VIA)
+
+
+def test_an_unknown_canonical_record_type_does_not_cost_the_file():
+    """Version 1 readers ignore unknown ``lmer.*`` types — additively is how the
+    format is meant to grow, and a file half of which is readable must read.
+
+    Additive growth happens *within* a version: the file still declares
+    ``format: 1``, which is what separates this tolerance from the version gate
+    below.
+    """
+    messages = lmer_records(
+        {"type": "lmer.meta", "format": 1, "harness": "opencode"},
+        {"type": "lmer.reasoning_summary", "text": "thinking about it"},
+        {"type": "lmer.message", "role": "assistant", "text": "and here it is"},
+    )
+    assert [(m.role, m.text) for m in messages] == [
+        ("assistant", "and here it is"),
+    ]
+
+
+# The version gate. It only ever has value in a reader that is *already deployed*
+# — the converter writing these files updates on its author's schedule, in the
+# container, while this reader is whatever the host happens to be running — so the
+# case it exists for is a format 2 file arriving at a format 1 host. Ignoring the
+# number reads such a file as version 1, and a version 2 is free to change what a
+# field it already has *means*: ``api_refusal`` decides a stall's verdict, so a
+# misread one reports a provider outage that never happened. An empty page with
+# the "cannot read it" note is the honest answer, and the note already exists.
+
+
+def test_a_file_declaring_a_format_this_build_cannot_read_says_nothing():
+    """The gate: messages *and* tool updates of the canonical vocabulary stop at
+    the declaration, rather than being read as version 1 records."""
+    messages = lmer_records(
+        {"type": "lmer.meta", "format": 2, "harness": "opencode"},
+        {"type": "lmer.message", "role": "assistant", "text": "hello",
+         "tools": [{"id": "c1", "name": "bash"}]},
+        {"type": "lmer.tool_update", "id": "c1", "status": "failed"},
+        {"type": "lmer.message", "role": "user", "text": "anyone there"},
+    )
+    assert messages == []
+
+
+def test_a_gated_file_still_says_which_drop_in_wrote_it(tmp_path):
+    """A meta whose ``harness`` is usable still labels the Source. It costs
+    nothing — the file emits no turns either way — and naming the drop-in is what
+    tells whoever finds the empty page which converter to go and look at."""
+    messages, source = canonical_file(
+        tmp_path,
+        {"type": "lmer.meta", "format": 2, "harness": "opencode"},
+        {"type": "lmer.message", "role": "assistant", "text": "hello"},
+    )
+    assert (messages, source.harness, source.messages) == ([], "opencode", 0)
+
+
+def plant_gated_canonical(session_id):
+    """A canonical transcript declaring a format this build does not speak."""
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir(session_id) / "_lmer"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "session.jsonl"
+    path.write_text(
+        '{"type":"lmer.meta","format":2,"harness":"opencode"}\n'
+        '{"type":"lmer.message","role":"assistant","text":"hello"}\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_gated_file_reads_as_the_empty_transcript_the_operator_is_told_about(
+    platform_root
+):
+    """What the operator actually gets: the page that says a transcript is on
+    disk and this build cannot read it, not a blank conversation."""
+    plant_gated_canonical("s-lmer-gate")
+    page = transcripts.read_messages("s-lmer-gate")
+    assert page.total == 0
+    assert page.note == transcripts.EMPTY_TRANSCRIPT_NOTE
+
+
+def test_the_gate_is_the_declaring_records_and_the_ones_after_it():
+    """Stated per file and from the declaration on. A turn already read stays
+    read — the reader is one pass over an append-only file, and the alternative
+    is holding every message until the last line to find out whether to keep it."""
+    messages = lmer_records(
+        {"type": "lmer.message", "role": "user", "text": "before"},
+        {"type": "lmer.meta", "format": 2, "harness": "opencode"},
+        {"type": "lmer.message", "role": "assistant", "text": "after"},
+    )
+    assert [m.text for m in messages] == ["before"]
+
+
+@pytest.mark.parametrize("meta", [
+    # Absent, and every shape a version cannot be read out of: the gate needs a
+    # number to compare, and no number means the version-1 reading it has always
+    # had rather than a refusal.
+    {"type": "lmer.meta", "harness": "opencode"},
+    {"type": "lmer.meta", "format": "2", "harness": "opencode"},
+    {"type": "lmer.meta", "format": 2.0, "harness": "opencode"},
+    {"type": "lmer.meta", "format": None, "harness": "opencode"},
+    {"type": "lmer.meta", "format": [2], "harness": "opencode"},
+    # ``True`` is an ``int`` in Python and would compare as 1 — the same trap
+    # ``api_error_status`` closes.
+    {"type": "lmer.meta", "format": True, "harness": "opencode"},
+    # And the version this build actually speaks.
+    {"type": "lmer.meta", "format": 1, "harness": "opencode"},
+])
+def test_a_format_that_is_not_a_later_version_reads_as_version_one(meta):
+    assert [m.text for m in lmer_records(
+        meta, {"type": "lmer.message", "role": "assistant", "text": "hello"},
+    )] == ["hello"]
+
+
+def test_the_gate_costs_the_file_that_declared_it_and_no_other(platform_root):
+    """Per file, because the declaration is a file's statement about itself: a
+    run's other transcripts are read exactly as they were."""
+    registry.register("s-lmer-gate2", pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir("s-lmer-gate2") / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "a-future.jsonl").write_text(
+        '{"type":"lmer.meta","format":2,"harness":"opencode"}\n'
+        '{"type":"lmer.message","role":"assistant","text":"unreadable"}\n',
+        encoding="utf-8",
+    )
+    (directory / "b-claude.jsonl").write_text(
+        SESSION_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    page = transcripts.read_messages(
+        "s-lmer-gate2", limit=transcripts.MAX_MESSAGE_LIMIT
+    )
+    expected = transcripts.normalise_records(records(SESSION_FIXTURE))
+    assert [m.text for m in page.messages] == [m.text for m in expected]
+    assert [source.harness for source in page.sources] == ["opencode", "claude"]
+
+
+def test_a_gated_file_is_reported_once_however_often_it_is_read(
+    platform_root, caplog
+):
+    """Once per *file*, not once per read. Both readers of a transcript are polls
+    — the chat view every few seconds, the fleet view every cycle — and a gated
+    file stays gated, so a warning keyed on the read would restate the same fact
+    forever and bury everything else in the daemon's log."""
+    plant_gated_canonical("s-lmer-once")
+    with caplog.at_level("DEBUG", logger="lmer_platform.transcripts"):
+        for _ in range(4):
+            assert transcripts.read_messages("s-lmer-once").total == 0
+    warnings = [
+        record for record in caplog.records
+        if record.levelname == "WARNING"
+        and "lmer_format_unsupported" in record.getMessage()
+    ]
+    assert len(warnings) == 1, [w.getMessage() for w in warnings]
+    # Keyed on the file, so the message has to name it.
+    assert "path=" in warnings[0].getMessage()
+
+
+def test_records_with_no_file_to_key_on_still_say_it_at_debug(caplog):
+    """``normalise_records`` is handed records, not a path, so nothing here can
+    promise to say this once — it is said at debug, where a caller in a loop
+    cannot flood a log nobody asked to read."""
+    with caplog.at_level("DEBUG", logger="lmer_platform.transcripts"):
+        assert lmer_records(
+            {"type": "lmer.meta", "format": 2, "harness": "opencode"},
+            {"type": "lmer.message", "role": "assistant", "text": "hello"},
+        ) == []
+    gated = [
+        record for record in caplog.records
+        if "lmer_format_unsupported" in record.getMessage()
+    ]
+    assert [record.levelname for record in gated] == ["DEBUG"]
+
+
+# The gate has to hold on the *tail* read as well, because that is the read the
+# gate's own justification points at: halt detection asks ``last_turn`` who spoke
+# last, and takes ``api_refusal`` from the answer as a stall verdict
+# (``inventory._stalled``). A tail read starts 256 KiB from the end and would
+# never see a header at the top of a long file — so the version the file declares
+# is exactly the per-file statement a seeked read misses, and ``last_turn``
+# prefixes the first line back on for it.
+
+def plant_canonical_tail(session_id, *, declares, filler=90):
+    """A canonical file longer than the tail bound: header, filler, a refusal.
+
+    The shape halt detection meets in the field — a long session whose newest turn
+    is the provider refusing — with the version declared in the header, out of
+    reach of the seek.
+    """
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir(session_id) / "_lmer"
+    directory.mkdir(parents=True, exist_ok=True)
+    lines = [{"type": "lmer.meta", "format": declares, "harness": "opencode"}]
+    lines += [
+        {"type": "lmer.message", "role": "assistant", "kind": "said",
+         "text": f"filler turn {index} " + "x" * 4000,
+         "at": f"2026-08-14T19:{index % 60:02d}:00.000Z"}
+        for index in range(filler)
+    ]
+    lines.append({
+        "type": "lmer.message", "role": "assistant", "kind": "said",
+        "text": "API Error: 400 billing_error", "at": "2026-08-14T20:00:00.000Z",
+        "api_refusal": True, "api_error": "billing_error",
+        "api_error_status": 400,
+    })
+    path = directory / f"{session_id}.jsonl"
+    path.write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+    )
+    return path
+
+
+def test_a_gated_file_does_not_answer_halt_detection_either(platform_root):
+    """The consumer the gate is *for*: a stall verdict read out of a file the
+    chat view has already refused to show. Version 2 is free to redefine
+    ``api_refusal``, and this path would have reported a provider outage on it."""
+    path = plant_canonical_tail("s-lmer-tail1", declares=2)
+    assert path.stat().st_size > transcripts.LAST_TURN_TAIL_BYTES, (
+        "the fixture fits in the tail, so the seek this is about never happens"
+    )
+    # The measurement the fix rests on: the tail alone cannot see the header, so
+    # without the prefix these records read as version 1 and answer the poll.
+    tail_only = transcripts._normalise(transcripts._tail_records(
+        path, tail_bytes=transcripts.LAST_TURN_TAIL_BYTES
+    ))[0]
+    assert tail_only and tail_only[-1].api_refusal is True
+
+    assert transcripts.last_turn("s-lmer-tail1") is None
+
+
+def test_the_same_file_at_a_format_this_build_speaks_still_answers(platform_root):
+    """The control, and the property the prefix must not cost: an ordinary long
+    canonical session still gets its verdict from the tail."""
+    plant_canonical_tail("s-lmer-tail2", declares=1)
+    turn = transcripts.last_turn("s-lmer-tail2")
+    assert turn is not None
+    assert (turn.text, turn.api_refusal, turn.api_error) == (
+        "API Error: 400 billing_error", True, "billing_error",
+    )
+
+
+def test_a_first_line_that_is_no_header_does_not_cost_the_tail_read(platform_root):
+    """Every way a first line can fail is silent and changes nothing: the header
+    read is an extra, and a file whose top is a torn or foreign line is exactly
+    the file this reader is built to keep answering for."""
+    registry.register("s-lmer-tail3", pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir("s-lmer-tail3") / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    filler = [turn_line("assistant", "x" * 4096) for _ in range(80)]
+    (directory / "session.jsonl").write_text(
+        "not json at all\n" + "\n".join(filler) + "\n"
+        + turn_line("user", "the newest thing") + "\n",
+        encoding="utf-8",
+    )
+    assert transcripts.last_turn("s-lmer-tail3").text == "the newest thing"
+
+
+def test_a_first_line_that_is_a_turn_is_not_read_back_as_the_newest(platform_root):
+    """The prefix carries a per-file statement, never a turn. A claude file can
+    open with a record that normalises to a message (three fixtures do), and a
+    tail window can hold no message-producing records at all — prepending that
+    first line would then hand halt detection the session's *oldest* turn as its
+    newest, a stale verdict where the caller was promised "no opinion"."""
+    registry.register("s-lmer-tail4", pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir("s-lmer-tail4") / "-workspace"
+    directory.mkdir(parents=True, exist_ok=True)
+    bookkeeping = json.dumps(
+        {"type": "file-history-snapshot", "snapshot": "y" * 4096}
+    )
+    path = directory / "session.jsonl"
+    path.write_text(
+        turn_line("user", "ANCIENT FIRST TURN") + "\n"
+        + (bookkeeping + "\n") * 90,
+        encoding="utf-8",
+    )
+    assert path.stat().st_size > transcripts.LAST_TURN_TAIL_BYTES, (
+        "the fixture fits in the tail, so the seek this is about never happens"
+    )
+    assert transcripts.last_turn("s-lmer-tail4") is None
+
+
+def test_the_header_is_only_read_back_for_a_seek_that_skipped_it(tmp_path):
+    """The other half of the prefix: a file the tail read whole already has its
+    first record, and prepending it again would double a turn."""
+    path = tmp_path / "canonical.jsonl"
+    path.write_text(
+        json.dumps({"type": "lmer.meta", "format": 1, "harness": "opencode"})
+        + "\n", encoding="utf-8",
+    )
+    assert transcripts._head_record(
+        path, tail_bytes=transcripts.LAST_TURN_TAIL_BYTES
+    ) is None
+    # And read when the seek would have skipped it.
+    assert transcripts._head_record(path, tail_bytes=8)["harness"] == "opencode"
+
+
+def test_the_canonical_grammar_for_a_harness_name_is_the_manifests_own():
+    """One grammar, restated rather than imported (the label reaches an HTTP
+    response), so the two spellings are pinned equal instead of left to drift."""
+    assert (
+        transcripts._HARNESS_NAME_RE.pattern == user_harnesses._NAME_RE.pattern
+    )
+
+
+@pytest.mark.parametrize("name", [
+    # ``$`` matches before a final newline, so ``match`` accepted this and the
+    # label reached the API with the newline in it.
+    "opencode\n",
+    "opencode\nharness",
+    "opencode\x00",
+    "opencode\x1b[31m",
+])
+def test_a_declared_name_with_a_trailing_line_break_is_not_a_label(
+    tmp_path, name
+):
+    """The name is a label in an HTTP response written by the container being
+    observed, so it is held to the whole of the grammar, end included."""
+    _, source = canonical_file(
+        tmp_path,
+        {"type": "lmer.meta", "format": 1, "harness": name},
+        {"type": "lmer.message", "role": "assistant", "text": "hello"},
+    )
+    assert source.harness == "lmer"
+
+
+def test_a_tool_entry_that_cannot_name_itself_is_dropped_and_the_turn_is_not():
+    """A chip is its name; an anonymous one invites the reader to guess. The
+    prose around it is a turn either way, so the entry is what is lost — and an
+    unusable ``status`` is the same call, since "pending" would draw a tool that
+    had finished as still running."""
+    message = lmer_records({
+        "type": "lmer.message", "role": "assistant", "text": "two of three ran",
+        "tools": [
+            {"name": "bash", "detail": "git status"},
+            {"detail": "no name at all"},
+            {"name": "read", "status": "half-done"},
+            {"name": "grep", "status": "ok"},
+        ],
+    })[0]
+    assert [(t.name, t.status) for t in message.tools] == [
+        ("bash", "pending"), ("grep", "ok"),
+    ]
+
+
+def test_a_canonical_tool_hint_is_bounded_like_every_other_one():
+    """``detail`` arrives as a one-line hint rather than being derived from an
+    input mapping, so the cap is the one thing this adapter still has to apply."""
+    tool = lmer_records({
+        "type": "lmer.message", "role": "assistant", "text": "running it",
+        "tools": [{"name": "bash", "detail": "echo " + "x" * 400}],
+    })[0].tools[0]
+    assert len(tool.detail) == transcripts.DETAIL_LIMIT
+
+
+@pytest.mark.parametrize("at, expected", [
+    # What a converter is asked for, in both spellings the merge parses.
+    ("2026-08-14T19:39:06.752Z", "2026-08-14T19:39:06.752Z"),
+    ("2026-08-14T19:39:06+00:00", "2026-08-14T19:39:06+00:00"),
+    # Not a time, and every other adapter's timestamp comes from a vendor while
+    # this one comes from the container being observed. It is drawn beside a
+    # speaker's name and hovered for the raw value, so what it may hold is a
+    # timestamp's shape rather than a length.
+    ("Bearer sk-live-4f3c9a2b7e1d", None),
+    ("<img src=x onerror=alert(1)>", None),
+    ("x" * 4000, None),
+    ("", None),
+    (7, None),
+])
+def test_a_timestamp_that_will_not_parse_is_dropped_rather_than_echoed(
+    at, expected
+):
+    """``at`` goes through the same parser the ask-channel merge orders by
+    (:func:`transcripts._timestamp_key`), which is the only reading of it anyone
+    here has. One that does not parse is no time at all — already the answer for
+    a turn that carried none."""
+    assert lmer_records(
+        {"type": "lmer.message", "role": "assistant", "text": "hi", "at": at}
+    )[0].at == expected
+
+
+def test_a_provider_refusal_reaches_halt_detection_from_a_canonical_file():
+    """What carrying those three fields buys a drop-in: the ``api_error`` stall
+    path instead of the backstop, on the same evidence claude's own marking
+    gives (:func:`transcripts._api_error_of`)."""
+    refusal = [
+        m for m in transcripts.normalise_records(records(LMER_FIXTURE))
+        if m.api_refusal
+    ]
+    assert len(refusal) == 1
+    assert (refusal[0].api_error, refusal[0].api_error_status) == (
+        "billing_error", 400,
+    )
+
+
+@pytest.mark.parametrize("record", [
+    # Truthiness is not the gate: a refusal is a statement the writer makes.
+    {"type": "lmer.message", "role": "assistant", "text": "hi",
+     "api_refusal": "yes", "api_error": "billing_error"},
+    # ``True`` is an int in Python, and an HTTP status of 1 is not a status.
+    {"type": "lmer.message", "role": "assistant", "text": "hi",
+     "api_refusal": True, "api_error_status": True},
+])
+def test_a_refusals_detail_is_validated_not_echoed(record):
+    message = lmer_records(record)[0]
+    assert message.api_error_status is None
+    assert message.api_refusal is (record.get("api_refusal") is True)
+
+
+def test_last_turn_reads_a_canonical_tail(platform_root):
+    """Halt detection asks the same question of a drop-in's transcript, and gets
+    it from the tail of the file rather than by reading the whole of it."""
+    registry.register("s-lmer2", pid=DEAD_PID, run=dict(RUN))
+    directory = transcripts.session_transcript_dir("s-lmer2") / "_lmer"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "session.jsonl").write_text(
+        LMER_FIXTURE.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    turn = transcripts.last_turn("s-lmer2")
+    assert turn is not None
+    assert (turn.role, turn.text) == ("assistant", "Done — anything else?")
+
+
+def test_a_canonical_file_beside_a_native_one_reads_each_message_once(
+    platform_root
+):
+    """The layout a converting drop-in actually leaves behind: its output in the
+    reserved ``_lmer/`` subdirectory, the harness's own session files still
+    beside it in the declared ``session_dir``.
+
+    What this pins is that the native file is *inert* — its dialect is one no
+    adapter claims, so it normalises to nothing and adds neither turns nor an
+    ordering surprise to the canonical file beside it — and that the readable
+    file's turns are each read exactly once, in file order, with the page's total
+    agreeing. It does **not** pin anything about doubling: these two files hold
+    the same conversation in principle, but the native one is unreadable here, so
+    a reader that rendered both would still produce exactly this page. A drop-in
+    that wraps a *readable* harness and converts anyway would double every turn,
+    and nothing in this module detects that today — the governance rule in
+    HARNESSES.md ("do not ship a converter for an adapter-tier CLI") is the whole
+    of the defence.
+    """
+    registry.register("s-lmer3", pid=DEAD_PID, run=dict(RUN))
+    plant_at("s-lmer3", "_lmer/session.jsonl", LMER_FIXTURE)
+    plant_at("s-lmer3", "native/wire.jsonl", UNKNOWN_FIXTURE)
+
+    page = transcripts.read_messages("s-lmer3", limit=transcripts.MAX_MESSAGE_LIMIT)
+    expected = [
+        message.text
+        for message in transcripts.normalise_records(records(LMER_FIXTURE))
+    ]
+    assert [m.text for m in page.messages] == expected
+    assert page.total == len(expected)
+    # Both files were read; only one of them could say what wrote it.
+    assert [source.harness for source in page.sources] == ["opencode", "claude"]
+
+
+#: The opencode example's converter output, as its own tests produce it. Not a
+#: hand-authored contract sample like ``LMER_FIXTURE`` but the *actual* bytes a
+#: shipped drop-in writes, which is why the test below reads it for shape rather
+#: than for content: it is regenerated whenever that converter changes.
+OPENCODE_GOLDEN = (
+    Path(__file__).resolve().parent / "fixtures" / "opencode"
+    / "golden-canonical.jsonl"
+)
+
+
+def test_the_worked_examples_output_is_a_conversation_on_the_messages_route(
+    client, platform_root
+):
+    """The whole drop-in path, closed at the surface the operator reads.
+
+    ``examples/harnesses/opencode/`` is the documented worked example, and its
+    own tests stop at the converter's output. This one picks that output up where
+    the host finds it — the per-session transcript directory the container's
+    ``session_dir`` mount lands in (#280/#293 cover the mount itself) — and asks
+    ``GET /api/sessions/{id}/messages`` for it, which is the acceptance criterion
+    stated end to end: the operator's prompts read as ``said``, the harness's
+    injected material is marked ``injected`` and stays behind the view's toggle,
+    the assistant's turns render, and a tool the converter emitted as pending and
+    resolved with a later ``lmer.tool_update`` arrives resolved.
+
+    Asserted as shape, never as bytes: the fixture is regenerated from the real
+    converter, so pinning its text here would make that regeneration a failure in
+    this file.
+    """
+    session = "s-opencode"
+    plant_session(session, fixture=OPENCODE_GOLDEN)
+    plant_log(session)
+
+    response = client.get(
+        f"/api/sessions/{session}/messages?limit={transcripts.MAX_MESSAGE_LIMIT}",
+        headers=bearer_header(),
+    )
+    assert response.status_code == 200
+    body = response.json()
+
+    # A conversation, not the "cannot read it" note — and labelled by the drop-in
+    # that wrote it rather than by the claude default a Source carries.
+    assert body["note"] is None
+    assert [source["harness"] for source in body["sessions"]] == ["opencode"]
+
+    served = body["messages"]
+    assert body["total"] == len(served) > 0
+    assert [m["seq"] for m in served] == list(range(len(served)))
+
+    spoken = [(m["role"], m["kind"]) for m in served]
+    assert ("user", "said") in spoken
+    assert ("user", "injected") in spoken or ("system", "injected") in spoken
+    assert any(role == "assistant" and kind == "said" for role, kind in spoken)
+
+    tools = [
+        (tool["name"], tool["status"])
+        for message in served if message["role"] == "assistant"
+        for tool in message["tools"]
+    ]
+    assert ("bash", "ok") in tools, tools
