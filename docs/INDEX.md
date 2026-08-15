@@ -125,6 +125,24 @@ adapt for any other agent CLI.
 
 ---
 
+### [TRANSCRIPT-FORMAT.md](./TRANSCRIPT-FORMAT.md)
+**The lmer transcript format (version 1)**
+
+The public contract a drop-in harness converts its sessions into so they render
+in the orchestrator's chat view:
+- The three record types (`lmer.meta`, `lmer.message`, `lmer.tool_update`) with
+  full field semantics and examples
+- The constraints the reader enforces (append-only, self-contained lines,
+  sizing, discovery, scrubbing)
+- What each canonical field looks like in the chat view
+- Converter lifecycle: the backgrounded tailer in `runner.sh`, per-record flush,
+  and the alternative end-of-session pass
+
+**Best for**: Making a user-installed harness's transcripts readable without
+any change to lmer itself.
+
+---
+
 ### [PROMPT-FRAGMENTS.md](./PROMPT-FRAGMENTS.md)
 **Prompt Fragments**
 

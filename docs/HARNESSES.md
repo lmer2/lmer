@@ -560,9 +560,9 @@ path to it before any harness starts. The reason is ownership: a bind mount's
 missing parent directories are created by the container runtime as **root**,
 before any container process exists, and the session runs as `developer` with
 no-new-privileges — so nothing inside can chown them. A harness that writes a
-sibling file next to its own mount (kimi's `~/.kimi-code/tui.html` beside
-`~/.kimi-code/sessions`, opencode's `mkdir ~/.local/share/opencode/repos` beside
-its `auth.json`) would die at startup with EACCES. The symlink is created by the
+sibling file next to its own mount (opencode's `mkdir
+~/.local/share/opencode/repos` beside its `auth.json`) would die at startup with
+EACCES. The symlink is created by the
 container user, so the parent chain is developer-owned and those writes work. No
 manifest change is needed — declare the path the harness actually uses; the
 pairs travel as `LMER_MOUNT_LINKS` (see [LMER-CLI.md](./LMER-CLI.md)).
@@ -666,8 +666,9 @@ existence.
 
 ### Transcript visibility (orchestrator chat view)
 
-Declaring `session_dir` is all a user harness does to become readable from the
-orchestrator's chat view. `lmer platform` creates one host directory per
+Declaring `session_dir` is all a user harness does to get its session files
+onto the host (readability is the tier question below). `lmer platform`
+creates one host directory per
 declaring harness underneath the session's own transcript directory and mounts
 it read-write into the container — at the declared path for a built-in, at a
 staged path the entrypoint symlinks the declared one to for a user harness (see
@@ -685,32 +686,45 @@ transcript mount.
 
 **Mounting is not reading**, and there are exactly two tiers of format support:
 
-- **A format the normaliser has a per-record adapter for** renders as a
-  conversation — roles, text, timestamps, tool calls with their outcome. Today
-  that is Claude Code, pi (session format 3) and codex (rollout format).
-- **Any other format** is reported explicitly: the page comes back empty
-  carrying the note *"The transcript for this run is on disk but has nothing to
-  show yet … so does one whose transcript this build cannot read."* Never a
-  silently blank page, which would read as "this run said nothing". The terminal
-  log remains the complete record either way.
+- **Adapter tier — the maintained harnesses.** Claude Code, pi (session format
+  3) and codex (rollout format) have per-record adapters in
+  `src/lmer_platform/transcripts.py`, so their native session files render as a
+  conversation: roles, text, timestamps, tool calls with their outcome. That set
+  is **closed** — no further in-tree dialect adapters are added unless the
+  operator says otherwise, and every other format integrates via the canonical
+  tier below. The rule is also what keeps one conversation from rendering twice:
+  a native file and its converted twin could only both render if a dialect
+  somebody already converts later gained an in-tree adapter, which this policy
+  forbids.
+- **Canonical tier — any drop-in.** A user harness makes its transcripts
+  readable by shipping an **in-container converter**: its own code, running
+  where the harness already runs, tailing the harness's native session files and
+  appending records in the documented
+  [lmer transcript format](./TRANSCRIPT-FORMAT.md) to a `.jsonl` file inside the
+  same declared `session_dir`. The reader recognises those records by their
+  `type`, per record, so nothing host-side has to be told the converter exists —
+  no manifest key, no in-tree change, no second mount.
 
-Adding a tier is a change to `src/lmer_platform/transcripts.py` (the dispatch is
-per record, keyed on the record's `type` values), not to the harness directory —
-a manifest cannot supply an adapter.
+A format with neither — no adapter, no converter — is reported explicitly: the
+page comes back empty carrying the note *"The transcript for this run is on disk
+but has nothing to show yet … so does one whose transcript this build cannot
+read."* Never a silently blank page, which would read as "this run said
+nothing". The terminal log remains the complete record in every case.
 
-Worked example, kimi code (`@moonshot-ai/kimi-code` 0.36.0). It writes
-`~/.kimi-code/sessions/wd_<cwd-slug>_<hash>/session_<uuid>/agents/main/wire.jsonl`,
-so its manifest line is:
+A drop-in cannot supply host-side *code* — the daemon never executes anything
+out of user-writable `~/.lmer/harnesses` — and does not need to: it ships an
+in-container converter instead, which is the same trust class as its
+`runner.sh`. A drop-in that *wraps* claude, codex or pi must **not** ship a
+converter; its native files already render.
 
-```json
-  "session_dir": "/home/developer/.kimi-code/sessions"
-```
-
-With that one line the `wire.jsonl` files land on the host, are scrubbed, and
-are inspectable — and the chat view answers with the cannot-read note, because
-kimi's wire format has no adapter yet (its records are the unknown-format
-fixture the reader is tested against,
-`tests/fixtures/transcripts/kimi-wire.jsonl`).
+Worked example: [`examples/harnesses/opencode/`](../examples/harnesses/opencode/)
+is a complete, copy-installable drop-in — `harness.json`, `runner.sh`,
+`converter.py` — demonstrating the canonical tier end to end, with the
+walkthrough in [USER-HARNESS-OPENCODE.md](./USER-HARNESS-OPENCODE.md). It is
+also the *decoupled* case: opencode keeps its sessions in a SQLite database, so
+nothing native lands in `session_dir` at all and the declared directory is
+purely the converter's output home — `session_dir` means "where readable
+transcripts appear", not "where the harness happens to write".
 
 Only `.jsonl` files inside the declared directory are discovered, recursively —
 a harness that writes `.json` or `.log` mounts out but never reads back — and a

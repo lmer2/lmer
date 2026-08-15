@@ -1,0 +1,11 @@
+{"type":"header","dialect":"acme-agent-log/2","protocol_version":"2.1","created_at":1786695545122}
+{"type":"policy.set","mode":"auto","tools":["shell","read","write"],"at":1786695545550}
+{"type":"turn.begin","turn":1,"role":"user","content":[{"type":"text","text":"say hi"}],"origin":{"kind":"keyboard"},"at":1786695545614}
+{"type":"context.push","entry":{"role":"user","text":"Instructions omitted from this fixture; the record shape is what matters."},"reason":"policy_preamble","at":1786695545630}
+{"type":"model.request","provider":"openai","model":"fake-model","message_count":2,"at":1786695545704}
+{"type":"stream.delta","turn":1,"role":"assistant","delta":{"kind":"text","text":"Hello from the fake model."},"at":1786695546752}
+{"type":"tool.invoke","turn":1,"call":"c1","tool":{"name":"shell","args":{"command":"echo transcript probe"}},"at":1786695546790}
+{"type":"tool.settle","turn":1,"call":"c1","ok":true,"output":"transcript probe\n","at":1786695546830}
+{"type":"turn.commit","turn":1,"message":{"role":"assistant","content":[{"type":"text","text":"Hello from the fake model."}],"tool_calls":[{"call":"c1","name":"shell"}]},"at":1786695546840}
+{"type":"usage.record","turn":1,"tokens":{"in":10,"out":7},"at":1786695546850}
+{"type":"run.finished","reason":"completed","duration_ms":1140,"at":1786695546758}

@@ -612,12 +612,12 @@ class TestMainEndToEnd:
             tmp_path,
             ["opus-review", "--prompt", "p", "--output", str(out)],
             exit_code=3,
-            stderr_text="No API key found for kimi-coding",
+            stderr_text="No API key found for acme-coding",
         )
         assert code == 3
         content = out.read_text()
         assert "[spawn-harness] child FAILED: exit code 3" in content
-        assert "No API key found for kimi-coding" in content
+        assert "No API key found for acme-coding" in content
 
     def test_successful_child_gets_no_footer(self, tmp_path):
         out = tmp_path / "result.md"
@@ -940,7 +940,7 @@ class TestFooterWriteFailuresKeepTheExitCode:
             tmp_path,
             ["opus-review", "--prompt", "p", "--output", str(out)],
             exit_code=3,
-            stderr_text="No API key found for kimi-coding",
+            stderr_text="No API key found for acme-coding",
         )
         assert code == 3
         assert "cannot append the failure footer" in capsys.readouterr().err
