@@ -97,9 +97,11 @@ from .presets import (
     task_preset_env_name,
 )
 from .runtime import (
+    apply_env_file_defaults,
     base_run_args,
     build_container_env,
     ContainerEnvError,
+    default_env_file_candidates,
     detect_runtime,
     lmer_state_dir,
     repo_root_path,
@@ -364,43 +366,6 @@ def _apply_port_passthrough(
     info("   (exposed inside the container via LMER_PORTS; bind services to 0.0.0.0)")
     _record_published_ports(picked_ports, port_bind)
     return None
-
-
-def apply_env_file_defaults(candidates: list[tuple[str, Path]]) -> dict[str, str]:
-    """Seed ``os.environ`` from ``.env`` files, first-wins, and report the sources.
-
-    First-wins means an already-exported variable is never overwritten: the
-    process environment outranks any file. Earlier candidates outrank later ones,
-    so callers pass them highest-priority first.
-
-    Shared by ``main()`` and by ``lmer platform`` (issue #141), which dispatches
-    before ``main()``'s own argument parsing and would otherwise never see
-    ``~/.lmer/.env`` — leaving the daemon without the work-repo URL and token an
-    operator had perfectly reasonably put there.
-
-    Returns ``{var: "…description…"}`` for ``--show-env`` attribution.
-    """
-    sources: dict[str, str] = {}
-    for location, env_file in candidates:
-        if not env_file.exists():
-            continue
-        for key, value in dotenv_values(dotenv_path=str(env_file)).items():
-            if key not in os.environ and value is not None:
-                os.environ[key] = value
-                sources[key] = f".env ({location})"
-    return sources
-
-
-def default_env_file_candidates(
-    *, state_dir: Path | None = None, cwd: Path | None = None
-) -> list[tuple[str, Path]]:
-    """The standard ``.env`` search order: working directory, then the state dir."""
-    from .runtime import lmer_state_dir
-
-    return [
-        ("working directory", (cwd or Path.cwd()) / ".env"),
-        ("lmer state dir", (state_dir or lmer_state_dir()) / ".env"),
-    ]
 
 
 def _record_platform_facts(**facts) -> None:

@@ -25,9 +25,6 @@ import asyncio
 import logging
 import os
 import sys
-from pathlib import Path
-
-from dotenv import load_dotenv
 
 from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.tls import ensure_ca_bundle
@@ -77,23 +74,19 @@ def _ensure_ca_bundle() -> None:
 def _load_env_files() -> None:
     """Populate ``os.environ`` from ``.env`` files the way the main lmer CLI does.
 
-    Sources, in precedence order (highest first):
-
-    1. the **active environment** — an already-exported variable always wins;
-    2. the **current working directory's** ``.env`` (the deployment dir);
-    3. ``~/.lmer/.env`` — lmer's shared state-dir config.
-
-    ``override=False`` keeps active env vars from being clobbered, and loading
-    the cwd file before the state-dir file makes cwd win between the two (the
-    first file to set a key keeps it). The state dir is resolved via
-    ``lmer_cli.runtime`` so it stays in lockstep with the main CLI.
+    Precedence, highest first: the active environment, the cwd ``.env``, then
+    ``~/.lmer/.env``. Implemented once in ``lmer_cli.runtime`` (issue #67);
+    ``references_from_environ=True`` keeps this caller's pre-#67 resolution of
+    ``${VAR}`` references inside a file. Imported late because ``lmer_cli.cli``
+    imports ``slack_chat``.
     """
-    from lmer_cli.runtime import lmer_state_dir
+    from lmer_cli.runtime import apply_env_file_defaults, default_env_file_candidates
 
-    for env_file in (Path.cwd() / ".env", lmer_state_dir() / ".env"):
-        if env_file.is_file():
-            load_dotenv(env_file, override=False)
-            logger.debug("loaded_env_file path=%s", env_file)
+    loaded = apply_env_file_defaults(
+        default_env_file_candidates(), references_from_environ=True
+    )
+    for key, source in loaded.items():
+        logger.debug("loaded_env_var key=%s source=%s", key, source)
 
 
 def _csv_env_set(name: str, default: str = "") -> set[str]:

@@ -121,6 +121,22 @@ _BOUNDARY = r"(?:^|[\s;&|()/])"
 _TRAIL = r"(?:[\s;&|)]|$)"
 _FLAG_TRAIL = r"(?:[\s;&|)=]|$)"
 
+# Leading boundary for a path-evidence row: the script must count as a command,
+# never as an argument to one (`cat`, `ls -l`, `git log -- <p>`), which is all
+# `_BOUNDARY` gives. Matches a shell simple-command prefix — assignments, then
+# wrappers and option tokens; assignments matter because the wrappers take no
+# arguments and read three exported variables. Braces are excluded everywhere:
+# `{` anchors `{ bash …; }` and must not anchor a `${VAR}` in an argument path.
+# Limits: an option token is accepted blindly (`bash -n <w>` reads as a run),
+# and no pattern over command text decides read-vs-run.
+_EXEC_WORDS = r"sudo|command|bash|sh|zsh|exec|source|env|nohup|time|timeout|then|do|else"
+_EXEC_POSITION = (
+    r"(?:^|[\n;&|(){])\s*"
+    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|(){}]*|-{1,2}[^\s;&|(){}]*|\d+|"
+    + _EXEC_WORDS + r")\s+)*"
+    r"(?:[^\s;&|(){}]*/)?"
+)
+
 # Quoted spans, blanked out before any pattern search: a command that merely
 # *talks about* a milestone (`git commit -m "… gate-push …"`,
 # `echo "then run lmer-signal"`) must not read as one. Blanked rather than
@@ -168,9 +184,9 @@ _MILESTONE_PATTERNS = (
     ("github-review --review-file",
      re.compile(_BOUNDARY + r"github-review\s[^\n]*--review-file" + _FLAG_TRAIL)),
     ("gitlab-review-post-review.sh",
-     re.compile(_BOUNDARY + r"gitlab-review-post-review\.sh" + _TRAIL)),
+     re.compile(_EXEC_POSITION + r"gitlab-review-post-review\.sh" + _TRAIL)),
     ("github-review-post-review.sh",
-     re.compile(_BOUNDARY + r"github-review-post-review\.sh" + _TRAIL)),
+     re.compile(_EXEC_POSITION + r"github-review-post-review\.sh" + _TRAIL)),
     ("work state set --status=complete",
      re.compile(_BOUNDARY + r"work\s+state\s+set\s[^\n]*--status(?:=|\s+)complete" + _TRAIL)),
 )

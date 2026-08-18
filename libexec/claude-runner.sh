@@ -295,9 +295,30 @@ AGENTS_COMBINED=""
 # bare `agents-prompt.*.md` glob deleted a concurrent session's file out from
 # under it, silently dropping its AGENTS.md injection (#276). $$ is unique
 # among live processes in the container, so the template below scopes every
-# file this runner creates, and the glob can never reach another runner's.
+# file this runner creates.
 AGENTS_PROMPT_TEMPLATE="/tmp/agents-prompt.$$.XXXXXX.md"
-rm -f /tmp/agents-prompt."$$".*.md 2>/dev/null
+
+# Collect by liveness: the pid in the name says whose file it is, and only a
+# dead owner's is removed — deleting a live session's file is the #276 bug, and
+# scoping the glob to "$$" (its first fix) collected nothing at all.
+# /proc rather than `kill -0`: EPERM and ESRCH are indistinguishable to a shell,
+# so a live process owned by another user would read as dead.
+for prompt_file in /tmp/agents-prompt.*.md; do
+    [ -f "$prompt_file" ] || continue
+    owner=${prompt_file#/tmp/agents-prompt.}
+    owner=${owner%%.*}
+    case "$owner" in
+        ''|*[!0-9]*) continue ;;  # not our naming scheme; not ours to delete
+    esac
+    if [ "$owner" != "$$" ]; then
+        if [ -d /proc/self ]; then
+            [ -d "/proc/$owner" ] && continue
+        else
+            kill -0 "$owner" 2>/dev/null && continue
+        fi
+    fi
+    rm -f "$prompt_file" 2>/dev/null
+done
 
 # Find workspace AGENTS.md
 WORKSPACE_AGENTS=""

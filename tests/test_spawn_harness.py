@@ -47,6 +47,27 @@ def _config_env(config=CONFIG):
     return {"LMER_SPAWN_AGENTS_CONFIG": json.dumps(config)}
 
 
+def _wait_for_pid_file(pid_file: Path, timeout: float = 15) -> int:
+    """The pid a stub child recorded, waiting for *content* (issue #142).
+
+    ``echo $$ > file`` truncates before writing, so waiting on ``exists()``
+    alone can read ``""`` and die in ``int("")``.
+    """
+    deadline = time.monotonic() + timeout
+    recorded = ""
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            recorded = pid_file.read_text().strip()
+            if recorded:
+                break
+        time.sleep(0.05)
+    assert recorded, (
+        f"stub child never recorded its pid in {pid_file} "
+        f"(exists={pid_file.exists()})"
+    )
+    return int(recorded)
+
+
 class TestLoadAgentsConfig:
     def test_absent_and_blank_yield_empty(self):
         assert load_agents_config({}) == {}
@@ -1055,6 +1076,26 @@ class TestMainValidation:
         assert "No agents configured" in capsys.readouterr().out
 
 
+class TestPidFileHandshake:
+    """The handshake the SIGTERM test depends on (issue #142)."""
+
+    def test_an_existing_but_empty_file_is_not_a_pid_yet(self, tmp_path):
+        pid_file = tmp_path / "child.pid"
+        pid_file.touch()  # the window `>` opens
+        writer = subprocess.Popen(
+            ["bash", "-c", f'sleep 0.4; echo 4321 > "{pid_file}"'])
+        try:
+            assert _wait_for_pid_file(pid_file, timeout=15) == 4321
+        finally:
+            writer.wait(timeout=15)
+
+    def test_nothing_recorded_fails_naming_the_file(self, tmp_path):
+        pid_file = tmp_path / "child.pid"
+        pid_file.write_text("   ")
+        with pytest.raises(AssertionError, match="never recorded its pid"):
+            _wait_for_pid_file(pid_file, timeout=0.2)
+
+
 class TestInterruptKillsChild:
     """SIGTERM/SIGINT on spawn-harness must not orphan the detached child
     process group: start_new_session detaches it from terminal signal
@@ -1080,11 +1121,7 @@ class TestInterruptKillsChild:
             text=True,
         )
         try:
-            deadline = time.monotonic() + 15
-            while not pid_file.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert pid_file.exists(), "stub child never started"
-            child_pid = int(pid_file.read_text())
+            child_pid = _wait_for_pid_file(pid_file)
 
             wrapper.send_signal(signal.SIGTERM)
             _, stderr = wrapper.communicate(timeout=15)

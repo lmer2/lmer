@@ -6,8 +6,10 @@ Slack calls.
 """
 
 import asyncio
+import inspect
 import json
 import os
+import re
 import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -762,6 +764,47 @@ class TestLoadEnvFiles:
         self._stub_state_dir(monkeypatch, state)
 
         listener._load_env_files()  # must not raise
+
+    def test_in_file_references_still_resolve_against_the_environment(
+        self, tmp_path, monkeypatch
+    ):
+        """The listener keeps its pre-#67 resolution: `${VAR}` inside a file
+        resolves against the active environment first, where the CLI's default
+        resolves it against the file. Rule 1 holds either way, so the
+        precedence tests above pass under both."""
+        cwd = tmp_path / "cwd"
+        cwd.mkdir()
+        (cwd / ".env").write_text(
+            "LMER_SLACK_ENVBASE=from_file\n"
+            "LMER_SLACK_ENVDERIVED=${LMER_SLACK_ENVBASE}/repo.git\n"
+        )
+        state = tmp_path / "state"
+        state.mkdir()
+        monkeypatch.chdir(cwd)
+        self._stub_state_dir(monkeypatch, state)
+        monkeypatch.setenv("LMER_SLACK_ENVBASE", "from_active")
+        monkeypatch.delenv("LMER_SLACK_ENVDERIVED", raising=False)
+
+        listener._load_env_files()
+
+        assert os.environ["LMER_SLACK_ENVBASE"] == "from_active"  # rule 1
+        assert os.environ["LMER_SLACK_ENVDERIVED"] == "from_active/repo.git"
+
+    def test_the_precedence_lives_in_one_implementation(self):
+        """#67: the behaviour tests pass with or without the sharing, so the
+        sharing itself is what is pinned here."""
+        from lmer_cli import cli, runtime
+
+        assert "apply_env_file_defaults" in inspect.getsource(listener._load_env_files)
+        # The import is the property to pin: a substring search for the call
+        # name breaks on a docstring that merely mentions it.
+        assert not re.search(
+            r"^\s*(?:from dotenv import|import dotenv)", inspect.getsource(listener), re.M
+        ), "the listener is loading .env files itself again"
+        # The CLI's names are the same objects, so its callers (and lmer
+        # platform's) reach the one implementation too.
+        assert cli.apply_env_file_defaults is runtime.apply_env_file_defaults
+        assert cli.default_env_file_candidates is runtime.default_env_file_candidates
 
 
 class TestEnsureCaBundle:

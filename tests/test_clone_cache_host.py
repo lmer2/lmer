@@ -148,14 +148,15 @@ class TestMirrorPathReuse:
 
 class TestSplitCredentials:
     def test_https_userinfo_becomes_auth_header_env(self):
-        scrubbed, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
-        assert scrubbed == "https://example.com/org/repo.git"
-        assert "sekrit" not in scrubbed
+        store, fetch, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
+        assert store == "https://example.com/org/repo.git"
+        assert fetch == store  # http(s) auth travels in the header, not the URL
+        assert "sekrit" not in store
         joined = json.dumps(env)
         assert "sekrit" not in joined  # header value is base64, never raw
         # env carries a git-config Authorization header scoped to the URL
         keys = {v for k, v in env.items() if k.startswith("GIT_CONFIG_KEY_")}
-        assert any(k.lower() == f"http.{scrubbed}.extraheader".lower() for k in keys)
+        assert any(k.lower() == f"http.{store}.extraheader".lower() for k in keys)
 
     @pytest.mark.parametrize(
         "url",
@@ -175,8 +176,9 @@ class TestSplitCredentials:
         helper is how a tokenless private repo mirrored) in exchange for nothing
         #157 asked for.
         """
-        scrubbed, env = _split_credentials(url)
-        assert scrubbed == url
+        store, fetch, env = _split_credentials(url)
+        assert store == url
+        assert fetch == url
         assert env == {}
         assert not _carries_credentials(env)
 
@@ -187,7 +189,7 @@ class TestSplitCredentials:
         on the wire with git 2.52.0 (review on !178). Order matters: the empty
         value resets the list, so it has to precede our own entry."""
         monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
-        scrubbed, env = _split_credentials("https://oauth2:sekrit@example.com/o/r.git")
+        scrubbed, _fetch, env = _split_credentials("https://oauth2:sekrit@example.com/o/r.git")
         assert env["GIT_CONFIG_COUNT"] == "3"
         assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
         assert env["GIT_CONFIG_VALUE_0"] == ""
@@ -197,8 +199,8 @@ class TestSplitCredentials:
         assert env["GIT_CONFIG_VALUE_2"].startswith("Authorization: Basic ")
 
     def test_carries_credentials_reads_the_header_value_not_the_key(self):
-        _, with_token = _split_credentials("https://oauth2:sekrit@example.com/o/r.git")
-        _, without = _split_credentials("https://example.com/o/r.git")
+        with_token = _split_credentials("https://oauth2:sekrit@example.com/o/r.git").env
+        without = _split_credentials("https://example.com/o/r.git").env
         assert _carries_credentials(with_token)
         assert not _carries_credentials(without)
         # a reset-only env names extraHeader too, but with an empty value: that
@@ -208,7 +210,7 @@ class TestSplitCredentials:
 
     def test_indices_default_to_zero_when_nothing_inherited(self, monkeypatch):
         monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
-        _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
+        env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git").env
         assert env["GIT_CONFIG_COUNT"] == "3"
         assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
         assert env["GIT_CONFIG_KEY_1"].endswith(".extraHeader")  # cancels inherited
@@ -223,7 +225,7 @@ class TestSplitCredentials:
         monkeypatch.setenv("GIT_CONFIG_VALUE_0", "CI Bot")
         monkeypatch.setenv("GIT_CONFIG_KEY_1", "core.sshCommand")
         monkeypatch.setenv("GIT_CONFIG_VALUE_1", "ssh -i /keys/ci")
-        _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
+        env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git").env
         assert env["GIT_CONFIG_COUNT"] == "5"
         assert env["GIT_CONFIG_KEY_2"] == "credential.helper"
         assert env["GIT_CONFIG_KEY_3"].endswith(".extraHeader")
@@ -240,9 +242,73 @@ class TestSplitCredentials:
     def test_unparseable_inherited_count_falls_back_to_zero(self, monkeypatch, bogus):
         # Same reading git itself applies to an invalid value: nothing inherited.
         monkeypatch.setenv("GIT_CONFIG_COUNT", bogus)
-        _, env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git")
+        env = _split_credentials("https://oauth2:sekrit@example.com/org/repo.git").env
         assert env["GIT_CONFIG_COUNT"] == "3"
         assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
+
+
+class TestNonHttpUrlsKeepTheirLogin:
+    """Userinfo on a non-http(s) URL is a transport login, not a header (#163)."""
+
+    SSH = "ssh://git@example.com/org/repo.git"
+
+    def test_ssh_login_survives_on_the_fetch_url(self):
+        store, fetch, env = _split_credentials(self.SSH)
+        assert fetch == self.SSH
+        assert store == "ssh://example.com/org/repo.git"  # disk gets no userinfo
+        assert env == {}
+        assert not _carries_credentials(env)  # so no retry, no misleading log line
+
+    def test_an_ssh_password_is_dropped_from_the_fetch_url(self):
+        """ssh cannot use a URL password, and argv is world-readable."""
+        store, fetch, env = _split_credentials("ssh://git:sekrit@example.com/o/r.git")
+        assert fetch == "ssh://git@example.com/o/r.git"
+        assert "sekrit" not in fetch
+        assert "sekrit" not in store
+        assert env == {}
+
+    @pytest.mark.parametrize("url", [
+        "git+ssh://git@example.com/o/r.git",
+        "ftps://anonymous@example.com/o/r.git",
+    ])
+    def test_no_http_header_is_built_for_any_non_http_scheme(self, url):
+        assert _split_credentials(url).env == {}
+
+    def test_a_percent_encoded_login_keeps_its_spelling(self):
+        """Cut out of the netloc, not rebuilt from the percent-decoded
+        ``parsed.username`` — a rebuild would rewrite ``%40`` as ``@``."""
+        url = "ssh://user%40corp:sekrit@example.com/o/r.git"
+        assert _split_credentials(url).fetch_url == "ssh://user%40corp@example.com/o/r.git"
+
+    def test_https_username_without_password_stays_credentialed(self):
+        """The ``<token>@host`` spelling: git sends ``Basic base64("<token>:")``
+        for it, and so do we."""
+        store, fetch, env = _split_credentials("https://gl-token@example.com/o/r.git")
+        assert store == fetch == "https://example.com/o/r.git"
+        assert _carries_credentials(env)
+
+    def test_the_ssh_fetch_url_is_what_git_is_actually_handed(self, tmp_path, monkeypatch):
+        """Through _update_one, not the splitter alone: the URL git receives is
+        the one carrying the login, and the URL on disk is not."""
+        seen = []
+
+        def record(args, timeout, cred_env):
+            seen.append((list(args), dict(cred_env)))
+            if args[0] == "init":  # the real init is what makes tmp.rename work
+                Path(args[-1]).mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(clone_cache, "_run_git", record)
+        monkeypatch.setattr(clone_cache, "_default_branch", lambda url, env: None)
+        mirror = tmp_path / "cache" / "example.com" / "org" / "repo.git"
+        clone_cache._update_one(mirror, "ssh://git:sekrit@example.com/org/repo.git")
+
+        stored = [a for a, _ in seen if "config" in a and "remote.origin.url" in a]
+        assert stored, seen
+        assert stored[0][-1] == "ssh://example.com/org/repo.git"
+        fetches = [a for a, _ in seen if "fetch" in a]
+        assert fetches and "ssh://git@example.com/org/repo.git" in fetches[0]
+        assert all("sekrit" not in arg for args, _ in seen for arg in args)
+        assert all(env == {} for _, env in seen)
 
 
 class TestHeadersOnTheWire:
@@ -309,7 +375,7 @@ class TestHeadersOnTheWire:
         base, seen = recorder
         monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
         operator = f'[http "{base}/"]\n\textraHeader = Authorization: Basic INHERITED\n'
-        scrubbed, cred_env = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git")
+        scrubbed, _fetch, cred_env = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git")
 
         ours = [
             v for k, v in cred_env.items()
@@ -342,7 +408,7 @@ class TestHeadersOnTheWire:
             f'\textraHeader = Authorization: Basic INHERITED\n'
             f'\textraHeader = X-Required: tenant-a\n'
         )
-        scrubbed, _ = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git")
+        scrubbed = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git").store_url
 
         # {} is what _attempt_with_fallback hands the retry
         headers = self._sent(scrubbed, {}, monkeypatch, seen, operator)
@@ -361,7 +427,7 @@ class TestHeadersOnTheWire:
         base, seen = recorder
         monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
         operator = f'[http "{base}/"]\n\textraHeader = X-Required: tenant-a\n'
-        scrubbed, cred_env = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git")
+        scrubbed, _fetch, cred_env = _split_credentials(f"http://oauth2:OURS@{base[7:]}/o/r.git")
 
         # in effect without our env ...
         assert self._sent(scrubbed, {}, monkeypatch, seen, operator).get_all(
@@ -506,14 +572,29 @@ class TestAnonymousFallback:
     credential, a private repo and a nonexistent path.
     """
 
-    def _credentialed(self, upstream) -> str:
-        """A credential-bearing URL whose scrubbed form is the local upstream.
+    # Scrubbed form of the stand-in URL; `_credentialed` maps it onto the
+    # local upstream so real git can fetch it.
+    UPSTREAM_URL = "https://cache-test.invalid/org/repo.git"
 
-        ``file://oauth2:sekrit@/path`` scrubs to ``file:///path``, so the
-        anonymous retry reaches real git while the first attempt looks exactly
-        like a tokenized https URL to the updater.
+    @pytest.fixture(autouse=True)
+    def _own_git_config(self, monkeypatch):
+        """Let the hermetic HOME's .gitconfig be the git config git reads."""
+        for var in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            monkeypatch.delenv(var, raising=False)
+
+    def _credentialed(self, upstream) -> str:
+        """A credential-bearing https URL whose scrubbed form real git can fetch.
+
+        http(s) because only those get an Authorization header, which is what
+        the retry keys on; ``url.<local>.insteadOf`` points it at the local
+        upstream so the retry actually transfers.
         """
-        return f"file://oauth2:sekrit@{upstream}"
+        gitconfig = Path(os.environ["HOME"]) / ".gitconfig"
+        gitconfig.parent.mkdir(parents=True, exist_ok=True)
+        gitconfig.write_text(
+            f'[url "file://{upstream}"]\n\tinsteadOf = {self.UPSTREAM_URL}\n'
+        )
+        return self.UPSTREAM_URL.replace("https://", "https://oauth2:sekrit@")
 
     def _start_rejecting(self, monkeypatch) -> list:
         """Make every git call that carries an Authorization header fail the way
@@ -543,9 +624,9 @@ class TestAnonymousFallback:
         attempts = []
         real = clone_cache._create_mirror
 
-        def counting(mirror, scrubbed_url, cred_env):
+        def counting(mirror, creds, cred_env):
             attempts.append(dict(cred_env))
-            return real(mirror, scrubbed_url, cred_env)
+            return real(mirror, creds, cred_env)
 
         monkeypatch.setattr(clone_cache, "_create_mirror", counting)
         return attempts
@@ -710,7 +791,7 @@ class TestAnonymousFallback:
         """Both attempts fail for real (the upstream does not exist), through
         the real create path: no half-built mirror, no leftover build dir."""
         cache_root, mirror = cache
-        update_mirrors([f"file://oauth2:sekrit@{tmp_path / 'does-not-exist'}"], cache_root)
+        update_mirrors(["https://oauth2:sekrit@cache-test.invalid/does/not-exist.git"], cache_root)
         assert not mirror.exists()
         assert list(cache_root.rglob("*.git.tmp")) == []
 
@@ -721,6 +802,53 @@ class TestAnonymousFallback:
         update_mirrors([self._credentialed(upstream)], cache_root)
         assert _scan_for("sekrit", cache_root) == []
         assert "sekrit" not in self._log_text()
+
+
+class TestFailureMessageNamesTheCommand:
+    """Failure lines name the git subcommand and the mirror (#159, #160).
+
+    The detached updater's log line is the whole diagnosis, and every mirror op
+    passes ``-C <path>`` first — which used to render as ``git -C failed``.
+    """
+
+    @pytest.mark.parametrize(
+        "args, expected",
+        [
+            (["-C", "/cache/host/o/r.git", "fetch", "--quiet", "--prune"],
+             "git fetch in /cache/host/o/r.git"),
+            (["-C", "/cache/host/o/r.git.tmp", "config", "gc.auto", "0"],
+             "git config in /cache/host/o/r.git.tmp"),
+            (["-C", "/cache/host/o/r.git.tmp", "symbolic-ref", "HEAD", "refs/heads/main"],
+             "git symbolic-ref in /cache/host/o/r.git.tmp"),
+            (["init", "--bare", "--quiet", "/cache/host/o/r.git.tmp"], "git init"),
+            (["-C"], "git -C"),  # malformed: render it rather than raise
+        ],
+    )
+    def test_rendered_shape(self, args, expected):
+        assert clone_cache._describe_git(args) == expected
+
+    def test_failed_fetch_names_fetch_and_the_mirror(self, cache, tmp_path):
+        """Through the real code path, not the renderer alone."""
+        cache_root, mirror = cache
+        update_mirrors([f"https://example.invalid/{tmp_path.name}/nope.git"], cache_root)
+        log = (Path(os.environ["HOME"]) / ".lmer" / "logs" / "clone-cache.log").read_text()
+        assert "git fetch in " in log, log
+        assert "git -C failed" not in log
+
+    def test_the_interpolated_command_is_scrubbed(self, tmp_path):
+        """The fetch URL sits beside the subcommand in ``args``; a message that
+        interpolates the command must not resurrect what the scrub removes."""
+        repo = tmp_path / "mirror.git"
+        subprocess.run(["git", "init", "--bare", "--quiet", str(repo)], check=True)
+        with pytest.raises(RuntimeError) as excinfo:
+            clone_cache._run_git(
+                ["-C", str(repo), "fetch", "--quiet",
+                 "https://oauth2:sekrit@example.invalid/o/r.git", "+refs/*:refs/*"],
+                timeout=60,
+                cred_env={},
+            )
+        assert "sekrit" not in str(excinfo.value)
+        assert f"git fetch in {repo}" in str(excinfo.value)
 
 
 class TestFailSoft:
