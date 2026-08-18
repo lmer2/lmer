@@ -1,6 +1,7 @@
 """Tests for the orchestrator signal-reminder Stop hook (hooks/signal_guard.py)."""
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -68,6 +69,27 @@ MILESTONE_HITS = [
      "bash /Agents/global/hooks/gitlab-review-post-review.sh"),
     ("github-review-post-review.sh",
      "bash /Agents/global/hooks/github-review-post-review.sh"),
+    # Every legal simple-command prefix counts. The assignment form matters
+    # most: the wrappers take no arguments and read three exported variables.
+    ("gitlab-review-post-review.sh",
+     "GITLAB_PROJECT=g/p GITLAB_MR_ID=42 GITLAB_REVIEW_FILE=/tmp/r.json "
+     "bash /Agents/global/hooks/gitlab-review-post-review.sh"),
+    ("gitlab-review-post-review.sh",
+     "sudo bash -x /Agents/global/hooks/gitlab-review-post-review.sh"),
+    ("gitlab-review-post-review.sh",
+     "timeout 300 bash /Agents/global/hooks/gitlab-review-post-review.sh"),
+    ("gitlab-review-post-review.sh",
+     "if true; then bash /Agents/global/hooks/gitlab-review-post-review.sh; fi"),
+    ("gitlab-review-post-review.sh", "/Agents/global/hooks/gitlab-review-post-review.sh"),
+    ("gitlab-review-post-review.sh", "./gitlab-review-post-review.sh"),
+    ("github-review-post-review.sh",
+     "{ bash /Agents/global/hooks/github-review-post-review.sh; }"),
+    ("gitlab-review-post-review.sh",
+     "if false; then true; else bash /Agents/global/hooks/gitlab-review-post-review.sh; fi"),
+    ("gitlab-review-post-review.sh",
+     "nohup bash /Agents/global/hooks/gitlab-review-post-review.sh &"),
+    ("github-review-post-review.sh",
+     "cd /tmp && bash hooks/github-review-post-review.sh"),
     ("work state set --status=complete", "work state set --status=complete"),
     ("work state set --status=complete", "work state set --status complete"),
     ("work state set --status=complete",
@@ -90,6 +112,22 @@ MILESTONE_MISSES = [
     'grep "gitlab-review --review-file" AGENTS.md',
     "github-review owner/repo 7 --docs",
     "bash /Agents/global/hooks/gitlab-review-docs.sh",
+    # Reading the wrapper is not running it.
+    "cat /Agents/global/hooks/gitlab-review-post-review.sh",
+    "ls -l /Agents/global/hooks/github-review-post-review.sh",
+    "git log --oneline -- hooks/gitlab-review-post-review.sh",
+    "grep -n glab /Agents/global/hooks/github-review-post-review.sh",
+    "wc -l /Agents/global/hooks/gitlab-review-post-review.sh",
+    "head -20 hooks/github-review-post-review.sh",
+    "diff hooks/gitlab-review-post-review.sh hooks/github-review-post-review.sh",
+    # Unquoted braces in the *argument* path: the `{` that anchors
+    # `{ bash …; }` must not anchor a `${VAR}` expansion.
+    "cat ${REPO}/hooks/gitlab-review-post-review.sh",
+    "ls -l ${LMER_GLOBAL_DIR}/hooks/github-review-post-review.sh",
+    "git log -- ${d}/hooks/gitlab-review-post-review.sh",
+    "grep -n GITLAB ${REPO}/hooks/gitlab-review-post-review.sh",
+    "wc -l ${HOME}/hooks/gitlab-review-post-review.sh",
+    "cat /Agents/{global,work}/hooks/gitlab-review-post-review.sh",
     "work state set --status=blocked",
     "work state set --phase=develop",
     "echo done",
@@ -255,6 +293,18 @@ class TestPatternsMatchRealCommands:
     def test_script_rows_name_a_real_hook_script(self, label):
         assert (REPO_ROOT / "hooks" / label).exists(), \
             f"{label} is not in hooks/"
+
+    def test_wrapper_scripts_take_no_positional_arguments(self):
+        """The wrappers accept nothing on the command line, which is why the
+        fixtures spell them bare or assignment-prefixed."""
+        for label, _ in _MILESTONE_PATTERNS:
+            if not label.endswith("-post-review.sh"):
+                continue
+            body = (REPO_ROOT / "hooks" / label).read_text()
+            assert not re.search(r"\$\{?[1-9@*]", body), (
+                f"{label} now reads positional arguments — the fixtures spell it "
+                "as a command with none"
+            )
 
     def test_bin_rows_name_a_real_bin_script(self):
         bare = [label for label, _ in _MILESTONE_PATTERNS

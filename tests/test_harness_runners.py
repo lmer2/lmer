@@ -12,6 +12,7 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -551,10 +552,13 @@ class TestPromptFileScoping:
         )
 
     def test_a_concurrent_runners_prompt_file_survives(self, tmp_path):
-        # Named like the files a concurrent runner leaves behind, but created
-        # by mktemp so this never collides with a real session's file. Removed
-        # by exact path — the shared /tmp is never globbed here.
-        fd, seeded = tempfile.mkstemp(prefix="agents-prompt.", suffix=".md", dir="/tmp")
+        # A live owner's pid plus a mkstemp-unique tail: the pid is what puts
+        # this on the liveness branch (a random name is skipped as unparseable
+        # and would pass without testing anything), and mkstemp keeps it from
+        # colliding with a real session's file.
+        fd, seeded = tempfile.mkstemp(
+            prefix=f"agents-prompt.{os.getpid()}.", suffix=".md", dir="/tmp"
+        )
         os.close(fd)
         seeded = Path(seeded)
         seeded.write_text("another runner's AGENTS.md\n")
@@ -572,6 +576,34 @@ class TestPromptFileScoping:
             assert seeded.read_text() == "another runner's AGENTS.md\n"
         finally:
             seeded.unlink(missing_ok=True)
+            if own_prompt is not None and str(own_prompt).startswith("/tmp/agents-prompt."):
+                own_prompt.unlink(missing_ok=True)
+
+    def test_a_dead_runners_prompt_file_is_collected(self, tmp_path):
+        """#276's fix scoped the sweep to the runner's own live pid, so it
+        collected nothing; collection is by owner liveness now."""
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        dead_file = Path(f"/tmp/agents-prompt.{dead.pid}.deadowner.md")
+        dead_file.write_text("a dead runner's leftovers\n")
+        live_file = Path(f"/tmp/agents-prompt.{os.getpid()}.liveowner.md")
+        live_file.write_text("a live runner's file\n")
+        own_prompt = None
+        try:
+            result = self._run_with_prompt_file(tmp_path)
+
+            idx = result.argv.index("--append-system-prompt-file")
+            own_prompt = Path(result.argv[idx + 1])
+            assert not dead_file.exists(), (
+                f"prompt file of dead pid {dead.pid} was not collected"
+            )
+            assert live_file.exists(), (
+                f"prompt file of live pid {os.getpid()} was collected — the #276 "
+                "regression"
+            )
+        finally:
+            dead_file.unlink(missing_ok=True)
+            live_file.unlink(missing_ok=True)
             if own_prompt is not None and str(own_prompt).startswith("/tmp/agents-prompt."):
                 own_prompt.unlink(missing_ok=True)
 

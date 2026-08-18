@@ -1,0 +1,7 @@
+fixed:
+- "Clone-cache failure lines name the git subcommand and the mirror they ran against instead of `git -C`. (#159, #160)"
+- "Clone-cache mirrors of `ssh://` URLs keep the login the URL names, and no longer build an HTTP auth header no ssh transport reads. (#163)"
+- "The claude runner collects prompt files left by exited runners, so they no longer accumulate in a long-lived container's `/tmp`."
+- "The signal reminder no longer fires when an agent merely reads a post-review wrapper script instead of running it."
+changed:
+- "`lmer-slack-listener` and the CLI now share one `.env` precedence implementation. (#67)"

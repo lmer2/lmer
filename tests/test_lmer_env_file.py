@@ -17,6 +17,8 @@ env dict the CLI hands to ``build_container_env``.
 import os
 from unittest.mock import patch
 
+import pytest
+
 from tests.test_lmer_cli_slack_target import (
     _BASE_ENV,
     _make_main_mocks,
@@ -143,3 +145,61 @@ class TestEnvFileMissing:
         assert str(a_dir) in (captured.out + captured.err), (
             "Expected a warning naming the directory passed as --env-file"
         )
+
+
+class TestInFileReferenceResolution:
+    """Both resolutions of a ``${VAR}`` reference inside a ``.env``.
+
+    The CLI has always resolved these against the file, the Slack listener
+    against the active environment; the helper takes the resolution as a
+    parameter so neither caller moves (#67).
+    """
+
+    def _seeded(self, tmp_path):
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "LMER_ENVREF_BASE=from_file\n"
+            "LMER_ENVREF_DERIVED=${LMER_ENVREF_BASE}/repo.git\n"
+            "LMER_ENVREF_FILEONLY=solo\n"
+            "LMER_ENVREF_DERIVED2=${LMER_ENVREF_FILEONLY}/x\n"
+        )
+        return [("probe", env_file)]
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        for name in ("BASE", "DERIVED", "FILEONLY", "DERIVED2"):
+            monkeypatch.delenv(f"LMER_ENVREF_{name}", raising=False)
+
+    def test_default_resolves_against_the_file(self, tmp_path, monkeypatch):
+        from lmer_cli.runtime import apply_env_file_defaults
+
+        monkeypatch.setenv("LMER_ENVREF_BASE", "from_active")
+        sources = apply_env_file_defaults(self._seeded(tmp_path))
+
+        assert os.environ["LMER_ENVREF_BASE"] == "from_active"  # first-wins
+        assert os.environ["LMER_ENVREF_DERIVED"] == "from_file/repo.git"
+        assert "LMER_ENVREF_DERIVED" in sources
+
+    def test_environ_resolution_uses_the_exported_value(self, tmp_path, monkeypatch):
+        """The listener's resolution: a value composed from an exported variable
+        is built from what is exported, not from the file's copy of it."""
+        from lmer_cli.runtime import apply_env_file_defaults
+
+        monkeypatch.setenv("LMER_ENVREF_BASE", "from_active")
+        sources = apply_env_file_defaults(
+            self._seeded(tmp_path), references_from_environ=True
+        )
+
+        assert os.environ["LMER_ENVREF_BASE"] == "from_active"  # first-wins
+        assert os.environ["LMER_ENVREF_DERIVED"] == "from_active/repo.git"
+        assert "LMER_ENVREF_DERIVED" in sources
+        assert "LMER_ENVREF_BASE" not in sources  # it came from the environment
+
+    def test_environ_resolution_still_falls_back_to_the_file(self, tmp_path):
+        """A variable the environment does not carry resolves from the file, so
+        the flag changes which value wins and never whether one is found."""
+        from lmer_cli.runtime import apply_env_file_defaults
+
+        apply_env_file_defaults(self._seeded(tmp_path), references_from_environ=True)
+
+        assert os.environ["LMER_ENVREF_DERIVED2"] == "solo/x"

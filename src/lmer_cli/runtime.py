@@ -22,6 +22,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Callable, List
 
+from dotenv import dotenv_values, load_dotenv
+
 from .log import warning
 
 
@@ -231,6 +233,57 @@ def lmer_state_dir() -> Path:
         Path to ~/.lmer/
     """
     return _LMER_STATE_DIR
+
+
+def apply_env_file_defaults(
+    candidates: "list[tuple[str, Path]]",
+    *,
+    references_from_environ: bool = False,
+) -> "dict[str, str]":
+    """Seed ``os.environ`` from ``.env`` files, first-wins, and report the sources.
+
+    First-wins: an exported variable is never overwritten, and earlier
+    candidates outrank later ones, so callers pass them highest-priority first.
+    The one implementation of that precedence (issue #67), shared by the CLI,
+    ``lmer platform`` and ``lmer-slack-listener``. It lives here rather than in
+    ``cli`` because ``slack_chat`` is imported *by* ``lmer_cli``.
+
+    *references_from_environ* picks how a ``${VAR}`` reference **inside** a file
+    resolves: file-first by default (the CLI's behaviour), environment-first
+    when True (the listener's, pre-#67). It is a parameter because both are
+    behaviour somebody depends on. The referenced variable itself obeys
+    first-wins either way, so only composed values differ.
+
+    Returns ``{var: "…description…"}`` for ``--show-env`` attribution.
+    """
+    sources: "dict[str, str]" = {}
+    for location, env_file in candidates:
+        if not env_file.exists():
+            continue
+        if references_from_environ:
+            # The only public entry point that interpolates against os.environ.
+            # It writes the variables itself, so the names it added are the
+            # source map.
+            before = set(os.environ)
+            load_dotenv(dotenv_path=str(env_file), override=False)
+            for key in set(os.environ) - before:
+                sources[key] = f".env ({location})"
+            continue
+        for key, value in dotenv_values(dotenv_path=str(env_file)).items():
+            if key not in os.environ and value is not None:
+                os.environ[key] = value
+                sources[key] = f".env ({location})"
+    return sources
+
+
+def default_env_file_candidates(
+    *, state_dir: "Path | None" = None, cwd: "Path | None" = None
+) -> "list[tuple[str, Path]]":
+    """The standard ``.env`` search order: working directory, then the state dir."""
+    return [
+        ("working directory", (cwd or Path.cwd()) / ".env"),
+        ("lmer state dir", (state_dir or lmer_state_dir()) / ".env"),
+    ]
 
 
 def _resolve_limit_env(
