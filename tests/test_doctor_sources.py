@@ -36,6 +36,16 @@ PASS_MARK = "✓"
 DECLARED_REPO = "https://git.example.com/group/taskdef.git"
 
 
+def test_work_repo_credential_file_contract_is_documented():
+    docs = (REPO_ROOT / "docs" / "LMER-CLI.md").read_text()
+    sources_contract = (
+        REPO_ROOT / "src" / "lmer_cli" / "container" / "sources.py"
+    ).read_text()
+
+    assert "**`LMER_WORK_REPO_CREDENTIAL_FILE`**" in docs
+    assert "https-credential-file" in sources_contract.split('"""', 2)[1]
+
+
 @pytest.fixture(autouse=True)
 def _clean_lmer_env(monkeypatch):
     """Strip LMER_* env vars so the subprocess env starts from a clean slate."""
@@ -141,6 +151,12 @@ GIT_OK_OTHER_REFS = (
     "    exit 0\n"
 )
 GIT_UNREACHABLE = "    exit 128\n"
+GIT_REJECTS_CREDENTIAL = (
+    "    helper_path=\"$(env | sed -n "
+    "'s/^GIT_CONFIG_VALUE_[0-9]*=store --file=//p' | head -n 1)\"\n"
+    "    if [ -n \"$helper_path\" ]; then : > \"$helper_path\"; fi\n"
+    "    exit 128\n"
+)
 # Enough refs to blow past the 64 KB pipe buffer, with the matched ref FIRST.
 # This is the shape that makes an early-exiting matcher in a `set -o pipefail`
 # pipeline report a present ref as missing (SIGPIPE → 141 → pipeline status).
@@ -445,6 +461,94 @@ class TestDoctorDeclaredSources:
         block = _declared_sources_block(proc.stdout)
         assert "taskdef source reachable" in block
         assert "taskdef ref 'main' present on remote" in block
+
+    def test_session_credential_file_reaches_git_only_as_a_helper_path(
+        self, tmp_path
+    ):
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "sources.yaml").write_text("schema: 1\n")
+        credential_file = tmp_path / "work-credential"
+        credential_file.write_text(
+            "https://oauth2:sekrit123@git.example.com/group/work.git\n"
+        )
+        stub = _write_stub_python(
+            tmp_path,
+            _helper_doc(
+                "https://git.example.com/group/taskdef.git",
+                mode="https-credential-file",
+            ),
+        )
+        git_dir = _write_fake_git(tmp_path, GIT_OK_MAIN)
+
+        proc = _run_doctor(
+            work=work,
+            taskdef_dir=tmp_path / "no-taskdef",
+            lmer_python=stub,
+            fake_git_dir=git_dir,
+            extra_env={
+                "LMER_WORK_REPO_CREDENTIAL_FILE": str(credential_file),
+            },
+        )
+
+        assert proc.returncode != 2, proc.stderr
+        recorded = _git_invocations(tmp_path)
+        assert "ENV GIT_CONFIG_COUNT=4" in recorded
+        assert not any("sekrit123" in line for line in recorded), recorded
+        assert any(
+            line.endswith(".useHttpPath") for line in recorded
+            if line.startswith("ENV GIT_CONFIG_KEY_")
+        ), recorded
+        assert any(
+            line.endswith(".helper") for line in recorded
+            if line.startswith("ENV GIT_CONFIG_KEY_")
+        ), recorded
+        assert any(
+            "store --file=" in line and not line.endswith(str(credential_file))
+            for line in recorded
+            if line.startswith("ENV GIT_CONFIG_VALUE_")
+        ), recorded
+        assert f"ARGV {DECLARED_REPO}" in recorded
+        helper_line = next(
+            line for line in recorded
+            if line.startswith("ENV GIT_CONFIG_VALUE_") and "store --file=" in line
+        )
+        probe_path = Path(helper_line.split("store --file=", 1)[1])
+        assert not probe_path.exists()
+
+    def test_rejected_probe_cannot_erase_live_work_credential(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / "sources.yaml").write_text("schema: 1\n")
+        credential_file = tmp_path / "work-credential"
+        original = "https://oauth2:sekrit123@git.example.com/group/work.git\n"
+        credential_file.write_text(original)
+        credential_file.chmod(0o600)
+        stub = _write_stub_python(
+            tmp_path,
+            _helper_doc(
+                "https://git.example.com/group/taskdef.git",
+                mode="https-credential-file",
+            ),
+        )
+        git_dir = _write_fake_git(tmp_path, GIT_REJECTS_CREDENTIAL)
+
+        proc = _run_doctor(
+            work=work,
+            taskdef_dir=tmp_path / "no-taskdef",
+            lmer_python=stub,
+            fake_git_dir=git_dir,
+            extra_env={
+                "LMER_WORK_REPO_CREDENTIAL_FILE": str(credential_file),
+            },
+        )
+
+        assert proc.returncode != 2, proc.stderr
+        assert credential_file.read_text() == original
+        assert credential_file.stat().st_mode & 0o777 == 0o600
+        assert "taskdef source unreachable" in _declared_sources_block(proc.stdout)
+        recorded = _git_invocations(tmp_path)
+        assert not any(line.endswith(str(credential_file)) for line in recorded)
 
     def test_inherited_git_config_entries_are_not_clobbered(self, tmp_path):
         """(h3) The ephemeral rewrite appends after inherited numbered config."""

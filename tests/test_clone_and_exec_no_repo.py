@@ -38,7 +38,7 @@ def _run_main(env, argv=None):
     clone_calls = []
     execv_calls = []
 
-    def fake_ensure_clone(workspace, repo_url, branch, ref):
+    def fake_ensure_clone(workspace, repo_url, branch, ref, **kwargs):
         clone_calls.append((Path(workspace), repo_url))
 
     def fake_execv(path, args):

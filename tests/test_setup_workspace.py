@@ -351,7 +351,8 @@ class TestSetupWorkspaceHappyPath:
         # repo_url in the result carries no token
         assert "TESTTOK" not in result["repo_url"]
         assert result["repo_url"] == "https://gitlab.example.com/group/project"
-        # The clone URL passed to ensure_clone did carry the token
+        # Host resolution still hands the clone boundary credentialed transport
+        # input; ensure_clone moves it to the session file before Git runs.
         assert holder["repo_url"] == "https://oauth2:TESTTOK@gitlab.example.com/group/project.git"
 
     def test_custom_task_used_for_work_repo_layout(self, tmp_path):

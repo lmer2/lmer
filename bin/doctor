@@ -382,21 +382,51 @@ for row in rows:
                         continue
                     fi
                     LS_REMOTE_OUT=""
-                    # argv carries the SCRUBBED declared URL; the credentialed
-                    # form reaches git as an ephemeral url.<credentialed>
-                    # .insteadOf rewrite in the subshell's environment, so the
-                    # token never lands in /proc/<pid>/cmdline. Numbered
-                    # entries are appended after any inherited GIT_CONFIG_*
-                    # so an outer numbered config is never clobbered.
+                    # argv carries the SCRUBBED declared URL. Current sessions
+                    # attach a disposable copy of the work-repo credential
+                    # file with process-scoped config; the legacy userinfo
+                    # mode keeps its ephemeral URL rewrite for compatibility
+                    # with older entrypoints. In
+                    # both cases numbered entries append after inherited
+                    # GIT_CONFIG_* so outer config is never clobbered.
                     GIT_CFG_N="${GIT_CONFIG_COUNT:-0}"
                     [[ "$GIT_CFG_N" =~ ^[0-9]+$ ]] || GIT_CFG_N=0
                     if LS_REMOTE_OUT="$(
                         export GIT_TERMINAL_PROMPT=0
                         export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=10'
-                        export GIT_CONFIG_COUNT="$((GIT_CFG_N + 1))"
                         export "GIT_CONFIG_KEY_${GIT_CFG_N}=url.${SRC_CLONE_URL}.insteadOf"
                         export "GIT_CONFIG_VALUE_${GIT_CFG_N}=${SRC_REPO}"
-                        "${LS_REMOTE_CMD[@]}" "$SRC_REPO" 2>/dev/null </dev/null
+                        CRED_PROBE_FILE=""
+                        if [[ "$SRC_MODE" == "https-credential-file" &&
+                              -f "${LMER_WORK_REPO_CREDENTIAL_FILE:-}" ]]; then
+                            # credential-store handles approve/reject as writes.
+                            # Give the diagnostic a disposable copy so a 401
+                            # cannot erase the live /work session credential.
+                            CRED_PROBE_FILE="$(mktemp "${TMPDIR:-/tmp}/lmer-doctor-credential.XXXXXX")"
+                            trap 'rm -f -- "$CRED_PROBE_FILE"' EXIT
+                            if ! cp -- "$LMER_WORK_REPO_CREDENTIAL_FILE" "$CRED_PROBE_FILE"; then
+                                exit 1
+                            fi
+                            if ! chmod 600 "$CRED_PROBE_FILE"; then
+                                exit 1
+                            fi
+                            printf -v CRED_FILE_Q '%q' "$CRED_PROBE_FILE"
+                            export GIT_CONFIG_COUNT="$((GIT_CFG_N + 4))"
+                            export "GIT_CONFIG_KEY_$((GIT_CFG_N + 1))=credential.${SRC_CLONE_URL}.useHttpPath"
+                            export "GIT_CONFIG_VALUE_$((GIT_CFG_N + 1))=false"
+                            export "GIT_CONFIG_KEY_$((GIT_CFG_N + 2))=credential.${SRC_CLONE_URL}.helper"
+                            export "GIT_CONFIG_VALUE_$((GIT_CFG_N + 2))="
+                            export "GIT_CONFIG_KEY_$((GIT_CFG_N + 3))=credential.${SRC_CLONE_URL}.helper"
+                            export "GIT_CONFIG_VALUE_$((GIT_CFG_N + 3))=store --file=${CRED_FILE_Q}"
+                        else
+                            export GIT_CONFIG_COUNT="$((GIT_CFG_N + 1))"
+                        fi
+                        if "${LS_REMOTE_CMD[@]}" "$SRC_REPO" 2>/dev/null </dev/null; then
+                            LS_REMOTE_RC=0
+                        else
+                            LS_REMOTE_RC=$?
+                        fi
+                        exit "$LS_REMOTE_RC"
                     )"; then
                         pass "$SRC_NAME source reachable: $SRC_REPO (mode: $SRC_MODE)"
                         if [[ -n "$SRC_REF" ]]; then

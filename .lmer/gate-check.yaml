@@ -31,6 +31,7 @@ tests:
     - tests/test_agent_defs.py
     - tests/test_consistency.py
     - tests/test_containerfile.py
+    - tests/test_doctor_sources.py
     - tests/test_gate_cache.py
     - tests/test_gate_inflight_hold.py
     - tests/test_gate_inflight_lock.py

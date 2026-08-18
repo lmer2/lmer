@@ -128,8 +128,14 @@ changing any of it is a breaking change to doctor:
     derived clone URLs, warnings, errors, ``supported_sources_schemas``
     and ``supported_taskdef_schemas``.
 
+- Derivation mode ``https-credential-file`` means the emitted clone URL is
+  clean and the consumer may authenticate it with the in-container
+  ``LMER_WORK_REPO_CREDENTIAL_FILE``. The explicit ``--work-repo-url`` path
+  never borrows that ambient file.
+
   ``--work-repo-url`` falls back to ``$LMER_REPO_URL`` (the container's
-  work-repo URL variable); ``doctor --path`` defaults to
+  work-repo URL variable; doctor prefers ``$LMER_WORK_REPO`` before the
+  legacy ``$LMER_REPO_URL`` fallback); ``doctor --path`` defaults to
   ``${LMER_WORK_REPO_PATH:-/work}/sources.yaml`` — the work-repo clone, the
   same location clone_and_exec resolves the declaration from.
 """
@@ -207,6 +213,7 @@ _RESERVED_SOURCE_KEYS = ("masterplan_mirror",)
 # every consumer tests against — a bare `== DERIVED_ANONYMOUS` check
 # would silently treat the withheld-credential case as credentialed.
 DERIVED_HTTPS_USERINFO = "https-userinfo"
+DERIVED_HTTPS_CREDENTIAL_FILE = "https-credential-file"
 DERIVED_SSH = "ssh"
 DERIVED_ANONYMOUS = "anonymous"
 DERIVED_ANONYMOUS_OTHER_PORT = "anonymous-other-port"
@@ -478,7 +485,9 @@ def scrub_credentials(text) -> str:
     return _SCP_CRED_RE.sub("", text)
 
 
-def derive_clone_url(declared_url, work_repo_url) -> Tuple[str, str]:
+def derive_clone_url(
+    declared_url, work_repo_url, *, work_repo_has_credential_file=False
+) -> Tuple[str, str]:
     """Borrow the work-repo URL's auth for a declared same-host source.
 
     Returns ``(clone_url, mode)`` (spec N2/N3, one branch per work-repo
@@ -488,6 +497,10 @@ def derive_clone_url(declared_url, work_repo_url) -> Tuple[str, str]:
       userinfo: that userinfo is copied onto the declared URL (an scp/ssh
       declared spelling is rebuilt on the work repo's scheme so the
       credential actually applies).
+    - ``DERIVED_HTTPS_CREDENTIAL_FILE`` — doctor received the clean work-repo
+      URL plus lmer's session credential-file path. The declared clone URL is
+      rebuilt on the same HTTPS authority without userinfo; doctor attaches
+      the helper file to its one Git process instead.
     - ``DERIVED_SSH`` — the work-repo URL is SSH-form (``git@host:...`` or
       ``ssh://git@host/...``, the REPO_AUTH_PREFER_SSH / no-token case):
       the declared URL is converted into the identical SSH form (the
@@ -523,7 +536,7 @@ def derive_clone_url(declared_url, work_repo_url) -> Tuple[str, str]:
             port = f":{w_port}" if w_port else ""
             return f"ssh://{user}@{host}{port}/{path}", DERIVED_SSH
         return f"{user}@{host}:{path}", DERIVED_SSH
-    if w_userinfo:
+    if w_userinfo or work_repo_has_credential_file:
         w_netloc = f"{host}:{w_port}" if w_port else host
         if d_scheme in ("http", "https"):
             if _effective_port(d_scheme, d_port) != _effective_port(w_scheme, w_port):
@@ -532,6 +545,11 @@ def derive_clone_url(declared_url, work_repo_url) -> Tuple[str, str]:
                 # the declared URL is attempted anonymously.
                 return declared_url, DERIVED_ANONYMOUS_OTHER_PORT
             netloc = f"{d_host}:{d_port}" if d_port else d_host
+            if work_repo_has_credential_file and not w_userinfo:
+                return (
+                    f"{d_scheme}://{netloc}/{d_path}",
+                    DERIVED_HTTPS_CREDENTIAL_FILE,
+                )
             return (
                 f"{d_scheme}://{w_userinfo}@{netloc}/{d_path}",
                 DERIVED_HTTPS_USERINFO,
@@ -549,6 +567,11 @@ def derive_clone_url(declared_url, work_repo_url) -> Tuple[str, str]:
         # service that never saw it. Converting ssh:2222 to https is
         # already a scheme change the declaration cannot dictate.
         path = d_path.lstrip("/")
+        if work_repo_has_credential_file and not w_userinfo:
+            return (
+                f"{w_scheme}://{w_netloc}/{path}",
+                DERIVED_HTTPS_CREDENTIAL_FILE,
+            )
         return f"{w_scheme}://{w_userinfo}@{w_netloc}/{path}", DERIVED_HTTPS_USERINFO
     return declared_url, DERIVED_ANONYMOUS
 
@@ -794,6 +817,27 @@ def _resolve_work_repo_url(args) -> Optional[str]:
     return args.work_repo_url or os.environ.get("LMER_REPO_URL") or None
 
 
+def _resolve_doctor_work_repo_url(args) -> Optional[str]:
+    """Resolve doctor's donor URL, preferring the paired work-repo value."""
+    return (
+        args.work_repo_url
+        or os.environ.get("LMER_WORK_REPO")
+        or os.environ.get("LMER_REPO_URL")
+        or None
+    )
+
+
+def _work_repo_credential_file() -> Optional[str]:
+    """Return lmer's readable session credential-file path, when present."""
+    value = os.environ.get("LMER_WORK_REPO_CREDENTIAL_FILE")
+    if not value:
+        return None
+    try:
+        return value if Path(value).is_file() else None
+    except OSError:
+        return None
+
+
 def _default_doctor_path() -> str:
     """`doctor --path` default: the work-repo clone's sources.yaml.
 
@@ -946,7 +990,13 @@ def _cmd_validate(args) -> int:
 
 def _cmd_doctor(args) -> int:
     """`doctor` — aggregated machine-readable check document."""
-    work_repo_url = _resolve_work_repo_url(args)
+    work_repo_url = _resolve_doctor_work_repo_url(args)
+    work_repo_credential_file = _work_repo_credential_file()
+    use_work_repo_credential_file = bool(
+        work_repo_credential_file
+        and not args.work_repo_url
+        and os.environ.get("LMER_WORK_REPO") == work_repo_url
+    )
     warnings: list = []
     errors: list = []
     config = None
@@ -964,14 +1014,19 @@ def _cmd_doctor(args) -> int:
     if config is not None:
         if work_repo_url is None:
             warnings.append(
-                "no work-repo URL (--work-repo-url / $LMER_REPO_URL): "
+                "no work-repo URL (--work-repo-url / $LMER_WORK_REPO / "
+                "$LMER_REPO_URL): "
                 "trust-rule check and clone-url derivation skipped"
             )
         declared = _scrubbed_declared_sources(config)
         for name, entry in config["sources"].items():
             if work_repo_url is None:
                 continue
-            clone_url, mode = derive_clone_url(entry["repo"], work_repo_url)
+            clone_url, mode = derive_clone_url(
+                entry["repo"],
+                work_repo_url,
+                work_repo_has_credential_file=use_work_repo_credential_file,
+            )
             declared[name]["mode"] = mode
             declared[name]["anonymous"] = mode in ANONYMOUS_MODES
             # The single documented redaction opt-in (module docstring).
@@ -1070,7 +1125,8 @@ def _build_parser() -> _ArgumentParser:
     _common(
         doctor,
         "work-repo URL for trust check + clone-url derivation "
-        "(default: $LMER_REPO_URL; omitted: derivation is skipped)",
+        "(default: $LMER_WORK_REPO, then $LMER_REPO_URL; omitted: "
+        "derivation is skipped)",
     )
     doctor.add_argument(
         "--emit-clone-urls",

@@ -61,7 +61,7 @@ class TestCheckoutFailureIsScrubbed:
             128, ["git", "-C", str(tmp_path), "fetch", _FAKE_URL, "merge-requests/7/head"]
         )
 
-        def boom(workspace, mr_id, remote="origin"):
+        def boom(workspace, mr_id, remote="origin", credential=None):
             raise err
 
         with patch.object(clone_and_exec, "_clone_with_cache"), \

@@ -36,8 +36,14 @@ class TestCloneAuxRepos:
                 "https://oauth2:t@h/org/taskdef.git",
                 "v1.2.3",
             )
-        mock_clone.assert_any_call(Path("/napkin"), "https://oauth2:t@h/org/napkin.git", None, None)
-        mock_clone.assert_any_call(Path("/taskdef"), "https://oauth2:t@h/org/taskdef.git", None, "v1.2.3")
+        mock_clone.assert_any_call(
+            Path("/napkin"), "https://oauth2:t@h/org/napkin.git", None, None,
+            manage_existing=True,
+        )
+        mock_clone.assert_any_call(
+            Path("/taskdef"), "https://oauth2:t@h/org/taskdef.git", None,
+            "v1.2.3", manage_existing=True,
+        )
         assert mock_clone.call_count == 2
 
     def test_no_clone_when_unset(self):
