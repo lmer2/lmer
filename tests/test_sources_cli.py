@@ -42,6 +42,8 @@ sources:
 def _no_ambient_repo_url(monkeypatch):
     """Hermetic runs: the CLI's $LMER_REPO_URL fallback must not fire."""
     monkeypatch.delenv("LMER_REPO_URL", raising=False)
+    monkeypatch.delenv("LMER_WORK_REPO", raising=False)
+    monkeypatch.delenv("LMER_WORK_REPO_CREDENTIAL_FILE", raising=False)
 
 
 def _write(tmp_path, text):
@@ -341,6 +343,59 @@ class TestDoctor:
         assert code == EXIT_OK
         assert doc["sources"]["taskdef"]["mode"] == "https-userinfo"
         assert TOKEN not in out
+
+    def test_clean_env_uses_session_credential_file_without_rebuilding_userinfo(
+        self, capsys, tmp_path, monkeypatch
+    ):
+        credential_file = tmp_path / "work-credential"
+        credential_file.write_text(WORK_URL + "\n")
+        monkeypatch.setenv(
+            "LMER_REPO_URL", "https://target.example.net/org/project.git"
+        )
+        monkeypatch.setenv("LMER_WORK_REPO", WORK_URL_ANON)
+        monkeypatch.setenv(
+            "LMER_WORK_REPO_CREDENTIAL_FILE", str(credential_file)
+        )
+        path = _write(tmp_path, GOOD)
+
+        code, doc, out, err = _run(
+            capsys,
+            ["doctor", "--json", "--emit-clone-urls", "--path", str(path)],
+        )
+
+        assert code == EXIT_OK
+        taskdef = doc["sources"]["taskdef"]
+        assert taskdef["mode"] == "https-credential-file"
+        assert taskdef["anonymous"] is False
+        assert taskdef["clone_url"] == (
+            "https://git.example.com/agents/taskdefs.git"
+        )
+        assert doc["work_repo_url"] == WORK_URL_ANON
+        assert TOKEN not in out
+        assert TOKEN not in err
+
+    def test_explicit_doctor_url_does_not_borrow_an_unpaired_session_file(
+        self, capsys, tmp_path, monkeypatch
+    ):
+        credential_file = tmp_path / "work-credential"
+        credential_file.write_text(WORK_URL + "\n")
+        monkeypatch.setenv("LMER_WORK_REPO", WORK_URL_ANON)
+        monkeypatch.setenv(
+            "LMER_WORK_REPO_CREDENTIAL_FILE", str(credential_file)
+        )
+        path = _write(tmp_path, GOOD)
+
+        code, doc, _, _ = _run(
+            capsys,
+            [
+                "doctor", "--json", "--path", str(path),
+                "--work-repo-url", WORK_URL_ANON,
+            ],
+        )
+
+        assert code == EXIT_OK
+        assert doc["sources"]["taskdef"]["mode"] == "anonymous"
+        assert doc["sources"]["taskdef"]["anonymous"] is True
 
     def test_no_work_repo_url_skips_derivation_with_warning(
         self, capsys, tmp_path

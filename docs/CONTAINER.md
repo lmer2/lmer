@@ -321,13 +321,26 @@ Set via the host environment, `~/.lmer/.env`, or a project-local `.env` file:
 - `LMER_HARNESS` - Agent harness the session runs (`claude` default; `codex`, `pi` — all baked into the image; see [HARNESSES.md](./HARNESSES.md))
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, ... - Provider API keys for non-claude harnesses (forwarded from `.env` like any other variable)
 
+Git repository credentials cross the container boundary only long enough for
+the clone entrypoint to write mode-`0600` session files named
+`~/.git-credentials-{host}-*`. Every container-internal lmer-created clone uses
+a clean URL plus a non-secret `credential.helper` reference to its file. The
+clean URL becomes the remote; the helper reference remains for later fetches
+and pushes; no token is written to repository config or placed in Git argv.
+Separate files preserve different target/work/auxiliary credentials on the same
+host. Operator-owned `--checkout` and service-mode bind mounts, including
+secondary-clone subdirectories beneath them, never receive container-only
+repository config or remote rewrites. Fresh secondary clones on those mounts
+use the session file only through process-scoped Git config. The entrypoint only
+scrubs the corresponding retained environment URL.
+
 ### How the environment reaches the container
 
 No environment **value** is ever placed in the `docker`/`podman run` command
 line. `/proc/<pid>/cmdline` is world-readable, so a `-e NAME=value` argument
 exposes the value to every user on the host for as long as the session runs
-— and a session's environment routinely carries a credentialed work-repo
-clone URL, git forge tokens and the FastAPI bearer token.
+— and the launch environment may transiently carry a resolved work-repo
+credential, git forge tokens and the FastAPI bearer token.
 
 The CLI uses two transports (`runtime.build_container_env`):
 

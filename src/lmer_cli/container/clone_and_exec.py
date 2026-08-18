@@ -43,6 +43,8 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -144,17 +146,197 @@ def _scrub_credentials(text: str) -> str:
     """Strip ``user:password@`` / ``oauth2:<token>@`` credentials from any URL
     embedded in *text*.
 
-    The clone commands here carry the tokenized clone URL as an argument, so a
-    failed clone surfaces the live token when its ``subprocess.CalledProcessError``
-    is stringified — ``str(e)`` includes ``e.cmd`` (e.g.
-    ``git clone https://oauth2:<token>@host/...``). CodeQL does not track this
-    (the value flows through ``subprocess`` and stdlib exception formatting), so
-    scrub error strings before printing them to stderr. Uses a regex that cannot
-    raise, so it is always safe to wrap an error string with.
+    Clone commands now receive clean URLs, but this remains the defensive error
+    boundary for older repositories, caller-supplied remotes, and transport
+    values that have not reached the credential-file seam yet. Uses a regex that
+    cannot raise, so it is always safe to wrap an error string with.
     """
     if not text:
         return text
     return re.sub(r"(://)[^/\s]*@", r"\1", text)
+
+
+@dataclass(frozen=True)
+class _SessionGitCredential:
+    """A clean clone URL and the mode-0600 helper file that authenticates it."""
+
+    clean_url: str
+    scope_url: str
+    path: Path
+
+    @property
+    def helper(self) -> str:
+        return f"store --file={shlex.quote(str(self.path))}"
+
+
+def _credential_scope_url(clean_url: str) -> str:
+    """Return Git's credential-match URL without query or fragment data."""
+    try:
+        parsed = urlparse(clean_url)
+        return parsed._replace(query="", fragment="").geturl()
+    except Exception:
+        return clean_url
+
+
+def _write_session_git_credential(repo_url: str) -> "tuple[str, _SessionGitCredential | None]":
+    """Move embedded URL credentials into a session-local Git helper file.
+
+    The host keeps resolving tokens exactly as before and transports the result
+    as URL userinfo. This is the container boundary where that transient form
+    ends: the returned URL has no userinfo, the credential is stored in a
+    mode-0600 file, and no token is placed in Git argv or configuration.
+
+    A fresh file per URL occurrence preserves dedicated credentials for target,
+    work, and auxiliary repositories even when they share a hostname.
+    """
+    if not repo_url or "://" not in repo_url:
+        return repo_url, None
+    try:
+        parsed = urlparse(repo_url)
+    except Exception:
+        return repo_url, None
+    if parsed.scheme.lower() not in {"http", "https", "file"}:
+        return repo_url, None
+    if not (parsed.username or parsed.password):
+        return _scrub_credentials(repo_url), None
+
+    clean_url = _scrub_credentials(repo_url)
+    credential_url = repo_url
+    if parsed.username and parsed.password is None:
+        # credential-store ignores username-only URL entries. Preserve the
+        # transport meaning while spelling the absent password explicitly so
+        # `git credential fill` can return the username/token.
+        userinfo, hostinfo = parsed.netloc.rsplit("@", 1)
+        credential_url = parsed._replace(
+            netloc=f"{userinfo}:@{hostinfo}"
+        ).geturl()
+    host = (parsed.hostname or "git").lower()
+    safe_host = re.sub(r"[^a-z0-9]+", "_", host).strip("_") or "git"
+    home = Path(os.environ.get("HOME", "/home/developer"))
+    home.mkdir(parents=True, exist_ok=True)
+    fd, filename = tempfile.mkstemp(
+        prefix=f".git-credentials-{safe_host}-", dir=str(home)
+    )
+    path = Path(filename)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as credential_file:
+            credential_file.write(credential_url)
+            credential_file.write("\n")
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+
+    return clean_url, _SessionGitCredential(
+        clean_url=clean_url,
+        scope_url=_credential_scope_url(clean_url),
+        path=path,
+    )
+
+
+def _credential_git_args(credential: "_SessionGitCredential | None") -> list[str]:
+    """Process-scoped Git config for clone authentication, containing no token."""
+    if credential is None:
+        return []
+    prefix = f"credential.{credential.scope_url}"
+    return [
+        "-c", f"{prefix}.useHttpPath=true",
+        "-c", f"{prefix}.helper=",
+        "-c", f"{prefix}.helper={credential.helper}",
+    ]
+
+
+def _persist_git_credential_helper(
+    repo_dir: Path, credential: "_SessionGitCredential | None"
+) -> None:
+    """Keep only a non-secret helper reference for later fetches and pushes."""
+    if credential is None:
+        return
+    prefix = f"credential.{credential.scope_url}"
+    try:
+        check_call([
+            "git", "-C", str(repo_dir), "config", "--local", "--replace-all",
+            f"{prefix}.useHttpPath", "true",
+        ])
+        # The empty value resets inherited helpers for this URL; the following
+        # entry makes lmer's exact session credential authoritative.
+        check_call([
+            "git", "-C", str(repo_dir), "config", "--local", "--replace-all",
+            f"{prefix}.helper", "",
+        ])
+        check_call([
+            "git", "-C", str(repo_dir), "config", "--local", "--add",
+            f"{prefix}.helper", credential.helper,
+        ])
+    except Exception as exc:
+        print(
+            f"⚠️  Failed to persist Git credential helper for "
+            f"{credential.clean_url}: {_scrub_credentials(str(exc))}",
+            file=sys.stderr,
+        )
+        raise
+
+
+def _lmer_credential_helper_path(value: str) -> "Path | None":
+    """Return the session-file path named by an lmer credential helper."""
+    try:
+        parts = shlex.split(value)
+    except ValueError:
+        return None
+    if not parts or parts[0] != "store":
+        return None
+    for index, part in enumerate(parts[1:], 1):
+        if part.startswith("--file="):
+            candidate = part.removeprefix("--file=")
+        elif part == "--file" and index + 1 < len(parts):
+            candidate = parts[index + 1]
+        else:
+            continue
+        path = Path(candidate)
+        return path if path.name.startswith(".git-credentials-") else None
+    return None
+
+
+def _clear_lmer_git_credential_helper(
+    repo_dir: Path, clean_url: str, *, preserve_live: bool = False
+) -> None:
+    """Remove lmer's helper, optionally retaining a live session file."""
+    prefix = f"credential.{_credential_scope_url(clean_url)}"
+    result = subprocess.run(
+        [
+            "git", "-C", str(repo_dir), "config", "--local", "--get-all",
+            f"{prefix}.helper",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return
+    helper_paths = [
+        path
+        for value in result.stdout.splitlines()
+        if (path := _lmer_credential_helper_path(value)) is not None
+    ]
+    if not helper_paths:
+        return
+    if preserve_live and any(path.is_file() for path in helper_paths):
+        return
+    for suffix in ("helper", "useHttpPath"):
+        subprocess.run(
+            [
+                "git", "-C", str(repo_dir), "config", "--local",
+                "--unset-all", f"{prefix}.{suffix}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 # --- Canonical source config (sources.yaml, issue #105) ---------------------
@@ -543,12 +725,19 @@ def _apply_sources_resolution(result, env, sources_mod, isatty, input_fn=input) 
     for line in result["notes"]:
         print(line, file=sys.stderr)
     for var, value in result["env_updates"].items():
-        env[var] = value
+        env[var] = (
+            _scrub_credentials(value)
+            if var in {"LMER_NAPKIN_REPO", "LMER_TASKDEF_REPO"}
+            else value
+        )
     for line in result["banners"]:
         print(line, file=sys.stderr)
     for clone in result["clones"]:
         try:
-            ensure_clone(Path(clone["dest"]), clone["url"], None, clone["ref"])
+            ensure_clone(
+                Path(clone["dest"]), clone["url"], None, clone["ref"],
+                manage_existing=True,
+            )
         except Exception as e:
             name = clone["name"]
             detail = sources_mod.scrub_credentials(str(e))
@@ -708,7 +897,10 @@ def _lfs_safe_git(*args: str) -> list[str]:
 
 
 def _clone_cmd(
-    repo_url: str, workspace: Path, extra_flags: "list[str] | None" = None
+    repo_url: str,
+    workspace: Path,
+    extra_flags: "list[str] | None" = None,
+    credential: "_SessionGitCredential | None" = None,
 ) -> list[str]:
     """Build the ``git clone`` command.
 
@@ -719,7 +911,10 @@ def _clone_cmd(
     ``--reference``/``--dissociate`` pair) are placed after ``clone`` and
     before the positional URL/destination.
     """
-    return _lfs_safe_git("clone", *(extra_flags or []), repo_url, str(workspace))
+    return _lfs_safe_git(
+        *_credential_git_args(credential),
+        "clone", *(extra_flags or []), repo_url, str(workspace),
+    )
 
 
 # --- Persistent clone cache (issue #112) ------------------------------------
@@ -816,7 +1011,9 @@ def _cache_reference_flags(repo_url: str) -> list[str]:
     return ["--reference", str(mirror), "--dissociate"]
 
 
-def _clone_with_cache(repo_url: str, dest: Path) -> None:
+def _clone_with_cache(
+    repo_url: str, dest: Path, *, persist_helper: bool = True
+) -> "_SessionGitCredential | None":
     """Clone *repo_url* into *dest*, borrowing objects from the cache mirror
     when one is available.
 
@@ -824,11 +1021,11 @@ def _clone_with_cache(repo_url: str, dest: Path) -> None:
     didn't surface) is retried as a plain direct clone, so the cache can
     never break a session — only the direct clone's failure propagates.
     """
-    flags = _cache_reference_flags(repo_url)
+    clean_url, credential = _write_session_git_credential(repo_url)
+    flags = _cache_reference_flags(clean_url)
     if flags:
         try:
-            check_call(_clone_cmd(repo_url, dest, flags))
-            return
+            check_call(_clone_cmd(clean_url, dest, flags, credential))
         except subprocess.CalledProcessError as e:
             print(
                 f"⚠️  cache-referenced clone failed (retrying directly): "
@@ -838,7 +1035,12 @@ def _clone_with_cache(repo_url: str, dest: Path) -> None:
             # git may leave a partial dest behind; clear it for the retry.
             shutil.rmtree(dest, ignore_errors=True)
             dest.mkdir(parents=True, exist_ok=True)
-    check_call(_clone_cmd(repo_url, dest))
+            check_call(_clone_cmd(clean_url, dest, credential=credential))
+    else:
+        check_call(_clone_cmd(clean_url, dest, credential=credential))
+    if persist_helper:
+        _persist_git_credential_helper(dest, credential)
+    return credential
 
 
 def _persist_lfs_skip_config(repo_dir: Path) -> None:
@@ -853,12 +1055,9 @@ def _persist_lfs_skip_config(repo_dir: Path) -> None:
     the same ``git-lfs: command not found`` abort. Repo-local config overrides
     the mounted global config and covers all of those.
 
-    Only ever called on a repo this script itself just cloned (never a
-    service-mode bind-mounted checkout), so the settings stay scoped to the
-    ephemeral clone and never disable LFS in a user's host repo. (A
-    secondary-MR repo cloned into a bind-mounted workspace outlives the
-    container together with this config, but the settings live in that
-    clone's own ``.git/config`` — still never the user's checkout's.)
+    Only ever called on a repo this script itself just cloned inside the
+    container. Secondary-MR repos beneath an operator-owned bind mount use
+    process-scoped LFS settings instead, so no local config survives there.
     Best-effort:
     a config write failure warns rather than failing the clone — the repo may
     not touch LFS-tracked files at all.
@@ -875,11 +1074,57 @@ def _persist_lfs_skip_config(repo_dir: Path) -> None:
             )
 
 
-def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Optional[str]) -> None:
+def _configure_managed_existing_clone(
+    workspace: Path, repo_url: str, remote: str = "origin"
+) -> "_SessionGitCredential | None":
+    """Refresh authentication and the clean remote of a clone lmer owns."""
+    clean_url, credential = _write_session_git_credential(repo_url)
+    current = subprocess.run(
+        ["git", "-C", str(workspace), "remote", "get-url", remote],
+        capture_output=True,
+        text=True,
+    )
+    current_url = ""
+    if current.returncode == 0:
+        current_url = _scrub_credentials(current.stdout.strip())
+    if current_url and current_url != clean_url:
+        _clear_lmer_git_credential_helper(
+            workspace, current_url
+        )
+    _clear_lmer_git_credential_helper(
+        workspace, clean_url, preserve_live=credential is None
+    )
+    _persist_git_credential_helper(workspace, credential)
+    try:
+        check_call([
+            "git", "-C", str(workspace), "remote", "set-url", remote,
+            clean_url,
+        ])
+    except Exception as exc:
+        print(
+            f"⚠️  Failed to clean existing {remote} URL in {workspace}: "
+            f"{_scrub_credentials(str(exc))}",
+            file=sys.stderr,
+        )
+        raise
+    return credential
+
+
+def ensure_clone(
+    workspace: Path,
+    repo_url: str,
+    branch: Optional[str],
+    ref: Optional[str],
+    *,
+    manage_existing: bool = False,
+) -> "_SessionGitCredential | None":
     """
     Clone repository into workspace if not already present.
 
-    If workspace already contains a git repository, skip cloning.
+    If workspace already contains a git repository, skip cloning. Existing
+    repositories are treated as operator-owned by default and are never given
+    repo-local config or a rewritten remote. Callers that point exclusively at
+    lmer-created clone locations opt into migration with ``manage_existing``.
     Otherwise, clone the repo and checkout the specified branch or ref.
 
     Args:
@@ -887,15 +1132,19 @@ def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Opt
         repo_url: Git repository URL to clone
         branch: Optional branch name to checkout
         ref: Optional git ref (tag/commit) to checkout
+        manage_existing: Refresh the helper and clean remote only when the
+            existing clone is known to have been created and owned by lmer.
 
     Raises:
         subprocess.CalledProcessError: If git commands fail
     """
     workspace.mkdir(parents=True, exist_ok=True)
     if (workspace / ".git").exists():
-        return
+        if manage_existing:
+            return _configure_managed_existing_clone(workspace, repo_url)
+        return None
 
-    _clone_with_cache(repo_url, workspace)
+    credential = _clone_with_cache(repo_url, workspace)
     _persist_lfs_skip_config(workspace)
 
     # Configure safe.directory to avoid ownership complaints
@@ -912,6 +1161,7 @@ def ensure_clone(workspace: Path, repo_url: str, branch: Optional[str], ref: Opt
         rc = run(["git", "-C", str(workspace), "switch", branch])
         if rc != 0:
             check_call(["git", "-C", str(workspace), "checkout", branch])
+    return credential
 
 
 def clone_aux_repos(
@@ -921,17 +1171,18 @@ def clone_aux_repos(
 ) -> None:
     """Clone the optional napkin/taskdef repos.
 
-    The URLs already carry credentials (baked in host-side by the launching
-    CLI), so they clone as-is. Clone failures are non-fatal — warn and continue,
-    matching the secondary-MR clone behavior.
+    The URLs carry host-resolved credential transport input. ``ensure_clone``
+    moves any credential into a session file and gives Git only the clean URL.
+    Clone failures are non-fatal — warn and continue, matching the secondary-MR
+    clone behavior.
 
     Failure-signal design (sources.yaml seam, issue #105): the loud failure
     signal lives on the RESOLVING side, never here. A declared source is
     cloned by _apply_sources_resolution before this runs —
     headless failure refuses start (exit 2), interactive failure prompts
     continue-legacy/abort. By the time this function runs, a declared URL
-    either has its clone in place (ensure_clone's .git check makes the
-    re-clone here a no-op) or its repo env var was reverted to unset by
+    either has its clone in place (the clean second pass preserves its live
+    session helper) or its repo env var was reverted to unset by
     continue-legacy (so there is nothing to retry or double-report). The
     warn-and-continue below therefore only ever fires for env-sourced
     (env-only, undeclared) or absent URLs, whose legacy best-effort
@@ -940,12 +1191,18 @@ def clone_aux_repos(
     """
     if napkin_repo_url:
         try:
-            ensure_clone(Path("/napkin"), napkin_repo_url, None, None)
+            ensure_clone(
+                Path("/napkin"), napkin_repo_url, None, None,
+                manage_existing=True,
+            )
         except Exception as e:
             print(f"⚠️  napkin clone failed (continuing): {_scrub_credentials(str(e))}", file=sys.stderr)
     if taskdef_repo_url:
         try:
-            ensure_clone(Path("/taskdef"), taskdef_repo_url, None, taskdef_ref)
+            ensure_clone(
+                Path("/taskdef"), taskdef_repo_url, None, taskdef_ref,
+                manage_existing=True,
+            )
         except Exception as e:
             print(f"⚠️  taskdef clone failed (continuing): {_scrub_credentials(str(e))}", file=sys.stderr)
 
@@ -1310,7 +1567,12 @@ def _parse_gitlab_mr_url(target: str) -> tuple[str | None, str | None, str | Non
     return host, project_path, mr_id
 
 
-def _fetch_and_checkout_mr(workspace: Path, mr_id: str, remote: str = "origin") -> None:
+def _fetch_and_checkout_mr(
+    workspace: Path,
+    mr_id: str,
+    remote: str = "origin",
+    credential: "_SessionGitCredential | None" = None,
+) -> None:
     """Fetch a GitLab MR's head ref and check it out as a local ``mr-<id>`` branch.
 
     Shared by the three sites that need an MR's source branch in a fresh
@@ -1324,12 +1586,19 @@ def _fetch_and_checkout_mr(workspace: Path, mr_id: str, remote: str = "origin") 
     # _lfs_safe_git: the workspace may be a bind-mounted --checkout (no
     # repo-local LFS-skip config); process-scoped -c flags keep the
     # checkout alive without touching the mounted repo's config.
-    check_call(_lfs_safe_git("-C", str(workspace), "fetch", remote,
-                             f"merge-requests/{mr_id}/head:mr-{mr_id}"))
-    check_call(_lfs_safe_git("-C", str(workspace), "checkout", f"mr-{mr_id}"))
+    credential_args = _credential_git_args(credential)
+    check_call(_lfs_safe_git(
+        *credential_args, "-C", str(workspace), "fetch", remote,
+        f"merge-requests/{mr_id}/head:mr-{mr_id}",
+    ))
+    check_call(_lfs_safe_git(
+        *credential_args, "-C", str(workspace), "checkout", f"mr-{mr_id}"
+    ))
 
 
-def clone_secondary_mr(target: str, workspace: Path) -> None:
+def clone_secondary_mr(
+    target: str, workspace: Path, *, persist_local_config: bool = True
+) -> None:
     """
     Clone a secondary MR into a subdirectory of the workspace.
 
@@ -1359,15 +1628,24 @@ def clone_secondary_mr(target: str, workspace: Path) -> None:
     target_dir = workspace / subdir_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    # Skip if already cloned
+    # A secondary directory beneath a bind-mounted workspace lives on the
+    # operator's disk. Never persist container-only helper references or
+    # rewrite remotes there, even if lmer originally created the directory.
     if (target_dir / ".git").exists():
+        if persist_local_config:
+            ensure_clone(
+                target_dir, repo_url, None, None, manage_existing=True
+            )
         print(f"✅ Secondary MR already cloned at {target_dir}", file=sys.stderr)
         return
 
     # Clone the repository
     print(f"📦 Cloning secondary MR into {target_dir}...", file=sys.stderr)
-    _clone_with_cache(repo_url, target_dir)
-    _persist_lfs_skip_config(target_dir)
+    credential = _clone_with_cache(
+        repo_url, target_dir, persist_helper=persist_local_config
+    )
+    if persist_local_config:
+        _persist_lfs_skip_config(target_dir)
 
     # Configure safe.directory
     try:
@@ -1379,7 +1657,7 @@ def clone_secondary_mr(target: str, workspace: Path) -> None:
     if gitlab_host and gitlab_project and mr_id:
         print(f"🔍 Attempting to fetch secondary MR {mr_id} branch from {gitlab_host}/{gitlab_project}...", file=sys.stderr)
         try:
-            _fetch_and_checkout_mr(target_dir, mr_id)
+            _fetch_and_checkout_mr(target_dir, mr_id, credential=credential)
             print(f"✅ Checked out secondary MR {mr_id} branch (mr-{mr_id}) in {target_dir}", file=sys.stderr)
         except subprocess.CalledProcessError as e:
             # Defensive scrub: the fetch/checkout commands name the remote,
@@ -2078,17 +2356,30 @@ def main(argv: list[str] | None = None) -> int:
     if not work_repo_url:
         print("❌ LMER_WORK_REPO is not set in environment", file=sys.stderr)
         return 2
+    # This path is minted below from the credential file created for the
+    # current work-repo clone. Never trust or propagate an inherited value.
+    os.environ.pop("LMER_WORK_REPO_CREDENTIAL_FILE", None)
 
     branch = os.environ.get("LMER_CHECKOUT_BRANCH")
     ref = os.environ.get("LMER_CHECKOUT_REF")
+    git_remote = os.environ.get("LMER_GIT_REMOTE", "origin")
 
     ws = Path("/workspace").resolve()
+    # At entry, a pre-existing checkout at /workspace came from the host's
+    # --checkout bind mount. Record that boundary before a normal session can
+    # create its own ephemeral clone there.
+    workspace_is_operator_owned = service_mode or (ws / ".git").exists()
 
     if service_mode:
         # Service mode: /workspace is bind-mounted from --checkout.
-        # Skip cloning, but configure git safe.directory and handle branch/MR checkout.
+        # Skip cloning and never persist config or rewrite a remote in the
+        # operator-owned checkout. Only clean the URL retained in the agent's
+        # environment; its existing Git auth configuration remains untouched.
         service_name = os.environ.get("LMER_SERVICE_NAME", "unknown")
         print(f"📦 Service mode: using local checkout at /workspace (service: {service_name})", file=sys.stderr)
+        if repo_url:
+            repo_url = _scrub_credentials(repo_url)
+            os.environ["LMER_REPO_URL"] = repo_url
         try:
             check_call(["git", "config", "--global", "--add", "safe.directory", str(ws)])
         except Exception:
@@ -2127,6 +2418,8 @@ def main(argv: list[str] | None = None) -> int:
         except subprocess.CalledProcessError as e:
             print(f"❌ git operation failed: {_scrub_credentials(str(e))}", file=sys.stderr)
             return e.returncode or 1
+        repo_url = _scrub_credentials(repo_url)
+        os.environ["LMER_REPO_URL"] = repo_url
 
     # Trust workspace mise config (shared with setup_workspace) so mise-managed
     # repos don't warn on every command; gated behind LMER_TRUST_MISE.
@@ -2136,7 +2429,6 @@ def main(argv: list[str] | None = None) -> int:
     # Skip in service mode — the user's checkout is already set up and remote auth
     # may not be available inside the container. Claude handles branch setup via
     # task instructions (Phase -1).
-    git_remote = os.environ.get("LMER_GIT_REMOTE", "origin")
     gitlab_mr_id = os.environ.get("GITLAB_MR_ID")
     if gitlab_mr_id and not branch and not ref and not service_mode:
         print(f"🔍 Detected GitLab MR {gitlab_mr_id}, attempting to fetch and checkout MR branch (remote: {git_remote})...", file=sys.stderr)
@@ -2159,10 +2451,19 @@ def main(argv: list[str] | None = None) -> int:
     # Clone work repository
     work_repo_path = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work")).resolve()
     try:
-        ensure_clone(work_repo_path, work_repo_url, None, None)
+        work_credential = ensure_clone(
+            work_repo_path, work_repo_url, None, None, manage_existing=True
+        )
     except subprocess.CalledProcessError as e:
         print(f"❌ work repo clone failed: {_scrub_credentials(str(e))}", file=sys.stderr)
         return e.returncode or 1
+    # Keep the original value for declared-source credential derivation below,
+    # but never hand URL userinfo to the eventual agent process.
+    os.environ["LMER_WORK_REPO"] = _scrub_credentials(work_repo_url)
+    if work_credential is not None:
+        # bin/doctor uses this non-secret path to authenticate declared-source
+        # probes without reconstructing a credential-bearing URL.
+        os.environ["LMER_WORK_REPO_CREDENTIAL_FILE"] = str(work_credential.path)
 
     # Canonical source resolution (sources.yaml, issue #105): runs here —
     # after the work-repo clone (the declaration is now present and fresh)
@@ -2180,7 +2481,11 @@ def main(argv: list[str] | None = None) -> int:
         secondary_targets = [t.strip() for t in secondary_targets_str.split(",") if t.strip()]
         for secondary_target in secondary_targets:
             try:
-                clone_secondary_mr(secondary_target, ws)
+                clone_secondary_mr(
+                    secondary_target,
+                    ws,
+                    persist_local_config=not workspace_is_operator_owned,
+                )
             except subprocess.CalledProcessError as e:
                 print(f"⚠️  Failed to clone secondary MR {secondary_target}: {_scrub_credentials(str(e))}", file=sys.stderr)
                 # Don't fail the entire operation if secondary MR clone fails
@@ -2209,13 +2514,19 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Optional napkin/taskdef auxiliary repos + stable home symlinks ---
     # Declared sources were already cloned LOUDLY by the resolution seam
-    # above; this pass is an idempotent no-op for them and is the sole
-    # (warn-and-continue) clone path for env-only/absent URLs — see the
-    # clone_aux_repos docstring for the failure-signal split.
+    # above; this clean-URL pass preserves their live session helper and is
+    # the sole (warn-and-continue) clone path for env-only/absent URLs — see
+    # the clone_aux_repos docstring for the failure-signal split.
     napkin_repo_url = os.environ.get("LMER_NAPKIN_REPO")
     taskdef_repo_url = os.environ.get("LMER_TASKDEF_REPO")
     taskdef_ref = os.environ.get("LMER_TASKDEF_REF")
     clone_aux_repos(napkin_repo_url, taskdef_repo_url, taskdef_ref)
+    for name, value in (
+        ("LMER_NAPKIN_REPO", napkin_repo_url),
+        ("LMER_TASKDEF_REPO", taskdef_repo_url),
+    ):
+        if value:
+            os.environ[name] = _scrub_credentials(value)
 
     napkin_path = Path(os.environ.get("LMER_NAPKIN_PATH", str(work_repo_path / "napkin")))
     home = Path(os.environ.get("HOME", "/home/developer"))

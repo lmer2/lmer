@@ -510,9 +510,13 @@ class TestApplySourcesResolution:
                 result, env, sources_mod, isatty=False, input_fn=_no_input
             )
         assert rc == 0
-        mock_clone.assert_called_once_with(Path("/taskdef"), ENV_TASKDEF_EQUAL, None, "main")
-        # Propagation (spec N1): env mutated exactly as if the host had set it.
-        assert env["LMER_TASKDEF_REPO"] == ENV_TASKDEF_EQUAL
+        mock_clone.assert_called_once_with(
+            Path("/taskdef"), ENV_TASKDEF_EQUAL, None, "main",
+            manage_existing=True,
+        )
+        # The clone gets the resolved credentialed transport input, while the
+        # environment retained for the agent keeps only the clean URL (#310).
+        assert env["LMER_TASKDEF_REPO"] == DECLARED_TASKDEF
         assert env["LMER_TASKDEF_REF"] == "main"
         assert env["LMER_TASKDEF_PATHS"] == "/taskdef"
         err = capsys.readouterr().err
@@ -738,10 +742,10 @@ class TestResolveDeclaredSources:
                 tmp_path, WORK_URL, env=env, isatty=False, input_fn=_no_input
             )
         assert rc == 0
-        assert env["LMER_TASKDEF_REPO"] == ENV_TASKDEF_EQUAL
+        assert env["LMER_TASKDEF_REPO"] == DECLARED_TASKDEF
         assert env["LMER_TASKDEF_REF"] == "main"
         assert env["LMER_TASKDEF_PATHS"] == "/taskdef"
-        assert env["LMER_NAPKIN_REPO"] == f"https://oauth2:{TOKEN}@git.example.com/org/napkin.git"
+        assert env["LMER_NAPKIN_REPO"] == DECLARED_NAPKIN
         assert env["LMER_NAPKIN_PATH"] == "/napkin"
         assert mock_clone.call_count == 2
         err = capsys.readouterr().err
@@ -830,7 +834,7 @@ class TestEnvDeltasPerRow:
         assert rc == 0
         assert env == {
             **pre,
-            "LMER_TASKDEF_REPO": ENV_TASKDEF_EQUAL,
+            "LMER_TASKDEF_REPO": DECLARED_TASKDEF,
             "LMER_TASKDEF_REF": "main",
             "LMER_TASKDEF_PATHS": "/mnt/td0:/taskdef",
         }
@@ -850,7 +854,7 @@ class TestEnvDeltasPerRow:
         assert rc == 0
         assert env == {
             **pre,
-            "LMER_TASKDEF_REPO": ENV_TASKDEF_EQUAL,
+            "LMER_TASKDEF_REPO": DECLARED_TASKDEF,
             "LMER_TASKDEF_PATHS": "/taskdef",
         }
 
@@ -869,7 +873,7 @@ class TestEnvDeltasPerRow:
         assert rc == 0
         assert env == {
             **pre,
-            "LMER_NAPKIN_REPO": f"https://oauth2:{TOKEN}@git.example.com/org/napkin.git",
+            "LMER_NAPKIN_REPO": DECLARED_NAPKIN,
             "LMER_NAPKIN_PATH": "/napkin",
         }
 
@@ -890,7 +894,10 @@ class TestEnvDeltasPerRow:
         )
         assert rc == 0
         assert env == pre
-        mock_clone.assert_called_once_with(Path("/taskdef"), ENV_TASKDEF_EQUAL, None, None)
+        mock_clone.assert_called_once_with(
+            Path("/taskdef"), ENV_TASKDEF_EQUAL, None, None,
+            manage_existing=True,
+        )
 
     def test_env_only_row_env_byte_identical(self, tmp_path, capsys):
         """Env-only (row 4): no declaration for the source — env stays
@@ -960,7 +967,8 @@ class TestEnvDeltasPerRow:
         }
         env = dict(pre)
 
-        def clone(dest, url, branch, ref):
+        def clone(dest, url, branch, ref, *, manage_existing):
+            assert manage_existing is True
             if Path(dest) == Path("/taskdef"):
                 raise Exception("boom")
 
@@ -982,7 +990,7 @@ class TestEnvDeltasPerRow:
             "LMER_WORK_REPO_PATH": "/work",
             "LMER_TASKDEF_PATHS": "/mnt/td0",
             # ...napkin: propagation kept.
-            "LMER_NAPKIN_REPO": f"https://oauth2:{TOKEN}@git.example.com/org/napkin.git",
+            "LMER_NAPKIN_REPO": DECLARED_NAPKIN,
             "LMER_NAPKIN_PATH": "/napkin",
         }
 
@@ -997,7 +1005,8 @@ class TestEnvDeltasPerRow:
         env = dict(pre)
         clone_calls = []
 
-        def clone(dest, url, branch, ref):
+        def clone(dest, url, branch, ref, *, manage_existing):
+            assert manage_existing is True
             clone_calls.append((Path(dest), url, ref))
             if Path(dest) == Path("/napkin"):
                 raise Exception("boom")
@@ -1022,7 +1031,7 @@ class TestEnvDeltasPerRow:
         assert env == {
             # taskdef: propagation kept in full (REPO + REF + PATHS append)...
             "LMER_WORK_REPO_PATH": "/work",
-            "LMER_TASKDEF_REPO": ENV_TASKDEF_EQUAL,
+            "LMER_TASKDEF_REPO": DECLARED_TASKDEF,
             "LMER_TASKDEF_REF": "main",
             "LMER_TASKDEF_PATHS": "/taskdef",
             # ...napkin: exact pre-resolution state restored (no REPO, PATH
@@ -1119,10 +1128,13 @@ class TestFailureSignalSeam:
             tmp_path, yaml_text, env, isatty=True, input_fn=_no_input, clone=None
         )
         assert rc3 == 0
-        mock_clone.assert_called_once_with(Path("/napkin"), napkin_cred, None, None)
+        mock_clone.assert_called_once_with(
+            Path("/napkin"), napkin_cred, None, None,
+            manage_existing=True,
+        )
         assert env == {
             **pre,
-            "LMER_NAPKIN_REPO": napkin_cred,
+            "LMER_NAPKIN_REPO": DECLARED_NAPKIN,
             "LMER_NAPKIN_PATH": "/napkin",
         }
 
@@ -1135,7 +1147,7 @@ class TestMainSeamWiring:
         BEFORE clone_aux_repos and before any /taskdef//napkin clone."""
         work = tmp_path / "work"
 
-        def fake_ensure_clone(workspace, repo_url, branch, ref):
+        def fake_ensure_clone(workspace, repo_url, branch, ref, **kwargs):
             assert Path(workspace) not in (Path("/taskdef"), Path("/napkin")), (
                 "no aux clone may run before resolution refuses start"
             )
@@ -1186,11 +1198,13 @@ class TestMainSeamWiring:
         os.environ at call time), setup_napkin_and_links gets
         napkin_path=/napkin with napkin_is_separate=True derived from
         bool(LMER_NAPKIN_REPO), and the total os.environ delta is exactly
-        the five propagated vars (no separate-mode env var)."""
+        the five propagated source vars plus the cleaned work URL and
+        non-secret credential-file path (no separate-mode env var)."""
         work = tmp_path / "work"
-        napkin_url = f"https://oauth2:{TOKEN}@git.example.com/org/napkin.git"
+        credential_file = tmp_path / "work-credential"
+        credential_file.write_text(WORK_URL + "\n")
 
-        def fake_ensure_clone(workspace, repo_url, branch, ref):
+        def fake_ensure_clone(workspace, repo_url, branch, ref, **kwargs):
             # Only materialize the work repo (the /taskdef and /napkin
             # declared clones must not touch the real filesystem root).
             if Path(workspace) == work:
@@ -1200,6 +1214,12 @@ class TestMainSeamWiring:
                     f"  taskdef:\n    repo: {DECLARED_TASKDEF}\n    ref: main\n"
                     f"  napkin:\n    repo: {DECLARED_NAPKIN}\n"
                 )
+                return clone_and_exec._SessionGitCredential(
+                    clean_url=WORK_URL_ANON,
+                    scope_url=WORK_URL_ANON,
+                    path=credential_file,
+                )
+            return None
 
         for var in (
             "LMER_SERVICE_MODE", "LMER_REPO_URL", "LMER_CHECKOUT_BRANCH",
@@ -1250,17 +1270,24 @@ class TestMainSeamWiring:
         # no separate-napkin-mode env var).
         delta = {k: v for k, v in post_env.items() if pre_env.get(k) != v}
         assert delta == {
-            "LMER_TASKDEF_REPO": ENV_TASKDEF_EQUAL,
+            "LMER_WORK_REPO": WORK_URL_ANON,
+            "LMER_WORK_REPO_CREDENTIAL_FILE": str(credential_file),
+            "LMER_TASKDEF_REPO": DECLARED_TASKDEF,
             "LMER_TASKDEF_REF": "main",
             "LMER_TASKDEF_PATHS": "/taskdef",
-            "LMER_NAPKIN_REPO": napkin_url,
+            "LMER_NAPKIN_REPO": DECLARED_NAPKIN,
             "LMER_NAPKIN_PATH": "/napkin",
         }
         assert set(pre_env) - set(post_env) == set()
         # clone_aux_repos got the resolved values (read back from the env)...
-        aux.assert_called_once_with(napkin_url, ENV_TASKDEF_EQUAL, "main")
+        aux.assert_called_once_with(DECLARED_NAPKIN, DECLARED_TASKDEF, "main")
         # ...and os.environ already carried them at call time.
-        assert env_at_aux_call == delta
+        assert env_at_aux_call == {
+            key: value for key, value in delta.items()
+            if key not in {
+                "LMER_WORK_REPO", "LMER_WORK_REPO_CREDENTIAL_FILE"
+            }
+        }
         # setup_napkin_and_links: /napkin + separate mode derived from
         # bool(LMER_NAPKIN_REPO), never from a dedicated env var.
         links.assert_called_once_with(
@@ -1309,7 +1336,8 @@ class TestEndToEndAcceptance:
         stand_in = tmp_path / "taskdef-clone"
         task_name = "sources-e2e-only-task"
 
-        def fake_clone(dest, url, branch, ref):
+        def fake_clone(dest, url, branch, ref, *, manage_existing):
+            assert manage_existing is True
             assert Path(dest) == Path("/taskdef")
             assert url == ENV_TASKDEF_EQUAL
             task_dir = stand_in / task_name
@@ -1367,7 +1395,7 @@ class TestEndToEndAcceptance:
         home = tmp_path / "home"
         home.mkdir()
 
-        def fake_ensure_clone(workspace, repo_url, branch, ref):
+        def fake_ensure_clone(workspace, repo_url, branch, ref, **kwargs):
             # Only materialize the work repo; the declared /napkin clone
             # must not touch the real filesystem root.
             if Path(workspace) == work:

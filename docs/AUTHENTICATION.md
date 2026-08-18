@@ -238,19 +238,54 @@ GITLAB_TOKEN=glpat-aaaaaaaaaaaaaaaaaaaaaa
 LMER_GITLAB_TOKEN_HOST=git.example.com
 ```
 
-### URL Conversion Behavior
+### Container Credential-File Behavior
 
-When a token is available, LMER automatically rewrites SSH URLs to HTTPS-with-token:
+When a token is available, LMER still resolves it on the host with the
+precedence above and converts SSH clone targets to HTTPS. The credentialed URL
+form is only transient transport into the clone boundary:
 
 ```
 # Original (SSH)
 git@github.com:owner/work.git
 
-# Converted (HTTPS with token)
+# Transient resolved form
 https://oauth2:<token>@github.com/owner/work.git
+
+# URL passed to git and stored as origin
+https://github.com/owner/work.git
 ```
 
 The `oauth2:` username works for both GitLab and GitHub — GitHub ignores the basic-auth username when the password is a valid PAT.
+
+Immediately before each container-side clone, lmer moves the userinfo into a
+session-local `~/.git-credentials-{host}-*` file created with mode `0600`.
+This includes password-style (`oauth2:<token>@`) and username-only
+(`<token>@`) HTTPS userinfo; SSH's protocol username (`ssh://git@`) is not a
+credential and remains unchanged.
+Clone-time Git configuration references that file and uses the clean URL. The
+new repository retains only the non-secret credential-helper file reference,
+so later fetches and pushes continue to authenticate while:
+
+- the token is absent from Git process arguments;
+- `git remote -v` shows a clean URL; and
+- `.git/config` contains no token.
+
+Each resolved repository credential gets its own session file. Dedicated work,
+napkin, or taskdef credentials therefore remain distinct even when those
+repositories share a host. The files live only in the session container and are
+removed with it.
+
+Only container-internal clones lmer creates and owns receive the repository-local
+helper reference or a clean-remote migration. A checkout supplied with
+`--checkout`, including a service-mode bind mount, keeps its existing remotes and
+local credential config byte-for-byte; the same rule covers secondary-clone
+subdirectories beneath that host mount. Fresh secondary clones there use the
+session file only through process-scoped Git config. Lmer removes userinfo from
+the URL retained in the agent's environment. Declared-source checks in
+`bin/doctor` attach a disposable mode-`0600` copy of the work-repo session file,
+so private sources remain checkable without letting Git approve or reject a
+credential in the live file or putting it back into an environment URL or
+repository config.
 
 ### Fallback to SSH
 
