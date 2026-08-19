@@ -1,0 +1,3 @@
+fixed:
+- "`gitlab-review --resolve-thread` now accepts non-diff discussions when GitLab advertises them as resolvable, while still refusing notes with no resolved state. (#250)"
+- "Platform spawns using a plain repository URL as their target are tracked and retain their requested title without a duplicate repo-URL field. (#255)"

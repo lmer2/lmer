@@ -457,11 +457,11 @@ def test_session_without_run_identity_is_still_registered(config, caplog, monkey
 # registry entry — which a clean exit removes, taking the row out of the fleet view
 # and leaving nothing behind but a log line.
 #
-# So the target is read as a third source of an identity, using the same helper
-# `lmer` runs on it, and never as a source of a *record*: a derived URL is a
-# reconstruction (and in the GitLab case a tokenised one), and recording a
-# reconstruction is what answer.py's `_identity_repo_url` docstring explains at
-# length would silently satisfy `resume.RepoUrlRequired` forever after.
+# A plain repository-URL target is evidence and is recorded. A resource target is
+# read as an identity using the same helper `lmer` runs on it, but its derived URL
+# remains a reconstruction (and in the GitLab case a tokenised one). Recording
+# that reconstruction is what answer.py's `_identity_repo_url` docstring explains
+# at length would silently satisfy `resume.RepoUrlRequired` forever after.
 
 #: A target whose project name ends in one of the characters `.git` is made of.
 #: Named because the parity test below cannot see what was wrong with it: until
@@ -481,6 +481,29 @@ DERIVABLE_TARGETS = [
     "https://gitlab.example.com/agents/global/-/merge_requests/7",
     GIT_CHAR_TAILED_TARGET,
     "https://github.com/owner/repo/pull/9",
+]
+
+#: Plain repository URLs are already clone targets, not resource URLs from which
+#: a clone target has to be reconstructed. Both URL spellings the shared parser
+#: supports are pinned because they take different branches.
+PLAIN_REPO_TARGETS = [
+    "https://gitlab.example.com/agents/global",
+    "https://gitlab.example.com/agents/global.git",
+    "git@gitlab.example.com:agents/global.git",
+    "ssh://git@gitlab.example.com/agents/global.git",
+]
+
+#: URL-shaped targets that are not repository roots. Before #255 these remained
+#: untracked and produced the actionable warning; recognising repo targets must
+#: not turn web pages or unsupported transports into persistent clone records.
+NON_REPO_URL_TARGETS = [
+    "https://gitlab.example.com/agents/global/-/tree/main",
+    "https://gitlab.example.com/agents/global/-/pipelines/1691",
+    "https://gitlab.example.com/agents/global/-/blob/main/README.md",
+    "https://gitlab.example.com/agents/global/-/wikis/home",
+    "https://github.com/owner/repo/tree/main",
+    "https://docs.example.com/guide/getting-started",
+    "ftp://gitlab.example.com/group/project",
 ]
 
 #: Targets that name no repository at all: the residual case, and the one the
@@ -556,6 +579,74 @@ def test_a_target_that_carries_the_repository_identifies_the_run(config, target)
     )
     assert tracked.source == "spawned"
     assert tracked.last_session_id == result.session_id
+
+
+@pytest.mark.parametrize("target", PLAIN_REPO_TARGETS)
+def test_a_plain_repo_url_target_is_recorded_and_tracks_the_run(config, target):
+    """A repository URL target is supplied repository evidence, not a guess."""
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+
+    assert (result.host, result.project) == (
+        "gitlab.example.com", "agents/global"
+    )
+    tracked = runs.get_tracked(result.host, result.project, result.slug)
+    assert tracked is not None
+    assert tracked.repo == target
+    assert result.warning is None
+
+
+def test_the_entry_records_a_plain_repo_url_target(config, monkeypatch):
+    """The registry and tracked index carry the same supplied repository."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    target = PLAIN_REPO_TARGETS[0]
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+    try:
+        assert registry.read_session(result.session_id)["task"]["repo"] == target
+        assert runs.get_tracked(
+            result.host, result.project, result.slug
+        ).repo == target
+    finally:
+        os.kill(result.pid, 9)
+
+
+@pytest.mark.parametrize("target", NON_REPO_URL_TARGETS)
+def test_a_url_shaped_non_repo_target_stays_untracked_and_warns(config, target):
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+
+    assert spawn._plain_repo_url_from_target(target) is None
+    assert (result.host, result.project) == (None, None)
+    assert runs.list_tracked() == []
+    assert result.warning is not None
+    assert "not tracked" in result.warning
+
+
+@pytest.mark.parametrize(("target", "clean", "secret"), [
+    (
+        f"https://oauth2:{HOST_TOKEN}@gitlab.example.com/agents/global.git",
+        "https://gitlab.example.com/agents/global.git",
+        HOST_TOKEN,
+    ),
+    (
+        "https://ghp-not-a-real-token@github.com/owner/repo",
+        "https://github.com/owner/repo",
+        "ghp-not-a-real-token",
+    ),
+])
+def test_embedded_http_credential_is_not_recorded_as_the_run_repo(
+    config, monkeypatch, target, clean, secret
+):
+    """The target may carry transport auth; persistent repo fields may not."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+    try:
+        entry = registry.read_session(result.session_id)
+        tracked = runs.get_tracked(result.host, result.project, result.slug)
+        assert entry["task"]["repo"] == clean
+        assert tracked.repo == clean
+        assert secret not in entry["task"]["repo"]
+        assert secret not in tracked.repo
+    finally:
+        os.kill(result.pid, 9)
 
 
 @pytest.mark.parametrize("target", DERIVABLE_TARGETS)
@@ -639,7 +730,9 @@ def test_the_daemon_s_own_repo_url_still_beats_the_target(config, monkeypatch):
     dropping a URL the operator did supply.
     """
     monkeypatch.setenv("LMER_REPO_URL", "https://gitlab.example.com/agents/other.git")
-    result = spawn.spawn_session(config, request_for(repo_url=None))
+    result = spawn.spawn_session(
+        config, request_for(repo_url=None, target=PLAIN_REPO_TARGETS[0])
+    )
 
     assert result.project == "agents/other"
     assert runs.get_tracked(result.host, result.project, result.slug).repo == (
@@ -647,7 +740,8 @@ def test_the_daemon_s_own_repo_url_still_beats_the_target(config, monkeypatch):
     )
 
 
-def test_a_supplied_identity_url_still_beats_the_target(config):
+@pytest.mark.parametrize("target", [DERIVABLE_TARGETS[0], PLAIN_REPO_TARGETS[0]])
+def test_a_supplied_identity_url_still_beats_the_target(config, target):
     """answer.py's reconstruction is a caller stating where the run already belongs.
 
     It is filed under a run that exists in the index; the target's project is a
@@ -657,13 +751,17 @@ def test_a_supplied_identity_url_still_beats_the_target(config):
     result = spawn.spawn_session(config, request_for(
         repo_url=None,
         identity_repo_url="https://gitlab.example.com/agents/elsewhere",
-        target=DERIVABLE_TARGETS[0],
+        target=target,
     ))
 
     assert result.project == "agents/elsewhere"
+    assert runs.get_tracked(result.host, result.project, result.slug).repo is None
 
 
-def test_a_no_repo_session_derives_nothing_from_its_target(config, monkeypatch):
+@pytest.mark.parametrize("target", [DERIVABLE_TARGETS[0], PLAIN_REPO_TARGETS[0]])
+def test_a_no_repo_session_derives_nothing_from_its_target(
+    config, monkeypatch, target
+):
     """Spec D17 outranks the target, and the assistant is why.
 
     It spawns with ``no_repo=True`` and a perfectly derivable target; a session
@@ -672,7 +770,7 @@ def test_a_no_repo_session_derives_nothing_from_its_target(config, monkeypatch):
     """
     monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
     result = spawn.spawn_session(
-        config, request_for(repo_url=None, target=DERIVABLE_TARGETS[0], no_repo=True)
+        config, request_for(repo_url=None, target=target, no_repo=True)
     )
     try:
         assert (result.host, result.project) == (None, None)

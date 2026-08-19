@@ -116,7 +116,12 @@ conversation window is lost.
   with the orange border and the robot is uber lmer itself; `chat` on that
   row (or the robot in the app bar) opens its drawer.
 - **Spawn a run** — the `run` button. Taskdef + target, optionally a preset,
-  a fan-out roster (`--agents`), a title.
+  a fan-out roster (`--agents`), a title. A plain clone URL is a complete target
+  by itself: the platform derives the run identity from it, records that
+  repository, tracks the run, and keeps the title without requiring the repo-URL
+  field to repeat the same value. GitLab/GitHub web routes and generic web-page
+  URLs are not treated as repository evidence; use the repo-URL field when an
+  HTTP clone URL is not recognisable as a forge root or does not end in `.git`.
 - **Answer a question** — a run stopped on a question shows a reply box.
   Answering a *stopped* run starts a fresh session with the answer attached;
   replying to a *live* one is delivered into the waiting session.

@@ -7,7 +7,7 @@ to catch regressions in:
     rules/git.md): non-review sessions must be refused before any API call
   - The --reply-thread/--resolve-thread pair: URL and payload of the reply
     call, the --comment-file requirement, reply-then-resolve ordering,
-    truncated discussion IDs, and non-resolvable (general) threads
+    truncated discussion IDs, and server-advertised resolvability
   - The --info thread-provenance block (counts, resolver breakdown,
     resolved-before-head heuristic, page-cap truncation marker)
   - Fail-soft behavior: --info must never fail on provenance trouble
@@ -77,14 +77,29 @@ def make_thread(discussion_id: str, resolved: bool = False,
             "resolved": resolved, "notes": [note]}
 
 
-def make_general_thread(discussion_id: str) -> dict:
-    """A summary/general thread: its notes are not resolvable.
-
-    GitLab only lets diff (inline) threads be resolved; general threads come
-    back with resolvable false and the resolve call is refused.
-    """
+def make_unresolvable_individual_note(discussion_id: str) -> dict:
+    """A standalone note for which GitLab advertises no resolved state."""
     thread = make_thread(discussion_id)
     thread["individual_note"] = True
+    thread["resolvable"] = False
+    thread["notes"][0]["resolvable"] = False
+    return thread
+
+
+def make_resolvable_general_discussion(discussion_id: str) -> dict:
+    """The non-diff resolvable shape measured by the live probe."""
+    thread = make_thread(discussion_id)
+    thread["resolvable"] = True
+    thread["notes"][0]["type"] = "DiscussionNote"
+    thread["notes"][0]["resolvable"] = True
+    return thread
+
+
+def make_discussion_level_only_resolvable(discussion_id: str) -> dict:
+    """Synthetic compatibility shape exercising the discussion-level fact."""
+    thread = make_resolvable_general_discussion(discussion_id)
+    # Not claimed as a measured server payload: the live probe returned both
+    # flags true. This pins the safe OR contract when a note omits/disagrees.
     thread["notes"][0]["resolvable"] = False
     return thread
 
@@ -250,6 +265,22 @@ def test_reply_to_mr_discussion_posts_note_to_thread():
     )
 
 
+def test_resolve_mr_discussion_uses_discussion_rest_endpoint():
+    """Client layer: keep the REST path proven by the live #250 probe."""
+    client = GitLabClient(host="gitlab.example.com", token="fake-token")
+
+    with patch.object(
+        GitLabClient, "_request", return_value={"resolved": True}
+    ) as request:
+        client.resolve_merge_request_discussion("group/project", 7, THREAD_ID)
+
+    request.assert_called_once_with(
+        "PUT",
+        f"projects/group%2Fproject/merge_requests/7/discussions/{THREAD_ID}",
+        json={"resolved": True},
+    )
+
+
 def test_reply_thread_sends_comment_file_body(monkeypatch, capsys, tmp_path):
     fake = FakeGitLabClient()
     comment_file = write_comment_file(tmp_path, "Fixed in abc1234.")
@@ -376,9 +407,42 @@ def test_non_hex_discussion_id_is_rejected(monkeypatch, capsys, review_session):
     assert "invalid discussion ID" in capsys.readouterr().err
 
 
-def test_resolve_refuses_general_thread(monkeypatch, capsys, review_session):
+def test_resolve_accepts_general_discussion_advertised_resolvable(
+    monkeypatch, capsys, review_session
+):
     fake = FakeGitLabClient()
-    fake.discussion = make_general_thread(THREAD_ID)
+    fake.discussion = make_resolvable_general_discussion(THREAD_ID)
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 0
+    assert fake.discussion_lookups == [THREAD_ID]
+    assert fake.resolve_calls == [THREAD_ID]
+    assert (
+        f"Successfully resolved discussion thread {THREAD_ID}"
+        in capsys.readouterr().out
+    )
+
+
+def test_resolve_accepts_discussion_level_resolvable_compatibility_shape(
+    monkeypatch, review_session
+):
+    fake = FakeGitLabClient()
+    fake.discussion = make_discussion_level_only_resolvable(THREAD_ID)
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 0
+    assert fake.resolve_calls == [THREAD_ID]
+
+
+def test_resolve_refuses_unresolvable_individual_note(
+    monkeypatch, capsys, review_session
+):
+    fake = FakeGitLabClient()
+    fake.discussion = make_unresolvable_individual_note(THREAD_ID)
 
     rc = run_cli(monkeypatch, fake, ["group/project", "7",
                                      "--resolve-thread", THREAD_ID])
@@ -387,14 +451,17 @@ def test_resolve_refuses_general_thread(monkeypatch, capsys, review_session):
     assert fake.discussion_lookups == [THREAD_ID]
     assert fake.resolve_calls == []
     err = capsys.readouterr().err
-    assert (f"thread {THREAD_ID} is not resolvable "
-            "(general threads cannot be resolved)") in err
+    assert f"thread {THREAD_ID} is not resolvable" in err
+    assert "GitLab reports no resolved state" in err
+    assert "Leave the note open" in err
 
 
-def test_general_thread_refusal_posts_no_reply(monkeypatch, capsys, tmp_path, review_session):
-    """Composing on a general thread must not half-apply: nothing is written."""
+def test_unresolvable_note_refusal_posts_no_reply(
+    monkeypatch, capsys, tmp_path, review_session
+):
+    """Composing on an unresolvable note must not half-apply."""
     fake = FakeGitLabClient()
-    fake.discussion = make_general_thread(THREAD_ID)
+    fake.discussion = make_unresolvable_individual_note(THREAD_ID)
 
     rc = run_cli(monkeypatch, fake, ["group/project", "7",
                                      "--reply-thread", THREAD_ID,
@@ -403,13 +470,13 @@ def test_general_thread_refusal_posts_no_reply(monkeypatch, capsys, tmp_path, re
 
     assert rc == 1
     assert fake.write_order == []
-    assert "general threads cannot be resolved" in capsys.readouterr().err
+    assert "GitLab reports no resolved state" in capsys.readouterr().err
 
 
-def test_reply_works_on_a_general_thread(monkeypatch, tmp_path):
-    """Reply is not restricted to diff threads — only resolve is."""
+def test_reply_works_on_an_unresolvable_individual_note(monkeypatch, tmp_path):
+    """Reply does not require the target to carry a resolved state."""
     fake = FakeGitLabClient()
-    fake.discussion = make_general_thread(THREAD_ID)
+    fake.discussion = make_unresolvable_individual_note(THREAD_ID)
 
     rc = run_cli(monkeypatch, fake, ["group/project", "7",
                                      "--reply-thread", THREAD_ID,
@@ -448,7 +515,7 @@ def test_refused_resolve_says_the_reply_went_nowhere(monkeypatch, capsys, tmp_pa
     monkeypatch.setenv("LMER_TASK", "develop" if refusal == "policy" else "review")
     fake = FakeGitLabClient()
     if refusal == "not-resolvable":
-        fake.discussion = make_general_thread(THREAD_ID)
+        fake.discussion = make_unresolvable_individual_note(THREAD_ID)
     resolve_id = THREAD_ID[:8] if refusal == "bad-id" else THREAD_ID
 
     argv = ["group/project", "7", "--resolve-thread", resolve_id]
