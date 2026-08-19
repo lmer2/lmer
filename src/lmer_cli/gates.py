@@ -58,6 +58,19 @@ class CheckResult:
     # runs nothing — which the receipt records as "cannot say" rather than
     # as a full run.
     scope_targets: Optional[List[str]] = None
+    # Structured cache decision for receipts. Reasons never carry environment
+    # values; environment misses name variables only.
+    cache_verdict: Optional[str] = None
+    cache_reason: Optional[str] = None
+
+
+@dataclass
+class PassingSuite:
+    """A cache pass eligible for a content-checked post-commit handoff."""
+    argv: List[str]
+    environment: Dict[str, str]
+    summary: Optional[str]
+    indexed_tree: str
 
 
 # Fixed, predictable location for the full gate-check log. Overwritten on every
@@ -193,9 +206,11 @@ class Colors:
 class GateSystem:
     """Main gate system for enforcing development rules"""
 
-    def __init__(self, verbose: bool = False, debug: bool = False):
+    def __init__(self, verbose: bool = False, debug: bool = False,
+                 commit_handoff: bool = False):
         self.verbose = verbose
         self.debug = debug
+        self.commit_handoff = commit_handoff
         self.results: List[CheckResult] = []
         self.project_root = Path.cwd()
         self.timestamp = time.time()
@@ -205,6 +220,7 @@ class GateSystem:
         # different question there.
         self.in_push_gate = False
         self.push_diff_base: Optional[str] = None
+        self._passing_suite: Optional[PassingSuite] = None
 
     def run_command(self, command: List[str], check: bool = True) -> Tuple[int, str, str]:
         """Run a command and return exit code, stdout, stderr"""
@@ -539,6 +555,7 @@ class GateSystem:
 
     def check_tests(self) -> CheckResult:
         """Run pytest tests, or a project-supplied custom test runner if present."""
+        self._passing_suite = None
         custom_runner = self._find_custom_test_runner()
         if custom_runner is not None:
             return self._run_custom_test_runner(custom_runner)
@@ -609,8 +626,19 @@ class GateSystem:
             self.run_command, pytest_argv, cache_env)
         cached = gate_cache.read_pass(fingerprint)
         if cached is not None:
+            indexed = None
+            if self.commit_handoff and gate_cache.cache_enabled():
+                indexed = gate_cache.indexed_tree(self.run_command)
+            if indexed is not None:
+                self._passing_suite = PassingSuite(
+                    argv=list(pytest_argv),
+                    environment=dict(cache_env),
+                    summary=cached.get("summary"),
+                    indexed_tree=indexed,
+                )
             return self._cached_tests_result(cached, fingerprint, scope,
                                              targets)
+        cache_verdict, cache_reason = self._cache_miss_decision(fingerprint)
         self._print_cache_miss_notice(fingerprint)
 
         # Run pytest and capture output
@@ -642,8 +670,9 @@ class GateSystem:
                 message = f"All {test_count} passed"
                 details = None
 
-            self._record_passing_suite(fingerprint, pytest_argv, cache_env,
-                                       combined_output)
+            self._passing_suite = self._record_passing_suite(
+                fingerprint, pytest_argv, cache_env, combined_output
+            )
 
             return CheckResult(
                 name="Python Tests",
@@ -653,6 +682,8 @@ class GateSystem:
                 full_output=combined_output,
                 scope=scope,
                 scope_targets=list(targets),
+                cache_verdict=cache_verdict,
+                cache_reason=cache_reason,
             )
         else:
             # Look for failure patterns in output
@@ -689,7 +720,23 @@ class GateSystem:
                 full_output=combined_output,
                 scope=scope,
                 scope_targets=list(targets),
+                cache_verdict=cache_verdict,
+                cache_reason=cache_reason,
             )
+
+    def _cache_miss_decision(
+        self, fingerprint: Optional[gate_cache.Fingerprint]
+    ) -> Tuple[str, str]:
+        """The structured verdict/reason recorded when no cache entry answered."""
+        if not gate_cache.cache_enabled():
+            return "disabled", f"disabled by {gate_cache.DISABLE_ENV}"
+        if fingerprint is None:
+            return "miss", "fingerprint unavailable"
+        names = gate_cache.environment_mismatch(fingerprint)
+        reason = gate_cache.environment_miss_reason(names)
+        if reason:
+            return "miss", reason
+        return "miss", "no current matching pass"
 
     def _print_cache_miss_notice(
             self, fingerprint: Optional[gate_cache.Fingerprint]) -> None:
@@ -746,12 +793,15 @@ class GateSystem:
             full_output="\n".join(captured),
             scope=cached_scope,
             scope_targets=list(targets),
+            cache_verdict="hit",
+            cache_reason="exact fingerprint pass found",
         )
 
     def _record_passing_suite(self,
                               fingerprint: Optional[gate_cache.Fingerprint],
                               pytest_argv: List[str],
-                              cache_env: Dict[str, str], output: str) -> None:
+                              cache_env: Dict[str, str], output: str
+                              ) -> Optional[PassingSuite]:
         """Record a passing suite for the tree it actually ran on (#269).
 
         The fingerprint is re-taken and must still match, because a suite
@@ -764,17 +814,66 @@ class GateSystem:
         commands against a run that just cost minutes.
         """
         if fingerprint is None:
-            return
+            return None
         confirmed = gate_cache.compute_fingerprint(
             self.run_command, pytest_argv, cache_env)
         if confirmed is None or confirmed.key != fingerprint.key:
-            return
-        gate_cache.record_pass(
+            return None
+        summary = pytest_summary_line(output)
+        recorded = gate_cache.record_pass(
             confirmed,
-            summary=pytest_summary_line(output),
+            summary=summary,
             argv=pytest_argv,
             gate=receipt_argv()[0],
         )
+        if recorded is None:
+            return None
+        if not self.commit_handoff:
+            return None
+        indexed = gate_cache.indexed_tree(self.run_command)
+        if indexed is None:
+            return None
+        return PassingSuite(
+            argv=list(pytest_argv),
+            environment=dict(cache_env),
+            summary=summary,
+            indexed_tree=indexed,
+        )
+
+    def handoff_test_cache_after_commit(self) -> bool:
+        """File the passing suite under the equivalent clean post-commit key.
+
+        The pre-commit key is the old HEAD plus staged state; the post-commit key
+        is the new HEAD plus a clean tree. Handoff is allowed only when the new
+        committed tree equals the index tree captured with the passing suite and
+        the recomputed fingerprint is clean. Any uncertainty declines reuse.
+        """
+        try:
+            suite = self._passing_suite
+            if suite is None:
+                return False
+            committed = gate_cache.committed_tree(self.run_command)
+            if committed is None or committed != suite.indexed_tree:
+                return False
+            post_commit = gate_cache.compute_fingerprint(
+                self.run_command, suite.argv, suite.environment
+            )
+            if (
+                post_commit is None
+                or not post_commit.clean
+                or post_commit.tree != suite.indexed_tree
+            ):
+                return False
+            return gate_cache.record_pass(
+                post_commit,
+                summary=suite.summary,
+                argv=suite.argv,
+                gate="gate-commit",
+            ) is not None
+        except Exception:
+            # The cache is an optimization. No handoff failure may change the
+            # result of the commit that already succeeded.
+            return False
 
     @staticmethod
     def _interpreter_can_import(python_cmd: str, module: str = "pytest") -> bool:
@@ -1430,6 +1529,10 @@ class GateSystem:
                 # the terminal); the receipt names it instead of implying it.
                 "test_scope": result.scope or FULL_SUITE_SCOPE,
                 "test_targets": list(result.scope_targets),
+                "test_cache_verdict": result.cache_verdict or "unknown",
+                "test_cache_reason": (
+                    result.cache_reason or "cache decision unavailable"
+                ),
             }
         return {}
 

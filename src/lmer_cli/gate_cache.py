@@ -365,8 +365,8 @@ def differing_names(recorded: Mapping[str, str],
                   if recorded.get(name) != current.get(name))
 
 
-def describe_miss(names: Sequence[str]) -> Optional[str]:
-    """The one line a nameable environment miss prints, or None when there is none.
+def environment_miss_reason(names: Sequence[str]) -> Optional[str]:
+    """Structured reason for a nameable environment miss, or ``None``.
 
     The point of the line: a cache that never hits is otherwise silent, which
     is how keying the filename on a per-shell variable survived a review round
@@ -380,8 +380,14 @@ def describe_miss(names: Sequence[str]) -> Optional[str]:
     remaining = len(names) - len(shown)
     if remaining > 0:
         listed += f", +{remaining} more"
-    return ("Cache miss: same tree and invocation, environment differs "
+    return ("same tree and invocation, environment differs "
             f"({listed})")
+
+
+def describe_miss(names: Sequence[str]) -> Optional[str]:
+    """The terminal line for a nameable environment miss, or ``None``."""
+    reason = environment_miss_reason(names)
+    return f"Cache miss: {reason}" if reason else None
 
 
 def compose_key(tree: Optional[str], working: Optional[str],
@@ -610,6 +616,23 @@ def _command_output(run: Runner, command: List[str]) -> Optional[str]:
 def committed_tree(run: Runner) -> Optional[str]:
     """``HEAD^{tree}`` — the committed content, or None outside a git repo."""
     stdout = _command_output(run, ["git", "rev-parse", "HEAD^{tree}"])
+    if stdout is None:
+        return None
+    tree = stdout.strip()
+    return tree or None
+
+
+def indexed_tree(run: Runner) -> Optional[str]:
+    """The tree object represented by the current index, or ``None``.
+
+    ``git write-tree`` does not change staged content or working-tree files, but
+    it may rewrite the index's cache-tree extension, takes the index lock, and
+    writes tree objects. It is therefore reserved for a cache-enabled commit
+    gate that can consume the identity after committing. Equality with
+    ``HEAD^{tree}`` then proves the clean post-commit tree is exactly the staged
+    content whose tests passed.
+    """
+    stdout = _command_output(run, ["git", "write-tree"])
     if stdout is None:
         return None
     tree = stdout.strip()

@@ -135,6 +135,111 @@ MILESTONE_MISSES = [
 ]
 
 
+@pytest.mark.parametrize(
+    ("wrapper", "reviewer", "review_env", "signal_text"),
+    [
+        (
+            "gitlab-review-post-review.sh",
+            "gitlab-review",
+            {
+                "GITLAB_PROJECT": "agents/global",
+                "GITLAB_MR_ID": "42",
+                "GITLAB_REVIEW_FILE": "/tmp/review.json",
+            },
+            "Posted GitLab review for agents/global!42",
+        ),
+        (
+            "github-review-post-review.sh",
+            "github-review",
+            {
+                "GITHUB_PROJECT": "agents/global",
+                "GITHUB_PR_ID": "42",
+                "GITHUB_REVIEW_FILE": "/tmp/review.json",
+                "GITHUB_HOST": "github.example.com",
+            },
+            "Posted GitHub review for agents/global#42",
+        ),
+    ],
+)
+class TestPostReviewWrappers:
+    @staticmethod
+    def _fake_commands(tmp_path, reviewer):
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        review = bin_dir / reviewer
+        review.write_text(
+            "#!/bin/sh\n"
+            "printf 'review %s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+            "exit \"${REVIEW_EXIT:-0}\"\n"
+        )
+        review.chmod(0o755)
+        signal = bin_dir / "lmer-signal"
+        signal.write_text(
+            "#!/bin/sh\n"
+            "printf 'signal %s\\n' \"$*\" >> \"$CALL_LOG\"\n"
+            "exit \"${SIGNAL_EXIT:-0}\"\n"
+        )
+        signal.chmod(0o755)
+        return bin_dir
+
+    def _run(self, tmp_path, wrapper, reviewer, review_env, review_exit="0",
+             signal_exit="0"):
+        call_log = tmp_path / "calls"
+        bin_dir = self._fake_commands(tmp_path, reviewer)
+        env = os.environ.copy()
+        env.update(review_env)
+        env.update(
+            {
+                "CALL_LOG": str(call_log),
+                "PATH": f"{bin_dir}:{env['PATH']}",
+                "REVIEW_EXIT": review_exit,
+                "SIGNAL_EXIT": signal_exit,
+            }
+        )
+        result = subprocess.run(
+            ["bash", str(REPO_ROOT / "hooks" / wrapper)],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+        calls = call_log.read_text().splitlines() if call_log.exists() else []
+        return result, calls
+
+    def test_success_signals_after_posting(
+        self, tmp_path, wrapper, reviewer, review_env, signal_text
+    ):
+        result, calls = self._run(tmp_path, wrapper, reviewer, review_env)
+
+        assert result.returncode == 0, result.stderr
+        assert calls[0].startswith("review ")
+        assert calls[1:] == [f"signal {signal_text}"]
+
+    def test_failure_preserves_status_and_does_not_signal(
+        self, tmp_path, wrapper, reviewer, review_env, signal_text
+    ):
+        result, calls = self._run(
+            tmp_path, wrapper, reviewer, review_env, review_exit="23"
+        )
+
+        assert result.returncode == 23
+        assert len(calls) == 1
+        assert calls[0].startswith("review ")
+
+    @pytest.mark.parametrize("signal_exit", ["3", "127"])
+    def test_signal_failure_does_not_turn_a_posted_review_into_a_failure(
+        self, tmp_path, wrapper, reviewer, review_env, signal_text, signal_exit
+    ):
+        result, calls = self._run(
+            tmp_path, wrapper, reviewer, review_env, signal_exit=signal_exit
+        )
+
+        assert result.returncode == 0
+        assert calls[0].startswith("review ")
+        assert calls[1:] == [f"signal {signal_text}"]
+        assert "review posted but milestone was not signalled" in result.stderr
+
+
 # ---- transcript event builders ------------------------------------------------
 
 def _assistant_text(text):

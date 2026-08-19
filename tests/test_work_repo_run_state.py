@@ -979,6 +979,25 @@ class TestEmitGateEvent:
         assert data["test_targets"] == ["tests/test_alpha.py",
                                         "tests/test_beta.py"]
 
+    def test_cache_verdict_and_reason_are_recorded(self, run_env):
+        rdir = run_state.run_dir()
+        run_state.write_state(
+            rdir, run_state.seed_state("develop-issue-123", "develop", "t")
+        )
+        run_state.emit_gate_event(
+            "gate-push",
+            "pass",
+            exit_code=0,
+            test_scope="cached full suite",
+            test_targets=["tests/"],
+            test_cache_verdict="hit",
+            test_cache_reason="exact fingerprint pass found",
+        )
+
+        data = run_state.read_events(rdir, last_n=0)[-1]["data"]
+        assert data["test_cache_verdict"] == "hit"
+        assert data["test_cache_reason"] == "exact fingerprint pass found"
+
     @pytest.mark.parametrize("scope", ["full suite", "cached full suite",
                                        "cached text-diff subset"])
     def test_every_run_shape_reaches_the_receipt(self, run_env, scope):
@@ -1029,12 +1048,16 @@ class TestEmitGateEvent:
             "gate-commit", "pass",
             summary="token=hunter2", argv=["gate-commit", "-m", "token=hunter2"],
             test_scope="token=hunter2", test_targets=["token=hunter2"],
+            test_cache_verdict="token=hunter2",
+            test_cache_reason="token=hunter2",
         )
         data = run_state.read_events(rdir, last_n=0)[-1]["data"]
         assert data["summary"] == "<redacted>"
         assert data["argv"] == ["<redacted>"] * 3
         assert data["test_scope"] == "<redacted>"
         assert data["test_targets"] == ["<redacted>"]
+        assert data["test_cache_verdict"] == "<redacted>"
+        assert data["test_cache_reason"] == "<redacted>"
 
 
 def _make_bundle(rdir, mp_slug, *names):
@@ -1258,6 +1281,19 @@ class TestGateCommitReceipt:
         assert data["duration_s"] >= 0
         assert data["argv"]  # invocation recorded (pytest's argv here)
         assert "summary" not in data  # no checks captured output — not fabricated
+
+    def test_successful_commit_attempts_the_cache_handoff(
+            self, run_env, monkeypatch):
+        self._seeded_rdir()
+        called = []
+        monkeypatch.setattr(
+            "lmer_cli.gates.GateSystem.handoff_test_cache_after_commit",
+            lambda self: called.append(True) or True,
+        )
+        mod = self._patched(monkeypatch, gate_passes=True, commit_rc=0)
+
+        assert mod.gate_commit("safe message") == 0
+        assert called == [True]
 
     def test_bypass_receipt_carries_sha(self, run_env, monkeypatch):
         rdir = self._seeded_rdir()

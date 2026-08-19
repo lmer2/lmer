@@ -255,11 +255,14 @@ class TestDifferingNames:
                                           self._hashes({"PATH": "/usr/bin"})) == []
 
     def test_the_notice_names_the_variable_and_nothing_else(self):
+        assert gate_cache.environment_miss_reason(["__MISE_SESSION"]) == (
+            "same tree and invocation, environment differs (__MISE_SESSION)")
         assert gate_cache.describe_miss(["__MISE_SESSION"]) == (
             "Cache miss: same tree and invocation, environment differs "
             "(__MISE_SESSION)")
 
     def test_nothing_differing_prints_no_notice(self):
+        assert gate_cache.environment_miss_reason([]) is None
         assert gate_cache.describe_miss([]) is None
 
     def test_a_long_list_is_summarized_rather_than_dumped(self):
@@ -552,6 +555,18 @@ class TestComputeFingerprint:
         assert after is not None
         assert after.key != before.key
         assert after.tree != before.tree
+
+    def test_the_index_tree_becomes_the_committed_tree(self, repo):
+        run = _runner(repo)
+        (repo / "module.py").write_text("value = 2\n")
+        _git(repo, "add", "module.py")
+
+        indexed = gate_cache.indexed_tree(run)
+        assert indexed is not None
+        assert indexed != gate_cache.committed_tree(run)
+
+        _git(repo, "-c", "commit.gpgsign=false", "commit", "-q", "-m", "edit")
+        assert gate_cache.committed_tree(run) == indexed
 
     def test_a_dirty_tree_says_so(self, repo):
         (repo / "module.py").write_text("value = 2\n")

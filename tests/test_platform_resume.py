@@ -124,6 +124,7 @@ def plant_run(
     question=None,
     status="in-progress",
     recorded_slug=...,
+    extra="",
 ):
     """Write one run dir into the mirror the way a pushed run appears there.
 
@@ -144,6 +145,8 @@ def plant_run(
     ):
         if value is not None:
             lines.append(f"{name}: {json.dumps(value)}")
+    if extra:
+        lines.append(extra)
     (path / "state.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
     (path / "events.jsonl").write_text(
         json.dumps({"ts": "2026-07-27T10:00:00Z", "type": "run_seeded"}) + "\n",
@@ -995,6 +998,24 @@ def test_a_resume_that_would_derive_another_run_is_refused(config):
         resume_mod.resume_run(config, request_for(slug="develop-issue-999"))
     assert "Pass a taskdef explicitly" in str(caught.value)
     assert registry.list_sessions(live_only=False) == []
+
+
+def test_resume_follows_a_run_that_reslugged_from_the_tracked_key(config):
+    base = run_state.derive_slug(TASKDEF, TARGET)
+    current = f"{base}-v1.2.3"
+    plant_run(
+        config,
+        slug=current,
+        recorded_slug=current,
+        stop_reason="yield",
+        extra=f"reslugged_from:\n  - {base}",
+    )
+    track_run(slug=base)
+
+    result = resume_mod.resume_run(config, request_for(slug=base))
+
+    assert result.continued is True
+    assert result.started_slug == base
 
 
 def test_the_same_mismatch_is_allowed_once_a_taskdef_is_named(config):

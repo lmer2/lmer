@@ -94,7 +94,7 @@ def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
             print(f"{Colors.YELLOW}ℹ️  LMER_QUICK_GATE_COMMIT enabled — tests will be skipped{Colors.NC}")
 
         # Run commit gate
-        gate = GateSystem(verbose=verbose)
+        gate = GateSystem(verbose=verbose, commit_handoff=True)
         if not gate.run_commit_gate(skip_tests=skip_tests):
             print(f"\n{Colors.RED}❌ Commit aborted due to gate failures{Colors.NC}")
             outcome = "fail"
@@ -121,6 +121,8 @@ def gate_commit(message: str, verbose: bool = False, bypass: bool = False):
 
     if result.returncode == 0:
         print(f"{Colors.GREEN}✅ Commit successful!{Colors.NC}")
+        if gate is not None and gate.handoff_test_cache_after_commit():
+            print(f"{Colors.GREEN}✅ Test cache handed off to the clean post-commit tree{Colors.NC}")
         emit(0, with_sha=True)
     else:
         print(f"{Colors.RED}❌ Commit failed{Colors.NC}")

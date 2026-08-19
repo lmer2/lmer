@@ -65,6 +65,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -72,6 +73,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 import yaml
+from work_repo import run_state
 
 # Private helpers reused deliberately rather than reimplemented: credential
 # lookup and credential scrubbing must have exactly one definition each.
@@ -106,6 +108,11 @@ _STATE_FILENAMES = ("state.yaml", "state.yml")
 #: Facts about run directories this process has already said out loud, so a read
 #: path the UI polls says each of them once — see :func:`_announce_once`.
 _ANNOUNCED: set = set()
+# One scan per mirrored revision and project for carried reslug identities. The
+# platform polls tracked rows individually; without this index every missing
+# direct slug re-read every state file in the project.
+_RESLUGGED_INDEX: dict[tuple[str, str, str], tuple[str, dict[str, str]]] = {}
+_RESLUGGED_INDEX_LOCK = threading.Lock()
 #: Characters that stop a slug from being usable as half of a directory-name glob
 #: pattern — path separators and the wildcards — see :func:`_renamed_run_dir`.
 _NOT_IN_A_DIR_NAME = ("/", "\\", "*", "?", "[")
@@ -657,6 +664,20 @@ def _ref_at(
     )
 
 
+def _read_run_state(path: Path) -> Optional[dict]:
+    """Read one mirror state file without ever mutating the checkout."""
+    for name in _STATE_FILENAMES:
+        state_file = path / name
+        if not state_file.is_file():
+            continue
+        try:
+            state = yaml.safe_load(state_file.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            return None
+        return state if isinstance(state, dict) else None
+    return None
+
+
 def _recorded_slug(path: Path) -> Optional[str]:
     """The slug a run dir *says* it is, or ``None`` when it does not say.
 
@@ -668,21 +689,13 @@ def _recorded_slug(path: Path) -> Optional[str]:
     the one caller treats as "this dir does not claim to be the run I am looking
     for".
     """
-    for name in _STATE_FILENAMES:
-        state_file = path / name
-        if not state_file.is_file():
-            continue
-        try:
-            state = yaml.safe_load(state_file.read_text(encoding="utf-8"))
-        except (OSError, yaml.YAMLError):
-            return None
-        if not isinstance(state, dict):
-            return None
-        recorded = state.get("slug")
-        if not isinstance(recorded, str) or not recorded.strip():
-            return None
-        return recorded.strip()
-    return None
+    state = _read_run_state(path)
+    if state is None:
+        return None
+    recorded = state.get("slug")
+    if not isinstance(recorded, str) or not recorded.strip():
+        return None
+    return recorded.strip()
 
 
 def _announce_once(key: str, level: int, message: str, *args) -> None:
@@ -848,18 +861,91 @@ def _renamed_run_dir(
     return ref
 
 
+def _build_reslugged_index(root: Path, host: str,
+                           project: str) -> dict[str, str]:
+    """Map each vacated slug to its newest live successor directory."""
+    try:
+        base = (root / host / project / "runs").resolve()
+        base.relative_to(root)
+        children = sorted(base.iterdir())
+    except (OSError, RuntimeError, ValueError):
+        return {}
+
+    matches: dict[str, tuple[str, str]] = {}
+    for child in children:
+        if (not child.is_dir() or child.name.startswith(".")
+                or child.name == run_state.ARCHIVE_DIR):
+            continue
+        state = _read_run_state(child)
+        if state is None or state.get("status") != "in-progress":
+            continue
+        rank = (str(state.get("created") or ""), child.name)
+        for vacated in run_state.vacated_slugs(state):
+            if rank > matches.get(vacated, ("", "")):
+                matches[vacated] = rank
+    return {slug: rank[1] for slug, rank in matches.items()}
+
+
+def _reslugged_run_dir(
+    config: PlatformConfig, root: Path, host: str, project: str, slug: str
+) -> Optional[RunDirRef]:
+    """The current live run that records *slug* as a vacated identity.
+
+    Release runs change from their target-derived seed slug to a version-bearing
+    slug after discovering the version. The container records that transition in
+    ``reslugged_from``; following that explicit history is safer than re-deriving
+    aliases, which can collide with legacy or truncated identities.
+
+    Only in-progress successors qualify. Terminal releases deliberately release
+    the seed address for a later run. The project is scanned once per mirrored
+    HEAD and indexed by every vacated slug, so fleet polling does not repeat the
+    YAML walk for each unresolved tracked row. A tie should be prevented by
+    release single-flight, but resolves exactly like the container: newest
+    ``created``, then directory name.
+    """
+    revision = mirror_status(config).head_sha
+    cache_key = (str(root), host, project)
+    with _RESLUGGED_INDEX_LOCK:
+        cached = _RESLUGGED_INDEX.get(cache_key)
+        if revision is not None and cached is not None and cached[0] == revision:
+            index = cached[1]
+        else:
+            index = _build_reslugged_index(root, host, project)
+            if revision is not None:
+                _RESLUGGED_INDEX[cache_key] = (revision, index)
+
+    dir_name = index.get(slug)
+    if dir_name is None:
+        return None
+    ref = _ref_at(root, host, project, slug, dir_name)
+    if ref is None:
+        return None
+    _announce_once(
+        f"reslugged:{host}/{project}/{slug}->{ref.dir_name}",
+        logging.INFO,
+        "platform_run_dir_reslugged run=%s/%s/runs/%s dir=%s — the live run "
+        "records the requested slug in reslugged_from, so the platform follows "
+        "that carried identity",
+        host, project, slug, ref.dir_name,
+    )
+    return ref
+
+
 def resolve_run_dir(
     config: PlatformConfig, host: str, project: str, slug: str
 ) -> Optional[RunDirRef]:
     """Locate one tracked run's directory in the mirror, or ``None``.
 
-    A direct path lookup rather than a walk: once scope comes from the local index
-    (spec D25) the platform knows exactly which paths it wants, and walking a
-    shared repo to find them would scale with other people's work instead of the
-    operator's.
+    Direct path lookup handles the ordinary case. Once scope comes from the local
+    index (spec D25) the platform knows exactly which paths it wants; the one
+    carried-identity fallback that must inspect sibling state builds one index per
+    mirror revision rather than scaling a YAML walk by the operator's tracked-row
+    count.
 
-    ``runs/<slug>`` first, and then the name-bearing directory the container
-    renamed the run into (:func:`_renamed_run_dir`). The second lookup is the fix
+    ``runs/<slug>`` first, then the name-bearing directory the container renamed
+    the run into (:func:`_renamed_run_dir`), and finally the live successor that
+    explicitly records the requested identity in ``reslugged_from``. The second
+    lookup is the fix
     for a bug found in the field (T90): a run tracked as ``review-mr-172`` whose
     directory was ``review-mr-172--review-mr-172`` read back as *no run state at
     all* — null phase and status, no files, a fleet row that was raw session
@@ -889,4 +975,7 @@ def resolve_run_dir(
     ref = _ref_at(root, host, project, slug, slug)
     if ref is not None:
         return ref
-    return _renamed_run_dir(root, host, project, slug)
+    renamed = _renamed_run_dir(root, host, project, slug)
+    if renamed is not None:
+        return renamed
+    return _reslugged_run_dir(config, root, host, project, slug)

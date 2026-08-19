@@ -499,7 +499,7 @@ def _require_same_run(
         recorded = ref.slug
     recorded = recorded.strip()
     derived = run_state.derive_slug(taskdef, target)
-    if derived != recorded:
+    if derived != recorded and not run_state.has_vacated(state, derived):
         raise NotAnswerable(
             f"{ref.rel_path}: respawning with taskdef {taskdef!r} and target "
             f"{target!r} derives run {derived!r}, not {recorded!r} — the answer "
