@@ -3275,3 +3275,135 @@ def test_a_spawn_is_refused_when_its_service_is_held_under_another_slot(
 
     with pytest.raises(spawn.SlotOccupied, match="already in use by s-b"):
         spawn.spawn_session(config, request_for(slot="a"))
+
+
+# --- service groups: what a group spawn records and refuses (issue #312) ------
+
+GROUP_SLOTS = [{"name": "stack", "preset": "stack_dev"}]
+
+
+def test_a_group_spawn_records_the_members_it_holds(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """The record every later occupancy answer is derived from: a group session
+    can retarget to any member, so all of them go on the entry."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(
+        slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
+    )
+
+    try:
+        task = registry.read_session(result.session_id)["task"]
+        assert task["slot_service_group"] == "stack"
+        # Both spellings of every member: a single-service slot's preset may
+        # name the compose service or the exact container.
+        assert task["slot_services"] == [
+            "db", "web", "webapp-web",
+            "stack-db-1", "stack-web-1", "stack-webapp-web-1",
+        ]
+        assert task["slot_service"] is None  # no starting member on this preset
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_an_ordinary_slot_spawn_records_no_group(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """Nothing about a single-service slot changes."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(
+        slot_config(fake_lmer), request_for(slot="webapp")
+    )
+
+    try:
+        task = registry.read_session(result.session_id)["task"]
+        assert task["slot_service"] == "webapp-web"
+        assert task["slot_service_group"] is None
+        assert task["slot_services"] is None
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_a_second_session_on_a_held_group_is_refused(
+    platform_root, fake_lmer, slot_host
+):
+    registry.register("s-holder", pid=os.getpid(), slot="stack")
+    registry.update("s-holder", task={
+        "preset": "stack_dev", "slot_service_group": "stack",
+        "slot_services": ["stack-web"],
+    })
+
+    with pytest.raises(spawn.SlotOccupied, match="s-holder"):
+        spawn.spawn_session(
+            slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
+        )
+
+
+def test_a_slot_on_a_member_is_refused_while_a_group_session_runs(
+    platform_root, fake_lmer, slot_host
+):
+    """The point of the accounting: one agent per dev service, however the
+    session that holds it got there. Only the member slot is declared, so the
+    refusal comes from the live session rather than from the config."""
+    registry.register("s-holder", pid=os.getpid(), slot="stack")
+    registry.update("s-holder", task={
+        "preset": "stack_dev", "slot_service_group": "stack",
+        "slot_services": ["web", "db", "webapp-web"],
+    })
+
+    with pytest.raises(spawn.SlotOccupied, match="s-holder"):
+        spawn.spawn_session(
+            slot_config(fake_lmer, [{"name": "webapp", "preset": "webapp_dev"}]),
+            request_for(slot="webapp"),
+        )
+
+
+def test_a_group_slot_is_refused_while_a_session_holds_one_of_its_members(
+    platform_root, fake_lmer, slot_host
+):
+    """The mirror — the direction that used to be granted. A live session in
+    webapp-web must stop a group spawn over the project containing it."""
+    registry.register("s-single", pid=os.getpid(), slot="webapp")
+    registry.update("s-single", task={
+        "preset": "webapp_dev", "slot_service": "webapp-web",
+    })
+
+    with pytest.raises(spawn.SlotOccupied, match="s-single") as exc:
+        spawn.spawn_session(
+            slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
+        )
+
+    assert "webapp-web" in str(exc.value)
+
+
+def test_two_slots_overlapping_through_a_group_refuse_at_the_config_level(
+    platform_root, fake_lmer, slot_host
+):
+    """Declared together they overlap permanently, so the later one is unusable
+    rather than merely busy — the same verdict two slots on one service get."""
+    entries = GROUP_SLOTS + [{"name": "webapp", "preset": "webapp_dev"}]
+
+    with pytest.raises(spawn.SpawnError, match="already bound by slot 'stack'") as exc:
+        spawn.spawn_session(
+            slot_config(fake_lmer, entries), request_for(slot="webapp")
+        )
+
+    assert not isinstance(exc.value, spawn.SlotOccupied)
+
+
+def test_a_group_that_vanished_between_probe_and_claim_is_refused(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """Recording an empty member list would read as a session holding nothing."""
+    from lmer_cli.service import ServiceError
+    from lmer_platform import slots as slots_mod
+
+    monkeypatch.setattr(
+        slots_mod, "group_members",
+        lambda project, **kw: (_ for _ in ()).throw(ServiceError("gone")),
+    )
+
+    with pytest.raises(spawn.SpawnError, match="could not resolve the members"):
+        spawn.spawn_session(
+            slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
+        )

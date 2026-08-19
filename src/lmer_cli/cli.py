@@ -106,7 +106,14 @@ from .runtime import (
     lmer_state_dir,
     repo_root_path,
 )
-from .service import ServiceError, resolve_container, inspect_container_workdir
+from .service import (
+    ServiceError,
+    inspect_container_workdir,
+    member_of,
+    resolve_container,
+    resolve_group,
+)
+from .container.target_switch import DEFAULT_TARGET_FILE as CONTAINER_SERVICE_TARGET_FILE
 from .tokens import (
     _get_gitlab_token,
     _prefer_ssh,
@@ -517,6 +524,7 @@ def parse_args(
     parser.add_argument("--exec", dest="exec_mode", action="store_true", help="Run an arbitrary command in the container")
     parser.add_argument("--no-clone", dest="no_clone", action="store_true", help="Skip git clone, just run command (requires --exec)")
     parser.add_argument("--service", dest="service", help="Docker service/container name to exec into (service mode)")
+    parser.add_argument("--service-group", dest="service_group", help="Compose project whose running services this session may target (service-group mode); the agent retargets with the in-container target-switch")
     parser.add_argument("--checkout", dest="checkout", help="Path to existing local source checkout (mounted as /workspace)")
     parser.add_argument("--user", dest="user", help="Container user (e.g., developer or 0:0)")
     parser.add_argument("--match-uid", dest="match_uid", action="store_true", help="Run container as your host UID:GID (fixes SSH agent permissions)")
@@ -1292,7 +1300,37 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
     if ns.service and not ns.checkout:
         error("--service requires --checkout (path to local source checkout)")
         return 2
+    if ns.service_group and not ns.checkout:
+        error(
+            "--service-group requires --checkout (path to local source checkout)"
+        )
+        return 2
     return None
+
+
+def resolve_service_target(
+    runtime: str, service: str | None, service_group: str | None
+) -> tuple[str | None, str | None, str | None]:
+    """``(container id, workdir, service name)`` a service-mode launch starts on.
+
+    A group is resolved here even when nothing is targeted yet, so a project the
+    host cannot see fails at launch rather than at the agent's first
+    ``target-switch``. Its members are deliberately *not* forwarded to the
+    container: ``target-switch`` re-reads them, which is what keeps a member
+    that restarted under a new container id reachable.
+
+    ``(None, None, None)`` is the group-without-``--service`` answer — a
+    targetless start, which ``target-exec`` reports by naming the switch rather
+    than by picking a member nobody chose.
+    """
+    if service_group:
+        members = resolve_group(runtime, service_group)
+        if not service:
+            return None, None, None
+        member = member_of(members, service)
+        return member.container_id, member.workdir, member.service
+    container_id = resolve_container(runtime, service)
+    return container_id, inspect_container_workdir(runtime, container_id), service
 
 
 def _display_presets_cli() -> int:
@@ -1319,6 +1357,8 @@ def _display_presets_cli() -> int:
             parts.append(f"checkout={preset.checkout}")
         if preset.service:
             parts.append(f"service={preset.service}")
+        if preset.service_group:
+            parts.append(f"service_group={preset.service_group}")
         if preset.env:
             parts.append("env=" + ",".join(sorted(preset.env)))
         if preset.args:
@@ -2070,8 +2110,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         success("✅ Selected no-task (exec mode)")
 
-    # Service mode: resolve checkout path early
-    service_mode = bool(ns.service)
+    # Service mode: resolve checkout path early. A group attaches the session to
+    # every running member of a compose project, so it puts the session into
+    # service mode exactly as a single --service does; what differs is only
+    # which container target-exec starts on (issue #312).
+    service_mode = bool(ns.service or ns.service_group)
     checkout_path: Path | None = None
     if ns.checkout:
         checkout_path = Path(ns.checkout).resolve()
@@ -2316,10 +2359,12 @@ def main(argv: list[str] | None = None) -> int:
     # Service mode: resolve container and add mounts
     service_container_id: str | None = None
     service_workdir: str | None = None
+    service_start_name: str | None = ns.service
     if service_mode:
         try:
-            service_container_id = resolve_container(runtime, ns.service)
-            service_workdir = inspect_container_workdir(runtime, service_container_id)
+            service_container_id, service_workdir, service_start_name = (
+                resolve_service_target(runtime, ns.service, ns.service_group)
+            )
         except ServiceError as e:
             error(f"❌ {e}")
             return 2
@@ -2658,8 +2703,15 @@ def main(argv: list[str] | None = None) -> int:
         # Service mode environment variables
         "LMER_SERVICE_MODE": "1" if service_mode else None,
         "LMER_SERVICE_CONTAINER": service_container_id,
-        "LMER_SERVICE_NAME": ns.service if service_mode else None,
+        "LMER_SERVICE_NAME": service_start_name if service_mode else None,
         "LMER_SERVICE_WORKDIR": service_workdir,
+        # Group mode (#312). The group is what target-switch resolves members
+        # from; the target file is where it records the pick, and is what makes
+        # a switch visible to shells that were already running.
+        "LMER_SERVICE_GROUP": ns.service_group if service_mode else None,
+        "LMER_SERVICE_TARGET_FILE": (
+            CONTAINER_SERVICE_TARGET_FILE if ns.service_group else None
+        ),
         # Supervisor / FastAPI controls (consumed inside the container by lmer-supervisor)
         "LMER_FASTAPI": "1" if ns.fastapi else None,
         "LMER_MANUAL_START": "1" if ns.manual_start else None,

@@ -146,6 +146,7 @@ from lmer_cli.supervisor import (
     SESSION_LOG_NAME,
     _pick_port,
 )
+from lmer_cli.service import ServiceError
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
@@ -2130,11 +2131,13 @@ def _claim_slot(
 ) -> tuple:
     """Check the requested service slot and fill its preset in (issue #245).
 
-    Returns ``(request, service)``: unchanged and ``None`` when no slot was
-    asked for, otherwise a copy carrying the slot's preset and the dev service
-    it resolved to. The service is returned so it can be *recorded* on the
-    session's entry — occupancy by service then reads what this session took
-    rather than re-deriving it from a presets file that may have changed since.
+    Returns ``(request, service, service_group, members)``: all ``None`` when no
+    slot was asked for, otherwise a copy carrying the slot's preset and what the
+    slot resolved to — the dev service, and for a group slot the compose project
+    plus the member services it covers (issue #312). They are returned so they
+    can be *recorded* on the session's entry: occupancy then reads what this
+    session took rather than re-deriving it from a presets file that may have
+    changed since.
     Nothing else is written: the claim *is* that registry entry, which is why
     there is no release path and a session that dies frees its slot unaided.
 
@@ -2160,7 +2163,7 @@ def _claim_slot(
     many there are, and the daemon logs ``slot_double_occupancy``.
     """
     if request.slot is None:
-        return request, None
+        return request, None, None, None
 
     status = slots.slot_status(config, request.slot, cached=False)
     if status is None:
@@ -2191,15 +2194,39 @@ def _claim_slot(
             f"service slot {request.slot!r}: {status.service_busy_reason}"
         )
     if status.service_down_reason is not None:
-        raise SpawnError(
-            f"service slot {request.slot!r} targets service "
-            f"{status.service!r}, which is not running: "
-            f"{status.service_down_reason}"
+        target = (
+            f"service group {status.service_group!r}" if status.service_group
+            else f"service {status.service!r}"
         )
+        raise SpawnError(
+            f"service slot {request.slot!r} targets {target}, which is not "
+            f"running: {status.service_down_reason}"
+        )
+
+    # What a group session takes, read once at the claim. Uncached and here
+    # rather than on the poll path, for the reason the probe above is uncached:
+    # this is the record every later occupancy answer is derived from, so it
+    # cannot afford a stale reading. A group that has gone since the probe is a
+    # refusal, not an empty member list — an empty list would read as a session
+    # holding nothing.
+    members = None
+    if status.service_group:
+        try:
+            members = slots.group_members(status.service_group)
+        except ServiceError as exc:
+            raise SpawnError(
+                f"service slot {request.slot!r}: could not resolve the members "
+                f"of service group {status.service_group!r}: {exc}"
+            )
 
     # ``validate`` has already refused a request naming both, so the preset
     # field is empty and this fills it.
-    return replace(request, preset=status.definition.preset), status.service
+    return (
+        replace(request, preset=status.definition.preset),
+        status.service,
+        status.service_group,
+        members,
+    )
 
 
 def spawn_session(
@@ -2241,7 +2268,7 @@ def spawn_session(
 
     # After the cap, so a host that is simply full says so rather than blaming
     # the slot.
-    request, slot_service = _claim_slot(config, request)
+    request, slot_service, slot_group, slot_services = _claim_slot(config, request)
 
     # Two URLs, because "what this run's repo is" and "what its identity is
     # derived from" are separable claims — only the first is recorded anywhere.
@@ -2405,6 +2432,11 @@ def spawn_session(
             # a slot repointed while this session runs must not change what it
             # is understood to be holding (issue #245).
             "slot_service": slot_service,
+            # A group session can retarget to any member, so it holds all of
+            # them; the members are resolved once, here, rather than re-read on
+            # every poll (issue #312).
+            "slot_service_group": slot_group,
+            "slot_services": slot_services,
         },
         run={"host": host, "project": project, "slug": slug},
         # The *only* record that the slot is taken — nothing writes an occupancy

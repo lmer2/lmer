@@ -1,0 +1,11 @@
+#!/bin/bash
+# Point target-exec/target-logs at another member of this session's service
+# group (issue #312).
+#
+# Usage:
+#   target-switch              # list the group's members and the current target
+#   target-switch <service>    # retarget to <service>
+#
+# Requires LMER_SERVICE_GROUP (set by `lmer --service-group <compose-project>`).
+
+exec "${LMER_PYTHON:-python3}" -c "from lmer_cli.container.target_switch import main; import sys; sys.exit(main())" "$@"

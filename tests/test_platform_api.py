@@ -1006,7 +1006,8 @@ def test_build_state_carries_a_row_per_declared_slot(platform_root, slot_host):
     assert [row["name"] for row in payload["slots"]] == ["webapp", "plain"]
     assert payload["slots"][0] == {
         "name": "webapp", "preset": "webapp_dev", "description": "Web app dev",
-        "service": "webapp-web", "state": "free", "reason": None,
+        "service": "webapp-web", "service_group": None, "members": [],
+        "state": "free", "reason": None,
         "occupant": None, "occupants": [], "service_occupants": [],
     }
     assert payload["slots"][1]["state"] == "misconfigured"

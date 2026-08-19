@@ -81,8 +81,13 @@ const holders = computed(() => [
         <span class="text-body-large font-weight-medium">{{ row.name }}</span>
 
         <!-- Colourless and outlined: identity, not urgency — the rule the run
-             row's launch chips follow. -->
-        <v-chip v-if="row.service" size="small" variant="outlined">
+             row's launch chips follow. A group slot names the group it holds
+             (#312): its `service` is only where the session starts, and may be
+             absent entirely. -->
+        <v-chip v-if="row.service_group" size="small" variant="outlined">
+          group: {{ row.service_group }}
+        </v-chip>
+        <v-chip v-else-if="row.service" size="small" variant="outlined">
           {{ row.service }}
         </v-chip>
       </div>

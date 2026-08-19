@@ -2375,8 +2375,17 @@ def main(argv: list[str] | None = None) -> int:
         # Skip cloning and never persist config or rewrite a remote in the
         # operator-owned checkout. Only clean the URL retained in the agent's
         # environment; its existing Git auth configuration remains untouched.
-        service_name = os.environ.get("LMER_SERVICE_NAME", "unknown")
-        print(f"📦 Service mode: using local checkout at /workspace (service: {service_name})", file=sys.stderr)
+        service_name = os.environ.get("LMER_SERVICE_NAME")
+        service_group = os.environ.get("LMER_SERVICE_GROUP")
+        if service_group and not service_name:
+            # A group session may legitimately start with nothing targeted: the
+            # agent picks with target-switch (#312).
+            where = f"group: {service_group}, no target selected yet"
+        elif service_group:
+            where = f"group: {service_group}, on {service_name}"
+        else:
+            where = f"service: {service_name or 'unknown'}"
+        print(f"📦 Service mode: using local checkout at /workspace ({where})", file=sys.stderr)
         if repo_url:
             repo_url = _scrub_credentials(repo_url)
             os.environ["LMER_REPO_URL"] = repo_url

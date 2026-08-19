@@ -194,3 +194,50 @@ class TestLoadPresetsInvalidEntriesSkipped:
             {"my service": {"checkout": "/co"}, "good": {"checkout": "/co"}},
         )
         assert set(load_presets(path)) == {"good"}
+
+
+class TestServiceGroupField:
+    """``service_group`` — a preset that attaches to a whole stack (#312)."""
+
+    def test_loads_and_maps_to_the_flag(self, tmp_path):
+        path = tmp_path / "presets.json"
+        path.write_text(json.dumps({
+            "fullstack": {"checkout": "/srv/stack", "service_group": "stack"},
+        }))
+        preset = load_presets(str(path))["fullstack"]
+        assert preset.service_group == "stack"
+        assert preset.cli_tokens() == [
+            "--checkout", "/srv/stack", "--service-group", "stack",
+        ]
+
+    def test_starting_member_composes_with_the_group(self, tmp_path):
+        path = tmp_path / "presets.json"
+        path.write_text(json.dumps({
+            "fullstack": {
+                "checkout": "/srv/stack",
+                "service": "web",
+                "service_group": "stack",
+            },
+        }))
+        assert load_presets(str(path))["fullstack"].cli_tokens() == [
+            "--checkout", "/srv/stack", "--service", "web",
+            "--service-group", "stack",
+        ]
+
+    def test_group_without_checkout_is_skipped(self, tmp_path):
+        """Mirrors the CLI rule, so the preset cannot produce a refused launch."""
+        path = tmp_path / "presets.json"
+        path.write_text(json.dumps({
+            "broken": {"service_group": "stack"},
+            "fine": {"checkout": "/srv/x"},
+        }))
+        presets = load_presets(str(path))
+        assert "broken" not in presets
+        assert "fine" in presets  # one bad entry never disables the others
+
+    def test_non_string_group_is_skipped(self, tmp_path):
+        path = tmp_path / "presets.json"
+        path.write_text(json.dumps({
+            "broken": {"checkout": "/srv/x", "service_group": ["stack"]},
+        }))
+        assert load_presets(str(path)) == {}
