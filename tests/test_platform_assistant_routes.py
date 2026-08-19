@@ -254,21 +254,31 @@ def test_the_index_says_the_drain_is_destructive(client):
     assert "DESTRUCTIVE" in index_text(client)
 
 
-def test_the_index_says_nothing_pushes_and_names_what_to_watch(client):
+def test_the_index_says_no_digest_is_pushed_and_names_what_to_watch(client):
     """T89, from the authority the taskdef sends the assistant to.
 
     A live incarnation read the spool as a push ("the orchestrator already pushes me
     digests") and then sat idle while a finished review's digest waited to be
     evicted. The route list is the one place it goes back to, so the correction and
     the non-consuming signal to watch instead belong in it.
+
+    Since #317 the index also has to draw the line the nudge sits on: a *reminder*
+    is typed into the session, and no digest ever is. An index saying only the
+    first half re-opens the misreading this test was written for.
     """
     index = index_text(client)
-    assert "Nothing pushes a" in index, "the index leaves the push question open"
+    assert "No digest is ever" in index, (
+        "the index leaves the push question open"
+    )
     assert "non-consuming" in index, (
         "nothing points a watch at the pending count on the status"
     )
     assert "watch that instead" in index, (
         "the drain still reads as the thing to poll, which eats every digest"
+    )
+    assert "one reminder typed into the session" in index, (
+        "an assistant that reads the index and then gets a line has no way to "
+        "place it"
     )
 
 
@@ -1356,3 +1366,127 @@ def test_the_window_is_writable_beside_a_launch_setting_in_one_patch(
     assert reply.status_code == 200, reply.text
     assert reply.json()["settings"]["preset"]["value"] == "dev"
     assert reply.json()["checkin"]["window_seconds"]["value"] == 600
+
+
+# --- the nudge's two knobs ride the same routes (issue #317) -------------------
+#
+# The check-in window's group again, so what these pin is the same HTTP shape for
+# a group of two, plus the difference between the knobs: the interval takes 0 and
+# the threshold does not, and the refusal for the second says where the
+# off-switch actually is.
+
+def test_config_serves_the_nudge_knobs_in_their_own_group(client, platform_root):
+    reply = client.get("/api/assistant/config", headers=bearer_header())
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["nudge"]["after_seconds"] == {
+        "value": cfg.DEFAULT_NUDGE_AFTER_SECONDS,
+        "source": "default",
+        "stored": None,
+    }
+    assert body["nudge"]["pending_threshold"]["value"] == (
+        cfg.DEFAULT_NUDGE_PENDING_THRESHOLD
+    )
+    assert "after_seconds" not in body["settings"]
+
+
+def test_config_write_persists_both_nudge_knobs_in_one_patch(
+    client, platform_root
+):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"nudge_after_seconds": 600, "nudge_pending_threshold": 4},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["nudge"]["after_seconds"]["value"] == 600
+    assert reply.json()["nudge"]["pending_threshold"]["value"] == 4
+    assert cfg.load().nudge_after_seconds == 600
+    assert cfg.load().nudge_pending_threshold == 4
+
+
+def test_config_write_accepts_zero_to_turn_the_nudge_off(client, platform_root):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"nudge_after_seconds": 0},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["nudge"]["after_seconds"]["value"] == 0
+
+
+def test_config_write_refuses_a_threshold_of_zero_and_says_where_off_is(
+    client, platform_root
+):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"nudge_pending_threshold": 0},
+    )
+    assert reply.status_code == 400, reply.text
+    detail = reply.json()["detail"]
+    assert "nudge_pending_threshold" in detail
+    assert "nudge_after_seconds=0" in detail
+    assert not cfg.config_path().exists(), "a refused write must land nothing"
+
+
+@pytest.mark.parametrize("bad", [-30, "soon", 3.5, True])
+def test_config_write_refuses_an_unusable_nudge_interval(
+    client, platform_root, bad
+):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"nudge_after_seconds": bad},
+    )
+    assert reply.status_code == 400, reply.text
+    assert "nudge_after_seconds" in reply.json()["detail"]
+
+
+def test_config_write_clears_a_nudge_knob_back_to_the_default(
+    client, platform_root
+):
+    cfg.update_stored({"nudge_pending_threshold": 5})
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"nudge_pending_threshold": None},
+    )
+    assert reply.status_code == 200, reply.text
+    threshold = reply.json()["nudge"]["pending_threshold"]
+    assert threshold["value"] == cfg.DEFAULT_NUDGE_PENDING_THRESHOLD
+    assert threshold["source"] == "default"
+    assert threshold["stored"] is None
+
+
+def test_an_unknown_setting_refusal_names_every_accepted_key(
+    client, platform_root
+):
+    """The list an operator reads after a typo has to be complete, or the two
+    knobs added last are the ones nobody discovers."""
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"nudge_afterseconds": 30},
+    )
+    assert reply.status_code == 400, reply.text
+    detail = reply.json()["detail"]
+    for key in ("nudge_after_seconds", "nudge_pending_threshold",
+                "checkin_window_seconds", "model"):
+        assert key in detail
+
+
+def test_config_write_refuses_a_threshold_above_the_spools_capacity(
+    client, platform_root
+):
+    """A threshold that can never be met is an off-switch the docs do not
+    mention, so the route refuses it the way it refuses a floor breach — naming
+    where the real off-switch is (review of !234)."""
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"nudge_pending_threshold": assistant.MAX_PENDING + 1},
+    )
+    assert reply.status_code == 400, reply.text
+    detail = reply.json()["detail"]
+    assert str(assistant.MAX_PENDING) in detail
+    assert "nudge_after_seconds=0" in detail
+
+    at_capacity = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"nudge_pending_threshold": assistant.MAX_PENDING},
+    )
+    assert at_capacity.status_code == 200, at_capacity.text

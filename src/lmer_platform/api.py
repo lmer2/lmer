@@ -101,15 +101,17 @@ from .ask import AskChannelError
 from .assistant import AssistantError
 from .config import (
     ASSISTANT_SETTING_KEYS,
+    INT_SETTINGS,
     ConfigError,
     PlatformConfig,
     active_assistant_credential,
     assistant_settings,
     checkin_settings,
     configured_repo_url,
+    nudge_settings,
     update_stored,
     validate_assistant_override,
-    validate_checkin_window,
+    validate_int_setting,
 )
 from .inventory import StallPolicy, build_inventory
 from .lifecycle import LifecycleError
@@ -168,10 +170,11 @@ WS_POLICY_VIOLATION = 1008
 #: so they are truncated rather than assumed short.
 _WS_REASON_LIMIT = 120
 
-#: The check-in window's key in a config request body (issue #244). Its config
-#: field's own name: the four launch settings are spelled short (``model``, not
-#: ``assistant_model``) because they are also spawn fields, and this is not one.
-_CHECKIN_WINDOW_KEY = "checkin_window_seconds"
+#: The integer settings' keys in a config request body (issues #244, #317), spelled
+#: as their config fields rather than the launch settings' short names. **Derived**
+#: from the table the validator indexes: a hand-written copy admitting a name absent
+#: from :data:`lmer_platform.config.INT_SETTINGS` would 500 on a ``KeyError``.
+_INT_SETTING_KEYS = tuple(sorted(INT_SETTINGS))
 
 #: What a starting assistant is told when its predecessor left it nothing (T60).
 #: A fact about the host rather than an error, and the ``orchestrate`` taskdef
@@ -464,9 +467,9 @@ _CONFIG_SCOPE_NOTE = (
     "settings apply to the NEXT incarnation: the running assistant keeps its "
     "context window until it is stopped or rotated. A value whose source is "
     "'env' is an export shadowing config.json — what POST persists here has no "
-    "effect until that export is removed. The checkin group is the exception "
-    "to the first sentence: the daemon reads the window on its next tick, so a "
-    "change there takes effect without a rotation."
+    "effect until that export is removed. The checkin and nudge groups are the "
+    "exception to the first sentence: the daemon reads both on its next tick, so "
+    "a change there takes effect without a rotation."
 )
 
 
@@ -487,12 +490,15 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
             key: setting.to_dict()
             for key, setting in assistant_settings().items()
         },
-        # Its own group rather than a fifth entry above (issue #244): those four
-        # become argv tokens on the assistant's command line, and this is an
-        # integer the daemon reads on its own tick.
+        # Their own groups rather than more entries above (issues #244, #317):
+        # those four are argv tokens, these are read on the daemon's own tick.
         "checkin": {
             key: setting.to_dict()
             for key, setting in checkin_settings().items()
+        },
+        "nudge": {
+            key: setting.to_dict()
+            for key, setting in nudge_settings().items()
         },
         "note": _CONFIG_SCOPE_NOTE,
     }
@@ -1388,7 +1394,9 @@ def create_app(
             "  POST /api/assistant/config   persist launch settings to config.json —\n"
             "                               a patch of the keys named; null clears\n"
             "                               one. Changes nothing about the running\n"
-            "                               incarnation: rotate to apply\n"
+            "                               incarnation: rotate to apply. The\n"
+            "                               checkin/nudge integers are the\n"
+            "                               exception — the next tick reads them\n"
             "  GET  /api/assistant/handoff  the note the last incarnation left. A\n"
             "                               null one with a note means nobody left\n"
             "                               you anything, which is not the same as\n"
@@ -1407,8 +1415,10 @@ def create_app(
             "  POST /api/assistant/pending  take the digests the daemon spooled and\n"
             "                               clear them. DESTRUCTIVE, hence not a\n"
             "                               GET; the status carries the count, so\n"
-            "                               watch that instead. Nothing pushes a\n"
-            "                               digest anywhere — it waits here\n\n"
+            "                               watch that instead. No digest is ever\n"
+            "                               pushed — it waits here; a spool left\n"
+            "                               unread past the nudge interval gets\n"
+            "                               one reminder typed into the session\n\n"
             "The fleet view is scoped to runs this orchestrator spawned or\n"
             "adopted — never the whole shared work repo.\n"
         )
@@ -2662,12 +2672,19 @@ def create_app(
         something is waiting without consuming it. An empty spool is ``[]`` and a
         200, which is most calls.
 
-        **Nothing pushes this to the assistant** (T89). The spool waits here until
+        **No digest is pushed to the assistant** (T89). The spool waits here until
         somebody takes it, and an idle session has no turn in which to call this —
         which is how a finished review once sat unread until it was evicted. The
         non-consuming signal is ``pending`` on ``GET /api/assistant``, and what the
         ``orchestrate`` taskdef does with it is arm a background watch on that
         count; this route is what the watch's wake-up calls, never what it polls.
+
+        What *is* pushed, since issue #317, is one sentence saying this route has
+        something for it — typed into the assistant's session by
+        :meth:`lmer_platform.detect.Detector.nudge_once` when the spool has gone
+        unread past the nudge interval beside a quiet assistant. It carries no
+        digest and changes nothing here: the drain is still explicit, and still
+        this route.
         """
         notes = assistant.take_pending()
         return {"pending": notes, "count": len(notes)}
@@ -2702,9 +2719,11 @@ def create_app(
         never an env-resolved value baked in where it would outlive the export
         (:func:`lmer_platform.config.update_stored`).
 
-        Keys are the four launch-setting names plus ``checkin_window_seconds``
-        (issue #244), which is spelled as its config field because it is not a
-        launch flag and does not share their short-name vocabulary. Omitted keys
+        Keys are the four launch-setting names plus the integer settings
+        (``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
+        ``nudge_pending_threshold`` from #317), which are spelled as their config
+        fields because they are not launch flags and do not share their
+        short-name vocabulary. Omitted keys
         are left alone, so this is a patch of exactly what the caller named.
         ``null`` — and the emptied text field a browser sends as ``""`` — clears
         the key, letting the layer below show through. Anything else must be a
@@ -2715,10 +2734,10 @@ def create_app(
 
         Nothing restarts on a write, deliberately: the running incarnation keeps
         its context window, the reply says so (``note``), and the rotate verb is
-        one call away when the operator wants the new settings live. The window
-        is the one key that needs neither — the daemon's next tick reads it.
+        one call away when the operator wants the new settings live. The integer
+        settings need neither — the daemon's next tick reads them.
         """
-        accepted = sorted(ASSISTANT_SETTING_KEYS) + [_CHECKIN_WINDOW_KEY]
+        accepted = sorted(ASSISTANT_SETTING_KEYS) + list(_INT_SETTING_KEYS)
         if not isinstance(body, dict) or not body:
             raise HTTPException(
                 status_code=400,
@@ -2729,12 +2748,12 @@ def create_app(
             )
         changes: dict = {}
         for key, value in body.items():
-            if key == _CHECKIN_WINDOW_KEY:
+            if key in _INT_SETTING_KEYS:
                 if value is None or (isinstance(value, str) and not value.strip()):
                     changes[key] = None
                     continue
                 try:
-                    changes[key] = validate_checkin_window(value)
+                    changes[key] = validate_int_setting(key, value)
                 except ConfigError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 continue
