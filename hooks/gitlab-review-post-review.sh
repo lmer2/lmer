@@ -18,3 +18,11 @@ if [ -z "$GITLAB_REVIEW_FILE" ]; then
 fi
 
 gitlab-review "$GITLAB_PROJECT" "$GITLAB_MR_ID" --review-file "$GITLAB_REVIEW_FILE"
+REVIEW_STATUS=$?
+if [ "$REVIEW_STATUS" -ne 0 ]; then
+  exit "$REVIEW_STATUS"
+fi
+
+lmer-signal "Posted GitLab review for ${GITLAB_PROJECT}!${GITLAB_MR_ID}" || \
+  echo "Warning: review posted but milestone was not signalled" >&2
+exit "$REVIEW_STATUS"

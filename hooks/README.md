@@ -115,7 +115,13 @@ it (a successful `lmer-signal`; a newer signal file in the channel dir, but
 only when the transcript holds no signal of its own — ordered evidence wins
 over a file with no position in the turn; or a newly opened `lmer-ask`
 question). The reminder asks the agent to run `lmer-signal`; the hook **never
-signals on the agent's behalf** — a signal must keep meaning a milestone.
+signals on the agent's behalf** — a signal must keep meaning a milestone. The
+GitLab and GitHub post-review wrappers own their milestone instead: after the
+review command succeeds they call `lmer-signal` directly. Signalling is
+best-effort: no orchestrator channel or no installed signal command warns but
+does not turn an already-posted review into a failed wrapper that a caller might
+retry. A failed review exits with the review command's status and never signals
+success.
 
 Fires once per distinct milestone, capped at 3 per session via a `/tmp`
 marker keyed on `LMER_SESSION_ID` and written atomically (a torn marker reads

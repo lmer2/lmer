@@ -849,6 +849,22 @@ def test_a_respawn_that_would_land_on_another_run_is_refused(config):
     assert registry.list_sessions(live_only=False) == []
 
 
+def test_answer_follows_a_run_that_reslugged_from_the_tracked_key(config):
+    base = run_state.derive_slug(TASKDEF, TARGET)
+    current = f"{base}-v1.2.3"
+    plant_run(
+        config,
+        slug=current,
+        recorded_slug=current,
+        extra=f"reslugged_from:\n  - {base}",
+    )
+    track_run(slug=base)
+
+    result = answer_mod.answer_run(config, request_for(slug=base))
+
+    assert result.session.slug == base
+
+
 def test_a_state_file_with_no_slug_is_matched_on_its_directory_name(config):
     """Nothing but the directory name can resolve such a run, so that is the check."""
     slug = run_state.derive_slug(TASKDEF, TARGET)

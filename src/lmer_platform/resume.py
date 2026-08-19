@@ -620,6 +620,8 @@ def _landing_slug(
     derived = run_state.derive_slug(taskdef, target)
     if derived == recorded:
         return derived, True
+    if run_state.has_vacated(state, derived):
+        return derived, True
     if request.taskdef is None:
         raise NotResumable(
             f"{ref.rel_path}: resuming with its recorded taskdef {taskdef!r} and "

@@ -261,7 +261,9 @@ exactly one per invocation, at command end:
  "data": {"gate": "gate-check", "outcome": "pass", "exit_code": 0,
           "duration_s": 142.3, "summary": "1397 passed in 140.2s",
           "argv": ["gate-check"],
-          "test_scope": "full suite", "test_targets": ["tests/"]}}
+          "test_scope": "full suite", "test_targets": ["tests/"],
+          "test_cache_verdict": "miss",
+          "test_cache_reason": "no current matching pass"}}
 ```
 
 - `outcome` (`pass` | `fail` | `bypass`) carries the check verdict;
@@ -282,6 +284,9 @@ exactly one per invocation, at command end:
   be read as "full suite": these are the fields a machine reader uses instead
   of reading `outcome: pass` as "the suite ran", which is exactly the
   misreading they exist to prevent.
+- `test_cache_verdict`/`test_cache_reason` say WHY the test-result cache hit,
+  missed, was disabled, or could not report a decision (issue #287). Reasons
+  may name differing environment variables but never contain their values.
 - `gate-commit` receipts additionally record `commit_sha` whenever a commit
   actually landed — including bypass commits. It is read from HEAD
   immediately after the commit (best-effort). The sha is the natural join
@@ -290,7 +295,8 @@ exactly one per invocation, at command end:
   the task↔receipt mapping, and it is not the gates).
 - Receipt text that could echo arbitrary content — `summary`, `argv`
   elements (gate-commit's argv carries the commit message), `test_scope`,
-  `test_targets`, verify's `summary_line` — is secret-redacted before landing
+  `test_targets`, `test_cache_verdict`, `test_cache_reason`, verify's
+  `summary_line` — is secret-redacted before landing
   in the work repo.
 - Fail-soft contract unchanged: with no run context the gates behave
   byte-identically, and no receipt failure can ever change a gate's exit

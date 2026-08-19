@@ -32,6 +32,7 @@ class TestGateSystem:
     def test_init(self):
         """Test GateSystem initialization"""
         assert self.gate.verbose == True
+        assert self.gate.commit_handoff is False
         assert self.gate.results == []
         # Verify project_root points to a valid project directory
         # (may differ due to bind mounts: /workspace vs /home/developer/Agents/global)
@@ -1066,6 +1067,8 @@ class TestReceiptTestFields:
         self.gate.results = [self._tests(scope_targets=["tests/"])]
         assert self.gate.receipt_test_fields() == {
             "test_scope": "full suite", "test_targets": ["tests/"],
+            "test_cache_verdict": "unknown",
+            "test_cache_reason": "cache decision unavailable",
         }
 
     def test_a_narrowed_run_carries_its_scope_and_targets(self):
@@ -1076,6 +1079,8 @@ class TestReceiptTestFields:
         assert self.gate.receipt_test_fields() == {
             "test_scope": "text-diff subset",
             "test_targets": ["tests/test_alpha.py", "tests/test_beta.py"],
+            "test_cache_verdict": "unknown",
+            "test_cache_reason": "cache decision unavailable",
         }
 
     def test_a_cached_run_is_distinguishable_from_a_fresh_full_one(self):
@@ -1100,6 +1105,22 @@ class TestReceiptTestFields:
         assert self.gate.receipt_test_fields() == {
             "test_scope": "text-diff subset",
             "test_targets": ["tests/test_alpha.py"],
+            "test_cache_verdict": "unknown",
+            "test_cache_reason": "cache decision unavailable",
+        }
+
+    def test_cache_verdict_and_reason_are_structured(self):
+        self.gate.results = [self._tests(
+            scope_targets=["tests/"],
+            cache_verdict="miss",
+            cache_reason="environment differs (PYTEST_ADDOPTS)",
+        )]
+
+        assert self.gate.receipt_test_fields() == {
+            "test_scope": "full suite",
+            "test_targets": ["tests/"],
+            "test_cache_verdict": "miss",
+            "test_cache_reason": "environment differs (PYTEST_ADDOPTS)",
         }
 
     def test_no_targets_means_no_claim(self):
@@ -1663,6 +1684,8 @@ class TestTextDiffFastPath:
         assert self.gate.receipt_summary() == "text-diff subset: 5 passed in 0.5s"
         assert self.gate.receipt_test_fields() == {
             "test_scope": "text-diff subset", "test_targets": list(self.SUBSET),
+            "test_cache_verdict": "miss",
+            "test_cache_reason": "fingerprint unavailable",
         }
 
     @patch('subprocess.run')
@@ -1680,6 +1703,8 @@ class TestTextDiffFastPath:
         # the full run — absence there means "cannot say", not "everything".
         assert self.gate.receipt_test_fields() == {
             "test_scope": "full suite", "test_targets": ["tests/"],
+            "test_cache_verdict": "miss",
+            "test_cache_reason": "fingerprint unavailable",
         }
 
     @patch('subprocess.run')
@@ -1824,7 +1849,7 @@ class TestTestResultCache:
         strip_lmer_env(monkeypatch)
         self.cache_dir = tmp_path / "cache"
         monkeypatch.setenv(gate_cache.CACHE_DIR_ENV, str(self.cache_dir))
-        self.gate = GateSystem(verbose=True)
+        self.gate = GateSystem(verbose=True, commit_handoff=True)
         self.gate.project_root = tmp_path / "repo"
         (self.gate.project_root / "tests").mkdir(parents=True)
         self.pytest_calls = []
@@ -1841,7 +1866,7 @@ class TestTestResultCache:
 
     def _dispatch(self, tree=None, status="", blobs=None, version="3.12.1",
                   rc=0, stdout="8 passed in 12.3s", staged=(),
-                  status_after=None, sites=None):
+                  status_after=None, sites=None, indexed_tree=None):
         """subprocess.run stand-in for the git probes, the interpreter and pytest.
 
         `status_after` swaps the porcelain output once pytest has run — the
@@ -1850,6 +1875,7 @@ class TestTestResultCache:
         dependencies can be played back here.
         """
         tree = self.TREE if tree is None else tree
+        indexed_tree = tree if indexed_tree is None else indexed_tree
         blobs = blobs or {}
         state = {"status": status}
 
@@ -1880,6 +1906,9 @@ class TestTestResultCache:
             if "rev-parse" in joined:
                 return MagicMock(returncode=0 if tree else 128, stdout=tree,
                                  stderr="")
+            if "write-tree" in joined:
+                return MagicMock(returncode=0 if indexed_tree else 128,
+                                 stdout=indexed_tree, stderr="")
             if "status" in joined:
                 return MagicMock(returncode=0, stdout=state["status"], stderr="")
             if "hash-object" in joined:
@@ -1922,6 +1951,87 @@ class TestTestResultCache:
         assert second.message == "cached full suite: 8 passed in 12.3s"
 
     @patch('subprocess.run')
+    def test_a_non_commit_gate_never_probes_the_index(self, mock_run):
+        self.gate.commit_handoff = False
+        mock_run.side_effect = self._dispatch()
+
+        self.gate.check_tests()
+        self.gate.check_tests()
+
+        commands = [" ".join(str(part) for part in call.args[0])
+                    for call in mock_run.call_args_list]
+        assert not any("git write-tree" in command for command in commands)
+
+    @patch('subprocess.run')
+    def test_a_disabled_cache_never_probes_the_index(self, mock_run,
+                                                     monkeypatch):
+        monkeypatch.setenv("LMER_GATE_NO_CACHE", "1")
+        mock_run.side_effect = self._dispatch()
+
+        self.gate.check_tests()
+
+        commands = [" ".join(str(part) for part in call.args[0])
+                    for call in mock_run.call_args_list]
+        assert not any("git write-tree" in command for command in commands)
+
+    @patch('subprocess.run')
+    def test_a_failed_index_probe_does_not_discard_the_passing_cache_entry(
+            self, mock_run):
+        mock_run.side_effect = self._dispatch(indexed_tree="")
+
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.PASSED
+        assert len(self._entries()) == 1
+        assert self.gate.handoff_test_cache_after_commit() is False
+
+    @patch('subprocess.run')
+    def test_a_commit_handoff_makes_the_clean_post_commit_tree_a_hit(
+            self, mock_run):
+        post_tree = "a" * 40
+        (self.gate.project_root / "module.py").write_text("value = 2\n")
+        mock_run.side_effect = self._dispatch(
+            status="M  module.py\0",
+            blobs={"module.py": "b" * 40},
+            indexed_tree=post_tree,
+        )
+
+        fresh = self.gate.check_tests()
+        assert fresh.cache_verdict == "miss"
+        assert len(self.pytest_calls) == 1
+
+        mock_run.side_effect = self._dispatch(
+            tree=post_tree, status="", indexed_tree=post_tree
+        )
+        assert self.gate.handoff_test_cache_after_commit() is True
+
+        cached = self.gate.check_tests()
+        assert len(self.pytest_calls) == 1, "the push-shaped lookup reran pytest"
+        assert cached.cache_verdict == "hit"
+        assert cached.scope == "cached full suite"
+
+    @patch('subprocess.run')
+    def test_handoff_refuses_a_commit_that_does_not_match_the_tested_index(
+            self, mock_run):
+        tested_tree = "a" * 40
+        mock_run.side_effect = self._dispatch(indexed_tree=tested_tree)
+        self.gate.check_tests()
+
+        mock_run.side_effect = self._dispatch(tree="b" * 40, status="")
+
+        assert self.gate.handoff_test_cache_after_commit() is False
+
+    def test_handoff_failure_never_changes_the_commits_result(self, monkeypatch):
+        self.gate._passing_suite = object()
+        monkeypatch.setattr(
+            gate_cache,
+            "committed_tree",
+            lambda _run: (_ for _ in ()).throw(OSError("cache unavailable")),
+        )
+
+        assert self.gate.handoff_test_cache_after_commit() is False
+
+    @patch('subprocess.run')
     def test_the_receipt_distinguishes_a_cached_pass_from_a_fresh_one(
             self, mock_run):
         """The receipt is what a reviewer reads when asking "was this tested?".
@@ -1936,6 +2046,8 @@ class TestTestResultCache:
         self.gate.results.append(fresh)
         assert self.gate.receipt_test_fields() == {
             "test_scope": "full suite", "test_targets": ["tests/"],
+            "test_cache_verdict": "miss",
+            "test_cache_reason": "no current matching pass",
         }
 
         self.gate.results = [self.gate.check_tests()]
@@ -1943,7 +2055,33 @@ class TestTestResultCache:
         assert self.gate.receipt_summary() == "cached full suite: 8 passed in 12.3s"
         assert self.gate.receipt_test_fields() == {
             "test_scope": "cached full suite", "test_targets": ["tests/"],
+            "test_cache_verdict": "hit",
+            "test_cache_reason": "exact fingerprint pass found",
         }
+
+    def test_cache_miss_decisions_are_structured_at_the_source(self,
+                                                               monkeypatch):
+        fingerprint = MagicMock()
+
+        monkeypatch.setattr(gate_cache, "cache_enabled", lambda: False)
+        assert self.gate._cache_miss_decision(fingerprint) == (
+            "disabled", f"disabled by {gate_cache.DISABLE_ENV}")
+
+        monkeypatch.setattr(gate_cache, "cache_enabled", lambda: True)
+        assert self.gate._cache_miss_decision(None) == (
+            "miss", "fingerprint unavailable")
+
+        monkeypatch.setattr(
+            gate_cache, "environment_mismatch", lambda _fingerprint: ["TERM"]
+        )
+        assert self.gate._cache_miss_decision(fingerprint) == (
+            "miss", "same tree and invocation, environment differs (TERM)")
+
+        monkeypatch.setattr(
+            gate_cache, "environment_mismatch", lambda _fingerprint: []
+        )
+        assert self.gate._cache_miss_decision(fingerprint) == (
+            "miss", "no current matching pass")
 
     @patch('subprocess.run')
     def test_the_hit_says_when_it_was_proven_and_how_to_force_a_rerun(
@@ -2061,6 +2199,8 @@ class TestTestResultCache:
         assert self.gate.receipt_test_fields() == {
             "test_scope": "cached text-diff subset",
             "test_targets": self.SUBSET,
+            "test_cache_verdict": "hit",
+            "test_cache_reason": "exact fingerprint pass found",
         }
 
     @patch('subprocess.run')
@@ -2943,6 +3083,22 @@ class TestGateCommands:
 
         assert rc == 0
         mock_gate.assert_called_once_with(skip_tests=False)
+
+    @patch('subprocess.run')
+    def test_gate_commit_alone_enables_post_commit_cache_handoff(
+            self, mock_subproc, monkeypatch):
+        mock_subproc.return_value = MagicMock(returncode=0)
+        monkeypatch.delenv("LMER_QUICK_GATE_COMMIT", raising=False)
+        module = self._load_gate_commit_module()
+        gate = MagicMock()
+        gate.run_commit_gate.return_value = True
+        gate.handoff_test_cache_after_commit.return_value = False
+        constructor = MagicMock(return_value=gate)
+        module.GateSystem = constructor
+
+        assert module.gate_commit("test commit", verbose=False, bypass=False) == 0
+
+        constructor.assert_called_once_with(verbose=False, commit_handoff=True)
 
     @patch('subprocess.run')
     @patch('lmer_cli.gates.GateSystem.run_commit_gate')

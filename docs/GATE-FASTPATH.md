@@ -126,6 +126,24 @@ This is what removes the repeat runs a release performs on one unchanged tree â€
 
 The status probe and the file hashing are anchored to the repository root (`git rev-parse --show-toplevel`), so running a gate from a subdirectory cannot make the digest content-blind.
 
+### Commit-to-push handoff
+
+A commit changes the fingerprint even when it changes no tested content: before
+the commit, the key is the old `HEAD` plus staged state; afterwards it is the new
+`HEAD` plus a clean tree. After `gate-commit` succeeds, it records the passing
+suite under that clean post-commit key as well, but only when the new committed
+tree exactly equals the index tree captured with the pass and the working tree is
+clean. Only `gate-commit` captures that index identity, and only while caching is
+enabled; `gate-check` and `gate-push` never run `git write-tree` for a handoff
+they cannot consume. `write-tree` leaves staged content and working-tree files
+alone, but it can update the index cache-tree, take the index lock, and write tree
+objects. A commit hook edit, partial commit, quick gate, unknown fingerprint, or
+leftover change declines the handoff, so `gate-push` runs the suite normally.
+
+The exact pytest argv is retained during the handoff. A text-diff subset can
+therefore hand off only to the same subset key; it still cannot satisfy a
+full-suite lookup.
+
 ### The environment is checked in the entry
 
 The environment the suite is handed has to match too â€” pytest reads `PYTEST_ADDOPTS`, and a suite's tests can branch on any other variable. It is checked out of the **entry** rather than out of the filename: the entry carries one digest of the environment plus a digest per variable name, so a mismatch is still a miss *and* the gate can say what moved.
@@ -187,7 +205,11 @@ All three are parsed the usual way (`1`/`true`/`yes`, case-insensitive) and are 
 
 ## Reading a gate receipt
 
-Every gate receipt carries `test_scope` and `test_targets`, so a reader can tell what a green actually proved:
+Every gate receipt with a test scope carries `test_scope`, `test_targets`,
+`test_cache_verdict`, and `test_cache_reason`, so a reader can tell both what a
+green proved and why the cache did or did not answer. Verdicts are `hit`, `miss`,
+`disabled`, or `unknown`; reasons name environment variables but never their
+values.
 
 | `test_scope` | Meaning |
 |---|---|

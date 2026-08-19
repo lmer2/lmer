@@ -169,18 +169,24 @@ def bearer_header():
     return {"Authorization": f"Bearer {SECRET}"}
 
 
-def wait_for_replacement(previous_id, timeout=20.0):
+def wait_for_replacement(previous_id, minimum_generation=None, timeout=20.0):
     """The incarnation that replaced *previous_id*, or the status when time ran out.
 
     A bounded wait on a *fact* rather than an assertion about a duration: the
     respawn happens on the supervisor's own thread, and this container has one CPU,
     so the only honest thing to wait for is the registry saying a different session
-    is up. Nothing here asserts how long it took.
+    is up. When the caller needs the persisted generation too, wait for that state
+    write instead of returning in the gap between registry replacement and state
+    persistence. Nothing here asserts how long it took.
     """
     deadline = time.monotonic() + timeout
     while True:
         current = assistant.status()
-        if current.running and current.session_id != previous_id:
+        generation_ready = (
+            minimum_generation is None
+            or current.generation > minimum_generation
+        )
+        if current.running and current.session_id != previous_id and generation_ready:
             return current
         if time.monotonic() >= deadline:
             return current
@@ -741,7 +747,9 @@ def test_a_manual_start_after_a_give_up_re_arms_supervision(
         assert spawn.wait_for_exit_recorded(manual["session_id"], 10.0), (
             "the exit was never recorded"
         )
-        respawned = wait_for_replacement(manual["session_id"])
+        respawned = wait_for_replacement(
+            manual["session_id"], minimum_generation=manual["generation"]
+        )
         assert respawned.running is True, (
             "nothing respawned it: the manual start did not re-arm supervision"
         )

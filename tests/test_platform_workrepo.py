@@ -24,6 +24,7 @@ import threading
 import time
 
 import pytest
+import yaml
 
 from lmer_platform import config as cfg
 from lmer_platform import store, workrepo
@@ -1054,14 +1055,22 @@ def announcing(monkeypatch):
 
 
 def _plant_run_dir(config, dir_name, *, slug=SLUG, host="gitlab.example.com",
-                   project="agents/global"):
+                   project="agents/global", status="in-progress", created=None,
+                   reslugged_from=None):
     """A run directory in the mirror named *dir_name* and recording *slug*."""
     path = config.mirror_path / host / project / "runs" / dir_name
     path.mkdir(parents=True, exist_ok=True)
-    (path / "state.yaml").write_text(
-        f"schema: 1\nslug: {slug}\nname: named\nstatus: in-progress\n",
-        encoding="utf-8",
-    )
+    state = {
+        "schema": 1,
+        "slug": slug,
+        "name": "named",
+        "status": status,
+    }
+    if created is not None:
+        state["created"] = created
+    if reslugged_from is not None:
+        state["reslugged_from"] = reslugged_from
+    (path / "state.yaml").write_text(yaml.safe_dump(state), encoding="utf-8")
     return path
 
 
@@ -1181,6 +1190,150 @@ def test_the_bare_dir_wins_over_a_name_bearing_sibling(config):
     ref = workrepo.resolve_run_dir(config, "gitlab.example.com", "agents/global", SLUG)
 
     assert ref.dir_name is None
+
+
+def test_resolve_run_dir_follows_the_live_run_that_vacated_the_slug(config):
+    workrepo.ensure_clone(config)
+    successor = f"{SLUG}-v1.2.3"
+    planted = _plant_run_dir(
+        config, successor, slug=successor, reslugged_from=[SLUG]
+    )
+
+    ref = workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    )
+
+    assert ref is not None
+    assert ref.path == planted
+    assert ref.slug == SLUG
+    assert ref.dir_name == successor
+
+
+def test_a_terminal_reslugged_run_does_not_keep_the_seed_address(config):
+    workrepo.ensure_clone(config)
+    successor = f"{SLUG}-v1.2.3"
+    _plant_run_dir(
+        config,
+        successor,
+        slug=successor,
+        status="complete",
+        reslugged_from=[SLUG],
+    )
+
+    assert workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    ) is None
+
+
+def test_the_newest_live_reslugged_successor_wins_deterministically(config):
+    workrepo.ensure_clone(config)
+    _plant_run_dir(
+        config,
+        f"{SLUG}-v1",
+        slug=f"{SLUG}-v1",
+        created="2026-08-18T10:00:00Z",
+        reslugged_from=[SLUG],
+    )
+    newest = _plant_run_dir(
+        config,
+        f"{SLUG}-v2",
+        slug=f"{SLUG}-v2",
+        created="2026-08-19T10:00:00Z",
+        reslugged_from=[SLUG],
+    )
+
+    ref = workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    )
+
+    assert ref.path == newest
+
+
+def test_reslugged_resolution_scans_once_per_mirror_revision(config, monkeypatch):
+    workrepo.ensure_clone(config)
+    successor = f"{SLUG}-v1.2.3"
+    _plant_run_dir(
+        config,
+        successor,
+        slug=successor,
+        reslugged_from=[SLUG, "another-vacated-slug"],
+    )
+    original = workrepo._read_run_state
+    reads = []
+
+    def counted(path):
+        reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(workrepo, "_read_run_state", counted)
+
+    first = workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    )
+    first_scan = list(reads)
+    second = workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", "another-vacated-slug"
+    )
+
+    assert first.path == second.path
+    assert first.path in first_scan
+    assert reads == first_scan
+
+
+def test_reslugged_resolution_rebuilds_when_the_mirror_head_moves(
+        config, monkeypatch):
+    workrepo.ensure_clone(config)
+    successor = f"{SLUG}-v1.2.3"
+    _plant_run_dir(
+        config, successor, slug=successor, reslugged_from=[SLUG]
+    )
+    revision = {"sha": "a" * 40}
+    monkeypatch.setattr(
+        workrepo,
+        "mirror_status",
+        lambda _config: workrepo.MirrorStatus(
+            present=True, last_pull_ok=True, head_sha=revision["sha"]
+        ),
+    )
+    original = workrepo._build_reslugged_index
+    builds = []
+
+    def counted(*args):
+        builds.append(revision["sha"])
+        return original(*args)
+
+    monkeypatch.setattr(workrepo, "_build_reslugged_index", counted)
+
+    assert workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    ) is not None
+    assert workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    ) is not None
+    revision["sha"] = "b" * 40
+    assert workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    ) is not None
+
+    assert builds == ["a" * 40, "b" * 40]
+
+
+def test_reslugged_resolution_never_descends_into_the_archive(config):
+    workrepo.ensure_clone(config)
+    archived = (
+        config.mirror_path / "gitlab.example.com" / "agents/global" / "runs"
+        / "archive"
+    )
+    archived.mkdir(parents=True)
+    (archived / "state.yaml").write_text(
+        "schema: 1\nstatus: in-progress\nslug: archived-run\n"
+        f"reslugged_from:\n  - {SLUG}\n",
+        encoding="utf-8",
+    )
+
+    assert workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    ) is None
 
 
 # --- the adoption listing keys on the recorded slug too (T90) ----------------
