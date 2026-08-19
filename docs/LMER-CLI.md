@@ -1063,6 +1063,15 @@ that fixed the code must not sign off on its own fix. The refusal message
 names the workaround: a human resolves in the web UI, or runs the CLI from
 a host shell where `LMER_TASK` is unset. There is no override flag.
 
+**GitLab resolvability.** The `gitlab-review --resolve-thread` eligibility gate
+follows GitLab's own `resolvable` fact instead of classifying threads by whether
+they are inline. This includes non-diff `DiscussionNote` discussions when GitLab
+marks the discussion resolvable. Standalone individual notes that advertise no
+resolved state are still refused before a write. Resolution uses GitLab's
+discussion-level REST endpoint. The aggregate `--info` provenance counts remain
+structural: standalone `individual_note` objects are not counted as discussion
+threads.
+
 **Thread provenance in `--info`.** Both CLIs render a "Threads" block —
 total / unresolved / resolved counts and a per-account resolver breakdown —
 and carry the same data under a `thread_provenance` key in `--json`.

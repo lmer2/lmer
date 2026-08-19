@@ -44,9 +44,10 @@ gitlab-review myorg/myproject 123 --reply-thread <discussion_id> --comment-file 
 
 Discussion IDs are full 40-character SHA1s — copy them from `--comments`
 output. A truncated ID is rejected up front (the API would otherwise return
-a bare 404 that reads like a token-scope failure). Only inline (diff)
-threads are resolvable; resolving a general/summary thread is refused with
-an explanation rather than an API error. Replying works on any thread type.
+a bare 404 that reads like a token-scope failure). Resolution follows GitLab's
+`resolvable` fact, including for non-diff discussions. Standalone notes that
+advertise no resolved state are refused before any write. Replying works on any
+thread type.
 
 ### Post Review Comments
 

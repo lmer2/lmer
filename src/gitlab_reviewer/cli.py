@@ -513,9 +513,10 @@ def build_thread_provenance(reviewer, project: str, mr_id: int, mr_info: dict,
     """Build thread-provenance data for an MR: counts, resolvers, and a
     resolved-before-head heuristic.
 
-    Only user discussions count as threads — discussions that are pure
-    system notes or standalone individual notes are skipped (they are not
-    resolvable, so they cannot carry resolution provenance).
+    Only structurally grouped user discussions count as threads. Pure system
+    notes and standalone ``individual_note`` objects are deliberately skipped;
+    this aggregate provenance view is separate from ``--resolve-thread``'s
+    server-advertised resolvability check.
 
     Returns a dict: {total, unresolved, resolved, resolvers: {username: n},
     resolved_before_head: [...ids], partial: bool}. The resolved_before_head
@@ -916,19 +917,21 @@ def _with_reply_not_posted(message: str, replying: bool) -> str:
 def _thread_not_resolvable_error(discussion: dict, discussion_id: str) -> Optional[str]:
     """Return the refusal message when a thread cannot be resolved.
 
-    Only diff (inline) threads carry resolvable notes; summary/general
-    threads come back with resolvable false and GitLab refuses to resolve
-    them. Say that plainly instead of relaying the raw API refusal. Returns
-    None when the thread is resolvable.
+    GitLab payloads can advertise resolution support on the discussion or a
+    note. Trust either server-provided fact instead of inferring support from
+    the note type or whether the discussion is attached to a diff. Returns None
+    when the thread is resolvable.
     """
     notes = discussion.get('notes', [])
-    if any(note.get('resolvable', False) for note in notes):
+    if discussion.get('resolvable', False) or any(
+        note.get('resolvable', False) for note in notes
+    ):
         return None
     return (
-        f"Error: thread {discussion_id} is not resolvable "
-        "(general threads cannot be resolved).\n"
-        "Only inline diff threads carry a resolved state; summary and "
-        "general comment threads have none."
+        f"Error: thread {discussion_id} is not resolvable.\n"
+        "GitLab reports no resolved state for this discussion or any of its "
+        "notes, so the CLI cannot close it. Leave the note open, or use the "
+        "GitLab web UI if the server offers a resolve control there."
     )
 
 

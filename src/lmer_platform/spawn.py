@@ -57,16 +57,15 @@ identity up front and tracks the run before the container has committed anything
 Without that, a session's first minutes — precisely when someone is watching —
 would show a row with no identity.
 
-Which repo URL, though, is a question with three answers, and the third is why
+Which repo URL, though, is a question with four answers, and the last two are why
 ``lmer develop <MR-url>`` needs no repo flag on the command line: **the target
 usually contains the repository**. So a spawn that was handed no URL and has no
-``LMER_REPO_URL`` to fall back on derives one from the target
-(:func:`_identity_url_from_target`) rather than giving up on the identity — the
-alternative, which this module used to do, is a run that is never tracked and
-therefore vanishes from the fleet view the moment its session is reaped. A
-derived URL is *identity only* (see :func:`_repo_urls`): it is a reconstruction,
-not evidence of where the code is cloned from, and recording a reconstruction is
-how a run acquires a repo URL nobody supplied.
+``LMER_REPO_URL`` to fall back on uses a plain repository-URL target as the run's
+repository of record, or derives identity from a resource target such as an issue
+or merge request (:func:`_identity_url_from_target`). The distinction is evidence:
+the former is the clone target the caller supplied, while the latter is a
+reconstruction. A reconstructed URL remains *identity only* (see
+:func:`_repo_urls`) so a run never acquires a clone URL nobody supplied.
 
 The residual case survives — a target that is a branch name or a sentence names
 no repository, and nothing can be derived from it — so it is said out loud at
@@ -128,9 +127,11 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Optional
+from urllib.parse import urlparse
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
 from lmer_cli.container.clone_and_exec import _scrub_credentials
+from lmer_cli.container.sources import url_has_embedded_credential
 from lmer_cli.harness import HARNESSES, known_harnesses
 from lmer_cli.mounts import (
     # Imported rather than restated: credential staging (there) and the
@@ -461,9 +462,9 @@ class SpawnRequest:
       ``LMER_REPO_URL`` fallback and tells ``lmer`` to skip the clone.
 
     A caller that fills in none of the three is the ordinary case rather than a
-    mistake — ``lmer develop <MR-url>`` takes no repo flag either — and the
-    identity is then read out of ``target`` itself
-    (:func:`_identity_url_from_target`), still without recording anything.
+    mistake — ``lmer develop <MR-url>`` takes no repo flag either. A plain clone
+    URL target becomes repository evidence; a resource URL target contributes
+    identity only (:func:`_repo_urls`).
 
     ``title`` and ``description`` are the odd pair here: they are the only fields
     that say nothing about the invocation. Nothing spells them in argv, ``lmer``
@@ -713,6 +714,85 @@ def _identity_url_from_target(target: str) -> Optional[str]:
     return scrubbed
 
 
+_PLAIN_REPO_SCHEMES = frozenset({"http", "https", "ssh", "git"})
+_KNOWN_HTTP_FORGES = frozenset({
+    "github.com", "gitlab.com", "bitbucket.org", "codeberg.org",
+})
+
+
+def _known_http_forge(host: str) -> bool:
+    """Whether *host* makes a suffix-less HTTP project URL unambiguous."""
+    host = host.lower()
+    first_label = host.split(".", 1)[0]
+    return (
+        host in _KNOWN_HTTP_FORGES
+        or first_label in {"git", "gitlab", "github", "bitbucket", "codeberg"}
+    )
+
+
+def _github_http_forge(host: str) -> bool:
+    """Whether *host* uses GitHub's fixed ``owner/repo`` project root."""
+    host = host.lower()
+    return host == "github.com" or host.split(".", 1)[0] == "github"
+
+
+def _plain_repo_url_from_target(target: str) -> Optional[str]:
+    """Return a repository URL used directly as *target*, or ``None``.
+
+    Parsing a host and path does not prove a URL is cloneable: ordinary GitLab
+    file, pipeline and wiki pages have the same shape. This predicate therefore
+    accepts only Git transports, HTTPS URLs ending in ``.git``, or suffix-less
+    HTTP(S) roots on a recognisable forge host. GitLab's ``/-/`` web routes and
+    GitHub's routes below ``owner/repo`` are always excluded.
+
+    Embedded HTTP credentials are transport material, not repository identity,
+    so they are stripped before the URL becomes the repository of record. Bare
+    SSH userinfo (``git@``) is protocol plumbing and is preserved.
+    """
+    if not target or _derive_repo_url_from_task_target(target):
+        return None
+    if target.startswith("git@"):
+        parsed = None
+    else:
+        try:
+            parsed = urlparse(target)
+            scheme = parsed.scheme.lower()
+            hostname = parsed.hostname or ""
+        except ValueError:
+            return None
+        if scheme not in _PLAIN_REPO_SCHEMES:
+            return None
+        if parsed.query or parsed.fragment or "/-/" in parsed.path:
+            return None
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if _github_http_forge(hostname) and len(path_parts) != 2:
+            return None
+        if scheme in {"http", "https"} and not (
+            parsed.path.rstrip("/").endswith(".git")
+            or _known_http_forge(hostname)
+        ):
+            return None
+        if (
+            scheme not in {"http", "https"}
+            and url_has_embedded_credential(target)
+        ):
+            return None
+    recorded = (
+        _scrub_credentials(target)
+        if parsed is not None and scheme in {"http", "https"}
+        else target
+    )
+    host, project = _parse_repo_url(recorded)
+    if not host or not project:
+        return None
+    logger.info(
+        "platform_spawn_repo_from_target repo=%s — plain repository URL target "
+        "available as repository evidence",
+        recorded,
+    )
+    return recorded
+
+
 def _repo_urls(request: SpawnRequest) -> tuple:
     """``(recorded, identity)`` — the run's repo of record, and what to derive from.
 
@@ -737,12 +817,14 @@ def _repo_urls(request: SpawnRequest) -> tuple:
     - a caller that supplied its own ``identity_repo_url``, which is a caller
       saying it already knows where this run belongs.
 
-    The target is the **last** source of an identity and never a source of a
-    record. Last, because the two above it are evidence and it is a
-    reconstruction: a supplied ``repo_url`` is the caller naming the repository,
-    an exported ``LMER_REPO_URL`` is the operator naming it for this daemon, and
-    a caller-supplied ``identity_repo_url`` is a caller stating where the run
-    already belongs. Never recorded, for the reason
+    A plain repository-URL target is also evidence: it is the clone target the
+    caller supplied, so it becomes both the record and identity when no stronger
+    source is present. A resource target remains the **last** source of identity
+    and never a source of record, because its URL is reconstructed. The ordering
+    keeps a supplied ``repo_url`` first, an exported ``LMER_REPO_URL`` next, and
+    a caller-supplied ``identity_repo_url`` ahead of either target shape.
+
+    A reconstructed resource URL is never recorded, for the reason
     :func:`lmer_platform.answer._identity_repo_url` sets out at length: a
     recorded reconstruction round-trips, so it satisfies every later identity
     check, and a run whose repo was *derived once* would pass
@@ -758,6 +840,8 @@ def _repo_urls(request: SpawnRequest) -> tuple:
         None if request.identity_repo_url
         else configured_repo_url()
     )
+    if recorded is None and not request.identity_repo_url:
+        recorded = _plain_repo_url_from_target(request.target)
     identity = (
         recorded
         or request.identity_repo_url
