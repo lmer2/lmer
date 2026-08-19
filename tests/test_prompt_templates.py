@@ -1,6 +1,4 @@
-"""Tests for lmer_cli.container.prompt_templates — the claude-command →
-harness prompt-template converter behind harness_render_prompt_templates
-(codex/pi slash commands)."""
+"""Tests for the Claude-command to pi prompt-template converter."""
 
 from pathlib import Path
 
@@ -53,9 +51,9 @@ class TestConvertCommandText:
 
     def test_arguments_appended_when_body_never_references_them(self):
         # Claude Code appends the invocation arguments when a command has no
-        # placeholder; codex/pi drop them — the trailing $ARGUMENTS preserves
+        # placeholder; pi drops them — the trailing $ARGUMENTS preserves
         # `/start phasic` semantics (and expands to nothing without args).
-        # $ARGUMENTS, not $@: codex does not document $@ (pi accepts both).
+        # $ARGUMENTS is the renderer's canonical spelling (pi accepts $@ too).
         out = convert_command_text(COMMAND)
         assert out.rstrip().endswith("$ARGUMENTS")
 

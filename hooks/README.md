@@ -76,7 +76,20 @@ Located in `~/.claude/`:
 - `commits.log` - Commits made via pc
 - `violations.log` - Rule violations (if any)
 
-## Claude Code Stop Hooks
+## Lifecycle Stop Hooks
+
+### codex_ask_guard.py
+
+Installed for Codex through the image-managed
+`agent-files/codex/requirements.toml`. In an interactive orchestrated session,
+it waits while any `lmer-ask` question is open and uses Codex's native Stop
+block to continue when the oldest unread answer appears. An answer already on
+disk when Stop fires is handled immediately. The hook never reads answer text;
+the continuation tells the agent to retrieve it with `lmer-ask wait`.
+
+The managed policy pins Codex's `hooks` feature on. Channel errors, a settled
+channel, repeated hook turns, non-interactive children, and the 3540-second
+timeout all fail open.
 
 ### run_state_guard.py
 

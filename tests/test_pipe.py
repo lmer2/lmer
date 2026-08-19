@@ -13,6 +13,7 @@ import requests
 import uvicorn
 
 from lmer_cli import pipe, supervisor
+from tests.conftest import strip_lmer_env
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +25,7 @@ from lmer_cli import pipe, supervisor
 
 @pytest.fixture(autouse=True)
 def _bypass_proxies(monkeypatch):
+    strip_lmer_env(monkeypatch)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
 

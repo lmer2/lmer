@@ -888,10 +888,9 @@ def _split_submit_cr(payload: str) -> str:
 #: box in !212.
 #:
 #: Codex and pi have only the first half. Their ``/`` escape is on this tree's
-#: record — lmer installs its own slash commands into those composers
-#: (:mod:`lmer_cli.container.prompt_templates`: pi ``/name``, codex
-#: ``/prompts:name``) and codex's quit sequence is ``/quit`` typed into the same
-#: box (:data:`lmer_cli.harness.HARNESSES`) — but nobody has established what a
+#: record — Pi loads lmer's ``/name`` prompt templates, while Codex has native
+#: commands such as ``/quit`` typed into the same box
+#: (:data:`lmer_cli.harness.HARNESSES`) — but nobody has established what a
 #: leading dot does there. Defusing on a prediction about another program's
 #: input box is how the leading *space* went wrong, so they are deliberately
 #: absent until the prefix half is answered too.
@@ -1027,6 +1026,34 @@ def _active_harness_name() -> str:
         return "claude"
 
 
+_CODEX_FOLLOWUP = "/followup"
+_CODEX_FOLLOWUP_INSTRUCTION = (
+    "Run `bash /Agents/global/hooks/followup.sh` now and follow the "
+    "instructions in its output."
+)
+
+
+def _rewrite_harness_command(payload: str, harness: str) -> str:
+    """Translate lmer command spellings a harness cannot register directly.
+
+    Current Codex builds no longer discover custom prompt files, so both
+    ``/followup`` and the former ``/prompts:followup`` spelling are rejected by
+    its slash-command parser. The control plane sees a complete submitted
+    message (unlike the terminal's per-keystroke path), so it can translate the
+    exact command to a plain-text instruction that invokes the same lmer hook.
+    Argument text and a trailing CR/LF remain appended verbatim.
+
+    Only a command token in column one is eligible: prose, leading whitespace,
+    ``/followups`` and every other harness remain byte-for-byte passthrough.
+    """
+    if harness != "codex" or not payload.startswith(_CODEX_FOLLOWUP):
+        return payload
+    tail = payload[len(_CODEX_FOLLOWUP):]
+    if tail and not tail[:1].isspace():
+        return payload
+    return _CODEX_FOLLOWUP_INSTRUCTION + tail
+
+
 def _submit_payload(
     write: Callable[[bytes], int],
     payload: str,
@@ -1034,6 +1061,7 @@ def _submit_payload(
     probe: Optional[Callable[[], Optional[int]]] = None,
     settle: float = DEFAULT_SUBMIT_ENTER_DELAY,
     drain_timeout: float = SUBMIT_DRAIN_TIMEOUT_SECONDS,
+    bracketed_paste: bool = False,
 ) -> tuple[int, str]:
     """Type *payload*, then press Enter **as a write of its own**.
 
@@ -1054,8 +1082,18 @@ def _submit_payload(
     run's evidence document: they are host-specific numbers, and what this code
     depends on is the ordering, not their values.
 
-    The text is **one write**, and the whole of it is what the wait watches. Do not
-    split off a tail to measure instead: a byte offset into UTF-8 severs a
+    The text is **one write**, and the whole of it is what the wait watches.  For
+    a TUI that enables bracketed paste, *bracketed_paste* wraps that write in the
+    terminal's explicit paste-start/paste-end sequences.  Codex does enable the
+    protocol: the end sequence gives its input parser an explicit boundary
+    before the separate Enter instead of asking a scheduler delay to imply one.
+    A payload that already contains the paste-end sequence is left unframed so
+    its remainder cannot escape the bracket and be interpreted as keystrokes.
+    The sequences are terminal protocol, so ``bytes_written`` includes them while
+    the control-plane delivery receipt continues to describe only the caller's
+    payload.
+
+    Do not split off a tail to measure instead: a byte offset into UTF-8 severs a
     multi-byte character across two reads, and the extra wait doubles a lock-hold
     budget the platform's control timeout depends on. What one write gives up:
     above the queue's 4095-byte ceiling, the moment the queue reads
@@ -1077,6 +1115,8 @@ def _submit_payload(
     if not text:
         return write(_SUBMIT_CR), SUBMIT_TEXT_UNKNOWN
     data = text.encode("utf-8")
+    if bracketed_paste and _BRACKETED_PASTE_END not in data:
+        data = _BRACKETED_PASTE_START + data + _BRACKETED_PASTE_END
     if probe is None:
         # No terminal to ask: the settle carries the gap alone, which is weaker,
         # and the verdict says so rather than implying more.
@@ -1099,6 +1139,7 @@ def _make_submit(
     slave_path: Optional[str],
     *,
     drain_timeout: float = SUBMIT_DRAIN_TIMEOUT_SECONDS,
+    harness: str = "claude",
 ) -> Callable[[str], tuple[int, str]]:
     """A submit closure for one PTY: types a message and presses Enter, atomically.
 
@@ -1131,6 +1172,7 @@ def _make_submit(
                 probe=probe,
                 settle=_resolve_submit_enter_delay(),
                 drain_timeout=drain_timeout,
+                bracketed_paste=harness == "codex",
             )
 
     return submit
@@ -1276,7 +1318,10 @@ def _build_fastapi_app(
     def _unlocked_submit(payload: str) -> tuple[int, str]:
         """Fallback for an app with no terminal behind it — see ``submit`` above."""
         return _submit_payload(
-            write_input, payload, settle=_resolve_submit_enter_delay()
+            write_input,
+            payload,
+            settle=_resolve_submit_enter_delay(),
+            bracketed_paste=_active_harness_name() == "codex",
         )
 
     submit_payload = submit if submit is not None else _unlocked_submit
@@ -1316,6 +1361,12 @@ def _build_fastapi_app(
         # behavior is "press Enter after the text".
         if not body.append_newline:
             return {"bytes_written": write_input(payload_bytes), **receipt}
+
+        # A whole submitted command can use lmer's portable spelling even when
+        # the harness namespaces custom commands.  Deliberately after the raw
+        # keystroke return above: translating one byte at a time is impossible,
+        # and the direct terminal documents Codex's native spelling instead.
+        payload = _rewrite_harness_command(payload, _active_harness_name())
 
         # Type it and submit it, ONCE — and with the Enter as a write of its own,
         # because a CR glued to the text is read as part of a paste and inserted
@@ -1787,6 +1838,8 @@ def _start_auto_start_thread(
 #: What "press Enter" is on the wire: CR, not LF. A raw-mode TUI reads ``\r`` as
 #: Enter and inserts ``\n`` as a literal newline in the input box.
 _SUBMIT_CR = b"\r"
+_BRACKETED_PASTE_START = b"\x1b[200~"
+_BRACKETED_PASTE_END = b"\x1b[201~"
 
 #: What ``/input`` says about a submit it cannot see land.
 #:
@@ -2152,7 +2205,9 @@ def run_supervisor(
     # Types a message and presses Enter as two writes with nothing able to land
     # between them — see :func:`_make_submit`, which owns that guarantee and is
     # tested on it directly.
-    submit_to_child = _make_submit(master_fd, write_lock, slave_path)
+    submit_to_child = _make_submit(
+        master_fd, write_lock, slave_path, harness=_active_harness_name()
+    )
 
     # The FastAPI control plane touches the PTY's geometry through these two
     # closures instead of being handed the fd, so the app never has to know it

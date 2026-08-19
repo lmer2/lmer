@@ -1,4 +1,6 @@
 """Tests for Containerfile configuration."""
+import tomllib
+
 import pytest
 from pathlib import Path
 
@@ -203,3 +205,39 @@ class TestBuildProvenanceBaked:
         assert "ARG LMER_BUILD_COMMIT" in content
         assert "ENV LMER_BUILD_COMMIT" in content
         assert "/Agents/global/BUILD_INFO" in content
+
+
+class TestCodexManagedHooks:
+    """lmer's hook is trusted without trusting arbitrary repository hooks."""
+
+    def test_image_installs_system_requirements(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert (
+            "COPY --chown=root:root agent-files/codex/requirements.toml "
+            "/etc/codex/requirements.toml"
+            in content
+        )
+        assert content.index("/etc/codex/requirements.toml") < content.index(
+            "USER developer"
+        ), "system requirements must be installed while the image is still root"
+
+    def test_requirements_enable_only_the_lmer_ask_guard(self, project_root):
+        path = project_root / "agent-files" / "codex" / "requirements.toml"
+        requirements = tomllib.loads(path.read_text())
+        assert requirements["feature_requirements"]["hooks"] is True, (
+            "managed Stop hooks must not be disabled by a lower config layer"
+        )
+        assert requirements["hooks"]["managed_dir"] == "/Agents/global/hooks"
+        stop = requirements["hooks"]["Stop"]
+        assert len(stop) == 1
+        assert stop[0]["hooks"] == [
+            {
+                "type": "command",
+                "command": "python3 /Agents/global/hooks/codex_ask_guard.py",
+                "timeout": 3600,
+                "statusMessage": "Waiting for the operator's lmer-ask answer",
+            }
+        ]
+        assert "allow_managed_hooks_only" not in requirements, (
+            "user and project hooks must keep their ordinary trust path"
+        )

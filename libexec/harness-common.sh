@@ -269,12 +269,11 @@ harness_provision_config() {
     fi
 }
 
-# ── Slash commands as prompt templates ──
-# codex and pi load markdown *prompt templates* from a per-user directory as
-# slash commands (pi: /name from ~/.pi/agent/prompts/; codex: /prompts:name
-# from ~/.codex/prompts/). Render lmer's claude command files
+# ── Pi slash commands as prompt templates ──
+# Pi loads markdown prompt templates from ~/.pi/agent/prompts/ as /name slash
+# commands. Render lmer's Claude command files
 # (agent-files/claude/commands/*.md) into that directory so /start,
-# /followup, the gate commands etc. exist on every harness. Work-repo
+# /followup, the gate commands etc. exist on Pi. Work-repo
 # commands override global ones of the same name — the same precedence as
 # claude_link_agent_files. Conversion lives in
 # lmer_cli.container.prompt_templates.

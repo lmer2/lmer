@@ -276,7 +276,7 @@ class TestCodexRunner:
         run_harness_runner("codex", tmp_path, env={"LMER_GLOBAL_DIR": str(global_dir)})
         assert target.read_text() == "hand-written\n"
 
-    def test_slash_commands_rendered_as_prompt_templates(self, tmp_path):
+    def test_removed_custom_prompt_mechanism_is_not_provisioned(self, tmp_path):
         global_dir = _global_claude_command(
             tmp_path, "start.md",
             "---\ndescription: Start the task\nallowed-tools: Bash(work:*)\n---\n"
@@ -286,10 +286,7 @@ class TestCodexRunner:
             "codex", tmp_path,
             env={"LMER_GLOBAL_DIR": str(global_dir), "PYTHONPATH": str(SRC)},
         )
-        template = (tmp_path / ".codex" / "prompts" / "start.md").read_text()
-        assert "description: Start the task" in template
-        assert "allowed-tools" not in template
-        assert "Run `bash /Agents/global/hooks/start.sh`" in template
+        assert not (tmp_path / ".codex" / "prompts").exists()
 
     def test_memory_restored_when_persistence_enabled(self, tmp_path):
         record = _stub_work_cli(tmp_path)

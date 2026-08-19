@@ -1,0 +1,5 @@
+fixed:
+- "Codex now resumes in a native continuation turn for the oldest unread lmer-ask answer, whether it arrived before or during Stop"
+- "Programmatic Codex messages, including the reported wind-down path, use an explicit bracketed-paste boundary before the single submit Enter"
+- "Control-plane /followup requests now become a plain-text instruction to load the taskdef follow-up because current Codex releases no longer discover custom prompt files"
+- "Supervisor tests no longer inherit LMER_HARNESS or other run context from the session executing pytest"
