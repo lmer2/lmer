@@ -70,10 +70,18 @@ disables the feature.
 Each preset's fields are all optional:
 
 - **`checkout`** — host path to a local source checkout, passed as
-  `--checkout` (mounted as `/workspace`). Required whenever `service` is set.
+  `--checkout` (mounted as `/workspace`). Required whenever `service` or
+  `service_group` is set.
 - **`service`** — a running container / Compose service to target, passed as
   `--service` ([service mode](./SERVICE-MODE.md); the agent can then run
   commands in that container via `target-exec`).
+- **`service_group`** — a Compose **project** whose running services the
+  session may target, passed as `--service-group`
+  ([service groups](./SERVICE-MODE.md#service-groups-one-session-a-whole-stack)).
+  The agent retargets `target-exec` at any member with `target-switch`, so one
+  preset covers a whole stack instead of one preset per container. Combine with
+  `service` to name the member the session starts on; on its own the session
+  starts with nothing targeted.
 - **`env`** — extra environment variables. How they merge with the
   invocation's environment is per-consumer — see
   [Merge semantics per consumer](#merge-semantics-per-consumer). Use for
@@ -97,8 +105,9 @@ consumer:
 - A missing, unreadable, or malformed file yields no presets (logged).
 - An individual invalid entry is logged with the offending preset name and
   skipped, so it cannot disable the others. Rejection reasons: not a JSON
-  object, `checkout`/`service` not a string, `service` without `checkout`
-  (mirrors the `--service` requires `--checkout` CLI rule), `env` not a
+  object, `checkout`/`service`/`service_group` not a string, `service` or
+  `service_group` without `checkout` (mirrors the `--service` /
+  `--service-group` require `--checkout` CLI rule), `env` not a
   string→string map, `args` not a list of strings, or a non-selectable name.
 - Unknown keys in an entry produce a warning but keep the preset — a typo /
   forward-compatibility signal rather than an error.

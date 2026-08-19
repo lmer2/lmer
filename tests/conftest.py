@@ -968,6 +968,20 @@ SLOT_PRESETS = {
     "webapp_alt": {"checkout": "/srv/webapp", "service": "webapp-web"},
     # Sets no service, so it cannot back a slot.
     "no_service": {"checkout": "/srv/plain"},
+    # Service groups (issue #312): a whole compose project, optionally with the
+    # member the session starts on.
+    "stack_dev": {"checkout": "/srv/stack", "service_group": "stack"},
+    "stack_alt": {"checkout": "/srv/stack", "service_group": "stack"},
+    "stack_start": {
+        "checkout": "/srv/stack", "service": "web",
+        "service_group": "stack",
+    },
+}
+
+#: What :data:`SLOT_PRESETS`' group resolves to. ``webapp-web`` is deliberately
+#: a member: a group session must block the single-service slot that names it.
+SLOT_GROUP_MEMBERS = {
+    "stack": ("web", "db", "webapp-web"),
 }
 
 
@@ -998,7 +1012,23 @@ def slot_host(tmp_path, monkeypatch):
         calls.append((runtime, service_name, announce))
         return "container-id"
 
+    def _resolve_group(runtime, project, *, announce=True):
+        """The group half of the same fake, with the real signature (#312)."""
+        from lmer_cli.service import ServiceError, ServiceMember
+
+        calls.append((runtime, project, announce))
+        members = SLOT_GROUP_MEMBERS.get(project)
+        if not members:
+            raise ServiceError(
+                f"No running containers in compose project {project!r}"
+            )
+        return [
+            ServiceMember(name, f"container-{name}", f"{project}-{name}-1", "/")
+            for name in members
+        ]
+
     monkeypatch.setattr(slots_mod, "resolve_container", _resolve)
+    monkeypatch.setattr(slots_mod, "resolve_group", _resolve_group)
     monkeypatch.setattr(slots_mod, "_detected_runtime", lambda: "a-runtime")
     # Module-level memos (probe answers, collision-warning dedup): no test may
     # inherit another's.
