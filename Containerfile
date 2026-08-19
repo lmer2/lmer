@@ -120,6 +120,13 @@ RUN mkdir -p /Agents/global /workspace /work /napkin /taskdef && \
     chown -R developer:developer /Agents && \
     chown developer:developer /workspace /work /napkin /taskdef
 
+# Codex lifecycle hooks installed by lmer are system-managed: they run without
+# a per-session trust dialog while user/project hooks retain Codex's normal
+# review gate. The requirements file names scripts from /Agents/global/hooks,
+# which is part of this image (and live-mounted in self-development sessions).
+RUN install -d -m 0755 /etc/codex
+COPY --chown=root:root agent-files/codex/requirements.toml /etc/codex/requirements.toml
+
 # === DEVELOPER: uv + python deps (cached until pyproject.toml/uv.lock change) ===
 
 # Switch to non-root user for all user-space installations

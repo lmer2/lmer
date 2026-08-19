@@ -40,6 +40,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from lmer_cli import supervisor
 from lmer_platform import api, lifecycle, reattach, registry, spawn, store
 from lmer_platform import config as cfg
 from lmer_platform.session_io import ControlUnavailable, SessionIOError
@@ -421,6 +422,55 @@ def test_wind_down_presses_enter(platform_root, control_plane):
     lifecycle.wind_down("s-1")
 
     assert control_plane.calls[0]["body"]["append_newline"] is True
+
+
+def test_codex_wind_down_reaches_the_framed_submit_path(
+    platform_root, monkeypatch
+):
+    """Item 4 of #313, from the lifecycle verb through the supervisor route.
+
+    The ordinary transport is already pinned above. This joins its two ends so a
+    future caller or supervisor refactor cannot leave the long wind-down paragraph
+    in Codex's composer: the exact prompt is bracketed as paste, then one separate
+    Enter reaches the PTY-facing writer.
+    """
+    monkeypatch.setenv("LMER_HARNESS", "codex")
+    monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+    plant_session("s-1")
+
+    sink: list[bytes] = []
+
+    def write_input(data: bytes) -> int:
+        sink.append(data)
+        return len(data)
+
+    app = supervisor._build_fastapi_app(
+        supervisor.OutputBuffer(limit=1024), write_input, CONTROL_TOKEN
+    )
+    client = TestClient(app)
+
+    def send_through_supervisor(
+        session_id: str, data: str, *, append_newline: bool = False
+    ) -> dict:
+        assert session_id == "s-1"
+        response = client.post(
+            "/input",
+            headers={"Authorization": f"Bearer {CONTROL_TOKEN}"},
+            json={"data": data, "append_newline": append_newline},
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    monkeypatch.setattr(lifecycle, "send_input", send_through_supervisor)
+
+    report = lifecycle.wind_down("s-1", note="finish the review")
+
+    framed = (
+        supervisor._BRACKETED_PASTE_START
+        + report.prompt.encode("utf-8")
+        + supervisor._BRACKETED_PASTE_END
+    )
+    assert sink == [framed, b"\r"]
 
 
 def test_an_invalid_note_is_refused_before_anything_is_sent(

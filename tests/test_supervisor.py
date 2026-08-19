@@ -18,6 +18,13 @@ from unittest import mock
 import pytest
 
 from lmer_cli import supervisor
+from tests.conftest import strip_lmer_env
+
+
+@pytest.fixture(autouse=True)
+def _clean_lmer_env(monkeypatch):
+    """Supervisor defaults belong to the test, not its outer lmer session."""
+    strip_lmer_env(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -1817,6 +1824,26 @@ class TestSubmitPayload:
         assert sink == ["héllo — ✓".encode("utf-8"), b"\r"]
         assert written == len("héllo — ✓".encode("utf-8")) + 1
 
+    def test_codex_text_has_an_explicit_paste_boundary_before_enter(self):
+        sink, write = self._recorder()
+        written, _ = supervisor._submit_payload(
+            write, "hello", probe=None, settle=0, bracketed_paste=True
+        )
+        framed = b"\x1b[200~hello\x1b[201~"
+        assert sink == [framed, b"\r"]
+        assert written == len(framed) + 1
+
+    def test_payload_with_paste_end_sequence_falls_back_to_unframed_text(self):
+        sink, write = self._recorder()
+        payload = "before\x1b[201~after"
+
+        written, _ = supervisor._submit_payload(
+            write, payload, probe=None, settle=0, bracketed_paste=True
+        )
+
+        assert sink == [payload.encode(), b"\r"]
+        assert written == len(payload.encode()) + 1
+
 
 class TestMakeSubmit:
     """The production closure, on a real PTY with a real reader behind it."""
@@ -2075,6 +2102,52 @@ class TestMakeSubmit:
         finally:
             os.close(slave)
             os.close(master)
+
+    def test_codex_submit_frames_text_but_still_sends_one_enter(self, monkeypatch):
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        try:
+            submit = supervisor._make_submit(
+                master, threading.Lock(), None, harness="codex"
+            )
+            written, _ = submit("hello")
+            expected = b"\x1b[200~hello\x1b[201~\r"
+            assert self._read_until(slave, expected) == expected
+            assert written == len(expected)
+        finally:
+            os.close(slave)
+            os.close(master)
+
+
+class TestRewriteHarnessCommand:
+    instruction = (
+        "Run `bash /Agents/global/hooks/followup.sh` now and follow the "
+        "instructions in its output."
+    )
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ("/followup", instruction),
+            ("/followup review round 2", instruction + " review round 2"),
+            ("/followup\tbrief", instruction + "\tbrief"),
+            ("/followup\r", instruction + "\r"),
+            ("/followup\n", instruction + "\n"),
+        ],
+    )
+    def test_codex_followup_becomes_a_plain_text_instruction(self, payload, expected):
+        assert supervisor._rewrite_harness_command(payload, "codex") == expected
+
+    @pytest.mark.parametrize(
+        "payload", [" /followup", "/followups", "please run /followup", "/start"]
+    )
+    def test_non_commands_are_untouched(self, payload):
+        assert supervisor._rewrite_harness_command(payload, "codex") == payload
+
+    @pytest.mark.parametrize("harness", ["claude", "pi", "custom"])
+    def test_other_harnesses_are_untouched(self, harness):
+        assert supervisor._rewrite_harness_command("/followup", harness) == "/followup"
 
 
 class TestSubmitEnterDelayReachesTheContainer:
@@ -2554,6 +2627,42 @@ class TestFastApiApp:
                 f"{raw!r} was altered on the no-submit path: {sink}"
             )
 
+    def test_codex_followup_is_plain_text_framed_and_receipted_as_sent(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LMER_HARNESS", "codex")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        original = b"/followup review round 2"
+
+        body = self._client(app).post(
+            "/input",
+            json={"data": original.decode(), "append_newline": True},
+            headers={"Authorization": "Bearer test-token"},
+        ).json()
+
+        translated = (
+            b"Run `bash /Agents/global/hooks/followup.sh` now and follow the "
+            b"instructions in its output. review round 2"
+        )
+        framed = b"\x1b[200~" + translated + b"\x1b[201~"
+        assert sink == [framed, b"\r"]
+        assert body["payload_sha256"] == hashlib.sha256(original).hexdigest()
+        assert body["payload_length"] == len(original)
+        assert body["bytes_written"] == len(framed) + 1
+
+    def test_codex_raw_keystroke_path_does_not_translate_or_frame(self, monkeypatch):
+        monkeypatch.setenv("LMER_HARNESS", "codex")
+        app, _buf, sink = self._build()
+
+        self._client(app).post(
+            "/input",
+            json={"data": "/followup", "append_newline": False},
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+        assert sink == [b"/followup"]
+
     def test_a_long_message_is_submitted_the_same_way_as_a_short_one(
         self, monkeypatch
     ):
@@ -2776,8 +2885,9 @@ class TestFastApiApp:
         """The flag says "a human typed this in a chat composer" — true whatever
         is running — and this is where that fact meets the harness. The mapping
         names claude and nothing else, so codex and pi take this path for every
-        character: their payload is written as typed, which is what they got
-        before the mapping existed.
+        character: their payload content is not rewritten. Codex's terminal
+        protocol framing is allowed around that content; it is not transcript
+        text and makes no edit to the operator's words.
 
         Their ``/`` is a real escape on this tree's record
         (:mod:`lmer_cli.container.prompt_templates`), and it is still not defused
@@ -2800,7 +2910,10 @@ class TestFastApiApp:
             headers={"Authorization": "Bearer test-token"},
         )
         assert resp.status_code == 200
-        assert sink == [message.encode(), b"\r"], (
+        typed = message.encode()
+        if harness == "codex":
+            typed = b"\x1b[200~" + typed + b"\x1b[201~"
+        assert sink == [typed, b"\r"], (
             f"{harness} got a message nobody typed: {sink}"
         )
 

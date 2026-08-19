@@ -30,12 +30,11 @@ fi
 harness_provision_config "codex/config.toml" "$HOME/.codex/config.toml"
 harness_render_global_context "$HOME/.codex/AGENTS.md"
 
-# ── Slash commands + agent memory ──
-# lmer's claude command files render as codex custom prompts (invoked as
-# /prompts:start, /prompts:followup, ... — deprecated upstream in favor of
-# skills but functional); saved agent memory is restored before codex starts
-# (usage contract delivered via the global context above).
-harness_render_prompt_templates "$HOME/.codex/prompts"
+# ── Agent memory ──
+# Current codex releases no longer discover ~/.codex/prompts custom prompt
+# files. Start and follow-up are therefore delivered as plain-text instructions
+# by the supervisor; saved agent memory is restored before codex starts (usage
+# contract delivered via the global context above).
 harness_restore_memory
 
 EXTRA_ARGS=""

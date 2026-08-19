@@ -72,7 +72,7 @@ gracefully and are listed explicitly:
 | Slash commands (`agent-files` commands)      | ✅     | ✅⁷   | ✅⁷ |
 | Skills (`agent-files` skills)                | ✅     | ❌    | ❌  |
 | Output styles (`agent-files` output-styles)  | ✅⁹    | ❌    | ❌  |
-| Stop/SessionEnd hook guards                  | ✅¹⁰   | ❌¹⁰  | ❌¹⁰ |
+| Lifecycle hook guards                        | ✅¹⁰   | ⚠️¹⁰  | ❌¹⁰ |
 | Agent memory persistence (`work memory`)     | ✅     | ✅⁸   | ✅⁸ |
 | Masterplan workflow                          | ✅     | ❌    | ❌  |
 | Slack chat mode / service mode               | ✅     | ❌    | ❌  |
@@ -97,14 +97,15 @@ gracefully and are listed explicitly:
 6. The `.mcp.json` merge machinery is claude-specific today. Codex supports
    MCP through its own config file (`agent-files/codex/config.toml`); pi has
    no built-in MCP support (extensions can add it).
-7. Rendered per session from the claude command files
-   (`agent-files/claude/commands/*.md`) into the harness's native *prompt
-   templates* by `harness_render_prompt_templates`
-   (`lmer_cli.container.prompt_templates`): pi invokes them as `/start`,
-   `/followup`, … with autocomplete; codex as `/prompts:start`, … (codex
-   custom prompts are deprecated upstream in favor of skills but remain
-   functional). Work-repo commands override global ones of the same name,
-   mirroring the claude layout. Claude-specific frontmatter
+7. Rendered per session for pi from the claude command files
+   (`agent-files/claude/commands/*.md`) into native *prompt templates* by
+   `harness_render_prompt_templates` (`lmer_cli.container.prompt_templates`),
+   invoked as `/start`, `/followup`, … with autocomplete. Current Codex
+   releases no longer discover custom prompt files: lmer starts Codex with a
+   plain-text instruction, and a control-plane `/followup` becomes a plain-text
+   instruction to run `hooks/followup.sh`; direct terminal users type that
+   instruction themselves. Work-repo commands override global ones of the same
+   name for pi, mirroring the claude layout. Claude-specific frontmatter
    (`allowed-tools`) is dropped in conversion, and a leading-`!` execution
    line becomes an instruction to run that command — these harnesses expand
    the template as prompt text and then run the command as a tool call.
@@ -120,16 +121,30 @@ gracefully and are listed explicitly:
    mechanisms, and a style reaches neither subagents nor the built-in coding
    instructions by default — see
    [LMER-CLI.md](LMER-CLI.md#output-styles-shipping-one-and-selecting-one-are-separate).
-10. Only the claude harness fires lifecycle hooks, so every Stop-hook guard is
-    claude-only — including the **signal reminder**
-    (`hooks/signal_guard.py`, issue #289), which reminds an orchestrated
-    session that ends a turn on an unreported milestone to run `lmer-signal`.
-    **codex and pi runs have no mechanical signal reminder at all** until the
-    daemon-side watch (issue #294) lands; they keep only the prose instruction
-    in the orchestrator-ask prompt fragment (`prompts/orchestrator-ask.md`),
-    so an unsignalled milestone on those harnesses still surfaces only through
-    the orchestrator's stalled-run digest. The same holds for the run-state and
-    Slack reply guards.
+10. Claude fires the full lmer Stop/SessionEnd guard set. Codex fires one narrow
+    Stop guard: in an orchestrated interactive session, an unread `lmer-ask`
+    answer triggers Codex's native continuation immediately; otherwise an open
+    question keeps Stop waiting for the first answer. The oldest unread answer
+    wins, including one already present when Stop fires, so the agent can run
+    `lmer-ask wait` in a real new turn. The hook never reads or embeds the answer;
+    the wait command prints it through the normal terminal path. The hook is
+    installed as an image-managed policy from
+    `agent-files/codex/requirements.toml`, which pins the `hooks` feature on and
+    makes the lmer-owned hook trusted without bypassing Codex's review of user
+    or project hooks. It fails open on channel errors, a fully settled channel,
+    repeated Stop-hook turns, `LMER_NONINTERACTIVE` children, and after its
+    3540-second timeout.
+
+    The remaining Stop-hook guards are still claude-only — including the
+    **signal reminder** (`hooks/signal_guard.py`, issue #289), which reminds an
+    orchestrated session that ends a turn on an unreported milestone to run
+    `lmer-signal`. **codex and pi runs have no mechanical signal reminder at
+    all** until the daemon-side watch (issue #294) lands; they keep only the
+    prose instruction in the orchestrator-ask prompt fragment
+    (`prompts/orchestrator-ask.md`), so an unsignalled milestone on those
+    harnesses still surfaces only through the orchestrator's stalled-run
+    digest. The same holds for the run-state, SessionEnd, and Slack reply
+    guards. Pi fires no lifecycle hook guards.
 
 ## Authentication
 

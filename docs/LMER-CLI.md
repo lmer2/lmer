@@ -289,6 +289,24 @@ The following environment variables control LMER behavior:
 
 - **`LMER_NO_REPO`** - Set **by lmer inside the container** (not a host input) to `1` when the session deliberately has no repository — currently only when a Slack thread permalink is the sole `lmer chat` target and no git origin could be inferred from the current directory. The container's clone step is skipped (`/workspace` stays empty) and the chat taskdef drops its repository-specific instructions. Unset for all repository-backed sessions.
 
+#### Codex ask continuation
+
+The lmer image installs `hooks/codex_ask_guard.py` through the system-managed
+`/etc/codex/requirements.toml` and pins Codex's `hooks` feature on. In an
+interactive orchestrated session, an unread answer immediately triggers a
+native Stop-block continuation; otherwise, while any question remains open,
+the hook waits for the first answer. It always selects the oldest answer without
+a `.read.json` receipt, whether that answer arrived before or during Stop, and
+tells the agent to run `lmer-ask wait`. The hook never reads or embeds the
+answer; `lmer-ask wait` still prints it through the normal terminal path. A
+close with no other open question, channel errors, repeated Stop-hook turns and
+`LMER_NONINTERACTIVE` children fail open. The timeout also fails open, after
+holding Stop for at most 3540 seconds. The managed source is trusted without
+disabling the ordinary trust review for user or project hooks.
+
+This is the one Codex lifecycle guard lmer currently installs. The signal,
+run-state, SessionEnd and Slack guards described elsewhere remain Claude-only.
+
 ### Canonical Source Declarations (`sources.yaml`)
 
 The work repo can declare the canonical taskdef and napkin sources in a `sources.yaml` file at its root. This makes the work repo itself the source of truth for where shared taskdefs and napkin notes come from, and turns the `LMER_TASKDEF_REPO` / `LMER_NAPKIN_REPO` / `LMER_TASKDEF_REF` environment variables into explicit, mismatch-checked overrides instead of the only configuration mechanism. Resolution runs in-container (in `clone_and_exec`, after the work-repo clone and before the auxiliary clones), where `sources.yaml` is guaranteed present and fresh.
@@ -487,6 +505,18 @@ For cases where a task needs to continue after its initial run (for example, add
 ```bash
 /followup
 ```
+
+Current Codex releases no longer discover custom prompt files, so neither
+`/followup` nor the former `/prompts:followup` spelling works in Codex's own
+terminal. There, type this plain-text instruction:
+
+```text
+Run bash /Agents/global/hooks/followup.sh now and follow the instructions in its output.
+```
+
+A whole `/followup` submitted through lmer's control plane is translated to
+that instruction automatically; arguments and line endings are preserved. The
+delivery receipt still hashes the original `/followup` bytes.
 
 The `/followup` command loads `followup.txt` from the active task definition directory and renders it with the same Jinja2 context as `/start` (the filtered `LMER_*` context — see [TASKDEFS.md](./TASKDEFS.md)). If a task type does not provide a `followup.txt`, the command exits with an error pointing at where it looked. Task types opt in simply by adding the file — no code change in lmer is required.
 
@@ -771,7 +801,25 @@ Claude is launched through `lmer-supervisor`, a Python process that sits between
 
 - `POST /input` — body `{"data": "...", "append_newline": true, "sanitize": true}` writes to Claude's stdin. `sanitize` is optional (absent means false) and asserts one fact only the client knows: a human typed this into a chat composer. When it is set **and** the payload's first character is one of the harness's **first-column escapes**, the supervisor prepends `". "` before writing, so the message reaches the TUI with `.` in the first column and is read as words rather than as a command (issues #254, #272). The escapes are per-harness data (`HARNESS_FIRST_COLUMN_ESCAPES` in `lmer_cli.supervisor`), and today only claude has a set: `!` (bash escape — the reported failure), `#` (write the line to memory) and `/` (slash command), each of which hijacks ordinary prose such as `!206 was merged`, `#254 is done` or `/help me read this backtrace`. `@` is **not** in the set and must not be: claude reads it as a file reference anywhere in a message, so defusing it would break the reference. Codex and pi have recorded `/` escapes of their own (lmer renders its slash commands into their prompt directories) but no set here, because the transform also needs a prefix that is known-inert in *that* composer and only claude's has been checked — so they, and any user-defined harness, are byte-for-byte passthrough along with every unflagged call. The test is on the payload exactly as sent, with no stripping, so `" !206"` (leading space) is not in the first column and is not touched. A dot rather than a space, deliberately: a leading space could be stripped by whitespace trimming before the first-character test, while a `.` survives any such trim; the assumption left is that `.` is not itself a first-column escape, and nothing in the supervisor proves it. The escape sets are this project's **recorded observations** of each harness's input box, not an interface any harness declares — a harness update can invalidate them and no check here would notice. What is enforced at import is the property the data can carry: no recorded escape set contains the prefix character (the supervisor refuses to load if one ever does), which turns a bad edit to the table into a load-time failure rather than a silent one — a self-consistency check on this project's own record, not a reading of the harness. The failure modes divide along that line: an escape missing from a set is the pre-#254 behavior for that character, a spurious entry costs a visible `. ` on a message that did not need one, and a future build that *starts* reading a leading `.` as an escape is the one the check cannot see. The prefix is visible in the transcript (`. !206 was merged`) — accepted, not hidden. The delivery receipt (`payload_sha256`, `payload_length`) deliberately describes the **pre-transform** bytes — the sender verifies its own hash against it, and hashing the transformed text would turn every sanitized send into a false corruption alarm — so `bytes_written` runs ahead of `payload_length` for a sanitized message: two bytes for the prefix, plus the Enter byte that every `append_newline` send already writes (three total on the chat path, pinned by test). That gap is the transform and the submit, not a partial write. When `append_newline` is true the text and its Enter are delivered as **two separate writes**, in that order: a CR in the same write as the text arrives in the same read, and a harness TUI reads a large enough chunk as a *paste*, where `\r` is a newline character rather than the Enter key — so above roughly 80 bytes the message used to land in the input box unsent (issue #210). Between the two writes the supervisor waits for evidence that the harness has *read* the text — `TIOCINQ` on the session's PTY reports how many written bytes the child has not taken yet — bounded (plus the `LMER_SUBMIT_ENTER_DELAY` margin), after which the Enter is sent regardless: a wedged harness delays a message rather than swallowing it. A payload that already ends with `\r` carries its own Enter and is not doubled; a trailing `\n` is **not** a submit, so it stays in the text and the Enter goes behind it (`"text\n"` → `"text\n"` then `"\r"`). To type a newline without pressing Enter, send `append_newline: false`, which still writes exactly the bytes given, once.
 
+  The parenthetical above about rendered prompt directories now applies only to
+  pi. Codex still treats `/` as command syntax, but current releases no longer
+  discover lmer's former custom-prompt files.
+
   The Enter itself is sent **once**, with no follow-up bare-CR "nudges": a bare CR is a no-op only against an empty input box with no dialog on screen, and this endpoint is called mid-session, when a tool-permission prompt is exactly what may be up — a second CR would take that prompt's default.
+
+  Codex wraps the text write in the terminal's bracketed-paste start/end
+  sequences before that single Enter. This covers the reported #313 wind-down
+  path, which submits through this endpoint. Codex enables the protocol, so the
+  paste end is an explicit parser boundary instead of a timing prediction. A
+  payload that already contains the paste-end control sequence is left
+  unframed, preventing the remainder from escaping the bracket and being read as
+  keystrokes. Protocol bytes count in `bytes_written` but not in
+  `payload_length` or `payload_sha256`; other harnesses retain text-then-Enter
+  with no framing. On a submitted Codex message whose entire command token is
+  `/followup`, the text becomes a plain instruction to run
+  `/Agents/global/hooks/followup.sh`; arguments and line endings are preserved,
+  non-matching prose and raw `append_newline: false` keystrokes are untouched,
+  and receipts continue to cover the caller's original bytes.
 
   Since the supervisor writes to the PTY and cannot see whether the TUI registered the CR as a submit, the reply reports what it can and no more:
 
