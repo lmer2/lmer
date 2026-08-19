@@ -629,6 +629,118 @@ def test_take_pending_drains(platform_root):
     assert assistant.status().pending == 0
 
 
+# --- the nudge mark lives beside the spool (issue #317) ------------------------
+#
+# One field, and everything about it is a consequence of it sharing a file and a
+# lock with the digests it describes: it survives a digest arriving, it does not
+# survive the drain, and a hand-edited file cannot make it a number.
+
+def test_the_nudge_mark_starts_absent_and_is_written_by_mark_nudged(platform_root):
+    assert assistant.read_state().nudged_at is None
+
+    stamped = assistant.mark_nudged()
+
+    assert stamped
+    assert assistant.read_state().nudged_at == stamped
+    assert assistant.status().nudged_at == stamped, (
+        "the session that was typed into has to be able to attribute the line"
+    )
+
+
+def test_the_nudge_mark_survives_a_digest_arriving(platform_root):
+    """A digest joining an accumulation does not re-open its nudge: the mark is
+    per accumulation, and the accumulation ends at the drain, not at each note."""
+    assistant.notify("first")
+    stamped = assistant.mark_nudged()
+
+    assistant.notify("second")
+
+    assert assistant.read_state().nudged_at == stamped
+    assert assistant.status().pending == 2
+
+
+def test_taking_the_spool_clears_the_nudge_mark(platform_root):
+    assistant.notify("first")
+    assistant.mark_nudged()
+
+    assistant.take_pending()
+
+    assert assistant.read_state().nudged_at is None, (
+        "whatever arrives after a drain is a new accumulation and is owed its "
+        "own nudge"
+    )
+
+
+def test_an_empty_take_clears_the_mark_too(platform_root):
+    """The spool is empty either way, and a mark surviving a take that raced the
+    last digest out would suppress the next accumulation's first nudge."""
+    assistant.mark_nudged()
+
+    assert assistant.take_pending() == []
+    assert assistant.read_state().nudged_at is None
+
+
+def test_a_nudge_mark_of_the_wrong_type_reads_as_absent(platform_root):
+    """One value, not the assistant — the tolerance every field in this file has
+    (:meth:`assistant.AssistantState.from_dict`)."""
+    store.write_json(assistant.state_path(), {"nudged_at": 1755590000})
+
+    assert assistant.read_state().nudged_at is None
+
+
+def test_the_accumulation_is_stamped_on_the_transition_and_only_then(platform_root):
+    """The age the nudge reports comes from this stamp, not from the notes: the
+    spool is bounded, so on a loud fleet the oldest *retained* note keeps getting
+    younger and an age read off the notes drifts below any interval and stays
+    there (review of !234)."""
+    assistant.notify("first")
+    started = assistant.read_state().pending_since
+    assert started
+
+    assistant.notify("second")
+
+    assert assistant.read_state().pending_since == started, (
+        "a digest joining an accumulation does not restart the wait it joins"
+    )
+
+
+def test_the_drain_clears_the_accumulation_stamp_and_the_next_one_is_its_own(
+    platform_root
+):
+    assistant.notify("first")
+    first = assistant.read_state()
+    assert first.pending_seq == 1
+
+    assistant.take_pending()
+    assert assistant.read_state().pending_since is None
+
+    assistant.notify("second")
+    second = assistant.read_state()
+    assert second.pending_since is not None
+    assert second.pending_seq == 2, (
+        "the sequence is what tells two accumulations apart when their stamps "
+        "land in the same second"
+    )
+
+
+def test_the_accumulation_sequence_tolerates_a_hand_edited_file(platform_root):
+    store.write_json(assistant.state_path(), {"pending_seq": "many"})
+
+    assert assistant.read_state().pending_seq == 0
+
+
+def test_the_nudge_mark_survives_a_stop_and_a_rotation(platform_root):
+    """``stop`` and ``start`` edit state with ``replace``, so a field they do not
+    name is carried rather than rebuilt — the property the standing orders rely
+    on, pinned here for the mark as well."""
+    assistant.notify("first")
+    stamped = assistant.mark_nudged()
+
+    assistant.stop(reason="operator")
+
+    assert assistant.read_state().nudged_at == stamped
+
+
 @pytest.mark.parametrize("note", ["", "   ", None, 42, b"bytes"])
 def test_notify_rejects_a_note_that_is_not_text(platform_root, note):
     with pytest.raises(assistant.AssistantError, match="note must be non-empty"):
@@ -1939,17 +2051,24 @@ def test_the_taskdef_corrects_the_confabulation_that_something_pushes(platform_r
     A running incarnation told the operator "the orchestrator already pushes me
     digests" and then sat idle while a finished review's digest waited in the
     spool until it was evicted. The old wording ("hands you a short digest")
-    invited exactly that reading, so the correction has to be explicit: nothing
-    arrives, and being idle means being deaf.
+    invited exactly that reading, so the correction has to be explicit: no digest
+    arrives, and until something wakes it an idle incarnation is deaf.
+
+    Since #317 the correction is narrower by exactly one thing, and the narrowing
+    is the point: a *reminder* is typed into the session, and no digest is. The
+    two claims this used to make about messages in general ("no message arrives",
+    "nothing interrupts you") would now be false, and a taskdef stating a false
+    absolute is how the next incarnation decides the line it just received must
+    have been the operator.
     """
     text = orchestrate_prose()
     assert "does not push digests to you" in text, (
-        "the taskdef never states plainly that nothing pushes"
+        "the taskdef never states plainly that no digest pushes"
     )
     assert "spool" in text
     for fact in (
-        "No message arrives in this session",
-        "Nothing interrupts you",
+        "No digest arrives in this session, ever",
+        "nothing about a digest interrupts you",
         "you are deaf",
     ):
         assert fact in text, f"the consequence {fact!r} is left to be inferred"

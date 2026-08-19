@@ -245,6 +245,31 @@ off this tick's fleet read. Two things keep it from being the firehose everythin
 above avoids: one digest names every stale run, and a run it named waits another
 window before it is named again.
 
+A fifth job on the same tick: saying a spool has gone unread (issue #317)
+-------------------------------------------------------------------------
+Everything above ends at :func:`lmer_platform.assistant.notify`, which writes to a
+file and pushes nothing. What reads that file is a watch the assistant arms on
+itself — and a watch stops: a skipped re-arm, a stale edge detector, a harness
+with no monitor primitive at all. On 2026-08-19 that left ten digests, live
+questions among them, sitting for seventeen minutes while the operator noticed
+first.
+
+So :meth:`Detector.nudge_once` types **one sentence** into the assistant's own
+session through :func:`lmer_platform.session_io.send_input` — the path a wind-down
+already uses — when :mod:`lmer_platform.nudge` says the spool has waited past the
+configured interval beside a quiet assistant. That module owns every boundary and
+the wording; this one owns the send, the mark and the event. The operator-facing
+account of both is ``docs/PLATFORM-QUICKSTART.md``, "Digest nudges".
+
+Three things keep it from being the push this module spent its first four
+sections arguing against. **No digest travels**: what is typed is "N are waiting,
+take them". **It is rate-limited by a window, not a count**, anchored in
+:attr:`lmer_platform.assistant.AssistantState.nudged_at` and bounded in memory
+when that write fails (:attr:`Detector._nudged`), so a nudge whose submit never
+registered is retried rather than lost. And **it cannot fire at a working
+assistant**, which is also why there is no separate "is it draining" check:
+draining is work, and work is not idle.
+
 Failure is absorbed, and a persistent one goes quiet
 ----------------------------------------------------
 A detection failure must never take the daemon down: the fleet view is what an
@@ -271,20 +296,22 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from ask_channel import protocol as ask_protocol
 from work_repo import run_state
 
-from . import ask, assistant, checkin, registry, transcripts
+from . import ask, assistant, checkin, nudge, registry, transcripts
 from .api import build_state
 from . import config as config_module
-from .config import PlatformConfig, checkin_settings
+from .config import PlatformConfig, checkin_settings, nudge_settings
+from .session_io import SessionIOError, send_input, session_output_state
 from .inventory import _TERMINAL_STATUSES
 from .spawn import ports_file_for
 from .store import (
     StoreError,
+    age_seconds,
     clamp_text,
     append_event,
     mutating,
@@ -300,6 +327,7 @@ logger = logging.getLogger("lmer_platform.detect")
 
 __all__ = [
     "DETECT_INTERVAL_SECONDS", "MATERIAL_STATES", "QUESTION_ANSWERED_KIND",
+    "ASSISTANT_NUDGED",
     "QUESTION_KINDS", "SESSION_ENDED_UNWATCHED",
     "SESSION_SIGNALLED", "SIGNAL_DIGEST_KIND", "SIGNAL_MARKS_FILE",
     "Signal", "SessionSignal", "Detector", "sweep_finished_sessions",
@@ -385,6 +413,16 @@ QUESTION_KINDS = ("live_question", "question")
 #: daemon restart, which is precisely when a session is signalling into a channel
 #: nobody is reading yet.
 SIGNAL_MARKS_FILE = "signals.json"
+
+#: Longest send-error text an :data:`ASSISTANT_NUDGED` event carries. Bounded like
+#: every other composed string in this package.
+MAX_SEND_ERROR_CHARS = 500
+
+#: What the platform records when it has typed a nudge into the assistant's
+#: session (issue #317). An event and not only a log line because the platform
+#: wrote into a session unasked, and "who typed that" must stay answerable from
+#: the same history that records a wind-down.
+ASSISTANT_NUDGED = "assistant_nudged"
 
 #: Run states whose *arrival* is material even though nothing needs a human.
 #: ``complete`` only: §8.3's "a task finished", read off the state axis because a
@@ -1062,6 +1100,7 @@ class Detector:
         interval: float = DETECT_INTERVAL_SECONDS,
         state_reader=None,
         notifier=None,
+        sender=None,
         sleep=None,
     ) -> None:
         self.config = config
@@ -1084,10 +1123,16 @@ class Detector:
         #: #254), counted apart from ``notified`` because this is the one digest
         #: class raised by a condition *going away*.
         self.answered = 0
+        #: Nudges typed into the assistant's session (issue #317). Counted
+        #: apart because it is the only stage that writes *into* a session.
+        self.nudged = 0
         self._stop = threading.Event()
         self._sleep = sleep or self._stop.wait
         self._read_state = state_reader or build_state
         self._notify = notifier or assistant.notify
+        #: How a nudge reaches the session. A parameter because the real one is
+        #: an HTTP call into a container.
+        self._send = sender or send_input
         #: The previous tick's conditions. ``None`` means no baseline has been
         #: established, which is the one state in which nothing is notified.
         self._seen: Optional[dict] = None
@@ -1096,6 +1141,12 @@ class Detector:
         #: ``{run ref: announced_at}`` for digests spooled but not recorded on
         #: disk; cleared by the first successful write (see :meth:`_check_ins`).
         self._announced: dict = {}
+        #: ``(pending_seq, stamp)`` for the nudge this process last typed —
+        #: ``_announced``' shape, and the bound when the durable mark cannot be
+        #: written (issue #317's review, module docstring). Keyed on the sequence
+        #: rather than the accumulation's stamp, which two accumulations a second
+        #: apart share. Per process: a restart re-nudges once.
+        self._nudged: Optional[tuple] = None
         self._warned_unattributed = False
 
     def stop(self) -> None:
@@ -1127,7 +1178,32 @@ class Detector:
             "   — and it picks up milestones a session announced itself with "
             "lmer-signal (an MR pushed, a review finished), which reach the "
             "assistant and not your attention list.\n"
-            f"   — {self._checkin_notice()}"
+            f"   — {self._checkin_notice()}\n"
+            f"   — {self._nudge_notice()}"
+        )
+
+    def _nudge_notice(self) -> str:
+        """The nudge half of :attr:`notice`, in one sentence (issue #317).
+
+        Worth a line for :meth:`_checkin_notice`'s reason, doubled: this is the
+        one thing here that types into a session rather than spooling for it, and
+        a feature that is switched off looks exactly like one that is broken from
+        the chat window it would have written to.
+        """
+        settings = nudge_settings()
+        after = settings["after_seconds"].value
+        if not after:
+            return (
+                "digest nudges are OFF on this host (nudge_after_seconds is 0): "
+                "an unretrieved spool waits for the assistant's own watch and "
+                "nothing else. POST /api/assistant/config to set an interval."
+            )
+        threshold = settings["pending_threshold"].value
+        return (
+            f"digest nudge ON: if {threshold} or more digests sit unretrieved "
+            f"for {after // 60 or 1}m beside an idle assistant, it types one "
+            "reminder into that session — the backstop for a watch that stopped "
+            "waking it. The digests themselves are never pushed."
         )
 
     def _checkin_notice(self) -> str:
@@ -1186,6 +1262,14 @@ class Detector:
         a mirror the sweep cannot read must not cost the detection that follows it,
         and the counters keep the two apart.
 
+        The nudge is the last stage and is likewise absent from the return value:
+        it is not a condition at all but a fact about the spool. It runs on **all
+        three** exits (:meth:`_nudge_stage`) — the ordinary one, the
+        baseline-establishing one, and the absorbed-scan one — because it depends
+        on none of what they have or lack: a first tick and an unreadable mirror
+        are both states in which a spool can already be sitting unread, and the
+        second is the host least able to notice.
+
         Signal ingestion is a third stage on the same terms, and it is *not* in the
         return value: what comes back is the diff's own fresh conditions, because
         that is what the tests of the diff assert on and a milestone is not one of
@@ -1211,6 +1295,9 @@ class Detector:
             payload = self._read_state(self.config)
         except Exception as exc:  # noqa: BLE001 - the daemon serves regardless
             self._absorb("scan", exc)
+            # The nudge stage depends on nothing this read provides, and a host
+            # whose mirror will not read is where a spool sits unnoticed.
+            self._nudge_stage()
             return []
         self._clear("scan")
         current = _signals(payload)
@@ -1235,6 +1322,10 @@ class Detector:
                 "records what is already true and notifies nothing; standing "
                 "state is what GET /api/state answers", len(current),
             )
+            # The nudge stage still runs: the baseline rule is about not
+            # re-announcing conditions, and a spool inherited across a restart is
+            # the one that has waited longest.
+            self._nudge_stage()
             return []
 
         fresh = [signal for key, signal in current.items() if key not in baseline]
@@ -1249,7 +1340,151 @@ class Detector:
         # tick), and what it leaves is exactly the case this order is for.
         for signal in self._answered_questions(baseline, current, payload):
             self._deliver_answered(signal)
+
+        # Last on purpose, so it counts what this tick spooled.
+        self._nudge_stage()
         return fresh
+
+    def _nudge_stage(self) -> None:
+        """:meth:`nudge_once` with its failures absorbed, as a tick stage.
+
+        Called from all three of :meth:`tick_once`'s exits, because a spool can
+        already be waiting in each — a restart carries one in, an unreadable
+        mirror hides one.
+        """
+        try:
+            self.nudge_once()
+        except Exception as exc:  # noqa: BLE001 - one reminder, not the tick
+            self._absorb("nudge", exc)
+
+    def nudge_once(self) -> Optional[nudge.Nudge]:
+        """Type one reminder into the assistant's session if its spool is owed one.
+
+        Returns the nudge that was delivered, or ``None`` for both "nothing was
+        due" and "it could not be sent" — the caller does the same with either and
+        the log says which.
+
+        Send, then mark, then record, as :func:`lmer_platform.lifecycle.wind_down`
+        does: a mark written first would silence the retry a refused send earns.
+        What decides retry-versus-bound is whether the bytes arrived, not whether
+        the call raised (see the ``except`` branch), and a durable mark that fails
+        to write costs nothing while this process lives — :attr:`_nudged` is the
+        bound — and one early repeat across a restart.
+        """
+        settings = nudge_settings()
+        after = settings["after_seconds"].value
+        if not after:
+            return None
+        status = assistant.status()
+        if not status.running or not status.session_id:
+            return None
+        state = self._nudge_state()
+        threshold = settings["pending_threshold"].value
+        # The cheap gates first, with both container-sourced readings omitted —
+        # ``None`` proceeds for each — so a young spool costs no HTTP call. The
+        # second call is the real decision.
+        if nudge.due(
+            state,
+            running=True,
+            idle_seconds=None,
+            after_seconds=after,
+            pending_threshold=threshold,
+        ) is None:
+            return None
+        reading = session_output_state(status.session_id) or {}
+        due = nudge.due(
+            state,
+            running=True,
+            idle_seconds=reading.get("idle_seconds"),
+            produced_output=reading.get("produced"),
+            after_seconds=after,
+            pending_threshold=threshold,
+        )
+        if due is None:
+            # Working, or not yet drawing bytes. Unmarked, so the tick after
+            # that changes is the one that tells it.
+            return None
+        text = nudge.prompt(due)
+        sent_error: Optional[str] = None
+        try:
+            # append_newline, or the reminder sits unsent in the input box.
+            self._send(status.session_id, text, append_newline=True)
+        except SessionIOError as exc:
+            # Absorbed: an unreachable control plane must not end the tick. Only
+            # the raiser knows whether the bytes were typed, and the two cases
+            # need opposite recoveries — retry a refusal, bound a delivered one.
+            # A transport failure cannot be told apart and counts as retryable,
+            # since a duplicate reminder beats a lost window. ``getattr``: this
+            # catches the base class, and only ``ControlPlaneError`` has the flag.
+            self._absorb("nudge", exc)
+            if not getattr(exc, "delivered", False):
+                return None
+            sent_error = _clamp(f"{type(exc).__name__}: {exc}", MAX_SEND_ERROR_CHARS)
+        else:
+            self._clear("nudge")
+        # From here on one condition: the bytes reached the session, however the
+        # call ended.
+        self.nudged += 1
+        # Before the durable write, which can fail: this is the bound that does
+        # not need a disk. Tagged with its accumulation so it cannot outlive it.
+        self._nudged = (state.pending_seq, utc_now_iso())
+        marked = assistant.mark_nudged()
+        append_event(
+            ASSISTANT_NUDGED,
+            note=status.session_id,
+            data={
+                "session": status.session_id,
+                "pending": due.count,
+                "accumulation": state.pending_seq,
+                "waited_seconds": round(due.waited_seconds, 1),
+                # ``None`` is a value, not a missing field: idleness was not
+                # measurable, which is what explains a mid-turn arrival.
+                "idle_seconds": due.idle,
+                "repeat": due.repeat,
+                "after_seconds": after,
+                "marked": bool(marked),
+                # Non-null only when the send raised after delivering. The key
+                # is always present, like ``idle_seconds`` above.
+                "send_error": sent_error,
+            },
+        )
+        logger.info(
+            "platform_assistant_nudged session=%s pending=%d waited=%.0fs "
+            "idle=%s repeat=%s marked=%s send_error=%s — the spool was "
+            "unretrieved past the %ds threshold; the digests themselves still "
+            "travel only through POST /api/assistant/pending",
+            status.session_id, due.count, due.waited_seconds, due.idle,
+            due.repeat, bool(marked), sent_error, after,
+        )
+        return due
+
+    def _nudge_state(self):
+        """The assistant state the nudge decision reads, with this process's own
+        nudge stamp folded in when the durable one is missing or older.
+
+        :meth:`_with_pending_announcements`' shape: an in-memory stamp is the same
+        fact as a stored one, the stored one wins when at least as new, and
+        folding it here keeps :mod:`lmer_platform.nudge` a function of one state.
+
+        Without it, a send that succeeds while ``assistant.json`` cannot be
+        written repeats every tick — and that same outage stops the assistant
+        draining the spool, so the repeats never end.
+        """
+        state = assistant.read_state()
+        if self._nudged is None:
+            return state
+        seq, stamp = self._nudged
+        if seq != state.pending_seq:
+            # A different accumulation: the drain ended what this remembered.
+            # Dropped, not ignored, so a cycling spool grows no dead windows.
+            self._nudged = None
+            return state
+        stored = state.nudged_at
+        # Usability, not text: a corrupt stamp sorts above an ISO one, and
+        # ``_window`` discards it anyway — so a lexical compare lost both bounds.
+        if stored is None or age_seconds(stored) is None or stored < stamp:
+            return replace(state, nudged_at=stamp)
+        return state
 
     def _answered_questions(
         self, baseline: dict, current: dict, payload: object

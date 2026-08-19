@@ -1019,6 +1019,28 @@ def test_a_mismatched_input_receipt_is_loud(platform_root, control_plane):
     serialized = json.dumps(events[-1])
     assert hashlib.sha256(b"hi!").hexdigest() not in serialized
     assert "not-what-was-sent" not in serialized
+    assert caught.value.delivered is True, (
+        "an automated caller needs the same fact the message spells out for a "
+        "human, in a form it can branch on: repeating this payload types it twice"
+    )
+
+
+def test_a_refused_input_is_not_marked_delivered(platform_root, control_plane):
+    """The other half of the same flag, and the reason it defaults to False: a
+    refusal typed nothing, so the caller's correct recovery is to retry."""
+    control_plane.answer("/input", 503, {"detail": "busy"})
+    plant_session("s-1", port=control_plane.port)
+
+    with pytest.raises(session_io.ControlPlaneError) as caught:
+        session_io.send_input("s-1", "hi!", append_newline=True)
+    assert "refused the input" in str(caught.value)
+    assert caught.value.delivered is False
+
+
+def test_control_plane_error_defaults_to_not_delivered():
+    """Every other raise site says nothing about delivery, and the safe reading —
+    nothing arrived — is what saying nothing has to mean."""
+    assert session_io.ControlPlaneError("anything").delivered is False
 
 
 # --- resizing (best-effort) ------------------------------------------------

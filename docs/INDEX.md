@@ -14,6 +14,7 @@ assistant) on a host:
   upgrade + timeouts included)
 - `LMER_PLATFORM_CONTAINER_URL` and the surviving-assistant restart gotcha
 - A tour of the fleet view, spawning, answering, wind down vs exit, uber lmer
+- Digest nudges: when the daemon reminds uber lmer that its spool is unread
 
 **Best for**: Getting the platform running and usable in a few minutes.
 

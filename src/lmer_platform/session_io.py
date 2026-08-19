@@ -204,6 +204,7 @@ __all__ = [
     "require_session", "session_is_live", "read_log",
     "read_log_at", "follow_log", "control_endpoint", "send_input", "apply_resize",
     "probe_health", "read_control_output", "session_activity",
+    "session_output_state",
     "control_plane_answers", "ACTIVITY_TIMEOUT_SECONDS",
 ]
 
@@ -311,9 +312,27 @@ class ControlPlaneError(SessionIOError):
 
     A gateway failure, not a client error: the request was well-formed and the
     platform is the one that could not complete it.
+
+    ``delivered`` is the one thing a caller cannot work out from the message, and
+    it decides what the caller may do next: **whether the payload reached the
+    session before this was raised.** :func:`send_input` raises for two unrelated
+    reasons and they need opposite recoveries — a refusal means nothing was typed
+    and retrying is correct, while a receipt mismatch means "the payload WAS typed
+    into the session" and retrying types it twice. That distinction lived only in
+    two prose messages until issue #317's second review round, where a caller that
+    could not read it retyped a reminder into a live session on every tick of a
+    30-second loop. It defaults to ``False``, so the safe reading — nothing
+    arrived, the operation can be retried — is what a raise site gets by saying
+    nothing.
     """
 
     status = 502
+
+    def __init__(self, *args, delivered: bool = False) -> None:
+        super().__init__(*args)
+        #: See the class docstring: read by callers that must not repeat a
+        #: payload the session already has.
+        self.delivered = delivered
 
 
 @dataclass(frozen=True)
@@ -999,12 +1018,15 @@ def send_input(
         # Loud AND accurate: the 200 means the bytes were already typed into
         # the session, so this must not read as a refusal — the taught
         # recovery for "not sent" is retyping, which would deliver it twice.
+        # ``delivered`` carries the same fact in a form a caller can branch on;
+        # the sentence below is for a human.
         raise ControlPlaneError(
             f"session {session_id} received the input, but its control plane "
             f"acknowledged different bytes than were sent (sent sha256 "
             f"{sent_sha256}, control plane read {receipt_sha256}) — the "
             "payload WAS typed into the session; check the terminal view "
-            "before retyping anything"
+            "before retyping anything",
+            delivered=True,
         )
     return reply.payload
 
@@ -1248,7 +1270,15 @@ def session_activity(session_id: str) -> Optional[dict]:
     tooltip and the loggable form of a measurement that ``idle_seconds`` *is*: a
     record with the timestamp and no number would have nothing to render.
     """
-    payload = _quiet_health(session_id)
+    return _activity_of(_quiet_health(session_id))
+
+
+def _activity_of(payload: Optional[dict]) -> Optional[dict]:
+    """:func:`session_activity`'s rules, applied to a health payload already read.
+
+    Split out so :func:`session_output_state` can answer a second question about
+    the same payload without a second call into the container.
+    """
     if payload is None:
         return None
     idle = payload.get("idle_seconds")
@@ -1258,6 +1288,45 @@ def session_activity(session_id: str) -> Optional[dict]:
     return {
         "last_output_at": last_output_at if isinstance(last_output_at, str) else None,
         "idle_seconds": idle,
+    }
+
+
+def session_output_state(session_id: str) -> Optional[dict]:
+    """``{"idle_seconds": …, "produced": …}`` for a session, or ``None``.
+
+    :func:`session_activity` plus the one fact it deliberately drops, in the same
+    request: **has this session ever produced output at all.** ``None`` for the
+    whole record means the container did not answer — the same silence
+    :func:`session_activity` reports, and for the same reason.
+
+    Why the second fact needs a home (issue #317's review). ``idle_seconds`` is
+    ``None`` in three situations that
+    :func:`session_activity` collapses into one, because a fleet row renders them
+    identically: an image that predates the activity fields, a plane that did not
+    answer, and **a session whose harness has not drawn a byte yet** — the last of
+    which the supervisor reports as an explicit null
+    (:class:`lmer_cli.supervisor.OutputBuffer`). A caller about to *type into* the
+    session cannot treat that third case as unknowable: there is no TUI reading
+    yet, so the bytes go nowhere. The distinction survives at the source, in a
+    field the same payload already carries — ``cursor``, the offset just past the
+    last byte ever written — so it is read here rather than inferred from timing.
+
+    ``produced`` is therefore three-valued on purpose: ``True`` (bytes have been
+    drawn), ``False`` (the plane answered and none ever have), ``None`` (the plane
+    answered but said nothing this can read — an older build with no ``cursor``).
+    Only ``False`` is a fact a caller may act on; ``None`` keeps whatever the
+    caller does with "not knowable".
+    """
+    payload = _quiet_health(session_id)
+    if payload is None:
+        return None
+    cursor = payload.get("cursor")
+    produced = None
+    if isinstance(cursor, int) and not isinstance(cursor, bool) and cursor >= 0:
+        produced = cursor > 0
+    return {
+        "idle_seconds": (_activity_of(payload) or {}).get("idle_seconds"),
+        "produced": produced,
     }
 
 
