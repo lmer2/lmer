@@ -121,8 +121,7 @@ In an orchestrated session (`LMER_ASK_DIR` set), it blocks a stop once when
 the turn shows an unreported milestone: a successful milestone-shaped command
 in the transcript (the `_MILESTONE_PATTERNS` list — `gate-push`,
 `gitlab-review --create-mr`/`--review-file`/`--reply-thread`,
-`github-review --review-file`, the `gitlab-review-post-review.sh` /
-`github-review-post-review.sh` wrappers, `work state set --status=complete`)
+`github-review --review-file`, `work state set --status=complete`)
 or a run record reporting itself complete, with no signal-equivalent act after
 it (a successful `lmer-signal`; a newer signal file in the channel dir, but
 only when the transcript holds no signal of its own — ordered evidence wins
@@ -134,7 +133,9 @@ review command succeeds they call `lmer-signal` directly. Signalling is
 best-effort: no orchestrator channel or no installed signal command warns but
 does not turn an already-posted review into a failed wrapper that a caller might
 retry. A failed review exits with the review command's status and never signals
-success.
+success. The transcript guard deliberately does not infer wrapper execution;
+parsing command text cannot establish the post succeeded, and doing so produced
+a redundant second-review reminder after the wrapper had already signalled.
 
 Fires once per distinct milestone, capped at 3 per session via a `/tmp`
 marker keyed on `LMER_SESSION_ID` and written atomically (a torn marker reads

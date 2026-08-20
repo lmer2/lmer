@@ -48,14 +48,15 @@ be worse than the late digest it prevents.
 **What this hook cannot see, so silence from it means "nothing to report" and
 never "nothing happened".** Milestone evidence comes from Bash ``tool_use``
 blocks and from ``work resume --json``. A milestone reached any other way is
-invisible: a slash command (``/gitlab-review-post-review`` and friends run
-their ``!``-prefixed line themselves, producing no Bash tool_use block), a
-subagent's own tool calls, an MCP tool, or a push made outside the gate
-wrappers. The pattern list below is likewise a list of *known* spellings, not a
-classifier — see the notes on it. Every one of those gaps ends in silence
-rather than a false nudge, which is the direction chosen throughout, but it
-means this hook is a backstop for the common shapes and not a proof that a
-turn reported everything it should.
+invisible: a slash command, a subagent's own tool calls, an MCP tool, or a push
+made outside the gate wrappers. Review-post wrappers deliberately belong to
+that list now: each wrapper reports its own successful post with
+``lmer-signal``, so predicting from shell text whether it ran successfully is a
+second, weaker owner of the same milestone (and one that misread brace-heavy
+commands). The pattern list below is a list of *direct CLI* spellings, not a
+classifier. Every gap ends in silence rather than a false nudge, which is the
+direction chosen throughout, but it means this hook is a backstop for the
+common shapes and not a proof that a turn reported everything it should.
 
 Claude-only, because only the claude harness fires lifecycle hooks; codex and
 pi runs keep the prose instruction until the daemon-side watch (issue #294)
@@ -121,22 +122,6 @@ _BOUNDARY = r"(?:^|[\s;&|()/])"
 _TRAIL = r"(?:[\s;&|)]|$)"
 _FLAG_TRAIL = r"(?:[\s;&|)=]|$)"
 
-# Leading boundary for a path-evidence row: the script must count as a command,
-# never as an argument to one (`cat`, `ls -l`, `git log -- <p>`), which is all
-# `_BOUNDARY` gives. Matches a shell simple-command prefix — assignments, then
-# wrappers and option tokens; assignments matter because the wrappers take no
-# arguments and read three exported variables. Braces are excluded everywhere:
-# `{` anchors `{ bash …; }` and must not anchor a `${VAR}` in an argument path.
-# Limits: an option token is accepted blindly (`bash -n <w>` reads as a run),
-# and no pattern over command text decides read-vs-run.
-_EXEC_WORDS = r"sudo|command|bash|sh|zsh|exec|source|env|nohup|time|timeout|then|do|else"
-_EXEC_POSITION = (
-    r"(?:^|[\n;&|(){])\s*"
-    r"(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|(){}]*|-{1,2}[^\s;&|(){}]*|\d+|"
-    + _EXEC_WORDS + r")\s+)*"
-    r"(?:[^\s;&|(){}]*/)?"
-)
-
 # Quoted spans, blanked out before any pattern search: a command that merely
 # *talks about* a milestone (`git commit -m "… gate-push …"`,
 # `echo "then run lmer-signal"`) must not read as one. Blanked rather than
@@ -164,7 +149,7 @@ _CONTINUATION_RE = re.compile(r"\\\n\s*")
 #
 # Spellings here are pinned against the real CLIs by
 # tests/test_signal_guard.py::TestPatternsMatchRealCommands, which reads the
-# argparse parsers and the hooks/ directory: the first version of this list
+# argparse parsers and bin/ directory: the first version of this list
 # invented a `--post-review` flag that exists on neither reviewer CLI, and only
 # the fixtures agreed with it. A flag renamed upstream now fails CI here.
 #
@@ -175,18 +160,14 @@ _MILESTONE_PATTERNS = (
     ("gitlab-review --create-mr",
      re.compile(_BOUNDARY + r"gitlab-review\s[^\n]*--create-mr" + _FLAG_TRAIL)),
     # Posting a review is `--review-file` on both reviewer CLIs; there is no
-    # --post-review flag. The taskdef's mandated path is the wrapper script
-    # below, which is why both spellings are listed.
+    # --post-review flag. Wrapper scripts are absent on purpose: they signal
+    # their own successful post and command-text inference cannot improve on it.
     ("gitlab-review --review-file",
      re.compile(_BOUNDARY + r"gitlab-review\s[^\n]*--review-file" + _FLAG_TRAIL)),
     ("gitlab-review --reply-thread",
      re.compile(_BOUNDARY + r"gitlab-review\s[^\n]*--reply-thread" + _FLAG_TRAIL)),
     ("github-review --review-file",
      re.compile(_BOUNDARY + r"github-review\s[^\n]*--review-file" + _FLAG_TRAIL)),
-    ("gitlab-review-post-review.sh",
-     re.compile(_EXEC_POSITION + r"gitlab-review-post-review\.sh" + _TRAIL)),
-    ("github-review-post-review.sh",
-     re.compile(_EXEC_POSITION + r"github-review-post-review\.sh" + _TRAIL)),
     ("work state set --status=complete",
      re.compile(_BOUNDARY + r"work\s+state\s+set\s[^\n]*--status(?:=|\s+)complete" + _TRAIL)),
 )

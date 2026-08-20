@@ -3,7 +3,6 @@
 
 ## Unreleased
 
-
 ## 0.7.0
 ### Added
 - Resolving a review thread is the reviewer's verified sign-off, so `--resolve-thread` now refuses in non-review sessions; the policy is in rules/git.md (#128)

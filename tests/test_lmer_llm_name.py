@@ -153,6 +153,18 @@ class TestModelReportedToThePlatform:
             "model": "claude-opus-5"
         }
 
+    def test_the_resolved_harness_is_reported_with_the_model(
+        self, monkeypatch, tmp_path
+    ):
+        target = tmp_path / "facts.json"
+        monkeypatch.setenv("LMER_PLATFORM_PORTS_FILE", str(target))
+
+        _record_session_model("gpt-5.6-sol", "codex")
+
+        assert json.loads(target.read_text(encoding="utf-8")) == {
+            "model": "gpt-5.6-sol", "harness": "codex",
+        }
+
     def test_no_model_writes_no_fact(self, monkeypatch, tmp_path):
         """Unset means the harness ran its own default, and recording that as a
         fact would put a name on a row that never chose one."""
@@ -208,7 +220,7 @@ class TestModelReportedToThePlatform:
         one) and it is the only thing that makes RunView.model answer."""
         source = CLI_PY.read_text()
         applied = source.index("_apply_model_selection(ns.model")
-        reported = source.index("_record_session_model(session_model)")
+        reported = source.index("_record_session_model(session_model, harness.name)")
 
         assert applied < reported, (
             "the model is reported before it is resolved, so a --model flag "

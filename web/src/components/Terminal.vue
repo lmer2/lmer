@@ -99,6 +99,12 @@ const props = defineProps({
   // reason. Liveness is not a prop either — the log route answers it freshly, and
   // a poll-old boolean is not what should decide whether input is offered.
   sessionId: { type: String, required: true },
+  // The TUI that draws the PTY. Codex and Pi both paint permanent chrome on
+  // their last terminal row; when the PTY is told it owns every row xterm can
+  // render, that chrome sits on the viewport's fractional bottom edge and its
+  // lower half is clipped. The local emulator still uses the whole box — only
+  // the reported PTY height reserves the renderer row below.
+  harness: { type: String, default: null },
 })
 
 // How much scrollback the first attach asks for, and what "earlier output" steps
@@ -187,6 +193,12 @@ function storedResizeOptIn() {
 const MIN_COLS = 20
 const MIN_ROWS = 5
 const MAX_DIMENSION = 1000
+
+// Measured TUI behavior, not a generic terminal rule: Claude's footer renders
+// fully at the fitted height, while Codex and Pi need their last drawn row one
+// row above xterm's bottom edge. Unknown/user harnesses keep the historical
+// geometry rather than inheriting a workaround that was never observed there.
+const PTY_FOOTER_GUARD_HARNESSES = new Set(['codex', 'pi'])
 
 // What the key buttons send. Named here because a control byte written into the
 // markup is invisible in a diff and unsearchable in review.
@@ -561,6 +573,13 @@ function plausibleGeometry(dims) {
     && clampDimension(dims.rows, MIN_ROWS) > 0
 }
 
+function reportedRows(rows) {
+  const fitted = clampDimension(rows, MIN_ROWS)
+  if (!fitted) return 0
+  const reserved = PTY_FOOTER_GUARD_HARNESSES.has(props.harness) ? 1 : 0
+  return Math.max(MIN_ROWS, fitted - reserved)
+}
+
 function reportGeometry() {
   // The single gate on writing to a shared PTY. Nothing else in this component
   // sends a resize frame, so opting out here is the whole guarantee that watching
@@ -568,7 +587,10 @@ function reportGeometry() {
   if (!resizeOptIn.value) return
   if (!term || !resizeSupported.value) return
   if (!socket || socket.readyState !== WebSocket.OPEN) return
-  const rows = clampDimension(term.rows, MIN_ROWS)
+  // Keep xterm at ``term.rows``: shrinking the emulator would merely trade a
+  // clipped footer for unused pixels. The PTY lays itself out one row shorter
+  // for the two TUIs whose bottom chrome needs the renderer margin.
+  const rows = reportedRows(term.rows)
   const cols = clampDimension(term.cols, MIN_COLS)
   if (!rows || !cols) return
   // A geometry this client already sent is not worth writing again: the pass a

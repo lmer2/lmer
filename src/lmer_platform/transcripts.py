@@ -848,6 +848,10 @@ class Source:
     path: Path
     session: str
     harness: str = "claude"
+    # Record-shape vocabulary, separate from the cosmetic harness label. A
+    # canonical converter can declare ``harness=opencode`` while its records
+    # remain the ``lmer`` vocabulary used for tier selection.
+    vocabulary: Optional[str] = None
     messages: int = 0
     capped: bool = False
 
@@ -861,6 +865,7 @@ class Source:
             "id": self.id,
             "session": self.session,
             "harness": self.harness,
+            "vocabulary": self.vocabulary,
             "messages": self.messages,
             "capped": self.capped,
         }
@@ -2195,13 +2200,38 @@ def _head_record(path: Path, *, tail_bytes: int) -> Optional[dict]:
     return record if isinstance(record, dict) else None
 
 
+def _tail_source(source: Source) -> tuple:
+    """Normalised tail plus detected vocabulary and mtime for one source."""
+    try:
+        modified = source.path.stat().st_mtime
+    except OSError as exc:
+        logger.warning(
+            "platform_transcript_stat_failed path=%s error=%s", source.path, exc
+        )
+        return [], None, None
+    records = _tail_records(source.path, tail_bytes=LAST_TURN_TAIL_BYTES)
+    if not records:
+        return [], None, modified
+    header = _head_record(source.path, tail_bytes=LAST_TURN_TAIL_BYTES)
+    if (
+        header is not None
+        and header.get("type") == "lmer.meta"
+        and records[0] != header
+    ):
+        records = [header] + records
+    messages, _, vocabulary, _label = _normalise(records, origin=source.path)
+    return messages, vocabulary, modified
+
+
 def last_turn(session_id: str) -> Optional["Message"]:
     """The newest turn in *session_id*'s transcript, or ``None``.
 
     What halt detection asks (#243): *who spoke last*. Not
     :func:`read_messages`, which reads every transcript of the whole run for a
-    paging client — this runs on the fleet-view poll path and reads one file's
-    tail (:data:`LAST_TURN_TAIL_BYTES`), newest by mtime when there are several.
+    paging client — this runs on the fleet-view poll path and reads each source's
+    bounded tail (:data:`LAST_TURN_TAIL_BYTES`) plus its first record, because
+    tier precedence needs every source's vocabulary before choosing the newest
+    turn by mtime.
 
     ``None`` for every ordinary way of not knowing — no transcript at all,
     unreadable, nothing that normalises — and callers must read it as "no
@@ -2218,34 +2248,14 @@ def last_turn(session_id: str) -> Optional["Message"]:
     sources = locate_sources(session_id)
     if not sources:
         return None
-    try:
-        newest = max(sources, key=lambda source: source.path.stat().st_mtime)
-    except OSError as exc:
-        logger.warning(
-            "platform_transcript_stat_failed session=%s error=%s", session_id, exc
-        )
+    tails = [(*_tail_source(source), source) for source in sources]
+    tails = [tail for tail in tails if tail[2] is not None]
+    if not tails:
         return None
-
-    records = _tail_records(newest.path, tail_bytes=LAST_TURN_TAIL_BYTES)
-    if not records:
-        return None
-    header = _head_record(newest.path, tail_bytes=LAST_TURN_TAIL_BYTES)
-    if (
-        header is not None
-        and header.get("type") == "lmer.meta"
-        and records[0] != header
-    ):
-        # Only the canonical header may join the tail. It is the per-file
-        # statement this prefix exists to carry, and it can never be a turn —
-        # any other first record can (three claude fixtures open with one), and
-        # prepending it would let a tail window with no messages answer with the
-        # session's *oldest* turn: a stale verdict where callers were promised
-        # "no opinion". The equality check, not the size check alone: the
-        # harness appends while this reads, so a file can cross the tail bound
-        # *between* the two reads and hand back a head the tail already holds.
-        # Doubling a record is the one thing a prefix must never do.
-        records = [header] + records
-    messages, _, _ = _normalise(records, origin=newest.path)
+    selected = _prefer_adapter_tier(session_id, tails, vocabulary_index=1)
+    messages, _vocabulary, _modified, _source = max(
+        selected, key=lambda tail: tail[2]
+    )
     return messages[-1] if messages else None
 
 
@@ -2259,6 +2269,36 @@ def last_turn(session_id: str) -> Optional["Message"]:
 #: gated file at once can say it twice, which is the whole cost of not holding a
 #: lock on a log line.
 _LMER_FORMAT_WARNED: set = set()
+
+# Sessions already reported with both native adapter output and canonical
+# derived output. Both read paths poll, so one warning per daemon lifetime is
+# the useful bound.
+_MIXED_TIER_WARNED: set = set()
+
+
+def _prefer_adapter_tier(session_id: str, values: list, *, vocabulary_index: int):
+    """Use native adapter values when readable canonical output exists too."""
+    adapter = [
+        value for value in values
+        if value[0]
+        and value[vocabulary_index] is not None
+        and value[vocabulary_index] != _LMER_HARNESS
+    ]
+    canonical = [
+        value for value in values
+        if value[0] and value[vocabulary_index] == _LMER_HARNESS
+    ]
+    if not adapter or not canonical:
+        return values
+    if session_id not in _MIXED_TIER_WARNED:
+        _MIXED_TIER_WARNED.add(session_id)
+        logger.warning(
+            "platform_transcript_mixed_tiers session=%s — native adapter "
+            "transcript wins; canonical derived output ignored and should not "
+            "exist for an adapter-supported harness",
+            session_id,
+        )
+    return adapter
 
 
 def _lmer_format_unsupported(declared: int, origin: Optional[Path]) -> None:
@@ -2291,7 +2331,9 @@ def _normalise(
     cap: Optional[int] = None,
     origin: Optional[Path] = None,
 ) -> tuple:
-    """Turn records into messages, one pass. ``(messages, capped, harness)``.
+    """Turn records into messages in one pass.
+
+    Returns ``(messages, capped, vocabulary, harness_label)``.
 
     Correlates each tool call with its later result — a tool still without one
     reads as ``pending``, which is what the session is doing right now. An
@@ -2337,18 +2379,22 @@ def _normalise(
     """
     pending: dict = {}
     messages: list = []
-    harness: Optional[str] = None
+    vocabulary_seen: Optional[str] = None
+    harness_label: Optional[str] = None
     unsupported = False
     for record in records:
         if cap is not None and len(messages) >= cap:
-            return messages, True, harness
+            return messages, True, vocabulary_seen, harness_label
         try:
             vocabulary = _harness_of_record(record)
-            if harness is None:
-                harness = vocabulary
+            if vocabulary_seen is None:
+                vocabulary_seen = vocabulary
+                harness_label = vocabulary
             if vocabulary == _LMER_HARNESS:
-                if harness == _LMER_HARNESS:
-                    harness = _lmer_declared_harness(record) or harness
+                if vocabulary_seen == _LMER_HARNESS:
+                    harness_label = (
+                        _lmer_declared_harness(record) or harness_label
+                    )
                 declared = _lmer_declared_format(record)
                 if declared is not None and declared > _LMER_FORMAT:
                     if not unsupported:
@@ -2365,7 +2411,7 @@ def _normalise(
             continue
         if message is not None:
             messages.append(message)
-    return messages, False, harness
+    return messages, False, vocabulary_seen, harness_label
 
 
 def normalise_records(records: Iterable[dict]) -> list:
@@ -2385,8 +2431,12 @@ def read_source(source: Source) -> tuple:
     (:mod:`lmer_platform.registry`) and the derived directory has no label at all,
     while the file says what it is. Nothing recognised keeps what was passed in —
     there is no evidence to correct it with.
+
+    ``vocabulary`` is the separate record-shape identity used for adapter-tier
+    precedence. A canonical file may therefore report ``vocabulary="lmer"``
+    while its cosmetic ``harness`` label is a converter-declared name.
     """
-    messages, capped, harness = _normalise(
+    messages, capped, vocabulary, harness = _normalise(
         _iter_records(source.path), cap=MAX_MESSAGES_PER_SOURCE,
         origin=source.path,
     )
@@ -2401,6 +2451,7 @@ def read_source(source: Source) -> tuple:
         path=source.path,
         session=source.session,
         harness=harness or source.harness,
+        vocabulary=vocabulary,
         messages=len(messages),
         capped=capped,
     )
@@ -2612,11 +2663,17 @@ def read_messages(
     messages: list = []
     read: list = []
     for member, sources in _collect_sources(session_id):
-        found: list = []
+        loaded: list = []
         for source in sources:
             from_file, described = read_source(source)
             read.append(described)
-            found.extend(from_file)
+            loaded.append((from_file, described.vocabulary))
+        selected = _prefer_adapter_tier(member, loaded, vocabulary_index=1)
+        found = [
+            message
+            for from_file, _vocabulary in selected
+            for message in from_file
+        ]
         messages.extend(_interleave(found, _channel_messages(member)))
 
     for index, message in enumerate(messages):

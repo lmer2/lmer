@@ -1120,7 +1120,7 @@ async function forget() {
             </v-tabs-window-item>
 
             <v-tabs-window-item value="terminal" class="pt-3">
-              <Terminal :session-id="terminalSession" />
+              <Terminal :session-id="terminalSession" :harness="run.harness" />
             </v-tabs-window-item>
 
             <v-tabs-window-item value="chat" class="pt-3">

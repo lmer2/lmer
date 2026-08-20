@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from lmer_cli import gate_cache
+from lmer_cli import gate_cache, precommit_cache
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -1023,11 +1023,15 @@ class TestDescribeHit:
 
 
 class TestContainerEnvPassthrough:
-    """Both vars must reach INSIDE the container: the gates run there, so a
+    """Cache vars must reach INSIDE the container: the gates run there, so a
     host-side value that stopped at the boundary would be inert (the
     env-vars.md rule-4 guard, as for the gate-in-flight pair)."""
 
-    NAMES = [gate_cache.DISABLE_ENV, gate_cache.CACHE_DIR_ENV]
+    NAMES = [
+        gate_cache.DISABLE_ENV,
+        gate_cache.CACHE_DIR_ENV,
+        precommit_cache.CACHE_DIR_ENV,
+    ]
 
     @pytest.mark.parametrize("name", NAMES)
     def test_cli_env_dict_declares_the_var(self, name):

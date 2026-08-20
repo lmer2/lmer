@@ -1404,9 +1404,44 @@ def test_a_sliver_fit_is_dropped_never_clamped():
         "a single legality floor of 1 is what let a sliver layout resize a "
         "shared PTY to one column"
     )
-    assert ("clampDimension(term.rows, MIN_ROWS)" in text
+    assert ("reportedRows(term.rows)" in text
             and "clampDimension(term.cols, MIN_COLS)" in text), (
         "each axis is checked against its own floor before a resize is sent"
+    )
+    assert "const fitted = clampDimension(rows, MIN_ROWS)" in text, (
+        "rows must be validated before applying the footer reserve"
+    )
+    assert "Math.max(MIN_ROWS, fitted - reserved)" in text, (
+        "a valid minimum-height terminal must still report geometry"
+    )
+
+
+def test_codex_and_pi_keep_their_footer_above_the_viewports_fractional_edge():
+    """Only the PTY height reserves a row, and only for the measured TUIs.
+
+    Xterm's fit owns the browser box. Shrinking the emulator would leave a blank
+    line without moving the child TUI's footer; reporting one fewer row makes the
+    child draw its bottom chrome above xterm's fractional viewport edge instead.
+    Claude already renders fully at the exact fit, and an unknown/user harness is
+    not licensed to inherit a workaround nobody measured on it.
+    """
+    terminal = _read(TERMINAL)
+    detail = _read(RUN_DETAIL)
+
+    assert 'harness: { type: String, default: null }' in terminal
+    assert "new Set(['codex', 'pi'])" in terminal
+    rows = _function_body(terminal, "function reportedRows")
+    assert "PTY_FOOTER_GUARD_HARNESSES.has(props.harness) ? 1 : 0" in rows
+    assert "fitted - reserved" in rows
+    assert "Math.max(MIN_ROWS" in rows
+
+    report = _function_body(terminal, "function reportGeometry")
+    assert "const rows = reportedRows(term.rows)" in report
+    assert "term.resize" not in report, (
+        "the local emulator was shrunk; the reserve belongs to PTY layout only"
+    )
+    assert ':harness="run.harness"' in detail, (
+        "the terminal cannot use the session-reported resolved harness"
     )
 
 

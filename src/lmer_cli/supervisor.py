@@ -879,23 +879,17 @@ def _split_submit_cr(payload: str) -> str:
 #: newly discovered escape, or a new harness, is an edit to this mapping rather
 #: than to any code.
 #:
-#: An entry needs **both** halves of the mechanic recorded, not just the first:
-#: that the character is a first-column escape in that harness's composer, *and*
-#: that the ``. `` prefix is inert in that same composer. Claude has both — its
-#: escapes are ``!`` (bash, the reported failure in #254), ``#`` (memory) and
-#: ``/`` (slash command), all as reachable from operator prose as each other
-#: ("#254 is done" is a sentence), and the prefix was checked against that input
-#: box in !212.
+#: This table records only the first half of the mechanic: characters known to
+#: be first-column escapes in each harness's composer. Claude reserves ``!``
+#: (bash, the reported failure in #254), ``#`` (memory) and ``/`` (slash
+#: command). Pi loads lmer's ``/name`` prompt templates into the same box.
 #:
-#: Codex and pi have only the first half. Their ``/`` escape is on this tree's
-#: record — Pi loads lmer's ``/name`` prompt templates, while Codex has native
-#: commands such as ``/quit`` typed into the same box
-#: (:data:`lmer_cli.harness.HARNESSES`) — but nobody has established what a
-#: leading dot does there. Defusing on a prediction about another program's
-#: input box is how the leading *space* went wrong, so they are deliberately
-#: absent until the prefix half is answered too.
+#: Chat defusal additionally needs the ``. `` prefix to be inert. That has been
+#: measured only for Claude, so :data:`CHAT_DEFUSAL_HARNESSES` keeps that second
+#: fact separate. Pi's known slash-command escape can therefore stay unframed
+#: without rewriting human chat on an unmeasured assumption about its prefix.
 #:
-#: A harness that is absent — those two, a user-defined one from
+#: A harness that is absent — Codex, a user-defined one from
 #: ``~/.lmer/harnesses``, or one added to the registry without a line here —
 #: gets an empty set and its payload back byte for byte.
 #:
@@ -904,13 +898,18 @@ def _split_submit_cr(payload: str) -> str:
 #: would break the reference rather than protect anything.
 HARNESS_FIRST_COLUMN_ESCAPES: dict[str, frozenset[str]] = {
     "claude": frozenset({"!", "#", "/"}),
+    "pi": frozenset({"/"}),
 }
 
-#: Put in front of a chat message whose first character is one of the above, so
-#: the escape is no longer in column one. The two characters are load-bearing in
-#: different ways — see :func:`_sanitize_user_chat` for the dot and the space —
-#: and :func:`_check_first_column_escapes` holds the half of what the dot needs
-#: that this project's own data can answer.
+#: Harnesses where the visible chat defusal prefix has also been measured.
+CHAT_DEFUSAL_HARNESSES = frozenset({"claude"})
+
+#: Put in front of a chat message whose first character is a recorded escape for
+#: a harness in :data:`CHAT_DEFUSAL_HARNESSES`, so the escape is no longer in
+#: column one. The two characters are load-bearing in different ways — see
+#: :func:`_sanitize_user_chat` for the dot and the space — and
+#: :func:`_check_first_column_escapes` holds the half of what the dot needs that
+#: this project's own data can answer.
 DEFUSAL_PREFIX = ". "
 
 
@@ -1007,7 +1006,12 @@ def _sanitize_user_chat(payload: str, harness: str) -> str:
     decided here and nowhere else. Refusing such a payload instead of
     transforming it is a change to this function alone.
     """
-    if payload[:1] in HARNESS_FIRST_COLUMN_ESCAPES.get(harness, frozenset()):
+    escapes = (
+        HARNESS_FIRST_COLUMN_ESCAPES.get(harness, frozenset())
+        if harness in CHAT_DEFUSAL_HARNESSES
+        else frozenset()
+    )
+    if payload[:1] in escapes:
         return DEFUSAL_PREFIX + payload
     return payload
 
@@ -1015,15 +1019,16 @@ def _sanitize_user_chat(payload: str, harness: str) -> str:
 def _active_harness_name() -> str:
     """The resolved harness name (``LMER_HARNESS``), for the routes that differ.
 
-    Degrades like :func:`_resolve_harness_profile` — inside the container a
-    broken env var must not take the session down, and claude is the historical
-    behavior — but silently: that function already warns about the same variable
-    at startup, and this one is read per request.
+    Degrades silently like :func:`_resolve_harness_profile`: that function already
+    warned about the broken variable at startup, and this one is read per request.
+    An empty name is deliberate here — protocol decisions must not treat a
+    malformed user-defined harness as Claude merely because Claude is the
+    historical command fallback.
     """
     try:
         return resolve_harness_name()
     except UnknownHarnessError:
-        return "claude"
+        return ""
 
 
 _CODEX_FOLLOWUP = "/followup"
@@ -1031,6 +1036,27 @@ _CODEX_FOLLOWUP_INSTRUCTION = (
     "Run `bash /Agents/global/hooks/followup.sh` now and follow the "
     "instructions in its output."
 )
+
+# Probed built-in TUIs that explicitly enable xterm bracketed-paste mode. Keep
+# user-defined harnesses conservative: their input protocol is not implied by a
+# cosmetic name or by their command shape.
+_BRACKETED_PASTE_HARNESSES = frozenset({"claude", "codex", "pi"})
+
+
+def _bracketed_paste_for(harness: str, payload: str) -> bool:
+    """Whether *payload* is safe to frame for the resolved harness.
+
+    Claude enables mode 2004 but does not execute a slash command delivered as
+    a paste (#210), and Pi has slash-command prompt templates in the same input
+    box. Any recorded first-column escape therefore stays as keystrokes. Human
+    Claude chat is sanitized before this decision and gets the measured inert
+    ``. `` prefix; ordinary multi-line prose keeps item #318's paste boundary.
+    """
+    if harness not in _BRACKETED_PASTE_HARNESSES:
+        return False
+    return payload[:1] not in HARNESS_FIRST_COLUMN_ESCAPES.get(
+        harness, frozenset()
+    )
 
 
 def _rewrite_harness_command(payload: str, harness: str) -> str:
@@ -1084,8 +1110,9 @@ def _submit_payload(
 
     The text is **one write**, and the whole of it is what the wait watches.  For
     a TUI that enables bracketed paste, *bracketed_paste* wraps that write in the
-    terminal's explicit paste-start/paste-end sequences.  Codex does enable the
-    protocol: the end sequence gives its input parser an explicit boundary
+    terminal's explicit paste-start/paste-end sequences.  The built-in Claude,
+    Codex and Pi TUIs enable the protocol: the end sequence gives their input
+    parsers an explicit boundary
     before the separate Enter instead of asking a scheduler delay to imply one.
     A payload that already contains the paste-end sequence is left unframed so
     its remainder cannot escape the bracket and be interpreted as keystrokes.
@@ -1139,7 +1166,7 @@ def _make_submit(
     slave_path: Optional[str],
     *,
     drain_timeout: float = SUBMIT_DRAIN_TIMEOUT_SECONDS,
-    harness: str = "claude",
+    harness: str = "",
 ) -> Callable[[str], tuple[int, str]]:
     """A submit closure for one PTY: types a message and presses Enter, atomically.
 
@@ -1158,6 +1185,9 @@ def _make_submit(
     cannot stop the child's output from being read (which would deadlock the very
     drain being waited for).
 
+    The caller supplies the resolved harness in production. An omitted harness
+    is deliberately conservative for protocol-level callers and tests.
+
     *slave_path* of ``None`` — a terminal that could not name itself — leaves the
     settle to carry it alone, and the verdict is :data:`SUBMIT_TEXT_UNKNOWN` so
     nobody downstream reads a weaker delivery as a stronger one.
@@ -1172,7 +1202,7 @@ def _make_submit(
                 probe=probe,
                 settle=_resolve_submit_enter_delay(),
                 drain_timeout=drain_timeout,
-                bracketed_paste=harness == "codex",
+                bracketed_paste=_bracketed_paste_for(harness, payload),
             )
 
     return submit
@@ -1321,7 +1351,9 @@ def _build_fastapi_app(
             write_input,
             payload,
             settle=_resolve_submit_enter_delay(),
-            bracketed_paste=_active_harness_name() == "codex",
+            bracketed_paste=_bracketed_paste_for(
+                _active_harness_name(), payload
+            ),
         )
 
     submit_payload = submit if submit is not None else _unlocked_submit

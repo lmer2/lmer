@@ -221,3 +221,28 @@ values.
 The field is **absent** when the run cannot say — a custom test runner, no `tests/` directory, `LMER_QUICK_GATE_COMMIT`, a bypass. Absence must never be read as "full suite".
 
 See also: [RUN-STATE.md](./RUN-STATE.md) for the receipt schema, [LMER-CLI.md](./LMER-CLI.md) for the environment variables in context.
+
+## Optional full pre-commit pass reuse
+
+Pre-commit reuse is a separate, operator-owned opt-in and is off by default. It
+may be enabled only from the work repo's `{host}/{project}/info/gate-check.yaml`,
+outside the tree being gated, after auditing the project's pinned hooks:
+
+```yaml
+precommit:
+  reuse_all_files: true
+```
+
+Only a successful `pre-commit run --all-files` pass can be reused, for 15
+minutes. Its identity covers the exact on-disk content and tracked path set that
+`--all-files` checks (so committing already-tracked modifications with unchanged
+bytes remains reusable), the complete `.pre-commit-config.yaml` (therefore every
+hook revision), the resolved executable bytes and version, exact argv, and every
+inherited environment variable (values are hashed, never stored). The key also
+covers the effective external attributes files, staged-added path projection,
+and merge/rebase markers used by this project's pinned `check-added-large-files`
+and `check-merge-conflict` hooks. Any missing or changed input is a miss. The
+fingerprint is recomputed after the run, so a hook autofix or concurrent
+checked-content change prevents recording the pass. Entries use an owner-only
+`/tmp/lmer-precommit-cache` directory and fail soft to running the hooks
+normally. Override that directory with `LMER_PRECOMMIT_CACHE_DIR`.
