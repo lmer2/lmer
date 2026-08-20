@@ -162,6 +162,7 @@ When the work is delivered (MR created, or the task is otherwise complete):
 - HARD RULE: DO NOT push to any repository without explicit permission
 - HARD RULE: DO NOT commit without explicit user approval or request
 {% block do_not_branch_rule %}- HARD RULE: DO NOT develop on `main` — always create a new branch first{% endblock %}
+- HARD RULE: DO NOT create worklogs, progress notes, or task journals in the target repository — record them in the work repository with `work log` and `work artifact`
 - HARD RULE: DO NOT add `Co-Authored-By`, `Signed-off-by`, or any self-reference tags to commit messages
 {% block do_not_extra %}{% endblock %}
 {% endblock %}

@@ -134,8 +134,11 @@ apart as the routes are: the one that starts a container is under `runs`, becaus
 a run is what it acts on.
 
 **Steering**
-- `POST /api/sessions/{id}/input` `{data,append_newline}` (`lmer-ctl send <id>
-  <text>`) — type into a live session. This is how a `/followup` gets delivered.
+- `POST /api/sessions/{id}/input`
+  `{data,append_newline,sanitize,preserve_slash_commands}` (`lmer-ctl send <id>
+  <text>`) — type prose into a live session. The CLI requests the harness command
+  guard while preserving deliberate slash commands, so a leading shell escape is
+  read as words and `/followup` stays live.
 - `POST /api/sessions` `{taskdef,target,title,...}` (`lmer-ctl spawn <taskdef>
   <target> --title …`) — spawn a worker. `GET /api/spawn-options`
   (`lmer-ctl spawn-options`) lists the taskdefs and presets this host can see
@@ -289,9 +292,10 @@ rely on the nudge: you are not deaf, you are slow — minutes rather than second
 ### The nudge: a line the platform types into this session
 
 If **N digests have been waiting X minutes** and this session has produced no
-output for about as long, the daemon writes one sentence into your terminal. Defaults are one
-digest and three minutes, per host (`GET /api/assistant/config`, the `nudge`
-group; the operator can widen either or switch it off with an interval of `0`).
+output for about as long, the daemon writes one sentence into your terminal.
+Defaults are one digest and three minutes, per host
+(`GET /api/assistant/config`, the `nudge` group; the operator can widen either
+or switch it off with an interval of `0`).
 It looks like this (wrapped here for reading — it arrives as one line):
 
 ```

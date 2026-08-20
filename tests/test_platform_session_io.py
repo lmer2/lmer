@@ -788,10 +788,10 @@ def test_a_chat_message_is_marked_as_one_for_the_supervisor(
 ):
     """The flag the chat pane sets, carried to the session's own control plane.
 
-    It says a human typed this into a composer — nothing about what to do with
-    it, which is the supervisor's call because only that end knows which harness
-    is running (a leading ``!`` is Claude Code's bash escape, #254). This layer
-    forwards the fact and touches the payload not at all.
+    It says this is prose intended to steer the session — nothing about what to
+    do with it, which is the supervisor's call because only that end knows which
+    harness is running. This layer forwards the fact and touches the payload not
+    at all.
     """
     plant_session("s-1", port=control_plane.port)
 
@@ -804,6 +804,24 @@ def test_a_chat_message_is_marked_as_one_for_the_supervisor(
         "append_newline": True,
         "sanitize": True,
     }
+
+
+def test_slash_command_intent_is_forwarded_only_with_the_prose_guard(
+    platform_root, control_plane
+):
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.send_input(
+        "s-1", "/followup", append_newline=True, sanitize=True,
+        preserve_slash_commands=True,
+    )
+    session_io.send_input(
+        "s-1", "/followup", append_newline=True,
+        preserve_slash_commands=True,
+    )
+
+    assert control_plane.calls[0]["body"]["preserve_slash_commands"] is True
+    assert "preserve_slash_commands" not in control_plane.calls[1]["body"]
 
 
 def test_input_nobody_flagged_puts_nothing_new_on_the_wire(
@@ -1389,18 +1407,22 @@ def test_input_route_proxies_to_the_control_plane(
     assert control_plane.calls[0]["authorization"] == f"Bearer {CONTROL_TOKEN}"
 
 
-def test_the_route_forwards_the_chat_flag_and_invents_it_for_nobody(
+def test_the_route_forwards_the_steering_flags_and_invents_them_for_nobody(
     client, platform_root, control_plane
 ):
-    """The client is the only end that knows a human typed the message in a
-    composer, so the route relays that and never infers it: a payload that looks
-    like a command is exactly what the terminal's own callers send on purpose."""
+    """Only the client knows prose from raw keystrokes, so the route relays that
+    assertion and never infers it from command-looking payload text."""
     plant_session("s-1", port=control_plane.port)
 
     client.post(
         "/api/sessions/s-1/input",
         headers=bearer_header(),
-        json={"data": "!206 was merged", "append_newline": True, "sanitize": True},
+        json={
+            "data": "/followup",
+            "append_newline": True,
+            "sanitize": True,
+            "preserve_slash_commands": True,
+        },
     )
     client.post(
         "/api/sessions/s-1/input",
@@ -1409,7 +1431,9 @@ def test_the_route_forwards_the_chat_flag_and_invents_it_for_nobody(
     )
 
     assert control_plane.calls[0]["body"]["sanitize"] is True
+    assert control_plane.calls[0]["body"]["preserve_slash_commands"] is True
     assert "sanitize" not in control_plane.calls[1]["body"]
+    assert "preserve_slash_commands" not in control_plane.calls[1]["body"]
 
 
 def test_an_unconfirmed_submit_reaches_the_caller(

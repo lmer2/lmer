@@ -384,7 +384,15 @@ def _call_send(args) -> Call:
     return Call(
         "POST",
         f"/api/sessions/{args.session}/input",
-        body={"data": _text(args.text), "append_newline": not args.no_newline},
+        body={
+            "data": _text(args.text),
+            "append_newline": not args.no_newline,
+            # This command steers another session with prose. The supervisor
+            # must not execute a sentence beginning with a harness escape, but
+            # slash commands are deliberate on this orchestration path.
+            "sanitize": True,
+            "preserve_slash_commands": True,
+        },
     )
 
 

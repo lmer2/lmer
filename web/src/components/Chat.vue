@@ -72,10 +72,11 @@
 // held as pending — which is what the ask-channel merge was for in the first
 // place.
 //
-// The fourth kind of turn takes the action ground rather than a colour of its
-// own: a watch the session armed, firing (`transcripts.MONITOR_ROLE`). It is the
-// machinery talking, which is what that ground already means here, and a fourth
-// tone would be one more thing to tell apart on a phone for a turn that is rare.
+// The other kinds of turn take the action ground rather than colours of their
+// own: a watch the session armed, firing (`transcripts.MONITOR_ROLE`), or input
+// the platform typed (`transcripts.PLATFORM_ROLE`). They are machinery talking,
+// which is what that ground already means here, and extra tones would be more to
+// tell apart on a phone for turns that are rare.
 //
 // Who a turn is titled as
 // -----------------------
@@ -153,6 +154,7 @@ const props = defineProps({
 const SPEAKERS = {
   user: 'you',
   monitor: 'the watch fired',
+  platform: 'lmer platform',
 }
 
 // Everything else: the harness's own 'system' prose today, a role a later release
@@ -743,7 +745,9 @@ watch(rendererLoaded, () => {
             … earlier part of this message trimmed — the terminal has all of it
           </p>
           <p
-            v-if="message.text && message.role === 'user'"
+            v-if="message.text && (
+              message.role === 'user' || message.role === 'platform'
+            )"
             class="text-body-medium said plain"
           >{{ message.text }}</p>
           <!-- A watch firing: the condition it was armed on and the line that

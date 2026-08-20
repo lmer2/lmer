@@ -261,7 +261,7 @@ STALL_PATHS = ("unanswered", "api_error", "backstop")
 #: Roles meaning *something was said to the session*. Named rather than written
 #: as "not the assistant", which swept in the ``system`` role of a local-command
 #: record — so typing ``/usage`` into a healthy run manufactured a halt.
-INPUT_ROLES = ("user", transcripts.MONITOR_ROLE)
+INPUT_ROLES = ("user", transcripts.MONITOR_ROLE, transcripts.PLATFORM_ROLE)
 
 
 @dataclass(frozen=True)

@@ -1621,12 +1621,17 @@ def create_app(
             reply = session_io.send_input(
                 session_id, data,
                 append_newline=bool(body.get("append_newline")),
-                # Forwarded, never inferred: the flag says a human typed this
-                # into a chat composer, which is a fact about the client and
-                # not something this route could read off the payload. What is
-                # done about it belongs to the session's own supervisor, which
-                # is the only place that knows which harness is running.
+                # Forwarded, never inferred: the flag says this is prose meant
+                # to steer the session, which is a fact about the client and not
+                # something this route can read off the payload. What is done
+                # about it belongs to the session's own supervisor, the only
+                # place that knows which harness is running.
                 sanitize=bool(body.get("sanitize")),
+                # ``lmer-ctl send`` deliberately carries live slash commands;
+                # web chat omits this and keeps the full prose guard.
+                preserve_slash_commands=bool(
+                    body.get("preserve_slash_commands")
+                ),
             )
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc

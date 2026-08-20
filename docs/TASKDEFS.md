@@ -179,6 +179,12 @@ branch instead of creating one (e.g. `followup`) overrides just the
 branch-discipline rule via `do_not_branch_rule`; extend a block while
 keeping its base content with `{% raw %}{{ super() }}{% endraw %}`.
 
+The inherited `do_not` block also forbids worklogs, progress notes, and task
+journals in the target repository. Task progress belongs in the work
+repository's run directory through `work log` and `work artifact`; task-specific
+templates should reinforce that destination rather than introduce a repository
+journal of their own.
+
 ## Schema versioning
 
 A taskdef *source root* (any directory on the precedence list) declares its

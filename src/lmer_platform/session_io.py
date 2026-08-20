@@ -918,7 +918,7 @@ def _record_attempt(
 
 def send_input(
     session_id: str, data: str, *, append_newline: bool = False,
-    sanitize: bool = False,
+    sanitize: bool = False, preserve_slash_commands: bool = False,
 ) -> dict:
     """Type *data* into a running session. Returns the control plane's answer.
 
@@ -931,12 +931,17 @@ def send_input(
     caller that means "and press Enter" says so. The payload itself is never
     logged: an answer routinely contains whatever the operator was asked for.
 
-    *sanitize* says the payload is a message a human typed into a chat composer,
-    which lets the supervisor defuse the shapes a TUI reads as a command
-    rather than as text (``lmer_cli.supervisor._sanitize_user_chat``). Off by
-    default and only put on the wire when set: a caller typing bytes on
-    something else's behalf — the terminal's keystrokes, an injected command —
-    sends exactly the body it sends today.
+    *sanitize* says the payload is prose intended to steer the session, from
+    either the chat composer or ``lmer-ctl send``. That lets the supervisor
+    defuse shapes a TUI reads as a command rather than as text
+    (``lmer_cli.supervisor._sanitize_user_chat``). Off by default and only put
+    on the wire when set: raw terminal keystrokes and injected lifecycle
+    commands send exactly the body they sent before the flag existed.
+
+    *preserve_slash_commands* narrows that transformation for an orchestration
+    caller whose leading slash is intentional. It has no effect unless
+    *sanitize* is also set; the supervisor remains the owner of the harness's
+    escape set and leaves only slash commands out of the prose guard.
 
     The reply carries ``submit_confirmed`` and a ``note`` when Enter was asked
     for, and both are passed to the caller rather than dropped: the supervisor
@@ -960,6 +965,8 @@ def send_input(
     body = {"data": data, "append_newline": bool(append_newline)}
     if sanitize:
         body["sanitize"] = True
+        if preserve_slash_commands:
+            body["preserve_slash_commands"] = True
     endpoint: Optional[ControlEndpoint] = None
     reply: Optional[_ControlReply] = None
     error: Optional[str] = None

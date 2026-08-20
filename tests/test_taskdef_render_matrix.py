@@ -148,6 +148,10 @@ class TestRenderMatrix:
             assert "## Phase 1: Matrix demo work" in out
             assert "## Phase -1: Branch Setup" in out
             assert "DO NOT leave the render matrix" in out
+            assert "DO NOT create worklogs, progress notes, or task journals" in out
+            if work_mode == "phasic":
+                assert "Checking the work repository run log" in out
+                assert "recording progress with `work log`" in out
             # The nested do_not_branch_rule block is part of the block
             # interface (docs/TASKDEFS.md) — the fixture overrides it, so
             # removing or renaming it base-side fails here, not only in
@@ -175,6 +179,13 @@ class TestRenderMatrix:
         assert "no fixed script" in out
         banner = capsys.readouterr().out
         assert f"taskdef source: {REPO_TASKDEF} (schema 1)" in banner
+
+    def test_repository_guidance_sends_progress_to_the_work_repository(self):
+        guidance = (REPO_TASKDEF.parent / "AGENTS.md").read_text()
+
+        assert "WORKLOG.md" not in guidance
+        assert "work repository run log" in guidance
+        assert "`work artifact`" in guidance
 
     @pytest.mark.parametrize("work_mode", WORK_MODES)
     def test_schema2_followup_renders(self, work_mode, tmp_path, monkeypatch):

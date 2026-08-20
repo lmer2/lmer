@@ -653,7 +653,12 @@ def test_a_merged_answer_is_not_run_through_the_markdown_renderer():
     be a second place for the renderer to creep into.
     """
     text = _chat()
-    assert 'v-if="message.text && message.role === \'user\'"' in text, (
+    branch = re.search(
+        r'<p\s+v-if="([^"]+)"\s+class="text-body-medium said plain"',
+        text,
+        re.S,
+    )
+    assert branch and "message.role === 'user'" in branch.group(1), (
         "the operator's own turns no longer key the verbatim branch on the role"
     )
     assert text.count("said plain") == 2, (

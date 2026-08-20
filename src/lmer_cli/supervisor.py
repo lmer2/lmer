@@ -520,13 +520,15 @@ class SessionLog:
 class _InputBody(BaseModel):
     data: str
     append_newline: bool = False
-    #: "A human typed this into a chat composer" — the one fact only the client
-    #: knows, and the whole of what this flag asserts. Everything else (which
-    #: harness is running, what its TUI does with the text) is decided here, in
-    #: :func:`_sanitize_user_chat`. Off by default, so every caller that types
-    #: bytes on someone's behalf — the web terminal's keystrokes, ``lmerctl
-    #: send``, the lifecycle injections — keeps delivering them exactly as given.
+    #: "This is prose meant to steer the session", whether a human composed it
+    #: in chat or an assistant sent it through ``lmer-ctl``. Everything else
+    #: (which harness is running, what its TUI does with the text) is decided
+    #: here, in :func:`_sanitize_user_chat`. Off by default, so raw terminal
+    #: keystrokes and lifecycle injections keep their command semantics.
     sanitize: bool = False
+    #: A steering caller can still intend a registered slash command. This only
+    #: narrows ``sanitize``; it never transforms or enables commands by itself.
+    preserve_slash_commands: bool = False
 
 
 class _OutputResponse(BaseModel):
@@ -882,27 +884,32 @@ def _split_submit_cr(payload: str) -> str:
 #: This table records only the first half of the mechanic: characters known to
 #: be first-column escapes in each harness's composer. Claude reserves ``!``
 #: (bash, the reported failure in #254), ``#`` (memory) and ``/`` (slash
-#: command). Pi loads lmer's ``/name`` prompt templates into the same box.
+#: command). Codex reserves ``!`` for local shell commands; its ``/`` commands
+#: are deliberate chat features and ``@`` is a file search/reference, so neither
+#: is rewritten here. Pi loads lmer's ``/name`` prompt templates into the same
+#: box.
 #:
 #: Chat defusal additionally needs the ``. `` prefix to be inert. That has been
-#: measured only for Claude, so :data:`CHAT_DEFUSAL_HARNESSES` keeps that second
-#: fact separate. Pi's known slash-command escape can therefore stay unframed
-#: without rewriting human chat on an unmeasured assumption about its prefix.
+#: established for Claude and approved for Codex's shell escape, so
+#: :data:`CHAT_DEFUSAL_HARNESSES` keeps that second fact separate. Pi's known
+#: slash-command escape can therefore stay unframed without rewriting human chat
+#: on an unmeasured assumption about its prefix.
 #:
-#: A harness that is absent — Codex, a user-defined one from
-#: ``~/.lmer/harnesses``, or one added to the registry without a line here —
-#: gets an empty set and its payload back byte for byte.
+#: A harness that is absent — a user-defined one from ``~/.lmer/harnesses`` or
+#: one added to the registry without a line here — gets an empty set and its
+#: payload back byte for byte.
 #:
-#: ``@`` is deliberately in no set: claude reads it as a file reference
+#: ``@`` is deliberately in no set: Claude and Codex read it as a file reference
 #: *anywhere* in a message, so it is not a first-column escape and prefixing it
 #: would break the reference rather than protect anything.
 HARNESS_FIRST_COLUMN_ESCAPES: dict[str, frozenset[str]] = {
     "claude": frozenset({"!", "#", "/"}),
+    "codex": frozenset({"!"}),
     "pi": frozenset({"/"}),
 }
 
 #: Harnesses where the visible chat defusal prefix has also been measured.
-CHAT_DEFUSAL_HARNESSES = frozenset({"claude"})
+CHAT_DEFUSAL_HARNESSES = frozenset({"claude", "codex"})
 
 #: Put in front of a chat message whose first character is a recorded escape for
 #: a harness in :data:`CHAT_DEFUSAL_HARNESSES`, so the escape is no longer in
@@ -949,17 +956,19 @@ def _check_first_column_escapes(
 _check_first_column_escapes(HARNESS_FIRST_COLUMN_ESCAPES, DEFUSAL_PREFIX)
 
 
-def _sanitize_user_chat(payload: str, harness: str) -> str:
+def _sanitize_user_chat(
+    payload: str, harness: str, *, preserve_slash_commands: bool = False
+) -> str:
     """Defuse a chat message the TUI would run as a command instead of reading.
 
     A harness TUI reserves the **first character of its input box** for escapes:
-    on claude a ``!`` runs the rest of the line as a shell command, a ``#``
-    writes it to memory, a ``/`` runs a slash command. A message typed into the
-    platform's chat pane travels through that same box, so "!206 was merged" and
-    "#254 is done" — sentences — become commands. Which characters those are is a
-    fact about each input box and lives in
-    :data:`HARNESS_FIRST_COLUMN_ESCAPES`; this function is only the rule applied
-    to it.
+    on Claude a ``!`` runs the rest of the line as a shell command, a ``#``
+    writes it to memory, and a ``/`` runs a slash command; on Codex, ``!`` runs a
+    local shell command. A message typed into the platform's chat pane travels
+    through that same box, so "!206 was merged" and "#254 is done" — sentences —
+    become commands. Which characters those are is a fact about each input box
+    and lives in :data:`HARNESS_FIRST_COLUMN_ESCAPES`; this function is only the
+    rule applied to it.
 
     :data:`DEFUSAL_PREFIX` takes the first column, and the harness reads the
     message with its ``!`` still in it, which is why this transforms rather than
@@ -986,7 +995,8 @@ def _sanitize_user_chat(payload: str, harness: str) -> str:
     prefix character — which turns a bad edit to the table into a load-time
     failure. It is a self-consistency check on this project's own record, not a
     reading of the harness. The evidence for the dot itself is an observation
-    too: the prefix was typed into claude's box in !212, once.
+    too: the prefix was typed into Claude's box in !212, once, and the same
+    guard was explicitly selected for Codex's shell escape in #321.
 
     The failure modes divide along that line. An escape missing from a set is the
     pre-#254 behavior for that character — the message is read as a command, as
@@ -1002,15 +1012,19 @@ def _sanitize_user_chat(payload: str, harness: str) -> str:
     the operator accepted a visible one.
 
     A harness with no recorded escapes gets its payload back untouched: the flag
-    says "a human typed this in a chat composer", and what to do about that is
-    decided here and nowhere else. Refusing such a payload instead of
-    transforming it is a change to this function alone.
+    says "this is prose meant to steer the session", and what to do about that is
+    decided here and nowhere else. Refusing such a payload instead of transforming
+    it is a change to this function alone. The function's historical name reflects
+    its first caller; ``lmer-ctl send`` now makes the same assertion for assistant
+    steering.
     """
     escapes = (
         HARNESS_FIRST_COLUMN_ESCAPES.get(harness, frozenset())
         if harness in CHAT_DEFUSAL_HARNESSES
         else frozenset()
     )
+    if preserve_slash_commands:
+        escapes = escapes - {"/"}
     if payload[:1] in escapes:
         return DEFUSAL_PREFIX + payload
     return payload
@@ -1042,21 +1056,32 @@ _CODEX_FOLLOWUP_INSTRUCTION = (
 # cosmetic name or by their command shape.
 _BRACKETED_PASTE_HARNESSES = frozenset({"claude", "codex", "pi"})
 
+#: Harnesses whose recorded command escapes must be sent as keystrokes rather
+#: than as a paste. Kept separate from chat defusal: Codex executes leading
+#: ``!`` from a paste too, and adding it to the escape table must not silently
+#: remove the paste boundary from an unsanitized long payload. The characters
+#: themselves still have one owner in :data:`HARNESS_FIRST_COLUMN_ESCAPES`.
+_KEYSTROKE_ESCAPE_HARNESSES = frozenset({"claude", "pi"})
+
 
 def _bracketed_paste_for(harness: str, payload: str) -> bool:
     """Whether *payload* is safe to frame for the resolved harness.
 
     Claude enables mode 2004 but does not execute a slash command delivered as
     a paste (#210), and Pi has slash-command prompt templates in the same input
-    box. Any recorded first-column escape therefore stays as keystrokes. Human
-    Claude chat is sanitized before this decision and gets the measured inert
-    ``. `` prefix; ordinary multi-line prose keeps item #318's paste boundary.
+    box. Their recorded command escapes therefore stay as keystrokes. Codex
+    executes its leading ``!`` even from a paste, so it keeps the paste boundary;
+    sanitized chat and ctl steering acquire the inert ``. `` prefix first.
+    Ordinary multi-line prose keeps item #318's paste boundary in every case.
     """
     if harness not in _BRACKETED_PASTE_HARNESSES:
         return False
-    return payload[:1] not in HARNESS_FIRST_COLUMN_ESCAPES.get(
-        harness, frozenset()
+    keystroke_escapes = (
+        HARNESS_FIRST_COLUMN_ESCAPES.get(harness, frozenset())
+        if harness in _KEYSTROKE_ESCAPE_HARNESSES
+        else frozenset()
     )
+    return payload[:1] not in keystroke_escapes
 
 
 def _rewrite_harness_command(payload: str, harness: str) -> str:
@@ -1384,7 +1409,11 @@ def _build_fastapi_app(
         # alarm. What this line does is not corruption in transit — it is what
         # the caller asked for by setting the flag.
         if body.sanitize:
-            payload = _sanitize_user_chat(payload, _active_harness_name())
+            payload = _sanitize_user_chat(
+                payload,
+                _active_harness_name(),
+                preserve_slash_commands=body.preserve_slash_commands,
+            )
             payload_bytes = payload.encode("utf-8")
         # Append CR (\r), not LF (\n): claude's TUI runs in raw mode where
         # the Enter key arrives as \r. \n would be inserted as a literal

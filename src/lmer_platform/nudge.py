@@ -57,7 +57,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .assistant import AssistantState, MAX_NOTE_CHARS
-from .lifecycle import PLATFORM_PREFIX
+from .provenance import PLATFORM_PREFIX
 from .store import age_seconds
 
 __all__ = [

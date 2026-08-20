@@ -109,9 +109,9 @@ Use these focused commands:
 - Document configuration requirements
 
 ### Work Tracking
-- Update WORKLOG.md with brief task overviews
-- Document what was done for each task
-- Include context for future reference
+- Record task progress in the work repository run log with `work log`
+- Persist specs, plans, and reports in the work repository with `work artifact`
+- Include context for future sessions without adding journals to the target repository
 
 ### Error Handling & Recovery
 - Always provide clear error messages with context
@@ -199,7 +199,7 @@ emit the `(yes/no)` line when nobody is attached to answer it.
 - Provide concise status updates during long operations
 - Use clear, actionable language in error messages
 - Document assumptions and decisions in code comments
-- Keep WORKLOG.md updated with task progress
+- Keep the work repository run log updated with task progress
 
 ### Communication Guidelines
 - Be specific about what's happening

@@ -124,6 +124,7 @@ from typing import Optional
 
 from . import registry
 from .assistant import KIND as ASSISTANT_KIND
+from .provenance import PLATFORM_PREFIX
 from .reattach import detached_record
 from .session_io import send_input
 from .store import StoreError, append_event, utc_now_iso
@@ -144,12 +145,6 @@ __all__ = [
 #: UI ends up matching on a value the daemon stopped writing.
 VERB_WIND_DOWN = "wind_down"
 VERB_EXIT = "exit"
-
-#: Marks input the platform typed rather than the operator. The scrollback of a
-#: session that was asked to wind down is read later by someone trying to work out
-#: why it stopped, and "who said this" is the first question. ASCII on purpose: this
-#: is written into a PTY belonging to a harness whose input handling is not ours.
-PLATFORM_PREFIX = "[lmer platform]"
 
 #: What a wind-down actually asks for. One paragraph, no newlines — see the module
 #: docstring for why that is a correctness property and not formatting.
