@@ -276,6 +276,7 @@ from ask_channel.protocol import KIND_QUESTION, AskError
 
 from . import ask, registry, runs
 from .config import active_assistant_credential, active_secret
+from .provenance import PLATFORM_PREFIX
 from .session_io import SessionNotFound
 from .store import logs_dir
 
@@ -287,7 +288,7 @@ __all__ = [
     "TRANSCRIPT_FILE_MODE",
     "DEFAULT_MESSAGE_LIMIT", "MAX_MESSAGE_LIMIT", "TEXT_LIMIT", "DETAIL_LIMIT",
     "MAX_MESSAGES_PER_SOURCE", "MAX_SOURCES", "TOOL_STATUSES", "MESSAGE_KINDS",
-    "ASK_CHANNEL_VIA", "MONITOR_VIA", "MONITOR_ROLE",
+    "ASK_CHANNEL_VIA", "MONITOR_VIA", "MONITOR_ROLE", "PLATFORM_ROLE",
     "ToolCall", "Message", "Source", "MessagePage",
     "transcript_root", "session_transcript_dir", "locate_sources",
     "sessions_for_run", "normalise_records", "read_source", "read_messages",
@@ -430,6 +431,13 @@ MONITOR_VIA = "monitor"
 #: message; not ``assistant`` either, since the session did not write it — the
 #: watch is a third party and the view has to be able to draw it as one.
 MONITOR_ROLE = "monitor"
+
+#: A host-authored prompt typed through the session control plane. Harnesses
+#: record these bytes as ``user`` because they entered through the composer, but
+#: the reserved producer-owned prefix lets the view preserve their provenance.
+#: An operator who deliberately begins with that exact prefix accepts this
+#: attribution; ordinary occurrences later in a message remain operator text.
+PLATFORM_ROLE = "platform"
 
 #: Record ``type`` values each harness writes. Disjoint, which is what makes the
 #: dispatch per record (:func:`_harness_of_record`) rather than per file. Each
@@ -2409,6 +2417,13 @@ def _normalise(
         except Exception as exc:
             logger.warning("platform_transcript_record_skipped error=%r", exc)
             continue
+        if (
+            message is not None
+            and message.role == "user"
+            and message.kind == "said"
+            and message.text.startswith(PLATFORM_PREFIX)
+        ):
+            message.role = PLATFORM_ROLE
         if message is not None:
             messages.append(message)
     return messages, False, vocabulary_seen, harness_label

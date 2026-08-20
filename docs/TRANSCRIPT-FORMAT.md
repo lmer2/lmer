@@ -123,6 +123,14 @@ injected into the model's context must be marked `injected` by the converter,
 from the native record's own provenance — otherwise it renders as something the
 operator typed, which is the one mistake this view keeps having to close.
 
+The host reserves a fifth, derived role: a `said` user turn whose text begins
+with `[lmer platform]` is re-attributed to `platform` after any native or
+canonical adapter runs. That prefix belongs to host-authored reminders and
+wind-down prompts. Converters cannot emit `role: "platform"` directly; an
+operator who deliberately types the reserved prefix accepts the same visible
+attribution, while the marker elsewhere in a sentence remains ordinary user
+text.
+
 ### `lmer.tool_update` — resolve a pending tool call
 
 ```json
@@ -188,6 +196,7 @@ advice.
 | `role: "assistant"` | Titled with the agent's name (`lmer` in a run's chat), rendered as markdown. |
 | `role: "system"` | Titled **the session**, on the action ground. |
 | `role: "monitor"` | Titled **the watch fired**, drawn as an event line rather than as prose — for a turn nobody in the conversation said. Pair it with `via: "monitor"`. |
+| host-derived `role: "platform"` | Titled **lmer platform**, on the action ground and rendered verbatim, for input the platform typed through the session control plane. |
 | `kind: "said"` | Shown by default. |
 | `kind: "injected"` / `"notice"` | Captioned **· internal**, drawn on the action ground, and hidden until the operator flips the view's internal toggle. |
 | `via: "monitor"` | Records that a watch delivered the turn rather than a party saying it; the `monitor` role is what titles it. It also crosses to API clients, which is the point — a turn assembled by machinery is never passed off as something somebody said. |
@@ -199,7 +208,7 @@ advice.
 | `tools[].status: "failed"` | The chip turns red and takes an alert icon. |
 | `tools[].error` | Appended as ` — <error>`, same one-line 160-character treatment as `detail`. |
 | `api_refusal: true` on an `assistant` turn | When the run has gone quiet, the fleet view names the stall `api_error` — the provider refusing, on the harness's own report rather than on a reading of the prose — instead of falling back to the silence backstop. `api_error` and `api_error_status` become the cause detail. |
-| newest turn is `role: "user"` or `"monitor"` | A quiet run reads as `unanswered`: something was said to the session and nothing answered it. |
+| newest turn is `role: "user"`, `"monitor"`, or `"platform"` | A quiet run reads as `unanswered`: something was said to the session and nothing answered it. |
 
 Nothing else crosses. Token accounting, request ids, model reasoning, whole tool
 payloads: the chat view is the readable summary and the terminal log is the

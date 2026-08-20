@@ -294,7 +294,12 @@ def test_your_own_words_are_never_rendered_anywhere():
     something else.
     """
     chat = _read(CHAT)
-    assert 'v-if="message.text && message.role === \'user\'"' in chat, (
+    branch = re.search(
+        r'<p\s+v-if="([^"]+)"\s+class="text-body-medium said plain"',
+        chat,
+        re.S,
+    )
+    assert branch and "message.role === 'user'" in branch.group(1), (
         "the user's own turns go through the renderer too"
     )
     entry = _read(ASK_ENTRY)

@@ -1414,8 +1414,9 @@ class Detector:
             # the raiser knows whether the bytes were typed, and the two cases
             # need opposite recoveries — retry a refusal, bound a delivered one.
             # A transport failure cannot be told apart and counts as retryable,
-            # since a duplicate reminder beats a lost window. ``getattr``: this
-            # catches the base class, and only ``ControlPlaneError`` has the flag.
+            # since a duplicate reminder beats a lost window. ``getattr`` is a
+            # positive-delivery test: a refused write is false, while a timeout
+            # after the child read the bytes is unknown and therefore false too.
             self._absorb("nudge", exc)
             if not getattr(exc, "delivered", False):
                 return None
@@ -1443,8 +1444,7 @@ class Detector:
                 "repeat": due.repeat,
                 "after_seconds": after,
                 "marked": bool(marked),
-                # Non-null only when the send raised after delivering. The key
-                # is always present, like ``idle_seconds`` above.
+                # Always present; null unless the send raised after delivering.
                 "send_error": sent_error,
             },
         )
@@ -1470,7 +1470,7 @@ class Detector:
         written repeats every tick — and that same outage stops the assistant
         draining the spool, so the repeats never end.
         """
-        state = assistant.read_state()
+        state = assistant.clamp_future_nudged_at()
         if self._nudged is None:
             return state
         seq, stamp = self._nudged
@@ -1480,9 +1480,10 @@ class Detector:
             self._nudged = None
             return state
         stored = state.nudged_at
+        stored_age = age_seconds(stored) if stored is not None else None
         # Usability, not text: a corrupt stamp sorts above an ISO one, and
         # ``_window`` discards it anyway — so a lexical compare lost both bounds.
-        if stored is None or age_seconds(stored) is None or stored < stamp:
+        if stored is None or stored_age is None or stored < stamp:
             return replace(state, nudged_at=stamp)
         return state
 

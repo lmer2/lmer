@@ -255,6 +255,11 @@ stays the accumulation's own. Taking the spool clears the stamp and ends the
 accumulation; whatever arrives next is a new one, owed its own reminder. It is
 never one reminder per digest.
 
+If clock correction leaves that stamp in the future, the daemon durably clamps
+it to the current time once. The ordinary interval can then elapse across ticks
+and daemon restarts; if the correction cannot be written, that future value is
+ignored for the decision so it cannot silence the accumulation indefinitely.
+
 The repeat is the remedy for the one thing the platform cannot know: the input
 path proves the bytes reached the control plane and cannot prove the harness
 registered the Enter that submits them. A reminder that vanished leaves an idle

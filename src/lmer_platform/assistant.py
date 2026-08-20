@@ -421,6 +421,7 @@ __all__ = [
     "state_path", "env_file_path", "taskdef_dir", "read_state", "status",
     "start", "stop", "rotate", "ensure_running", "set_handoff",
     "set_instructions", "notify", "take_pending", "mark_nudged",
+    "clamp_future_nudged_at",
     "register_supervisor", "resume_supervision",
 ]
 
@@ -678,7 +679,8 @@ class AssistantState:
     #: When the platform last typed a nudge about this accumulation (issue #317).
     #: Here rather than in its own file so it shares the spool's lock and drain,
     #: and cannot disagree with what it describes. Cleared by
-    #: :func:`take_pending`.
+    #: :func:`take_pending`; a future value is durably bounded to the current
+    #: time by :func:`clamp_future_nudged_at` before the detector reads it.
     nudged_at: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -2312,6 +2314,34 @@ def mark_nudged() -> Optional[str]:
         if not _write_state(replace(state, nudged_at=stamped)):
             return None
         return stamped
+
+
+def clamp_future_nudged_at() -> AssistantState:
+    """Read the spool state, durably bounding a future nudge stamp to now.
+
+    A corrected host clock can leave a parseable mark ahead of the present. If
+    every detector tick merely folds ``now`` over that stored value, the repeat
+    window restarts on every tick and no reminder ever becomes due. Correct the
+    file once under the spool lock instead, so elapsed time can accumulate and a
+    restarted daemon reads the same bound.
+
+    If the best-effort write fails, return the state with no nudge bound for this
+    decision. One early reminder is safer than letting an uncorrectable future
+    value silence the accumulation indefinitely; the detector's in-memory mark
+    still bounds repeats after that reminder is delivered.
+    """
+    with _LOCK:
+        state = read_state()
+        stamped = state.nudged_at
+        if stamped is None:
+            return state
+        age = age_seconds(stamped)
+        if age is None or age >= 0:
+            return state
+        corrected = replace(state, nudged_at=utc_now_iso())
+        if _write_state(corrected):
+            return corrected
+        return replace(state, nudged_at=None)
 
 
 def _oldest_at(pending: tuple) -> Optional[str]:

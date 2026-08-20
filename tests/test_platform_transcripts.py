@@ -370,6 +370,42 @@ def test_long_text_is_trimmed_and_says_so():
     assert len(message.text) <= transcripts.TEXT_LIMIT
 
 
+# --- input typed by the platform is not operator speech (#321) ----------------
+
+@pytest.mark.parametrize("record", [
+    {"type": "user", "message": {"role": "user", "content": (
+        "[lmer platform] The operator asked this session to wind down."
+    )}},
+    {"type": "message", "message": {"role": "user", "content": [
+        {"type": "text", "text": "[lmer platform] Pending digests are ready."},
+    ]}},
+    {"type": "response_item", "payload": {
+        "type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "[lmer platform] Wind down now."},
+        ],
+    }},
+    {"type": "lmer.message", "role": "user", "kind": "said",
+     "text": "[lmer platform] A digest is pending."},
+])
+def test_every_adapter_attributes_reserved_platform_input_to_the_platform(record):
+    message = transcripts.normalise_records([record])[0]
+
+    assert message.role == transcripts.PLATFORM_ROLE
+    assert message.role != "user"
+    assert message.kind == "said"
+
+
+def test_the_platform_marker_is_reserved_only_at_the_start_of_a_turn():
+    record = {
+        "type": "user",
+        "message": {"role": "user", "content": (
+            "Please explain what [lmer platform] means."
+        )},
+    }
+
+    assert transcripts.normalise_records([record])[0].role == "user"
+
+
 # --- a watch firing is nobody talking (T99) ----------------------------------
 #
 # The live incident, verbatim: the operator armed uber lmer's digest watch (T89),

@@ -2471,16 +2471,39 @@ class TestFirstColumnEscapes:
                 {"claude": frozenset({"/quit"})}, ". "
             )
 
-    @pytest.mark.parametrize("harness", ["codex", "acme"])
     @pytest.mark.parametrize("char", ["!", "#", "/"])
-    def test_a_harness_without_a_recorded_set_is_a_passthrough(self, harness, char):
+    def test_a_harness_without_a_recorded_set_is_a_passthrough(self, char):
         """Absent from the mapping means untouched, whether the harness is a
-        registry one whose set is not established yet (codex) or a user-defined
-        one from ``~/.lmer/harnesses`` that this mapping has never heard of.
+        user-defined one from ``~/.lmer/harnesses`` that this mapping has never
+        heard of.
         """
+        harness = "acme"
         assert harness not in supervisor.HARNESS_FIRST_COLUMN_ESCAPES
         message = f"{char}206 was merged"
         assert supervisor._sanitize_user_chat(message, harness) == message
+
+    def test_codex_defuses_only_its_shell_escape(self):
+        assert supervisor.HARNESS_FIRST_COLUMN_ESCAPES["codex"] == frozenset({"!"})
+        assert "codex" in supervisor.CHAT_DEFUSAL_HARNESSES
+        assert supervisor._sanitize_user_chat("!206 was merged", "codex") == (
+            ". !206 was merged"
+        )
+        assert supervisor._sanitize_user_chat("/followup", "codex") == "/followup"
+        assert supervisor._sanitize_user_chat("@AGENTS.md", "codex") == "@AGENTS.md"
+        assert supervisor._bracketed_paste_for("codex", "!206 was merged") is True
+
+    def test_steering_can_preserve_claude_slash_commands_only(self):
+        sanitize = supervisor._sanitize_user_chat
+
+        assert sanitize(
+            "/followup", "claude", preserve_slash_commands=True
+        ) == "/followup"
+        assert sanitize(
+            "!206 was merged", "claude", preserve_slash_commands=True
+        ) == ". !206 was merged"
+        assert sanitize(
+            "#254 is done", "claude", preserve_slash_commands=True
+        ) == ". #254 is done"
 
     def test_pi_slash_is_recorded_without_guessing_its_chat_prefix(self):
         assert supervisor.HARNESS_FIRST_COLUMN_ESCAPES["pi"] == frozenset({"/"})
@@ -2966,7 +2989,6 @@ class TestFastApiApp:
             f"the write is a different size than the defused message: {body}"
         )
 
-    @pytest.mark.parametrize("harness", ["codex", "pi"])
     @pytest.mark.parametrize(
         "message",
         [
@@ -2975,22 +2997,21 @@ class TestFastApiApp:
             "/workspace/src is where it lives",
         ],
     )
-    def test_non_claude_chat_is_not_rewritten_on_an_unmeasured_prefix(
-        self, monkeypatch, harness, message
+    def test_pi_chat_is_not_rewritten_on_an_unmeasured_prefix(
+        self, monkeypatch, message
     ):
         """The flag says "a human typed this in a chat composer" — true whatever
-        is running — and this is where that fact meets the harness. Only Claude
-        has a measured safe defusal prefix, so codex and pi take this path for
-        every character: their payload content is not rewritten. Terminal
-        protocol framing is allowed around ordinary content; it is not
+        is running — and this is where that fact meets the harness. Pi has no
+        measured safe defusal prefix, so its payload content is not rewritten.
+        Terminal protocol framing is allowed around ordinary content; it is not
         transcript text and makes no edit to the operator's words.
 
         Pi's ``/`` is a real escape on this tree's record
         (:mod:`lmer_cli.container.prompt_templates`), but it is not defused here:
         the transform needs the *other* half too, that a leading ``. `` is inert
-        in that composer. It is instead sent as keystrokes below. Codex's slash
-        behavior remains pre-existing and outside this change.
+        in that composer. It is instead sent as keystrokes below.
         """
+        harness = "pi"
         monkeypatch.setenv("LMER_HARNESS", harness)
         monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
         app, _buf, sink = self._build()
@@ -3011,6 +3032,73 @@ class TestFastApiApp:
         assert sink == [typed, b"\r"], (
             f"{harness} got a message nobody typed: {sink}"
         )
+
+    def test_codex_shell_escape_is_defused_but_slash_remains_live(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LMER_HARNESS", "codex")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        response = client.post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": True,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200
+        assert sink == [self._framed(b". !206 was merged"), b"\r"]
+
+        sink.clear()
+        response = client.post(
+            "/input",
+            json={"data": "/followup", "append_newline": True, "sanitize": True},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200
+        assert [bytes(part) for part in sink] == [
+            bytes(self._framed(supervisor._CODEX_FOLLOWUP_INSTRUCTION.encode())),
+            b"\r",
+        ]
+        assert not bytes(sink[0]).startswith(b". ")
+
+    def test_ctl_steering_keeps_claude_followup_live(self, monkeypatch):
+        """The ctl path guards prose escapes without consuming its command."""
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        response = client.post(
+            "/input",
+            json={
+                "data": "/followup rebase please",
+                "append_newline": True,
+                "sanitize": True,
+                "preserve_slash_commands": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200
+        assert sink == [b"/followup rebase please", b"\r"]
+
+        sink.clear()
+        response = client.post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": True,
+                "sanitize": True,
+                "preserve_slash_commands": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200
+        assert sink == [self._framed(b". !206 was merged"), b"\r"]
 
     def test_a_flagged_message_that_is_no_command_is_typed_as_written(
         self, monkeypatch

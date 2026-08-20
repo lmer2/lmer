@@ -942,7 +942,16 @@ def test_every_integer_setting_names_its_unit():
 
     for field, rule in cfg.INT_SETTINGS.items():
         assert rule.unit, field
+        assert rule.singular_unit, field
         assert (rule.maximum is None) == (rule.ceiling_reason is None), field
+
+
+def test_a_one_digest_default_warning_is_singular(caplog):
+    from lmer_platform import config as cfg
+
+    assert cfg._int_setting_value(0, field="nudge_pending_threshold") == 1
+    assert "using the default of 1 digest instead" in caplog.text
+    assert "1 digests" not in caplog.text
 
 
 @pytest.mark.parametrize("corrupt", ["yesterday", "not a date", "soon"])
@@ -971,5 +980,58 @@ def test_an_unusable_stored_mark_does_not_defeat_the_in_memory_bound(
 
     for _ in range(4):
         instance.nudge_once()
+
+    assert len(sender.calls) == 1
+
+
+def test_a_future_stored_mark_is_clamped_once_then_nudges_after_the_window(
+    detector, platform_root
+):
+    """A valid future stamp otherwise wins the fold and suppresses every repeat
+    until the skewed wall-clock time arrives. The correction must be durable:
+    deriving ``now`` on every tick restarts the window forever, and a restarted
+    daemon would otherwise keep the original future value.
+    """
+    sender = _Sender()
+    instance = detector(sender=sender)
+    assistant.notify("a question opened")
+    _age_spool(minutes=10)
+    payload = store.read_json(assistant.state_path())
+    payload["nudged_at"] = iso(minutes=-10)
+    store.write_json(assistant.state_path(), payload)
+
+    instance.nudge_once()
+
+    assert sender.calls == []
+    corrected = assistant.read_state().nudged_at
+    assert corrected is not None
+    assert 0 <= store.age_seconds(corrected) < 5
+
+    # Model the next tick after one complete interval, and model the daemon
+    # restart that used to bypass the detector's in-memory fold entirely.
+    payload = store.read_json(assistant.state_path())
+    payload["nudged_at"] = iso(minutes=10)
+    store.write_json(assistant.state_path(), payload)
+    restarted = detector(sender=sender)
+
+    restarted.nudge_once()
+
+    assert len(sender.calls) == 1
+
+
+def test_an_unwritable_future_mark_fails_open_to_one_nudge(
+    detector, platform_root, monkeypatch
+):
+    """A failed correction cannot leave the future value as a permanent bound."""
+    sender = _Sender()
+    instance = detector(sender=sender)
+    assistant.notify("a question opened")
+    _age_spool(minutes=10)
+    payload = store.read_json(assistant.state_path())
+    payload["nudged_at"] = iso(minutes=-10)
+    store.write_json(assistant.state_path(), payload)
+    monkeypatch.setattr(assistant, "_write_state", lambda _state: False)
+
+    instance.nudge_once()
 
     assert len(sender.calls) == 1

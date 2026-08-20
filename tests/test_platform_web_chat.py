@@ -126,8 +126,16 @@ def test_your_own_lines_are_still_shown_exactly_as_you_sent_them():
     halves rendered the same way, a long scroll is one wall of formatted prose.
     """
     text = _read(CHAT)
-    assert 'v-if="message.text && message.role === \'user\'"' in text, (
+    branch = re.search(
+        r'<p\s+v-if="([^"]+)"\s+class="text-body-medium said plain"',
+        text,
+        re.S,
+    )
+    assert branch and "message.role === 'user'" in branch.group(1), (
         "the user's own turns go through the renderer too"
+    )
+    assert "message.role === 'platform'" in branch.group(1), (
+        "platform-authored prose is no longer shown as exact bytes"
     )
     assert text.count("said plain") == 2, (
         "a sent message and one still pending must both be shown verbatim"
@@ -463,6 +471,20 @@ def test_a_watch_firing_is_drawn_as_an_event_and_not_as_anybodys_bubble():
     assert 'class="text-body-small said watch"' in text
     assert "white-space: pre-wrap" in _chat_rule(".watch"), (
         "the condition and the event run into one line"
+    )
+
+
+def test_platform_typed_input_is_labelled_as_machinery_not_as_the_operator():
+    text = _read(CHAT)
+    ground = _chat_function("function ground(message)")
+
+    assert "platform: 'lmer platform'" in text
+    assert "return message.role === 'assistant' ? 'agent' : 'action'" in ground
+    assert re.search(r"message\.role === 'user'", text), (
+        "the verbatim operator branch no longer identifies operator turns by role"
+    )
+    assert "message.role === 'user' || message.role === 'platform'" in text, (
+        "platform text is rendered as markdown instead of the exact bytes typed"
     )
 
 
@@ -1152,6 +1174,9 @@ def test_a_message_the_platform_defused_settles_on_its_own_defused_turn():
     assert _sanitize_user_chat(_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND, "claude") == (
         _AS_THE_SESSION_RECORDS_IT
     ), "the supervisor defuses a message into something this view does not expect"
+    assert _sanitize_user_chat(_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND, "codex") == (
+        _AS_THE_SESSION_RECORDS_IT
+    ), "Codex defuses a message into something this view does not expect"
 
     settled = _settled()
 

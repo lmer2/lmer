@@ -286,6 +286,8 @@ class _IntSettingRule:
     log_key: str
     #: What the value counts, so the shared warn message keeps its unit.
     unit: str
+    #: The one-count spelling, declared rather than guessed from the plural.
+    singular_unit: str
     #: Largest usable value, or ``None`` where a larger number is merely slower
     #: rather than unreachable. Required wherever the setting is measured against
     #: something bounded: an unsatisfiable value is an undocumented off-switch.
@@ -307,6 +309,7 @@ INT_SETTINGS = {
         ),
         log_key="platform_checkin_window_invalid",
         unit="seconds",
+        singular_unit="second",
     ),
     "nudge_after_seconds": _IntSettingRule(
         default=DEFAULT_NUDGE_AFTER_SECONDS,
@@ -316,6 +319,7 @@ INT_SETTINGS = {
         ),
         log_key="platform_nudge_after_invalid",
         unit="seconds",
+        singular_unit="second",
     ),
     "nudge_pending_threshold": _IntSettingRule(
         default=DEFAULT_NUDGE_PENDING_THRESHOLD,
@@ -326,6 +330,7 @@ INT_SETTINGS = {
         ),
         log_key="platform_nudge_threshold_invalid",
         unit="digests",
+        singular_unit="digest",
         maximum=MAX_NUDGE_PENDING_THRESHOLD,
         ceiling_reason=(
             f"the digest spool holds at most {MAX_NUDGE_PENDING_THRESHOLD}, so a "
@@ -608,9 +613,10 @@ def _int_setting_value(value: object, *, field: str) -> int:
     reason = _int_setting_reason(coerced, field=field)
     if reason is None:
         return int(coerced)
+    unit = rule.singular_unit if rule.default == 1 else rule.unit
     logger.warning(
         "%s value=%r — %s; using the default of %d %s instead",
-        rule.log_key, value, reason, rule.default, rule.unit,
+        rule.log_key, value, reason, rule.default, unit,
     )
     return rule.default
 
