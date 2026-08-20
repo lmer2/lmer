@@ -919,6 +919,15 @@ def test_the_ports_and_the_model_arrive_in_one_file_and_both_land(platform_root)
     assert entry["task"]["model"] == "opus"
 
 
+def test_a_session_reports_the_harness_resolved_without_a_spawn_flag(platform_root):
+    registry.register("s-1", pid=os.getpid(), task={"taskdef": "develop"})
+    _write_reported_facts("s-1", harness="codex")
+
+    entry = spawn.absorb_ports(registry.list_sessions())[0]
+
+    assert entry["task"]["harness"] == "codex"
+
+
 @pytest.mark.parametrize("reported", [{}, {"model": None}, {"model": "  "},
                                       {"model": 5}, {"ports": []}])
 def test_a_file_that_reports_no_usable_model_leaves_the_entry_alone(

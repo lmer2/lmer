@@ -551,6 +551,12 @@ SETTLED_SECONDS = 120.0
 #: Reentrant because :func:`rotate` is a stop and a start.
 _LOCK = threading.RLock()
 
+#: Serializes only the registry/state publication boundary shared with
+#: :func:`status`. The lifecycle lock above is deliberately much wider and may
+#: cover process spawn or bounded termination waits; status polling must not pay
+#: for either operation.
+_PUBLICATION_LOCK = threading.RLock()
+
 
 
 class AssistantError(RuntimeError):
@@ -967,43 +973,48 @@ def status() -> AssistantStatus:
     """What the assistant is doing, reconciled against the registry.
 
     Side-effect free: a stale pointer is *reported* (``stale``), never cleaned up
-    here. :func:`stop` and :func:`start` are where state changes, so that reading
-    the status from a UI poll can never race a start.
+    here. The publication lock is still required even though this writes nothing:
+    :func:`start` publishes the live registry entry before it publishes the new
+    state generation, and a reader between those writes would otherwise combine
+    the new session id with the previous generation and call it untracked. The
+    lock covers only those adjacent writes, so status polling does not wait for a
+    process spawn or termination grace period.
     """
-    state = read_state()
-    live = _live_assistant()
-    if live is None:
+    with _PUBLICATION_LOCK:
+        state = read_state()
+        live = _live_assistant()
+        if live is None:
+            return AssistantStatus(
+                running=False,
+                session_id=state.session_id,
+                pid=None,
+                started_at=state.started_at,
+                generation=state.generation,
+                stale=state.session_id is not None,
+                tracked=False,
+                pending=len(state.pending),
+                handoff=state.handoff,
+                nudged_at=state.nudged_at,
+            )
+        session_id = live.get("id")
+        pid = live.get("pid")
         return AssistantStatus(
-            running=False,
-            session_id=state.session_id,
-            pid=None,
-            started_at=state.started_at,
+            running=True,
+            session_id=session_id if isinstance(session_id, str) else None,
+            pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+            # The live entry's own timestamp, not the recorded one: an adopted
+            # assistant (tracked=False) has no recorded start, and the age an age
+            # policy needs is the session's, not the pointer's.
+            started_at=_opt_str(live.get("started_at")) or state.started_at,
             generation=state.generation,
-            stale=state.session_id is not None,
-            tracked=False,
+            stale=False,
+            tracked=session_id == state.session_id,
             pending=len(state.pending),
             handoff=state.handoff,
             nudged_at=state.nudged_at,
+            log_path=_opt_str(live.get("log_path")),
+            settings=_launched_settings(live),
         )
-    session_id = live.get("id")
-    pid = live.get("pid")
-    return AssistantStatus(
-        running=True,
-        session_id=session_id if isinstance(session_id, str) else None,
-        pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
-        # The live entry's own timestamp, not the recorded one: an adopted
-        # assistant (tracked=False) has no recorded start, and the age an age
-        # policy needs is the session's, not the pointer's.
-        started_at=_opt_str(live.get("started_at")) or state.started_at,
-        generation=state.generation,
-        stale=False,
-        tracked=session_id == state.session_id,
-        pending=len(state.pending),
-        handoff=state.handoff,
-        nudged_at=state.nudged_at,
-        log_path=_opt_str(live.get("log_path")),
-        settings=_launched_settings(live),
-    )
 
 
 def _launched_settings(live: dict) -> dict:
@@ -1468,8 +1479,31 @@ def start(
                 ),
                 "invalid_request",
             ) from exc
+        published = False
+
+        def publish_registration(register, session_id: str, _pid: int) -> None:
+            nonlocal published
+            with _PUBLICATION_LOCK:
+                register()
+                _write_state(replace(
+                    state,
+                    session_id=session_id,
+                    started_at=now,
+                    generation=state.generation + 1,
+                    handoff=text,
+                    handoff_at=stamp,
+                    stopped_at=None,
+                    stop_reason=None,
+                ))
+                published = True
+
         try:
-            result = spawn.spawn_session(config, request, kind=KIND)
+            result = spawn.spawn_session(
+                config,
+                request,
+                kind=KIND,
+                publish_registration=publish_registration,
+            )
         except spawn.CapacityError as exc:
             raise _refuse(
                 AssistantCapacityError(
@@ -1482,16 +1516,11 @@ def start(
                 "cap_reached",
             ) from exc
 
-        _write_state(replace(
-            state,
-            session_id=result.session_id,
-            started_at=now,
-            generation=state.generation + 1,
-            handoff=text,
-            handoff_at=stamp,
-            stopped_at=None,
-            stop_reason=None,
-        ))
+        if not published:
+            raise AssistantError(
+                "the assistant spawn returned without publishing its registry "
+                "entry and lifecycle state"
+            )
         append_event(
             "assistant_started",
             note=result.session_id,
@@ -1563,23 +1592,34 @@ def stop(
 
         session_id = live.get("id")
         gone = _terminate(live.get("pid"))
-        if gone and isinstance(session_id, str):
+        if gone:
             # The spawn path keeps the entry of a session that exited unclean,
             # because that entry is how a crash is detected — but this exit was
             # requested, so leaving it would report an assistant we killed as one
             # that died. Signal-terminated is never a clean exit, so nothing else
             # is going to remove it.
-            registry.remove(session_id)
-
-        _write_state(replace(
-            state,
-            session_id=None if gone else state.session_id,
-            started_at=None if gone else state.started_at,
-            handoff=text,
-            handoff_at=stamp,
-            stopped_at=now,
-            stop_reason=reason,
-        ))
+            with _PUBLICATION_LOCK:
+                if isinstance(session_id, str):
+                    registry.remove(session_id)
+                _write_state(replace(
+                    state,
+                    session_id=None,
+                    started_at=None,
+                    handoff=text,
+                    handoff_at=stamp,
+                    stopped_at=now,
+                    stop_reason=reason,
+                ))
+        else:
+            _write_state(replace(
+                state,
+                session_id=state.session_id,
+                started_at=state.started_at,
+                handoff=text,
+                handoff_at=stamp,
+                stopped_at=now,
+                stop_reason=reason,
+            ))
         append_event(
             "assistant_stopped",
             note=session_id if isinstance(session_id, str) else None,

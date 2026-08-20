@@ -3198,6 +3198,7 @@ def test_the_source_says_which_harness_wrote_the_file(
     plant_session("s-h1", fixture=fixture)
     page = transcripts.read_messages("s-h1")
     assert [source.harness for source in page.sources] == [harness]
+    assert [source.vocabulary for source in page.sources] == [harness]
 
 
 def test_a_file_nothing_recognises_keeps_the_label_it_came_with(platform_root):
@@ -3205,6 +3206,7 @@ def test_a_file_nothing_recognises_keeps_the_label_it_came_with(platform_root):
     plant_session("s-h2", fixture=UNKNOWN_FIXTURE)
     page = transcripts.read_messages("s-h2")
     assert [source.harness for source in page.sources] == ["claude"]
+    assert [source.vocabulary for source in page.sources] == [None]
 
 
 @pytest.mark.parametrize("fixture", [PI_FIXTURE, CODEX_FIXTURE])
@@ -3353,7 +3355,60 @@ def test_the_source_reports_the_harness_the_meta_record_declares(platform_root):
     plant_session("s-lmer1", fixture=LMER_FIXTURE)
     page = transcripts.read_messages("s-lmer1")
     assert [source.harness for source in page.sources] == ["opencode"]
+    assert [source.vocabulary for source in page.sources] == ["lmer"]
     assert page.note is None
+
+
+@pytest.mark.parametrize("fixture,harness", [
+    (SESSION_FIXTURE, "claude"),
+    (PI_FIXTURE, "pi"),
+    (CODEX_FIXTURE, "codex"),
+])
+def test_adapter_tier_wins_over_newer_canonical_output_once(
+    platform_root, fixture, harness, caplog
+):
+    """#300: derived canonical output never doubles a supported adapter."""
+    session_id = f"s-tier-{harness}"
+    registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
+    native = plant_at(session_id, f"{harness}/native.jsonl", fixture)
+    canonical = transcripts.session_transcript_dir(session_id) / "_lmer" / "derived.jsonl"
+    canonical.parent.mkdir(parents=True, exist_ok=True)
+    canonical.write_text(
+        '{"type":"lmer.meta","format":1,"harness":"opencode"}\n'
+        '{"type":"lmer.message","role":"assistant",'
+        '"text":"derived duplicate must not render"}\n',
+        encoding="utf-8",
+    )
+    os.utime(native, (1_700_000_000, 1_700_000_000))
+    os.utime(canonical, (1_800_000_000, 1_800_000_000))
+
+    with caplog.at_level("WARNING", logger="lmer_platform.transcripts"):
+        page = transcripts.read_messages(
+            session_id, limit=transcripts.MAX_MESSAGE_LIMIT
+        )
+        turn = transcripts.last_turn(session_id)
+        # Both paths poll again; the mixed-tier diagnosis remains one log line.
+        transcripts.read_messages(session_id)
+
+    expected = transcripts.normalise_records(records(fixture))
+    assert [message.text for message in page.messages] == [
+        message.text for message in expected
+    ]
+    assert "derived duplicate must not render" not in [
+        message.text for message in page.messages
+    ]
+    assert turn is not None and turn.text == expected[-1].text
+    by_vocabulary = {source.vocabulary: source.harness for source in page.sources}
+    assert by_vocabulary[harness] == harness
+    assert by_vocabulary["lmer"] == "opencode", (
+        "record vocabulary was conflated with the cosmetic harness label"
+    )
+    warnings = [
+        record for record in caplog.records
+        if "platform_transcript_mixed_tiers" in record.getMessage()
+        and session_id in record.getMessage()
+    ]
+    assert len(warnings) == 1
 
 
 def canonical_file(tmp_path, *lines):

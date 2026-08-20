@@ -785,6 +785,15 @@ def _long_paste():
     return text
 
 
+def _multi_kb_fenced_paste():
+    """Issue #297's shape: large enough to span terminal reads, one code fence."""
+    from lmer_platform import transcripts
+
+    text = "```python\n" + "print('one submitted turn')\n" * 250 + "```"
+    assert 4095 < len(text) < transcripts.TEXT_LIMIT
+    return text
+
+
 def _cases():
     """Every fixture, built once. Case name → the page and the bubbles held."""
     working = _agent_turn("Working on it.", _STAMPS[0])
@@ -814,6 +823,15 @@ def _cases():
                 _agent_turn("That is a broken mount.", _STAMPS[2]),
             ]),
             "pending": [{"text": _long_paste(), "at": 0, "since": 1}],
+        },
+        "multi_kb_fenced_paste": {
+            "messages": _conversation([
+                working,
+                _operator_turn(_multi_kb_fenced_paste()),
+            ]),
+            "pending": [
+                {"text": _multi_kb_fenced_paste(), "at": 0, "since": 1}
+            ],
         },
         # No reply after the turn, so only the whitespace layer can settle this one.
         "recorded_in_pieces": {
@@ -1094,6 +1112,9 @@ def test_the_text_match_forgives_whitespace_and_nothing_else():
     assert settled["recorded_in_pieces"] == [], (
         "a turn the harness recorded in two blocks never matches what was typed, "
         f"so the bubble outlives it — {settled['recorded_in_pieces']}"
+    )
+    assert settled["multi_kb_fenced_paste"] == [], (
+        "the one multi-kilobyte fenced turn did not settle its pending bubble"
     )
     assert settled["different_words"] == ["rebase on main"], (
         "a different message settled this bubble, so the match now forgives words"
@@ -1807,6 +1828,16 @@ def test_a_message_from_the_composer_is_marked_as_typed_by_a_person():
     assert body["sanitize"] is True, f"the flag never reached the wire: {body}"
     assert body["data"] == _A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND
     assert body["append_newline"] is True, "a chat message is typed AND submitted"
+
+
+def test_multi_kilobyte_fenced_paste_reaches_the_wire_as_one_message():
+    payload = _multi_kb_fenced_paste()
+    seen = _wire(payload)
+
+    assert seen["composed"]["data"] == payload
+    body = json.loads(seen["flagged"]["body"])
+    assert body["data"] == payload
+    assert body["append_newline"] is True
 
 
 def test_a_send_nobody_flagged_puts_nothing_new_on_the_wire():

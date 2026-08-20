@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 import pytest
 
-from lmer_cli import gate_lock, user_harnesses
+from lmer_cli import gate_lock, precommit_cache, user_harnesses
 
 _OUTDATED_TREE_MSG = (
     "tests/conftest.py needs the #233 write-attribution layer "
@@ -54,8 +54,15 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 #: session fixture below points it at a tmp dir so the suite cannot see the
 #: marker held by the very `gate-check` running it. Stripping it would send any
 #: env-isolating module back to the operational lock dir, where a live gate
-#: would defer the commit paths those tests are asserting on.
-_HARNESS_ENV = frozenset({REQUIRE_NODE_ENV, gate_lock.LOCK_DIR_ENV})
+#: would defer the commit paths those tests are asserting on. The pre-commit
+#: cache directory has the same floor-beneath-tests role: GateSystem tests run
+#: mocked pre-commit commands and must never publish those verdicts into the
+#: operational cache merely because this project is opted in.
+_HARNESS_ENV = frozenset({
+    REQUIRE_NODE_ENV,
+    gate_lock.LOCK_DIR_ENV,
+    precommit_cache.CACHE_DIR_ENV,
+})
 
 
 def strip_lmer_env(monkeypatch):
@@ -618,6 +625,24 @@ def _isolate_gate_lock_dir(tmp_path_factory):
     finally:
         gate_lock.DEFAULT_LOCK_DIR = original_default
         os.environ.pop(gate_lock.LOCK_DIR_ENV, None)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_precommit_cache(tmp_path_factory):
+    """Keep mocked gate verdicts out of the operational pre-commit cache."""
+    directory = str(tmp_path_factory.mktemp("precommit-cache"))
+    original_default = precommit_cache.DEFAULT_CACHE_DIR
+    original_env = os.environ.get(precommit_cache.CACHE_DIR_ENV)
+    precommit_cache.DEFAULT_CACHE_DIR = directory
+    os.environ[precommit_cache.CACHE_DIR_ENV] = directory
+    try:
+        yield
+    finally:
+        precommit_cache.DEFAULT_CACHE_DIR = original_default
+        if original_env is None:
+            os.environ.pop(precommit_cache.CACHE_DIR_ENV, None)
+        else:
+            os.environ[precommit_cache.CACHE_DIR_ENV] = original_env
 
 
 @pytest.fixture(autouse=True, scope="session")

@@ -707,10 +707,12 @@ transcript mount.
   conversation: roles, text, timestamps, tool calls with their outcome. That set
   is **closed** — no further in-tree dialect adapters are added unless the
   operator says otherwise, and every other format integrates via the canonical
-  tier below. The rule is also what keeps one conversation from rendering twice:
-  a native file and its converted twin could only both render if a dialect
-  somebody already converts later gained an in-tree adapter, which this policy
-  forbids.
+  tier below. Adapter-tier messages win mechanically if a session contains both
+  a readable native transcript and readable canonical derived output: one
+  warning is logged and only native messages render (including for halt
+  detection). Source metadata keeps the detected record vocabulary separate
+  from the cosmetic harness label. The canonical twin should not exist for an
+  adapter-supported harness; precedence prevents it from doubling the view.
 - **Canonical tier — any drop-in.** A user harness makes its transcripts
   readable by shipping an **in-container converter**: its own code, running
   where the harness already runs, tailing the harness's native session files and

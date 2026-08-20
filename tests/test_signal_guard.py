@@ -1,7 +1,6 @@
 """Tests for the orchestrator signal-reminder Stop hook (hooks/signal_guard.py)."""
 import json
 import os
-import re
 import subprocess
 import sys
 import uuid
@@ -41,7 +40,7 @@ HOOK = REPO_ROOT / "hooks" / "signal_guard.py"
 
 # One representative hit and one near-miss per pattern family. Spellings are the
 # real ones — `--review-file` posts a review on both reviewer CLIs, and the
-# taskdef's mandated path is the wrapper script; an earlier version of these
+# wrappers report successful posts themselves; an earlier version of these
 # fixtures invented a `--post-review` flag and agreed with a hook that had
 # invented the same one, which is what TestPatternsMatchRealCommands now
 # prevents. The near-misses are the boundary cases the character classes and the
@@ -65,31 +64,6 @@ MILESTONE_HITS = [
      "gitlab-review group/proj 42 --reply-thread abc --comment-file r.md"),
     ("github-review --review-file",
      "github-review owner/repo 7 --review-file /tmp/review.json"),
-    ("gitlab-review-post-review.sh",
-     "bash /Agents/global/hooks/gitlab-review-post-review.sh"),
-    ("github-review-post-review.sh",
-     "bash /Agents/global/hooks/github-review-post-review.sh"),
-    # Every legal simple-command prefix counts. The assignment form matters
-    # most: the wrappers take no arguments and read three exported variables.
-    ("gitlab-review-post-review.sh",
-     "GITLAB_PROJECT=g/p GITLAB_MR_ID=42 GITLAB_REVIEW_FILE=/tmp/r.json "
-     "bash /Agents/global/hooks/gitlab-review-post-review.sh"),
-    ("gitlab-review-post-review.sh",
-     "sudo bash -x /Agents/global/hooks/gitlab-review-post-review.sh"),
-    ("gitlab-review-post-review.sh",
-     "timeout 300 bash /Agents/global/hooks/gitlab-review-post-review.sh"),
-    ("gitlab-review-post-review.sh",
-     "if true; then bash /Agents/global/hooks/gitlab-review-post-review.sh; fi"),
-    ("gitlab-review-post-review.sh", "/Agents/global/hooks/gitlab-review-post-review.sh"),
-    ("gitlab-review-post-review.sh", "./gitlab-review-post-review.sh"),
-    ("github-review-post-review.sh",
-     "{ bash /Agents/global/hooks/github-review-post-review.sh; }"),
-    ("gitlab-review-post-review.sh",
-     "if false; then true; else bash /Agents/global/hooks/gitlab-review-post-review.sh; fi"),
-    ("gitlab-review-post-review.sh",
-     "nohup bash /Agents/global/hooks/gitlab-review-post-review.sh &"),
-    ("github-review-post-review.sh",
-     "cd /tmp && bash hooks/github-review-post-review.sh"),
     ("work state set --status=complete", "work state set --status=complete"),
     ("work state set --status=complete", "work state set --status complete"),
     ("work state set --status=complete",
@@ -97,6 +71,15 @@ MILESTONE_HITS = [
 ]
 
 MILESTONE_MISSES = [
+    # The wrappers own this event now: they signal after a successful post, and
+    # no parser of command text can establish that fact more reliably. This also
+    # closes the redundant second-review nudge when an earlier signal invocation
+    # exists in the transcript and the wrapper's newer signal exists only as a
+    # channel file.
+    "bash /Agents/global/hooks/gitlab-review-post-review.sh",
+    "{ bash /Agents/global/hooks/github-review-post-review.sh; }",
+    "GITLAB_PROJECT=g/p GITLAB_MR_ID=42 GITLAB_REVIEW_FILE=/tmp/r.json "
+    "bash /Agents/global/hooks/gitlab-review-post-review.sh",
     'grep "gate-push" notes.md',
     # Measured false positives before quote-stripping: whitespace inside quotes
     # is a boundary like any other, so a command that merely talks about a
@@ -319,14 +302,6 @@ class TestMilestonePatterns:
         command = "cat <<EOF > notes.md\nrun gate-push before merging\nEOF"
         assert unsignalled_milestone([_assistant_bash(command)])[0] == "gate-push"
 
-    def test_the_wrapper_script_does_not_read_as_the_bare_cli(self):
-        # `gitlab-review-post-review.sh` must not satisfy the `gitlab-review\s…`
-        # rows (no whitespace follows the CLI name) — the label proves which row
-        # matched.
-        command = "bash /Agents/global/hooks/gitlab-review-post-review.sh"
-        assert unsignalled_milestone([_assistant_bash(command)])[0] == \
-            "gitlab-review-post-review.sh"
-
 
 # ---- pattern list vs. reality (drift guard) -----------------------------------
 
@@ -372,12 +347,11 @@ class TestPatternsMatchRealCommands:
     """
 
     def test_every_row_is_classified(self):
-        """A new row must be a flag row, a script row, or a bin row — so adding
+        """A new row must be a flag row or a bin row — so adding
         one to the hook without a reality check fails here."""
         for label, _pattern in _MILESTONE_PATTERNS:
             assert (
-                label.endswith(".sh")
-                or " --" in label
+                " --" in label
                 or (REPO_ROOT / "bin" / label).exists()
             ), f"unclassified milestone row: {label}"
 
@@ -392,28 +366,8 @@ class TestPatternsMatchRealCommands:
         assert flag in _option_strings(owners[prefix]()), (
             f"{label}: {flag} is not an option of the {prefix} CLI")
 
-    @pytest.mark.parametrize("label", [
-        label for label, _ in _MILESTONE_PATTERNS if label.endswith(".sh")
-    ])
-    def test_script_rows_name_a_real_hook_script(self, label):
-        assert (REPO_ROOT / "hooks" / label).exists(), \
-            f"{label} is not in hooks/"
-
-    def test_wrapper_scripts_take_no_positional_arguments(self):
-        """The wrappers accept nothing on the command line, which is why the
-        fixtures spell them bare or assignment-prefixed."""
-        for label, _ in _MILESTONE_PATTERNS:
-            if not label.endswith("-post-review.sh"):
-                continue
-            body = (REPO_ROOT / "hooks" / label).read_text()
-            assert not re.search(r"\$\{?[1-9@*]", body), (
-                f"{label} now reads positional arguments — the fixtures spell it "
-                "as a command with none"
-            )
-
     def test_bin_rows_name_a_real_bin_script(self):
-        bare = [label for label, _ in _MILESTONE_PATTERNS
-                if " --" not in label and not label.endswith(".sh")]
+        bare = [label for label, _ in _MILESTONE_PATTERNS if " --" not in label]
         assert bare, "expected at least one bare-command row (gate-push)"
         for label in bare:
             assert (REPO_ROOT / "bin" / label).exists()

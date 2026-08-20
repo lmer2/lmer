@@ -126,7 +126,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import urlparse
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
@@ -1019,13 +1019,13 @@ def ports_file_for(session_id: str) -> Path:
     honored by ``lmer_cli.cli``). A file rather than an import keeps ``lmer_cli``
     free of any dependency on this package.
 
-    T51 put a second fact through the same channel, the model the session
-    resolved (see :func:`absorb_ports`), because it has the same shape: known
-    only inside the launch, and unguessable from here — the daemon's own
-    environment is not evidence about a run. The name stayed as it is on both
-    sides: it is an interface between two independently-installed programs, and
-    an older ``lmer`` writing a ports-only file into a newer platform is exactly
-    the case that must keep working.
+    T51 put the session-resolved model through the same channel, and #318 added
+    the resolved harness (see :func:`absorb_ports`). Both have the same shape:
+    known only inside the launch and unguessable here — the daemon's environment
+    is not evidence about a preset/model-selected run. The name stayed as it is
+    on both sides: it is an interface between independently-installed programs,
+    and an older ``lmer`` writing a ports-only file into a newer platform is
+    exactly the case that must keep working.
     """
     return logs_dir() / f"{session_id}.ports.json"
 
@@ -1604,17 +1604,25 @@ def _reported_model(payload: dict) -> Optional[str]:
     return model.strip()
 
 
+def _reported_harness(payload: dict) -> Optional[str]:
+    """The resolved harness a session reported for itself, if usable."""
+    harness = payload.get("harness")
+    if not isinstance(harness, str) or not harness.strip():
+        return None
+    return harness.strip()
+
+
 def absorb_ports(sessions: list) -> list:
     """Fold what running sessions reported about themselves into their entries.
 
-    Two facts today, both from :func:`ports_file_for`: the published port mapping
-    and the model the session resolved. Called on the read path because both
+    Three facts today, all from :func:`ports_file_for`: the published port mapping,
+    model and harness the session resolved. Called on the read path because they
     appear *after* the spawn returns — ``lmer`` publishes ports while starting the
     container and settles the model just before that, which is strictly later than
     the moment the registry entry is written.
 
     Each fact is folded only when the entry lacks it, which is what makes this
-    converge and then stop doing work — and, for the model, what keeps the
+    converge and then stop doing work — and, for model/harness, what keeps the
     precedence right in the other direction: a spawn that *named* a model already
     recorded it, so there is nothing here to learn. Only a session that named none
     (the ordinary case, where the model comes from the daemon's environment or a
@@ -1638,8 +1646,9 @@ def absorb_ports(sessions: list) -> list:
         # missing model: the fleet view already treats it as no metadata at all
         # (lmer_platform.inventory), and it stays exactly as its writer left it.
         wants_model = isinstance(task, dict) and not task.get("model")
+        wants_harness = isinstance(task, dict) and not task.get("harness")
         # Nothing left to learn about this session: stop reading its file.
-        if not session_id or not (wants_ports or wants_model):
+        if not session_id or not (wants_ports or wants_model or wants_harness):
             updated.append(entry)
             continue
         path = ports_file_for(session_id)
@@ -1663,11 +1672,17 @@ def absorb_ports(sessions: list) -> list:
         if wants_ports and isinstance(ports, list) and ports:
             changes["ports"] = ports
         model = _reported_model(payload)
-        if wants_model and model:
+        harness = _reported_harness(payload)
+        if (wants_model and model) or (wants_harness and harness):
             # The whole block, because registry.update merges at the top level
             # only; a bare ``{"model": …}`` would drop the taskdef and target the
             # fleet view labels the row with.
-            changes["task"] = {**task, "model": model}
+            resolved = dict(task)
+            if wants_model and model:
+                resolved["model"] = model
+            if wants_harness and harness:
+                resolved["harness"] = harness
+            changes["task"] = resolved
         if not changes:
             updated.append(entry)
             continue
@@ -2318,6 +2333,9 @@ def spawn_session(
     request: SpawnRequest,
     *,
     kind: str = "worker",
+    publish_registration: Optional[
+        Callable[[Callable[[], None], str, int], None]
+    ] = None,
 ) -> SpawnResult:
     """Start a session, register it, and track its run.
 
@@ -2492,50 +2510,61 @@ def spawn_session(
     # Register before starting the drain thread: the thread's cleanup path
     # removes the entry, and it must never run against an entry that was never
     # written.
-    registry.register(
-        session_id,
-        kind=kind,
-        pid=process.pid,
-        task={
-            "taskdef": request.taskdef,
-            "target": request.target,
-            "repo": repo_url,
-            "preset": request.preset,
-            # Names only, which is all that was ever passed: the presets these
-            # select stay on the host (their env can hold credentials), and the
-            # entry is a debugging artifact people paste around.
-            "agents": request.agents,
-            "harness": request.harness,
-            # What the spawn *asked* for, which is ``None`` for the ordinary
-            # request that names no model. The session overwrites it with what
-            # it actually resolved as soon as it reports back (absorb_ports), so
-            # this key answers "which model is driving this run" rather than
-            # only "which model was requested".
-            "model": request.model,
-            # Recorded rather than re-derived, because the presets file is hot:
-            # a slot repointed while this session runs must not change what it
-            # is understood to be holding (issue #245).
-            "slot_service": slot_service,
-            # A group session can retarget to any member, so it holds all of
-            # them; the members are resolved once, here, rather than re-read on
-            # every poll (issue #312).
-            "slot_service_group": slot_group,
-            "slot_services": slot_services,
-        },
-        run={"host": host, "project": project, "slug": slug},
-        # The *only* record that the slot is taken — nothing writes an occupancy
-        # file — so a session that dies takes its claim with it (issue #245).
-        slot=request.slot,
-        # Reachability, minus the credential: ``token_ref`` is a path, and
-        # registry.register rejects an inline ``token`` outright (spec §6.2).
-        control={
-            "host": _CONTROL_HOST,
-            "port": control_port,
-            "token_ref": str(token_file),
-        },
-        log_path=str(log_file),
-        started_at=utc_now_iso(),
-    )
+    def register() -> None:
+        registry.register(
+            session_id,
+            kind=kind,
+            pid=process.pid,
+            task={
+                "taskdef": request.taskdef,
+                "target": request.target,
+                "repo": repo_url,
+                "preset": request.preset,
+                # Names only, which is all that was ever passed: the presets these
+                # select stay on the host (their env can hold credentials), and the
+                # entry is a debugging artifact people paste around.
+                "agents": request.agents,
+                "harness": request.harness,
+                # What the spawn *asked* for, which is ``None`` for the ordinary
+                # request that names no model. The session overwrites it with what
+                # it actually resolved as soon as it reports back (absorb_ports), so
+                # this key answers "which model is driving this run" rather than
+                # only "which model was requested".
+                "model": request.model,
+                # Recorded rather than re-derived, because the presets file is hot:
+                # a slot repointed while this session runs must not change what it
+                # is understood to be holding (issue #245).
+                "slot_service": slot_service,
+                # A group session can retarget to any member, so it holds all of
+                # them; the members are resolved once, here, rather than re-read on
+                # every poll (issue #312).
+                "slot_service_group": slot_group,
+                "slot_services": slot_services,
+            },
+            run={"host": host, "project": project, "slug": slug},
+            # The *only* record that the slot is taken — nothing writes an occupancy
+            # file — so a session that dies takes its claim with it (issue #245).
+            slot=request.slot,
+            # Reachability, minus the credential: ``token_ref`` is a path, and
+            # registry.register rejects an inline ``token`` outright (spec §6.2).
+            control={
+                "host": _CONTROL_HOST,
+                "port": control_port,
+                "token_ref": str(token_file),
+            },
+            log_path=str(log_file),
+            started_at=utc_now_iso(),
+        )
+
+    # Most sessions publish only their registry entry. The assistant also has a
+    # lifecycle-state pointer that must become visible with that entry, so it
+    # supplies a tiny publication wrapper. It runs only after process startup and
+    # receives registration as a thunk, keeping its lock around the two writes
+    # rather than around the whole spawn.
+    if publish_registration is None:
+        register()
+    else:
+        publish_registration(register, session_id, process.pid)
 
     # Track the run so it appears in this orchestrator's fleet view (D25). Only
     # possible with a full identity; a session whose repo URL could not be parsed

@@ -381,15 +381,15 @@ def _record_platform_facts(**facts) -> None:
     The orchestrator platform (issue #141) hands a spawned ``lmer`` this path to
     report back things it can only learn at launch — the ports it published (free
     ports are picked *here*, so the spawning platform cannot know them in advance)
-    and the model actually driving the session, which is resolved after preset
-    application and would be a guess anywhere else (T50/T51). The platform folds
+    plus the model and harness actually driving the session, which are resolved
+    after preset application and would be guesses anywhere else (T50/T51). The platform folds
     whatever it finds into the session's registry entry
     (``lmer_platform.spawn.absorb_ports``).
 
     A file rather than an import keeps the dependency pointing the right way:
     ``lmer_platform`` depends on ``lmer_cli``, never the reverse. Merged rather
     than overwritten because the two facts are recorded at different points in a
-    launch — the model before the container is built, the ports while it starts —
+    launch — model/harness before the container is built, ports while it starts —
     and the second writer must not erase the first. Best-effort by design:
     failing to record an annotation must never fail the launch it annotates, so a
     file that cannot be read is treated as empty rather than as an error.
@@ -438,8 +438,8 @@ def _record_published_ports(ports: list[int], bind: str) -> None:
     )
 
 
-def _record_session_model(model: str | None) -> None:
-    """Report the model this session resolved to, if it resolved to one.
+def _record_session_model(model: str | None, harness: str | None = None) -> None:
+    """Report the model and harness this session resolved inside the container.
 
     The platform cannot work this out for itself and must not guess: it applies
     preset environment only over keys its own environment leaves unset, so an
@@ -448,12 +448,22 @@ def _record_session_model(model: str | None) -> None:
     named a preset (``lmer_platform.inventory.RunView.model``). Here the value is
     resolved: flag, then preset env, then the ambient environment.
 
-    Nothing is written when there is no model, rather than a ``None``: unset is
-    the harness running its own default, and recording that as a fact would put a
-    name on a row that never chose one.
+    The harness is always resolved even when the spawn named neither one nor a
+    model. Reporting it is what lets the host render harness-specific terminal
+    geometry for preset/model-selected sessions instead of treating an absent
+    ``--harness`` as an unknown harness.
+
+    Nothing is written for an absent fact rather than writing ``None``: unset
+    model means the harness ran its own default, and recording that as a model
+    would put a name on a row that never chose one.
     """
+    facts = {}
     if model:
-        _record_platform_facts(model=model)
+        facts["model"] = model
+    if harness:
+        facts["harness"] = harness
+    if facts:
+        _record_platform_facts(**facts)
 
 
 class ParseRefused(Exception):
@@ -2038,7 +2048,7 @@ def main(argv: list[str] | None = None) -> int:
     # rather than anywhere earlier because this is the first point the answer is
     # final: the flag, the preset's env and the ambient environment have all had
     # their say. A plain terminal launch sets no ports file and writes nothing.
-    _record_session_model(session_model)
+    _record_session_model(session_model, harness.name)
 
     # Harnesses the --agents fan-out children imply beyond the session's
     # (issue #131): their credential files union into build_user_mounts
@@ -2635,6 +2645,7 @@ def main(argv: list[str] | None = None) -> int:
         # live in. Both are read where the gates run — in the container.
         "LMER_GATE_NO_CACHE": os.environ.get("LMER_GATE_NO_CACHE"),
         "LMER_GATE_CACHE_DIR": os.environ.get("LMER_GATE_CACHE_DIR"),
+        "LMER_PRECOMMIT_CACHE_DIR": os.environ.get("LMER_PRECOMMIT_CACHE_DIR"),
         # Opt-in to the masterplan workflow. Truthy (get_bool_env) turns on the
         # session-start plugin provisioning in claude-runner.sh; LMER_TASK=masterplan
         # implies it. MASTERPLAN_RUNS_DIR is computed in-container from the run

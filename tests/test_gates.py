@@ -11,15 +11,29 @@ import os
 import sys
 import tempfile
 import shutil
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lmer_cli import gate_cache
+from lmer_cli import gate_cache, precommit_cache
 from lmer_cli.gates import GateSystem, CheckStatus, CheckResult, Colors
 from tests.conftest import strip_lmer_env
+
+
+def enable_precommit_reuse(monkeypatch, tmp_path):
+    """Authorize a cache skip outside the repository being checked."""
+    work = tmp_path / "work"
+    info = work / "git.example.com" / "org/proj" / "info"
+    info.mkdir(parents=True)
+    info.joinpath("gate-check.yaml").write_text(
+        "precommit:\n  reuse_all_files: true\n"
+    )
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+    monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+    monkeypatch.setenv("LMER_REPO_PROJECT", "org/proj")
 
 
 class TestGateSystem:
@@ -309,6 +323,99 @@ class TestGateSystem:
         result = self.gate.check_precommit()
         assert result.status == CheckStatus.FAILED
         assert result.details == ["pre-commit exited 2 with no output"]
+
+    @patch.object(precommit_cache, "compute_fingerprint")
+    @patch('subprocess.run')
+    def test_check_precommit_reuse_is_off_by_default(
+        self, mock_run, compute_fingerprint, tmp_path, monkeypatch
+    ):
+        strip_lmer_env(monkeypatch)
+        mock_run.return_value = MagicMock(returncode=0, stdout="passed", stderr="")
+        self.gate.project_root = tmp_path
+
+        result = self.gate.check_precommit()
+
+        assert result.status == CheckStatus.PASSED
+        compute_fingerprint.assert_not_called()
+        mock_run.assert_called_once()
+
+    @patch.object(precommit_cache, "compute_fingerprint")
+    @patch('subprocess.run')
+    def test_repo_local_config_cannot_authorize_skipping_precommit(
+        self, mock_run, compute_fingerprint, tmp_path, monkeypatch
+    ):
+        strip_lmer_env(monkeypatch)
+        config_dir = tmp_path / ".lmer"
+        config_dir.mkdir()
+        config_dir.joinpath("gate-check.yaml").write_text(
+            "precommit:\n  reuse_all_files: true\n"
+        )
+        self.gate.project_root = tmp_path
+        mock_run.return_value = MagicMock(returncode=0, stdout="passed", stderr="")
+
+        result = self.gate.check_precommit()
+
+        assert result.status == CheckStatus.PASSED
+        compute_fingerprint.assert_not_called()
+        mock_run.assert_called_once()
+
+    @patch.object(precommit_cache, "read_pass")
+    @patch.object(precommit_cache, "compute_fingerprint")
+    @patch('subprocess.run')
+    def test_check_precommit_reuses_an_opted_in_exact_pass(
+        self, mock_run, compute_fingerprint, read_pass, tmp_path, monkeypatch
+    ):
+        enable_precommit_reuse(monkeypatch, tmp_path)
+        self.gate.project_root = tmp_path
+        fingerprint = MagicMock()
+        compute_fingerprint.return_value = fingerprint
+        read_pass.return_value = {"created_at": time.time() - 3}
+
+        result = self.gate.check_precommit()
+
+        assert result.status == CheckStatus.PASSED
+        assert "Reused recent" in result.message
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize("changed_after", [False, True])
+    @patch.object(precommit_cache, "record_pass")
+    @patch.object(precommit_cache, "read_pass", return_value=None)
+    @patch.object(precommit_cache, "compute_fingerprint")
+    @patch('subprocess.run')
+    def test_check_precommit_records_only_a_stable_success(
+        self, mock_run, compute_fingerprint, _read_pass, record_pass,
+        changed_after, tmp_path, monkeypatch
+    ):
+        enable_precommit_reuse(monkeypatch, tmp_path)
+        self.gate.project_root = tmp_path
+        before = MagicMock(name="before")
+        after = MagicMock(name="after") if changed_after else before
+        compute_fingerprint.side_effect = [before, after]
+        mock_run.return_value = MagicMock(returncode=0, stdout="passed", stderr="")
+
+        result = self.gate.check_precommit()
+
+        assert result.status == CheckStatus.PASSED
+        if changed_after:
+            record_pass.assert_not_called()
+        else:
+            record_pass.assert_called_once_with(before)
+
+    @patch.object(precommit_cache, "record_pass")
+    @patch.object(precommit_cache, "read_pass", return_value=None)
+    @patch.object(precommit_cache, "compute_fingerprint", return_value=MagicMock())
+    @patch('subprocess.run')
+    def test_check_precommit_never_records_a_failure(
+        self, mock_run, _compute, _read, record_pass, tmp_path, monkeypatch
+    ):
+        enable_precommit_reuse(monkeypatch, tmp_path)
+        self.gate.project_root = tmp_path
+        mock_run.return_value = MagicMock(returncode=1, stdout="failed", stderr="")
+
+        result = self.gate.check_precommit()
+
+        assert result.status == CheckStatus.FAILED
+        record_pass.assert_not_called()
 
     def test_check_secrets_clean(self, tmp_path):
         """Test checking for secrets when none exist"""
@@ -2459,6 +2566,24 @@ class TestGateConfigSources:
 
         assert subset == ["tests/far.py"]
         assert source.parent.name == "info"
+
+    def test_agents_global_precommit_opt_in_is_found(self, tmp_path, monkeypatch):
+        """Pin the external authorization path deployed for issue #318."""
+        work = tmp_path / "work"
+        info = work / "git.20c.com" / "agents" / "global" / "info"
+        info.mkdir(parents=True)
+        config = info / "gate-check.yaml"
+        config.write_text("precommit:\n  reuse_all_files: true\n")
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
+        monkeypatch.setenv("LMER_REPO_HOST", "git.20c.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "agents/global")
+
+        reuse, source = self.gate._gate_config_lookup(
+            "precommit", "reuse_all_files", repo_local=False
+        )
+
+        assert reuse is True
+        assert source == config
 
     def test_lookup_is_per_key_not_per_file(self, tmp_path, monkeypatch):
         """A repo declaring only `tests` must not hide the work repo's

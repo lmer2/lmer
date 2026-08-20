@@ -21,7 +21,7 @@ import time
 
 import yaml
 
-from lmer_cli import gate_cache, push_allow
+from lmer_cli import gate_cache, precommit_cache, push_allow
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.util import get_bool_env
 from work_repo.utils import project_info_dir, task_info_dir
@@ -944,12 +944,38 @@ class GateSystem:
         return ["pre-commit"]
 
     def check_precommit(self) -> CheckResult:
-        """Run pre-commit hooks."""
+        """Run pre-commit hooks, optionally reusing an exact recent full pass."""
         precommit_cmd = self._resolve_precommit_command()
+        argv = precommit_cmd + ["run", "--all-files"]
+        reuse, _source = self._gate_config_lookup(
+            "precommit", "reuse_all_files", repo_local=False
+        )
+        fingerprint = None
+        if reuse is True:
+            fingerprint = precommit_cache.compute_fingerprint(
+                self.run_command,
+                self.project_root,
+                precommit_cmd,
+                argv,
+                os.environ,
+            )
+            cached = precommit_cache.read_pass(fingerprint)
+            if cached is not None:
+                age = max(0, int(time.time() - float(cached["created_at"])))
+                return CheckResult(
+                    name="Pre-commit Hooks",
+                    status=CheckStatus.PASSED,
+                    message="Reused recent full --all-files pass",
+                    details=[
+                        f"Exact checked content, Git hook state, config, hooks, "
+                        f"executable, argv and environment passed {age}s ago."
+                    ],
+                    full_output="Pre-commit cache hit: exact full --all-files pass\n",
+                )
 
         # Run pre-commit and capture output
         result = subprocess.run(
-            precommit_cmd + ["run", "--all-files"],
+            argv,
             capture_output=True,
             text=True,
             cwd=self.project_root
@@ -961,6 +987,18 @@ class GateSystem:
         combined_output = stdout + stderr
 
         if code == 0:
+            if fingerprint is not None:
+                after = precommit_cache.compute_fingerprint(
+                    self.run_command,
+                    self.project_root,
+                    precommit_cmd,
+                    argv,
+                    os.environ,
+                )
+                # A hook that changed any checked content (including an
+                # autofix) did not prove the original fingerprint green.
+                if after == fingerprint:
+                    precommit_cache.record_pass(fingerprint)
             return CheckResult(
                 name="Pre-commit Hooks",
                 status=CheckStatus.PASSED,
@@ -998,14 +1036,15 @@ class GateSystem:
            test subset) belong beside them and version with them, and this is
            the only location a CI runner is guaranteed to have.
         2. `{LMER_WORK_REPO_PATH}/{host}/{project}/info/gate-check.yaml` — the
-           work repo's project info, where the secrets ignore list lives.
+           work repo's project info, where operator-owned settings that may
+           silence work live (the secrets ignore list and pre-commit reuse).
 
         `repo_local=False` drops source 1, for settings that must NOT be
         readable from the gated repo: source 1 is inside the tree the agent
         is editing, so anything read from it is a setting the gated code can
         rewrite about its own gating. It is right for the test subset (naming
         a repo's own tests is a claim the guard test re-derives) and wrong for
-        `secrets.ignore`, which silences a check.
+        `secrets.ignore` or pre-commit reuse, which silence a check.
 
         A missing file, unreadable file or unparseable YAML contributes
         nothing; this never raises. Lookup is per key (_gate_config_lookup),
