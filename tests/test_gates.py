@@ -2570,13 +2570,13 @@ class TestGateConfigSources:
     def test_agents_global_precommit_opt_in_is_found(self, tmp_path, monkeypatch):
         """Pin the external authorization path deployed for issue #318."""
         work = tmp_path / "work"
-        info = work / "git.20c.com" / "agents" / "global" / "info"
+        info = work / "git.example.com" / "org" / "proj" / "info"
         info.mkdir(parents=True)
         config = info / "gate-check.yaml"
         config.write_text("precommit:\n  reuse_all_files: true\n")
         monkeypatch.setenv("LMER_WORK_REPO_PATH", str(work))
-        monkeypatch.setenv("LMER_REPO_HOST", "git.20c.com")
-        monkeypatch.setenv("LMER_REPO_PROJECT", "agents/global")
+        monkeypatch.setenv("LMER_REPO_HOST", "git.example.com")
+        monkeypatch.setenv("LMER_REPO_PROJECT", "org/proj")
 
         reuse, source = self.gate._gate_config_lookup(
             "precommit", "reuse_all_files", repo_local=False

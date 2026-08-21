@@ -1,5 +1,5 @@
 added:
-  - "Projects can opt into reuse of a recent successful `pre-commit run --all-files` pass through work-repo project info. The short-lived key follows checked worktree bytes across landing-train commits and covers config and hook pins, executable and version, argv, environment, and the Git attributes, merge state, and staged-added paths used by agents/global's pinned hooks. (#318)"
+  - "Projects can opt into reuse of a recent successful `pre-commit run --all-files` pass through work-repo project info. The short-lived key follows checked worktree bytes across landing-train commits and covers config and hook pins, executable and version, argv, environment, and the Git attributes, merge state, and staged-added paths that pinned hooks can read. (#318)"
 fixed:
   - "Assistant status can no longer observe a newly registered incarnation under the previous lifecycle generation, without making UI status polls wait for container spawn or termination grace periods. (#318)"
   - "The platform learns the harness a session actually resolved, so Codex and Pi footer geometry applies when a preset or model hint selected it; the minimum five-row terminal still reports a valid size. Existing source deployments must re-run `lmer platform setup-ui` to rebuild the web bundle. (#318)"
