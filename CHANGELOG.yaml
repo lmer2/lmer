@@ -5,6 +5,172 @@ unreleased:
   deprecated: []
   removed: []
   security: []
+0.8.0:
+  added:
+  - LMER_CPUS and LMER_MEMORY environment variables to override the container CPU
+    (default 1) and memory (default 2g) limits; invalid values warn and keep the default
+  - The fleet view shows a hint when no service slots are configured.
+  - Gates run only the declared text-reading tests when a change touches documentation
+    or changelog text alone
+  - Gates reuse a passing test-suite result when the tree, test invocation, interpreter,
+    environment and installed dependencies are all unchanged, instead of re-running
+    the suite
+  - Gate receipts record what the test run covered as structured fields (full suite,
+    the declared text subset, or a reused pass) instead of only as summary prose
+  - 'gitlab-review can reply inside an MR discussion thread: --reply-thread with --comment-file,
+    composable with --resolve-thread (#278)'
+  - User-installed harnesses can declare session_dir in their manifest to make spawned-run
+    transcripts visible to the orchestrator (#280)
+  - User-installed harnesses can make their transcripts readable in the chat view
+    by shipping an in-container converter that emits the documented lmer transcript
+    format (docs/TRANSCRIPT-FORMAT.md) (#296)
+  - 'docs/TRANSCRIPT-FORMAT.md: the public record schemas, reader constraints and
+    converter lifecycle, with a copy-installable opencode drop-in under examples/harnesses/opencode/
+    (#296)'
+  - Orchestrated claude sessions are now reminded to signal the orchestrator when
+    a turn ends on an unreported milestone
+  - Platform reminds its orchestrating assistant when spooled digests sit unretrieved
+    beside an idle session
+  - Projects can opt into reuse of a recent successful `pre-commit run --all-files`
+    pass through work-repo project info. The short-lived key follows checked worktree
+    bytes across landing-train commits and covers config and hook pins, executable
+    and version, argv, environment, and the Git attributes, merge state, and staged-added
+    paths that pinned hooks can read. (#318)
+  - 'Service groups: one session can attach to a whole compose project and retarget
+    target-exec at any member with target-switch'
+  - 'Control UI: a redraw button on the terminal view, which rebuilds the view and
+    asks the session to repaint where fitting is on'
+  - 'Control UI: a toggle that holds the whole app in a band in the middle of a wide
+    screen, remembered between loads, with uber lmer''s pane open beside it'
+  - 'Control UI: a message still waiting for the transcript can be removed from the
+    chat pane'
+  fixed:
+  - The orchestrating assistant is now woken when a run's question is answered out
+    of band, instead of believing the run still waits.
+  - Chat messages sent while a session is mid-turn keep their place in history instead
+    of vanishing, and the false unconfirmed-delivery warning is gone.
+  - Mid-turn chat messages now appear in the transcript once delivered, so their bubbles
+    settle in order instead of piling up below the conversation.
+  - Operator chat messages starting with ! reach Claude sessions with a visible '.
+    ' prefix instead of executing as shell commands.
+  - CONTAINER_LIMITS in the session shell is now derived from the container's cgroup
+    at startup, so it reflects LMER_CPUS/LMER_MEMORY/LMER_PIDS_LIMIT overrides instead
+    of a stale baked-in string
+  - Gate lock no longer treats a reaped-but-unwaited gate process as alive, which
+    silently deferred every work-repo commit (#261)
+  - default_preset= in the chat acknowledgement and spawn log now resolves the forwarded
+    env file the way the child does (#259)
+  - Platform spawn suppressions of LMER_ASK_DIR/LMER_NO_REPO now survive the child's
+    .env seeding (blank instead of deleted) (#260)
+  - 'Operator chat messages starting with # or / reach Claude sessions with the visible
+    ''. '' prefix instead of triggering memory or slash-command escapes (#272)'
+  - 'Fan-out selection is no longer ambient in session containers: forwarded as LMER_SPAWN_AGENTS/_CONFIG
+    and read only by spawn-harness (#283)'
+  - claude-runner now really merges settings.local.json and .mcp.local.json overlays;
+    both jq filters failed silently before (#251)
+  - claude-runner startup no longer deletes concurrently-starting runners' prompt
+    files (#276)
+  - The work goal fallback file is scoped per session, so test runs cannot clobber
+    a live session's goal (#277)
+  - Closing a browser tab on a terminal view no longer dumps an ASGI traceback (#247)
+  - Harness task-notification blocks no longer render as operator turns in the assistant
+    chat pane (#242)
+  - Returning to a terminal view no longer sends a redundant resize to the shared
+    PTY (#218)
+  - Release leg 2 wires LMER_RELEASE_GITHUB_TOKEN into the GitHub mirror remote, so
+    the mirror push works (#264)
+  - Orchestrator chat view now reads pi and codex run transcripts, not only claude's
+    (#280)
+  - 'User-harness sessions no longer crash on startup when a declared mount path''s
+    parent directory does not exist in the image (#293, #290)'
+  - 'Clone-cache failure lines name the git subcommand and the mirror they ran against
+    instead of `git -C`. (#159, #160)'
+  - Clone-cache mirrors of `ssh://` URLs keep the login the URL names, and no longer
+    build an HTTP auth header no ssh transport reads. (#163)
+  - The claude runner collects prompt files left by exited runners, so they no longer
+    accumulate in a long-lived container's `/tmp`.
+  - The signal reminder no longer fires when an agent merely reads a post-review wrapper
+    script instead of running it.
+  - Codex now resumes in a native continuation turn for the oldest unread lmer-ask
+    answer, whether it arrived before or during Stop
+  - Programmatic Codex messages, including the reported wind-down path, use an explicit
+    bracketed-paste boundary before the single submit Enter
+  - Control-plane /followup requests now become a plain-text instruction to load the
+    taskdef follow-up because current Codex releases no longer discover custom prompt
+    files
+  - Supervisor tests no longer inherit LMER_HARNESS or other run context from the
+    session executing pytest
+  - GitLab and GitHub post-review wrappers signal successful reviews without letting
+    signal-delivery failures trigger duplicate review posts.
+  - Platform answer and resume follow an in-progress run's explicit `reslugged_from`
+    history after a release run changes slug. (#263)
+  - The manual supervision restart regression now waits for the replacement generation
+    to be persisted, removing a status/state race.
+  - A successful commit gate hands its test pass to the equivalent clean post-commit
+    cache key, and gate receipts explain cache hits and misses. (#287)
+  - '`gitlab-review --resolve-thread` now accepts non-diff discussions when GitLab
+    advertises them as resolvable, while still refusing notes with no resolved state.
+    (#250)'
+  - Platform spawns using a plain repository URL as their target are tracked and retain
+    their requested title without a duplicate repo-URL field. (#255)
+  - Assistant status can no longer observe a newly registered incarnation under the
+    previous lifecycle generation, without making UI status polls wait for container
+    spawn or termination grace periods. (#318)
+  - The platform learns the harness a session actually resolved, so Codex and Pi footer
+    geometry applies when a preset or model hint selected it; the minimum five-row
+    terminal still reports a valid size. Existing source deployments must re-run `lmer
+    platform setup-ui` to rebuild the web bundle. (#318)
+  - Multi-kilobyte Claude, Codex, and Pi prose uses explicit bracketed-paste boundaries,
+    while known Claude and Pi column-one commands remain keystrokes. (#318)
+  - Native transcript adapters consistently outrank canonical derived twins, with
+    one diagnostic per mixed session and record vocabulary kept separate from the
+    cosmetic harness label. (#318)
+  - 'Control UI: a long URL in a chat pane no longer scrolls the conversation sideways'
+  - Attributed platform-typed chat lines correctly and prevented Codex chat and CLI
+    steering messages beginning with `!` from executing as shell commands while preserving
+    deliberate slash commands. (#321)
+  - Kept digest reminders on schedule after future timestamps and corrected related
+    configuration messages. (#321)
+  changed:
+  - Port chips moved from the run overview tab to the run header, visible from every
+    tab.
+  - Operator-channel questions and answers render as separate cards with color-coded
+    QUESTION and ANSWER labels.
+  - Gate checks now run cheapest-first and skip the test suite when an earlier check
+    has already failed
+  - docs/RELEASE-PROD-SETUP.md is a reusable checklist again; deployment receipts
+    belong in the release run's work-repo records (#266)
+  - 'The self-dev taskdef states measured gate provenance: bare gate commands run
+    the operational copy (#282)'
+  - 'Transcript format support is now two tiers: in-tree adapters stay closed at claude/codex/pi,
+    and every other harness integrates through the canonical format (#296)'
+  - '`lmer-slack-listener` and the CLI now share one `.env` precedence implementation.
+    (#67)'
+  - Git authentication for lmer-created clones now uses mode-0600 container credential
+    files, keeping tokens out of clone arguments, remotes, and repository config while
+    leaving operator-owned bind-mounted checkouts untouched.
+  - Review-post wrapper names are no longer inferred as milestones by the signal guard;
+    wrappers signal only after a successful post. (#318)
+  - Abbreviations of --service (--serv, --se) are now ambiguous with --service-group
+    and are refused; the full spelling is unchanged
+  - target-logs <container> now works in sessions that are not in service mode, and
+    while the current target is unset or unreadable
+  - Directed agent progress tracking to work-repository run directories instead of
+    target-repository journal files. (#321)
+  - Rebuild the platform UI bundle to deploy platform-attributed chat turns. (#321)
+  - Rebuild session images and recreate Codex sessions to deploy the shell-escape
+    guard. (#321)
+  security:
+  - gate-push output no longer prints credentials embedded in remote URLs (#281)
+  - 'The generic GITLAB_TOKEN fallback is scoped to its issuing host (new LMER_GITLAB_TOKEN_HOST,
+    default: the work-repo host from LMER_WORK_REPO or the platform config); third-party
+    hosts no longer receive it (#161)'
+  - Work-repo run-state writers now redact secrets; redaction covers GitHub/Slack/GitLab-runner
+    token shapes and URL-embedded credentials; git error output is credential-scrubbed
+    (#124)
+  - 'Taskdef rendering no longer exposes credentials: sensitive-named LMER_* variables
+    are dropped from the template context and credential-bearing URLs render in tokenless
+    form. (#285)'
 0.7.0:
   added:
   - Resolving a review thread is the reviewer's verified sign-off, so `--resolve-thread`

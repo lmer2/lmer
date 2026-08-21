@@ -1,5 +1,0 @@
-fixed:
-- "GitLab and GitHub post-review wrappers signal successful reviews without letting signal-delivery failures trigger duplicate review posts."
-- "Platform answer and resume follow an in-progress run's explicit `reslugged_from` history after a release run changes slug. (#263)"
-- "The manual supervision restart regression now waits for the replacement generation to be persisted, removing a status/state race."
-- "A successful commit gate hands its test pass to the equivalent clean post-commit cache key, and gate receipts explain cache hits and misses. (#287)"

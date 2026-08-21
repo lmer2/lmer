@@ -1,5 +1,0 @@
-added:
-- "Service groups: one session can attach to a whole compose project and retarget target-exec at any member with target-switch"
-changed:
-- "Abbreviations of --service (--serv, --se) are now ambiguous with --service-group and are refused; the full spelling is unchanged"
-- "target-logs <container> now works in sessions that are not in service mode, and while the current target is unset or unreadable"

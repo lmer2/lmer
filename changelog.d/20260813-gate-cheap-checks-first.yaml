@@ -1,4 +1,0 @@
-added:
-- "Gates run only the declared text-reading tests when a change touches documentation or changelog text alone"
-changed:
-- "Gate checks now run cheapest-first and skip the test suite when an earlier check has already failed"

@@ -1,2 +1,0 @@
-added:
-- "LMER_CPUS and LMER_MEMORY environment variables to override the container CPU (default 1) and memory (default 2g) limits; invalid values warn and keep the default"

@@ -1,4 +1,0 @@
-fixed:
-- "Orchestrator chat view now reads pi and codex run transcripts, not only claude's (#280)"
-added:
-- "User-installed harnesses can declare session_dir in their manifest to make spawned-run transcripts visible to the orchestrator (#280)"
