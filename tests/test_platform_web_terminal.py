@@ -55,7 +55,13 @@ browser, and CI here has none.
 import json
 import math
 import re
+import subprocess
 from pathlib import Path
+
+# The two-root Node lookup (T47), imported rather than copied for the reason the
+# chat module's own import gives: a second copy of a helper that locates the pinned
+# toolchain is how a guard starts skipping everywhere instead of failing.
+from tests.conftest import node_binary, require_node_toolchain
 
 WEB = Path(__file__).resolve().parent.parent / "web"
 TERMINAL = WEB / "src" / "components" / "Terminal.vue"
@@ -68,15 +74,27 @@ def _read(path):
 
 
 def _function_body(text, signature):
-    """Source of one top-level function in a ``<script setup>`` block.
+    """Source of one top-level declaration in a ``<script setup>`` block.
 
-    Every function in the component is top-level, so a ``}`` in column zero ends
-    one. Used to assert *ordering* and locality — which of two calls happens
-    first, and which function a call lives in — since that is exactly what these
-    bugs are made of.
+    Everything in the component is top-level, so the first line that *starts* at
+    column zero with a ``}`` ends the thing that began at ``signature``, and that
+    line comes back with it. Used to assert *ordering* and locality — which of two
+    calls happens first, and which function a call lives in — since that is exactly
+    what these bugs are made of.
+
+    The closing line is matched rather than a bare ``\n}\n``, because the two
+    lifecycle hooks here are callbacks: they end ``})``, and against the narrower
+    form ``onBeforeUnmount(()`` returned 346 lines of an 18-line handler and
+    ``onMounted(()`` returned 360 (measured; found in review of !236). Everything
+    after the hook came with it, so the release guard below was asserting on strings
+    that occur elsewhere in the file — ``teardownSocket()`` three times,
+    ``term.dispose()`` twice — and deleting either from the handler would have left
+    it green, which is precisely the leak it is named for.
     """
     start = text.index(signature)
-    return text[start:text.index("\n}\n", start)]
+    end = re.search(r"^\}.*$", text[start:], re.M)
+    assert end, f"nothing at column zero closes {signature!r}"
+    return text[start:start + end.end()]
 
 
 def _status_case(text, event):
@@ -471,8 +489,16 @@ def test_reported_dimensions_stay_inside_the_supervisors_bounds():
     assert "MAX_DIMENSION" in clamp and "floor" in clamp
     report = _function_body(text, "function reportGeometry")
     assert "clampDimension" in report
-    assert "if (!rows || !cols) return" in report, (
+    assert "if (!fitted || !cols) return false" in report, (
         "a below-floor dimension is dropped, never sent"
+    )
+    # And the row the redraw asks for on top of the fit (#286) is inside the upper
+    # bound as well: it is added after the floor check, so it is the one dimension
+    # here that clampDimension never sees.
+    assert "Math.min(fitted + extraRows, MAX_DIMENSION)" in report, (
+        "the extra row is added without a ceiling, so a redraw can ask the control "
+        "plane for a geometry it answers with resize_failed — whose message says "
+        "the PTY is probably gone"
     )
 
 
@@ -1436,7 +1462,7 @@ def test_codex_and_pi_keep_their_footer_above_the_viewports_fractional_edge():
     assert "Math.max(MIN_ROWS" in rows
 
     report = _function_body(terminal, "function reportGeometry")
-    assert "const rows = reportedRows(term.rows)" in report
+    assert "reportedRows(term.rows)" in report
     assert "term.resize" not in report, (
         "the local emulator was shrunk; the reserve belongs to PTY layout only"
     )
@@ -1538,6 +1564,13 @@ def test_a_return_repaints_and_a_repaint_is_never_a_resize():
     would change the session for every other watcher. The operator asked for a
     forced resize and settled on this instead (2026-08-03); a later change that
     turns it back into a resize gives that decision away silently.
+
+    The redraw button (#286) is not that change and this test is where the line
+    between them is: a *return to the view* is something the browser does, and it
+    still only repaints, while the button is a tap the operator made — gated on the
+    fit switch, which is where they had already agreed this client may write sizes.
+    What must never happen is the automatic pass acquiring the button's behaviour,
+    which is what the assertions below still say.
 
     ``refresh`` also cannot be swapped for a ``start()``: re-reading the log
     re-attaches the socket and drops the scrollback the operator was reading.
@@ -1657,6 +1690,327 @@ def test_a_return_to_the_view_does_not_resend_a_geometry_the_pty_has():
         assert "geometrySent" not in _status_case(text, event), (
             f"{event} clears the memo, which re-sends the geometry it answered"
         )
+
+
+# --- the manual redraw (#286) -------------------------------------------------
+#
+# Operator: "sometime the terminal gets garbled and an easy way for me to fix it is
+# to flip between terminal sizes forcing a redraw, i think this could be a single
+# button that's available next to the size pickers".
+#
+# The flip did two things at once, and the button has to keep them apart: it changed
+# the emulator's dimensions (which is the only thing in the fit addon that clears and
+# redraws — see the note above) *and*, with fitting on, it wrote a new size to the
+# PTY, which is what makes the session itself draw again. A local repair cannot fix a
+# screen the session sent garbled, and a session-side repair is a write to a terminal
+# other people are watching, so which of them happens where is the whole design
+# (operator decision, 2026-08-20: the fit switch is the gate).
+#
+# Run rather than read, because every one of those claims is about what goes out and
+# in which order, and a source check would confirm the call exists while a wrong gate
+# order or a memo swallowing the frame would look identical.
+
+#: One Node run over `redraw`, `reportGeometry` and the two dimension helpers, with
+#: the module state they close over as plain values. The JS half reports the frames
+#: that reached the socket and whether the local rebuild ran; every assertion is in
+#: Python. The three bounds are stated here rather than read out of the component
+#: because another guard already pins them to the daemon's own constants
+#: (test_reported_dimensions_stay_inside_the_supervisors_bounds) — what this needs is
+#: only that they are the real numbers.
+_REDRAW_PROBE = """
+const MIN_COLS = 20
+const MIN_ROWS = 5
+const MAX_DIMENSION = 1000
+const REDRAW_JOSTLE_MS = 5
+// The one copy here that is not a number pinned elsewhere: this set is asserted
+// against the component's own in the footer-guard test above, so a harness added
+// there and not here would leave the `footer_guarded` case measuring the old set.
+const PTY_FOOTER_GUARD_HARNESSES = new Set(['codex', 'pi'])
+const props = { harness: 'claude' }
+
+const sent = []
+const notice = { value: null }
+const redrawing = { value: false }
+const resizeSupported = { value: true }
+const resizeOptIn = { value: true }
+const term = { rows: 24, cols: 80 }
+const socket = { readyState: 1, send: (frame) => sent.push(JSON.parse(frame)) }
+const WebSocket = { OPEN: 1 }
+let geometrySent = null
+let geometryDeferred = false
+let generation = 0
+let disposed = false
+const stale = (mine) => disposed || mine !== generation
+let rebuilt = 0
+// The local rebuild, which is `start()` in the component: a fresh emulator, the log
+// tail re-read, the socket re-attached. Recorded rather than performed, and its
+// position in `sent` is what says whether the frame went out first.
+const start = () => { rebuilt += 1; sent.push({ type: 'rebuilt' }) }
+
+%s
+
+%s
+
+%s
+
+%s
+
+const probe = %s
+;(async () => {
+  const answers = {}
+  for (const [name, setup] of Object.entries(probe)) {
+    sent.length = 0
+    rebuilt = 0
+    resizeOptIn.value = setup.fit
+    resizeSupported.value = setup.supported ?? true
+    socket.readyState = setup.socketOpen === false ? 3 : 1
+    term.rows = setup.rows ?? 24
+    term.cols = setup.cols ?? 80
+    props.harness = setup.harness ?? 'claude'
+    geometrySent = setup.alreadySent ?? null
+    redrawing.value = false
+    if (setup.taps > 1) {
+      // Two taps, the second inside the jostle window: both calls started, neither
+      // awaited in order, which is what a double tap is.
+      const first = redraw()
+      await new Promise((resolve) => setTimeout(resolve, 1))
+      const second = redraw()
+      await Promise.all([first, second])
+    } else {
+      await redraw()
+    }
+    answers[name] = { sent: [...sent], rebuilt }
+  }
+  console.log(JSON.stringify(answers))
+})()
+"""
+
+
+def _redrawn(cases):
+    """Run ``redraw`` per case. Case name → the frames sent and the rebuild count."""
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    text = _read(TERMINAL)
+    script = _REDRAW_PROBE % (
+        _function_body(text, "function clampDimension"),
+        _function_body(text, "function reportedRows"),
+        _function_body(text, "function reportGeometry"),
+        _function_body(text, "async function redraw"),
+        json.dumps(cases),
+    )
+    result = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"the redraw probe failed:\n{result.stdout}\n{result.stderr}"
+    )
+    return json.loads(result.stdout)
+
+
+def test_the_redraw_repairs_this_client_always_and_the_session_only_where_asked():
+    """The two halves of one tap, and which of them is allowed to leave the browser.
+
+    The local half is unconditional: re-reading the log is how bytes missed across a
+    reconnect come back, and it writes nothing anywhere. The session-side half is a
+    resize, which reflows that TUI for everyone attached — so it happens only where
+    the operator had already agreed this client may write sizes, and the switch that
+    says so is the one that was already the single gate. With fitting off the button
+    is a local repair and nothing else, which is also the honest answer: there is no
+    way to ask a session to redraw without writing to it.
+    """
+    answers = _redrawn({
+        "fitting_on": {"fit": True},
+        "fitting_off": {"fit": False},
+        "session_cannot_be_resized": {"fit": True, "supported": False},
+        "socket_gone": {"fit": True, "socketOpen": False},
+    })
+
+    assert answers["fitting_on"]["sent"] == [
+        {"type": "resize", "rows": 25, "cols": 80},
+        {"type": "rebuilt"},
+    ], (
+        "with fitting on the redraw did not ask the session for a size it does not "
+        f"have, or asked after rebuilding — {answers['fitting_on']}"
+    )
+    for quiet in ("fitting_off", "session_cannot_be_resized", "socket_gone"):
+        assert answers[quiet]["sent"] == [{"type": "rebuilt"}], (
+            f"{quiet}: the redraw wrote to a session it may not or cannot write to "
+            f"— {answers[quiet]}"
+        )
+        assert answers[quiet]["rebuilt"] == 1, (
+            f"{quiet}: the local repair was skipped along with the write, so the "
+            "button does nothing at all in the state it is most needed in"
+        )
+
+
+def test_the_size_the_redraw_asks_for_differs_by_one_row_and_no_columns():
+    """A column change reflows the session's own output — a wrapped command reads as
+    two lines — so the smallest thing that is still a new window size is a row, and
+    that is what is asked for.
+
+    One row *taller*, not shorter: the daemon refuses a geometry below its floor
+    (``session_io.MIN_RESIZE_*``) and a refusal comes back as a notice on screen
+    instead of a repaint. And the harnesses that reserve a footer row keep it — the
+    reserve is subtracted first, so what the session is asked for is one row past the
+    size it would otherwise be told, whatever this client happens to be drawing.
+    """
+    answers = _redrawn({
+        "claude": {"fit": True, "rows": 24, "cols": 80},
+        "footer_guarded": {"fit": True, "rows": 24, "cols": 80, "harness": "codex"},
+        "narrow_phone": {"fit": True, "rows": 14, "cols": 40},
+    })
+    frames = {name: answer["sent"][0] for name, answer in answers.items()}
+
+    assert frames["claude"] == {"type": "resize", "rows": 25, "cols": 80}
+    assert frames["footer_guarded"] == {"type": "resize", "rows": 24, "cols": 80}, (
+        "the footer reserve was dropped or applied twice, so a codex session is "
+        f"asked for a height that is not one row off its own — {frames}"
+    )
+    assert frames["narrow_phone"] == {"type": "resize", "rows": 15, "cols": 40}, (
+        f"the columns moved, or the row did not — {frames}"
+    )
+
+
+def test_a_geometry_this_client_already_sent_does_not_swallow_the_redraw():
+    """The memo's whole job is to drop a frame for a size the PTY already has, and a
+    terminal that has been sitting still is exactly the state a redraw is tapped in —
+    so the memo holds the size the jostle is measured against.
+
+    It passes because the jostle asks for a *different* size, which is the second
+    reason the extra row is not cosmetic: a redraw that asked for the same geometry
+    would be dropped one line before the send, silently, and only where the client
+    had already reported — i.e. everywhere that matters.
+    """
+    answers = _redrawn({
+        "memo_holds_the_current_size": {
+            "fit": True, "rows": 24, "cols": 80,
+            "alreadySent": {"rows": 24, "cols": 80},
+        },
+    })
+    assert answers["memo_holds_the_current_size"]["sent"] == [
+        {"type": "resize", "rows": 25, "cols": 80},
+        {"type": "rebuilt"},
+    ], (
+        "the memo dropped the redraw's frame, so the button stops asking the "
+        "session for anything the moment the terminal has been still"
+    )
+
+
+def test_a_second_tap_inside_the_jostle_window_is_not_a_weaker_redraw():
+    """Reported in review of !236, and the shape of it is worth keeping.
+
+    The button had no in-flight guard and said nothing while it worked, so the
+    natural gesture on an unreadable terminal — tap, nothing visibly happens, tap
+    again — took the deliberate 250ms apart. The second call's own frame was
+    swallowed by the geometry memo (same rows, already sent), so it rebuilt at once,
+    and the first call's continuation then found itself stale and returned: the
+    session held the other size for the gap between the taps plus a reconnect
+    instead of ``REDRAW_JOSTLE_MS``, which is the one quantity that constant exists
+    so as not to depend on. Both taps looked identical to the operator.
+
+    So the second tap does nothing at all while the first is in flight, and it is
+    the flag that says so rather than the button's ``loading`` prop — VBtn's own
+    ``isDisabled`` is group-and-disabled only, so a loading button still calls its
+    click listener, and ``disabled`` reaches the DOM a render later than 30ms.
+    """
+    answers = _redrawn({"double_tap": {"fit": True, "taps": 2}})
+    assert answers["double_tap"]["sent"] == [
+        {"type": "resize", "rows": 25, "cols": 80},
+        {"type": "rebuilt"},
+    ], (
+        "a second tap inside the jostle window sent or rebuilt again, so the "
+        f"session's moment at the other size is the gap between taps — {answers}"
+    )
+    assert answers["double_tap"]["rebuilt"] == 1, (
+        "the view was rebuilt twice for one gesture, which spends a ticket and "
+        "re-reads the log for nothing"
+    )
+
+    text = _read(TERMINAL)
+    body = _function_body(text, "async function redraw")
+    assert "if (redrawing.value) return" in body, "there is no in-flight guard"
+    assert body.index("if (redrawing.value) return") < body.index("reportGeometry(1)"), (
+        "the guard is checked after the frame it exists to stop has gone out"
+    )
+    assert "finally" in body and "redrawing.value = false" in body, (
+        "a redraw that returns early leaves the button stuck saying it is working"
+    )
+    button = re.search(r"<v-btn\b[^>]*@click=\"redraw\"[^>]*>", text, re.S).group(0)
+    assert ':loading="redrawing"' in button, (
+        "the button says nothing while it works, which is what the second tap is"
+    )
+
+
+def test_the_redraw_is_beside_the_size_pickers_and_says_what_it_is():
+    """Where the operator asked for it — "next to the size pickers" — because the
+    gesture it replaces is flipping between them.
+
+    Not on a failed view: there is nothing drawn to repair, and that state already
+    offers the same restart under the name it calls for ("try again"). A second
+    button doing one thing under two names in one row is what the row's own
+    single-line rule exists against.
+    """
+    text = _read(TERMINAL)
+    button = re.search(r"<v-btn\b[^>]*@click=\"redraw\"[^>]*>", text, re.S)
+    assert button, "nothing in the terminal view calls the redraw"
+    assert "mdiImageRefreshOutline" in button.group(0), (
+        "the button draws no icon, or one pasted as path data rather than taken "
+        "from @mdi/js"
+    )
+    assert 'v-if="phase !== \'failed\'"' in button.group(0), (
+        "the redraw is offered on a view with nothing on it, beside the restart "
+        "that state already has"
+    )
+
+    start = text.index('class="d-flex flex-wrap align-center ga-2 mb-2"')
+    row = text[start:text.index("<v-alert", start)]
+    assert row.index("HEIGHT_SCALES") < row.index('@click="redraw"'), (
+        "the redraw is in front of the height presets it belongs beside"
+    )
+    assert row.index('@click="redraw"') < row.index('label="fit to my screen"'), (
+        "the redraw landed after the switch that gates half of what it does"
+    )
+    # And it is a word, not an icon alone: the row's other verbs are words, and this
+    # one is tapped in a hurry on a terminal that is unreadable at the time.
+    assert ">redraw</v-btn>" in text
+
+
+def test_the_session_is_put_back_by_the_rebuild_and_not_by_a_second_frame():
+    """Why there is no way-back frame: the rebuild is the way back.
+
+    A fresh socket's ``open`` clears the memo and reports this client's real geometry
+    (see the memo test above), which is the same path every reconnect already takes —
+    so the session holds the jostled size for the delay plus a reconnect and is then
+    told the true one by code that was already there. A second frame here would be a
+    second thing to keep in step with the first, and it would have to be sent through
+    a socket that is being torn down in the same breath.
+
+    What that leaves is the one failure this feature can have: a socket that never
+    comes back leaves the session one row taller than this client draws. The next
+    real geometry change corrects it, and the operator can tap again — which is why
+    the delay is a delay and not a handshake.
+    """
+    text = _read(TERMINAL)
+    body = _function_body(text, "async function redraw")
+    assert "reportGeometry(1)" in body, "the redraw asks for no different size"
+    assert body.count("reportGeometry") == 1, (
+        "the redraw sends a second frame of its own; the way back is the rebuild"
+    )
+    assert body.index("reportGeometry(1)") < body.index("start()"), (
+        "the rebuild runs first, so the frame goes out over a socket that is "
+        "already being torn down"
+    )
+    assert "REDRAW_JOSTLE_MS" in body, (
+        "the session is asked for the other size and rebuilt in the same tick, so "
+        "the two window sizes coalesce into the one it already had"
+    )
+    assert "if (stale(mine)) return" in body, (
+        "a redraw whose delay outlived the view rebuilds a terminal that is gone"
+    )
+    # The frame's own trip is the delay's reason, and the constant says how long: a
+    # number here that is not a real interval would make the jostle a no-op.
+    assert re.search(r"const REDRAW_JOSTLE_MS = (\d+)", text).group(1) == "250"
 
 
 def test_an_unfocused_terminal_says_so_where_the_keyboard_is_real():

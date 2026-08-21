@@ -42,6 +42,7 @@ from pathlib import Path
 WEB = Path(__file__).resolve().parent.parent / "web"
 APP = WEB / "src" / "App.vue"
 RUN_NAV = WEB / "src" / "components" / "RunNav.vue"
+RUN_CARD = WEB / "src" / "components" / "RunCard.vue"
 RUN_DETAIL = WEB / "src" / "components" / "RunDetail.vue"
 FORMAT = WEB / "src" / "format.js"
 
@@ -51,31 +52,66 @@ def _read(path):
 
 
 def _function_body(text, signature):
-    """Source of one top-level function in a ``<script setup>`` block.
+    """Source of one top-level declaration in a ``<script setup>`` block.
 
-    Same helper as :mod:`tests.test_platform_web_terminal`: every function in
-    these components is top-level, so a ``}`` in column zero ends one. Used for
-    *ordering* assertions — which of two lookups happens first — because that is
+    Same idea as :mod:`tests.test_platform_web_terminal`'s copy: everything in
+    these components is top-level, so the first line that *starts* at column zero
+    with a ``}`` ends the thing that began at ``signature``. Used for *ordering*
+    assertions — which of two lookups happens first — and for scoping, which is
     what several of these bugs are made of.
+
+    That closing line is matched rather than a bare ``\n}\n``, because a
+    top-level ``watch(x, (on) => {…})`` ends ``})`` and one carrying options ends
+    ``}, { immediate: true })``. Against the narrower form the search ran past
+    those and returned the next few declarations as well, so two guards below were
+    reading a 24-line blob while naming one watcher — and passing on text from
+    outside it (found in review of !236). Everything up to and including the
+    closing line is returned, so an option passed alongside the callback is inside
+    the scope that names it.
+
+    :mod:`tests.test_platform_web_terminal`'s copy is the same rule, and had to be:
+    review round 2 measured it returning 346 lines for an 18-line
+    ``onBeforeUnmount(()`` handler, which left the guard on releasing the socket and
+    the emulator asserting against most of the file. The third copy
+    (``_chat_function`` in :mod:`tests.test_platform_web_app`) is deliberately left
+    narrower — every one of its ten call sites names a ``function``, so no callback
+    form reaches it, and ``_chat_body`` there depends on the closing brace being
+    *excluded*.
     """
     start = text.index(signature)
-    return text[start:text.index("\n}\n", start)]
+    end = re.search(r"^\}.*$", text[start:], re.M)
+    assert end, f"nothing at column zero closes {signature!r}"
+    return text[start:start + end.end()]
 
 
-def _drawer():
-    """The run navigator's drawer — its opening tag, attributes and all.
+def _drawer(location="left"):
+    """One of the shell's drawers — its opening tag, attributes and all.
 
-    The first of the two the shell has since T31: this file is about the
-    navigator, and the supervisor's right-hand drawer has its own guards in
-    :mod:`tests.test_platform_web_assistant`.
+    Left by default, because this file is mostly about the navigator; the
+    supervisor's right-hand drawer has its own guards in
+    :mod:`tests.test_platform_web_assistant` and one here, about a state it may not
+    be rendered in. Taking a side rather than being copied inline is the point: the
+    first cut of that guard walked the tags itself and kept the *last* match, which
+    is right by accident while there is one drawer per side.
     """
-    match = re.search(r"<v-navigation-drawer\b[^>]*>", _read(APP), re.S)
-    assert match, "App.vue has no navigation drawer, so the detail view is a dead end"
-    assert 'location="left"' in match.group(0), (
-        "the first drawer in App.vue is no longer the run navigator, so every "
-        "assertion below is about the wrong panel"
-    )
+    match = None
+    for candidate in re.finditer(r"<v-navigation-drawer\b[^>]*>", _read(APP), re.S):
+        if f'location="{location}"' in candidate.group(0):
+            match = candidate
+            break
+    assert match, f"App.vue has no {location}-hand navigation drawer"
     return match.group(0)
+
+
+def _css_rule(style, selector):
+    """One declaration block out of a scoped stylesheet, by exact selector.
+
+    Same shape as the chat module's ``_chat_rule``; here because the focused layout
+    is three rules that have to agree with each other, and reading them as text
+    would match the prose above them.
+    """
+    start = style.index(f"{selector} {{")
+    return style[start:style.index("}", start)]
 
 
 def _icon_map(name):
@@ -151,6 +187,162 @@ def test_the_drawer_is_on_the_left_and_the_shell_has_no_third_one():
     )
     assert app.count('location="left"') == 1 and app.count('location="right"') == 1, (
         "the two drawers no longer sit on one side each"
+    )
+
+
+# --- the narrow band (#286) ---------------------------------------------------
+#
+# Operator, after living with the first cut of focused mode: the layout was the wrong
+# answer to the right complaint. What they wanted was not a special place for uber
+# lmer — it was the whole app held together in the middle of a wide screen, "the
+# effect of narrowing the browser window", as a platform option because the window has
+# other tabs in it. So the teleported panel, the fixed-width run column and the pinned
+# pane are all gone, and what is left is one class and a width.
+
+def test_the_whole_app_can_be_held_in_a_band_in_the_middle_of_the_screen():
+    """The mode, and the two things that make it work at all.
+
+    It is a class on the app's own root, because what sits against the window's edges
+    is the app bar and the two drawers — and all three are ``position: fixed``, which
+    no ``max-width`` on an ancestor can reach. The measured band at 2560: bar and
+    navigator both start at 480 instead of 0, the conversation's drawer opens inside
+    it, and nothing overflows sideways; below the band's own width the rules are inert,
+    which is why a phone needs no special case.
+
+    ``!important`` is load-bearing and is the reason this guard exists. Vuetify's
+    layout composable writes ``position``, ``left``/``right`` and ``width`` as *inline*
+    styles on every item it places, and an inline declaration outranks any stylesheet:
+    without it the class applies, the toggle works, the preference persists — and
+    nothing moves, which is exactly what the first cut of this measured.
+    """
+    app = _read(APP)
+    assert 'class="{ \'app-narrow\': narrow }"' in app.replace(':class', 'class'), (
+        "the band is not a class on the app root, so it cannot reach the fixed "
+        "elements that sit against the window's edges"
+    )
+    style = app[app.index("<style scoped>"):]
+
+    band = _css_rule(style, ".app-narrow")
+    assert "--app-band" in band and "--app-inset" in band, (
+        "the band's width is not a named property, so changing it is a hunt"
+    )
+    assert "max(0px" in band, (
+        "a viewport narrower than the band gets a negative inset, which pushes the "
+        "app off the screen instead of leaving it alone"
+    )
+
+    # The three fixed items, each with the framework's inline value overridden.
+    for selector, edges in (
+        (".app-narrow .v-app-bar", ("left", "right", "width")),
+        (".app-narrow .v-navigation-drawer--left", ("left",)),
+        (".app-narrow .v-navigation-drawer--right", ("right",)),
+    ):
+        rule = _css_rule(style, selector)
+        for edge in edges:
+            assert f"{edge}:" in rule, f"{selector} does not move its {edge}"
+        assert rule.count("!important") == len(edges), (
+            f"{selector} leaves an edge to a stylesheet, which the framework's "
+            "inline layout style outranks — the class then does nothing at all"
+        )
+
+    # And the drawer *closed*. The framework parks a right drawer by translating it its
+    # own width plus a pixel, which lands it exactly on whatever ``right`` says — and
+    # ``right`` is now the inset from the window's edge, so the park stopped clearing
+    # the screen: a closed drawer sat in the band's right-hand gutter showing the
+    # inset's worth of itself (measured: 469px at 2560), empty on a fresh load because
+    # the conversation is not mounted until it is first opened. The park carries the
+    # same inset. It has to be the transform rather than putting ``right`` back, since
+    # the transform is what the framework transitions — moving the edge would jump.
+    parked = _css_rule(
+        style, ".app-narrow .v-navigation-drawer--right:not(.v-navigation-drawer--active)",
+    )
+    for part in ("transform:", "var(--app-inset)", "!important"):
+        assert part in parked, (
+            f"the closed conversation drawer's park drops {part}, so it shows itself "
+            "in the band's empty gutter"
+        )
+
+    # And the content between them, which is style.css's rule plus the inset rather
+    # than instead of it: dropping either half puts the content under a drawer or
+    # under a phone's rounded corner.
+    main = _css_rule(style, ".app-narrow .v-main")
+    for part in ("--v-layout-left", "--v-layout-right", "safe-area-inset-left",
+                 "safe-area-inset-right", "var(--app-inset)"):
+        assert part in main, f"the content's padding drops {part}"
+
+
+def test_the_band_is_a_remembered_preference_with_a_control_that_does_something():
+    """Kept from the first cut, because these two parts were never the problem.
+
+    Offered on a desktop only: on a phone the window is already narrower than any band
+    this could hold the app in, so the control would be a button that does nothing —
+    and the rules being inert there is what makes that safe rather than a special case.
+
+    Remembered through the same rules as every other stored preference (validate, fall
+    back, survive a storage that throws). The key is ``.narrow`` and not the ``.focus``
+    the feature was first called: what it names changed, and a key whose name means
+    something else is one that gets read as the wrong answer.
+    """
+    app = _read(APP)
+
+    toggle = None
+    for match in re.finditer(r"<v-btn\b[^>]*>", app, re.S):
+        if "narrow = !narrow" in match.group(0):
+            toggle = match.group(0)
+            break
+    assert toggle, "nothing in the shell turns the band on"
+    assert 'v-if="!mobile"' in toggle, (
+        "the toggle is offered on a phone, where there is no width to give back"
+    )
+    assert "aria-label" in toggle, "an icon-only button needs a name"
+    assert "mdiArrowCollapseHorizontal" in toggle and "mdiArrowExpandHorizontal" in toggle, (
+        "the toggle draws the same icon in both states, or one pasted as path data "
+        "rather than taken from @mdi/js"
+    )
+    cluster = app.index('<div class="bar-cluster"')
+    assert cluster < app.index('@click="narrow = !narrow"') < app.index("</v-app-bar>")
+
+    assert "const NARROW_STORAGE_KEY = 'lmer.app.narrow'" in app
+    assert re.search(
+        r"const narrow = ref\(storedFlag\(\s*\(\) => window\.localStorage"
+        r"\.getItem\(NARROW_STORAGE_KEY\), false,\s*\)\)", app,
+    ), (
+        "the band is not read back through preferences.js, or it defaults to on — "
+        "which would hold every first load in a band nobody asked for"
+    )
+    stored = _function_body(app, "watch(narrow,")
+    assert "rememberFlag(" in stored and "NARROW_STORAGE_KEY" in stored, (
+        f"the band is never written back — {stored}"
+    )
+
+
+def test_nothing_is_left_of_the_layout_the_band_replaced():
+    """The first cut of this feature moved the conversation into the main view with a
+    teleport, gave the run view a fixed-width column, and pinned the pane against the
+    viewport. All three are gone (operator: "the focused-mode concept was misaligned in
+    the original ask, simplify it"), and this is the guard that says so — a leftover
+    from any of them is a second layout nobody is looking at.
+
+    The two things the earlier rounds *did* fix are gone with the state they were
+    about: a drawer that could open holding nothing, and a fleet card offering to
+    reveal a conversation already on screen. Neither can happen when the conversation
+    is only ever in the drawer, so the derived model and the write gate went with them
+    — what is left is the drawer's own `v-model`, exactly as it was before this MR.
+    """
+    app = _read(APP)
+    for gone in ("Teleport", "uber-stage", "uber-dock", "stage-uber", "stage-runs",
+                 "stage-focused", "RUN_COLUMN_PX", "setUberOpen", "toggleUberFocus",
+                 "closeUber", "offer-chat"):
+        assert gone not in app, (
+            f"{gone} is still in the shell, so part of the layout the band replaced "
+            "is still shipping"
+        )
+    assert 'v-model="uberOpen"' in _drawer("right"), (
+        "the drawer's open state is still derived from a mode that no longer exists"
+    )
+    assert "offerChat" not in _read(RUN_CARD), (
+        "the run card still takes the prop that hid its chat button in a mode that "
+        "no longer exists"
     )
 
 
