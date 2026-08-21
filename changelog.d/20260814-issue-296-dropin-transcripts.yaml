@@ -1,5 +1,0 @@
-added:
-- "User-installed harnesses can make their transcripts readable in the chat view by shipping an in-container converter that emits the documented lmer transcript format (docs/TRANSCRIPT-FORMAT.md) (#296)"
-- "docs/TRANSCRIPT-FORMAT.md: the public record schemas, reader constraints and converter lifecycle, with a copy-installable opencode drop-in under examples/harnesses/opencode/ (#296)"
-changed:
-- "Transcript format support is now two tiers: in-tree adapters stay closed at claude/codex/pi, and every other harness integrates through the canonical format (#296)"

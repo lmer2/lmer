@@ -1,3 +1,0 @@
-added:
-- "Gates reuse a passing test-suite result when the tree, test invocation, interpreter, environment and installed dependencies are all unchanged, instead of re-running the suite"
-- "Gate receipts record what the test run covered as structured fields (full suite, the declared text subset, or a reused pass) instead of only as summary prose"

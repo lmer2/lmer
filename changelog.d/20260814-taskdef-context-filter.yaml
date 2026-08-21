@@ -1,2 +1,0 @@
-security:
-- "Taskdef rendering no longer exposes credentials: sensitive-named LMER_* variables are dropped from the template context and credential-bearing URLs render in tokenless form. (#285)"

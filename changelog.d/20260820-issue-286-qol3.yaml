@@ -1,6 +1,0 @@
-added:
-- "Control UI: a redraw button on the terminal view, which rebuilds the view and asks the session to repaint where fitting is on"
-- "Control UI: a toggle that holds the whole app in a band in the middle of a wide screen, remembered between loads, with uber lmer's pane open beside it"
-- "Control UI: a message still waiting for the transcript can be removed from the chat pane"
-fixed:
-- "Control UI: a long URL in a chat pane no longer scrolls the conversation sideways"

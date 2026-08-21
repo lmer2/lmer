@@ -1,7 +1,0 @@
-fixed:
-  - "Attributed platform-typed chat lines correctly and prevented Codex chat and CLI steering messages beginning with `!` from executing as shell commands while preserving deliberate slash commands. (#321)"
-  - "Kept digest reminders on schedule after future timestamps and corrected related configuration messages. (#321)"
-changed:
-  - "Directed agent progress tracking to work-repository run directories instead of target-repository journal files. (#321)"
-  - "Rebuild the platform UI bundle to deploy platform-attributed chat turns. (#321)"
-  - "Rebuild session images and recreate Codex sessions to deploy the shell-escape guard. (#321)"
