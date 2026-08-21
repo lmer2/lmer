@@ -271,8 +271,10 @@ def test_the_app_is_wrapped_in_the_vuetify_layout_root():
     assert "createVuetify" in main
     assert ".use(vuetify)" in main
     app = (WEB / "src" / "App.vue").read_text(encoding="utf-8")
-    assert "<v-app>" in app
-    assert "<v-main>" in app
+    # The tags, not their whole openings: the app root carries the narrow band's class
+    # since #286, and what this is about is the layout root being there at all.
+    assert "<v-app" in app
+    assert "<v-main" in app
 
 
 def test_empty_state_explains_the_scope_rule():
@@ -457,6 +459,13 @@ ALLOWED_STORAGE_KEYS = {
     # the agreement with the inline first-paint script in web/index.html, are in
     # tests/test_platform_web_theme.py.
     "THEME_STORAGE_KEY",
+    # Whether the whole app is held in a band in the middle of the screen instead of
+    # spread across it (#286) — the effect of narrowing the browser window, for a
+    # window that has other tabs in it. A property of the screen being read from, like
+    # the three above, and it costs nothing to remember: no panel is mounted and no
+    # request is made by the answer being "on". The drawer's own open state is still
+    # deliberately not stored (tests/test_platform_web_assistant.py).
+    "NARROW_STORAGE_KEY",
 }
 
 

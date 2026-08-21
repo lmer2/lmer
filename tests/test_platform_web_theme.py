@@ -334,9 +334,19 @@ def test_the_scheme_goes_through_the_shared_preference_rules():
         "the list saying what this app is allowed to put in a browser"
     )
     # Named at the access, not handed to a helper: `getItem(key)` inside
-    # preferences.js would make that allowlist blind.
+    # preferences.js would make that allowlist blind. Every key the shell reaches for
+    # has to be one of the named constants and on the allowlist — which key set the
+    # shell is allowed to have at all is pinned in
+    # tests/test_platform_web_assistant (it is one line either side of the drawer's
+    # deliberately-unremembered open state, so that is where it belongs).
     used = set(re.findall(r"localStorage\.\w+\((\w+)", app))
-    assert used == {"THEME_STORAGE_KEY"}, f"App.vue stores under {sorted(used)}"
+    assert "THEME_STORAGE_KEY" in used, (
+        f"the scheme is not stored under its own named constant — {sorted(used)}"
+    )
+    assert used <= ALLOWED_STORAGE_KEYS, (
+        f"App.vue stores under {sorted(used - ALLOWED_STORAGE_KEYS)}, which is not "
+        "on the allowlist that says what this app may put in a browser"
+    )
 
 
 def test_the_choice_is_applied_at_startup_and_written_down_when_it_changes():

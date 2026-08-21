@@ -132,6 +132,23 @@ conversation window is lost.
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
   drawer when needed.
+- **A narrower app** — the toggle in the app bar holds the whole app — the bar, the
+  run list, the content and uber lmer's drawer — in a 1620px band in the middle of
+  the screen instead of spreading it across a wide window. It is the effect of
+  narrowing the browser, for a window that has other tabs in it. Offered on a desktop
+  only (below the band's own width it does nothing) and remembered between loads.
+  Uber lmer stays where it always is, in the right-hand drawer — and with the band
+  on it comes up open, because the band's width is the smallest one that still
+  fits the run view beside that drawer.
+- **redraw** (terminal view, beside the x1/x1.5/x2 height presets) — for a terminal
+  that has gone garbled. It always rebuilds *this* view: the log tail is re-read into
+  a fresh emulator, which is what repairs output this browser missed across a
+  reconnect. If **fit to my screen** is on it also asks the session itself to
+  repaint, by holding it one row taller for a moment before the rebuild hands its
+  real size back — that half is a write to a PTY every watcher shares, which is why
+  the fit switch (already the one gate on writing sizes) decides whether it happens.
+  Whether a given TUI repaints on being resized is the TUI's own behaviour; if it
+  does not, tap again or use its own redraw key.
 - **uber lmer settings** — how its session is *run* (model, harness, preset,
   agents fan-out), per platform instance: the settings entry in the drawer's
   overflow menu, or `GET`/`POST /api/assistant/config`. Each value shows which
@@ -140,6 +157,12 @@ conversation window is lost.
   the **next** incarnation — the running one keeps its context window until
   you restart it, and the dialog offers the restart. Standing orders are the
   chat's to edit and are deliberately not in this dialog.
+- **A message that never settles** — a message you sent is shown as a bubble until
+  the harness writes that turn into its transcript, which is how a queued message
+  stays visible. When one gets stuck there — a transcript gap, which is a bug rather
+  than a wait — the × on the bubble takes it off the screen. Display only, for as
+  long as the page is loaded: the message was sent, nothing is deleted, and if the
+  turn does land later it appears as the ordinary transcript turn it always was.
 - **Adopt / forget** — runs started outside the platform can be adopted into
   the fleet view (`+ run` → adopt, or `POST /api/runs/adopt`); ended runs can
   be forgotten from their card (undo window; nothing on disk is touched).

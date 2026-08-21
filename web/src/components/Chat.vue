@@ -96,6 +96,7 @@ import {
 } from 'vue'
 import {
   mdiAlertCircleOutline,
+  mdiClose,
   mdiCogOutline,
   mdiRefresh,
   mdiSend,
@@ -215,6 +216,12 @@ let cursor = 0
 // nothing renders it. Dropped with `pending` and the cursor in `start()`, and the
 // rule it exists for is the last paragraph above `settlePending`.
 const consumed = new Set()
+// What names a bubble, since nothing about one is a name: two identical messages
+// are two bubbles, and the transcript has neither of them yet. It is the render key
+// and it is what the dismiss below is given — the index was both, and an index
+// shifts under a removal, so dropping the first of two bubbles renamed the second
+// to the row that had just gone.
+let bubbleId = 0
 let timer = null
 let boxWatcher = null
 let disposed = false
@@ -576,6 +583,7 @@ async function send() {
     // `true` is not a confirmation: a daemon that says nothing about the submit has
     // not confirmed one.
     pending.value = [...pending.value, {
+      id: (bubbleId += 1),
       text,
       at: Date.now(),
       since,
@@ -623,6 +631,32 @@ async function send() {
 // the item (see `send()`); nothing here captions on it.
 function pendingLabel(item) {
   return props.now - item.at <= PENDING_GRACE_MS ? 'sending…' : ''
+}
+
+// The only way a bubble leaves this pane that the transcript did not decide — and
+// it is a tap, not a rule. The operator asked for it after two goes at the cause
+// (issue 237 fixed one, issue 238's transcript gap is still open): a message the
+// transcript never caught up with sits at the bottom of the pane for the rest of the
+// run, and there was nothing to do about it. Display only, for as long as the page is
+// loaded: the send already succeeded, so nothing here calls a route, and nothing
+// anywhere is deleted. If the turn does land later it arrives as the ordinary
+// transcript turn it always was.
+//
+// Not a timer wearing a button. The standing rule above `settlePending` is that no
+// clock decides what is held, because a bubble dropped on one is dropped while its
+// message is still in flight — and a control that only appeared past the grace
+// window would be that same clock, deciding when the operator is allowed to act. So
+// every bubble carries it, and what it means is "I am done looking at this", which
+// is the one thing no observation in this component can be wrong about.
+//
+// `consumed` is deliberately untouched: it remembers the turns that settled
+// bubbles, and a dismissed bubble settled against nothing.
+//
+// No storage either, unlike the ask dock's dismissals (dismissals.js). Those had to
+// outlive a component rebuilt on every visit to a run; a bubble does not survive a
+// remount in the first place, so there is nothing here to outlive.
+function dismissPending(id) {
+  pending.value = pending.value.filter((item) => item.id !== id)
 }
 
 onMounted(() => {
@@ -804,12 +838,26 @@ watch(rendererLoaded, () => {
              makes a bubble look provisional, so a bubble nothing is going to
              confirm must not keep one (issue 254). -->
         <div
-          v-for="(item, index) in pending"
-          :key="`pending-${index}`"
+          v-for="item in pending"
+          :key="item.id"
           class="turn turn-user ground-operator"
         >
-          <div class="text-body-small text-medium-emphasis">
-            you<template v-if="pendingLabel(item)"> · {{ pendingLabel(item) }}</template>
+          <div class="d-flex align-center ga-1 text-body-small text-medium-emphasis">
+            <span>
+              you<template v-if="pendingLabel(item)"> · {{ pendingLabel(item) }}</template>
+            </span>
+            <!-- On the bubble it removes, and on these bubbles only: what gets
+                 stuck is a message the transcript never wrote down, and a turn read
+                 back from the transcript would come straight back on the next poll.
+                 See dismissPending on what it does and does not do. -->
+            <v-btn
+              :icon="mdiClose"
+              size="small"
+              variant="text"
+              density="comfortable"
+              aria-label="stop showing me this message"
+              @click="dismissPending(item.id)"
+            />
           </div>
           <p class="text-body-medium said plain">{{ item.text }}</p>
         </div>
@@ -924,11 +972,29 @@ watch(rendererLoaded, () => {
   overflow-y: auto;
 }
 
+/* The wrap is declared here, on the bubble, rather than on each kind of content
+   inside it: a long path or URL is routine in every one of them, and the message
+   body was the only one that said so. What the operator reported was a *tool row*
+   — a `Bash` line whose detail was a curl at a long API URL — whose span is a flex
+   item, so its min-content width is that whole URL, and `.chat`'s `overflow-y:
+   auto` makes the other axis `auto` too: that is the horizontal scrollbar under
+   the conversation. Measured at 129px of overflow in a 689px pane, the width the
+   report came from.
+
+   `anywhere` and not `break-word`, which is the whole reason one of them fixes
+   this: only `anywhere` reduces the min-content contribution, and min-content is
+   what a flex item refuses to shrink below. `break-word` measures the same 129px.
+
+   Inherited, so a fourth kind of content cannot arrive without it — and inherited
+   is also why Markdown.vue's fences are untouched: `overflow-wrap: normal` on the
+   <pre> and its <code> is a rule on those elements and beats a value coming down
+   from here, so a command still scrolls in its own box instead of reflowing. */
 .turn {
   min-width: 0;
   max-width: 92%;
   border-radius: 10px;
   padding: 4px 10px 6px;
+  overflow-wrap: anywhere;
 }
 
 /* The colour coding, and only which class gets which: the tones themselves are
@@ -976,12 +1042,12 @@ watch(rendererLoaded, () => {
    share: tool output and pasted files are routine in these transcripts, and a
    single message taller than the pane would fill it and push every other turn
    out of reach — rendering only made that more likely, because a list or a table
-   is taller than the text it came from. `anywhere` because a long path or URL
-   must scroll nothing sideways. Scroll chaining is left alone deliberately —
-   reaching the end of a message has to carry on scrolling the conversation, or a
-   thumb gets stuck in one bubble. */
+   is taller than the text it came from. The wrap that used to be declared here is
+   now the turn's, which is where every kind of content in a bubble inherits it
+   from; a body is no longer the only part of one that can hold a URL. Scroll
+   chaining is left alone deliberately — reaching the end of a message has to
+   carry on scrolling the conversation, or a thumb gets stuck in one bubble. */
 .said {
-  overflow-wrap: anywhere;
   margin: 2px 0 4px;
   max-height: 30vh;
   max-height: 30dvh;

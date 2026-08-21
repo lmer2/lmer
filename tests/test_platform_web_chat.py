@@ -106,6 +106,20 @@ def _read(path):
     return path.read_text(encoding="utf-8")
 
 
+def _chat_declarations():
+    """Chat.vue's scoped stylesheet with its comments taken out.
+
+    Because two of the guards below are about what this stylesheet *declares* —
+    which wrap, and how many of them — and the comments beside those declarations
+    name the value that was rejected and the one Markdown.vue keeps. Read as text,
+    the prose explaining why ``break-word`` is wrong is indistinguishable from a
+    rule using it.
+    """
+    style = _read(CHAT)
+    style = style[style.index("<style"):]
+    return re.sub(r"/\*.*?\*/", " ", style, flags=re.S)
+
+
 def _chat_rule(selector):
     """One declaration block from Chat.vue's scoped stylesheet.
 
@@ -202,6 +216,59 @@ def test_the_cap_on_one_message_survives_a_rendered_one():
     assert "const following = ref(true)" in text
     assert "if (follow) nextTick(stickToBottom)" in text
     assert "max-height: 30dvh" in _chat_rule(".said")
+
+
+def test_a_long_line_anywhere_in_a_turn_wraps_instead_of_scrolling_the_pane():
+    """The operator, with a screenshot: a long URL leaves the conversation with a
+    horizontal scrollbar under it (#286).
+
+    What overflowed was not a message body — those two have said ``anywhere`` since
+    T44 — it was a **tool row**, whose text is a flex item, so its min-content width
+    is the whole unbreakable URL and the turn grows to it. ``.chat`` asks for
+    ``overflow-y: auto``, which makes the other axis ``auto`` as well, and that is
+    the scrollbar. So the declaration moved to the bubble every kind of content sits
+    in: measured in a 689px pane — the width the report came from — the pane
+    overflowed by 129px before and by nothing after.
+
+    Two things this pins beyond "a wrap is declared somewhere".
+
+    ``anywhere`` rather than ``break-word``, which is the whole of why one of them
+    fixes it: only ``anywhere`` reduces min-content, and min-content is what a flex
+    item refuses to shrink below. ``break-word`` measures the identical 129px, so a
+    later edit that swaps them would read as the same rule and restore the bug.
+
+    And *one* place, because the parts of a turn that can hold a URL are not a list
+    anybody keeps: the body, a tool's detail, a watch's line, and whatever the next
+    kind of content is. Inheritance covers them all; a per-kind declaration covers
+    the ones somebody remembered. Markdown.vue's fence is the deliberate opt-out and
+    stays one — a rule on the element beats an inherited value, which is
+    :mod:`tests.test_platform_web_markdown`'s to hold.
+    """
+    text = _read(CHAT)
+    declared = _chat_declarations()
+    assert "overflow-wrap: anywhere" in _chat_rule(".turn"), (
+        "the bubble no longer wraps, so a long URL in any part of it scrolls the "
+        "conversation sideways"
+    )
+    assert "break-word" not in declared, (
+        "break-word does not shrink min-content, so a tool row still widens the "
+        "turn it is in — it reads like a wrap and measures like none"
+    )
+    assert declared.count("overflow-wrap") == 1, (
+        "a second wrap declaration in this stylesheet; the turn's is inherited by "
+        "every kind of content in it, and a per-kind copy is one the next kind "
+        "will not have"
+    )
+    # And the two surfaces that had none of their own are inside that turn, which
+    # is what makes inheriting it the fix rather than a coincidence.
+    turns = text.index('v-for="message in visible"')
+    bubbles = text.index('v-for="item in pending"')
+    inside = text[turns:bubbles]
+    for surface in ('class="tools ground-action"', "said watch"):
+        assert surface in inside, (
+            f"{surface} is no longer rendered inside a turn, so it inherits no "
+            "wrap from one"
+        )
 
 
 # --- the colour coding (T84) --------------------------------------------------
@@ -720,6 +787,11 @@ const sending = { value: false }
 const problem = { value: null }
 const pending = { value: [] }
 const following = { value: false }
+// The component's bubble counter, which lives beside `pending` in the module scope
+// rather than inside the function under test. Here because a bubble's id is what
+// the dismiss is given (issue 286) and what the render key is, so a probe that left
+// it undefined would report no bubbles at all rather than a wrong one.
+let bubbleId = 0
 const stale = () => false
 const nextTick = () => {}
 const stickToBottom = () => {}
@@ -744,6 +816,7 @@ const typed = %s
     draft.value = typed
     await send()
     held[name] = pending.value.map((item) => ({
+      id: item.id,
       text: item.text,
       submitConfirmed: item.submitConfirmed,
       since: item.since,
@@ -1277,6 +1350,150 @@ def test_two_identical_messages_need_two_turns_and_take_them_in_send_order():
     )
 
 
+#: The dismiss run against the settle rule, in one Node process, because the
+#: question is not "does the array get shorter" — it is whether the rule that pairs
+#: bubbles with turns still works over the gap a dismissal leaves. Its pairing walks
+#: `pending` in send order and takes the oldest unmatched bubble, so a pair with the
+#: first one removed is the case where a wrong implementation shows: the survivor
+#: has to take the next turn that arrives, not wait for a second one.
+_DISMISS_PROBE = """
+const messages = { value: [] }
+const pending = { value: [] }
+const consumed = new Set()
+
+%s
+
+%s
+
+%s
+
+const probe = %s
+pending.value = probe.pending
+const after = {}
+dismissPending(probe.dismiss)
+after.dismissed = pending.value.map((item) => item.id)
+messages.value = probe.messages
+settlePending()
+after.settled = pending.value.map((item) => item.id)
+console.log(JSON.stringify(after))
+"""
+
+
+def _dismissed(pending, dismiss, messages):
+    """Run ``dismissPending`` then ``settlePending``. Ids left after each."""
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    script = _DISMISS_PROBE % (
+        _chat_body("function dismissPending"),
+        _chat_body("function comparable"),
+        _chat_body("function settlePending"),
+        json.dumps({"pending": pending, "dismiss": dismiss, "messages": messages}),
+    )
+    result = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"the dismiss probe failed:\n{result.stdout}\n{result.stderr}"
+    )
+    return json.loads(result.stdout)
+
+
+def test_the_operator_can_take_an_unsettled_bubble_off_the_screen():
+    """The operator, with a screenshot of a message they sent five turns earlier
+    still sitting at the bottom of the pane: *"for now i just want an UX authored fix
+    that just lets me manually remove a message from the display only"* (issue 286).
+
+    Two goes at the cause are behind that "for now" — issue 237's cursor race, and
+    issue 238's transcript gap, which is still open — so what is added is an escape
+    hatch and not a third theory. It removes the bubble from this pane and nothing
+    else: no route is called, the send already succeeded, and a turn that does land
+    later arrives as the ordinary transcript turn it always was.
+
+    Run rather than read, and run *with* the settle rule, because the property worth
+    having is not that an array gets shorter. The pairing walks `pending` in send
+    order and gives a turn to the oldest unmatched bubble, so a pair whose first
+    bubble was dismissed is the case that separates a working dismissal from one that
+    strands the survivor: the message still on its way has to settle against the next
+    turn that arrives, not wait for a second one that never comes.
+    """
+    pair = [
+        {"id": 1, "text": "yes", "since": 0, "at": 0},
+        {"id": 2, "text": "yes", "since": 0, "at": 1000},
+    ]
+    turn = [{"role": "user", "kind": "said", "seq": 4, "text": "yes"}]
+
+    after = _dismissed(pair, 1, turn)
+    assert after["dismissed"] == [2], (
+        "the dismiss took the wrong bubble, or more than one: two identical "
+        f"messages are two bubbles and the id is what tells them apart — {after}"
+    )
+    assert after["settled"] == [], (
+        "the bubble left standing did not settle against the next recorded turn, so "
+        "dismissing the older of two identical messages leaves the newer one waiting "
+        "for a turn of its own — and where the dismissed message's turn never lands, "
+        f"which is the case this feature is for, that wait has no end — {after}"
+    )
+
+    # A dismiss of something that is not held is a no-op rather than a wrong drop:
+    # two taps on one bubble is one gesture as far as the operator is concerned.
+    assert _dismissed(pair, 9, [])["dismissed"] == [1, 2]
+
+
+def test_the_dismiss_is_the_operators_and_not_a_timer_in_disguise():
+    """The rule this feature had to be added *under*: nothing about a bubble is
+    decided by a clock (see the test of that name).
+
+    A control that only appeared once the grace window had expired would be the
+    rejected timeout wearing a button's clothes — the same clock deciding, one step
+    removed, when a message the operator sent may leave the screen. So the affordance
+    is on every bubble and reads no clock, and what removes one is now the transcript
+    or a tap, neither of which is a timer.
+
+    The rest is what "display only" has to mean in the code: no route, no storage,
+    and nothing else in the component that remembers a bubble is touched. `consumed`
+    is the one that would be tempting — it holds the turns that settled earlier
+    bubbles — and a dismissed bubble settled against nothing, so there is nothing in
+    it to forget.
+    """
+    body = _chat_function("function dismissPending")
+    for forbidden, why in (
+        ("Date.now", "the dismiss reads a clock"),
+        ("props.now", "the dismiss reads the shell's clock"),
+        ("PENDING_GRACE_MS", "the dismiss is gated on the grace window"),
+        ("consumed", "the dismiss reaches into the turn memory"),
+        ("localStorage", "a dismissal is remembered between loads"),
+        ("await", "the dismiss calls something"),
+    ):
+        assert forbidden not in body, f"{why}: {body}"
+
+    text = _read(CHAT)
+    label = _chat_function("function pendingLabel")
+    assert "props.now - item.at" in label and "PENDING_GRACE_MS" in label, (
+        "the clock moved out of the label, which is the only thing it is for"
+    )
+    # And the control is on the bubbles that can get stuck, not on the transcript's
+    # own turns: a turn removed from the display would be back on the next poll. The
+    # markup alone, since the script above it is where the function is declared.
+    markup = text[text.index("<template>"):]
+    bubbles = markup.index('v-for="item in pending"')
+    assert "dismissPending(item.id)" in markup[bubbles:], (
+        "nothing in the pending bubble calls the dismiss"
+    )
+    assert "dismissPending" not in markup[:bubbles], (
+        "a transcript turn offers a dismiss, which the next poll undoes"
+    )
+    assert ":key=\"item.id\"" in markup[bubbles:], (
+        "the bubbles are keyed by position again, so dropping one renames the rest "
+        "— which is a removal that redraws the wrong bubble"
+    )
+    dismiss = re.search(r"<v-btn\b[^>]*dismissPending[^>]*>", markup[bubbles:], re.S)
+    assert dismiss and "aria-label" in dismiss.group(0), (
+        "the dismiss is an icon button with no name, so it is unusable to a screen "
+        "reader and unlabelled to everyone else"
+    )
+
+
 def test_a_strangers_turn_no_longer_takes_a_message_off_the_screen():
     """#254, at the exact rule it was reported against.
 
@@ -1634,6 +1851,7 @@ def test_the_reply_from_the_control_plane_reaches_the_bubble():
     held = _held()
 
     assert held["unconfirmed"] == [{
+        "id": 1,
         "text": _TYPED_AT_A_SESSION,
         "submitConfirmed": False,
         "since": _CURSOR_AT_SEND,
@@ -1757,6 +1975,11 @@ const sending = { value: false }
 const problem = { value: null }
 const pending = { value: [] }
 const following = { value: false }
+// The component's bubble counter, which lives beside `pending` in the module scope
+// rather than inside the function under test. Here because a bubble's id is what
+// the dismiss is given (issue 286) and what the render key is, so a probe that left
+// it undefined would report no bubbles at all rather than a wrong one.
+let bubbleId = 0
 const stale = () => false
 const nextTick = () => {}
 const stickToBottom = () => {}

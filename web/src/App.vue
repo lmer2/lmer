@@ -5,6 +5,8 @@ import {
   mdiRobot,
   mdiAlertOutline,
   mdiArrowLeft,
+  mdiArrowCollapseHorizontal,
+  mdiArrowExpandHorizontal,
   mdiBroom,
   mdiMagnify,
   mdiPlus,
@@ -23,7 +25,9 @@ import { fetchState, forgetRun, prune, rescan } from './api.js'
 import {
   ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef,
 } from './format.js'
-import { rememberChoice, storedChoice } from './preferences.js'
+import {
+  rememberChoice, rememberFlag, storedChoice, storedFlag,
+} from './preferences.js'
 
 const POLL_MS = 10000
 
@@ -111,19 +115,58 @@ watch(themeMode, (mode) => {
 // initial value of a model somebody else owns.
 const navOpen = ref(!mobile.value)
 
+// --- the narrow band (#286) --------------------------------------------------
+// The operator, after living with the first cut: on a widescreen the app is spread
+// across the whole window — the run list against the left edge, the conversation's
+// drawer against the right — and the fix they wanted was not a special layout for
+// uber lmer at all. It is the effect of narrowing the browser window: hold the whole
+// app in a band in the middle of the screen and leave the rest of it empty. As a
+// platform option rather than an actual narrow window, because the window has other
+// tabs in it.
+//
+// So this is one class and a width. Everything the mode used to do — a second dock
+// for the conversation, a fixed-width run column, a pinned pane — is gone with it,
+// and the drawer, the run view and the bar behave exactly as they do at full width.
+//
+// Remembered, unlike the drawer's open state: this is a property of the screen being
+// read from, like the terminal's height and the colour scheme, and an operator who
+// wants the band wants it on every load. The key is `.narrow` rather than the
+// `.focus` this feature was first called, because what it names has changed —
+// anything that read the old key would be reading a different feature's answer.
+const NARROW_STORAGE_KEY = 'lmer.app.narrow'
+const narrow = ref(storedFlag(
+  () => window.localStorage.getItem(NARROW_STORAGE_KEY), false,
+))
+
+watch(narrow, (on) => {
+  rememberFlag(
+    (value) => window.localStorage.setItem(NARROW_STORAGE_KEY, value), on,
+  )
+})
+// --- end of the narrow band ---------------------------------------------------
+
 // --- the supervisor's drawer (T31) -------------------------------------------
-// Closed on every load, and deliberately not remembered. The landing screen is
-// the fleet, and a remembered-open drawer would open a phone onto a full-screen
-// chat instead of it — and make every glance at the fleet fetch the supervisor's
-// status and its transcript. So no preference and no storage key: this is a
-// drawer you open to say something.
-const uberOpen = ref(false)
+// Closed on every load unless the band is on, and deliberately not remembered on its
+// own. The landing screen is the fleet, and a remembered-open drawer would open a
+// phone onto a full-screen chat instead of it — and make every glance at the fleet
+// fetch the supervisor's status and its transcript. So no preference and no storage
+// key of its own: this is a drawer you open to say something.
+//
+// The band is the one exception, and it is the operator's (#286, from living with it):
+// the band exists to hold the app beside this conversation — its width is the smallest
+// one at which the run view still fits *with this drawer open* — so a screen the band
+// was left on is a screen the pane belongs on, whole. Not on a phone: there the band is
+// inert (the window is already narrower than it), and the flag alone must not land a
+// phone on a full-screen chat.
+const uberOpen = ref(narrow.value && !mobile.value)
 // Mounted on first open and left mounted after. The v-if is what keeps the fleet
 // view free of the chat's two polls until somebody asks for it; leaving it mounted
 // afterwards is what keeps a half-typed message alive across a close. The bar
 // button shows no digest count for the same reason the drawer is not preloaded —
 // a badge would mean polling the supervisor on every fleet load.
-const uberSeen = ref(false)
+// Seeded from the drawer's own first frame rather than `false`, because the watcher
+// below fires on a *change*: a drawer that starts open would otherwise come up empty.
+const uberSeen = ref(uberOpen.value)
 watch(uberOpen, (open) => {
   if (open) uberSeen.value = true
 })
@@ -427,7 +470,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <v-app>
+  <!-- The narrow band is a class on the app's own root, because the things that sit
+       against the window's edges are the app bar and the two drawers — all three
+       `position: fixed`, which no `max-width` on an ancestor can reach. The rules
+       are at the bottom of this file. -->
+  <v-app :class="{ 'app-narrow': narrow }">
     <v-app-bar :elevation="1" density="comfortable">
       <!-- Only where the drawer is an overlay: where it is permanent there is
            nothing to toggle, and a button that does nothing is worse than no
@@ -462,6 +509,20 @@ onUnmounted(() => {
         variant="text"
         aria-label="talk to uber lmer"
         @click="uberOpen = !uberOpen"
+      />
+      <!-- The band (#286), in the bar for the same reason the scheme picker is: it
+           is a property of the screen this app is being read on, not of any run.
+           Offered only on a desktop, where there is width to give back — on a phone
+           the window is already narrower than any band this could hold the app in,
+           so the control would do nothing. -->
+      <v-btn
+        v-if="!mobile"
+        :icon="narrow ? mdiArrowExpandHorizontal : mdiArrowCollapseHorizontal"
+        :variant="narrow ? 'tonal' : 'text'"
+        :aria-label="narrow
+          ? 'use the whole width of the screen'
+          : 'hold the app in a band in the middle of the screen'"
+        @click="narrow = !narrow"
       />
       <!-- In the bar because the scheme is the app's and not one run's: it stays
            reachable from the fleet, a run and the spawn form alike.
@@ -717,6 +778,7 @@ onUnmounted(() => {
       </v-container>
     </v-main>
 
+
     <!-- The undo window, made visible. It is not a report of something that
          happened — nothing has been sent yet — which is why it stays up for the
          whole window (`timeout="-1"`, the window's own timers close it) and why the
@@ -752,5 +814,87 @@ onUnmounted(() => {
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
+}
+
+/* The band. What the mode does, and all it does: hold the whole app in a strip in
+   the middle of a wide screen and leave the rest of the window empty — the effect of
+   narrowing the browser, without narrowing a window that has other tabs in it.
+
+   It is four rules rather than a `max-width` on one element because the parts that
+   sit against the window's edges are `position: fixed` (the app bar and both
+   drawers), and a fixed box takes its edges from the viewport however its ancestors
+   are sized. The alternative — giving an ancestor a transform so it becomes their
+   containing block — turns `fixed` into something that scrolls with the page, which
+   is the app bar and the drawers scrolling away.
+
+   `100vw` includes a vertical scrollbar where the platform draws one, so the band can
+   sit up to half a scrollbar off true centre. Left alone deliberately: correcting it
+   means measuring the scrollbar in script, and the error is a few pixels on the
+   screens this mode is for. */
+.app-narrow {
+  /* The band's width, in one place, and the number is measured rather than chosen:
+     it is the smallest band at which the terminal's control row still fits on one
+     line with uber lmer's drawer open (operator report — at 1600 the `redraw` button
+     wrapped to a second row). With the drawer open the content column gets
+     `band - 280 - 720`, so the run view sees 620px here; 619 wraps, 620 does not.
+     The extra width comes out of the empty page either side, not out of the run list
+     or the drawer — both are untouched at 280 and 720.
+     No slack on purpose, since the operator asked for the smallest: the row keeps
+     its own `flex-wrap`, so a control added to it later wraps rather than overflows,
+     and a transiently wider row (the `reconnecting` chip is far wider than `live`)
+     can still wrap by design. Change this line to change the band. */
+  --app-band: 1620px;
+  --app-inset: max(0px, (100vw - var(--app-band)) / 2);
+}
+
+/* `!important` on exactly these, and only these: Vuetify's layout composable writes
+   `position`, `left`/`right` and `width` as INLINE styles on every layout item it
+   places (measured on the built bundle — the bar carries
+   `left: 0px; width: calc(100% + 0px)`, the navigator `left: 0px; width: 280px`), and
+   an inline declaration outranks any stylesheet. The alternative is a wrapper with a
+   transform, which makes it the containing block for its fixed descendants and turns
+   the bar and both drawers into things that scroll away with the page.
+   The width is released as well as the edges moved, because a left/right inset cannot
+   shrink a box whose width the framework has already pinned. Everything else about
+   these elements — the open/closed transform, the z-index, the heights — is left to
+   the framework. */
+.app-narrow .v-app-bar {
+  left: var(--app-inset) !important;
+  right: var(--app-inset) !important;
+  width: auto !important;
+}
+
+.app-narrow .v-navigation-drawer--left {
+  left: var(--app-inset) !important;
+}
+
+.app-narrow .v-navigation-drawer--right {
+  right: var(--app-inset) !important;
+}
+
+/* Parked, the drawer has to clear the window's edge — and moving that edge inwards is
+   what stopped it clearing. The framework parks a right drawer by translating it its
+   own width plus a pixel (measured: `translateX(721px)` on a 720px drawer), which lands
+   it exactly on whatever `right` says, and `right` is now `--app-inset` from the edge.
+   So a closed drawer left the inset's worth of itself sitting in the band's right-hand
+   gutter — 469px at 2560 — empty on a fresh load, because the conversation is not
+   mounted until it is first opened. The park is extended by the same inset. `transform`
+   is what the framework transitions, so it still slides rather than jumping, which is
+   why this moves the park instead of moving `right` back to the edge. */
+.app-narrow .v-navigation-drawer--right:not(.v-navigation-drawer--active) {
+  transform: translateX(calc(100% + 1px + var(--app-inset))) !important;
+}
+
+/* The content between them. The two layout variables and the safe-area insets are
+   style.css's rule for this element, restated because the band adds to it rather
+   than replacing it — dropping either half would put the content under a drawer or
+   under a phone's rounded corner. */
+.app-narrow .v-main {
+  padding-left: calc(
+    var(--v-layout-left, 0px) + env(safe-area-inset-left) + var(--app-inset)
+  );
+  padding-right: calc(
+    var(--v-layout-right, 0px) + env(safe-area-inset-right) + var(--app-inset)
+  );
 }
 </style>
