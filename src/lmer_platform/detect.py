@@ -55,10 +55,62 @@ persists is announced once. A condition that clears and comes back is announced
 again — the second occurrence is a second event, and treating it as a duplicate
 of the first would hide a run that asked, got answered, and asked again.
 
+One *clear* is material, and only one (issue #254)
+---------------------------------------------------
+A run that stops having *any* question on the attention axis is the exception,
+delivered as :data:`QUESTION_ANSWERED_KIND` for the kinds :data:`QUESTION_KINDS`
+names. The consumer is the whole argument: the orchestrating assistant is asleep
+between digests, so an answer given out of band — the UI's survey, ``POST
+/api/runs/answer``, ``work answer`` in a shell someone had open — wakes nothing,
+and it goes on believing the run is blocked on a human who has already replied.
+Every *other* clear stays silent, because nothing is waiting on it: a run that
+stops being crashed needs no next step from anybody.
+
+The clear is keyed on the **run**, and not on the condition key the diff above
+uses — which is the difference between a wake-up and a lie. Two ordinary
+movements change that key while a human is still owed an answer. A run that is
+*re-asked* between two ticks gets a new ``since`` (the new question's own
+timestamp), so the baseline's key is gone from the current tick with the run
+waiting right now. And a live ask most often ends by changing *shape* rather
+than disappearing: a session records its blocking question and exits, turning
+``live_question`` into the stopped run's ``question`` — two spellings of one fact
+(:data:`lmer_platform.inventory.ATTENTION_REASONS` explains why they are two
+reasons and not one name), which is why they are both in
+:data:`QUESTION_KINDS`. Keyed on the tuple, each of those spools "no longer
+waiting" about a run that is waiting, and the assistant drains oldest-first, so
+the false all-clear would be its last word on the subject.
+
+So both sides of the diff are reduced to the set of runs carrying at least one
+:data:`QUESTION_KINDS` condition, and a clear is a run that *left* that set. A
+re-ask and a shape change both keep the run in it, and say nothing here; the
+fresh condition each of them raises still arrives through the diff above, which
+is the digest that is true. What is given up is real and small: a run that has
+one question answered and asks another in the same window is told about the new
+question only, and the assistant learns the old one is gone by the run not being
+on the attention list when it reads.
+
+Three things this deliberately does not claim. A run that left the fleet between
+ticks (archived, deleted) also loses its condition, and is not announced — its
+question was not answered, and naming a run the assistant can no longer address
+is a wake-up with no move behind it. A question can leave the axis without being
+answered at all, if the session holding it dies; that run's ``crashed`` arrives
+on the same tick through the diff above, saying so. And a session can *withdraw*
+its own question — close it unanswered and go on running
+(:func:`ask_channel.protocol.open_questions` drops a closed entry, which is what
+both ask views render as "the session stopped waiting for this") — after which
+the condition clears exactly as an answer clears it, on a run that is still in
+the fleet and still healthy. Nothing in the payload tells those two apart: the
+attention record that carried the question is precisely what is gone. So the
+digest is worded to the strength this can measure — *answered or withdrawn* —
+because "a human replied" is a claim an assistant would act on by skipping the
+read that would have shown nobody had.
+
 The first tick therefore establishes the baseline and notifies **nothing**, which
 is a real choice with a real cost. What it gives up: a question that opened while
-the daemon was down is never announced as an event. What it buys: a daemon
-restart on a host with a long history does not flood a spool bounded at
+the daemon was down is never announced as an event — and, symmetrically, one that
+was *answered* while it was down, since :attr:`Detector._seen` lives in memory
+only and a clear is a diff against a baseline that restarted empty. What it buys:
+a daemon restart on a host with a long history does not flood a spool bounded at
 :data:`lmer_platform.assistant.MAX_PENDING` with digests about runs that finished
 last week — and dropping the oldest to make room for stale ones is the failure
 worth avoiding. The standing list is not lost either way: it is what
@@ -193,6 +245,31 @@ off this tick's fleet read. Two things keep it from being the firehose everythin
 above avoids: one digest names every stale run, and a run it named waits another
 window before it is named again.
 
+A fifth job on the same tick: saying a spool has gone unread (issue #317)
+-------------------------------------------------------------------------
+Everything above ends at :func:`lmer_platform.assistant.notify`, which writes to a
+file and pushes nothing. What reads that file is a watch the assistant arms on
+itself — and a watch stops: a skipped re-arm, a stale edge detector, a harness
+with no monitor primitive at all. On 2026-08-19 that left ten digests, live
+questions among them, sitting for seventeen minutes while the operator noticed
+first.
+
+So :meth:`Detector.nudge_once` types **one sentence** into the assistant's own
+session through :func:`lmer_platform.session_io.send_input` — the path a wind-down
+already uses — when :mod:`lmer_platform.nudge` says the spool has waited past the
+configured interval beside a quiet assistant. That module owns every boundary and
+the wording; this one owns the send, the mark and the event. The operator-facing
+account of both is ``docs/PLATFORM-QUICKSTART.md``, "Digest nudges".
+
+Three things keep it from being the push this module spent its first four
+sections arguing against. **No digest travels**: what is typed is "N are waiting,
+take them". **It is rate-limited by a window, not a count**, anchored in
+:attr:`lmer_platform.assistant.AssistantState.nudged_at` and bounded in memory
+when that write fails (:attr:`Detector._nudged`), so a nudge whose submit never
+registered is retried rather than lost. And **it cannot fire at a working
+assistant**, which is also why there is no separate "is it draining" check:
+draining is work, and work is not idle.
+
 Failure is absorbed, and a persistent one goes quiet
 ----------------------------------------------------
 A detection failure must never take the daemon down: the fleet view is what an
@@ -219,20 +296,22 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from ask_channel import protocol as ask_protocol
 from work_repo import run_state
 
-from . import ask, assistant, checkin, registry, transcripts
+from . import ask, assistant, checkin, nudge, registry, transcripts
 from .api import build_state
 from . import config as config_module
-from .config import PlatformConfig, checkin_settings
+from .config import PlatformConfig, checkin_settings, nudge_settings
+from .session_io import SessionIOError, send_input, session_output_state
 from .inventory import _TERMINAL_STATUSES
 from .spawn import ports_file_for
 from .store import (
     StoreError,
+    age_seconds,
     clamp_text,
     append_event,
     mutating,
@@ -247,7 +326,9 @@ from .workrepo import resolve_run_dir
 logger = logging.getLogger("lmer_platform.detect")
 
 __all__ = [
-    "DETECT_INTERVAL_SECONDS", "MATERIAL_STATES", "SESSION_ENDED_UNWATCHED",
+    "DETECT_INTERVAL_SECONDS", "MATERIAL_STATES", "QUESTION_ANSWERED_KIND",
+    "ASSISTANT_NUDGED",
+    "QUESTION_KINDS", "SESSION_ENDED_UNWATCHED",
     "SESSION_SIGNALLED", "SIGNAL_DIGEST_KIND", "SIGNAL_MARKS_FILE",
     "Signal", "SessionSignal", "Detector", "sweep_finished_sessions",
     "new_signals", "record_ingested_signals",
@@ -296,12 +377,52 @@ SESSION_SIGNALLED = "session_signalled"
 #: produced it, because the assistant's own instructions talk about ``lmer-signal``.
 SIGNAL_DIGEST_KIND = "session_signal"
 
+#: Digest class for a question that is no longer being asked (issue #254). Beside
+#: :data:`SIGNAL_DIGEST_KIND` rather than on the attention axis, and for the same
+#: reason: an answered question means the *orchestrator* has a next step, while
+#: every member of :data:`lmer_platform.inventory.ATTENTION_REASONS` means the
+#: operator does — and this one exists precisely because the operator has already
+#: acted. The name is what happened, not what cleared, because it is what the
+#: assistant's own instructions call the event.
+#:
+#: It names the common case rather than the only one: a session that closes its
+#: own question unanswered clears the condition the same way, and the payload
+#: cannot tell the two apart (module docstring). The *note* says so —
+#: :meth:`Signal.answered_digest` claims answered *or withdrawn* — while this
+#: label stays the one word the spool sorts on and the instructions already use.
+QUESTION_ANSWERED_KIND = "question_answered"
+
+#: The attention reasons whose *disappearance* is material — the exception the
+#: module docstring argues for, and the only one. Both are questions a human
+#: answers (:data:`lmer_platform.inventory.ATTENTION_REASONS` explains why they
+#: are two reasons and not one name), which is what makes their clearing an event
+#: rather than a run merely getting better. Named here rather than derived,
+#: unlike everything else on that axis: nothing on the record says "a person can
+#: answer this", and a reason added there later must not silently start claiming
+#: it was answered.
+#:
+#: Written in *lifecycle* order — the live session's ask first, then the record a
+#: stopped run leaves behind — which is what :func:`_question_rank` reads when it
+#: has to choose between two spellings on one run. The membership is what the
+#: clear is keyed on; the order matters only to that tie-break.
+QUESTION_KINDS = ("live_question", "question")
+
 #: Where the high-water marks live: ``{"sessions": {"<id>": {"seq": N, ...}}}``,
 #: beside the daemon's other snapshots (spec §6.1) and written only from here.
 #: Persisted rather than held in memory because "exactly once" has to survive a
 #: daemon restart, which is precisely when a session is signalling into a channel
 #: nobody is reading yet.
 SIGNAL_MARKS_FILE = "signals.json"
+
+#: Longest send-error text an :data:`ASSISTANT_NUDGED` event carries. Bounded like
+#: every other composed string in this package.
+MAX_SEND_ERROR_CHARS = 500
+
+#: What the platform records when it has typed a nudge into the assistant's
+#: session (issue #317). An event and not only a log line because the platform
+#: wrote into a session unasked, and "who typed that" must stay answerable from
+#: the same history that records a wind-down.
+ASSISTANT_NUDGED = "assistant_nudged"
 
 #: Run states whose *arrival* is material even though nothing needs a human.
 #: ``complete`` only: §8.3's "a task finished", read off the state axis because a
@@ -387,6 +508,29 @@ class Signal:
                 text = f"{text}: {self.note}"
         return _clamp(text, assistant.MAX_NOTE_CHARS)
 
+    @property
+    def answered_digest(self) -> str:
+        """The one line for this condition having *gone* (:data:`QUESTION_KINDS`).
+
+        Names the run and nothing else it would have to be read back to know: the
+        answer's own text is on the run, not in this tick's payload — the
+        attention record that carried the question is exactly what disappeared —
+        and a fleet-wide sweep is what naming the run is here to save.
+
+        "Answered **or withdrawn**" is the strongest thing that record's absence
+        supports, and the weaker word is the load-bearing one: a session can close
+        its own question unanswered and keep running, which clears the condition
+        identically and leaves nothing in the payload to distinguish it (module
+        docstring). Saying "answered" alone would tell the orchestrator a human
+        replied, and the move it makes on that is to *skip* the read that would
+        have shown nobody did.
+        """
+        return _clamp(
+            f"{self.ref} is no longer waiting — its {self.kind} was answered "
+            "or withdrawn",
+            assistant.MAX_NOTE_CHARS,
+        )
+
     def data(self) -> dict:
         """The structured half of the digest: enough to act without a fleet read."""
         return {
@@ -400,6 +544,24 @@ class Signal:
         }
 
 
+def _identity(row: object) -> Optional[tuple]:
+    """``(host, project, slug)`` off one fleet row, or ``None``.
+
+    ``None`` for a row the inventory built from a session with no run identity
+    yet (spawned seconds ago, nothing committed): :func:`lmer_platform.inventory
+    ._view_from_session` fills those fields with :data:`_UNIDENTIFIED`. Nothing
+    here can name such a row to the assistant in a way the assistant could act on
+    — every run route takes host, project and slug — and it will have an identity
+    by the time it has anything material to say.
+    """
+    if not isinstance(row, dict):
+        return None
+    identity = [_text(row.get(field)) for field in ("host", "project", "slug")]
+    if not all(identity) or _UNIDENTIFIED in identity:
+        return None
+    return tuple(identity)
+
+
 def _signals_of_row(row: object) -> list:
     """Every material condition one fleet row carries, or an empty list.
 
@@ -408,15 +570,8 @@ def _signals_of_row(row: object) -> list:
     once (a ``complete`` run has no attention record), and this does not depend on
     that staying true.
     """
-    if not isinstance(row, dict):
-        return []
-    identity = [_text(row.get(field)) for field in ("host", "project", "slug")]
-    if not all(identity) or _UNIDENTIFIED in identity:
-        # A row the inventory built from a session with no run identity yet
-        # (spawned seconds ago, nothing committed). Nothing here can name it to
-        # the assistant in a way the assistant could act on — every run route
-        # takes host, project and slug — and it will have an identity by the time
-        # it has anything material to say.
+    identity = _identity(row)
+    if identity is None:
         return []
     host, project, slug = identity
 
@@ -457,6 +612,51 @@ def _signals(payload: object) -> dict:
     for row in rows if isinstance(rows, list) else []:
         for signal in _signals_of_row(row):
             found.setdefault(signal.key, signal)
+    return found
+
+
+def _question_refs(signals: dict) -> set:
+    """The runs in *signals* carrying at least one :data:`QUESTION_KINDS` condition.
+
+    The whole of what a *clear* is keyed on (module docstring): not the condition
+    key the diff uses, because a run that is re-asked or whose live ask becomes a
+    stopped run's ``question`` changes that key without ceasing to wait on a
+    person.
+    """
+    return {
+        signal.ref for signal in signals.values() if signal.kind in QUESTION_KINDS
+    }
+
+
+def _question_rank(signal: Signal) -> int:
+    """How late in a question's life this spelling is; higher wins a tie.
+
+    Only reached when one run carries both spellings at once, which today's
+    :func:`lmer_platform.inventory.build_inventory` does not produce — a row has
+    at most one attention record, and the one shape that puts two rows on one run
+    (a session entry no run-dir row claims) reads ``crashed``. It is a tie-break
+    rather than an assertion because this module takes the fleet payload as it
+    finds it, and "whichever came first in the payload" is the kind of ordering
+    that changes under an unrelated sort. The stopped run's ``question`` wins: it
+    is the later stage, so it is the condition the run is still remembered by.
+    """
+    return QUESTION_KINDS.index(signal.kind)
+
+
+def _refs(payload: object) -> set:
+    """Every run the payload names, material or not.
+
+    Deliberately not derivable from :func:`_signals`: a run with nothing material
+    to say is absent there and present here, and that difference is the whole of
+    how a question that stopped being asked is told apart from a run that left the
+    fleet (module docstring).
+    """
+    rows = payload.get("runs") if isinstance(payload, dict) else None
+    found = set()
+    for row in rows if isinstance(rows, list) else []:
+        identity = _identity(row)
+        if identity is not None:
+            found.add("/".join(identity))
     return found
 
 
@@ -900,6 +1100,7 @@ class Detector:
         interval: float = DETECT_INTERVAL_SECONDS,
         state_reader=None,
         notifier=None,
+        sender=None,
         sleep=None,
     ) -> None:
         self.config = config
@@ -918,10 +1119,20 @@ class Detector:
         #: Runs named in a check-in digest (issue #244) — runs rather than
         #: digests, because one digest names all of them.
         self.stale_reported = 0
+        #: Questions that cleared while their run stayed in the fleet (issue
+        #: #254), counted apart from ``notified`` because this is the one digest
+        #: class raised by a condition *going away*.
+        self.answered = 0
+        #: Nudges typed into the assistant's session (issue #317). Counted
+        #: apart because it is the only stage that writes *into* a session.
+        self.nudged = 0
         self._stop = threading.Event()
         self._sleep = sleep or self._stop.wait
         self._read_state = state_reader or build_state
         self._notify = notifier or assistant.notify
+        #: How a nudge reaches the session. A parameter because the real one is
+        #: an HTTP call into a container.
+        self._send = sender or send_input
         #: The previous tick's conditions. ``None`` means no baseline has been
         #: established, which is the one state in which nothing is notified.
         self._seen: Optional[dict] = None
@@ -930,6 +1141,12 @@ class Detector:
         #: ``{run ref: announced_at}`` for digests spooled but not recorded on
         #: disk; cleared by the first successful write (see :meth:`_check_ins`).
         self._announced: dict = {}
+        #: ``(pending_seq, stamp)`` for the nudge this process last typed —
+        #: ``_announced``' shape, and the bound when the durable mark cannot be
+        #: written (issue #317's review, module docstring). Keyed on the sequence
+        #: rather than the accumulation's stamp, which two accumulations a second
+        #: apart share. Per process: a restart re-nudges once.
+        self._nudged: Optional[tuple] = None
         self._warned_unattributed = False
 
     def stop(self) -> None:
@@ -961,7 +1178,32 @@ class Detector:
             "   — and it picks up milestones a session announced itself with "
             "lmer-signal (an MR pushed, a review finished), which reach the "
             "assistant and not your attention list.\n"
-            f"   — {self._checkin_notice()}"
+            f"   — {self._checkin_notice()}\n"
+            f"   — {self._nudge_notice()}"
+        )
+
+    def _nudge_notice(self) -> str:
+        """The nudge half of :attr:`notice`, in one sentence (issue #317).
+
+        Worth a line for :meth:`_checkin_notice`'s reason, doubled: this is the
+        one thing here that types into a session rather than spooling for it, and
+        a feature that is switched off looks exactly like one that is broken from
+        the chat window it would have written to.
+        """
+        settings = nudge_settings()
+        after = settings["after_seconds"].value
+        if not after:
+            return (
+                "digest nudges are OFF on this host (nudge_after_seconds is 0): "
+                "an unretrieved spool waits for the assistant's own watch and "
+                "nothing else. POST /api/assistant/config to set an interval."
+            )
+        threshold = settings["pending_threshold"].value
+        return (
+            f"digest nudge ON: if {threshold} or more digests sit unretrieved "
+            f"for {after // 60 or 1}m beside an idle assistant, it types one "
+            "reminder into that session — the backstop for a watch that stopped "
+            "waking it. The digests themselves are never pushed."
         )
 
     def _checkin_notice(self) -> str:
@@ -1020,10 +1262,20 @@ class Detector:
         a mirror the sweep cannot read must not cost the detection that follows it,
         and the counters keep the two apart.
 
+        The nudge is the last stage and is likewise absent from the return value:
+        it is not a condition at all but a fact about the spool. It runs on **all
+        three** exits (:meth:`_nudge_stage`) — the ordinary one, the
+        baseline-establishing one, and the absorbed-scan one — because it depends
+        on none of what they have or lack: a first tick and an unreadable mirror
+        are both states in which a spool can already be sitting unread, and the
+        second is the host least able to notice.
+
         Signal ingestion is a third stage on the same terms, and it is *not* in the
         return value: what comes back is the diff's own fresh conditions, because
         that is what the tests of the diff assert on and a milestone is not one of
-        them (:attr:`signalled` is where those are counted).
+        them (:attr:`signalled` is where those are counted). An answered question
+        stays out of it for the same reason, being a condition that has gone
+        rather than one this tick found (:attr:`answered`).
         """
         try:
             self.reconciled += len(sweep_finished_sessions(self.config))
@@ -1043,6 +1295,9 @@ class Detector:
             payload = self._read_state(self.config)
         except Exception as exc:  # noqa: BLE001 - the daemon serves regardless
             self._absorb("scan", exc)
+            # The nudge stage depends on nothing this read provides, and a host
+            # whose mirror will not read is where a spool sits unnoticed.
+            self._nudge_stage()
             return []
         self._clear("scan")
         current = _signals(payload)
@@ -1067,12 +1322,205 @@ class Detector:
                 "records what is already true and notifies nothing; standing "
                 "state is what GET /api/state answers", len(current),
             )
+            # The nudge stage still runs: the baseline rule is about not
+            # re-announcing conditions, and a spool inherited across a restart is
+            # the one that has waited longest.
+            self._nudge_stage()
             return []
 
         fresh = [signal for key, signal in current.items() if key not in baseline]
         for signal in fresh:
             self._deliver(signal)
+        # After the fresh ones, so a run whose question cleared *into* another
+        # condition — a session that died holding it — is described by what it
+        # needs now before it is told what it no longer needs. Still the right
+        # order now that the clear is keyed on the run: what that keying removes
+        # is the case the order could not have saved (a stale all-clear beside a
+        # fresh ask *for the same run*, which can no longer both be raised in one
+        # tick), and what it leaves is exactly the case this order is for.
+        for signal in self._answered_questions(baseline, current, payload):
+            self._deliver_answered(signal)
+
+        # Last on purpose, so it counts what this tick spooled.
+        self._nudge_stage()
         return fresh
+
+    def _nudge_stage(self) -> None:
+        """:meth:`nudge_once` with its failures absorbed, as a tick stage.
+
+        Called from all three of :meth:`tick_once`'s exits, because a spool can
+        already be waiting in each — a restart carries one in, an unreadable
+        mirror hides one.
+        """
+        try:
+            self.nudge_once()
+        except Exception as exc:  # noqa: BLE001 - one reminder, not the tick
+            self._absorb("nudge", exc)
+
+    def nudge_once(self) -> Optional[nudge.Nudge]:
+        """Type one reminder into the assistant's session if its spool is owed one.
+
+        Returns the nudge that was delivered, or ``None`` for both "nothing was
+        due" and "it could not be sent" — the caller does the same with either and
+        the log says which.
+
+        Send, then mark, then record, as :func:`lmer_platform.lifecycle.wind_down`
+        does: a mark written first would silence the retry a refused send earns.
+        What decides retry-versus-bound is whether the bytes arrived, not whether
+        the call raised (see the ``except`` branch), and a durable mark that fails
+        to write costs nothing while this process lives — :attr:`_nudged` is the
+        bound — and one early repeat across a restart.
+        """
+        settings = nudge_settings()
+        after = settings["after_seconds"].value
+        if not after:
+            return None
+        status = assistant.status()
+        if not status.running or not status.session_id:
+            return None
+        state = self._nudge_state()
+        threshold = settings["pending_threshold"].value
+        # The cheap gates first, with both container-sourced readings omitted —
+        # ``None`` proceeds for each — so a young spool costs no HTTP call. The
+        # second call is the real decision.
+        if nudge.due(
+            state,
+            running=True,
+            idle_seconds=None,
+            after_seconds=after,
+            pending_threshold=threshold,
+        ) is None:
+            return None
+        reading = session_output_state(status.session_id) or {}
+        due = nudge.due(
+            state,
+            running=True,
+            idle_seconds=reading.get("idle_seconds"),
+            produced_output=reading.get("produced"),
+            after_seconds=after,
+            pending_threshold=threshold,
+        )
+        if due is None:
+            # Working, or not yet drawing bytes. Unmarked, so the tick after
+            # that changes is the one that tells it.
+            return None
+        text = nudge.prompt(due)
+        sent_error: Optional[str] = None
+        try:
+            # append_newline, or the reminder sits unsent in the input box.
+            self._send(status.session_id, text, append_newline=True)
+        except SessionIOError as exc:
+            # Absorbed: an unreachable control plane must not end the tick. Only
+            # the raiser knows whether the bytes were typed, and the two cases
+            # need opposite recoveries — retry a refusal, bound a delivered one.
+            # A transport failure cannot be told apart and counts as retryable,
+            # since a duplicate reminder beats a lost window. ``getattr`` is a
+            # positive-delivery test: a refused write is false, while a timeout
+            # after the child read the bytes is unknown and therefore false too.
+            self._absorb("nudge", exc)
+            if not getattr(exc, "delivered", False):
+                return None
+            sent_error = _clamp(f"{type(exc).__name__}: {exc}", MAX_SEND_ERROR_CHARS)
+        else:
+            self._clear("nudge")
+        # From here on one condition: the bytes reached the session, however the
+        # call ended.
+        self.nudged += 1
+        # Before the durable write, which can fail: this is the bound that does
+        # not need a disk. Tagged with its accumulation so it cannot outlive it.
+        self._nudged = (state.pending_seq, utc_now_iso())
+        marked = assistant.mark_nudged()
+        append_event(
+            ASSISTANT_NUDGED,
+            note=status.session_id,
+            data={
+                "session": status.session_id,
+                "pending": due.count,
+                "accumulation": state.pending_seq,
+                "waited_seconds": round(due.waited_seconds, 1),
+                # ``None`` is a value, not a missing field: idleness was not
+                # measurable, which is what explains a mid-turn arrival.
+                "idle_seconds": due.idle,
+                "repeat": due.repeat,
+                "after_seconds": after,
+                "marked": bool(marked),
+                # Always present; null unless the send raised after delivering.
+                "send_error": sent_error,
+            },
+        )
+        logger.info(
+            "platform_assistant_nudged session=%s pending=%d waited=%.0fs "
+            "idle=%s repeat=%s marked=%s send_error=%s — the spool was "
+            "unretrieved past the %ds threshold; the digests themselves still "
+            "travel only through POST /api/assistant/pending",
+            status.session_id, due.count, due.waited_seconds, due.idle,
+            due.repeat, bool(marked), sent_error, after,
+        )
+        return due
+
+    def _nudge_state(self):
+        """The assistant state the nudge decision reads, with this process's own
+        nudge stamp folded in when the durable one is missing or older.
+
+        :meth:`_with_pending_announcements`' shape: an in-memory stamp is the same
+        fact as a stored one, the stored one wins when at least as new, and
+        folding it here keeps :mod:`lmer_platform.nudge` a function of one state.
+
+        Without it, a send that succeeds while ``assistant.json`` cannot be
+        written repeats every tick — and that same outage stops the assistant
+        draining the spool, so the repeats never end.
+        """
+        state = assistant.clamp_future_nudged_at()
+        if self._nudged is None:
+            return state
+        seq, stamp = self._nudged
+        if seq != state.pending_seq:
+            # A different accumulation: the drain ended what this remembered.
+            # Dropped, not ignored, so a cycling spool grows no dead windows.
+            self._nudged = None
+            return state
+        stored = state.nudged_at
+        stored_age = age_seconds(stored) if stored is not None else None
+        # Usability, not text: a corrupt stamp sorts above an ISO one, and
+        # ``_window`` discards it anyway — so a lexical compare lost both bounds.
+        if stored is None or stored_age is None or stored < stamp:
+            return replace(state, nudged_at=stamp)
+        return state
+
+    def _answered_questions(
+        self, baseline: dict, current: dict, payload: object
+    ) -> list:
+        """One signal per run that *stopped* having a question this tick.
+
+        Keyed on the run rather than on the condition key everything else uses,
+        which is the module docstring's argument in code: a run still carrying a
+        question of either spelling is still waiting on a person, however much
+        the ``(run, kind, since)`` tuple moved. So a re-ask and a
+        ``live_question`` → ``question`` shape change produce nothing here, and
+        at most one clear is ever raised per run per tick.
+
+        The signal returned is the baseline's own question for that run, because
+        the digest and its ``data`` describe the condition that *went* — the
+        payload no longer holds it. :func:`_question_rank` picks when a run
+        somehow had both spellings at once.
+
+        The ``payload`` read is the whole of the vanished-run rule: a run that is
+        no longer in the fleet at all lost its question to an archive or a
+        deletion rather than to an answer, and it is not announced.
+        """
+        refs = _refs(payload)
+        outstanding = _question_refs(current)
+        cleared: dict = {}
+        for signal in baseline.values():
+            if signal.kind not in QUESTION_KINDS:
+                continue
+            if signal.ref in outstanding or signal.ref not in refs:
+                continue
+            previous = cleared.get(signal.ref)
+            if previous is None or _question_rank(signal) > _question_rank(previous):
+                cleared[signal.ref] = signal
+        # Baseline order, which is the inventory's own sort (:func:`_signals`).
+        return list(cleared.values())
 
     def _check_ins(self, payload: dict) -> list:
         """Spool one digest naming every run nobody has checked. Returns them.
@@ -1199,6 +1647,28 @@ class Detector:
             return
         logger.info(
             "platform_detection_notified run=%s kind=%s assistant_live=%s",
+            signal.ref, signal.kind, bool(live),
+        )
+
+    def _deliver_answered(self, signal: Signal) -> None:
+        """Hand one *cleared* question to the spool, on :meth:`_deliver`'s terms.
+
+        Its own method rather than a flag, because the two say opposite things
+        about the same run and the digest class is what a reader of the spool
+        sorts on. ``data`` is the question's own — the reason that cleared and
+        when it started — so the assistant can match this against the digest it
+        was woken with when the question opened.
+        """
+        delivered, live = self._spool(
+            signal.answered_digest, QUESTION_ANSWERED_KIND, signal.data()
+        )
+        if not delivered:
+            return
+        self.answered += 1
+        logger.info(
+            "platform_detection_answered run=%s kind=%s assistant_live=%s — the "
+            "condition cleared while the run stayed in the fleet, so it was "
+            "answered or withdrawn somewhere this daemon was not watching",
             signal.ref, signal.kind, bool(live),
         )
 

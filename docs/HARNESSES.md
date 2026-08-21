@@ -72,7 +72,7 @@ gracefully and are listed explicitly:
 | Slash commands (`agent-files` commands)      | ✅     | ✅⁷   | ✅⁷ |
 | Skills (`agent-files` skills)                | ✅     | ❌    | ❌  |
 | Output styles (`agent-files` output-styles)  | ✅⁹    | ❌    | ❌  |
-| Stop/SessionEnd hook guards                  | ✅     | ❌    | ❌  |
+| Lifecycle hook guards                        | ✅¹⁰   | ⚠️¹⁰  | ❌¹⁰ |
 | Agent memory persistence (`work memory`)     | ✅     | ✅⁸   | ✅⁸ |
 | Masterplan workflow                          | ✅     | ❌    | ❌  |
 | Slack chat mode / service mode               | ✅     | ❌    | ❌  |
@@ -97,14 +97,15 @@ gracefully and are listed explicitly:
 6. The `.mcp.json` merge machinery is claude-specific today. Codex supports
    MCP through its own config file (`agent-files/codex/config.toml`); pi has
    no built-in MCP support (extensions can add it).
-7. Rendered per session from the claude command files
-   (`agent-files/claude/commands/*.md`) into the harness's native *prompt
-   templates* by `harness_render_prompt_templates`
-   (`lmer_cli.container.prompt_templates`): pi invokes them as `/start`,
-   `/followup`, … with autocomplete; codex as `/prompts:start`, … (codex
-   custom prompts are deprecated upstream in favor of skills but remain
-   functional). Work-repo commands override global ones of the same name,
-   mirroring the claude layout. Claude-specific frontmatter
+7. Rendered per session for pi from the claude command files
+   (`agent-files/claude/commands/*.md`) into native *prompt templates* by
+   `harness_render_prompt_templates` (`lmer_cli.container.prompt_templates`),
+   invoked as `/start`, `/followup`, … with autocomplete. Current Codex
+   releases no longer discover custom prompt files: lmer starts Codex with a
+   plain-text instruction, and a control-plane `/followup` becomes a plain-text
+   instruction to run `hooks/followup.sh`; direct terminal users type that
+   instruction themselves. Work-repo commands override global ones of the same
+   name for pi, mirroring the claude layout. Claude-specific frontmatter
    (`allowed-tools`) is dropped in conversion, and a leading-`!` execution
    line becomes an instruction to run that command — these harnesses expand
    the template as prompt text and then run the command as a tool call.
@@ -120,6 +121,30 @@ gracefully and are listed explicitly:
    mechanisms, and a style reaches neither subagents nor the built-in coding
    instructions by default — see
    [LMER-CLI.md](LMER-CLI.md#output-styles-shipping-one-and-selecting-one-are-separate).
+10. Claude fires the full lmer Stop/SessionEnd guard set. Codex fires one narrow
+    Stop guard: in an orchestrated interactive session, an unread `lmer-ask`
+    answer triggers Codex's native continuation immediately; otherwise an open
+    question keeps Stop waiting for the first answer. The oldest unread answer
+    wins, including one already present when Stop fires, so the agent can run
+    `lmer-ask wait` in a real new turn. The hook never reads or embeds the answer;
+    the wait command prints it through the normal terminal path. The hook is
+    installed as an image-managed policy from
+    `agent-files/codex/requirements.toml`, which pins the `hooks` feature on and
+    makes the lmer-owned hook trusted without bypassing Codex's review of user
+    or project hooks. It fails open on channel errors, a fully settled channel,
+    repeated Stop-hook turns, `LMER_NONINTERACTIVE` children, and after its
+    3540-second timeout.
+
+    The remaining Stop-hook guards are still claude-only — including the
+    **signal reminder** (`hooks/signal_guard.py`, issue #289), which reminds an
+    orchestrated session that ends a turn on an unreported milestone to run
+    `lmer-signal`. **codex and pi runs have no mechanical signal reminder at
+    all** until the daemon-side watch (issue #294) lands; they keep only the
+    prose instruction in the orchestrator-ask prompt fragment
+    (`prompts/orchestrator-ask.md`), so an unsignalled milestone on those
+    harnesses still surfaces only through the orchestrator's stalled-run
+    digest. The same holds for the run-state, SessionEnd, and Slack reply
+    guards. Pi fires no lifecycle hook guards.
 
 ## Authentication
 
@@ -310,9 +335,10 @@ for `build_exec_argv(..., unattended=True)` (which `spawn-harness` passes):
 a future consumer of the exec profiles must opt into permission-free
 children explicitly, never inherit them from neutral registry data.
 Children are also barred
-from fanning out further: `spawn-harness` strips `LMER_AGENTS` /
-`LMER_AGENTS_CONFIG` from the child environment (no grandchildren,
-structurally).
+from fanning out further: `spawn-harness` strips both fan-out pairs — the
+container-side `LMER_SPAWN_AGENTS` / `LMER_SPAWN_AGENTS_CONFIG` it reads and
+the host-input `LMER_AGENTS` / `LMER_AGENTS_CONFIG` — from the child
+environment (no grandchildren, structurally).
 
 Children equally cannot answer *approval* questions, which is a prompt-level
 problem rather than a flag one: a child that obeys a rule telling it to stop
@@ -503,7 +529,8 @@ quit chord, no credential mounts, empty exec profile).
     "dashdash_before_prompt": true
   },
   "model_hints": ["acme"],
-  "extra_env": {"ACME_NO_UPDATE": "1"}
+  "extra_env": {"ACME_NO_UPDATE": "1"},
+  "session_dir": "/home/developer/.acme/sessions"
 }
 ```
 
@@ -519,6 +546,50 @@ start instruction (see `GENERIC_START_COMMAND`); set it only if the harness
 has a native way to load the task instructions. `exec` powers `spawn-harness`
 fan-out children (see the exec-mode section above); leave it minimal if the
 harness won't be used as a fan-out child.
+
+`session_dir` is optional and names the **absolute container directory** the
+harness writes its session JSONL under (`~/.acme/sessions` for the example
+above). The orchestrator (`lmer platform`) mounts a host directory there for
+every harness that declares one, so a spawned session's transcript survives the
+`--rm` container and the chat view can read it back; a harness that declares
+nothing simply has no transcript on the host. An invalid value (relative, or
+containing `..`, `:`, `,` or whitespace) is warned about and ignored — the
+harness still loads, since a mis-declared transcript path must not cost the
+session. The platform imposes two more conditions at spawn time, with the same
+warn-and-ignore outcome: the directory must sit **strictly below
+`/home/developer`** (the container home — every harness checked keeps its
+sessions under `$HOME`), and it must not be, or contain, a directory the
+platform already mounts, nor sit inside the mount staging area described
+below. A value outside those bounds means the harness runs with no transcript
+on the host, and the reason appears only in the platform daemon's log. What the
+mount does and does not buy the chat view is
+[Transcript visibility](#transcript-visibility-orchestrator-chat-view).
+
+**Every user-harness mount below the container home** — both
+`credential_mounts` and `session_dir` — is **delivered via a staged mount plus
+an in-container symlink**, because a manifest may name a path whose parents the
+image does not ship. (Built-in harnesses are not staged: the image ships their
+`~/.claude`, `~/.codex`, `~/.pi` developer-owned.) The bind lands under
+`/home/developer/.lmer-mounts`, and the container entrypoint links the declared
+path to it before any harness starts. The reason is ownership: a bind mount's
+missing parent directories are created by the container runtime as **root**,
+before any container process exists, and the session runs as `developer` with
+no-new-privileges — so nothing inside can chown them. A harness that writes a
+sibling file next to its own mount (opencode's `mkdir
+~/.local/share/opencode/repos` beside its `auth.json`) would die at startup with
+EACCES. The symlink is created by the
+container user, so the parent chain is developer-owned and those writes work. No
+manifest change is needed — declare the path the harness actually uses; the
+pairs travel as `LMER_MOUNT_LINKS` (see [LMER-CLI.md](./LMER-CLI.md)).
+
+A `credential_mounts[].container_path` **outside** the container home (say
+`/etc/acme/auth.json`) binds directly at its declared path instead: staging
+cannot help there — the container user cannot create `/etc/acme`, so the
+credential would land where the harness never looks — and it is not needed
+either, since root-owned parents only hurt a harness *writing beside* its
+mount, which it cannot do outside `$HOME` in any case. Reading a
+directly-mounted credential is unaffected. (`session_dir` has no such case: a
+declared value outside the container home is refused outright, above.)
 
 ### Runner script (`runner.sh`)
 
@@ -607,6 +678,77 @@ existence.
 - The empirically fragile bits of TUI driving are the ready marker and quit
   sequence; use the env overrides to iterate, and `--no-supervisor` as the
   escape hatch.
+
+### Transcript visibility (orchestrator chat view)
+
+Declaring `session_dir` is all a user harness does to get its session files
+onto the host (readability is the tier question below). `lmer platform`
+creates one host directory per
+declaring harness underneath the session's own transcript directory and mounts
+it read-write into the container — at the declared path for a built-in, at a
+staged path the entrypoint symlinks the declared one to for a user harness (see
+the staged-mount note above) — so what the harness writes there
+survives the `--rm` container; the `.jsonl` files in it get the credential-shape
+scrub when the session ends (a masking pass, not a guarantee) and are what
+`GET /api/sessions/{id}/messages` reads back
+(`_prepare_transcript_subdirs` / `_transcript_mount_flags` in
+`src/lmer_platform/spawn.py`). A harness that declares nothing runs exactly as
+before and leaves no transcript on the host. The declared directory must sit
+strictly below the container home and must not be, or contain, a directory the
+platform already mounts — a value outside those bounds is skipped with a
+warning in the platform daemon's log, and the harness runs without a
+transcript mount.
+
+**Mounting is not reading**, and there are exactly two tiers of format support:
+
+- **Adapter tier — the maintained harnesses.** Claude Code, pi (session format
+  3) and codex (rollout format) have per-record adapters in
+  `src/lmer_platform/transcripts.py`, so their native session files render as a
+  conversation: roles, text, timestamps, tool calls with their outcome. That set
+  is **closed** — no further in-tree dialect adapters are added unless the
+  operator says otherwise, and every other format integrates via the canonical
+  tier below. Adapter-tier messages win mechanically if a session contains both
+  a readable native transcript and readable canonical derived output: one
+  warning is logged and only native messages render (including for halt
+  detection). Source metadata keeps the detected record vocabulary separate
+  from the cosmetic harness label. The canonical twin should not exist for an
+  adapter-supported harness; precedence prevents it from doubling the view.
+- **Canonical tier — any drop-in.** A user harness makes its transcripts
+  readable by shipping an **in-container converter**: its own code, running
+  where the harness already runs, tailing the harness's native session files and
+  appending records in the documented
+  [lmer transcript format](./TRANSCRIPT-FORMAT.md) to a `.jsonl` file inside the
+  same declared `session_dir`. The reader recognises those records by their
+  `type`, per record, so nothing host-side has to be told the converter exists —
+  no manifest key, no in-tree change, no second mount.
+
+A format with neither — no adapter, no converter — is reported explicitly: the
+page comes back empty carrying the note *"The transcript for this run is on disk
+but has nothing to show yet … so does one whose transcript this build cannot
+read."* Never a silently blank page, which would read as "this run said
+nothing". The terminal log remains the complete record in every case.
+
+A drop-in cannot supply host-side *code* — the daemon never executes anything
+out of user-writable `~/.lmer/harnesses` — and does not need to: it ships an
+in-container converter instead, which is the same trust class as its
+`runner.sh`. A drop-in that *wraps* claude, codex or pi must **not** ship a
+converter; its native files already render.
+
+Worked example: [`examples/harnesses/opencode/`](../examples/harnesses/opencode/)
+is a complete, copy-installable drop-in — `harness.json`, `runner.sh`,
+`converter.py` — demonstrating the canonical tier end to end, with the
+walkthrough in [USER-HARNESS-OPENCODE.md](./USER-HARNESS-OPENCODE.md). It is
+also the *decoupled* case: opencode keeps its sessions in a SQLite database, so
+nothing native lands in `session_dir` at all and the declared directory is
+purely the converter's output home — `session_dir` means "where readable
+transcripts appear", not "where the harness happens to write".
+
+Only `.jsonl` files inside the declared directory are discovered, recursively —
+a harness that writes `.json` or `.log` mounts out but never reads back — and a
+symlink there resolving outside the session's own transcript directory is
+refused rather than followed, since the directory is container-writable and the
+link would serve another run's conversation (`_jsonl_files` in
+`src/lmer_platform/transcripts.py`).
 
 ### When the CLI doesn't fit the flag model
 

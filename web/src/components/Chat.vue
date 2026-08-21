@@ -72,10 +72,11 @@
 // held as pending — which is what the ask-channel merge was for in the first
 // place.
 //
-// The fourth kind of turn takes the action ground rather than a colour of its
-// own: a watch the session armed, firing (`transcripts.MONITOR_ROLE`). It is the
-// machinery talking, which is what that ground already means here, and a fourth
-// tone would be one more thing to tell apart on a phone for a turn that is rare.
+// The other kinds of turn take the action ground rather than colours of their
+// own: a watch the session armed, firing (`transcripts.MONITOR_ROLE`), or input
+// the platform typed (`transcripts.PLATFORM_ROLE`). They are machinery talking,
+// which is what that ground already means here, and extra tones would be more to
+// tell apart on a phone for turns that are rare.
 //
 // Who a turn is titled as
 // -----------------------
@@ -95,6 +96,7 @@ import {
 } from 'vue'
 import {
   mdiAlertCircleOutline,
+  mdiClose,
   mdiCogOutline,
   mdiRefresh,
   mdiSend,
@@ -153,6 +155,7 @@ const props = defineProps({
 const SPEAKERS = {
   user: 'you',
   monitor: 'the watch fired',
+  platform: 'lmer platform',
 }
 
 // Everything else: the harness's own 'system' prose today, a role a later release
@@ -172,34 +175,13 @@ const INITIAL_TAIL = 40
 // What "earlier messages" steps back by each time.
 const PAGE = 40
 
-// How long a sent message waits to appear in the transcript before the view says
-// so. Not a failure — the send already succeeded — just an honest answer to "did
-// that go through?".
+// How long a message the transcript does not have yet is captioned as still going
+// out. Not a failure — the send already succeeded — just the honest answer to "did
+// that go through?" for the seconds before the harness writes the turn down. What
+// happens when it runs out is that the caption stops: the window moves WORDING and
+// nothing else, and no clock in this component decides what is held (pendingLabel
+// below, and `settlePending` above it).
 const PENDING_GRACE_MS = 45000
-
-// What the view says about a message the transcript still does not have once the
-// grace window is up, when the control plane could not confirm the Enter it typed
-// (issue 194). It is the one caption that must not say "sent": the supervisor
-// writes the submit CR and cannot see whether the TUI took it — a dialog on screen
-// consumes the keystrokes and answers itself with the CR, and a re-render can
-// swallow it — so a message can be sitting in the session's input box, typed and
-// unsent, while this pane calls it delivered. That is what an operator hit: the
-// app reported every send as sent and none of them had arrived.
-//
-// The sentence is the view's own rather than the note the control plane sends with
-// the same fact (`_SUBMIT_UNCONFIRMED_NOTE`), for the reason the transcript's roles
-// are mapped rather than rendered: that note is written for an API caller and says
-// "the supervisor", which is a code spelling of a thing this UI calls uber lmer.
-// What is reused is the *fact*, which is the half that has to have one source.
-// Both outcomes, because they are different repairs and the caption cannot tell
-// them apart: a modal on screen consumes the keystrokes *and* answers itself with
-// the Enter, so there is nothing left in the box to submit — while a swallowed CR
-// leaves the whole message typed and waiting. Naming only the second would send an
-// operator to the terminal view looking for text that is not there.
-const SUBMIT_UNCONFIRMED_LABEL = (
-  'not confirmed — the session may not have received it at all, or it may be '
-  + 'sitting unsent in its input box. The terminal view shows which.'
-)
 
 // How far off the end still counts as "reading the end". About one turn's worth:
 // a thumb that has come to rest a few pixels short is still following, while a
@@ -228,6 +210,18 @@ const showInjected = ref(false)
 // The next `since` to poll with. Server-issued: computing it from a message count
 // would skip or repeat the moment one record normalised to nothing.
 let cursor = 0
+// The transcript turns the bubbles that are already gone took with them, by `seq`.
+// Belongs beside `pending` and outlives it — a settled bubble is dropped, so this
+// is the only thing left that remembers the turn it settled against. Not a ref:
+// nothing renders it. Dropped with `pending` and the cursor in `start()`, and the
+// rule it exists for is the last paragraph above `settlePending`.
+const consumed = new Set()
+// What names a bubble, since nothing about one is a name: two identical messages
+// are two bubbles, and the transcript has neither of them yet. It is the render key
+// and it is what the dismiss below is given — the index was both, and an index
+// shifts under a removal, so dropping the first of two bubbles renamed the second
+// to the row that had just gone.
+let bubbleId = 0
 let timer = null
 let boxWatcher = null
 let disposed = false
@@ -330,86 +324,118 @@ function comparable(text) {
 // id we could correlate on, and the alternative — trusting a timeout — would drop
 // the pending bubble while the message was still on its way.
 //
+// One thing settles a bubble, and it is a positive one: the transcript came back
+// holding this message. Nothing else takes it off the screen — not the grace window
+// running out, not a later turn, not a reply the agent produced in the meantime. A
+// message this pane accepted is ASSUMED delivered and this view owns its place in
+// the conversation until the transcript agrees, which is the operator's explicit
+// decision in issue 254 and is worth stating as a decision rather than as mechanics:
+// message loss is exceedingly rare, and a view that quietly removes what somebody
+// typed is worse than one that shows it twice.
+//
+// It replaced a second, negative way out that this rule used to have — an arrival
+// backstop, which dropped a bubble once the transcript held ANY operator turn past
+// this send's cursor with a reply after it. Neither of those facts is about this
+// message, and the hot path was the ordinary one: a message typed at a session that
+// is still working is queued and unwritten for as long as the current turn runs
+// (Claude Code records such a turn with a prompt source of its own), so a stranger's
+// turn plus any reply removed the bubble while the message had not been written down
+// yet — and a settled item is dropped, never re-added. The operator's words then left
+// the screen having never appeared in the history they were sent into. That is what
+// issue 254 reports as messages "in between turns" going missing, and it is why the
+// backstop is gone rather than narrowed: no client-side rule can tell a stranger's
+// turn from evidence of its own.
+//
+// What that costs is real and was accepted with the decision. The words are not
+// always recoverable: the same server chokepoint that normalises a turn also masks
+// credential shapes, deletes the harness's wrapper tags out of the middle of an
+// operator turn, and keeps only the tail of a turn past its length cap
+// (lmer_platform.transcripts) — each of which leaves a transcript copy that says
+// something different from what was sent, and no text rule can match those without
+// also matching messages that really are different. A bubble whose copy came back
+// rewritten therefore stays up for the rest of the run, beside the transcript's own
+// version of it. That is the T121 report (a sent message stuck at the tail of the
+// conversation, the agent having plainly acted on it) returning in the one shape it
+// still can, and it is the side of the trade the issue chose: the same message
+// twice, rather than nowhere. Issue 238 is the other half of it and is a server-side
+// story — it closes the transcript gap where a message can be correlated instead of
+// guessed at, which is the only place the guessing can actually end.
+//
+// One rewriting is not on that list, because it is the one this end can undo exactly:
+// the platform may have DEFUSED this very message on the way in. A chat message whose
+// first character is `!` reaches Claude Code's input box as that TUI's bash escape, so
+// the supervisor gives the first column to a `.` and types ". !206 was merged" (issue
+// 254, `_sanitize_user_chat`). The prefix is then part of the recorded turn, and it is
+// meant to be — nothing here hides it; this only stops the bubble from surviving its
+// own delivery. So a pending item whose text starts with `!` accepts two forms as its
+// turn: its words, and the defused rendering of those same words. The client does not
+// know which harness is on the other side and does not need to — the flag it sends
+// asserts only that a person typed this, and on a harness with no such escape the
+// second form simply never appears in a transcript.
+//
+// It has to be spelled out because the whitespace collapse above does not do it. The
+// space this defusal used to be collapsed away, so a defused copy matched its bubble
+// by itself and nothing here knew the mechanic existed; a `.` does not collapse, and
+// without this every message an operator opens with `!` would show twice — bubble plus
+// dotted transcript copy — for the rest of the run. Kept as narrow as the reason for
+// it: only an item starting with `!`, only the exact defused form of that item's own
+// text, and it takes a turn through the same one-consume walk as the plain form, so a
+// dotted turn is claimed by the one bubble whose defusal it is and by no other.
+//
 // Only messages that arrived *after* the send count. Without that, answering "yes"
 // twice in one conversation would settle the second bubble against the first
 // answer and stop showing that the new one is still in flight. `since` is the
-// client's cursor, which trails the server's end by up to a poll, so the bound
-// forgives that lag — the first arrival bullet below owns that cost.
+// client's cursor as of the send (see `send()` on why it is read before the round
+// trip), which trails the server's end by up to a poll, so the bound forgives that
+// lag rather than reaching back past it.
 //
-// `claimed` narrows the same pair: two sends inside one interval share a cursor,
-// so the seq guard cannot separate them, and without it one recorded "yes" matched
-// both. A turn is matched by text once, earliest send first (`pending` is in send
-// order).
+// `consumed` separates the same pair from the other side: two sends inside one poll
+// interval share a cursor, so the seq guard cannot tell them apart at all, and
+// without it one recorded "yes" matched both bubbles and the second message vanished
+// while it was still in flight. So the pairing is on order as well as text — a turn
+// is taken by at most one bubble, and the oldest unmatched bubble takes it, which is
+// the walk itself rather than a sort: `pending` is in send order and `filter` visits
+// it in that order. Two identical messages need two recorded turns to clear, in the
+// order they were sent, and the second is held until its own turn lands.
 //
-// That is a rule about the TEXT match only — the arrival branch neither reads nor
-// writes `claimed` — so the second bubble is held just until a reply follows that
-// turn, then settles on the same accepted cost as a stranger's turn. Excluding
-// claimed turns there would close that within a pass and is deliberately not done:
-// `claimed` is rebuilt per call, so a later poll settles the second bubble anyway
-// once the first has gone. Both shapes are pinned as fixtures. Only per-message
-// identity fixes it and the transcript has none; issue 238 removes the shared bound
-// at the source instead.
+// Which is why that memory is the component's rather than this call's, and it is the
+// whole of what makes the sentence above true. This runs on every absorb — a poll
+// that came back with nothing included — and a settled bubble is dropped, so nothing
+// else in the view remembers the turn it took. Kept per call, the set was empty again
+// on the next pass, the one recorded "yes" looked unclaimed, and the second bubble
+// settled against the first one's turn a few seconds after the first: the same drop
+// this rule exists to prevent, arriving one poll late and invisible to any fixture
+// that settles once.
 //
-// The words themselves are not always recoverable, which is why there is a second
-// way out of the bubble. The same server chokepoint that normalises a turn also
-// masks credential shapes, deletes the harness's wrapper tags out of the middle of
-// an operator turn, and keeps only the tail of a turn past its length cap
-// (lmer_platform.transcripts) — each of which leaves a transcript copy that says
-// something different from what was sent, and no text rule can match those without
-// also matching messages that really are different. Reported live: a message the
-// agent had plainly acted on stayed at the tail of the conversation as if it had
-// just been sent, for the rest of the run.
-//
-// So an item settles on arrival evidence as well, which is two facts about the
-// transcript and neither of them about text: it now holds an operator turn later
-// than this send's cursor, and a turn of the agent's follows that one. Both are
-// needed to say the message is no longer in flight —
-//
-//   - the harness records what it is sent in the order it receives it, so an
-//     operator turn at or past this send's cursor is normally one recorded after
-//     this message went — and then this message is written down too, whatever the
-//     normalisation left of it. Normally, not always, and the exception is the
-//     cost of this whole layer: the cursor trails the server by up to a poll, so
-//     an unrelated turn from that lag window plus any later reply also settles
-//     this bubble — and a settled item is dropped, never re-added. For a message
-//     that was never submitted (issue 194's dialog-ate-the-CR case, which the
-//     caption exists for) the warning is therefore gone for the rest of the run.
-//     Accepted deliberately (issue 237): the alternative bound, read after the
-//     send's round trip, leaves EVERY bubble unsettleable and the caption then
-//     lies about messages that did arrive, which is what was reported. No
-//     client-side bound can tell a stranger's turn from evidence of its own;
-//     issue 238 sources the bound from the server instead;
-//   - and the agent's turn postdates *that* turn, so the evidence is a reply
-//     produced after the harness read input it took after this bubble appeared —
-//     not the tail of the turn that was already running when the message went. A
-//     harness queues a message typed at a working session and keeps streaming what
-//     it was doing (Claude Code records the queued turn with a prompt source of
-//     its own), so an agent turn on its own says nothing about whether this message
-//     has been read, and settling on one would drop the bubble for the same reason
-//     a timeout was rejected. It is also what stops an answer merged in from the
-//     ask channel standing in for this message: that turn is placed by its own
-//     clock rather than by the queue this one is in.
+// It keys on `seq` because that is what names a turn everywhere else in this
+// component — the render key, the prepend dedupe, the cursor itself. The server
+// renumbers the whole merged conversation on every read, but deterministically from
+// the same history, and nothing here rewrites the seq of a turn already absorbed, so
+// the numbers a settled bubble left behind go on naming the turns they matched. The
+// exception is history that renumbers underneath a live view (a transcript file that
+// appeared late, or an answer merged in behind the end — lmer_platform.transcripts
+// bounds both), and that is the case which already moves the cursor and the render
+// keys with it: this memory shares their fate rather than adding one. `start()` drops
+// all of them together — a different session behind the view is a different
+// numbering, and none of this one's turns may be remembered against it.
 function settlePending() {
   if (!pending.value.length) return
   const said = messages.value.filter(
     (message) => message.role === 'user' && message.kind === 'said',
   )
-  const agent = messages.value.filter((message) => message.role === 'assistant')
-  // Turns an earlier bubble already matched by text — see the header.
-  const claimed = new Set()
   pending.value = pending.value.filter((item) => {
-    const arrived = said.filter((message) => message.seq >= item.since)
-    const own = arrived.find(
-      (message) => !claimed.has(message.seq)
-        && comparable(message.text) === comparable(item.text),
+    const words = comparable(item.text)
+    // The same message as the supervisor would have typed it, or nothing to match
+    // when this message was never a command to begin with (see above).
+    const defused = words.startsWith('!') ? comparable(`. ${item.text}`) : null
+    const own = said.find(
+      (message) => message.seq >= item.since
+        && !consumed.has(message.seq)
+        && (comparable(message.text) === words
+          || comparable(message.text) === defused),
     )
-    if (own) {
-      claimed.add(own.seq)
-      return false
-    }
-    return !arrived.some(
-      (message) => agent.some((reply) => reply.seq > message.seq),
-    )
+    if (own) consumed.add(own.seq)
+    return !own
   })
 }
 
@@ -479,6 +505,10 @@ async function start() {
   pending.value = []
   following.value = true
   cursor = 0
+  // With the numbering they were recorded against: the turns of the session this
+  // view is leaving say nothing about the one it is opening, and a seq held past
+  // the reset would hold a new bubble against a turn that is not its own.
+  consumed.clear()
   try {
     const page = await fetchSessionMessages(props.sessionId, {
       since: -INITIAL_TAIL,
@@ -523,28 +553,37 @@ async function send() {
   // The poll keeps running while the POST is in flight and the harness writes the
   // turn down as soon as the TUI takes the submit, so a poll can absorb this very
   // message and move `cursor` past it first. Read after the await, `since` then
-  // points beyond the turn it exists to find and no settle layer may look behind
-  // it, so the bubble outlives its own delivery and the caption below hardens into
-  // "not confirmed" for a message the session answered (issue 237).
+  // points beyond the turn it exists to find and the match may not look behind it,
+  // so the bubble outlives its own delivery (issue 237) — and since the text match
+  // is now the only thing that ever settles one, it would outlive it for the rest
+  // of the run, leaving the operator's message on the screen twice.
   const since = cursor
   sending.value = true
   problem.value = null
   try {
-    const reply = await sendSessionInput(props.sessionId, text)
+    // `sanitize` because this is a composer: a person typed these words at a
+    // session, meaning them as words. That is all this end asserts — the message
+    // is not touched here, and what the harness's TUI would otherwise do with it
+    // (run a leading `!` as a shell command, issue 254) is decided by the supervisor,
+    // which is the only end that knows which harness is on the other side.
+    const reply = await sendSessionInput(props.sessionId, text, { sanitize: true })
     if (stale(mine)) return
     // Held until the transcript catches up. The send has already succeeded, so
     // this bubble is not a maybe — it is "delivered, not yet written down".
     // `since` is where the transcript ended when it went, which is what makes the
     // match forward-looking.
     //
-    // `submitConfirmed` is the one thing the reply is read for, and only ever to
-    // make the caption *weaker*: the route answers `submit_confirmed: false` plus a
-    // note whenever it typed an Enter it could not observe landing, and this view
-    // used to throw that away and claim the message was sent regardless (issue 194).
-    // Anything other than an explicit `true` counts as unconfirmed — a daemon that
-    // says nothing about the submit has not confirmed one — because the failure
-    // being fixed is over-claiming, so the fallback has to be the quiet answer.
+    // `submitConfirmed` records what the route said about the Enter it typed: it
+    // answers `submit_confirmed: false` plus a note whenever it could not observe
+    // the submit landing (issue 194), which is every message typed at a TUI today.
+    // No caption reads it any more — issue 254 settled that a send this pane
+    // accepted is assumed delivered — and it is kept because this reply is the only
+    // place the view is ever told, and a fact already in hand costs nothing to carry
+    // while re-deriving it would cost a round trip. Anything other than an explicit
+    // `true` is not a confirmation: a daemon that says nothing about the submit has
+    // not confirmed one.
     pending.value = [...pending.value, {
+      id: (bubbleId += 1),
       text,
       at: Date.now(),
       since,
@@ -574,22 +613,50 @@ async function send() {
 }
 
 // What is held is decided by the transcript alone (`settlePending`); this is the
-// only thing a clock touches, and all it moves is the wording. Three rungs, and the
-// order matters: inside the grace window a slow transcript is the ordinary case and
-// says nothing; past it, a message the transcript still does not have is only
-// called *sent* when the submit is a fact. It is not one today for anything typed
-// at a TUI, which is the whole of issue 194 — so the third rung is what a chat send
-// normally reaches, and it is the truth rather than a reassurance.
+// only thing a clock touches, and all it moves is the wording. Two rungs: a send
+// that just went says so, because "did that go through?" is a real question in the
+// seconds before the harness writes the turn down; past the grace window it says
+// nothing, and the bubble is drawn like any other message the operator sent — which
+// is what issue 254 decided it is. The empty string is a rung rather than a gap, and
+// the header treats it as one: it drops the separator with the caption, so the line
+// reads "you" like the transcript's own copy of the message will.
 //
-// Note what this deliberately does not do: drop the bubble, or claim the message
-// failed. A session working through an earlier turn queues this one and writes it
-// down later, and from here that is indistinguishable from text sitting unsent in
-// its input box — so the caption stops asserting and names the one place both can
-// be told apart.
+// There is deliberately no third rung. The one that was here warned, past the grace
+// window, that the session might never have read the message — true of *every*
+// message this pane sends, because the supervisor types a submit CR at a TUI and
+// cannot observe it landing (issue 194), and therefore printed beside messages that
+// had plainly arrived and been answered. A caption that fires on the ordinary case
+// teaches an operator to read past it, and the rare real case is visible in the
+// terminal view beside this one either way. `submitConfirmed` is still recorded on
+// the item (see `send()`); nothing here captions on it.
 function pendingLabel(item) {
-  if (props.now - item.at <= PENDING_GRACE_MS) return 'sending…'
-  if (item.submitConfirmed) return 'sent — the transcript has not caught up yet'
-  return SUBMIT_UNCONFIRMED_LABEL
+  return props.now - item.at <= PENDING_GRACE_MS ? 'sending…' : ''
+}
+
+// The only way a bubble leaves this pane that the transcript did not decide — and
+// it is a tap, not a rule. The operator asked for it after two goes at the cause
+// (issue 237 fixed one, issue 238's transcript gap is still open): a message the
+// transcript never caught up with sits at the bottom of the pane for the rest of the
+// run, and there was nothing to do about it. Display only, for as long as the page is
+// loaded: the send already succeeded, so nothing here calls a route, and nothing
+// anywhere is deleted. If the turn does land later it arrives as the ordinary
+// transcript turn it always was.
+//
+// Not a timer wearing a button. The standing rule above `settlePending` is that no
+// clock decides what is held, because a bubble dropped on one is dropped while its
+// message is still in flight — and a control that only appeared past the grace
+// window would be that same clock, deciding when the operator is allowed to act. So
+// every bubble carries it, and what it means is "I am done looking at this", which
+// is the one thing no observation in this component can be wrong about.
+//
+// `consumed` is deliberately untouched: it remembers the turns that settled
+// bubbles, and a dismissed bubble settled against nothing.
+//
+// No storage either, unlike the ask dock's dismissals (dismissals.js). Those had to
+// outlive a component rebuilt on every visit to a run; a bubble does not survive a
+// remount in the first place, so there is nothing here to outlive.
+function dismissPending(id) {
+  pending.value = pending.value.filter((item) => item.id !== id)
 }
 
 onMounted(() => {
@@ -712,7 +779,9 @@ watch(rendererLoaded, () => {
             … earlier part of this message trimmed — the terminal has all of it
           </p>
           <p
-            v-if="message.text && message.role === 'user'"
+            v-if="message.text && (
+              message.role === 'user' || message.role === 'platform'
+            )"
             class="text-body-medium said plain"
           >{{ message.text }}</p>
           <!-- A watch firing: the condition it was armed on and the line that
@@ -762,14 +831,33 @@ watch(rendererLoaded, () => {
         </div>
 
         <!-- Sent, not yet in the transcript — and on the operator's ground like
-             everything else you sent, because that is what it is. -->
+             everything else you sent, because that is what it is.
+
+             Past the grace window `pendingLabel` has nothing to say, and then this
+             is drawn as the plain message it is taken to be: the caption is what
+             makes a bubble look provisional, so a bubble nothing is going to
+             confirm must not keep one (issue 254). -->
         <div
-          v-for="(item, index) in pending"
-          :key="`pending-${index}`"
+          v-for="item in pending"
+          :key="item.id"
           class="turn turn-user ground-operator"
         >
-          <div class="text-body-small text-medium-emphasis">
-            you · {{ pendingLabel(item) }}
+          <div class="d-flex align-center ga-1 text-body-small text-medium-emphasis">
+            <span>
+              you<template v-if="pendingLabel(item)"> · {{ pendingLabel(item) }}</template>
+            </span>
+            <!-- On the bubble it removes, and on these bubbles only: what gets
+                 stuck is a message the transcript never wrote down, and a turn read
+                 back from the transcript would come straight back on the next poll.
+                 See dismissPending on what it does and does not do. -->
+            <v-btn
+              :icon="mdiClose"
+              size="small"
+              variant="text"
+              density="comfortable"
+              aria-label="stop showing me this message"
+              @click="dismissPending(item.id)"
+            />
           </div>
           <p class="text-body-medium said plain">{{ item.text }}</p>
         </div>
@@ -884,11 +972,29 @@ watch(rendererLoaded, () => {
   overflow-y: auto;
 }
 
+/* The wrap is declared here, on the bubble, rather than on each kind of content
+   inside it: a long path or URL is routine in every one of them, and the message
+   body was the only one that said so. What the operator reported was a *tool row*
+   — a `Bash` line whose detail was a curl at a long API URL — whose span is a flex
+   item, so its min-content width is that whole URL, and `.chat`'s `overflow-y:
+   auto` makes the other axis `auto` too: that is the horizontal scrollbar under
+   the conversation. Measured at 129px of overflow in a 689px pane, the width the
+   report came from.
+
+   `anywhere` and not `break-word`, which is the whole reason one of them fixes
+   this: only `anywhere` reduces the min-content contribution, and min-content is
+   what a flex item refuses to shrink below. `break-word` measures the same 129px.
+
+   Inherited, so a fourth kind of content cannot arrive without it — and inherited
+   is also why Markdown.vue's fences are untouched: `overflow-wrap: normal` on the
+   <pre> and its <code> is a rule on those elements and beats a value coming down
+   from here, so a command still scrolls in its own box instead of reflowing. */
 .turn {
   min-width: 0;
   max-width: 92%;
   border-radius: 10px;
   padding: 4px 10px 6px;
+  overflow-wrap: anywhere;
 }
 
 /* The colour coding, and only which class gets which: the tones themselves are
@@ -936,12 +1042,12 @@ watch(rendererLoaded, () => {
    share: tool output and pasted files are routine in these transcripts, and a
    single message taller than the pane would fill it and push every other turn
    out of reach — rendering only made that more likely, because a list or a table
-   is taller than the text it came from. `anywhere` because a long path or URL
-   must scroll nothing sideways. Scroll chaining is left alone deliberately —
-   reaching the end of a message has to carry on scrolling the conversation, or a
-   thumb gets stuck in one bubble. */
+   is taller than the text it came from. The wrap that used to be declared here is
+   now the turn's, which is where every kind of content in a bubble inherits it
+   from; a body is no longer the only part of one that can hold a URL. Scroll
+   chaining is left alone deliberately — reaching the end of a message has to
+   carry on scrolling the conversation, or a thumb gets stuck in one bubble. */
 .said {
-  overflow-wrap: anywhere;
   margin: 2px 0 4px;
   max-height: 30vh;
   max-height: 30dvh;

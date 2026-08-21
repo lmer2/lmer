@@ -1,6 +1,7 @@
 #!/bin/bash
 # Tail logs from the target service container or another named container.
-# Requires LMER_SERVICE_CONTAINER environment variable.
+#
+# The target follows `target-switch` the same way target-exec does (#312).
 #
 # Usage:
 #   target-logs                    # target service, last 50 lines
@@ -9,13 +10,40 @@
 
 set -e
 
-if [ -z "$LMER_SERVICE_CONTAINER" ]; then
-    echo "❌ target-logs: not in service mode (LMER_SERVICE_CONTAINER not set)" >&2
-    echo "   Use --service <name> when launching lmer" >&2
+TARGET_FILE="${LMER_SERVICE_TARGET_FILE:-/home/developer/.lmer-session/service-target}"
+LINES="${2:-50}"
+
+# An explicitly named container settles it: the pointer file is not consulted,
+# so a broken one cannot stand between the agent and the logs it asked for —
+# which is the moment those logs are most likely to be what it needs.
+if [ -n "$1" ]; then
+    exec docker logs --tail "$LINES" -f "$1"
+fi
+
+SERVICE_CONTAINER="$LMER_SERVICE_CONTAINER"
+
+if [ -f "$TARGET_FILE" ]; then
+    { IFS= read -r FILE_NAME; IFS= read -r FILE_CONTAINER; } < "$TARGET_FILE" || true
+    if [ -z "$FILE_CONTAINER" ]; then
+        echo "❌ target-logs: $TARGET_FILE is malformed" >&2
+        echo "   (expected service name, container id and workdir, one per line)" >&2
+        echo "   Run 'target-switch <service>', or name a container:" >&2
+        echo "   target-logs <container>" >&2
+        exit 1
+    fi
+    SERVICE_CONTAINER="$FILE_CONTAINER"
+fi
+
+if [ -z "$SERVICE_CONTAINER" ]; then
+    if [ -n "$LMER_SERVICE_GROUP" ]; then
+        echo "❌ target-logs: no service selected yet in group '$LMER_SERVICE_GROUP'" >&2
+        echo "   Run 'target-switch' to list the group's members, or pass a" >&2
+        echo "   container name: target-logs <container>" >&2
+    else
+        echo "❌ target-logs: not in service mode (LMER_SERVICE_CONTAINER not set)" >&2
+        echo "   Use --service <name> or --service-group <project> when launching lmer" >&2
+    fi
     exit 1
 fi
 
-CONTAINER="${1:-$LMER_SERVICE_CONTAINER}"
-LINES="${2:-50}"
-
-exec docker logs --tail "$LINES" -f "$CONTAINER"
+exec docker logs --tail "$LINES" -f "$SERVICE_CONTAINER"

@@ -5,9 +5,15 @@ to catch regressions in:
 
   - The --resolve-thread LMER_TASK guard (Thread Resolution Policy,
     rules/git.md): non-review sessions must be refused before any API call
+  - The --reply-thread/--resolve-thread pair: URL and payload of the reply
+    call, the --comment-file requirement, reply-then-resolve ordering,
+    truncated discussion IDs, and server-advertised resolvability
   - The --info thread-provenance block (counts, resolver breakdown,
     resolved-before-head heuristic, page-cap truncation marker)
   - Fail-soft behavior: --info must never fail on provenance trouble
+  - Token resolution: the client sends whatever it resolves as a PRIVATE-TOKEN
+    header to whatever `--host` it was handed, so the generic GITLAB_TOKEN must
+    stay scoped to its issuing host (issue #161)
 """
 
 from __future__ import annotations
@@ -18,7 +24,9 @@ from unittest.mock import patch
 import pytest
 
 from gitlab_reviewer import cli as gl_cli
-from gitlab_reviewer.client import GitLabError
+from gitlab_reviewer.client import GitLabClient, GitLabError
+from lmer_cli import tokens
+from tests.conftest import strip_lmer_env
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +36,9 @@ from gitlab_reviewer.client import GitLabError
 
 HEAD_SHA = "abc123def456"
 HEAD_COMMITTED_DATE = "2026-07-01T12:00:00+00:00"
+
+# Discussion IDs are full 40-character SHA1 hex digests
+THREAD_ID = "0123456789abcdef0123456789abcdef01234567"
 
 
 def make_mr_info(sha: str = HEAD_SHA) -> dict:
@@ -66,6 +77,33 @@ def make_thread(discussion_id: str, resolved: bool = False,
             "resolved": resolved, "notes": [note]}
 
 
+def make_unresolvable_individual_note(discussion_id: str) -> dict:
+    """A standalone note for which GitLab advertises no resolved state."""
+    thread = make_thread(discussion_id)
+    thread["individual_note"] = True
+    thread["resolvable"] = False
+    thread["notes"][0]["resolvable"] = False
+    return thread
+
+
+def make_resolvable_general_discussion(discussion_id: str) -> dict:
+    """The non-diff resolvable shape measured by the live probe."""
+    thread = make_thread(discussion_id)
+    thread["resolvable"] = True
+    thread["notes"][0]["type"] = "DiscussionNote"
+    thread["notes"][0]["resolvable"] = True
+    return thread
+
+
+def make_discussion_level_only_resolvable(discussion_id: str) -> dict:
+    """Synthetic compatibility shape exercising the discussion-level fact."""
+    thread = make_resolvable_general_discussion(discussion_id)
+    # Not claimed as a measured server payload: the live probe returned both
+    # flags true. This pins the safe OR contract when a note omits/disagrees.
+    thread["notes"][0]["resolvable"] = False
+    return thread
+
+
 class FakeGitLabClient:
     """Stands in for GitLabClient: records calls, serves canned data."""
 
@@ -79,10 +117,14 @@ class FakeGitLabClient:
         self.discussions_error = None
         self.commit = {"id": HEAD_SHA, "committed_date": HEAD_COMMITTED_DATE}
         self.commit_error = None
+        self.discussion = None  # single-thread lookup override
         # Call recording
         self.resolve_calls = []
+        self.reply_calls = []
+        self.discussion_lookups = []
         self.discussion_calls = []
         self.commit_calls = []
+        self.write_order = []
 
     def get_merge_request_info(self, project, mr_id):
         return make_mr_info()
@@ -113,8 +155,22 @@ class FakeGitLabClient:
             raise self.commit_error
         return self.commit
 
+    def get_merge_request_discussion(self, project, mr_id, discussion_id):
+        self.discussion_lookups.append(discussion_id)
+        if self.discussion is not None:
+            return self.discussion
+        return make_thread(discussion_id)
+
+    def reply_to_merge_request_discussion(self, project, mr_id, discussion_id, body):
+        self.reply_calls.append((discussion_id, body))
+        self.write_order.append("reply")
+        return {"id": 4242, "body": body,
+                "author": {"name": "Alice", "username": "alice"},
+                "created_at": "2026-07-03T10:00:00+00:00"}
+
     def resolve_merge_request_discussion(self, project, mr_id, discussion_id):
         self.resolve_calls.append(discussion_id)
+        self.write_order.append("resolve")
         return {"id": discussion_id, "resolved": True}
 
 
@@ -135,7 +191,7 @@ def test_resolve_thread_refused_in_non_review_session(monkeypatch, capsys):
     fake = FakeGitLabClient()
 
     rc = run_cli(monkeypatch, fake, ["group/project", "7",
-                                     "--resolve-thread", "disc1"])
+                                     "--resolve-thread", THREAD_ID])
 
     assert rc == 1
     # The resolve API must NOT have been called
@@ -156,12 +212,12 @@ def test_resolve_thread_allowed_when_lmer_task_unset(monkeypatch, capsys):
     fake = FakeGitLabClient()
 
     rc = run_cli(monkeypatch, fake, ["group/project", "7",
-                                     "--resolve-thread", "disc1"])
+                                     "--resolve-thread", THREAD_ID])
 
     assert rc == 0
-    assert fake.resolve_calls == ["disc1"]
+    assert fake.resolve_calls == [THREAD_ID]
     out = capsys.readouterr().out
-    assert "Successfully resolved discussion thread disc1" in out
+    assert f"Successfully resolved discussion thread {THREAD_ID}" in out
 
 
 def test_resolve_thread_allowed_in_review_session(monkeypatch):
@@ -169,10 +225,328 @@ def test_resolve_thread_allowed_in_review_session(monkeypatch):
     fake = FakeGitLabClient()
 
     rc = run_cli(monkeypatch, fake, ["group/project", "7",
-                                     "--resolve-thread", "disc1"])
+                                     "--resolve-thread", THREAD_ID])
 
     assert rc == 0
-    assert fake.resolve_calls == ["disc1"]
+    assert fake.resolve_calls == [THREAD_ID]
+
+
+# ---------------------------------------------------------------------------
+# --reply-thread (and composing it with --resolve-thread)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def review_session(monkeypatch):
+    """Resolving is reviewer-only — opt in where the resolve path is exercised."""
+    monkeypatch.setenv("LMER_TASK", "review")
+
+
+def write_comment_file(tmp_path, body: str = "Fixed in abc1234.") -> str:
+    """Write a reply body to a file and return its path."""
+    path = tmp_path / "reply.md"
+    path.write_text(body, encoding="utf-8")
+    return str(path)
+
+
+def test_reply_to_mr_discussion_posts_note_to_thread():
+    """Client layer: URL shape and payload of the reply call."""
+    client = GitLabClient(host="gitlab.example.com", token="fake-token")
+
+    with patch.object(GitLabClient, "_request", return_value={"id": 1}) as request:
+        client.reply_to_merge_request_discussion(
+            "group/project", 7, THREAD_ID, "Fixed in abc1234."
+        )
+
+    request.assert_called_once_with(
+        "POST",
+        f"projects/group%2Fproject/merge_requests/7/discussions/{THREAD_ID}/notes",
+        json={"body": "Fixed in abc1234."},
+    )
+
+
+def test_resolve_mr_discussion_uses_discussion_rest_endpoint():
+    """Client layer: keep the REST path proven by the live #250 probe."""
+    client = GitLabClient(host="gitlab.example.com", token="fake-token")
+
+    with patch.object(
+        GitLabClient, "_request", return_value={"resolved": True}
+    ) as request:
+        client.resolve_merge_request_discussion("group/project", 7, THREAD_ID)
+
+    request.assert_called_once_with(
+        "PUT",
+        f"projects/group%2Fproject/merge_requests/7/discussions/{THREAD_ID}",
+        json={"resolved": True},
+    )
+
+
+def test_reply_thread_sends_comment_file_body(monkeypatch, capsys, tmp_path):
+    fake = FakeGitLabClient()
+    comment_file = write_comment_file(tmp_path, "Fixed in abc1234.")
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID,
+                                     "--comment-file", comment_file])
+
+    assert rc == 0
+    assert fake.reply_calls == [(THREAD_ID, "Fixed in abc1234.")]
+    # A reply alone must not touch the resolve path
+    assert fake.resolve_calls == []
+    out = capsys.readouterr().out
+    assert f"Successfully replied to discussion thread {THREAD_ID}" in out
+
+
+def test_reply_thread_requires_comment_file(monkeypatch, capsys):
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID])
+
+    assert rc == 1
+    assert fake.reply_calls == []
+    assert "--reply-thread requires --comment-file" in capsys.readouterr().err
+
+
+def test_comment_file_requires_reply_thread(monkeypatch, capsys, tmp_path):
+    """A comment file with no thread to attach it to must not be ignored."""
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--comment-file", write_comment_file(tmp_path)])
+
+    assert rc == 1
+    assert fake.reply_calls == []
+    assert "--comment-file requires --reply-thread" in capsys.readouterr().err
+
+
+def test_reply_thread_reports_missing_comment_file(monkeypatch, capsys, tmp_path):
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID,
+                                     "--comment-file", str(tmp_path / "nope.md")])
+
+    assert rc == 1
+    assert fake.reply_calls == []
+    assert "File not found" in capsys.readouterr().err
+
+
+def test_reply_then_resolve_in_one_invocation(monkeypatch, capsys, tmp_path, review_session):
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID,
+                                     "--comment-file", write_comment_file(tmp_path),
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 0
+    # The reply must land before the thread is closed
+    assert fake.write_order == ["reply", "resolve"]
+    assert fake.resolve_calls == [THREAD_ID]
+    out = capsys.readouterr().out
+    assert f"Successfully replied to discussion thread {THREAD_ID}" in out
+    assert f"Successfully resolved discussion thread {THREAD_ID}" in out
+
+
+def test_reply_and_resolve_json_is_one_document(monkeypatch, capsys, tmp_path, review_session):
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID,
+                                     "--comment-file", write_comment_file(tmp_path),
+                                     "--resolve-thread", THREAD_ID,
+                                     "--json"])
+
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["reply"]["body"] == "Fixed in abc1234."
+    assert data["resolve"] == {"id": THREAD_ID, "resolved": True}
+
+
+def test_resolve_thread_json_keeps_raw_payload(monkeypatch, capsys, review_session):
+    """Resolving alone keeps the pre-existing single-payload JSON shape."""
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--resolve-thread", THREAD_ID, "--json"])
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == {"id": THREAD_ID, "resolved": True}
+
+
+@pytest.mark.parametrize("flag", ["--reply-thread", "--resolve-thread"])
+def test_truncated_discussion_id_is_rejected(monkeypatch, capsys, tmp_path, flag):
+    """A short ID would 404 — indistinguishable from a token-scope failure."""
+    fake = FakeGitLabClient()
+    argv = ["group/project", "7", flag, THREAD_ID[:8]]
+    if flag == "--reply-thread":
+        argv += ["--comment-file", write_comment_file(tmp_path)]
+
+    rc = run_cli(monkeypatch, fake, argv)
+
+    assert rc == 1
+    # Rejected before any API call
+    assert fake.reply_calls == []
+    assert fake.resolve_calls == []
+    assert fake.discussion_lookups == []
+    err = capsys.readouterr().err
+    assert f"{flag} got an invalid discussion ID" in err
+    assert "40-character SHA1" in err
+    assert "8 character(s)" in err
+
+
+def test_non_hex_discussion_id_is_rejected(monkeypatch, capsys, review_session):
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--resolve-thread", "z" * 40])
+
+    assert rc == 1
+    assert fake.resolve_calls == []
+    assert "invalid discussion ID" in capsys.readouterr().err
+
+
+def test_resolve_accepts_general_discussion_advertised_resolvable(
+    monkeypatch, capsys, review_session
+):
+    fake = FakeGitLabClient()
+    fake.discussion = make_resolvable_general_discussion(THREAD_ID)
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 0
+    assert fake.discussion_lookups == [THREAD_ID]
+    assert fake.resolve_calls == [THREAD_ID]
+    assert (
+        f"Successfully resolved discussion thread {THREAD_ID}"
+        in capsys.readouterr().out
+    )
+
+
+def test_resolve_accepts_discussion_level_resolvable_compatibility_shape(
+    monkeypatch, review_session
+):
+    fake = FakeGitLabClient()
+    fake.discussion = make_discussion_level_only_resolvable(THREAD_ID)
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 0
+    assert fake.resolve_calls == [THREAD_ID]
+
+
+def test_resolve_refuses_unresolvable_individual_note(
+    monkeypatch, capsys, review_session
+):
+    fake = FakeGitLabClient()
+    fake.discussion = make_unresolvable_individual_note(THREAD_ID)
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 1
+    assert fake.discussion_lookups == [THREAD_ID]
+    assert fake.resolve_calls == []
+    err = capsys.readouterr().err
+    assert f"thread {THREAD_ID} is not resolvable" in err
+    assert "GitLab reports no resolved state" in err
+    assert "Leave the note open" in err
+
+
+def test_unresolvable_note_refusal_posts_no_reply(
+    monkeypatch, capsys, tmp_path, review_session
+):
+    """Composing on an unresolvable note must not half-apply."""
+    fake = FakeGitLabClient()
+    fake.discussion = make_unresolvable_individual_note(THREAD_ID)
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID,
+                                     "--comment-file", write_comment_file(tmp_path),
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 1
+    assert fake.write_order == []
+    assert "GitLab reports no resolved state" in capsys.readouterr().err
+
+
+def test_reply_works_on_an_unresolvable_individual_note(monkeypatch, tmp_path):
+    """Reply does not require the target to carry a resolved state."""
+    fake = FakeGitLabClient()
+    fake.discussion = make_unresolvable_individual_note(THREAD_ID)
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID,
+                                     "--comment-file", write_comment_file(tmp_path)])
+
+    assert rc == 0
+    assert fake.reply_calls == [(THREAD_ID, "Fixed in abc1234.")]
+    # No resolvability lookup is needed when only replying
+    assert fake.discussion_lookups == []
+
+
+def test_resolve_refused_in_non_review_session_posts_no_reply(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("LMER_TASK", "develop")
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID,
+                                     "--comment-file", write_comment_file(tmp_path),
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 1
+    assert fake.write_order == []
+    assert "Thread Resolution Policy" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("replying", [True, False])
+@pytest.mark.parametrize("refusal", ["policy", "not-resolvable", "bad-id"])
+def test_refused_resolve_says_the_reply_went_nowhere(monkeypatch, capsys, tmp_path,
+                                                     refusal, replying):
+    """Every resolve refusal aborts the reply half too — say so.
+
+    The refusal texts only speak about resolving, so a composed call reads
+    as "the reply landed, only the resolve was declined". The notice must
+    fire on all three refusal paths, and only when a reply was in flight.
+    """
+    monkeypatch.setenv("LMER_TASK", "develop" if refusal == "policy" else "review")
+    fake = FakeGitLabClient()
+    if refusal == "not-resolvable":
+        fake.discussion = make_unresolvable_individual_note(THREAD_ID)
+    resolve_id = THREAD_ID[:8] if refusal == "bad-id" else THREAD_ID
+
+    argv = ["group/project", "7", "--resolve-thread", resolve_id]
+    if replying:
+        argv += ["--reply-thread", THREAD_ID,
+                 "--comment-file", write_comment_file(tmp_path)]
+
+    rc = run_cli(monkeypatch, fake, argv)
+
+    assert rc == 1
+    assert fake.write_order == []
+    err = capsys.readouterr().err
+    assert ("Your reply was NOT posted" in err) is replying
+    assert ("--reply-thread alone to post it" in err) is replying
+
+
+def test_bad_reply_id_does_not_claim_a_reply_was_dropped(monkeypatch, capsys, tmp_path,
+                                                         review_session):
+    """The reply's own ID being bad is self-explanatory — no extra notice."""
+    fake = FakeGitLabClient()
+
+    rc = run_cli(monkeypatch, fake, ["group/project", "7",
+                                     "--reply-thread", THREAD_ID[:8],
+                                     "--comment-file", write_comment_file(tmp_path),
+                                     "--resolve-thread", THREAD_ID])
+
+    assert rc == 1
+    assert fake.write_order == []
+    err = capsys.readouterr().err
+    assert "--reply-thread got an invalid discussion ID" in err
+    assert "Your reply was NOT posted" not in err
 
 
 # ---------------------------------------------------------------------------
@@ -329,3 +703,85 @@ def test_info_json_provenance_failure_is_null_not_omitted(monkeypatch, capsys):
     data = json.loads(capsys.readouterr().out)
     assert "thread_provenance" in data
     assert data["thread_provenance"] is None
+
+
+# ---------------------------------------------------------------------------
+# Token resolution (issue #161)
+# ---------------------------------------------------------------------------
+
+
+#: Provider vars the shared lookup consults; cleared so a developer's real
+#: shell cannot satisfy (or defeat) any assertion below.
+_TOKEN_ENV = (
+    "GITLAB_TOKEN",
+    "GITLAB_TOKEN_git_example_com",
+    "GITLAB_TOKEN_gitlab_other_com",
+    "GITLAB_HOST",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+)
+
+_STUB = "glpat-notarealcredential"
+
+
+@pytest.fixture
+def token_env(monkeypatch):
+    """No run context, no provider vars, no carried-over refusal notices."""
+    strip_lmer_env(monkeypatch)
+    for name in _TOKEN_ENV:
+        monkeypatch.delenv(name, raising=False)
+    tokens._warned.clear()
+    yield
+    tokens._warned.clear()
+
+
+def test_host_specific_token_applies_to_its_own_host(token_env, monkeypatch):
+    monkeypatch.setenv("GITLAB_TOKEN_git_example_com", _STUB)
+    assert GitLabClient._resolve_token("git.example.com") == _STUB
+
+
+def test_host_specific_token_does_not_leak_to_another_host(token_env, monkeypatch):
+    monkeypatch.setenv("GITLAB_TOKEN_git_example_com", _STUB)
+    assert GitLabClient._resolve_token("gitlab.other.com") is None
+
+
+def test_generic_token_applies_to_the_work_repo_host(token_env, monkeypatch):
+    """The single-host setup: one PAT, one host, unchanged behavior."""
+    monkeypatch.setenv("GITLAB_TOKEN", _STUB)
+    monkeypatch.setenv("LMER_WORK_REPO", "https://git.example.com/agents/work.git")
+    assert GitLabClient._resolve_token("git.example.com") == _STUB
+    client = GitLabClient(host="git.example.com")
+    assert client.session.headers["PRIVATE-TOKEN"] == _STUB
+
+
+def test_generic_token_refused_for_another_host(token_env, monkeypatch, capsys):
+    monkeypatch.setenv("GITLAB_TOKEN", _STUB)
+    monkeypatch.setenv("LMER_WORK_REPO", "https://git.example.com/agents/work.git")
+    assert GitLabClient._resolve_token("gitlab.other.com") is None
+    err = capsys.readouterr().err
+    assert "GITLAB_TOKEN not used for gitlab.other.com" in err
+    assert _STUB not in err
+
+
+def test_generic_token_refused_when_the_issuing_host_is_unknown(token_env, monkeypatch):
+    """Default --host is gitlab.com; with no LMER_WORK_REPO nothing vouches for it."""
+    monkeypatch.setenv("GITLAB_TOKEN", _STUB)
+    assert GitLabClient._resolve_token("gitlab.com") is None
+
+
+def test_refused_generic_token_raises_and_names_the_per_host_variable(
+    token_env, monkeypatch, capsys
+):
+    monkeypatch.setenv("GITLAB_TOKEN", _STUB)
+    monkeypatch.setenv("LMER_WORK_REPO", "https://git.example.com/agents/work.git")
+    with pytest.raises(GitLabError) as exc_info:
+        GitLabClient(host="gitlab.other.com")
+    assert "GITLAB_TOKEN_gitlab_other_com" in str(exc_info.value)
+    assert _STUB not in str(exc_info.value)
+    assert _STUB not in capsys.readouterr().err
+
+
+def test_explicit_token_argument_bypasses_the_lookup(token_env):
+    """`--token` is the operator's own call about who gets the credential."""
+    client = GitLabClient("gitlab.other.com", _STUB)
+    assert client.session.headers["PRIVATE-TOKEN"] == _STUB

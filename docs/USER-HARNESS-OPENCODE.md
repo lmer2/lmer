@@ -15,9 +15,13 @@ against 1.18.1 during the original built-in evaluation).
 ~/.lmer/harnesses/opencode/
 ├── harness.json
 ├── runner.sh
+├── converter.py
 └── agent-files/
     └── opencode.json
 ```
+
+Every file below is checked in, ready to copy, at
+[`examples/harnesses/opencode/`](../examples/harnesses/opencode/).
 
 ## 1. `harness.json`
 
@@ -32,6 +36,7 @@ against 1.18.1 during the original built-in evaluation).
       "container_path": "/home/developer/.local/share/opencode/auth.json"
     }
   ],
+  "session_dir": "/home/developer/.opencode-transcripts",
   "supervisor": {
     "ready_marker": "Ask anything...",
     "quit_sequence": ["\\x1b", "\\x03", "\\x03"]
@@ -53,6 +58,14 @@ Field notes:
   default) so **logging in on the host IS logging in the container**, and a
   token refresh inside a session writes back to the host file. See
   [Authentication](#4-authentication-log-in-on-the-host).
+- **`session_dir`** — where readable transcripts appear, **not** where
+  opencode writes: it keeps its sessions in a SQLite database, so nothing
+  native ever lands here and this directory is purely the converter's output
+  home (see [Transcripts](#6-transcripts-in-the-chat-view)). Any absolute path
+  below the container home that the platform does not already mount works;
+  this one is unique to the harness and covers nothing.
+  (`~/.local/share/opencode` itself would be *refused* — it contains the
+  already-mounted `auth.json`.)
 - **`supervisor.ready_marker`** — `Ask anything...` is the stable prefix of
   the TUI's empty-input placeholder. `quit_sequence`: Esc dismisses/interrupts,
   then Ctrl-C twice (first clears input, second fires `app_exit`, which is
@@ -119,6 +132,17 @@ harness_render_global_context "$HOME/.config/opencode/AGENTS.md"
 # opencode custom commands (~/.config/opencode/command/<name>.md → /<name>).
 harness_render_prompt_templates "$HOME/.config/opencode/command"
 harness_restore_memory
+
+# ── Transcripts (docs/TRANSCRIPT-FORMAT.md) ──
+# opencode keeps its sessions in a SQLite database, so nothing native ever
+# lands in the declared session_dir; the converter polls opencode's own reader
+# and writes the canonical records the chat view understands. Backgrounded
+# before harness_exec (which execs), so it is orphaned to the container's init
+# and dies with the container — and fail-soft: it logs into the session
+# directory when there is one and exits quietly otherwise, because a converter
+# that cannot start must not cost the session.
+CONVERTER_LOG_DIR="$HOME/.lmer-session"; [ -d "$CONVERTER_LOG_DIR" ] || CONVERTER_LOG_DIR="$HOME"
+python3 "$HARNESS_DIR/converter.py" >>"$CONVERTER_LOG_DIR/converter.log" 2>&1 &
 
 EXTRA_ARGS=""
 
@@ -277,6 +301,64 @@ commands as opencode custom commands (`/start`, `/followup`, `/rgr`,
 restore, and `spawn-harness` fan-out (both directions, subject to the
 cross-harness child caveat in HARNESSES.md).
 
+## 6. Transcripts in the chat view
+
+Without this half, an opencode session runs fine and the orchestrator's chat
+view answers *"this build cannot read it"* — mounting is not reading. Two
+pieces close that, both drop-in-local:
+
+1. **`"session_dir"` in the manifest** (above) — the platform creates one host
+   directory per session, mounts it read-write at that path, scrubs the
+   `.jsonl` files in it when the session ends, and reads them back for
+   `GET /api/sessions/{id}/messages`.
+2. **`converter.py` beside `runner.sh`** — the drop-in's own code, running in
+   the container where opencode already runs, appending records in the
+   documented [lmer transcript format](./TRANSCRIPT-FORMAT.md) to
+   `~/.opencode-transcripts/<sessionID>.jsonl`. The daemon never executes it;
+   it only reads what it writes.
+
+opencode is the *decoupled* case, and the reason it is the worked example:
+current releases persist sessions in a SQLite database (not per-session JSONL),
+so nothing native ever appears in `session_dir` — the declared directory holds
+only the converter's output. The converter never touches that database either.
+Rather than track a schema that migrates without notice while a live writer
+holds it, it polls opencode's own reader:
+
+```bash
+opencode session list --format json     # newest session for this directory
+opencode export <sessionID>             # full message history, as JSON
+```
+
+Each export is a whole snapshot, so the converter appends only the message
+*parts* it has not written yet — per part, because a turn keeps growing after
+the poll that first saw it (another paragraph, a second tool call), and one
+consumed whole would lose the rest. A turn can therefore arrive as more than
+one record, across polls; the view concatenates them in file order. A tool call
+that finished after its turn went out is resolved with a one-line
+`lmer.tool_update` rather than a rewrite, so the file stays strictly
+append-only, which is what a chat client polling with a cursor needs.
+
+Text parts become message text; tool parts become tool chips (name, a one-line hint, and the
+outcome); a part opencode marks `synthetic` — the context it injects in front
+of the model — becomes `kind: "injected"`, from opencode's own flag rather than
+any host-side guess.
+
+What the chat view then shows: your prompts as operator turns, opencode's
+replies as assistant turns with their tool calls and outcomes, injected context
+behind the "internal" toggle instead of masquerading as something you typed,
+and `opencode` as the transcript's source.
+
+The converter is deliberately unremarkable code — a poll loop, a mapping, an
+append — and it is fail-soft by construction: it is backgrounded, it never
+signals the session, and if it dies the session is untouched (you get today's
+behavior, an unreadable transcript, plus the complete terminal log). Read
+[TRANSCRIPT-FORMAT.md](./TRANSCRIPT-FORMAT.md) for the record schemas and the
+lifecycle rules, and copy
+[`examples/harnesses/opencode/converter.py`](../examples/harnesses/opencode/converter.py)
+as the starting point for your own harness — it is tested in CI against
+captured `opencode export` fixtures, so what it maps is what opencode actually
+writes.
+
 ## Troubleshooting
 
 - **Session starts but never auto-types the start instruction** — the ready
@@ -292,3 +374,8 @@ cross-harness child caveat in HARNESSES.md).
   `opencode models` (host side) lists what your credentials can reach.
 - **Rendering issues** — `--no-supervisor` execs the harness directly
   (debug aid; auto-start and the FastAPI endpoint are bypassed).
+- **Chat view empty for a session that clearly ran** — the converter never
+  started or never found the session. It logs to `converter.log` in the
+  session directory (`~/.lmer-session/` in a platform-spawned session, `$HOME`
+  otherwise), which lands beside the session's own files on the host. Run it by
+  hand with `--once` inside the container to see the same errors on stderr.

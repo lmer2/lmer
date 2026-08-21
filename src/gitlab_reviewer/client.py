@@ -6,6 +6,11 @@ import requests
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
+# The token lookup rule, not a second copy of it — see _resolve_token.
+# lmer_cli.tokens is stdlib-only and bin/gitlab-review puts src/ on
+# PYTHONPATH, so the import costs nothing and always resolves.
+from lmer_cli.tokens import _get_gitlab_token
+
 
 DEFAULT_PAGE_SIZE = 20
 DEFAULT_MAX_PAGES = 25
@@ -53,7 +58,8 @@ class GitLabClient:
 
         Args:
             host: GitLab host (defaults to GITLAB_HOST env var or gitlab.com)
-            token: API token (defaults to host-specific GITLAB_TOKEN_{host} or GITLAB_TOKEN)
+            token: API token (defaults to host-specific GITLAB_TOKEN_{host}, or
+                GITLAB_TOKEN when this host is the one that issued it)
         """
         self.host = host or os.getenv('GITLAB_HOST', 'gitlab.com')
         self.token = token or self._resolve_token(self.host)
@@ -62,8 +68,9 @@ class GitLabClient:
             import re
             suffix = re.sub(r"[.\-]", "_", self.host.lower())
             raise GitLabError(
-                f"GitLab token required. Set GITLAB_TOKEN_{suffix} or GITLAB_TOKEN "
-                "environment variable or pass token parameter."
+                f"GitLab token required. Set GITLAB_TOKEN_{suffix} (always applies "
+                "to this host) or pass token parameter; a generic GITLAB_TOKEN is "
+                "used only for its issuing host (LMER_GITLAB_TOKEN_HOST)."
             )
 
         self.base_url = f"https://{self.host}/api/v4"
@@ -80,15 +87,14 @@ class GitLabClient:
     def _resolve_token(host: str) -> str | None:
         """Resolve API token for a given host from environment variables.
 
-        Checks host-specific tokens first (GITLAB_TOKEN_{sanitized_host}),
-        then falls back to GITLAB_TOKEN.
+        Delegates to the shared lookup, which keeps the precedence this used
+        to implement inline — host-specific GITLAB_TOKEN_{sanitized_host}
+        first, generic GITLAB_TOKEN after — but hands the generic token out
+        only for the host that issued it (LMER_GITLAB_TOKEN_HOST, defaulting
+        to the LMER_WORK_REPO host). Without that scoping, `--host` alone
+        decided who received the PAT in a PRIVATE-TOKEN header (issue #161).
         """
-        import re
-        suffix = re.sub(r"[.\-]", "_", host.lower())
-        return (
-            os.getenv(f'GITLAB_TOKEN_{suffix}')
-            or os.getenv('GITLAB_TOKEN')
-        )
+        return _get_gitlab_token(host)
 
     def _request(self, method: str, endpoint: str, **kwargs) -> Any:
         """Make API request with error handling."""
@@ -243,6 +249,36 @@ class GitLabClient:
             discussions = [d for d in discussions if d.get('resolved', False) == resolved]
 
         return discussions
+
+    def get_merge_request_discussion(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
+        """Get a single merge request discussion thread.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            mr_id: Merge request ID
+            discussion_id: ID of the discussion thread
+
+        Returns:
+            Discussion data including its notes
+        """
+        project_encoded = project.replace('/', '%2F')
+        return self._request('GET', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions/{discussion_id}")
+
+    def reply_to_merge_request_discussion(self, project: str, mr_id: int, discussion_id: str, body: str) -> Dict[str, Any]:
+        """Reply to an existing discussion thread on a merge request.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            mr_id: Merge request ID
+            discussion_id: Discussion thread ID to reply to
+            body: Reply text
+
+        Returns:
+            Created note data
+        """
+        project_encoded = project.replace('/', '%2F')
+        data = {"body": body}
+        return self._request('POST', f"projects/{project_encoded}/merge_requests/{mr_id}/discussions/{discussion_id}/notes", json=data)
 
     def resolve_merge_request_discussion(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
         """Resolve a merge request discussion thread.
@@ -1017,6 +1053,39 @@ class CodeReviewer:
             )
         except GitLabError as e:
             raise GitLabError(f"Failed to get MR discussions: {e}") from e
+
+    def get_mr_discussion(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
+        """Get a single merge request discussion thread.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            mr_id: Merge request ID
+            discussion_id: Discussion ID to fetch
+
+        Returns:
+            Discussion data including its notes
+        """
+        try:
+            return self.client.get_merge_request_discussion(project, mr_id, discussion_id)
+        except GitLabError as e:
+            raise GitLabError(f"Failed to get discussion {discussion_id}: {e}") from e
+
+    def reply_to_thread(self, project: str, mr_id: int, discussion_id: str, body: str) -> Dict[str, Any]:
+        """Reply to an existing discussion thread on a merge request.
+
+        Args:
+            project: GitLab project path (e.g., 'group/project')
+            mr_id: Merge request ID
+            discussion_id: Discussion ID to reply to
+            body: Reply text
+
+        Returns:
+            Created note data
+        """
+        try:
+            return self.client.reply_to_merge_request_discussion(project, mr_id, discussion_id, body)
+        except GitLabError as e:
+            raise GitLabError(f"Failed to reply to discussion {discussion_id}: {e}") from e
 
     def resolve_thread(self, project: str, mr_id: int, discussion_id: str) -> Dict[str, Any]:
         """Resolve a discussion thread.

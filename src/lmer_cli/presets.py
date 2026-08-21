@@ -38,8 +38,8 @@ selector charset (``[A-Za-z0-9_-]``); a name with other characters is logged
 and skipped at load time, since the token could never select it.
 
 All fields are optional, with one rule mirrored from the lmer CLI: a preset
-that sets ``service`` must also set ``checkout`` (``--service`` requires
-``--checkout``). Loading degrades gracefully - a missing/unreadable/malformed
+that sets ``service`` (or ``service_group``) must also set ``checkout``
+(``--service``/``--service-group`` require ``--checkout``). Loading degrades gracefully - a missing/unreadable/malformed
 file yields no presets, and a single invalid entry is logged and skipped so it
 cannot disable the others. A caller that then selects a preset that did not
 load gets the consumer's normal "unknown preset" rejection.
@@ -89,16 +89,26 @@ _ENV_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9]")
 # comma-delimited list of preset names (the --agents flag wins over it,
 # matching --preset/LMER_PRESET). Read host-side only: the names are resolved
 # against the presets file before the container starts, and only the resolved
-# env overlays are forwarded inside (as LMER_AGENTS + LMER_AGENTS_CONFIG, for
-# spawn-harness) — the presets file itself never crosses the boundary.
+# env overlays are forwarded inside (under the scoped SPAWN_* names below,
+# for spawn-harness) — the presets file itself never crosses the boundary.
 AGENTS_ENV = "LMER_AGENTS"
 
-# Container env var carrying the resolved per-agent config as JSON
-# (``{name: {"env": {...}}}``), written by the host CLI and consumed by
-# spawn-harness. Defined beside AGENTS_ENV because the two are halves of one
-# contract (host writes both, spawn-harness strips both from children) —
-# every consumer must import them from here so a rename can't split them.
+# The config half of the same host-side input convention: never written by
+# lmer, never read as input, and defined beside AGENTS_ENV because both
+# spellings must be stripped from a fan-out child (a child carrying either
+# one would hand the session's selection to whatever it runs). Every
+# consumer imports them from here so a rename can't split them.
 AGENTS_CONFIG_ENV = "LMER_AGENTS_CONFIG"
+
+# Container-side names the resolved selection is actually forwarded under
+# (issue #283), read by spawn-harness and by nothing host-side. Scoped away
+# from AGENTS_ENV because inside the container the pair is ambient: forwarding
+# the selection under the host *input* name made every nested `lmer` invocation
+# and every test run in the session inherit it, and resolve those names against
+# a presets file that never crosses the boundary. The input convention stays
+# AGENTS_ENV; only what the container sees is renamed.
+SPAWN_AGENTS_ENV = "LMER_SPAWN_AGENTS"
+SPAWN_AGENTS_CONFIG_ENV = "LMER_SPAWN_AGENTS_CONFIG"
 
 # Charset a preset name may use. Shared between the selector token and the
 # load-time name check so a name that loads is always one the token can select.
@@ -115,7 +125,7 @@ _PRESET_TOKEN_RE = re.compile(r"\$preset:(" + _NAME_PATTERN + r")")
 _VALID_NAME_RE = re.compile(_NAME_PATTERN)
 
 # Keys a preset entry may define. Anything else is an (logged) typo signal.
-_KNOWN_KEYS = frozenset({"checkout", "service", "env", "args"})
+_KNOWN_KEYS = frozenset({"checkout", "service", "service_group", "env", "args"})
 
 
 @dataclass
@@ -126,7 +136,8 @@ class Preset:
         name: The preset's key in the presets file (what ``$preset:<name>``
             or ``--preset <name>`` / ``LMER_PRESET`` selects).
         checkout: Host path to a local source checkout, passed as
-            ``--checkout``. Required whenever ``service`` is set.
+            ``--checkout``. Required whenever ``service`` or ``service_group``
+            is set.
         service: Docker/Compose service or container name to target, passed
             as ``--service`` (service mode).
         env: Extra environment variables. How they merge is the consumer's
@@ -145,6 +156,7 @@ class Preset:
     name: str
     checkout: str | None = None
     service: str | None = None
+    service_group: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
 
@@ -152,15 +164,17 @@ class Preset:
         """The lmer CLI tokens this preset contributes.
 
         The single home of the field→flag mapping (``checkout`` →
-        ``--checkout``, ``service`` → ``--service``, then ``args`` verbatim),
-        shared by every spawner so a future preset field only needs wiring
-        here.
+        ``--checkout``, ``service`` → ``--service``, ``service_group`` →
+        ``--service-group``, then ``args`` verbatim), shared by every spawner so
+        a future preset field only needs wiring here.
         """
         tokens: list[str] = []
         if self.checkout:
             tokens += ["--checkout", self.checkout]
         if self.service:
             tokens += ["--service", self.service]
+        if self.service_group:
+            tokens += ["--service-group", self.service_group]
         return tokens + list(self.args)
 
 
@@ -403,7 +417,7 @@ def resolve_agent_presets(
 
     Returns ``(resolved, warnings, error)``: ``resolved`` maps name → the
     agent's config entry (``{"env": {...}}`` plus optional ``"prompt"`` —
-    the exact ``LMER_AGENTS_CONFIG`` shape) and is ``None`` when ``error``
+    the exact ``LMER_SPAWN_AGENTS_CONFIG`` shape) and is ``None`` when ``error``
     is set (an empty selection, any unknown name — unknown must fail the
     invocation, mirroring the ``--preset`` UX, never silently spawn fewer
     agents — or an unknown harness, which would otherwise only surface
@@ -457,7 +471,10 @@ def resolve_agent_presets(
                 f"agent '{name}': unknown harness '{harness_name}' "
                 f"(known harnesses: {known})"
             )
-        ignored = [f for f in ("checkout", "service") if getattr(preset, f)]
+        ignored = [
+            f for f in ("checkout", "service", "service_group")
+            if getattr(preset, f)
+        ]
         if ignored:
             warnings.append(
                 f"agent '{name}': preset field(s) {', '.join(ignored)} ignored — "
@@ -501,10 +518,23 @@ def _build_preset(name: str, spec: object) -> Preset | None:
         logger.error("preset_invalid name=%s reason=service_not_a_string", name)
         return None
 
-    # Mirror the lmer CLI rule (--service requires --checkout): a preset that
-    # would produce that invalid invocation is rejected up front.
+    service_group = spec.get("service_group")
+    if service_group is not None and not isinstance(service_group, str):
+        logger.error(
+            "preset_invalid name=%s reason=service_group_not_a_string", name
+        )
+        return None
+
+    # Mirror the lmer CLI rule (--service and --service-group both require
+    # --checkout): a preset that would produce that invalid invocation is
+    # rejected up front.
     if service and not checkout:
         logger.error("preset_invalid name=%s reason=service_requires_checkout", name)
+        return None
+    if service_group and not checkout:
+        logger.error(
+            "preset_invalid name=%s reason=service_group_requires_checkout", name
+        )
         return None
 
     raw_env = spec.get("env", {})
@@ -532,6 +562,7 @@ def _build_preset(name: str, spec: object) -> Preset | None:
         name=name,
         checkout=checkout,
         service=service,
+        service_group=service_group,
         env=dict(raw_env),
         args=list(raw_args),
     )

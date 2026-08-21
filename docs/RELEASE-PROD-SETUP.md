@@ -2,32 +2,36 @@
 
 Operator-performed, one-time production configuration for the lmer release
 flow ([RELEASE-FLOW.md](./RELEASE-FLOW.md)). Every item below is performed by
-a human operator and ticked here with a date and actor — the **gating**
-receipts gate the **follow-on G4 release run** (the first production release
-through the new flow), not the release-flow build itself.
+a human operator and ticked with a date and actor — the **gating**
+receipts gate the **first production release run through this flow**, not
+the release-flow build itself.
 
 Work each item with the adoption checklist
 ([RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md)) open — it carries the detail
 each step summarizes. Record fingerprints, dates, and actor only — **never a
 secret value** (no tokens, no private keys).
 
-> **Status: IN PROGRESS.** Some items were satisfied before this flow
-> existed, by the manual release path that shipped earlier versions; those
-> are ticked below with the evidence that establishes them. The remaining
-> gating items are the operator's to perform before launching the first
-> production release run. A run of the release taskdef must refuse to
-> proceed to leg 2 while any **gating** item is unchecked; the hardening
-> section does not gate.
+This file is the reusable template, kept unticked. A completed deployment's
+receipts — dates, actors, evidence, and any waiver — are recorded with that
+release run's records in the work repo, not here.
+
+> **How this file gates.** A deployment WORKS this checklist in a copy: it
+> lands in the release run's own run directory in the work repo — the one
+> the release taskdef's run state lives in — and each item is ticked there
+> with its date and actor. The completed copy is what gates. A run of the
+> release taskdef must refuse to proceed to leg 2 while any **gating** item
+> is unchecked in that copy; the template here stays blank, and the
+> hardening section does not gate.
 >
-> Receipts here are self-attestation unless an item cites externally
-> verifiable evidence — a missed or misconfigured setting surfaces in the
-> follow-on release run (leg-2 step 5 is where canonical-forge-side
-> misconfiguration surfaces). Tick an item only after performing it, with
-> the date and your name.
+> Receipts are self-attestation unless an item cites externally verifiable
+> evidence — a missed or misconfigured setting surfaces in the follow-on
+> release run (leg-2 step 5 is where canonical-forge-side misconfiguration
+> surfaces). Tick an item only after performing it, with the date and your
+> name.
 
 ## Gating receipts
 
-These must all be checked before the first production release run proceeds
+These must all be checked in the release run's copy before that run proceeds
 to leg 2.
 
 - [ ] **(0) Release SSH signing keypair generated** — private half stored in
@@ -44,16 +48,22 @@ to leg 2.
   — date/actor:
 - [ ] **(5a) Push-allow entries provisioned** — mirror `refs/heads/main` and
   `refs/tags/*`, canonical origin `refs/tags/*`. Mirror entries must be
-  written `host/path|refpattern`: release pushes to the mirror go by URL and
-  the push-by-URL match is anchored, so a path-only entry does not authorize
-  them — date/actor:
-- [x] **(7) Production PyPI project trusted publisher registered** — pinned
+  written `host/path|refpattern` — host-anchored and ref-scoped. Leg 2 adds
+  the mirror as a NAMED remote and pushes through it, and the named-remote
+  half of the grammar accepts a host-less `group/project` entry, which
+  grants on any host serving that path; naming the host confines the grant
+  to the one host git will dial. The ref half matters just as much: a bare
+  entry authorizes `refs/heads/*` only, so the tag push needs
+  `|refs/tags/*` spelled out, and `|refs/heads/main` keeps the branch grant
+  off every other branch. (If a future leg pushes by URL instead, the match
+  there is anchored and a path-only entry would not authorize it at all.) —
+  date/actor:
+- [ ] **(7) Production PyPI project trusted publisher registered** — pinned
   to the mirror repo + workflow `.github/workflows/release.yml` +
-  environment `pypi`. **Pre-existing.** Evidence: the mirror's `main`
-  workflow publishes with `id-token: write` and no API token, and the
-  project index already holds releases published by it — the binding is
-  demonstrably live. — date/actor: 2026-07-29 / verified from published
-  release evidence, confirmed by the repository owner
+  environment `pypi`. A project whose mirror already publishes tokenlessly
+  (workflow with `id-token: write` and no API token, releases on the index
+  published by it) may record this as **pre-existing**, citing that live
+  binding as the evidence — date/actor:
 - [ ] **(11) `vars.RELEASE_RESUME_VERSION` confirmed ABSENT** — the
   version-reuse gate ([RELEASE-FLOW.md](./RELEASE-FLOW.md) §5) refuses to
   publish over an already-published version unless this variable names it.
@@ -102,30 +112,9 @@ unrelated hardening task cannot block a release.
   [evidence-leg2.md](./rehearsal/evidence-leg2.md)) before any production
   release — date/actor:
 
-> **WAIVED for the first lmer production release — 2026-07-29, by the
-> repository owner.** The first production release is the test.
->
-> Rationale, recorded so the waiver is auditable rather than implicit:
->
-> - The publish path — build, checks, trusted-publisher upload, GitHub
->   Release — is byte-identical to the workflow that already shipped earlier
->   versions to the index, so it is production-proven.
-> - The two components this flow adds (`verify-tag-signature` and the
->   `gate-version-reuse` step) both fail **closed, before any publish
->   step**. The realistic failure mode is a red run, not a bad artifact.
-> - A red run is recoverable in place: fix the variable and re-run. The tag
->   stays where it is — tags are never deleted or re-pointed — and re-running
->   converges ([RELEASE-FLOW.md](./RELEASE-FLOW.md) §3).
-> - Tag-signature verification, the highest-risk new component, was
->   exercised locally instead: a correctly-signed tag verifies (exit 0), a
->   tag signed by a key outside the allowlist fails (`No principal
->   matched.`), and an unsigned lightweight tag fails.
->
-> **Residual accepted:** no end-to-end proof that the mirror's repo
-> controls, the environment binding, and the tag trigger interact as
-> expected under a signed tag. First observation of that is the live run.
->
-> This waiver covers the first release only. It does not retire the standing
-> rule in [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md), and it does not
-> carry over to another adopter — ctl's adoption exercises components that
-> have no production-proven predecessor.
+Waiving this for a given release is possible but never implicit: the waiver
+— its rationale and the residual it accepts — is recorded with that release
+run's records, alongside the run's other receipts. An unrecorded skip is not
+a waiver. A waiver covers the one release it names; it does not retire the
+standing rule in [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md) and does not
+carry over to another adopter.

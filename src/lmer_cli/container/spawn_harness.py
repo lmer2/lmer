@@ -3,10 +3,13 @@
 The in-container half of the ``--agents`` fan-out (issue #130): the host CLI
 resolves ``--agents <name,...>`` against the operator's presets file and
 forwards only the resolved per-agent config into the container as
-``LMER_AGENTS_CONFIG`` (JSON ``{name: {"env": {...}, "prompt": "..."?}}`` —
-the env overlay plus an optional prompt preamble folded from the preset's
-args; names also listed in ``LMER_AGENTS``). This tool lets the
-orchestrating agent run one of those agents non-interactively::
+``LMER_SPAWN_AGENTS_CONFIG`` (JSON ``{name: {"env": {...}, "prompt": "..."?}}``
+— the env overlay plus an optional prompt preamble folded from the preset's
+args; names also listed in ``LMER_SPAWN_AGENTS``). The container-side names are
+scoped away from the host input ``LMER_AGENTS`` on purpose: they are ambient to
+everything in the session, and under the input name a nested ``lmer`` inherited
+the outer selection (issue #283). This tool lets the orchestrating agent run one
+of those agents non-interactively::
 
     spawn-harness sol-review --prompt-file prompt.md \\
         --env LMER_REVIEW_ON_MR=0 --output agents/sol-review.md
@@ -18,9 +21,10 @@ their harness's permission checks bypassed (the lmer container is the
 security boundary; see :class:`lmer_cli.harness.ExecProfile`).
 
 Child environment: parent env, overlaid with the agent's preset ``env``,
-overlaid with ``--env KEY=VAL`` pairs (last wins). ``LMER_AGENTS`` /
-``LMER_AGENTS_CONFIG`` are stripped from the child so children cannot fan
-out further (no grandchildren, structurally), and
+overlaid with ``--env KEY=VAL`` pairs (last wins). Both fan-out pairs — the
+scoped ``LMER_SPAWN_AGENTS`` / ``LMER_SPAWN_AGENTS_CONFIG`` and the host-input
+``LMER_AGENTS`` / ``LMER_AGENTS_CONFIG`` — are stripped from the child so
+children cannot fan out further (no grandchildren, structurally), and
 ``LMER_NONINTERACTIVE=1`` is set on every child. The rule the marker stands
 for is delivered in-band, at the head of the child's prompt
 (:data:`NONINTERACTIVE_NOTICE`), so a child reports a gate-worthy problem
@@ -73,7 +77,14 @@ from lmer_cli.harness import (
 
 # Both halves of the fan-out env contract live in lmer_cli.presets (the
 # host-side writer) so the writer and this consumer can never drift apart.
-from lmer_cli.presets import AGENTS_CONFIG_ENV, AGENTS_ENV
+# The host-input pair is imported for the child strip only — nothing here
+# reads it, or a child could re-admit the ambient selection (issue #283).
+from lmer_cli.presets import (
+    AGENTS_CONFIG_ENV,
+    AGENTS_ENV,
+    SPAWN_AGENTS_CONFIG_ENV,
+    SPAWN_AGENTS_ENV,
+)
 from lmer_cli.user_harnesses import CONTAINER_HARNESS_CACHE_DIR
 
 #: Exit code for a child killed by ``--timeout`` (the coreutils convention).
@@ -118,29 +129,35 @@ def _fail(message: str) -> "SystemExit":
 
 
 def load_agents_config(environ: Dict[str, str]) -> Dict[str, dict]:
-    """Parse ``LMER_AGENTS_CONFIG`` from ``environ``.
+    """Parse ``LMER_SPAWN_AGENTS_CONFIG`` from ``environ``.
 
     Returns the ``{name: {"env": {...}}}`` mapping. Absent/empty means no
     agents were configured at launch. A malformed value is a hard error —
     the variable is machine-written by the host CLI, so damage means the
     session is misconfigured, not that the user typo'd.
+
+    Only the scoped name is read: falling back to ``LMER_AGENTS_CONFIG``
+    would re-admit exactly the ambient value the scoping removed (#283).
     """
-    raw = environ.get(AGENTS_CONFIG_ENV, "").strip()
+    raw = environ.get(SPAWN_AGENTS_CONFIG_ENV, "").strip()
     if not raw:
         return {}
     try:
         config = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise _fail(f"{AGENTS_CONFIG_ENV} is not valid JSON: {exc}") from None
+        raise _fail(f"{SPAWN_AGENTS_CONFIG_ENV} is not valid JSON: {exc}") from None
     if not isinstance(config, dict):
-        raise _fail(f"{AGENTS_CONFIG_ENV} must be a JSON object, got {type(config).__name__}")
+        raise _fail(
+            f"{SPAWN_AGENTS_CONFIG_ENV} must be a JSON object, "
+            f"got {type(config).__name__}"
+        )
     for name, entry in config.items():
         if (
             not isinstance(entry, dict)
             or not isinstance(entry.get("env", {}), dict)
             or not isinstance(entry.get("prompt", ""), str)
         ):
-            raise _fail(f"{AGENTS_CONFIG_ENV} entry {name!r} is malformed")
+            raise _fail(f"{SPAWN_AGENTS_CONFIG_ENV} entry {name!r} is malformed")
     return config
 
 
@@ -149,7 +166,9 @@ def resolve_agent(name: str, config: Dict[str, dict]) -> dict:
     if not config:
         raise _fail(
             "No agents configured — launch the session with "
-            "--agents <name,...> (or LMER_AGENTS) to enable spawn-harness"
+            f"--agents <name,...> (or {AGENTS_ENV}) to enable spawn-harness; "
+            f"the launch forwards the resolved selection as "
+            f"{SPAWN_AGENTS_CONFIG_ENV}"
         )
     if name not in config:
         available = ", ".join(sorted(config))
@@ -176,7 +195,9 @@ def build_child_env(
     """Compose the child environment (parent < agent preset < ``--env``).
 
     The fan-out variables are stripped so a child cannot spawn further
-    children — the no-grandchildren rule is structural, not advisory.
+    children — the no-grandchildren rule is structural, not advisory. Both
+    spellings go: the scoped pair this tool reads, and the host-input pair,
+    which a child would otherwise carry into any ``lmer`` it runs (#283).
 
     ``LMER_NONINTERACTIVE`` is set last, so neither the preset overlay nor an
     ``--env`` pair can unset it: a child harness process has no human attached
@@ -191,8 +212,13 @@ def build_child_env(
     child = dict(parent_env)
     child.update(agent_env)
     child.update(extra_env)
-    child.pop(AGENTS_ENV, None)
-    child.pop(AGENTS_CONFIG_ENV, None)
+    for key in (
+        AGENTS_ENV,
+        AGENTS_CONFIG_ENV,
+        SPAWN_AGENTS_ENV,
+        SPAWN_AGENTS_CONFIG_ENV,
+    ):
+        child.pop(key, None)
     child[NONINTERACTIVE_ENV] = "1"
     return child
 
@@ -714,7 +740,9 @@ def main(argv: Optional[list] = None) -> None:
             "non-interactive child harness process"
         ),
     )
-    parser.add_argument("agent", nargs="?", help="Agent name from LMER_AGENTS_CONFIG")
+    parser.add_argument(
+        "agent", nargs="?", help="Agent name from LMER_SPAWN_AGENTS_CONFIG"
+    )
     prompt_group = parser.add_mutually_exclusive_group()
     prompt_group.add_argument("--prompt", help="Prompt text for the child")
     prompt_group.add_argument("--prompt-file", help="File containing the prompt")

@@ -14,6 +14,7 @@ assistant) on a host:
   upgrade + timeouts included)
 - `LMER_PLATFORM_CONTAINER_URL` and the surviving-assistant restart gotcha
 - A tour of the fleet view, spawning, answering, wind down vs exit, uber lmer
+- Digest nudges: when the daemon reminds uber lmer that its spool is unread
 
 **Best for**: Getting the platform running and usable in a few minutes.
 
@@ -68,6 +69,19 @@ Detailed documentation on authentication mechanisms in containerized environment
 
 ---
 
+### [GATE-FASTPATH.md](./GATE-FASTPATH.md)
+**Gate fast paths**
+
+How the commit and push gates avoid re-running the test suite, and when they refuse to:
+- The text-only fast path and the per-project `tests.text_diff_subset` declaration
+- The test-result cache, its key, and what the key cannot see
+- When the full suite always runs
+- Kill switches and how to read a gate receipt's `test_scope`
+
+**Best for**: Understanding why a gate ran a subset or skipped the suite, and declaring the subset for a new project.
+
+---
+
 ### [LMER-CLI.md](./LMER-CLI.md)
 **LMER Python CLI (lmer)**
 
@@ -109,6 +123,24 @@ troubleshooting. Verified against opencode 1.18.4.
 
 **Best for**: Setting up your first user-installed harness, or a template to
 adapt for any other agent CLI.
+
+---
+
+### [TRANSCRIPT-FORMAT.md](./TRANSCRIPT-FORMAT.md)
+**The lmer transcript format (version 1)**
+
+The public contract a drop-in harness converts its sessions into so they render
+in the orchestrator's chat view:
+- The three record types (`lmer.meta`, `lmer.message`, `lmer.tool_update`) with
+  full field semantics and examples
+- The constraints the reader enforces (append-only, self-contained lines,
+  sizing, discovery, scrubbing)
+- What each canonical field looks like in the chat view
+- Converter lifecycle: the backgrounded tailer in `runner.sh`, per-record flush,
+  and the alternative end-of-session pass
+
+**Best for**: Making a user-installed harness's transcripts readable without
+any change to lmer itself.
 
 ---
 
@@ -257,7 +289,7 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - Production PAT issuance and provisioning, bot account signing key, PyPI trusted publisher, GitLab protected tags
 - Mirror PR/collaborator policy and the green-rehearsal gate
 - Split into **gating** receipts and **hardening** items: a release run must refuse leg 2 while any gating item is unchecked; hardening is tracked separately so it neither blocks a release nor passes unnoticed
-- Rehearsal waivers for a given release are recorded here with rationale and accepted residual
+- Rehearsal waivers for a given release are recorded with that release run's records in the work repo — rationale and accepted residual — not in this checklist
 
 **Best for**: The operator completing (and auditors reviewing) the production setup checklist before the first release run.
 

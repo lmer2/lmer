@@ -1,0 +1,39 @@
+{
+  "schema": 1,
+  "description": "OpenCode (opencode.ai) \u2014 user-installed, core tier",
+  "binary": "opencode",
+  "credential_mounts": [
+    {
+      "host_path": ".local/share/opencode/auth.json",
+      "container_path": "/home/developer/.local/share/opencode/auth.json"
+    }
+  ],
+  "session_dir": "/home/developer/.opencode-transcripts",
+  "supervisor": {
+    "ready_marker": "Ask anything...",
+    "quit_sequence": [
+      "\\x1b",
+      "\\x03",
+      "\\x03"
+    ]
+  },
+  "exec": {
+    "base_args": [
+      "run"
+    ],
+    "permission_bypass_args": [
+      "--auto"
+    ],
+    "model_args": [
+      "--model",
+      "{model}"
+    ],
+    "effort_args": [
+      "--variant",
+      "{effort}"
+    ]
+  },
+  "extra_env": {
+    "OPENCODE_DISABLE_AUTOUPDATE": "1"
+  }
+}

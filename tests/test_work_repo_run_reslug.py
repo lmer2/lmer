@@ -142,6 +142,21 @@ class TestReslugRun:
 
 
 class TestSuccessorResolution:
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            ({}, ()),
+            ({"reslugged_from": "release-main"}, ()),
+            ({"reslugged_from": ["release-main", 7, None]},
+             ("release-main",)),
+        ],
+    )
+    def test_vacated_slug_shape_is_defined_once(self, state, expected):
+        assert run_state.vacated_slugs(state) == expected
+        assert run_state.has_vacated(state, "release-main") == (
+            "release-main" in expected
+        )
+
     def test_a_live_reslugged_run_still_resolves_from_the_bare_slug(self, runs):
         rdir, state = _seed(runs, "release-main")
         new_dir, _, _ = run_state.reslug_run(rdir, state, "release-main-v0.6.0")
@@ -218,6 +233,18 @@ class TestSuccessorResolution:
         run_state.write_state(newer, state)
 
         assert run_state.find_successor_run_dir("release-main") == newer
+
+    def test_every_vacated_identity_survives_multiple_reslugs(self, runs):
+        first, state = _seed(runs, "release-main")
+        second, state, _ = run_state.reslug_run(
+            first, state, "release-main-v0.6.0")
+        third, state, _ = run_state.reslug_run(
+            second, state, "release-main-v0.6.0-final")
+
+        assert run_state.vacated_slugs(state) == (
+            "release-main", "release-main-v0.6.0")
+        assert run_state.find_successor_run_dir("release-main") == third
+        assert run_state.find_successor_run_dir("release-main-v0.6.0") == third
 
     def test_run_rel_path_candidates_covers_both_addresses(self, runs):
         rdir, state = _seed(runs, "release-main")

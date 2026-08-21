@@ -226,6 +226,13 @@ class Harness:
     #: Extra fixed environment for the container when this harness is active.
     #: (e.g. disable self-updates inside ephemeral containers)
     extra_env: Tuple[Tuple[str, str], ...] = field(default_factory=tuple)
+    #: Absolute CONTAINER directory this harness writes its session JSONL
+    #: under. Declared here so an orchestrator can mount each harness's
+    #: transcripts out to the host instead of only claude's (issue #280):
+    #: ``lmer`` runs the container ``--rm``, so an unmounted session directory
+    #: dies with the session and the chat view has nothing to read back.
+    #: ``None`` for a harness that writes no transcript worth keeping.
+    session_dir: Optional[str] = None
     #: For user-installed harnesses (lmer_cli.user_harnesses): the host
     #: directory the definition was loaded from. ``None`` for built-ins —
     #: the "is this a user harness" discriminator.
@@ -268,6 +275,10 @@ HARNESSES: dict[str, Harness] = {
             dashdash_before_prompt=True,
         ),
         description="Claude Code (Anthropic) — full feature tier",
+        # The platform's transcript mount destination since T22 — one fact with
+        # lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR, which
+        # lmer_platform.spawn refuses to spawn without agreeing with.
+        session_dir="/home/developer/.claude/projects",
     ),
     "codex": Harness(
         name="codex",
@@ -302,6 +313,8 @@ HARNESSES: dict[str, Harness] = {
             dashdash_before_prompt=True,
         ),
         description="Codex CLI (OpenAI) — core feature tier",
+        # codex-cli 0.147.0: rollout files under a year/month/day tree in here.
+        session_dir="/home/developer/.codex/sessions",
     ),
     "pi": Harness(
         name="pi",
@@ -355,6 +368,8 @@ HARNESSES: dict[str, Harness] = {
         ),
         description="pi (earendil-works/pi, formerly badlogic/pi-mono) — core feature tier",
         extra_env=(("PI_SKIP_VERSION_CHECK", "1"),),
+        # pi 0.84.1: one subdirectory per project, one JSONL per session.
+        session_dir="/home/developer/.pi/agent/sessions",
     ),
 }
 

@@ -25,15 +25,12 @@ import asyncio
 import logging
 import os
 import sys
-from pathlib import Path
-
-from dotenv import load_dotenv
 
 from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.tls import ensure_ca_bundle
 
 from .registry import is_thread_connected
-from .sessions import SessionManager, listener_default_preset
+from .sessions import SessionManager
 
 logger = logging.getLogger("lmer_slack.listener")
 
@@ -77,23 +74,19 @@ def _ensure_ca_bundle() -> None:
 def _load_env_files() -> None:
     """Populate ``os.environ`` from ``.env`` files the way the main lmer CLI does.
 
-    Sources, in precedence order (highest first):
-
-    1. the **active environment** — an already-exported variable always wins;
-    2. the **current working directory's** ``.env`` (the deployment dir);
-    3. ``~/.lmer/.env`` — lmer's shared state-dir config.
-
-    ``override=False`` keeps active env vars from being clobbered, and loading
-    the cwd file before the state-dir file makes cwd win between the two (the
-    first file to set a key keeps it). The state dir is resolved via
-    ``lmer_cli.runtime`` so it stays in lockstep with the main CLI.
+    Precedence, highest first: the active environment, the cwd ``.env``, then
+    ``~/.lmer/.env``. Implemented once in ``lmer_cli.runtime`` (issue #67);
+    ``references_from_environ=True`` keeps this caller's pre-#67 resolution of
+    ``${VAR}`` references inside a file. Imported late because ``lmer_cli.cli``
+    imports ``slack_chat``.
     """
-    from lmer_cli.runtime import lmer_state_dir
+    from lmer_cli.runtime import apply_env_file_defaults, default_env_file_candidates
 
-    for env_file in (Path.cwd() / ".env", lmer_state_dir() / ".env"):
-        if env_file.is_file():
-            load_dotenv(env_file, override=False)
-            logger.debug("loaded_env_file path=%s", env_file)
+    loaded = apply_env_file_defaults(
+        default_env_file_candidates(), references_from_environ=True
+    )
+    for key, source in loaded.items():
+        logger.debug("loaded_env_var key=%s source=%s", key, source)
 
 
 def _csv_env_set(name: str, default: str = "") -> set[str]:
@@ -111,6 +104,9 @@ DM_ALLOWED_USERS: set[str] = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
 # token (see :mod:`lmer_cli.presets`). Empty when LMER_PRESETS_FILE is
 # unset. Repopulated from env in main() after .env load, mirroring how the
 # session manager and DM allowlist are reconstructed there.
+# Scope: this is the token allowlist, loaded from the *listener's* environment.
+# Whether a listener-wide default is defined is a question about the spawned
+# CLI's environment instead — see SessionManager.child_presets (issue #279).
 PRESETS: dict[str, Preset] = load_presets()
 
 
@@ -135,8 +131,19 @@ def _preset_ack_parts(preset: Preset | None) -> tuple[str, str]:
     error, rejected before spawning — this is an operator misconfiguration of
     the listener itself, so the spawn still goes ahead and only the diagnosis
     is surfaced.
+
+    The default is resolved through the session manager because it owns the
+    ``.env`` files the spawned CLI seeds itself from: a default that lives
+    only in the forwarded ``--env-file`` applies to the session and must be
+    named here too (issue #259). Its *availability* is asked of the manager for
+    the same reason (issue #279): ``LMER_PRESETS_FILE`` travels those same
+    tiers, so checking a file-sourced default against the listener's own
+    ``PRESETS`` — loaded from an environment that never reads that file —
+    warned that a session would fail to start when the child was about to load
+    the very preset being named. ``PRESETS`` still answers for a ``$preset:``
+    token, which is resolved here and must name something this listener holds.
     """
-    default_name, default_source = listener_default_preset()
+    default_name, default_source = session_manager.default_preset()
     if preset is not None:
         if default_name and default_name != preset.name:
             return (
@@ -147,13 +154,14 @@ def _preset_ack_parts(preset: Preset | None) -> tuple[str, str]:
         return f" using preset `{preset.name}`", ""
     if not default_name:
         return "", ""
-    if default_name in PRESETS:
+    child_presets = session_manager.child_presets()
+    if default_name in child_presets:
         return (
             f" using the listener default preset `{default_name}` "
             f"(from `{default_source}`)",
             "",
         )
-    available = ", ".join(sorted(PRESETS)) or "(none configured)"
+    available = ", ".join(sorted(child_presets)) or "(none configured)"
     return "", (
         f"⚠️ The listener default preset `{default_name}` (from "
         f"`{default_source}`) is not defined, so this session will fail to "

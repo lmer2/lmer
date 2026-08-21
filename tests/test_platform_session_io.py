@@ -783,6 +783,61 @@ def test_append_newline_defaults_off(platform_root, control_plane):
     assert control_plane.calls[0]["body"]["append_newline"] is False
 
 
+def test_a_chat_message_is_marked_as_one_for_the_supervisor(
+    platform_root, control_plane
+):
+    """The flag the chat pane sets, carried to the session's own control plane.
+
+    It says this is prose intended to steer the session — nothing about what to
+    do with it, which is the supervisor's call because only that end knows which
+    harness is running. This layer forwards the fact and touches the payload not
+    at all.
+    """
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.send_input(
+        "s-1", "!206 was merged", append_newline=True, sanitize=True
+    )
+
+    assert control_plane.calls[0]["body"] == {
+        "data": "!206 was merged",
+        "append_newline": True,
+        "sanitize": True,
+    }
+
+
+def test_slash_command_intent_is_forwarded_only_with_the_prose_guard(
+    platform_root, control_plane
+):
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.send_input(
+        "s-1", "/followup", append_newline=True, sanitize=True,
+        preserve_slash_commands=True,
+    )
+    session_io.send_input(
+        "s-1", "/followup", append_newline=True,
+        preserve_slash_commands=True,
+    )
+
+    assert control_plane.calls[0]["body"]["preserve_slash_commands"] is True
+    assert "preserve_slash_commands" not in control_plane.calls[1]["body"]
+
+
+def test_input_nobody_flagged_puts_nothing_new_on_the_wire(
+    platform_root, control_plane
+):
+    """Absent rather than ``false``, so every caller that types on something
+    else's behalf — the terminal's keystrokes, an injected command — sends the
+    body it has always sent, and a session running an older image sees a request
+    it already understands."""
+    plant_session("s-1", port=control_plane.port)
+
+    session_io.send_input("s-1", "!ls", append_newline=True)
+
+    assert "sanitize" not in control_plane.calls[0]["body"]
+
+
 def test_the_input_payload_is_never_logged(platform_root, control_plane, caplog):
     plant_session("s-1", port=control_plane.port)
     caplog.set_level("DEBUG")
@@ -982,6 +1037,28 @@ def test_a_mismatched_input_receipt_is_loud(platform_root, control_plane):
     serialized = json.dumps(events[-1])
     assert hashlib.sha256(b"hi!").hexdigest() not in serialized
     assert "not-what-was-sent" not in serialized
+    assert caught.value.delivered is True, (
+        "an automated caller needs the same fact the message spells out for a "
+        "human, in a form it can branch on: repeating this payload types it twice"
+    )
+
+
+def test_a_refused_input_is_not_marked_delivered(platform_root, control_plane):
+    """The other half of the same flag, and the reason it defaults to False: a
+    refusal typed nothing, so the caller's correct recovery is to retry."""
+    control_plane.answer("/input", 503, {"detail": "busy"})
+    plant_session("s-1", port=control_plane.port)
+
+    with pytest.raises(session_io.ControlPlaneError) as caught:
+        session_io.send_input("s-1", "hi!", append_newline=True)
+    assert "refused the input" in str(caught.value)
+    assert caught.value.delivered is False
+
+
+def test_control_plane_error_defaults_to_not_delivered():
+    """Every other raise site says nothing about delivery, and the safe reading —
+    nothing arrived — is what saying nothing has to mean."""
+    assert session_io.ControlPlaneError("anything").delivered is False
 
 
 # --- resizing (best-effort) ------------------------------------------------
@@ -1328,6 +1405,35 @@ def test_input_route_proxies_to_the_control_plane(
     assert response.status_code == 200
     assert response.json() == {"session": "s-1", "bytes_written": 7}
     assert control_plane.calls[0]["authorization"] == f"Bearer {CONTROL_TOKEN}"
+
+
+def test_the_route_forwards_the_steering_flags_and_invents_them_for_nobody(
+    client, platform_root, control_plane
+):
+    """Only the client knows prose from raw keystrokes, so the route relays that
+    assertion and never infers it from command-looking payload text."""
+    plant_session("s-1", port=control_plane.port)
+
+    client.post(
+        "/api/sessions/s-1/input",
+        headers=bearer_header(),
+        json={
+            "data": "/followup",
+            "append_newline": True,
+            "sanitize": True,
+            "preserve_slash_commands": True,
+        },
+    )
+    client.post(
+        "/api/sessions/s-1/input",
+        headers=bearer_header(),
+        json={"data": "!206 was merged", "append_newline": True},
+    )
+
+    assert control_plane.calls[0]["body"]["sanitize"] is True
+    assert control_plane.calls[0]["body"]["preserve_slash_commands"] is True
+    assert "sanitize" not in control_plane.calls[1]["body"]
+    assert "preserve_slash_commands" not in control_plane.calls[1]["body"]
 
 
 def test_an_unconfirmed_submit_reaches_the_caller(

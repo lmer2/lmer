@@ -44,20 +44,46 @@ CONFIG = {
 
 
 def _config_env(config=CONFIG):
-    return {"LMER_AGENTS_CONFIG": json.dumps(config)}
+    return {"LMER_SPAWN_AGENTS_CONFIG": json.dumps(config)}
+
+
+def _wait_for_pid_file(pid_file: Path, timeout: float = 15) -> int:
+    """The pid a stub child recorded, waiting for *content* (issue #142).
+
+    ``echo $$ > file`` truncates before writing, so waiting on ``exists()``
+    alone can read ``""`` and die in ``int("")``.
+    """
+    deadline = time.monotonic() + timeout
+    recorded = ""
+    while time.monotonic() < deadline:
+        if pid_file.exists():
+            recorded = pid_file.read_text().strip()
+            if recorded:
+                break
+        time.sleep(0.05)
+    assert recorded, (
+        f"stub child never recorded its pid in {pid_file} "
+        f"(exists={pid_file.exists()})"
+    )
+    return int(recorded)
 
 
 class TestLoadAgentsConfig:
     def test_absent_and_blank_yield_empty(self):
         assert load_agents_config({}) == {}
-        assert load_agents_config({"LMER_AGENTS_CONFIG": "  "}) == {}
+        assert load_agents_config({"LMER_SPAWN_AGENTS_CONFIG": "  "}) == {}
 
     def test_valid_config_parses(self):
         assert load_agents_config(_config_env()) == CONFIG
 
+    def test_host_input_name_is_not_read(self):
+        """The unscoped pair is ambient in the container (issue #283): reading
+        it as a fallback would put the outer session's selection back."""
+        assert load_agents_config({"LMER_AGENTS_CONFIG": json.dumps(CONFIG)}) == {}
+
     def test_invalid_json_exits_2(self, capsys):
         with pytest.raises(SystemExit) as exc:
-            load_agents_config({"LMER_AGENTS_CONFIG": "{nope"})
+            load_agents_config({"LMER_SPAWN_AGENTS_CONFIG": "{nope"})
         assert exc.value.code == 2
         assert "not valid JSON" in capsys.readouterr().err
 
@@ -72,7 +98,7 @@ class TestLoadAgentsConfig:
     )
     def test_wrong_shapes_exit_2(self, payload):
         with pytest.raises(SystemExit) as exc:
-            load_agents_config({"LMER_AGENTS_CONFIG": payload})
+            load_agents_config({"LMER_SPAWN_AGENTS_CONFIG": payload})
         assert exc.value.code == 2
 
 
@@ -118,11 +144,20 @@ class TestBuildChildEnv:
         assert child["CLI"] == "cli"
 
     def test_fanout_vars_stripped_no_grandchildren(self):
+        # Both spellings: the scoped pair spawn-harness reads, and the
+        # host-input pair a child would otherwise hand to a nested `lmer`.
         child = build_child_env(
-            {"LMER_AGENTS": "a,b", "LMER_AGENTS_CONFIG": "{}"},
-            {"LMER_AGENTS": "sneaky"},
+            {
+                "LMER_SPAWN_AGENTS": "a,b",
+                "LMER_SPAWN_AGENTS_CONFIG": "{}",
+                "LMER_AGENTS": "a,b",
+                "LMER_AGENTS_CONFIG": "{}",
+            },
+            {"LMER_SPAWN_AGENTS": "sneaky", "LMER_AGENTS": "sneaky"},
             {},
         )
+        assert "LMER_SPAWN_AGENTS" not in child
+        assert "LMER_SPAWN_AGENTS_CONFIG" not in child
         assert "LMER_AGENTS" not in child
         assert "LMER_AGENTS_CONFIG" not in child
 
@@ -424,7 +459,7 @@ def _run_main(tmp_path, args, config=CONFIG, extra_env=None, stub="claude", **st
     env = {
         "PATH": f"{fake_bin}:/usr/bin:/bin",
         "HOME": str(tmp_path),
-        "LMER_AGENTS": ",".join(config),
+        "LMER_SPAWN_AGENTS": ",".join(config),
         **_config_env(config),
         **(extra_env or {}),
     }
@@ -468,7 +503,14 @@ class TestMainEndToEnd:
         # CI_MERGE_REQUEST_DESCRIPTION whose *text* mentions LMER_AGENTS —
         # only actual fan-out variables must be absent.
         assert not any(
-            line.startswith(("LMER_AGENTS=", "LMER_AGENTS_CONFIG="))
+            line.startswith(
+                (
+                    "LMER_SPAWN_AGENTS=",
+                    "LMER_SPAWN_AGENTS_CONFIG=",
+                    "LMER_AGENTS=",
+                    "LMER_AGENTS_CONFIG=",
+                )
+            )
             for line in env_lines
         )
 
@@ -591,12 +633,12 @@ class TestMainEndToEnd:
             tmp_path,
             ["opus-review", "--prompt", "p", "--output", str(out)],
             exit_code=3,
-            stderr_text="No API key found for kimi-coding",
+            stderr_text="No API key found for acme-coding",
         )
         assert code == 3
         content = out.read_text()
         assert "[spawn-harness] child FAILED: exit code 3" in content
-        assert "No API key found for kimi-coding" in content
+        assert "No API key found for acme-coding" in content
 
     def test_successful_child_gets_no_footer(self, tmp_path):
         out = tmp_path / "result.md"
@@ -919,7 +961,7 @@ class TestFooterWriteFailuresKeepTheExitCode:
             tmp_path,
             ["opus-review", "--prompt", "p", "--output", str(out)],
             exit_code=3,
-            stderr_text="No API key found for kimi-coding",
+            stderr_text="No API key found for acme-coding",
         )
         assert code == 3
         assert "cannot append the failure footer" in capsys.readouterr().err
@@ -1034,6 +1076,26 @@ class TestMainValidation:
         assert "No agents configured" in capsys.readouterr().out
 
 
+class TestPidFileHandshake:
+    """The handshake the SIGTERM test depends on (issue #142)."""
+
+    def test_an_existing_but_empty_file_is_not_a_pid_yet(self, tmp_path):
+        pid_file = tmp_path / "child.pid"
+        pid_file.touch()  # the window `>` opens
+        writer = subprocess.Popen(
+            ["bash", "-c", f'sleep 0.4; echo 4321 > "{pid_file}"'])
+        try:
+            assert _wait_for_pid_file(pid_file, timeout=15) == 4321
+        finally:
+            writer.wait(timeout=15)
+
+    def test_nothing_recorded_fails_naming_the_file(self, tmp_path):
+        pid_file = tmp_path / "child.pid"
+        pid_file.write_text("   ")
+        with pytest.raises(AssertionError, match="never recorded its pid"):
+            _wait_for_pid_file(pid_file, timeout=0.2)
+
+
 class TestInterruptKillsChild:
     """SIGTERM/SIGINT on spawn-harness must not orphan the detached child
     process group: start_new_session detaches it from terminal signal
@@ -1059,11 +1121,7 @@ class TestInterruptKillsChild:
             text=True,
         )
         try:
-            deadline = time.monotonic() + 15
-            while not pid_file.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            assert pid_file.exists(), "stub child never started"
-            child_pid = int(pid_file.read_text())
+            child_pid = _wait_for_pid_file(pid_file)
 
             wrapper.send_signal(signal.SIGTERM)
             _, stderr = wrapper.communicate(timeout=15)

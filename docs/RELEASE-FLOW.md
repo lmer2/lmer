@@ -332,13 +332,16 @@ All of the following must hold before launching the run:
   files in `docs/rehearsal/` populated from real run data and passing
   their offline verifiers. The files ship as pending skeletons and are
   populated when the rig runs — a pending skeleton is not evidence.
-  Waiving this for a given release is possible but must be **recorded in
-  [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) with its rationale and
-  accepted residual** — an unrecorded skip is not a waiver.
-- **Gating operator receipts complete** — every item in the *gating*
-  section of [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) ticked with
-  date and actor. A release run must refuse to proceed to Leg 2 while any
-  gating item is unchecked. That file's **hardening** section does not
+  Waiving this for a given release is possible but must be **recorded with
+  that release run's records in the work repo — its rationale and the
+  residual it accepts** — an unrecorded skip is not a waiver.
+- **Gating operator receipts complete** — the deployment works the *gating*
+  section of [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) in a copy
+  filed with that release run's records in the work repo — its own run
+  directory — ticking every item there with date and actor. That completed
+  copy is what gates: a release run must refuse to proceed to Leg 2 while
+  any gating item is unchecked in it, and the checklist in the repo is the
+  reusable template, kept blank. That file's **hardening** section does not
   gate: those items close real holes but a release completes correctly
   without them, and they are tracked separately so an open hardening task
   cannot block a release — nor pass unnoticed.
@@ -355,8 +358,7 @@ first release, per the taskdef's per-repo changelog parameter).
 The release run's receipts — the gate and verification events from run
 state, the Actions run URL, the PyPI project page — are recorded back
 into the build's goal assessment as its G4 evidence. The receipts
-themselves live where they were produced: the completed operator template
-in [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) and the release run's
-own run directory in the work repo. The handoff closes when that evidence
+themselves live where they were produced: the release run's own run
+directory in the work repo. The handoff closes when that evidence
 is in place; until then, G4 remains open by design — deferred, not
 dropped.

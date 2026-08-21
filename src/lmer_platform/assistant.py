@@ -156,41 +156,56 @@ module, nothing here imports detection, and no path here polls anything.
 Since T122 that tick delivers a *second* kind of digest through the same call: a
 milestone a session announced with ``lmer-signal`` ("pushed MR !167", "the review
 is finished"), carrying :data:`lmer_platform.detect.SIGNAL_DIGEST_KIND` as its
-``kind``. Nothing in this module distinguishes it, and that is the point — ``kind``
-is a label on a spooled note, not an enum, so a new class of event costs the seam
-nothing. What it is *not* is an attention reason: those mean a human has to act
-and each one becomes a digest class automatically, while a milestone is addressed
-to the orchestrator and stays off the operator's badge.
+``kind``. Since issue #254 there is a third, on the same terms: a question whose
+condition cleared while its run stayed in the fleet — answered or withdrawn
+somewhere the daemon was not watching — carrying
+:data:`lmer_platform.detect.QUESTION_ANSWERED_KIND`. Nothing in this module
+distinguishes them, and that is the point — ``kind`` is a label on a spooled
+note, not an enum, so a new class of event costs the seam nothing. What they are
+*not* is attention reasons: those mean a human has to act and each one becomes a
+digest class automatically, while these are addressed to the orchestrator and
+stay off the operator's badge.
 
-Nothing pushes. The spool waits to be taken (T89)
---------------------------------------------------
+No digest is pushed. The spool waits to be taken (T89, issue #317)
+------------------------------------------------------------------
 :func:`notify` returns whether an assistant is *live*, and that is the whole of
 what "notified" means here: a digest is written to a file and the return value
-says somebody might read it. No code path writes into a session's stdin, and
-none is planned in this slice. That matters because a live incarnation read the
-seam the other way round and told the operator "the orchestrator already pushes
-me digests" — after which a completed review sat in the spool until it was
-evicted, because an idle LLM session has no turn in which to poll and nothing
-was going to give it one.
+says somebody might read it. Nothing in this module writes into a session's
+stdin, and no digest travels that way at all. That matters because a live
+incarnation read the seam the other way round and told the operator "the
+orchestrator already pushes me digests" — after which a completed review sat in
+the spool until it was evicted, because an idle LLM session has no turn in which
+to poll and nothing was going to give it one.
 
-The fix is not here, and deliberately: what wakes an idle session is a *watch*
-the session itself arms, using its harness's own background-monitor tool, whose
-condition is the non-consuming ``pending`` count on :attr:`AssistantStatus` (see
-:func:`status`). The count is on the status precisely so a watch has something to
-poll that is not the destructive take — ``POST /api/assistant/pending`` drains,
-so polling it would eat every digest at the moment nothing was ready to act on
-it. The instruction that arms the watch, re-arms it after each take and reports a
-watch that keeps erroring lives in the ``orchestrate`` taskdef, because it is a
-fact about how the assistant's harness works rather than a fact about this state
-file.
+The first half of the fix is not here, and deliberately: what wakes an idle
+session promptly is a *watch* the session itself arms, using its harness's own
+background-monitor tool, whose condition is the non-consuming ``pending`` count
+on :attr:`AssistantStatus` (see :func:`status`). The count is on the status
+precisely so a watch has something to poll that is not the destructive take —
+``POST /api/assistant/pending`` drains, so polling it would eat every digest at
+the moment nothing was ready to act on it. The instruction that arms the watch
+and reports a watch that keeps erroring lives in the ``orchestrate`` taskdef,
+because it is a fact about how the assistant's harness works rather than a fact
+about this state file.
 
-The fallback, if a taught watch turns out to be too easy to forget: the daemon
-grows a push — :func:`notify` already knows an assistant is live, and
-:mod:`lmer_platform.session_io` already knows how to type into a session — and
-the digest still travels only as "something is waiting", with the spool remaining
-the one bounded, scrubbed source. That design is written down in the plan and is
-**not built**; the watch is cheaper and does not risk interrupting a session
-mid-turn, so it goes first.
+The second half is the backstop that taught watch turned out to need, and it is
+now built (issue #317): a watch that silently stops — a skipped re-arm, a stale
+edge detector, a harness with no monitor tool — leaves digests sitting for as
+long as nobody happens to look, which was measured at 10 digests over 17 minutes
+on 2026-08-19. So :mod:`lmer_platform.nudge` decides when a spool has waited too
+long beside a *quiet* assistant, and :class:`lmer_platform.detect.Detector` types
+one sentence into that session over :func:`lmer_platform.session_io.send_input`.
+
+Two properties of it belong here rather than there, because they are properties
+of this file. **The digest still does not travel**: what is typed is "N are
+waiting, take them", and the spool remains the one bounded, scrubbed source. And
+**the rate limit is anchored in the state**: :attr:`AssistantState.nudged_at`
+marks the accumulation that has been nudged, dated against
+:attr:`AssistantState.pending_since`, and :func:`take_pending` clears both, so
+neither can outlive the spool they describe. The detector keeps a per-process copy
+of that mark as well, because a write to this file can fail and the bound must not
+(:attr:`lmer_platform.detect.Detector._nudged`) — but the file is where it belongs
+and the only copy that survives a restart.
 
 Standing instructions: the handoff's sibling, never consumed (T87)
 ------------------------------------------------------------------
@@ -405,7 +420,8 @@ __all__ = [
     "RESPAWN_BACKOFF_CAP_SECONDS", "MAX_RESPAWN_ATTEMPTS", "SETTLED_SECONDS",
     "state_path", "env_file_path", "taskdef_dir", "read_state", "status",
     "start", "stop", "rotate", "ensure_running", "set_handoff",
-    "set_instructions", "notify", "take_pending",
+    "set_instructions", "notify", "take_pending", "mark_nudged",
+    "clamp_future_nudged_at",
     "register_supervisor", "resume_supervision",
 ]
 
@@ -536,6 +552,12 @@ SETTLED_SECONDS = 120.0
 #: Reentrant because :func:`rotate` is a stop and a start.
 _LOCK = threading.RLock()
 
+#: Serializes only the registry/state publication boundary shared with
+#: :func:`status`. The lifecycle lock above is deliberately much wider and may
+#: cover process spawn or bounded termination waits; status polling must not pay
+#: for either operation.
+_PUBLICATION_LOCK = threading.RLock()
+
 
 
 class AssistantError(RuntimeError):
@@ -643,6 +665,23 @@ class AssistantState:
     stopped_at: Optional[str] = None
     stop_reason: Optional[str] = None
     pending: tuple = ()
+    #: When this accumulation of digests began — the empty→non-empty moment
+    #: (issue #317). Its own stamp because the notes cannot answer it: the spool
+    #: is bounded, so the oldest *retained* note gets younger as older ones are
+    #: evicted. Cleared by :func:`take_pending`.
+    pending_since: Optional[str] = None
+    #: Which accumulation this is, incremented per empty→non-empty transition and
+    #: never reset (issue #317). An exact identity for callers that key on one —
+    #: :attr:`lmer_platform.detect.Detector._nudged` — because two accumulations a
+    #: second apart share :attr:`pending_since`. Mis-keying that memory costs a
+    #: delay of the send's duration, not a window.
+    pending_seq: int = 0
+    #: When the platform last typed a nudge about this accumulation (issue #317).
+    #: Here rather than in its own file so it shares the spool's lock and drain,
+    #: and cannot disagree with what it describes. Cleared by
+    #: :func:`take_pending`; a future value is durably bounded to the current
+    #: time by :func:`clamp_future_nudged_at` before the detector reads it.
+    nudged_at: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -656,6 +695,9 @@ class AssistantState:
             "stopped_at": self.stopped_at,
             "stop_reason": self.stop_reason,
             "pending": [note.to_dict() for note in self.pending],
+            "pending_since": self.pending_since,
+            "pending_seq": self.pending_seq,
+            "nudged_at": self.nudged_at,
         }
 
     @classmethod
@@ -685,6 +727,13 @@ class AssistantState:
         generation = payload.get("generation")
         if not isinstance(generation, int) or isinstance(generation, bool) or generation < 0:
             generation = 0
+        pending_seq = payload.get("pending_seq")
+        if (
+            not isinstance(pending_seq, int)
+            or isinstance(pending_seq, bool)
+            or pending_seq < 0
+        ):
+            pending_seq = 0
         raw_pending = payload.get("pending")
         pending = tuple(
             note
@@ -705,6 +754,9 @@ class AssistantState:
             stopped_at=_opt_str(payload.get("stopped_at")),
             stop_reason=_opt_str(payload.get("stop_reason")),
             pending=pending[-MAX_PENDING:],
+            pending_since=_opt_str(payload.get("pending_since")),
+            pending_seq=pending_seq,
+            nudged_at=_opt_str(payload.get("nudged_at")),
         )
 
 
@@ -729,6 +781,11 @@ class AssistantStatus:
     tracked: bool
     pending: int
     handoff: Optional[str]
+    #: When the platform last nudged this spool (issue #317), so the session that
+    #: was typed into can attribute the line rather than read it as the operator.
+    #: Served here because no route serves ``events.jsonl``, making this the only
+    #: answer an assistant can fetch.
+    nudged_at: Optional[str] = None
     log_path: Optional[str] = None
     #: What the *running* incarnation was actually launched with — the four
     #: launch settings (issue #234), read off its registry entry, where the
@@ -756,6 +813,7 @@ class AssistantStatus:
             "tracked": self.tracked,
             "pending": self.pending,
             "handoff": self.handoff,
+            "nudged_at": self.nudged_at,
             "log_path": self.log_path,
             "settings": self.settings,
             "taskdef": TASKDEF,
@@ -917,41 +975,48 @@ def status() -> AssistantStatus:
     """What the assistant is doing, reconciled against the registry.
 
     Side-effect free: a stale pointer is *reported* (``stale``), never cleaned up
-    here. :func:`stop` and :func:`start` are where state changes, so that reading
-    the status from a UI poll can never race a start.
+    here. The publication lock is still required even though this writes nothing:
+    :func:`start` publishes the live registry entry before it publishes the new
+    state generation, and a reader between those writes would otherwise combine
+    the new session id with the previous generation and call it untracked. The
+    lock covers only those adjacent writes, so status polling does not wait for a
+    process spawn or termination grace period.
     """
-    state = read_state()
-    live = _live_assistant()
-    if live is None:
+    with _PUBLICATION_LOCK:
+        state = read_state()
+        live = _live_assistant()
+        if live is None:
+            return AssistantStatus(
+                running=False,
+                session_id=state.session_id,
+                pid=None,
+                started_at=state.started_at,
+                generation=state.generation,
+                stale=state.session_id is not None,
+                tracked=False,
+                pending=len(state.pending),
+                handoff=state.handoff,
+                nudged_at=state.nudged_at,
+            )
+        session_id = live.get("id")
+        pid = live.get("pid")
         return AssistantStatus(
-            running=False,
-            session_id=state.session_id,
-            pid=None,
-            started_at=state.started_at,
+            running=True,
+            session_id=session_id if isinstance(session_id, str) else None,
+            pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+            # The live entry's own timestamp, not the recorded one: an adopted
+            # assistant (tracked=False) has no recorded start, and the age an age
+            # policy needs is the session's, not the pointer's.
+            started_at=_opt_str(live.get("started_at")) or state.started_at,
             generation=state.generation,
-            stale=state.session_id is not None,
-            tracked=False,
+            stale=False,
+            tracked=session_id == state.session_id,
             pending=len(state.pending),
             handoff=state.handoff,
+            nudged_at=state.nudged_at,
+            log_path=_opt_str(live.get("log_path")),
+            settings=_launched_settings(live),
         )
-    session_id = live.get("id")
-    pid = live.get("pid")
-    return AssistantStatus(
-        running=True,
-        session_id=session_id if isinstance(session_id, str) else None,
-        pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
-        # The live entry's own timestamp, not the recorded one: an adopted
-        # assistant (tracked=False) has no recorded start, and the age an age
-        # policy needs is the session's, not the pointer's.
-        started_at=_opt_str(live.get("started_at")) or state.started_at,
-        generation=state.generation,
-        stale=False,
-        tracked=session_id == state.session_id,
-        pending=len(state.pending),
-        handoff=state.handoff,
-        log_path=_opt_str(live.get("log_path")),
-        settings=_launched_settings(live),
-    )
 
 
 def _launched_settings(live: dict) -> dict:
@@ -1416,8 +1481,31 @@ def start(
                 ),
                 "invalid_request",
             ) from exc
+        published = False
+
+        def publish_registration(register, session_id: str, _pid: int) -> None:
+            nonlocal published
+            with _PUBLICATION_LOCK:
+                register()
+                _write_state(replace(
+                    state,
+                    session_id=session_id,
+                    started_at=now,
+                    generation=state.generation + 1,
+                    handoff=text,
+                    handoff_at=stamp,
+                    stopped_at=None,
+                    stop_reason=None,
+                ))
+                published = True
+
         try:
-            result = spawn.spawn_session(config, request, kind=KIND)
+            result = spawn.spawn_session(
+                config,
+                request,
+                kind=KIND,
+                publish_registration=publish_registration,
+            )
         except spawn.CapacityError as exc:
             raise _refuse(
                 AssistantCapacityError(
@@ -1430,16 +1518,11 @@ def start(
                 "cap_reached",
             ) from exc
 
-        _write_state(replace(
-            state,
-            session_id=result.session_id,
-            started_at=now,
-            generation=state.generation + 1,
-            handoff=text,
-            handoff_at=stamp,
-            stopped_at=None,
-            stop_reason=None,
-        ))
+        if not published:
+            raise AssistantError(
+                "the assistant spawn returned without publishing its registry "
+                "entry and lifecycle state"
+            )
         append_event(
             "assistant_started",
             note=result.session_id,
@@ -1511,23 +1594,34 @@ def stop(
 
         session_id = live.get("id")
         gone = _terminate(live.get("pid"))
-        if gone and isinstance(session_id, str):
+        if gone:
             # The spawn path keeps the entry of a session that exited unclean,
             # because that entry is how a crash is detected — but this exit was
             # requested, so leaving it would report an assistant we killed as one
             # that died. Signal-terminated is never a clean exit, so nothing else
             # is going to remove it.
-            registry.remove(session_id)
-
-        _write_state(replace(
-            state,
-            session_id=None if gone else state.session_id,
-            started_at=None if gone else state.started_at,
-            handoff=text,
-            handoff_at=stamp,
-            stopped_at=now,
-            stop_reason=reason,
-        ))
+            with _PUBLICATION_LOCK:
+                if isinstance(session_id, str):
+                    registry.remove(session_id)
+                _write_state(replace(
+                    state,
+                    session_id=None,
+                    started_at=None,
+                    handoff=text,
+                    handoff_at=stamp,
+                    stopped_at=now,
+                    stop_reason=reason,
+                ))
+        else:
+            _write_state(replace(
+                state,
+                session_id=state.session_id,
+                started_at=state.started_at,
+                handoff=text,
+                handoff_at=stamp,
+                stopped_at=now,
+                stop_reason=reason,
+            ))
         append_event(
             "assistant_stopped",
             note=session_id if isinstance(session_id, str) else None,
@@ -2166,15 +2260,29 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
     payload = _scrubbed_data(data)
     with _LOCK:
         state = read_state()
+        now = utc_now_iso()
         entry = PendingNote(
-            at=utc_now_iso(),
+            at=now,
             kind=label,
             note=text,
             data=payload,
         )
         dropped = max(0, len(state.pending) + 1 - MAX_PENDING)
+        starting = not state.pending
         _write_state(replace(
-            state, pending=(*state.pending, entry)[-MAX_PENDING:]
+            state,
+            pending=(*state.pending, entry)[-MAX_PENDING:],
+            # One predicate for both, because they answer one question: is this a
+            # new accumulation? Two predicates re-dated a spool *inherited* from a
+            # build without the stamp, so on upgrade the next digest made an
+            # overdue accumulation not-due for a full interval.
+            pending_since=(
+                now if starting
+                else (state.pending_since or _oldest_at(state.pending) or now)
+            ),
+            pending_seq=(
+                state.pending_seq + 1 if starting else state.pending_seq
+            ),
         ))
         if dropped:
             logger.warning(
@@ -2187,6 +2295,72 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
         return _live_assistant() is not None
 
 
+def mark_nudged() -> Optional[str]:
+    """Record that the platform has just nudged about the current spool (#317).
+
+    Returns the stamp it wrote, or ``None`` when the write failed — best-effort
+    like :func:`notify` and for a sharper reason: the nudge has already been
+    typed by the time this is called, so raising here would report a failure for
+    something that happened. What a lost mark costs is one early re-nudge, which
+    is the direction to fail in; the opposite (marking a nudge that never went
+    out) would silence the retry the mark exists to space.
+
+    Under :data:`_LOCK` with the spool it describes, so a digest arriving in the
+    same instant cannot interleave with the mark for the accumulation it joins.
+    """
+    with _LOCK:
+        state = read_state()
+        stamped = utc_now_iso()
+        if not _write_state(replace(state, nudged_at=stamped)):
+            return None
+        return stamped
+
+
+def clamp_future_nudged_at() -> AssistantState:
+    """Read the spool state, durably bounding a future nudge stamp to now.
+
+    A corrected host clock can leave a parseable mark ahead of the present. If
+    every detector tick merely folds ``now`` over that stored value, the repeat
+    window restarts on every tick and no reminder ever becomes due. Correct the
+    file once under the spool lock instead, so elapsed time can accumulate and a
+    restarted daemon reads the same bound.
+
+    If the best-effort write fails, return the state with no nudge bound for this
+    decision. One early reminder is safer than letting an uncorrectable future
+    value silence the accumulation indefinitely; the detector's in-memory mark
+    still bounds repeats after that reminder is delivered.
+    """
+    with _LOCK:
+        state = read_state()
+        stamped = state.nudged_at
+        if stamped is None:
+            return state
+        age = age_seconds(stamped)
+        if age is None or age >= 0:
+            return state
+        corrected = replace(state, nudged_at=utc_now_iso())
+        if _write_state(corrected):
+            return corrected
+        return replace(state, nudged_at=None)
+
+
+def _oldest_at(pending: tuple) -> Optional[str]:
+    """The earliest stamp among *pending*, or ``None`` when none is usable.
+
+    Only for adopting an age on upgrade (:func:`notify`), which is why it is the
+    minimum of the strings rather than a parse: these are ISO-8601 Z stamps
+    written by :func:`lmer_platform.store.utc_now_iso`, so lexical order *is*
+    chronological order, and one unparseable entry then costs the comparison
+    nothing. An adopted stamp that turns out to be unreadable degrades to
+    :func:`lmer_platform.nudge._accumulation_age`'s own note fallback rather than
+    to a wrong number.
+    """
+    stamps = [note.at for note in pending if note.at]
+    if not stamps:
+        return None
+    return min(stamps)
+
+
 def take_pending() -> list:
     """Drain the spooled digests, oldest first, and clear them.
 
@@ -2194,13 +2368,23 @@ def take_pending() -> list:
     identity, and the reader is a session that gets replaced on rotation. What
     matters instead is that nothing is lost by *not* reading: the attention list
     the daemon computes is still there, and the events are in ``events.jsonl``.
+
+    It also clears :attr:`AssistantState.nudged_at`, because the accumulation
+    that mark was about is what just left: whatever arrives next is a new one and
+    is owed its own nudge (#317). An empty take clears it too — the spool is
+    empty either way, and a mark left behind by a take that raced the last digest
+    out would suppress the next accumulation's first nudge for a window.
     """
     with _LOCK:
         state = read_state()
         if not state.pending:
+            if state.nudged_at is not None or state.pending_since is not None:
+                _write_state(replace(state, nudged_at=None, pending_since=None))
             return []
         notes = [note.to_dict() for note in state.pending]
-        _write_state(replace(state, pending=()))
+        _write_state(
+            replace(state, pending=(), nudged_at=None, pending_since=None)
+        )
         return notes
 
 

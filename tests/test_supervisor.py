@@ -18,6 +18,13 @@ from unittest import mock
 import pytest
 
 from lmer_cli import supervisor
+from tests.conftest import strip_lmer_env
+
+
+@pytest.fixture(autouse=True)
+def _clean_lmer_env(monkeypatch):
+    """Supervisor defaults belong to the test, not its outer lmer session."""
+    strip_lmer_env(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -1817,6 +1824,26 @@ class TestSubmitPayload:
         assert sink == ["héllo — ✓".encode("utf-8"), b"\r"]
         assert written == len("héllo — ✓".encode("utf-8")) + 1
 
+    def test_codex_text_has_an_explicit_paste_boundary_before_enter(self):
+        sink, write = self._recorder()
+        written, _ = supervisor._submit_payload(
+            write, "hello", probe=None, settle=0, bracketed_paste=True
+        )
+        framed = b"\x1b[200~hello\x1b[201~"
+        assert sink == [framed, b"\r"]
+        assert written == len(framed) + 1
+
+    def test_payload_with_paste_end_sequence_falls_back_to_unframed_text(self):
+        sink, write = self._recorder()
+        payload = "before\x1b[201~after"
+
+        written, _ = supervisor._submit_payload(
+            write, payload, probe=None, settle=0, bracketed_paste=True
+        )
+
+        assert sink == [payload.encode(), b"\r"]
+        assert written == len(payload.encode()) + 1
+
 
 class TestMakeSubmit:
     """The production closure, on a real PTY with a real reader behind it."""
@@ -2076,6 +2103,121 @@ class TestMakeSubmit:
             os.close(slave)
             os.close(master)
 
+    @pytest.mark.parametrize("harness", ["claude", "codex", "pi"])
+    def test_builtin_tui_submit_frames_text_but_still_sends_one_enter(
+        self, monkeypatch, harness
+    ):
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        try:
+            submit = supervisor._make_submit(
+                master, threading.Lock(), None, harness=harness
+            )
+            written, _ = submit("hello")
+            expected = b"\x1b[200~hello\x1b[201~\r"
+            assert self._read_until(slave, expected) == expected
+            assert written == len(expected)
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    @pytest.mark.parametrize("command", ["/followup", "!pwd", "# remember"])
+    def test_claude_first_column_commands_are_keystrokes_not_pastes(
+        self, monkeypatch, command
+    ):
+        """Claude opens autocomplete instead of executing a pasted slash command.
+
+        Lifecycle/control-plane commands deliberately arrive unsanitized, so all
+        three recorded first-column escapes retain keystroke delivery. Human chat
+        gets its ``. `` defusal before this decision and is still frameable.
+        """
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        try:
+            submit = supervisor._make_submit(
+                master, threading.Lock(), None, harness="claude"
+            )
+            submit(command)
+            expected = command.encode() + b"\r"
+            assert self._read_until(slave, expected) == expected
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_user_defined_harness_keeps_plain_text_delivery(self, monkeypatch):
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        master, slave = os.openpty()
+        tty.setraw(slave)
+        try:
+            submit = supervisor._make_submit(
+                master, threading.Lock(), None, harness="acme"
+            )
+            submit("hello")
+            assert self._read_until(slave, b"hello\r") == b"hello\r"
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    @pytest.mark.parametrize("harness", ["claude", "codex", "pi"])
+    def test_multi_kilobyte_fenced_paste_is_one_frame_and_one_enter(
+        self, monkeypatch, harness
+    ):
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        payload = "```python\n" + "print('one submitted turn')\n" * 250 + "```"
+        master, slave, path, seen, stop, reader = self._pty_with_reader()
+        try:
+            submit = supervisor._make_submit(
+                master, threading.Lock(), path, harness=harness
+            )
+            submit(payload)
+            expected = (
+                supervisor._BRACKETED_PASTE_START
+                + payload.encode()
+                + supervisor._BRACKETED_PASTE_END
+                + b"\r"
+            )
+            deadline = time.monotonic() + 2.0
+            while bytes(seen) != expected and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert bytes(seen) == expected
+        finally:
+            stop.set()
+            os.close(slave)
+            os.close(master)
+            reader.join(timeout=1)
+
+
+class TestRewriteHarnessCommand:
+    instruction = (
+        "Run `bash /Agents/global/hooks/followup.sh` now and follow the "
+        "instructions in its output."
+    )
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ("/followup", instruction),
+            ("/followup review round 2", instruction + " review round 2"),
+            ("/followup\tbrief", instruction + "\tbrief"),
+            ("/followup\r", instruction + "\r"),
+            ("/followup\n", instruction + "\n"),
+        ],
+    )
+    def test_codex_followup_becomes_a_plain_text_instruction(self, payload, expected):
+        assert supervisor._rewrite_harness_command(payload, "codex") == expected
+
+    @pytest.mark.parametrize(
+        "payload", [" /followup", "/followups", "please run /followup", "/start"]
+    )
+    def test_non_commands_are_untouched(self, payload):
+        assert supervisor._rewrite_harness_command(payload, "codex") == payload
+
+    @pytest.mark.parametrize("harness", ["claude", "pi", "custom"])
+    def test_other_harnesses_are_untouched(self, harness):
+        assert supervisor._rewrite_harness_command("/followup", harness) == "/followup"
+
 
 class TestSubmitEnterDelayReachesTheContainer:
     """Guard: the knob is useless if it stops at the container boundary.
@@ -2266,11 +2408,132 @@ class TestCli:
 
 
 # ---------------------------------------------------------------------------
+# First-column escapes (the data behind the chat defusal)
+# ---------------------------------------------------------------------------
+
+
+class TestFirstColumnEscapes:
+    """The escape sets are data, so what is tested here is the data's shape.
+
+    ``#272``: the defusal was written against a single literal ``!`` and every
+    other first-column escape of the same input box — ``#`` for memory, ``/``
+    for commands — went through untouched. Which characters a given TUI grabs is
+    a fact about that TUI, so it lives in
+    :data:`~lmer_cli.supervisor.HARNESS_FIRST_COLUMN_ESCAPES` and a newly found
+    one is an edit to that mapping. These tests hold the properties the
+    transform needs from whatever the mapping ends up saying.
+    """
+
+    def test_the_prefix_is_not_itself_an_escape_anywhere(self):
+        """The whole mechanic: the prefix takes the first column, so the prefix's
+        own first character must be a character no input box grabs. Adding one to
+        a set — say a harness that reads a leading ``.`` — turns every defusal
+        into a different command, silently, and this is where that shows up.
+        """
+        first = supervisor.DEFUSAL_PREFIX[:1]
+        for harness, escapes in supervisor.HARNESS_FIRST_COLUMN_ESCAPES.items():
+            assert first not in escapes, (
+                f"{harness} reads {first!r} in the first column, so the defusal "
+                f"prefix would hand it a command"
+            )
+
+    def test_a_prefix_that_is_itself_an_escape_is_refused_loudly(self):
+        """And it shows up at import, not at the next chat message: the check runs
+        over the mapping as written, so a data change that breaks the property
+        cannot reach a session — the module fails to load.
+        """
+        with pytest.raises(RuntimeError, match=r"first-column escape"):
+            supervisor._check_first_column_escapes(
+                {"claude": frozenset({"!", "."})}, ". "
+            )
+
+    def test_a_prefix_that_whitespace_trimming_could_eat_is_refused(self):
+        """The other half of the assumption (#254): a leading space is only a
+        defusal if the input box preserves it. A prefix that starts with
+        whitespace is a no-op against any implementation that trims before
+        testing the first character, and a no-op defusal is invisible.
+        """
+        with pytest.raises(RuntimeError, match=r"whitespace"):
+            supervisor._check_first_column_escapes(
+                supervisor.HARNESS_FIRST_COLUMN_ESCAPES, " "
+            )
+
+    def test_every_escape_is_one_visible_character(self):
+        """An empty string is in every string's prefix set, so an empty entry
+        would defuse *every* message including the empty one; a multi-character
+        entry would never match a single first character and would read as
+        protection that is not there.
+        """
+        with pytest.raises(RuntimeError, match=r"single"):
+            supervisor._check_first_column_escapes({"claude": frozenset({""})}, ". ")
+        with pytest.raises(RuntimeError, match=r"single"):
+            supervisor._check_first_column_escapes(
+                {"claude": frozenset({"/quit"})}, ". "
+            )
+
+    @pytest.mark.parametrize("char", ["!", "#", "/"])
+    def test_a_harness_without_a_recorded_set_is_a_passthrough(self, char):
+        """Absent from the mapping means untouched, whether the harness is a
+        user-defined one from ``~/.lmer/harnesses`` that this mapping has never
+        heard of.
+        """
+        harness = "acme"
+        assert harness not in supervisor.HARNESS_FIRST_COLUMN_ESCAPES
+        message = f"{char}206 was merged"
+        assert supervisor._sanitize_user_chat(message, harness) == message
+
+    def test_codex_defuses_only_its_shell_escape(self):
+        assert supervisor.HARNESS_FIRST_COLUMN_ESCAPES["codex"] == frozenset({"!"})
+        assert "codex" in supervisor.CHAT_DEFUSAL_HARNESSES
+        assert supervisor._sanitize_user_chat("!206 was merged", "codex") == (
+            ". !206 was merged"
+        )
+        assert supervisor._sanitize_user_chat("/followup", "codex") == "/followup"
+        assert supervisor._sanitize_user_chat("@AGENTS.md", "codex") == "@AGENTS.md"
+        assert supervisor._bracketed_paste_for("codex", "!206 was merged") is True
+
+    def test_steering_can_preserve_claude_slash_commands_only(self):
+        sanitize = supervisor._sanitize_user_chat
+
+        assert sanitize(
+            "/followup", "claude", preserve_slash_commands=True
+        ) == "/followup"
+        assert sanitize(
+            "!206 was merged", "claude", preserve_slash_commands=True
+        ) == ". !206 was merged"
+        assert sanitize(
+            "#254 is done", "claude", preserve_slash_commands=True
+        ) == ". #254 is done"
+
+    def test_pi_slash_is_recorded_without_guessing_its_chat_prefix(self):
+        assert supervisor.HARNESS_FIRST_COLUMN_ESCAPES["pi"] == frozenset({"/"})
+        assert "pi" not in supervisor.CHAT_DEFUSAL_HARNESSES
+        assert supervisor._sanitize_user_chat("/followup", "pi") == "/followup"
+
+    @pytest.mark.parametrize("harness", ["claude", "pi"])
+    def test_known_slash_commands_stay_unframed(self, harness):
+        assert supervisor._bracketed_paste_for(harness, "/followup") is False
+        assert supervisor._bracketed_paste_for(harness, "ordinary prose") is True
+
+    def test_a_malformed_harness_name_gets_no_protocol_guess(self, monkeypatch):
+        monkeypatch.setenv("LMER_HARNESS", "not-a-real-harness")
+
+        harness = supervisor._active_harness_name()
+
+        assert harness == ""
+        assert supervisor._bracketed_paste_for(harness, "ordinary prose") is False
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app behavior
 # ---------------------------------------------------------------------------
 
 
 class TestFastApiApp:
+    @staticmethod
+    def _framed(payload: bytes) -> bytes:
+        return b"\x1b[200~" + payload + b"\x1b[201~"
+
     def _build(self, token="test-token", **app_kwargs):
         buf = supervisor.OutputBuffer(limit=1024)
         sink: list[bytes] = []
@@ -2334,7 +2597,8 @@ class TestFastApiApp:
         # The text, then the submit CR as a write of ITS OWN, and nothing after
         # it. CR, not LF: raw mode treats \r as Enter. Two writes rather than one
         # because a CR in the same write as the text is read as part of a paste
-        # and inserted as a newline (#210).
+        # and inserted as a newline (#210). The slash command itself must remain
+        # keystrokes: Claude does not execute it when bracketed as a paste.
         assert sink == [b"/start", b"\r"], (
             f"the submit must be a separate, single CR: {sink}"
         )
@@ -2411,7 +2675,7 @@ class TestFastApiApp:
         )
         assert resp.status_code == 200
 
-        assert sink == [b"no, stop", b"\r"], (
+        assert sink == [self._framed(b"no, stop"), b"\r"], (
             f"something else reached the PTY: {sink}"
         )
         assert sink.count(b"\r") == 1, f"the Enter was sent more than once: {sink}"
@@ -2422,7 +2686,7 @@ class TestFastApiApp:
         )
 
         body = resp.json()
-        assert body["bytes_written"] == len(b"no, stop\r")
+        assert body["bytes_written"] == len(self._framed(b"no, stop")) + 1
         assert body["submit_confirmed"] is False, (
             "the handler must not claim a submit it cannot observe"
         )
@@ -2475,6 +2739,42 @@ class TestFastApiApp:
                 f"{raw!r} was altered on the no-submit path: {sink}"
             )
 
+    def test_codex_followup_is_plain_text_framed_and_receipted_as_sent(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LMER_HARNESS", "codex")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        original = b"/followup review round 2"
+
+        body = self._client(app).post(
+            "/input",
+            json={"data": original.decode(), "append_newline": True},
+            headers={"Authorization": "Bearer test-token"},
+        ).json()
+
+        translated = (
+            b"Run `bash /Agents/global/hooks/followup.sh` now and follow the "
+            b"instructions in its output. review round 2"
+        )
+        framed = b"\x1b[200~" + translated + b"\x1b[201~"
+        assert sink == [framed, b"\r"]
+        assert body["payload_sha256"] == hashlib.sha256(original).hexdigest()
+        assert body["payload_length"] == len(original)
+        assert body["bytes_written"] == len(framed) + 1
+
+    def test_codex_raw_keystroke_path_does_not_translate_or_frame(self, monkeypatch):
+        monkeypatch.setenv("LMER_HARNESS", "codex")
+        app, _buf, sink = self._build()
+
+        self._client(app).post(
+            "/input",
+            json={"data": "/followup", "append_newline": False},
+            headers={"Authorization": "Bearer test-token"},
+        )
+
+        assert sink == [b"/followup"]
+
     def test_a_long_message_is_submitted_the_same_way_as_a_short_one(
         self, monkeypatch
     ):
@@ -2505,7 +2805,9 @@ class TestFastApiApp:
                 headers={"Authorization": "Bearer test-token"},
             )
             assert resp.status_code == 200
-            assert sink == [message.encode(), b"\r"], (
+            assert [bytes(part) for part in sink] == [
+                self._framed(message.encode()), b"\r"
+            ], (
                 f"a {length}-byte message was not delivered as text-then-Enter: "
                 f"{[len(part) for part in sink]}"
             )
@@ -2548,6 +2850,343 @@ class TestFastApiApp:
             ).json()
         assert body["submit_text"] == supervisor.SUBMIT_TEXT_UNKNOWN
         assert body["submit_confirmed"] is False
+
+    def test_a_chat_message_that_would_run_as_a_command_is_defused(self, monkeypatch):
+        """The reported failure (#254): "!206 was merged" ran a shell command.
+
+        Claude Code reads a literal ``!`` in the first column of its input box as
+        its bash escape, and the chat pane types into that same box — so a
+        sentence about a merge request became a command in the operator's
+        session. The message goes through rather than being refused (they meant
+        the words), defused by giving the first column to a ``.`` — with the
+        ``!`` and the rest of the sentence untouched behind it. A dot rather than
+        a space because a space is only a defusal if the input box preserves it,
+        and whitespace is the one thing a first-character test may skip; the
+        space that follows the dot is for the reader of the transcript.
+
+        Both paths, because what decides is the flag and not the route: the
+        composer always asks for Enter, but a caller that sets the flag without
+        it is saying the same thing about the same text.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        resp = client.post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": True,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [self._framed(b". !206 was merged"), b"\r"], (
+            f"the message reached the TUI as a command: {sink}"
+        )
+
+        sink.clear()
+        resp = client.post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": False,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [b". !206 was merged"], (
+            f"the flag was honored only on the submit path: {sink}"
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "#254 is done",
+            "/help me read this backtrace",
+        ],
+    )
+    def test_the_other_first_column_escapes_are_defused_too(
+        self, monkeypatch, message
+    ):
+        """#272: ``!`` was never the only one.
+
+        Claude Code's input box also reads a first-column ``#`` as "write this to
+        memory" and a first-column ``/`` as a slash command, and both are as
+        reachable from operator prose as the bash escape was — "#254 is done" is
+        a sentence about an issue, "/help me read this backtrace" a request. The
+        defusal now asks the harness's escape set rather than testing one
+        literal, so all three take the same ``. `` prefix and the message is read
+        as words.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+
+        resp = self._client(app).post(
+            "/input",
+            json={"data": message, "append_newline": True, "sanitize": True},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert [bytes(part) for part in sink] == [
+            self._framed(f". {message}".encode()), b"\r"
+        ], (
+            f"{message!r} reached the TUI as a command: {sink}"
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "!206 was merged",
+            "#254 is done",
+            "/help me read this backtrace",
+        ],
+    )
+    def test_the_receipt_covers_what_was_sent_and_not_what_was_typed(
+        self, monkeypatch, message
+    ):
+        """The receipt is the sender's proof the wire was clean (#197), and the
+        sender hashes what IT sent — so the transform has to happen after the
+        hash is taken. Hashing the defused text instead would make every
+        sanitized message a "the control plane acknowledged different bytes"
+        alarm in :func:`lmer_platform.session_io.send_input`, which is worded to
+        mean corruption in transit.
+
+        Over every escape the harness has (#272), because they all reach the
+        write through this one path: a receipt that described the typed bytes for
+        ``!`` and the transformed bytes for ``#`` would be two contracts.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+
+        body = self._client(app).post(
+            "/input",
+            json={
+                "data": message,
+                "append_newline": True,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        ).json()
+
+        typed = message.encode()
+        assert sink[0] == self._framed(b". " + typed), \
+            "the transform did not run at all"
+        assert body["payload_sha256"] == hashlib.sha256(typed).hexdigest()
+        assert body["payload_length"] == len(typed)
+        # And the gap that leaves between the receipt and the write is the
+        # transform, two bytes of it, plus this path's submit CR. Pinned because
+        # somebody reconciling a write against a receipt has to be able to read
+        # the difference as deliberate rather than as a partial write.
+        assert body["bytes_written"] == (
+            body["payload_length"] + len(b". ") + 1 + 12
+        ), (
+            f"the write is a different size than the defused message: {body}"
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "!206 was merged",
+            "#254 is done",
+            "/workspace/src is where it lives",
+        ],
+    )
+    def test_pi_chat_is_not_rewritten_on_an_unmeasured_prefix(
+        self, monkeypatch, message
+    ):
+        """The flag says "a human typed this in a chat composer" — true whatever
+        is running — and this is where that fact meets the harness. Pi has no
+        measured safe defusal prefix, so its payload content is not rewritten.
+        Terminal protocol framing is allowed around ordinary content; it is not
+        transcript text and makes no edit to the operator's words.
+
+        Pi's ``/`` is a real escape on this tree's record
+        (:mod:`lmer_cli.container.prompt_templates`), but it is not defused here:
+        the transform needs the *other* half too, that a leading ``. `` is inert
+        in that composer. It is instead sent as keystrokes below.
+        """
+        harness = "pi"
+        monkeypatch.setenv("LMER_HARNESS", harness)
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+
+        resp = self._client(app).post(
+            "/input",
+            json={
+                "data": message,
+                "append_newline": True,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        typed = message.encode()
+        if not (harness == "pi" and message.startswith("/")):
+            typed = self._framed(typed)
+        assert sink == [typed, b"\r"], (
+            f"{harness} got a message nobody typed: {sink}"
+        )
+
+    def test_codex_shell_escape_is_defused_but_slash_remains_live(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("LMER_HARNESS", "codex")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        response = client.post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": True,
+                "sanitize": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200
+        assert sink == [self._framed(b". !206 was merged"), b"\r"]
+
+        sink.clear()
+        response = client.post(
+            "/input",
+            json={"data": "/followup", "append_newline": True, "sanitize": True},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200
+        assert [bytes(part) for part in sink] == [
+            bytes(self._framed(supervisor._CODEX_FOLLOWUP_INSTRUCTION.encode())),
+            b"\r",
+        ]
+        assert not bytes(sink[0]).startswith(b". ")
+
+    def test_ctl_steering_keeps_claude_followup_live(self, monkeypatch):
+        """The ctl path guards prose escapes without consuming its command."""
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        response = client.post(
+            "/input",
+            json={
+                "data": "/followup rebase please",
+                "append_newline": True,
+                "sanitize": True,
+                "preserve_slash_commands": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200
+        assert sink == [b"/followup rebase please", b"\r"]
+
+        sink.clear()
+        response = client.post(
+            "/input",
+            json={
+                "data": "!206 was merged",
+                "append_newline": True,
+                "sanitize": True,
+                "preserve_slash_commands": True,
+            },
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert response.status_code == 200
+        assert sink == [self._framed(b". !206 was merged"), b"\r"]
+
+    def test_a_flagged_message_that_is_no_command_is_typed_as_written(
+        self, monkeypatch
+    ):
+        """Every chat message carries the flag, so the transform has to be the
+        exception. A ``!`` anywhere but the first character is punctuation, and
+        text that came out with ``. `` in front of it would be a quiet edit of the
+        operator's words on the way through — visible in the transcript, and about
+        a trigger that was never there. Same for ``#`` and ``/`` (#272): "MR !206"
+        and "fixed in #254" and "src/lmer_cli" are prose wherever the character
+        sits except column one.
+
+        ``@`` is in none of the sets and belongs in none: claude reads it as a
+        file reference *anywhere* in a message, which makes it not a first-column
+        escape at all — it is not hijacking the message, it is doing what the
+        operator typed it for, and defusing it would break the reference.
+
+        The leading-space case is the raw-payload rule (#254): the test is on the
+        payload as sent, without stripping, so ``" !206"`` does not have ``!`` in
+        the first column and is not touched. Anything that trims before typing
+        would make that wrong, which is why the prefix is a ``.`` rather than a
+        space — surviving a trim is the property the transform rests on.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        for message in (
+            "206 was merged",
+            "merged !206",
+            "yes!",
+            "",
+            "fixed in #254",
+            "look in src/lmer_cli/supervisor.py",
+            "@AGENTS.md says otherwise",
+            " !206 was merged",
+        ):
+            sink.clear()
+            resp = client.post(
+                "/input",
+                json={
+                    "data": message,
+                    "append_newline": True,
+                    "sanitize": True,
+                },
+                headers={"Authorization": "Bearer test-token"},
+            )
+            assert resp.status_code == 200
+            expected = (
+                [self._framed(message.encode()), b"\r"]
+                if message else [b"\r"]
+            )
+            assert sink == expected, (
+                f"{message!r} was altered on the way to the TUI: {sink}"
+            )
+
+    def test_input_nobody_flagged_is_delivered_byte_for_byte(self, monkeypatch):
+        """The bash escape is a *feature* for everyone else on this route.
+
+        The web terminal's keystrokes, ``lmerctl send`` and the lifecycle
+        injections all type on something's behalf rather than carrying words a
+        person wrote, and an operator who opens the terminal view and types
+        ``!ls`` means the escape. Without the flag the payload is untouched, which
+        is also what an older client — one that has never heard of it — sends.
+        """
+        monkeypatch.setenv("LMER_HARNESS", "claude")
+        monkeypatch.setenv("LMER_SUBMIT_ENTER_DELAY", "0")
+        app, _buf, sink = self._build()
+        client = self._client(app)
+
+        resp = client.post(
+            "/input",
+            json={"data": "!ls -la", "append_newline": True},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [b"!ls -la", b"\r"], \
+            f"an unflagged payload was edited: {sink}"
+
+        sink.clear()
+        resp = client.post(
+            "/input",
+            json={"data": "!", "append_newline": False},
+            headers={"Authorization": "Bearer test-token"},
+        )
+        assert resp.status_code == 200
+        assert sink == [b"!"], f"a keystroke was edited: {sink}"
 
     def test_output_returns_buffered_data(self):
         app, buf, _sink = self._build()

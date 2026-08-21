@@ -69,6 +69,7 @@ import {
   mdiArrowDown,
   mdiArrowLeft,
   mdiArrowUp,
+  mdiImageRefreshOutline,
   mdiInformationOutline,
   mdiRefresh,
   mdiRocketLaunchOutline,
@@ -99,6 +100,12 @@ const props = defineProps({
   // reason. Liveness is not a prop either — the log route answers it freshly, and
   // a poll-old boolean is not what should decide whether input is offered.
   sessionId: { type: String, required: true },
+  // The TUI that draws the PTY. Codex and Pi both paint permanent chrome on
+  // their last terminal row; when the PTY is told it owns every row xterm can
+  // render, that chrome sits on the viewport's fractional bottom edge and its
+  // lower half is clipped. The local emulator still uses the whole box — only
+  // the reported PTY height reserves the renderer row below.
+  harness: { type: String, default: null },
 })
 
 // How much scrollback the first attach asks for, and what "earlier output" steps
@@ -138,6 +145,20 @@ const GEOMETRY_RETRY_DELAYS = [1000, 2000, 4000, 8000, 15000]
 // and for an operator who has opted into fitting, every one of those is a round
 // trip that reflows the session — so they are coalesced.
 const RESIZE_DEBOUNCE_MS = 250
+
+// How long the session is left holding the other size before the redraw below
+// rebuilds this client and the fresh socket hands the real one back.
+//
+// It is a delay and not a round-trip wait because there is nothing to wait *for*:
+// a resize that works is answered with silence (only a refusal comes back), so the
+// only observable is the session having had a moment at the other size. It needs
+// one because SIGWINCH coalesces — two window sizes applied before the app handles
+// the first signal are one signal at the second size, which is the size it already
+// had, and an app has no reason to repaint for that. The operator's own workaround
+// (flipping the height presets) gave it whole seconds; a quarter of one is far
+// longer than the frame's trip to the ioctl and short enough that the button still
+// answers to a tap.
+const REDRAW_JOSTLE_MS = 250
 
 // How much taller than the default the operator can make the emulator. x1 is what
 // it has always been; the rest are for a desktop window where 55dvh leaves a TUI
@@ -187,6 +208,12 @@ function storedResizeOptIn() {
 const MIN_COLS = 20
 const MIN_ROWS = 5
 const MAX_DIMENSION = 1000
+
+// Measured TUI behavior, not a generic terminal rule: Claude's footer renders
+// fully at the fitted height, while Codex and Pi need their last drawn row one
+// row above xterm's bottom edge. Unknown/user harnesses keep the historical
+// geometry rather than inheriting a workaround that was never observed there.
+const PTY_FOOTER_GUARD_HARNESSES = new Set(['codex', 'pi'])
 
 // What the key buttons send. Named here because a control byte written into the
 // markup is invisible in a diff and unsearchable in review.
@@ -240,6 +267,9 @@ const focused = ref(false)
 // exception is now remembered, so nothing here reads `true` unless this operator
 // has never turned it off.
 const resizeOptIn = ref(storedResizeOptIn())
+// A redraw in flight, for the jostle window only — see `redraw`, which is where the
+// two taps this exists for are described.
+const redrawing = ref(false)
 // Reactive, because the control has to be able to say it is not available: the
 // answer only arrives after the first attempt, from the session's own supervisor.
 const resizeSupported = ref(true)
@@ -278,6 +308,11 @@ let geometryRetries = 0
 // separately from the retry count because the count stops at the budget while the
 // stale message can outlive it by a long way.
 let geometryDeferred = false
+// The geometry this client last wrote to the PTY, or null for "nothing sent on
+// this socket". A memo of what THIS client said, never of what the session is:
+// it is cleared with the socket, because the PTY's size is not this client's to
+// remember across one.
+let geometrySent = null
 let boxWatcher = null
 let finished = false
 let disposed = false
@@ -556,16 +591,41 @@ function plausibleGeometry(dims) {
     && clampDimension(dims.rows, MIN_ROWS) > 0
 }
 
-function reportGeometry() {
+function reportedRows(rows) {
+  const fitted = clampDimension(rows, MIN_ROWS)
+  if (!fitted) return 0
+  const reserved = PTY_FOOTER_GUARD_HARNESSES.has(props.harness) ? 1 : 0
+  return Math.max(MIN_ROWS, fitted - reserved)
+}
+
+// `extraRows` is how the redraw below asks for a size this client is not actually
+// drawing at, and it is a parameter here rather than a second `send` for the reason
+// the gate above is the whole guarantee: one sender means every frame that reaches a
+// shared PTY passed these four conditions, and that stays checkable by reading one
+// function. Zero is every other caller, and answers exactly as it did before.
+//
+// The return says whether a frame went out — a caller that needs to know whether the
+// session was asked for anything cannot tell from the four ways this declines.
+function reportGeometry(extraRows = 0) {
   // The single gate on writing to a shared PTY. Nothing else in this component
   // sends a resize frame, so opting out here is the whole guarantee that watching
   // a session does not change it for whoever else is watching.
-  if (!resizeOptIn.value) return
-  if (!term || !resizeSupported.value) return
-  if (!socket || socket.readyState !== WebSocket.OPEN) return
-  const rows = clampDimension(term.rows, MIN_ROWS)
+  if (!resizeOptIn.value) return false
+  if (!term || !resizeSupported.value) return false
+  if (!socket || socket.readyState !== WebSocket.OPEN) return false
+  // Keep xterm at ``term.rows``: shrinking the emulator would merely trade a
+  // clipped footer for unused pixels. The PTY lays itself out one row shorter
+  // for the two TUIs whose bottom chrome needs the renderer margin.
+  const fitted = reportedRows(term.rows)
   const cols = clampDimension(term.cols, MIN_COLS)
-  if (!rows || !cols) return
+  if (!fitted || !cols) return false
+  const rows = Math.min(fitted + extraRows, MAX_DIMENSION)
+  // A geometry this client already sent is not worth writing again: the pass a
+  // return to the view schedules re-fits unconditionally, so without this memo
+  // switching back to the tab resized a session for everyone attached — when a
+  // return is a repaint and never a resize (operator decision, 2026-08-03).
+  if (geometrySent
+      && geometrySent.rows === rows && geometrySent.cols === cols) return false
   // Clear a previous "still starting" line as the next attempt goes out. A
   // successful resize is answered with SILENCE by design (the server only speaks
   // up to refuse), so there is no success event to clear it on — which left the
@@ -577,6 +637,8 @@ function reportGeometry() {
     notice.value = null
   }
   socket.send(JSON.stringify({ type: 'resize', rows, cols }))
+  geometrySent = { rows, cols }
+  return true
 }
 
 function applyGeometry() {
@@ -632,7 +694,18 @@ function setResizeOptIn(enabled) {
   )
   // Turning it off cannot put the session back the way it was — nothing here
   // knows what size it had before — so it only stops sending more.
-  if (resizeOptIn.value) applyGeometry()
+  //
+  // Turning it back ON is a command and not a repaint, so the memo does not get
+  // to answer it. While the fit was off the PTY could have been resized by
+  // anyone else attached, and this client's dimensions have not changed since
+  // the last frame it sent: the memo would match, nothing would go out, and the
+  // switch the operator just flipped would do nothing while the terminal renders
+  // against a PTY it is not sized to. A return to the view still goes through
+  // scheduleGeometryPass and never through here, so it stays a repaint (#218).
+  if (resizeOptIn.value) {
+    geometrySent = null
+    applyGeometry()
+  }
 }
 
 // One debounced pass for both of the things that ask for one, so a return that
@@ -666,6 +739,64 @@ function runGeometryPass() {
   // session actually sent, this redraws it faithfully — only the session drawing
   // again fixes that, and asking it to is the operator's Ctrl-L, not ours.
   if (repaint && term) term.refresh(0, term.rows - 1)
+}
+
+// The operator's manual repair (#286): "sometime the terminal gets garbled and an
+// easy way for me to fix it is to flip between terminal sizes forcing a redraw".
+//
+// A garbled terminal is two different faults wearing one symptom, and each has its
+// own repair. Either this client's copy of the screen is wrong — bytes missed across
+// a reconnect, a renderer that went stale — and re-reading the log fixes it; or the
+// SESSION's own screen state is wrong, and then nothing local can help, because what
+// is on screen is what it sent. Only the session drawing again fixes the second, and
+// the only thing here that can ask it to is a resize.
+//
+// So the button does both, and the gate on the half that writes is the fit switch
+// rather than a new preference (operator decision, 2026-08-20): that switch is
+// already the single answer to "may this client write to a PTY it shares", so a
+// redraw asks the session to repaint exactly where the operator had already agreed
+// their size may reach it, and stays local everywhere else. This is not the
+// 2026-08-03 decision being undone — that one is about the geometry pass a *return
+// to the view* schedules, which still repaints and never resizes. This is a tap.
+//
+// The way back is the rebuild rather than a second frame: the fresh socket's `open`
+// clears the memo and reports this client's real geometry (see handleFrame), which
+// is the mechanism a reconnect already relies on. So the session is left at the
+// other size for as long as the jostle delay plus a reconnect, and is put back by
+// the path that puts every reconnect back.
+async function redraw() {
+  // One at a time, and the flag is the guarantee rather than the `loading` prop: a
+  // v-btn's `loading` leaves its click listener live (VBtn's own `isDisabled` is
+  // group-and-disabled only), and `disabled` reaches the DOM a render later, which
+  // two taps 30ms apart can beat. Without this, the second tap found its own frame
+  // swallowed by the geometry memo — same rows, already sent — and rebuilt
+  // immediately, which left the session holding the other size for the gap between
+  // the taps plus a reconnect instead of REDRAW_JOSTLE_MS: the one quantity the
+  // constant exists so as not to depend on. And two taps is the natural gesture on
+  // a button whose terminal is unreadable, which is why the button also says it is
+  // working (issue 286, review of !236).
+  if (redrawing.value) return
+  redrawing.value = true
+  const mine = generation
+  try {
+    // One row taller than this client draws, and only that: a column change reflows
+    // the session's own output, while a row is the smallest thing that is still a
+    // new window size. Taller rather than shorter because the daemon refuses a
+    // geometry below its floor, and a refusal is a line on screen instead of a
+    // repaint.
+    if (reportGeometry(1)) {
+      await new Promise((resolve) => setTimeout(resolve, REDRAW_JOSTLE_MS))
+      // The operator can leave the run, or switch logs, while that quarter second
+      // runs; restarting then would rebuild a view that is already gone. It also
+      // skips the rebuild that hands the real size back, so an unmount inside the
+      // window leaves the session one row taller — the same residue as a socket
+      // that never returns, and the next client to fit corrects it.
+      if (stale(mine)) return
+    }
+    start()
+  } finally {
+    redrawing.value = false
+  }
 }
 
 function onWindowResize() {
@@ -762,6 +893,10 @@ function handleStatus(frame) {
       // that came up seconds later. Retried with backoff, and bounded, because a
       // plane that never answers is a real failure the follower will report.
       geometryDeferred = true
+      // Deferred means the size never reached the harness, so the memo is a
+      // record of a write that did not happen: dropped, or the retry below —
+      // and any later pass proposing that same size — would skip itself.
+      geometrySent = null
       if (geometryRetries >= GEOMETRY_RETRY_DELAYS.length) {
         // Still not a latch: the observer keeps calling reportGeometry on a
         // rotation, a tab switch or a height change, and any of those clears this
@@ -823,6 +958,7 @@ function handleFrame(text) {
     if (term) term.options.disableStdin = !frame.live
     // Re-applies a fit the operator asked for, because this may be a reconnect and
     // the PTY's size is not this client's to remember. A no-op otherwise.
+    geometrySent = null
     reportGeometry()
   }
 }
@@ -837,6 +973,7 @@ function teardownSocket() {
   geometryRetryTimer = null
   geometryRetries = 0
   geometryDeferred = false
+  geometrySent = null
   const closing = socket
   socket = null
   if (!closing) return
@@ -1168,6 +1305,21 @@ watch(() => theme.current.value.dark, () => {
             :aria-label="`terminal height ${scale} times the default`"
           >x{{ scale }}</v-btn>
         </v-btn-toggle>
+
+        <!-- Beside the height presets because flipping between them is the gesture
+             this replaces (#286). Not offered on a failed view: there is nothing
+             drawn to repair there, and the same restart is already on screen under
+             the name that state calls for. What it does, and what it only does
+             while the fit switch is on, is in `redraw`. -->
+        <v-btn
+          v-if="phase !== 'failed'"
+          size="small"
+          variant="tonal"
+          :prepend-icon="mdiImageRefreshOutline"
+          :loading="redrawing"
+          :disabled="redrawing"
+          @click="redraw"
+        >redraw</v-btn>
 
         <div v-if="showInput" class="d-flex align-center ga-1">
           <v-switch

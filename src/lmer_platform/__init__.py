@@ -3,8 +3,9 @@
 The platform is a long-lived host process (``lmer platform``) that holds the
 queue, the concurrency caps, the service-mode slots and the spawn path for every
 lmer instance on a host, and serves the control UI. See the approved design spec
-(work repo, ``runs/develop-issue-141--lmer-orchestrator/spec.md``) for the
-decisions this package implements.
+(the project's internal work repo, not this repository:
+``runs/develop-issue-141--lmer-orchestrator/spec.md``) for the decisions this
+package implements.
 
 Two invariants run through every module here:
 

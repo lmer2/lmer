@@ -188,12 +188,19 @@ fi
 
 # Merge personal MCP configuration if .mcp.local.json exists
 # This allows users to add personal MCPs without modifying the base .mcp.json
-# Place your file at ~/.lmer/.mcp.local.json or /home/developer/.mcp.local.json
-MCP_FILE="/home/developer/.mcp.json"
-MCP_LOCAL="/home/developer/.mcp.local.json"
+# The file must already exist in the container at /home/developer/.mcp.local.json
+# (or the LMER_MCP_LOCAL_FILE path) — no lmer mount delivers a host copy there.
+# LMER_MCP_FILE / LMER_MCP_LOCAL_FILE override the paths for non-standard
+# layouts and tests (mirrors LMER_SETTINGS_FILE below).
+MCP_FILE="${LMER_MCP_FILE:-/home/developer/.mcp.json}"
+MCP_LOCAL="${LMER_MCP_LOCAL_FILE:-/home/developer/.mcp.local.json}"
 if [ -f "$MCP_LOCAL" ] && [ -f "$MCP_FILE" ] && command -v jq >/dev/null 2>&1; then
     echo "🔧 Merging personal MCP servers from .mcp.local.json"
-    MERGED=$(jq -s '.[0] * .[1] | .mcpServers = ((.[0].mcpServers // {}) * (.[1].mcpServers // {}))' "$MCP_FILE" "$MCP_LOCAL" 2>/dev/null)
+    # Both inputs are bound before the merge: after `.[0] * .[1] |` the filter's
+    # input is the merged object, where `.[0]` is "Cannot index object with
+    # number" — a jq exit 5 that the 2>/dev/null hid, so every merge silently
+    # fell back to base-only config (#251).
+    MERGED=$(jq -s '.[0] as $base | .[1] as $local | ($base * $local) | .mcpServers = (($base.mcpServers // {}) * ($local.mcpServers // {}))' "$MCP_FILE" "$MCP_LOCAL" 2>/dev/null)
     if [ $? -eq 0 ] && [ -n "$MERGED" ]; then
         echo "$MERGED" > "$MCP_FILE"
         echo "✅ Merged personal MCP servers into .mcp.json"
@@ -206,17 +213,23 @@ fi
 
 # Merge personal permissions if settings.local.json exists
 # This allows users to add personal permissions without modifying the base settings.json
-# Place your file at ~/.lmer/.claude/settings.local.json
-# LMER_SETTINGS_FILE overrides the path for non-standard layouts and tests
-# (mirrors LMER_AGENT_MEMORY_DIR); defaults to the container's real location.
+# The file must already exist in the container at
+# /home/developer/.claude/settings.local.json (or the LMER_SETTINGS_LOCAL_FILE
+# path) — no lmer mount delivers a host copy there.
+# LMER_SETTINGS_FILE / LMER_SETTINGS_LOCAL_FILE override the paths for
+# non-standard layouts and tests (mirrors LMER_AGENT_MEMORY_DIR); they default
+# to the container's real locations.
 SETTINGS_FILE="${LMER_SETTINGS_FILE:-/home/developer/.claude/settings.json}"
-SETTINGS_LOCAL="/home/developer/.claude/settings.local.json"
+SETTINGS_LOCAL="${LMER_SETTINGS_LOCAL_FILE:-/home/developer/.claude/settings.local.json}"
 if [ -f "$SETTINGS_LOCAL" ] && [ -f "$SETTINGS_FILE" ] && command -v jq >/dev/null 2>&1; then
     echo "🔧 Merging personal permissions from settings.local.json"
+    # Both inputs are bound before the merge — see the .mcp.local.json merge
+    # above for the indexing bug this shape avoids (#251).
     MERGED=$(jq -s '
-      .[0] * .[1] |
-      .permissions.allow = (((.[0].permissions.allow // []) + (.[1].permissions.allow // [])) | unique) |
-      .permissions.deny = (((.[0].permissions.deny // []) + (.[1].permissions.deny // [])) | unique)
+      .[0] as $base | .[1] as $local |
+      ($base * $local) |
+      .permissions.allow = ((($base.permissions.allow // []) + ($local.permissions.allow // [])) | unique) |
+      .permissions.deny = ((($base.permissions.deny // []) + ($local.permissions.deny // [])) | unique)
     ' "$SETTINGS_FILE" "$SETTINGS_LOCAL" 2>/dev/null)
     if [ $? -eq 0 ] && [ -n "$MERGED" ]; then
         # Settings may be a symlink to a read-only mount — replace with regular file
@@ -274,7 +287,38 @@ fi
 #   2. ~/.lmer/AGENTS.md (optional user-specific additions)
 AGENTS_PROMPT_ARGS=""
 AGENTS_COMBINED=""
-rm -f /tmp/agents-prompt.*.md 2>/dev/null
+
+# The prompt file has to outlive this shell — the script ends in `exec`, so
+# claude reads it after we are gone and no EXIT trap can clean it up. The
+# collection therefore happens at startup, and it must match this runner's own
+# files only: several runners share a container's /tmp (agent fan-out), and a
+# bare `agents-prompt.*.md` glob deleted a concurrent session's file out from
+# under it, silently dropping its AGENTS.md injection (#276). $$ is unique
+# among live processes in the container, so the template below scopes every
+# file this runner creates.
+AGENTS_PROMPT_TEMPLATE="/tmp/agents-prompt.$$.XXXXXX.md"
+
+# Collect by liveness: the pid in the name says whose file it is, and only a
+# dead owner's is removed — deleting a live session's file is the #276 bug, and
+# scoping the glob to "$$" (its first fix) collected nothing at all.
+# /proc rather than `kill -0`: EPERM and ESRCH are indistinguishable to a shell,
+# so a live process owned by another user would read as dead.
+for prompt_file in /tmp/agents-prompt.*.md; do
+    [ -f "$prompt_file" ] || continue
+    owner=${prompt_file#/tmp/agents-prompt.}
+    owner=${owner%%.*}
+    case "$owner" in
+        ''|*[!0-9]*) continue ;;  # not our naming scheme; not ours to delete
+    esac
+    if [ "$owner" != "$$" ]; then
+        if [ -d /proc/self ]; then
+            [ -d "/proc/$owner" ] && continue
+        else
+            kill -0 "$owner" 2>/dev/null && continue
+        fi
+    fi
+    rm -f "$prompt_file" 2>/dev/null
+done
 
 # Find workspace AGENTS.md
 WORKSPACE_AGENTS=""
@@ -291,7 +335,7 @@ fi
 
 if [ -n "$WORKSPACE_AGENTS" ] && [ -n "$USER_AGENTS" ]; then
     # Concatenate both into a temp file
-    AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+    AGENTS_COMBINED=$(mktemp "$AGENTS_PROMPT_TEMPLATE")
     cat "$WORKSPACE_AGENTS" "$USER_AGENTS" > "$AGENTS_COMBINED"
     AGENTS_PROMPT_ARGS="--append-system-prompt-file $AGENTS_COMBINED"
     echo "✅ AGENTS.md system prompt: workspace + user (~/.lmer/AGENTS.md)"
@@ -338,7 +382,7 @@ if [ -n "$(printf '%s' "$LMER_HUMAN_IDENTITY" | tr -d '[:space:]')" ]; then
 
     if [ -n "$IDENTITY_TEMPLATE" ] && [ -n "$RENDERER" ]; then
         if [ -z "$AGENTS_COMBINED" ]; then
-            AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+            AGENTS_COMBINED=$(mktemp "$AGENTS_PROMPT_TEMPLATE")
             if [ -n "$WORKSPACE_AGENTS" ]; then
                 cat "$WORKSPACE_AGENTS" > "$AGENTS_COMBINED"
             elif [ -n "$USER_AGENTS" ]; then
@@ -403,7 +447,7 @@ append_prompt_fragment() {
     fi
 
     if [ -z "$AGENTS_COMBINED" ]; then
-        AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+        AGENTS_COMBINED=$(mktemp "$AGENTS_PROMPT_TEMPLATE")
         if [ -n "$WORKSPACE_AGENTS" ]; then
             cat "$WORKSPACE_AGENTS" > "$AGENTS_COMBINED"
         elif [ -n "$USER_AGENTS" ]; then
@@ -447,7 +491,7 @@ case "${LMER_NONINTERACTIVE,,}" in
 
         if [ -n "$NONINTERACTIVE_FRAGMENT" ]; then
             if [ -z "$AGENTS_COMBINED" ]; then
-                AGENTS_COMBINED=$(mktemp /tmp/agents-prompt.XXXXXX.md)
+                AGENTS_COMBINED=$(mktemp "$AGENTS_PROMPT_TEMPLATE")
                 if [ -n "$WORKSPACE_AGENTS" ]; then
                     cat "$WORKSPACE_AGENTS" > "$AGENTS_COMBINED"
                 elif [ -n "$USER_AGENTS" ]; then

@@ -608,6 +608,41 @@ def test_a_run_with_no_identity_keeps_its_session_and_says_the_title_went_with_i
     assert "POST /api/runs/meta" in result.warning
 
 
+def test_a_plain_repo_url_target_tracks_the_run_and_keeps_its_title(config):
+    """A repository URL target is enough identity for atomic spawn naming."""
+    target = "https://gitlab.example.com/agents/global"
+    result = spawn.spawn_session(
+        config,
+        request_for(repo_url=None, target=target, title="cache handoff follow-up"),
+    )
+
+    tracked = runs.get_tracked(result.host, result.project, result.slug)
+    assert tracked is not None
+    assert tracked.repo == target
+    assert meta.read(
+        result.host, result.project, result.slug
+    ).title == "cache handoff follow-up"
+    assert result.warning is None
+
+
+def test_a_web_page_target_remains_untracked_and_drops_its_title_loudly(config):
+    """A URL-shaped page is not repository evidence for metadata attachment."""
+    result = spawn.spawn_session(
+        config,
+        request_for(
+            repo_url=None,
+            target="https://gitlab.example.com/agents/global/-/pipelines/1691",
+            title="must not attach to a fabricated project",
+        ),
+    )
+
+    assert (result.host, result.project) == (None, None)
+    assert runs.list_tracked() == []
+    assert meta.load_all() == {}
+    assert "not tracked" in result.warning
+    assert "were not stored" in result.warning
+
+
 def test_a_spawn_that_named_nothing_gets_no_warning_about_it(config):
     """The ordinary spawn, and the reason the sentence above is conditional: a
     warning that fires when nothing was asked for is one operators learn to skip."""
@@ -882,6 +917,15 @@ def test_the_ports_and_the_model_arrive_in_one_file_and_both_land(platform_root)
 
     assert entry["ports"] == [{"host": 30021, "container": 30021}]
     assert entry["task"]["model"] == "opus"
+
+
+def test_a_session_reports_the_harness_resolved_without_a_spawn_flag(platform_root):
+    registry.register("s-1", pid=os.getpid(), task={"taskdef": "develop"})
+    _write_reported_facts("s-1", harness="codex")
+
+    entry = spawn.absorb_ports(registry.list_sessions())[0]
+
+    assert entry["task"]["harness"] == "codex"
 
 
 @pytest.mark.parametrize("reported", [{}, {"model": None}, {"model": "  "},

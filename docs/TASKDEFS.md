@@ -179,6 +179,12 @@ branch instead of creating one (e.g. `followup`) overrides just the
 branch-discipline rule via `do_not_branch_rule`; extend a block while
 keeping its base content with `{% raw %}{{ super() }}{% endraw %}`.
 
+The inherited `do_not` block also forbids worklogs, progress notes, and task
+journals in the target repository. Task progress belongs in the work
+repository's run directory through `work log` and `work artifact`; task-specific
+templates should reinforce that destination rather than introduce a repository
+journal of their own.
+
 ## Schema versioning
 
 A taskdef *source root* (any directory on the precedence list) declares its
@@ -247,7 +253,33 @@ every extending body while everything still renders green. Two guards:
 fires, the template is rendered with:
 
 - every `LMER_*` environment variable (e.g. `{{ LMER_REPO_URL }}`,
-  `{{ LMER_TASK }}`, `{{ LMER_TASK_TARGET }}`)
+  `{{ LMER_TASK }}`, `{{ LMER_TASK_TARGET }}`) — minus sensitive entries:
+  a name matching `TOKEN | KEY | SECRET | PASSWORD | CREDENTIALS`
+  (case-insensitive) is dropped from the context entirely, and a value that
+  is a URL with embedded credentials is redacted in place to its tokenless
+  form, so `{{ LMER_REPO_URL }}` renders `https://host/path` even when the
+  session's variable carries `oauth2:<token>@` and `{% if LMER_REPO_URL %}`
+  guards keep firing. The redact-in-place half deliberately differs from the
+  prompt-fragment renderer, which *drops* credentialed URLs outright (see
+  [PROMPT-FRAGMENTS.md](./PROMPT-FRAGMENTS.md)): taskdefs legitimately print
+  the repo URL, fragments never need it. The taskdef renderer takes both
+  rules from `work_repo.utils` (`is_secret_env_name`,
+  `strip_url_credentials`); the fragment renderer carries its own copy of
+  the same name pattern because it must stay dependency-free (it runs from
+  whatever install location the runner scripts find it at). The taskdef
+  value filter is layered: the URL strip is userinfo-scoped (only the
+  `user:password@` segment is removed; query strings and fragments
+  survive), then `work_repo.utils.redact_secrets` runs as a shape-only
+  backstop over each value, stamping `***REDACTED***` over known token
+  prefixes and URL userinfo embedded inside larger values — the shapes a
+  structured value like an `LMER_SPAWN_AGENTS_CONFIG` overlay can carry.
+  The backstop deliberately skips `redact_secrets`' env-value sweep
+  (`secret_values=[]`): a secret-named variable can hold non-secret text —
+  `LMER_GITLAB_TOKEN_HOST` is a hostname — which the sweep would stamp out
+  of every URL containing it. The cost is the boundary: a secret whose
+  shape is not a known token prefix (and is not URL userinfo) is not
+  detected. The fragment renderer has no backstop; its filter is the
+  userinfo-scoped drop rule alone.
 - `{{ work_mode }}` — `finish` (default) or `phasic`
 - `{{ instructions_file }}` — the absolute path of the file being rendered
 - `{{ taskdef_name }}` — the directory name of the active taskdef

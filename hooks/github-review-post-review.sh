@@ -24,3 +24,11 @@ if [ -n "$GITHUB_HOST" ]; then
 fi
 
 github-review "$GITHUB_PROJECT" "$GITHUB_PR_ID" "${HOST_ARG[@]}" --review-file "$GITHUB_REVIEW_FILE"
+REVIEW_STATUS=$?
+if [ "$REVIEW_STATUS" -ne 0 ]; then
+  exit "$REVIEW_STATUS"
+fi
+
+lmer-signal "Posted GitHub review for ${GITHUB_PROJECT}#${GITHUB_PR_ID}" || \
+  echo "Warning: review posted but milestone was not signalled" >&2
+exit "$REVIEW_STATUS"

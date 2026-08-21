@@ -6,13 +6,16 @@ as well as helper functions for formatting output and watching pipeline status.
 """
 
 import json
-import os
 import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
+
+# The token lookup rule, not a second copy of it — see get_token. Stdlib-only
+# module, so importing it costs nothing and cannot cycle back here.
+from lmer_cli.tokens import _get_gitlab_token
 
 # Pre-compiled regex for stripping ANSI escape codes
 ANSI_PATTERN = re.compile(r"\x1b\[[0-9;]*[mK]|\[0K")
@@ -51,7 +54,11 @@ class TokenNotFoundError(GitLabPipelineError):
 
     def __init__(self, env_var: str):
         self.env_var = env_var
-        super().__init__(f"No token found. Set {env_var} or GITLAB_TOKEN")
+        super().__init__(
+            f"No token found. Set {env_var} — it always applies to this host; "
+            "a generic GITLAB_TOKEN is used only for its issuing host "
+            "(LMER_GITLAB_TOKEN_HOST, default the LMER_WORK_REPO host)"
+        )
 
 
 class ProjectNotFoundError(GitLabPipelineError):
@@ -168,9 +175,13 @@ class GitLabPipelineClient:
 def get_token(host: str) -> str:
     """Get API token for host.
 
-    Derives the environment variable name from the sanitized hostname.
-    For example, 'git.example.com' checks GITLAB_TOKEN_git_example_com,
-    then falls back to GITLAB_TOKEN.
+    Delegates to the shared lookup (:func:`lmer_cli.tokens._get_gitlab_token`)
+    rather than reading the environment here: the per-host
+    ``GITLAB_TOKEN_{sanitized_host}`` entry is checked first, and the generic
+    ``GITLAB_TOKEN`` applies only to the host that issued it
+    (``LMER_GITLAB_TOKEN_HOST``, defaulting to the ``LMER_WORK_REPO`` host).
+    A second copy of that scoping rule here is how one caller keeps sending a
+    PAT to a third-party host after the other stopped (issue #161).
 
     Args:
         host: GitLab host (e.g., 'gitlab.example.com')
@@ -179,15 +190,13 @@ def get_token(host: str) -> str:
         API token string
 
     Raises:
-        TokenNotFoundError: If no token is found in environment
+        TokenNotFoundError: If no token is found in environment. A generic
+            token refused for being issued elsewhere reads as "not found"
+            here, and the shared lookup prints why, once per process.
     """
-    suffix = _sanitize_hostname(host)
-    token = (
-        os.environ.get(f"GITLAB_TOKEN_{suffix}")
-        or os.environ.get("GITLAB_TOKEN")
-    )
+    token = _get_gitlab_token(host)
     if not token:
-        raise TokenNotFoundError(f"GITLAB_TOKEN_{suffix}")
+        raise TokenNotFoundError(f"GITLAB_TOKEN_{_sanitize_hostname(host)}")
     return token
 
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 import pytest
 
-from lmer_cli import gate_lock, user_harnesses
+from lmer_cli import gate_lock, precommit_cache, user_harnesses
 
 _OUTDATED_TREE_MSG = (
     "tests/conftest.py needs the #233 write-attribution layer "
@@ -54,8 +54,15 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 #: session fixture below points it at a tmp dir so the suite cannot see the
 #: marker held by the very `gate-check` running it. Stripping it would send any
 #: env-isolating module back to the operational lock dir, where a live gate
-#: would defer the commit paths those tests are asserting on.
-_HARNESS_ENV = frozenset({REQUIRE_NODE_ENV, gate_lock.LOCK_DIR_ENV})
+#: would defer the commit paths those tests are asserting on. The pre-commit
+#: cache directory has the same floor-beneath-tests role: GateSystem tests run
+#: mocked pre-commit commands and must never publish those verdicts into the
+#: operational cache merely because this project is opted in.
+_HARNESS_ENV = frozenset({
+    REQUIRE_NODE_ENV,
+    gate_lock.LOCK_DIR_ENV,
+    precommit_cache.CACHE_DIR_ENV,
+})
 
 
 def strip_lmer_env(monkeypatch):
@@ -621,6 +628,24 @@ def _isolate_gate_lock_dir(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _isolate_precommit_cache(tmp_path_factory):
+    """Keep mocked gate verdicts out of the operational pre-commit cache."""
+    directory = str(tmp_path_factory.mktemp("precommit-cache"))
+    original_default = precommit_cache.DEFAULT_CACHE_DIR
+    original_env = os.environ.get(precommit_cache.CACHE_DIR_ENV)
+    precommit_cache.DEFAULT_CACHE_DIR = directory
+    os.environ[precommit_cache.CACHE_DIR_ENV] = directory
+    try:
+        yield
+    finally:
+        precommit_cache.DEFAULT_CACHE_DIR = original_default
+        if original_env is None:
+            os.environ.pop(precommit_cache.CACHE_DIR_ENV, None)
+        else:
+            os.environ[precommit_cache.CACHE_DIR_ENV] = original_env
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _work_repo_leak_guard(_isolate_gate_lock_dir):
     """Fail the suite if tests leak run-state into the real work repo.
 
@@ -968,6 +993,20 @@ SLOT_PRESETS = {
     "webapp_alt": {"checkout": "/srv/webapp", "service": "webapp-web"},
     # Sets no service, so it cannot back a slot.
     "no_service": {"checkout": "/srv/plain"},
+    # Service groups (issue #312): a whole compose project, optionally with the
+    # member the session starts on.
+    "stack_dev": {"checkout": "/srv/stack", "service_group": "stack"},
+    "stack_alt": {"checkout": "/srv/stack", "service_group": "stack"},
+    "stack_start": {
+        "checkout": "/srv/stack", "service": "web",
+        "service_group": "stack",
+    },
+}
+
+#: What :data:`SLOT_PRESETS`' group resolves to. ``webapp-web`` is deliberately
+#: a member: a group session must block the single-service slot that names it.
+SLOT_GROUP_MEMBERS = {
+    "stack": ("web", "db", "webapp-web"),
 }
 
 
@@ -998,7 +1037,23 @@ def slot_host(tmp_path, monkeypatch):
         calls.append((runtime, service_name, announce))
         return "container-id"
 
+    def _resolve_group(runtime, project, *, announce=True):
+        """The group half of the same fake, with the real signature (#312)."""
+        from lmer_cli.service import ServiceError, ServiceMember
+
+        calls.append((runtime, project, announce))
+        members = SLOT_GROUP_MEMBERS.get(project)
+        if not members:
+            raise ServiceError(
+                f"No running containers in compose project {project!r}"
+            )
+        return [
+            ServiceMember(name, f"container-{name}", f"{project}-{name}-1", "/")
+            for name in members
+        ]
+
     monkeypatch.setattr(slots_mod, "resolve_container", _resolve)
+    monkeypatch.setattr(slots_mod, "resolve_group", _resolve_group)
     monkeypatch.setattr(slots_mod, "_detected_runtime", lambda: "a-runtime")
     # Module-level memos (probe answers, collision-warning dedup): no test may
     # inherit another's.

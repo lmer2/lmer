@@ -49,6 +49,10 @@ def main() -> int:
                 duration_s=time.monotonic() - started,
                 summary=gate.receipt_summary(),
                 argv=receipt_argv(),
+                # What the tests check actually covered, as data (#269): a
+                # narrowed or cache-served run is a pass with exit code 0
+                # exactly like a full one.
+                **gate.receipt_test_fields(),
             )
         except Exception:
             pass

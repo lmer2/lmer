@@ -67,6 +67,14 @@ RELEASE_CLAIM_ATTEMPTS = 3
 ANSWER_MARKER_DIR: str | None = None
 
 
+#: Overridable directory for the run-less `work goal` fallback file (mirrors
+#: ``ANSWER_MARKER_DIR`` above). ``None`` means /tmp — container-lifetime
+#: scoped, exactly like the goal itself. Tests point it at a temp dir so a
+#: suite run never writes into the operator's real goal file (issue #277).
+#: Consumed by :func:`_goal_file` (next to ``cmd_goal``).
+GOAL_FILE_DIR: str | None = None
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -714,6 +722,9 @@ def cmd_commit(message: str | None) -> int:
     Returns:
         Exit code (the work-repo commit result; napkin capture is best-effort)
     """
+    # Agent-typed free text landing in git history (work repo and napkin) —
+    # redact once here so every commit below carries the same clean subject.
+    message = redact_secrets(message)
     # Self-maintain masterplan artifact links before staging (spec §6) so
     # every push carries the run-dir-root links. Fail-soft: never changes
     # the commit's behavior or exit code.
@@ -797,6 +808,25 @@ def cmd_report(file_path: str) -> int:
         return 1
 
 
+def _goal_file() -> Path:
+    """Path of the session-scoped fallback goal file (issue #277).
+
+    /tmp is shared by every process on the host, so a single unscoped path
+    let any other session — a test suite included — overwrite the operator's
+    goal. Same ``LMER_SESSION_ID`` across CLI invocations still means the
+    same file (that persistence is what `work goal` promises); distinct ids
+    never share one. The id comes from the environment, so it is sanitized
+    for path use, and because sanitization is many-to-one a digest of the RAW
+    id keeps two ids that sanitize alike on separate files. The ``"unknown"``
+    default is a session id like any other here.
+    """
+    session_id = run_state.current_session_id()
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", session_id).strip("-.")[:48]
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:8]
+    stem = f"{safe}-{digest}" if safe else digest
+    return Path(GOAL_FILE_DIR or "/tmp") / f"lmer_work_goal.{stem}.txt"
+
+
 def cmd_goal(
     description: str | None,
     estimate_sessions: int | None = None,
@@ -805,8 +835,9 @@ def cmd_goal(
     """
     Execute goal command.
 
-    Sets or displays temporary context/goal. The goal is stored in a temporary file
-    and is not persisted permanently (cleaned up on system restart).
+    Sets or displays temporary context/goal. The goal is stored in a temporary,
+    session-scoped file and is not persisted permanently (cleaned up on system
+    restart).
 
     Args:
         description: Optional goal description. If provided, sets the goal.
@@ -819,6 +850,10 @@ def cmd_goal(
         Exit code
     """
     try:
+        # Agent-typed free text bound for the (shared) work repo — redact once
+        # here so state.goal, the goal_set event and the echo all agree. The
+        # estimate fields are structured, never free text, and stay as typed.
+        description = redact_secrets(description)
         # Estimate flags (issue #99) only make sense while recording a goal,
         # and land only in the run state below — validate them up front.
         has_estimate = estimate_sessions is not None or estimate_time is not None
@@ -832,9 +867,9 @@ def cmd_goal(
             print("❌ --estimate-time requires a non-empty string", file=sys.stderr)
             return 1
 
-        # Use a temporary file in /tmp for storing the goal
-        # This persists across CLI invocations but is temporary (not permanent)
-        goal_file = Path("/tmp") / "lmer_work_goal.txt"
+        # Session-scoped temporary file: persists across CLI invocations but
+        # is temporary (not permanent), and belongs to this session alone.
+        goal_file = _goal_file()
 
         if description:
             # Set the goal
@@ -1111,6 +1146,28 @@ def _completion_actuals(rdir: Path) -> dict:
     }
 
 
+def _redact_json_values(obj):
+    """Redact every string in an agent-supplied JSON structure.
+
+    The free text in `--data`/`--critical-error` payloads is as agent-typed as
+    any note, but it arrives nested, so a single :func:`redact_secrets` call
+    cannot reach it. Keys are typed by the same agent that types the values —
+    nothing stops `--data '{"glpat-…": 1}'` — so string keys are redacted too;
+    non-string scalars carry nothing to redact and are left alone (json.loads
+    only ever produces string keys, but in-process callers pass dicts too).
+    """
+    if isinstance(obj, dict):
+        return {
+            (redact_secrets(k) if isinstance(k, str) else k): _redact_json_values(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact_json_values(v) for v in obj]
+    if isinstance(obj, str):
+        return redact_secrets(obj)
+    return obj
+
+
 def cmd_state(args) -> int:
     """Execute state / state set commands."""
     if args.action != "set":
@@ -1159,12 +1216,16 @@ def cmd_state(args) -> int:
         print("❌ --question requires --stop-reason=question (pass both, or set it first)", file=sys.stderr)
         return 1
 
+    # `--phase` is free-form, so it is agent-typed text like `--question`
+    # below — redact once here and use the clean value everywhere after.
+    phase = redact_secrets(args.phase)
+
     changed = {}
     phase_changed = False
     old_phase = state.get("phase")  # the step the transition ends (issue #100)
-    if args.phase and args.phase != state.get("phase"):
-        state["phase"] = args.phase
-        changed["phase"] = args.phase
+    if phase and phase != state.get("phase"):
+        state["phase"] = phase
+        changed["phase"] = phase
         phase_changed = True
     if args.stop_reason:
         state["stop_reason"] = None if args.stop_reason == "none" else args.stop_reason
@@ -1180,7 +1241,8 @@ def cmd_state(args) -> int:
         state["open_question"] = redact_secrets(args.question)
         changed["open_question"] = state["open_question"]
     if critical_error is not None:
-        state["critical_error"] = critical_error
+        # Same free text as `--question`, only nested inside a JSON object.
+        state["critical_error"] = _redact_json_values(critical_error)
         changed["critical_error"] = True
     if args.status:
         state["status"] = args.status
@@ -1198,7 +1260,7 @@ def cmd_state(args) -> int:
     old_dir_name = None
     if (
         phase_changed
-        and not run_state.is_planning_phase(args.phase)
+        and not run_state.is_planning_phase(phase)
         and not state.get("frozen")
     ):
         try:
@@ -1208,7 +1270,7 @@ def cmd_state(args) -> int:
 
     run_state.write_state(rdir, state)
     if phase_changed:
-        run_state.append_event(rdir, "phase", note=args.phase)
+        run_state.append_event(rdir, "phase", note=phase)
     if set(changed) - {"phase"}:
         event_data = dict(changed)
         if args.status == "complete":
@@ -1220,13 +1282,13 @@ def cmd_state(args) -> int:
 
     # Durability (spec §4.4): push on phase transitions and completion.
     if phase_changed or args.status == "complete":
-        detail = f"phase={args.phase}" if phase_changed else f"status={args.status}"
+        detail = f"phase={phase}" if phase_changed else f"status={args.status}"
         _push_run_dir(state, detail, old_dir_name)
     # Pushed-deliverable advisory (issue #100): checked AFTER the durability
     # push, so it fires only when that push left the previous step's
     # artifacts unpushed. A first phase set (no old phase) ends no step.
     if phase_changed and old_phase:
-        _advise_unpushed_phase_end(rdir, old_phase, args.phase)
+        _advise_unpushed_phase_end(rdir, old_phase, phase)
     return 0
 
 
@@ -1408,7 +1470,13 @@ def cmd_event(args) -> int:
     rdir, _state = _require_run()
     if rdir is None:
         return 1
-    run_state.append_event(rdir, args.type, note=args.note, data=data)
+    # Note and payload are both agent-typed free text bound for the (shared)
+    # work repo — redact at this boundary, as the other event writers do.
+    run_state.append_event(
+        rdir, args.type,
+        note=redact_secrets(args.note),
+        data=_redact_json_values(data),
+    )
     print(f"✅ Event appended: {args.type}")
     return 0
 
@@ -1428,7 +1496,15 @@ def _validate_name(value: str) -> str | None:
     Shared by `work name` and `work seed --name` so the naming rules can't
     drift between them. Prints the normalization note / errors itself;
     returns the kebab-case name, or None when nothing valid survives.
+
+    Agent-typed free text bound for the (shared) work repo — redacted here,
+    before normalization, because a name reaches state.name, the run_named
+    event and the run *directory* name, and an all-lowercase secret survives
+    kebab-casing intact. The marker normalizes down to a harmless `redacted`
+    component, so a redacted name still passes the rules below (a name that
+    was nothing but a secret becomes `redacted`, not an error).
     """
+    value = redact_secrets(value)
     name = _normalize_name(value)
     if not name:
         print(f"❌ Nothing left of {value!r} after kebab-case normalization", file=sys.stderr)
@@ -2283,14 +2359,17 @@ def cmd_seed(args) -> int:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
 
-    if args.goal:
-        state["goal"] = args.goal
+    # Agent-typed free text bound for the (shared) work repo — redacted once
+    # here so state.goal and the goal_set event agree, as `work goal` does.
+    goal = redact_secrets(args.goal)
+    if goal:
+        state["goal"] = goal
     if name:
         state["name"] = name
-    if args.goal or name:
+    if goal or name:
         run_state.write_state(rdir, state)
-        if args.goal:
-            run_state.append_event(rdir, "goal_set", note=args.goal)
+        if goal:
+            run_state.append_event(rdir, "goal_set", note=goal)
         if name:
             run_state.append_event(rdir, "run_named", note=name)
 

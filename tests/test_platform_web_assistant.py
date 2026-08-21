@@ -865,16 +865,31 @@ def test_the_fleet_view_pays_nothing_for_the_drawer_until_it_is_opened():
     and neither is any use to an operator looking at the fleet. So it is mounted on
     first open and left mounted afterwards, which is also what keeps a half-typed
     message alive across a close.
+
+    One screen is exempt, and the operator asked for it (#286, from living with the
+    band): the band exists to hold the app *beside* this conversation — its width is
+    the smallest one at which the run view still fits with this drawer open — so a
+    screen the band was left on is a screen the pane belongs on. Not a phone, where
+    the band is inert and a full-screen chat would be the whole landing screen.
+
+    And whatever opens it on the first frame has to mount it on the first frame too:
+    the watcher fires on a *change*, so a drawer seeded open from anything but its own
+    initial value comes up visible and empty, which is the report this answers.
     """
     app = _read(APP)
-    assert "const uberOpen = ref(false)" in app, (
-        "the supervisor's drawer starts open, so the fleet opens behind a chat"
+    assert "const uberOpen = ref(narrow.value && !mobile.value)" in app, (
+        "the supervisor's drawer starts open on a screen with no band, so the fleet "
+        "opens behind a chat — or a phone does"
     )
     assert re.search(r"<AssistantChat v-if=\"uberSeen\"", app), (
         "the chat is mounted before anyone asked for it, so the landing screen "
         "polls the supervisor"
     )
-    assert "const uberSeen = ref(false)" in app
+    assert "const uberSeen = ref(uberOpen.value)" in app, (
+        "the chat is mounted from something other than the drawer's own first frame: "
+        "either the fleet pays for it unasked, or a drawer that starts open comes up "
+        "empty"
+    )
     assert "uberSeen.value = true" in app, "the drawer can never be mounted at all"
 
 
@@ -883,17 +898,24 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
     drawer opens a phone onto a full-screen chat instead of the fleet, and makes
     every glance fetch the supervisor's status and transcript.
 
-    Which is why ``ALLOWED_STORAGE_KEYS`` in :mod:`tests.test_platform_web_app` did
-    not have to grow for this feature. The width is the theme's, not a preference.
+    The one key the shell has grown since is not this rule bending: ``.narrow`` is
+    whether the whole app is held in a band in the middle of a wide screen (#286), a
+    property of the screen being read from like the colour scheme beside it. It does
+    decide the drawer's *first frame* now — a screen the band was left on is one the
+    pane belongs on — but nothing writes the drawer's own open state anywhere, so
+    closing it is still forgotten by the next load and a screen with no band still
+    lands on the fleet, which is what a glance would otherwise pay for.
+
+    The width is still the theme's, not a preference.
     """
     assert "localStorage" not in _read(DRAWER), (
         "the drawer stores something; if it is a preference it belongs in "
         "preferences.js and in ALLOWED_STORAGE_KEYS with a reason"
     )
     keys = re.findall(r"localStorage\.\w+\(\s*([A-Za-z0-9_.]+)", _read(APP))
-    assert set(keys) == {"THEME_STORAGE_KEY"}, (
+    assert set(keys) == {"THEME_STORAGE_KEY", "NARROW_STORAGE_KEY"}, (
         f"the shell now stores {sorted(set(keys))}; the drawer's open state is "
-        "deliberately not remembered"
+        "deliberately not remembered, and a third key here is a decision"
     )
 
 

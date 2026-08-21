@@ -17,6 +17,12 @@ from urllib.parse import quote, urlsplit
 # same way.
 from lmer_cli.tokens import _is_github_host
 
+# The credential scrub, imported for the same reason and from the same origin
+# every other sink uses (lmer_platform.workrepo, clone_cache, gates): this
+# module prints combined git output verbatim on the failure and retry paths,
+# and the work-repo origin is a tokenized clone URL. One regex, one place.
+from lmer_cli.container.clone_and_exec import _scrub_credentials
+
 # The gate-in-flight marker (issue #201). Same reasoning as the token import
 # above: the decision "is a long gate running right now?" has exactly one
 # definition, and a second copy here would drift from the gates that write it.
@@ -566,7 +572,7 @@ def commit_work_path(
     print(f"➕ Staging {', '.join(paths)} in work repository...")
     rc, output = run_git_command(["add", "-A", "--", *paths], work_repo_path, check=False)
     if rc != 0:
-        print(f"❌ git add failed (work repo): {output}", file=sys.stderr)
+        print(f"❌ git add failed (work repo): {_scrub_credentials(output)}", file=sys.stderr)
         return rc
 
     rc, status_output = run_git_command(
@@ -582,7 +588,7 @@ def commit_work_path(
     print(f"💾 Committing changes to work repository...")
     rc, output = run_git_command(["commit", "-m", commit_message], work_repo_path, check=False)
     if rc != 0:
-        print(f"❌ git commit failed (work repo): {output}", file=sys.stderr)
+        print(f"❌ git commit failed (work repo): {_scrub_credentials(output)}", file=sys.stderr)
         return rc
 
     # 3. Integrate the remote and push, rebasing between attempts — many
@@ -608,22 +614,33 @@ def _push_with_rebase_retries(repo_path: Path, label: str) -> int:
     run_git_command(["fetch"], repo_path, check=False)
     rc, output = run_git_command(["pull", "--rebase"], repo_path, check=False)
     if rc != 0:
-        print(f"⚠️  git pull --rebase warning ({label}): {output}", file=sys.stderr)
+        print(
+            f"⚠️  git pull --rebase warning ({label}): {_scrub_credentials(output)}",
+            file=sys.stderr,
+        )
 
     for attempt in range(1, PUSH_RETRIES + 1):
         rc, output = run_git_command(["push"], repo_path, check=False)
         if rc == 0:
             return 0
         print(
-            f"⚠️  git push rejected (attempt {attempt}/{PUSH_RETRIES}): {output}",
+            f"⚠️  git push rejected (attempt {attempt}/{PUSH_RETRIES}): "
+            f"{_scrub_credentials(output)}",
             file=sys.stderr,
         )
         if attempt < PUSH_RETRIES:
             rrc, routput = run_git_command(["pull", "--rebase"], repo_path, check=False)
             if rrc != 0:
-                print(f"⚠️  git pull --rebase warning ({label}): {routput}", file=sys.stderr)
+                print(
+                    f"⚠️  git pull --rebase warning ({label}): {_scrub_credentials(routput)}",
+                    file=sys.stderr,
+                )
 
-    print(f"❌ git push failed after {PUSH_RETRIES} attempts ({label}): {output}", file=sys.stderr)
+    print(
+        f"❌ git push failed after {PUSH_RETRIES} attempts ({label}): "
+        f"{_scrub_credentials(output)}",
+        file=sys.stderr,
+    )
     return rc
 
 
@@ -656,7 +673,7 @@ def claim_push_once(repo_path: Path, label: str = "work repo") -> tuple[str, str
     """
     rc, output = run_git_command(["fetch"], repo_path, check=False)
     if rc != 0:
-        print(f"❌ git fetch failed ({label}): {output}", file=sys.stderr)
+        print(f"❌ git fetch failed ({label}): {_scrub_credentials(output)}", file=sys.stderr)
         return CLAIM_PUSH_ERROR, output
 
     rc, output = run_git_command(["push"], repo_path, check=False)
@@ -667,7 +684,7 @@ def claim_push_once(repo_path: Path, label: str = "work repo") -> tuple[str, str
     if any(marker in lowered for marker in _NON_FAST_FORWARD_MARKERS):
         return CLAIM_PUSH_LOST_RACE, output
 
-    print(f"❌ git push failed ({label}): {output}", file=sys.stderr)
+    print(f"❌ git push failed ({label}): {_scrub_credentials(output)}", file=sys.stderr)
     return CLAIM_PUSH_ERROR, output
 
 
@@ -842,7 +859,7 @@ def push_napkin_if_separate(commit_message: Optional[str] = None) -> int:
     print("➕ Staging all changes in napkin repository...")
     rc, output = run_git_command(["add", "-A"], napkin_path, check=False)
     if rc != 0:
-        print(f"⚠️  git add failed (napkin): {output}", file=sys.stderr)
+        print(f"⚠️  git add failed (napkin): {_scrub_credentials(output)}", file=sys.stderr)
         return rc
 
     rc, status_output = run_git_command(["status", "--porcelain"], napkin_path, check=False)
@@ -856,7 +873,7 @@ def push_napkin_if_separate(commit_message: Optional[str] = None) -> int:
     print("💾 Committing changes to napkin repository...")
     rc, output = run_git_command(["commit", "-m", commit_message], napkin_path, check=False)
     if rc != 0:
-        print(f"⚠️  git commit failed (napkin): {output}", file=sys.stderr)
+        print(f"⚠️  git commit failed (napkin): {_scrub_credentials(output)}", file=sys.stderr)
         return rc
 
     # 3. Integrate the remote and push, rebasing between attempts.

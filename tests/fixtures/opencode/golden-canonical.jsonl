@@ -1,0 +1,6 @@
+{"type": "lmer.meta", "format": 1, "harness": "opencode", "generator": "opencode-converter/0.1", "native_format": "opencode-export/1"}
+{"type": "lmer.message", "role": "user", "kind": "injected", "text": "Called the Read tool with the following input: {\"filePath\":\"/home/developer/workspace/README.md\"}", "at": "2026-08-14T23:32:23.606Z", "native_id": "msg_0029e99b6001m15lHfgXBECB2a", "native_parts": [0, 1]}
+{"type": "lmer.message", "role": "user", "kind": "said", "text": "say hi and run a quick shell command", "at": "2026-08-14T23:32:23.606Z", "native_id": "msg_0029e99b6001m15lHfgXBECB2a", "native_parts": [1, 2]}
+{"type": "lmer.message", "role": "assistant", "kind": "said", "text": "I will check the working tree.", "at": "2026-08-14T23:32:27.266Z", "tools": [{"id": "call_fake_1", "name": "bash", "status": "pending", "detail": "sleep 6; echo hello from the fake tool"}], "native_id": "msg_0029ea802001i0c7MDzED7muAj", "native_parts": [0, 3]}
+{"type": "lmer.tool_update", "id": "call_fake_1", "status": "ok"}
+{"type": "lmer.message", "role": "assistant", "kind": "said", "text": "The tool reported: hello from the fake tool.", "at": "2026-08-14T23:32:44.964Z", "native_id": "msg_0029eed24001bGaNu00vu0LkTO", "native_parts": [0, 2]}

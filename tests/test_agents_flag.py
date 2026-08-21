@@ -5,7 +5,8 @@ Contract under test
 ``lmer <task> <target> --agents=a,b`` (or ``LMER_AGENTS=a,b``; the flag wins,
 matching --preset/LMER_PRESET) resolves each name against LMER_PRESETS_FILE
 host-side and forwards only the resolved per-agent config into the
-container: ``LMER_AGENTS`` (names, csv) and ``LMER_AGENTS_CONFIG`` (JSON
+container, under scoped names the container has no other source for:
+``LMER_SPAWN_AGENTS`` (names, csv) and ``LMER_SPAWN_AGENTS_CONFIG`` (JSON
 ``{name: {"env": {...}, "prompt": "..."?}}``), consumed in-container by
 spawn-harness. A name matching no preset falls back to the model route when
 its model family implies a harness (a case-variant of a defined preset is
@@ -244,6 +245,30 @@ def presets_file(tmp_path):
     return path
 
 
+def _container_env_names(captured):
+    """The names the container actually receives, from a captured env dict.
+
+    ``captured`` is what main() hands to ``build_container_env``, which drops
+    None values — so a key seeded None in cli.py's env dict (the guard that
+    stops the .env merge and the preset-env seeding from filling a host input
+    name in) is present here but never inside the container. Composing the
+    real transport is what tells the two apart.
+    """
+    from lmer_cli.runtime import _ENV_FILE_NAME, build_container_env
+
+    container_env = build_container_env(dict(captured))
+    try:
+        names = set(container_env.client_env)
+        if container_env.env_file_dir is not None:
+            text = (container_env.env_file_dir / _ENV_FILE_NAME).read_text(
+                encoding="utf-8"
+            )
+            names |= {line.partition("=")[0] for line in text.split("\n") if line}
+        return names
+    finally:
+        container_env.cleanup()
+
+
 def _run_main(argv, env_in=None, captured_env=None, home=None):
     env = {**_BASE_ENV, **(env_in or {})}
     if home is not None:
@@ -265,8 +290,8 @@ class TestAgentsFlagCli:
             home=tmp_path,
         )
         assert rc == 0
-        assert captured.get("LMER_AGENTS") == "opus-review,sol-review"
-        config = json.loads(captured["LMER_AGENTS_CONFIG"])
+        assert captured.get("LMER_SPAWN_AGENTS") == "opus-review,sol-review"
+        config = json.loads(captured["LMER_SPAWN_AGENTS_CONFIG"])
         assert config == {
             "opus-review": {"env": {"LMER_LLM_NAME": "opus"}},
             "sol-review": {
@@ -286,7 +311,7 @@ class TestAgentsFlagCli:
             home=tmp_path,
         )
         assert rc == 0
-        assert captured.get("LMER_AGENTS") == "opus-review"
+        assert captured.get("LMER_SPAWN_AGENTS") == "opus-review"
 
     def test_flag_wins_over_env_var(self, presets_file, tmp_path):
         captured: dict = {}
@@ -300,7 +325,7 @@ class TestAgentsFlagCli:
             home=tmp_path,
         )
         assert rc == 0
-        assert captured.get("LMER_AGENTS") == "sol-review"
+        assert captured.get("LMER_SPAWN_AGENTS") == "sol-review"
 
     def test_dotenv_sourced_selection_honored(self, presets_file, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -310,7 +335,73 @@ class TestAgentsFlagCli:
         captured: dict = {}
         rc = _run_main(_EXEC_ARGS, captured_env=captured, home=tmp_path)
         assert rc == 0
-        assert captured.get("LMER_AGENTS") == "opus-review"
+        assert captured.get("LMER_SPAWN_AGENTS") == "opus-review"
+
+    def test_dotenv_sourced_selection_does_not_reach_the_container(
+        self, presets_file, tmp_path, monkeypatch
+    ):
+        """A .env-file LMER_AGENTS stays host-side (issue #283).
+
+        The .env merge forwards any key the container env dict does not
+        already carry, so the selection would otherwise travel into the
+        container under its host input name — the ambient value the scoped
+        pair replaced.
+        """
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text(
+            f"LMER_AGENTS=opus-review\n"
+            f"LMER_AGENTS_CONFIG=/host/only.json\n"
+            f"LMER_PRESETS_FILE={presets_file}\n"
+        )
+        captured: dict = {}
+        rc = _run_main(_EXEC_ARGS, captured_env=captured, home=tmp_path)
+        assert rc == 0
+        assert captured.get("LMER_SPAWN_AGENTS") == "opus-review"
+        assert json.loads(captured["LMER_SPAWN_AGENTS_CONFIG"]) == {
+            "opus-review": {"env": {"LMER_LLM_NAME": "opus"}}
+        }
+        names = _container_env_names(captured)
+        assert "LMER_SPAWN_AGENTS" in names and "LMER_SPAWN_AGENTS_CONFIG" in names
+        assert "LMER_AGENTS" not in names
+        assert "LMER_AGENTS_CONFIG" not in names
+
+    def test_preset_env_selection_does_not_reach_the_container(self, tmp_path):
+        """A preset's env carrying LMER_AGENTS stays host-side (issue #283).
+
+        The preset-env seeding loop copies every applied key the container
+        env dict does not already carry, the second route by which the host
+        input name would go ambient inside the container.
+        """
+        presets_file = tmp_path / "presets.json"
+        presets_file.write_text(
+            json.dumps(
+                {
+                    "fanout": {
+                        "env": {
+                            "LMER_AGENTS": "opus-review",
+                            "LMER_AGENTS_CONFIG": "/host/only.json",
+                        }
+                    },
+                    "opus-review": {"env": {"LMER_LLM_NAME": "opus"}},
+                }
+            )
+        )
+        captured: dict = {}
+        rc = _run_main(
+            ["--preset", "fanout", *_EXEC_ARGS],
+            env_in={"LMER_PRESETS_FILE": str(presets_file)},
+            captured_env=captured,
+            home=tmp_path,
+        )
+        assert rc == 0
+        assert captured.get("LMER_SPAWN_AGENTS") == "opus-review"
+        assert json.loads(captured["LMER_SPAWN_AGENTS_CONFIG"]) == {
+            "opus-review": {"env": {"LMER_LLM_NAME": "opus"}}
+        }
+        names = _container_env_names(captured)
+        assert "LMER_SPAWN_AGENTS" in names and "LMER_SPAWN_AGENTS_CONFIG" in names
+        assert "LMER_AGENTS" not in names
+        assert "LMER_AGENTS_CONFIG" not in names
 
     def test_unknown_hintless_name_exits_2(self, presets_file, tmp_path):
         rc = _run_main(
@@ -337,7 +428,7 @@ class TestAgentsFlagCli:
             home=tmp_path,
         )
         assert rc == 0
-        config = json.loads(captured["LMER_AGENTS_CONFIG"])
+        config = json.loads(captured["LMER_SPAWN_AGENTS_CONFIG"])
         assert config == {"fable": {"env": {"LMER_LLM_NAME": "fable"}}}
 
     def test_unknown_harness_in_preset_env_exits_2(self, presets_file, tmp_path):
@@ -365,7 +456,7 @@ class TestAgentsFlagCli:
             home=tmp_path,
         )
         assert rc == 0
-        config = json.loads(captured["LMER_AGENTS_CONFIG"])
+        config = json.loads(captured["LMER_SPAWN_AGENTS_CONFIG"])
         assert config == {"svc": {"env": {}}}
         # The agent preset must NOT shape the launch: no service mode.
         assert captured.get("LMER_SERVICE_MODE") is None
@@ -379,13 +470,42 @@ class TestAgentsFlagCli:
             home=tmp_path,
         )
         assert rc == 0
-        config = json.loads(captured["LMER_AGENTS_CONFIG"])
+        config = json.loads(captured["LMER_SPAWN_AGENTS_CONFIG"])
         assert config == {
             "sol-second": {
                 "env": {"LMER_LLM_NAME": "gpt-5.6-sol", "LMER_HARNESS": "codex"},
                 "prompt": "Second pass.",
             }
         }
+
+    def test_host_input_names_do_not_reach_the_container(self, presets_file, tmp_path):
+        """The container sees the scoped pair only (issue #283).
+
+        ``LMER_AGENTS`` is a host input; ambient inside the container it made
+        every nested ``lmer`` and every test run inherit the outer session's
+        fan-out selection — resolved against a presets file that never crosses
+        the boundary. Selected here through the env var, the spelling that
+        would have travelled by inheritance if the launch forwarded nothing.
+        """
+        captured: dict = {}
+        rc = _run_main(
+            _EXEC_ARGS,
+            env_in={
+                "LMER_PRESETS_FILE": str(presets_file),
+                "LMER_AGENTS": "opus-review",
+            },
+            captured_env=captured,
+            home=tmp_path,
+        )
+        assert rc == 0
+        assert captured.get("LMER_SPAWN_AGENTS") == "opus-review"
+        assert json.loads(captured["LMER_SPAWN_AGENTS_CONFIG"]) == {
+            "opus-review": {"env": {"LMER_LLM_NAME": "opus"}}
+        }
+        names = _container_env_names(captured)
+        assert "LMER_SPAWN_AGENTS" in names and "LMER_SPAWN_AGENTS_CONFIG" in names
+        assert "LMER_AGENTS" not in names
+        assert "LMER_AGENTS_CONFIG" not in names
 
     def test_no_selection_forwards_nothing(self, presets_file, tmp_path):
         captured: dict = {}
@@ -396,8 +516,8 @@ class TestAgentsFlagCli:
             home=tmp_path,
         )
         assert rc == 0
-        assert captured.get("LMER_AGENTS") is None
-        assert captured.get("LMER_AGENTS_CONFIG") is None
+        assert captured.get("LMER_SPAWN_AGENTS") is None
+        assert captured.get("LMER_SPAWN_AGENTS_CONFIG") is None
 
 
 class TestAgentsCrossHarnessCreds:
@@ -574,12 +694,30 @@ class TestAgentsChildHarnesses:
 
 class TestEnvDictGuard:
     """Guard: the fan-out vars must stay in cli.py's container env dict —
-    without them the resolved selection never reaches spawn-harness."""
+    without them the resolved selection never reaches spawn-harness. Under
+    the scoped names: the host-input spelling is ambient in the container
+    and was inherited by everything running there (issue #283).
 
-    @pytest.mark.parametrize("var", ["LMER_AGENTS", "LMER_AGENTS_CONFIG"])
-    def test_cli_env_dict_declares_fanout_var(self, var):
+    The host input names must stay declared too, seeded None: their presence
+    in the dict is what blocks the preset-env seeding and .env merge from
+    filling them in (build_container_env drops the None)."""
+
+    @pytest.mark.parametrize("const", ["SPAWN_AGENTS_ENV", "SPAWN_AGENTS_CONFIG_ENV"])
+    def test_cli_env_dict_declares_fanout_var(self, const):
         source = CLI_PY.read_text()
-        pattern = re.compile(rf"""["']{var}["']\s*:""")
+        # Keyed by the presets constants, not literals: presets.py's every-
+        # consumer-imports rule is what keeps a rename from splitting the pair.
+        pattern = re.compile(rf"\b{const}\s*:")
         assert pattern.search(source), (
-            f"{var} entry missing from cli.py container env dict"
+            f"{const} entry missing from cli.py container env dict"
+        )
+
+    @pytest.mark.parametrize("const", ["AGENTS_ENV", "AGENTS_CONFIG_ENV"])
+    def test_cli_env_dict_seeds_host_input_name_none(self, const):
+        source = CLI_PY.read_text()
+        pattern = re.compile(rf"\b{const}\s*:\s*None")
+        assert pattern.search(source), (
+            f"{const} None seed missing from cli.py container env dict — "
+            "the .env merge and preset-env seeding can leak the host input "
+            "name into the container without it"
         )

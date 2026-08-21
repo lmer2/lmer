@@ -6,6 +6,7 @@ gets prompted rather than a bare 401. Plus the guarantees the payload has to mak
 crashed runs survive into the attention list.
 """
 
+import asyncio
 import base64
 
 import pytest
@@ -744,6 +745,97 @@ def test_the_tty_socket_takes_no_shared_secret(client, platform_root):
             pass
 
 
+#: A pid nothing can be running under, so the session reads as crashed and the
+#: follower ends instead of polling. Same value the rest of the platform tests use.
+DEAD_PID = 2**22
+
+
+class _StubSocket:
+    """The tty endpoint's client, cut down to what the handler touches.
+
+    ``close`` raises whatever *failure* is, which is how a client that went away
+    is reproduced without a socket to hang up: nothing else about the connection
+    is different, and the handler reaches the close either way.
+    """
+
+    def __init__(self, session_id, ticket, failure=None):
+        self.path_params = {"session_id": session_id}
+        self.query_params = {"ticket": ticket}
+        self.failure = failure
+        self.sent = []
+        self.closes = 0
+
+    async def accept(self):
+        return None
+
+    async def send_json(self, payload):
+        self.sent.append(payload)
+
+    async def receive(self):
+        return {"type": "websocket.disconnect"}
+
+    async def close(self, code=1000, reason=""):
+        self.closes += 1
+        if self.failure is not None:
+            raise self.failure
+
+
+def open_tty_with(client, socket_factory):
+    """Run the tty handler itself against a stub socket.
+
+    The route rather than a copy of its last two lines: what #247 is about is
+    whether anything escapes *the endpoint*, and the ticket is redeemed against
+    the same app's store so the handler runs the whole way through.
+    """
+    endpoint = next(
+        route.endpoint for route in client.app.routes
+        if getattr(route, "path", None) == "/api/sessions/{session_id}/tty"
+    )
+    minted = client.post("/api/sessions/s-1/tty-ticket", headers=bearer_header())
+    assert minted.status_code == 200, minted.text
+    socket = socket_factory(minted.json()["ticket"])
+    asyncio.run(endpoint(socket))
+    return socket
+
+
+def test_a_client_that_left_before_the_close_is_not_an_error(client, platform_root):
+    """Every browser tab closed on a terminal logged an ASGI traceback (#247).
+
+    starlette turns the hung-up transport's ``OSError`` — uvicorn's
+    ``ClientDisconnected`` — into ``WebSocketDisconnect(1006)`` on a socket its
+    own state still calls connected, so the ``RuntimeError`` guard, which is the
+    already-closed state, never saw the common case.
+    """
+    from starlette.websockets import WebSocketDisconnect
+
+    registry.register("s-1", pid=DEAD_PID)
+    socket = open_tty_with(
+        client, lambda ticket: _StubSocket("s-1", ticket, WebSocketDisconnect(1006))
+    )
+
+    assert socket.closes == 1, "the handler must still try to close"
+    assert socket.sent[0]["type"] == "open", "the socket was served before it left"
+
+
+def test_closing_an_already_closed_socket_stays_quiet(client, platform_root):
+    """The state that was handled, still handled: starlette raises this one when
+    a close frame follows a close frame."""
+    registry.register("s-1", pid=DEAD_PID)
+    failure = RuntimeError('Cannot call "send" once a close message has been sent.')
+    socket = open_tty_with(client, lambda ticket: _StubSocket("s-1", ticket, failure))
+
+    assert socket.closes == 1
+
+
+def test_a_close_that_fails_for_another_reason_is_not_swallowed():
+    """Two named exceptions, not a bare ``except``: a socket failing some other
+    way is a bug in this daemon, and suppressing it would only hide the next one."""
+    socket = _StubSocket("s-1", "unused", ValueError("nothing to do with the peer"))
+
+    with pytest.raises(ValueError):
+        asyncio.run(api._close_quietly(socket))
+
+
 def test_route_list_mentions_the_terminal_routes(client):
     body = client.get("/api", headers=bearer_header()).text
     assert "/api/sessions/{id}/log" in body
@@ -914,7 +1006,8 @@ def test_build_state_carries_a_row_per_declared_slot(platform_root, slot_host):
     assert [row["name"] for row in payload["slots"]] == ["webapp", "plain"]
     assert payload["slots"][0] == {
         "name": "webapp", "preset": "webapp_dev", "description": "Web app dev",
-        "service": "webapp-web", "state": "free", "reason": None,
+        "service": "webapp-web", "service_group": None, "members": [],
+        "state": "free", "reason": None,
         "occupant": None, "occupants": [], "service_occupants": [],
     }
     assert payload["slots"][1]["state"] == "misconfigured"

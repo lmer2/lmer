@@ -10,6 +10,7 @@ This module handles:
 """
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +20,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
-from typing import List
+from typing import Callable, List
+
+from dotenv import dotenv_values, load_dotenv
 
 from .log import warning
 
@@ -45,6 +48,16 @@ _LMER_STATE_DIR = Path.home() / ".lmer"
 # counter leak on older kernels (e.g. RHEL 8 / 4.18), where phantom fork
 # entries accumulate and prematurely exhaust the cap.
 DEFAULT_PIDS_LIMIT = "512"
+
+# Default container CPU quota, passed as --cpus. One core is the conservative
+# baseline; overridable via LMER_CPUS — see _resolve_cpus() and
+# docs/LMER-CLI.md — because a single core throttles parallel workloads (test
+# suites, builds) on hosts with cores to spare.
+DEFAULT_CPUS = "1"
+
+# Default container memory cap, passed as --memory. Overridable via
+# LMER_MEMORY — see _resolve_memory() and docs/LMER-CLI.md.
+DEFAULT_MEMORY = "2g"
 
 
 #: The kernel's own answer, read rather than shelled out for. ``1`` is
@@ -222,41 +235,235 @@ def lmer_state_dir() -> Path:
     return _LMER_STATE_DIR
 
 
-def _resolve_pids_limit() -> str:
-    """Resolve the container ``--pids-limit`` value from ``LMER_PIDS_LIMIT``.
+def apply_env_file_defaults(
+    candidates: "list[tuple[str, Path]]",
+    *,
+    references_from_environ: bool = False,
+) -> "dict[str, str]":
+    """Seed ``os.environ`` from ``.env`` files, first-wins, and report the sources.
 
-    Returns the value to hand to ``docker``/``podman`` ``--pids-limit``.
+    First-wins: an exported variable is never overwritten, and earlier
+    candidates outrank later ones, so callers pass them highest-priority first.
+    The one implementation of that precedence (issue #67), shared by the CLI,
+    ``lmer platform`` and ``lmer-slack-listener``. It lives here rather than in
+    ``cli`` because ``slack_chat`` is imported *by* ``lmer_cli``.
 
-    Rules:
-    - Unset/empty → :data:`DEFAULT_PIDS_LIMIT`.
-    - Any positive integer → that value (raise the cap on hosts affected by
-      the cgroup-v1 pids-controller leak).
-    - ``-1`` → ``"-1"`` (Docker/Podman "unlimited"; an escape hatch for badly
-      leaking hosts where any finite cap eventually fills with phantom
-      entries).
-    - Anything else — ``0``, other negatives, non-numeric — is rejected with a
-      warning and falls back to the default. A misconfigured value must never
-      silently weaken or disable the safety bound.
+    *references_from_environ* picks how a ``${VAR}`` reference **inside** a file
+    resolves: file-first by default (the CLI's behaviour), environment-first
+    when True (the listener's, pre-#67). It is a parameter because both are
+    behaviour somebody depends on. The referenced variable itself obeys
+    first-wins either way, so only composed values differ.
+
+    Returns ``{var: "…description…"}`` for ``--show-env`` attribution.
     """
-    raw = os.environ.get("LMER_PIDS_LIMIT", "").strip()
+    sources: "dict[str, str]" = {}
+    for location, env_file in candidates:
+        if not env_file.exists():
+            continue
+        if references_from_environ:
+            # The only public entry point that interpolates against os.environ.
+            # It writes the variables itself, so the names it added are the
+            # source map.
+            before = set(os.environ)
+            load_dotenv(dotenv_path=str(env_file), override=False)
+            for key in set(os.environ) - before:
+                sources[key] = f".env ({location})"
+            continue
+        for key, value in dotenv_values(dotenv_path=str(env_file)).items():
+            if key not in os.environ and value is not None:
+                os.environ[key] = value
+                sources[key] = f".env ({location})"
+    return sources
+
+
+def default_env_file_candidates(
+    *, state_dir: "Path | None" = None, cwd: "Path | None" = None
+) -> "list[tuple[str, Path]]":
+    """The standard ``.env`` search order: working directory, then the state dir."""
+    return [
+        ("working directory", (cwd or Path.cwd()) / ".env"),
+        ("lmer state dir", (state_dir or lmer_state_dir()) / ".env"),
+    ]
+
+
+def _resolve_limit_env(
+    name: str,
+    default: str,
+    validator: Callable[[str], str | None],
+    hint: str,
+) -> str:
+    """Resolve one container resource limit from ``name``, or warn and default.
+
+    The shared skeleton behind :func:`_resolve_pids_limit`,
+    :func:`_resolve_cpus` and :func:`_resolve_memory`: read the variable,
+    strip it, and hand what remains to ``validator``. Unset or empty (after
+    stripping) is not a misconfiguration — it is the ordinary "no override"
+    case and yields ``default`` silently, without consulting ``validator``.
+
+    ``validator`` returns the string to hand the runtime rather than a bool,
+    so a limit whose accepted spelling differs from what was typed can
+    normalise it on the way through (``LMER_PIDS_LIMIT=' +5 '`` resolves to
+    ``5``); ``None`` means rejected. Each validator's docstring is the single
+    home for that limit's grammar and why it is drawn where it is.
+
+    Rejection is always warn-and-default — never an abort, never a
+    pass-through. That is the safety property these limits exist for: a
+    misconfigured value must not silently weaken or remove the bound, and it
+    must not stop a session from launching either. The warning therefore
+    names the variable, quotes what was read, states the grammar (``hint``)
+    and the default it fell back to.
+    """
+    raw = os.environ.get(name, "").strip()
     if not raw:
-        return DEFAULT_PIDS_LIMIT
+        return default
+    accepted = validator(raw)
+    if accepted is not None:
+        return accepted
+    warning(f"⚠️  Ignoring invalid {name}={raw!r} ({hint}); using default {default}")
+    return default
+
+
+def _valid_pids_limit(raw: str) -> str | None:
+    """Accept ``raw`` as a ``--pids-limit`` value, or None to reject it.
+
+    The grammar:
+
+    - any positive integer → that value. Raising the cap is the
+      host-kernel-agnostic mitigation for the cgroup-v1 pids-controller
+      counter leak, where phantom fork entries accumulate and prematurely
+      exhaust the cap.
+    - ``-1`` → ``"-1"``, Docker/Podman "unlimited" — an escape hatch for
+      badly leaking hosts where any finite cap eventually fills with phantom
+      entries.
+    - anything else — ``0``, other negatives, non-numeric — is rejected, so a
+      misconfigured value can never silently weaken or disable the fork-bomb
+      safety bound; :func:`_resolve_limit_env` warns and keeps
+      :data:`DEFAULT_PIDS_LIMIT`.
+
+    An accepted value is returned as ``str(int(raw))``, so an in-grammar
+    spelling the runtimes would take anyway (``+5``, ``007``) reaches them
+    normalised.
+    """
     try:
         value = int(raw)
     except ValueError:
-        warning(
-            f"⚠️  Ignoring invalid LMER_PIDS_LIMIT={raw!r} (not an integer); "
-            f"using default {DEFAULT_PIDS_LIMIT}"
-        )
-        return DEFAULT_PIDS_LIMIT
+        return None
     if value > 0 or value == -1:
         return str(value)
-    warning(
-        f"⚠️  Ignoring out-of-range LMER_PIDS_LIMIT={raw!r} "
-        f"(must be a positive integer, or -1 for unlimited); "
-        f"using default {DEFAULT_PIDS_LIMIT}"
+    return None
+
+
+def _resolve_pids_limit() -> str:
+    """The container ``--pids-limit`` value, from ``LMER_PIDS_LIMIT``."""
+    return _resolve_limit_env(
+        "LMER_PIDS_LIMIT",
+        DEFAULT_PIDS_LIMIT,
+        _valid_pids_limit,
+        "must be a positive integer, or -1 for unlimited",
     )
-    return DEFAULT_PIDS_LIMIT
+
+
+# The only shape accepted for --cpus; see _valid_cpus for the grammar and why
+# it is drawn where it is.
+_CPUS_RE = re.compile(r"^\d+(\.\d{1,9})?$", re.ASCII)
+
+# The only shape accepted for --memory; see _valid_memory for the grammar and
+# why it is drawn where it is.
+_MEMORY_RE = re.compile(r"^(\d+)(b|k|m|g|kb|mb|gb)?$", re.IGNORECASE | re.ASCII)
+
+# Magnitude bound for --cpus. docker encodes the value as int64 nano-CPUs, and
+# magnitudes near 2**64/1e9 wrap to 0 — the daemon's "unset" encoding — so an
+# in-grammar value could silently remove the CPU bound (measured on the wire in
+# the !211 review). 4096 is orders of magnitude below the wrap and above any
+# real host.
+_MAX_CPUS = 4096.0
+
+# Floor for --memory, docker's documented minimum allocation (6m). Below it the
+# runtime refuses to start the container, so pre-screen to warn-and-default
+# instead of aborting the launch over a forgotten unit suffix.
+_MIN_MEMORY_BYTES = 6 * 1024**2
+
+_MEMORY_UNIT_BYTES = {
+    "": 1,
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+}
+
+
+def _valid_cpus(raw: str) -> str | None:
+    """Accept ``raw`` as a ``--cpus`` value, or None to reject it.
+
+    The grammar: a positive decimal literal (:data:`_CPUS_RE`) up to
+    :data:`_MAX_CPUS`, integers and fractions alike — ``2``, ``0.5``, ``1.5``
+    are all valid to both runtimes, and raising the value is what lets
+    parallel workloads use more of the host's cores. Deliberately a subset of
+    what the runtimes parse (docker also takes ``1e2``, ``3/2``, ``"1."``),
+    because a rejected spelling only costs warn-and-default while a passed
+    one must not abort the launch. The pattern is ASCII-only, since Python's
+    ``\\d`` otherwise matches non-ASCII digits the runtimes reject, and takes
+    at most 9 fractional digits, since docker's nano-CPU parser rejects finer
+    values as "too precise".
+
+    Anything else — ``0``, negatives, ``inf``/``nan``/scientific notation,
+    non-numeric, magnitudes past :data:`_MAX_CPUS` (which could wrap to the
+    runtime's "unset" encoding) — is rejected and :func:`_resolve_limit_env`
+    warns and keeps :data:`DEFAULT_CPUS`. There is no "unlimited" spelling: a
+    misconfigured value must never silently remove the CPU bound.
+    """
+    if _CPUS_RE.match(raw) and 0 < float(raw) <= _MAX_CPUS:
+        return raw
+    return None
+
+
+def _resolve_cpus() -> str:
+    """The container ``--cpus`` value, from ``LMER_CPUS``."""
+    return _resolve_limit_env(
+        "LMER_CPUS",
+        DEFAULT_CPUS,
+        _valid_cpus,
+        f"must be a positive number of cores up to {_MAX_CPUS:g}, e.g. 2 or 0.5",
+    )
+
+
+def _valid_memory(raw: str) -> str | None:
+    """Accept ``raw`` as a ``--memory`` value, or None to reject it.
+
+    The grammar: an integer with an optional unit suffix (:data:`_MEMORY_RE`)
+    — ``b``/``k``/``m``/``g`` or their two-letter forms, case-insensitive,
+    bytes when omitted — resolving to at least :data:`_MIN_MEMORY_BYTES`.
+    Deliberately a subset of the runtimes' size grammar (which also takes
+    fractions like ``2.5g`` and ``t``/``tb`` suffixes), on the same
+    warn-and-default rationale as :func:`_valid_cpus`.
+
+    Anything else — sizes below the runtime's minimum (e.g. a bare ``8``
+    meaning eight bytes), ``0``, negatives, fractions, unknown suffixes,
+    non-numeric — is rejected and :func:`_resolve_limit_env` warns and keeps
+    :data:`DEFAULT_MEMORY`. As with :func:`_valid_cpus`, there is no
+    "unlimited" spelling: a misconfigured value must never silently remove
+    the memory bound. (Oversized values need no ceiling here: the runtime's
+    int64 saturation is negative, not the "unset" encoding, so they fail
+    loudly at launch.)
+    """
+    match = _MEMORY_RE.match(raw)
+    if not match:
+        return None
+    size = int(match.group(1)) * _MEMORY_UNIT_BYTES[(match.group(2) or "").lower()]
+    return raw if size >= _MIN_MEMORY_BYTES else None
+
+
+def _resolve_memory() -> str:
+    """The container ``--memory`` value, from ``LMER_MEMORY``."""
+    return _resolve_limit_env(
+        "LMER_MEMORY",
+        DEFAULT_MEMORY,
+        _valid_memory,
+        "must be a size of at least 6m, e.g. 4g or 512m",
+    )
 
 
 def _resource_limit_args(runtime: str) -> List[str]:
@@ -272,10 +479,12 @@ def _resource_limit_args(runtime: str) -> List[str]:
     would silently shed the --pids-limit fork-bomb bound on hosts where
     the limits worked fine. Docker (root daemon) always passes the flags.
     """
+    # Resolvers stay unevaluated until a flag is actually passed, so an
+    # invalid override never warns about a default the gate then drops.
     flag_specs = [
-        ("--cpus", "1", "cpu"),
-        ("--memory", "2g", "memory"),
-        ("--pids-limit", _resolve_pids_limit(), "pids"),
+        ("--cpus", _resolve_cpus, "cpu"),
+        ("--memory", _resolve_memory, "memory"),
+        ("--pids-limit", _resolve_pids_limit, "pids"),
     ]
     controllers = None
     if runtime == "podman" and os.geteuid() != 0:
@@ -283,13 +492,13 @@ def _resource_limit_args(runtime: str) -> List[str]:
     if controllers is None:
         # Gate does not apply (docker, root, cgroup v1, unreadable slice) —
         # pass all resource flags.
-        return [arg for flag, value, _controller in flag_specs for arg in (flag, value)]
+        return [arg for flag, resolve, _controller in flag_specs for arg in (flag, resolve())]
 
     args: List[str] = []
     dropped: list[str] = []
-    for flag, value, controller in flag_specs:
+    for flag, resolve, controller in flag_specs:
         if controller in controllers:
-            args += [flag, value]
+            args += [flag, resolve()]
         else:
             dropped.append(controller)
     if dropped:

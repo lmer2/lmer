@@ -8,7 +8,9 @@ subprocess + stdlib exception stringification).
 """
 
 import subprocess
+from unittest.mock import patch
 
+from lmer_cli.container import clone_and_exec
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 
 
@@ -47,3 +49,29 @@ class TestScrubCredentials:
 
     def test_handles_empty(self):
         assert _scrub_credentials("") == ""
+
+
+class TestCheckoutFailureIsScrubbed:
+    """The MR checkout handlers print str(CalledProcessError) too, and the
+    fetch/checkout commands reach a remote whose URL may be tokenized."""
+
+    def test_secondary_mr_checkout_failure(self, tmp_path, capsys):
+        target = "https://git.example.com/group/project/-/merge_requests/7"
+        err = subprocess.CalledProcessError(
+            128, ["git", "-C", str(tmp_path), "fetch", _FAKE_URL, "merge-requests/7/head"]
+        )
+
+        def boom(workspace, mr_id, remote="origin", credential=None):
+            raise err
+
+        with patch.object(clone_and_exec, "_clone_with_cache"), \
+             patch.object(clone_and_exec, "_persist_lfs_skip_config"), \
+             patch.object(clone_and_exec, "check_call"), \
+             patch.object(clone_and_exec, "_fetch_and_checkout_mr", boom):
+            clone_and_exec.clone_secondary_mr(target, tmp_path)
+
+        captured = capsys.readouterr().err
+        assert "Failed to checkout secondary MR 7 branch" in captured
+        assert "glpat-" not in captured
+        assert "oauth2:" not in captured
+        assert "git.example.com" in captured

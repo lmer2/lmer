@@ -23,6 +23,7 @@ lmer <task> [target] --service <service-name> --checkout <host-path>
 |----------|---------|
 | `target` (positional) | Repo URL, MR/PR/issue link — used for git operations, branch checkout, MR comments. Unchanged from normal mode. |
 | `--service <name>` | Docker Compose service name (or container name/ID) to `docker exec` into. Must be running. |
+| `--service-group <project>` | Compose **project** whose running services this session may target. The agent retargets with `target-switch`. See [Service groups](#service-groups-one-session-a-whole-stack). |
 | `--checkout <path>` | Path to existing local source checkout on the host. Mounted as `/workspace` instead of cloning. |
 
 ### Examples
@@ -110,23 +111,20 @@ no runtime-conditional logic needed inside the container.
 
 ### Wrapper Scripts
 
-Two scripts are installed to the lmer container's PATH:
+Three scripts are installed to the lmer container's PATH:
 
-#### `target-exec`
-```bash
-#!/bin/bash
-# Run a command inside the target service container
-exec docker exec -w "$LMER_SERVICE_WORKDIR" "$LMER_SERVICE_CONTAINER" "$@"
-```
+| script | what it does |
+|---|---|
+| `target-exec <command>` | Runs the command inside the target container, in that container's working directory |
+| `target-logs [container] [N]` | Follows the target container's logs, or a named container's |
+| `target-switch [service]` | Lists the [service group](#service-groups-one-session-a-whole-stack) and its current target, or retargets to a member |
 
-#### `target-logs`
-```bash
-#!/bin/bash
-# Tail logs from the target service container (or another named container)
-CONTAINER="${1:-$LMER_SERVICE_CONTAINER}"
-LINES="${2:-50}"
-exec docker logs --tail "$LINES" -f "$CONTAINER"
-```
+`target-exec` and `target-logs` take their container from the target file
+`target-switch` writes (`LMER_SERVICE_TARGET_FILE`), falling back to
+`LMER_SERVICE_CONTAINER` from the launch when no switch has happened. Reading it
+per invocation is what makes a switch visible to shells that were already
+running; a target file that exists but is incomplete is an error naming the
+file, never a quiet fall-back to a container the agent did not choose.
 
 ### What Claude Sees
 
@@ -186,6 +184,8 @@ lmer chat --service web --checkout ~/project/dev-env --match-uid ...
 | `LMER_SERVICE_CONTAINER` | CLI | Resolved container ID |
 | `LMER_SERVICE_NAME` | CLI | Original `--service` value |
 | `LMER_SERVICE_WORKDIR` | CLI | Working directory inside target container |
+| `LMER_SERVICE_GROUP` | CLI | Compose project the session is attached to (`--service-group`) |
+| `LMER_SERVICE_TARGET_FILE` | CLI | Where `target-switch` records the current target; read by `target-exec`/`target-logs` |
 
 ## Constraints
 
@@ -196,10 +196,105 @@ lmer chat --service web --checkout ~/project/dev-env --match-uid ...
   the target container has bind-mounted. Otherwise edits won't be visible
   to the running service. Note that the target container may only mount
   **specific subdirectories** — not the entire checkout.
-- `--service` requires `--checkout` (can't exec into a container without
-  local source to edit).
+- `--service` and `--service-group` both require `--checkout` (can't exec into
+  a container without local source to edit).
 - `--checkout` can be used alone (without `--service`) to skip cloning and
   use an existing checkout.
+
+## Service groups: one session, a whole stack
+
+`--service` binds a session to one container. A stack that runs as a unit — the
+fullctl suite is 12+ containers, all up together — would need twelve sessions
+that way, one per service. `--service-group <compose-project>` attaches **one**
+session to the whole project instead, and the agent moves its target around
+inside it:
+
+```bash
+lmer chat \
+  --service-group fullctl \
+  --checkout ~/fullctl/dev-env
+```
+
+### The group is discovered, not declared
+
+Membership is read from Compose's own `com.docker.compose.project` label — the
+same label family `--service` already matches on. Nobody lists the members: a
+stack that is up has already named them, and a list written by hand would go
+stale the first time the stack changed. The list is re-read on every switch, so
+a member that restarted under a new container id is still reachable, and a
+member that is down simply is not offered.
+
+A member is named by its **compose service name**, whatever the replica count —
+a name that moved when a sibling stopped would not match what a running session
+recorded as the containers it holds. A scaled service (`--scale web=3`) is
+therefore listed once per replica under the one service name, and that name is
+refused as ambiguous when you switch to it; the replica's container name
+(`stack-web-2`) selects one. Containers appearing and disappearing mid-read is
+ordinary for a live stack, so a member that vanishes between the listing and the
+inspection is dropped rather than failing the whole group.
+
+### Switching target
+
+Inside the container:
+
+```bash
+target-switch                # the group, the current target, and every member
+target-switch tasks          # point target-exec/target-logs at 'tasks'
+target-exec pytest tests/    # …now runs in the tasks container
+```
+
+A switch takes effect for every command started after it, including in shells
+and agents that were already running — the target lives in a small file
+(`LMER_SERVICE_TARGET_FILE`), not in the environment, precisely so that a
+retarget is not invisible to processes that started before it. `target-exec`
+and `target-logs` read that file on each invocation and fall back to the
+launch-time container when it does not exist, which is what leaves
+single-service sessions behaving exactly as they did.
+
+`--service` and `--service-group` compose: `--service <member>` names where the
+session **starts**, and must be a running member of the group. With the group
+alone the session starts with nothing targeted, and `target-exec` says so and
+names the switch rather than picking a member nobody chose.
+
+### What a group session holds
+
+A group session can retarget to any member without asking anyone, so for
+[slot](#service-slots-several-agents-one-dev-stack) purposes it holds **all** of
+them. That runs in both directions, because the harm — two agents in one dev
+container — does not care which session started first:
+
+- a slot naming any member reads `in use` while a group session runs, and
+- a group slot reads `in use` while any *single-service* session holds one of
+  its members, naming that container in the reason.
+
+The members a session holds are resolved once, at the spawn that claims the
+slot, and recorded on its registry entry — the "recorded rather than re-derived"
+rule single-service slots already follow, so a presets edit cannot move what a
+running session is understood to hold. Both spellings of each container are
+recorded (compose service name and container name), since a slot's preset may
+name either. A group *slot* learns its members from the same probe that already
+asks whether the project is up, so the symmetry costs no extra runtime query.
+
+A preset attaches to a group with `service_group` (see
+[PRESETS.md](./PRESETS.md#fields)); a slot pointing at such a preset guards the
+project.
+
+### Not in this slice
+
+- **A control-plane route to retarget a running session.** The switch is an
+  in-container command; the operator moves a session by asking its agent.
+- **Groups that are not a compose project.** No ad-hoc name lists, no group
+  spanning two projects.
+- **A container that joined the project after a group session started.** The
+  session can switch to it — membership is live — but what that session was
+  recorded as holding was read at spawn, so a *single-service* slot naming the
+  late member reads free. (A group slot over the project is not affected: its
+  own membership is re-read on every poll.) Closing the remaining case means
+  re-resolving every live session's group on every poll; if it bites, that is
+  the trade to revisit.
+- **Retargeting `/workspace`.** One checkout per session, as before: a group is
+  the services of one stack over one source tree.
+- **Per-member slots inside a group.** A group is taken whole.
 
 ## Service slots (several agents, one dev stack)
 
@@ -301,18 +396,24 @@ A slot is `misconfigured` when:
   the preset name: the daemon's `LMER_PRESETS_FILE` is unset (above), or it is
   set and the file is missing, unreadable or not a JSON object;
 - the named preset does not exist on this host;
-- the preset sets no `service`, so it cannot put a session into service mode;
-- the preset's `args` set `--service` or `--checkout` — **including any
-  abbreviation** argparse accepts (`--serv`, `--se`, `--che=…`), since `lmer`
-  leaves `allow_abbrev` on. `lmer` re-parses the preset's own tokens followed by
+- the preset sets neither `service` nor `service_group`, so it cannot put a
+  session into service mode;
+- the preset's `args` set `--service`, `--service-group` or `--checkout` —
+  **including any abbreviation** argparse accepts (`--che=…`, `--service-g`),
+  since `lmer` leaves `allow_abbrev` on. (`--serv`/`--se` are ambiguous between
+  `--service` and `--service-group` and are refused by the parser instead, which
+  lands the slot under the *unparseable args* bullet below rather than this
+  one.) `lmer` re-parses the preset's own tokens followed by
   its `args` and the last occurrence wins, so the slot would probe, display and
   guard one service while the session ran against another. The binding a slot
   claims has to be the one the session gets. Decided by handing the `args` to
   the real parser rather than by matching spellings, so this cannot drift from
   what `lmer` does;
 - the preset's `args` do not parse at all, since the session could not start;
-- the preset's `service` is already bound by an earlier slot (one service, one
-  slot — above).
+- the preset's `service` — or, for a group preset, its project or any of the
+  project's running members — is already bound by an earlier slot (one service,
+  one slot — above). Two slots that overlap only through a group's membership
+  are caught here too, so neither reads free until someone spawns.
 
 A slot whose preset this host cannot resolve **loads anyway**, unusable and
 with the reason on its row. It is not dropped, because it can become true again

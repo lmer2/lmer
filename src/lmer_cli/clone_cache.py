@@ -22,20 +22,24 @@ never an exception.
 Credential rules (the reason this code lives host-side at all):
 
 - The tokenized URL is **never written to disk**: mirrors are created with
-  ``git init --bare`` storing only the scrubbed URL as origin, and every
-  fetch passes the URL explicitly.
-- The token is **never on any argv**: git children fetch the *scrubbed*
-  URL, with credentials injected via ephemeral ``GIT_CONFIG_*`` process
-  env (an ``http.<url>.extraHeader`` Authorization header).
+  ``git init --bare`` storing only the scrubbed *store* URL as origin, and
+  every fetch passes its URL explicitly.
+- **No secret is ever on an argv**: http(s) children fetch the *scrubbed* URL
+  with the credential in ephemeral ``GIT_CONFIG_*`` env (an
+  ``http.<url>.extraHeader``). Other schemes get no header — their userinfo is
+  a transport login, so the fetch URL keeps ``user@`` and drops any password
+  (:func:`_split_credentials`, issue #163).
 - **Exactly one Authorization header goes out, and it is ours**: a credentialed
   fetch cancels any header the operator's git config or the inherited
   ``GIT_CONFIG_*`` pairs would add before appending its own, and resets
   ``credential.helper`` so nothing can substitute other credentials or block a
   detached updater on an interactive unlock.
 - A credential lmer injected may still be one the remote rejects (a
-  ``GITLAB_TOKEN`` fallback reaching a github.com URL). A failed attempt that
-  carried credentials is therefore retried **once without lmer's own
-  injection**, so a public repo mirrors regardless (issue #157). The retry
+  ``GITLAB_TOKEN`` fallback used to reach github.com URLs; since #161 the
+  generic token is scoped to its issuing host, so what remains is an
+  explicitly mis-scoped or per-host token the target refuses). A failed
+  attempt that carried credentials is therefore retried **once without
+  lmer's own injection**, so a public repo mirrors regardless (#157). The retry
   undoes what this process attached and nothing else: it runs the same empty
   env a URL lmer could not credential gets, so the operator's own git config
   — headers and credential helper included — is what remains, exactly as
@@ -58,7 +62,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from typing import NamedTuple
+from urllib.parse import unquote, urlparse, urlunparse
 
 # Host→container imports are allowed (the container script is the side that
 # must stay standalone); reusing the mapping + scrub keeps the two sides
@@ -274,47 +279,67 @@ def _carries_credentials(cred_env: "dict[str, str]") -> bool:
     return False
 
 
-def _split_credentials(repo_url: str) -> "tuple[str, dict[str, str]]":
-    """Split an http(s) URL into (scrubbed URL, ephemeral git-config env).
+class _Credentials(NamedTuple):
+    """Two URLs because the uses differ: *store_url* lands in the mirror's
+    ``remote.origin.url`` on disk and never carries userinfo, of any scheme;
+    *fetch_url* is git's explicit argument and carries what the transport
+    needs (issue #163)."""
 
-    The env entries carry an ``http.<url>.extraHeader`` Authorization header
-    so the token reaches git without ever appearing on an argv (host ``ps``
-    shows every command line for the full duration of an initial mirror
-    build), preceded by :func:`_credential_sources_off` so exactly one
-    ``Authorization`` header goes out — ours. Without that reset an inherited
-    global header is sent *alongside* it (measured: git 2.52.0 puts both on
-    the wire).
+    store_url: str
+    fetch_url: str
+    env: "dict[str, str]"
 
-    URLs without userinfo — and URLs with no scheme or an unparseable one —
-    pass through with an **empty** env: the operator's own git config, credential
-    helper included, is then what authenticates, exactly as it did before this
-    function existed.
 
-    Note the userinfo branch is taken for *any* scheme, so an
-    ``ssh://user@host/…`` URL loses its login and gets a meaningless
-    ``http.ssh://….extraHeader``. That mangling predates this function and is
-    tracked separately — untangling it needs a store-URL/fetch-URL split, since
-    simply passing such URLs through puts their userinfo in the mirror's
-    ``remote.origin.url`` on disk, which the module's credential rules forbid.
+def _password_stripped(parsed) -> str:
+    """*parsed* re-rendered with its password removed and its login kept.
+
+    Netloc surgery, not a rebuild from ``parsed.username``: that attribute is
+    percent-decoded, so re-inserting it would rewrite a login containing
+    ``@`` or ``%``.
+    """
+    userinfo, _, hostpart = parsed.netloc.rpartition("@")
+    login = userinfo.split(":", 1)[0]
+    return urlunparse(parsed._replace(netloc=f"{login}@{hostpart}" if login else hostpart))
+
+
+def _split_credentials(repo_url: str) -> _Credentials:
+    """Split *repo_url* into the URL to store, the URL to fetch, and the env.
+
+    http(s): fetch the scrubbed URL, credential in ephemeral ``GIT_CONFIG_*``
+    env as an ``http.<url>.extraHeader`` so no token reaches an argv, preceded
+    by :func:`_credential_sources_off` so exactly one Authorization header goes
+    out. A username with no password stays credentialed — that is the
+    ``<token>@host`` spelling git itself treats this way.
+
+    Any other scheme: the userinfo is a transport login, so the fetch URL keeps
+    it and drops any password (no ssh transport reads one, and argv is
+    world-readable), and no header is built — ``http.ssh://….extraHeader`` is
+    read by nothing. The empty env also keeps :func:`_carries_credentials`
+    honest, so such a fetch earns no #157 retry (issue #163).
+
+    No userinfo, no scheme, or unparseable: identical URLs and an empty env,
+    leaving authentication to the operator's own git config.
     """
     if "://" not in repo_url:
-        return repo_url, {}
+        return _Credentials(repo_url, repo_url, {})
     try:
         parsed = urlparse(repo_url)
     except Exception:
-        return repo_url, {}
+        return _Credentials(repo_url, repo_url, {})
     if not parsed.username and not parsed.password:
-        return repo_url, {}
+        return _Credentials(repo_url, repo_url, {})
     host = parsed.hostname or ""
     if parsed.port:
         host = f"{host}:{parsed.port}"
     scrubbed = f"{parsed.scheme}://{host}{parsed.path or ''}"
+    if parsed.scheme not in ("http", "https"):
+        return _Credentials(scrubbed, _password_stripped(parsed), {})
     userinfo = f"{unquote(parsed.username or '')}:{unquote(parsed.password or '')}"
     token = base64.b64encode(userinfo.encode()).decode()
     entries = _credential_sources_off(scrubbed) + [
         (f"http.{scrubbed}.extraHeader", f"Authorization: Basic {token}"),
     ]
-    return scrubbed, _config_env(entries)
+    return _Credentials(scrubbed, scrubbed, _config_env(entries))
 
 
 def _git_env(cred_env: "dict[str, str]") -> "dict[str, str]":
@@ -327,6 +352,24 @@ def _git_env(cred_env: "dict[str, str]") -> "dict[str, str]":
     env["SSH_ASKPASS"] = ""
     env["GIT_SSH_COMMAND"] = env.get("GIT_SSH_COMMAND", "ssh") + " -oBatchMode=yes"
     return env
+
+
+def _describe_git(args: "list[str]") -> str:
+    """Render *args* as the command a reader can act on (issues #159, #160).
+
+    Only ``-C`` is unwrapped: the two caller shapes are
+    ``["-C", "<path>", "<subcommand>", …]`` and ``["<subcommand>", …]``, and a
+    general parser would need to know which other global flags take a value.
+    The result is scrubbed at the raise site along with git's own output — a
+    mirror path carries no userinfo, but a fetch URL in ``args`` can.
+    """
+    rest = list(args)
+    location = ""
+    if len(rest) >= 2 and rest[0] == "-C":
+        location = f" in {rest[1]}"
+        rest = rest[2:]
+    subcommand = rest[0] if rest else "?"
+    return f"git {subcommand}{location}"
 
 
 def _run_git(args: "list[str]", timeout: float, cred_env: "dict[str, str]") -> None:
@@ -345,9 +388,11 @@ def _run_git(args: "list[str]", timeout: float, cred_env: "dict[str, str]") -> N
         timeout=timeout,
     )
     if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
-            f"git {args[0]} failed (exit {result.returncode}): "
-            f"{_scrub_credentials((result.stderr or result.stdout or '').strip())}"
+            _scrub_credentials(
+                f"{_describe_git(args)} failed (exit {result.returncode}): {detail}"
+            )
         )
 
 
@@ -421,7 +466,7 @@ def _default_branch(url: str, cred_env: "dict[str, str]") -> "str | None":
     return None
 
 
-def _create_mirror(mirror: Path, scrubbed_url: str, cred_env: "dict[str, str]") -> None:
+def _create_mirror(mirror: Path, creds: _Credentials, cred_env: "dict[str, str]") -> None:
     """Build a ``clone --mirror``-equivalent bare repo without the token ever
     touching disk: init + scrubbed origin + explicit-URL fetch, in a sibling
     ``.tmp`` renamed into place. Any failure removes the tmp before
@@ -433,7 +478,7 @@ def _create_mirror(mirror: Path, scrubbed_url: str, cred_env: "dict[str, str]") 
     try:
         _run_git(["init", "--bare", "--quiet", str(tmp)], timeout=30, cred_env={})
         for key, value in (
-            ("remote.origin.url", scrubbed_url),
+            ("remote.origin.url", creds.store_url),
             ("remote.origin.mirror", "true"),
             ("remote.origin.fetch", "+refs/*:refs/*"),
             # fetch-triggered auto-gc deletes packfiles, which would yank
@@ -443,11 +488,11 @@ def _create_mirror(mirror: Path, scrubbed_url: str, cred_env: "dict[str, str]") 
         ):
             _run_git(["-C", str(tmp), "config", key, value], timeout=30, cred_env={})
         _run_git(
-            ["-C", str(tmp), "fetch", "--quiet", scrubbed_url, "+refs/*:refs/*"],
+            ["-C", str(tmp), "fetch", "--quiet", creds.fetch_url, "+refs/*:refs/*"],
             timeout=CREATE_TIMEOUT_S,
             cred_env=cred_env,
         )
-        head = _default_branch(scrubbed_url, cred_env)
+        head = _default_branch(creds.fetch_url, cred_env)
         if head:
             _run_git(["-C", str(tmp), "symbolic-ref", "HEAD", head], timeout=30, cred_env={})
         tmp.rename(mirror)
@@ -456,10 +501,10 @@ def _create_mirror(mirror: Path, scrubbed_url: str, cred_env: "dict[str, str]") 
         raise
 
 
-def _fetch_existing(mirror: Path, scrubbed_url: str, cred_env: "dict[str, str]") -> None:
-    """Refresh an existing mirror from *scrubbed_url*."""
+def _fetch_existing(mirror: Path, creds: _Credentials, cred_env: "dict[str, str]") -> None:
+    """Refresh an existing mirror from the fetch URL."""
     _run_git(
-        ["-C", str(mirror), "fetch", "--quiet", "--prune", scrubbed_url,
+        ["-C", str(mirror), "fetch", "--quiet", "--prune", creds.fetch_url,
          "+refs/*:refs/*"],
         timeout=FETCH_TIMEOUT_S,
         cred_env=cred_env,
@@ -471,12 +516,16 @@ def _attempt_with_fallback(
 ) -> None:
     """Run *operation(cred_env)*, retrying once anonymously if it failed (#157).
 
-    A credential lmer injected is not necessarily one the remote accepts: a
-    host with ``GITLAB_TOKEN`` set and no GitHub token gets that PAT injected
-    into github.com URLs by the generic token fallback, and GitHub challenges
-    it even for a **public** repo — which is how a mirror of a public repo
-    failed with "could not read Username" while an anonymous fetch of the same
-    URL would have succeeded (issue #157, seen in the #150 spike).
+    A credential lmer injected is not necessarily one the remote accepts:
+    a host with ``GITLAB_TOKEN`` set and no GitHub token *used to* get that
+    PAT injected into github.com URLs by the generic token fallback, and
+    GitHub challenges it even for a **public** repo — which is how a mirror
+    of a public repo failed with "could not read Username" while an anonymous
+    fetch of the same URL would have succeeded (issue #157, seen in the #150
+    spike). Since #161 the generic token is scoped to its issuing host, so
+    that exact path is closed and the retry now mainly covers explicitly
+    mis-scoped (``LMER_GITLAB_TOKEN_HOST``) or per-host tokens the target
+    rejects — the failure mode is unchanged, only its sources are fewer.
 
     So a failed attempt that *carried* credentials is retried once **with
     lmer's own injection dropped and nothing else changed** — an empty env,
@@ -534,7 +583,7 @@ def _attempt_with_fallback(
 
 def _update_one(mirror: Path, repo_url: str) -> None:
     """Create or refresh one mirror. Must be called under its flock."""
-    scrubbed_url, cred_env = _split_credentials(repo_url)
+    creds = _split_credentials(repo_url)
     stamp = _stamp_path(mirror)
     if (mirror / "HEAD").exists():
         try:
@@ -544,8 +593,8 @@ def _update_one(mirror: Path, repo_url: str) -> None:
             pass  # no stamp: treat as stale
         _clean_lock_droppings(mirror)
         _attempt_with_fallback(
-            lambda env: _fetch_existing(mirror, scrubbed_url, env),
-            mirror, cred_env,
+            lambda env: _fetch_existing(mirror, creds, env),
+            mirror, creds.env,
         )
     else:
         if mirror.is_dir():
@@ -556,8 +605,8 @@ def _update_one(mirror: Path, repo_url: str) -> None:
             _log(f"{mirror.name}: removing damaged mirror (no HEAD)")
             shutil.rmtree(mirror)
         _attempt_with_fallback(
-            lambda env: _create_mirror(mirror, scrubbed_url, env),
-            mirror, cred_env,
+            lambda env: _create_mirror(mirror, creds, env),
+            mirror, creds.env,
         )
     stamp.touch()
 

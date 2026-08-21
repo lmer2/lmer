@@ -70,10 +70,18 @@ disables the feature.
 Each preset's fields are all optional:
 
 - **`checkout`** — host path to a local source checkout, passed as
-  `--checkout` (mounted as `/workspace`). Required whenever `service` is set.
+  `--checkout` (mounted as `/workspace`). Required whenever `service` or
+  `service_group` is set.
 - **`service`** — a running container / Compose service to target, passed as
   `--service` ([service mode](./SERVICE-MODE.md); the agent can then run
   commands in that container via `target-exec`).
+- **`service_group`** — a Compose **project** whose running services the
+  session may target, passed as `--service-group`
+  ([service groups](./SERVICE-MODE.md#service-groups-one-session-a-whole-stack)).
+  The agent retargets `target-exec` at any member with `target-switch`, so one
+  preset covers a whole stack instead of one preset per container. Combine with
+  `service` to name the member the session starts on; on its own the session
+  starts with nothing targeted.
 - **`env`** — extra environment variables. How they merge with the
   invocation's environment is per-consumer — see
   [Merge semantics per consumer](#merge-semantics-per-consumer). Use for
@@ -97,8 +105,9 @@ consumer:
 - A missing, unreadable, or malformed file yields no presets (logged).
 - An individual invalid entry is logged with the offending preset name and
   skipped, so it cannot disable the others. Rejection reasons: not a JSON
-  object, `checkout`/`service` not a string, `service` without `checkout`
-  (mirrors the `--service` requires `--checkout` CLI rule), `env` not a
+  object, `checkout`/`service`/`service_group` not a string, `service` or
+  `service_group` without `checkout` (mirrors the `--service` /
+  `--service-group` require `--checkout` CLI rule), `env` not a
   string→string map, `args` not a list of strings, or a non-selectable name.
 - Unknown keys in an entry produce a warning but keep the preset — a typo /
   forward-compatibility signal rather than an error.
@@ -177,7 +186,18 @@ listener default `house_default` from `LMER_CHAT_PRESET`)... ⏳
 
 `lmer_session_spawned` records the same pair — `preset=` for the
 token-selected one, plus `default_preset=` or `displaced_default=` for the
-env-selected one.
+default it replaces, resolved the way the child itself resolves it
+(environment first, then the same `.env` file tiers the spawned `lmer`
+reads, including a forwarded `--env-file`).
+
+One residual: a selector whose value uses `${VAR}` interpolation may display
+differently from what the session resolves. The display expands a file's
+`${VAR}` against the listener's live environment, while the child expands it
+against an environment that the *earlier* `.env` tiers have already seeded, so
+a reference to a key introduced by an upper tier resolves for the child and not
+for the display. The failure direction is one-way: the display can lose a name
+this way (falling back to a lower-priority selector, or to no preset), never
+invent one. Avoid `${VAR}` in preset selectors if you want the ack to be exact.
 
 Two more things worth knowing:
 
@@ -192,7 +212,11 @@ Two more things worth knowing:
   default is only discovered by the spawned CLI, which exits 2. The listener
   therefore warns in the thread — naming the variable and listing the
   available presets — rather than leaving a session that dies seconds after
-  connecting with the reason buried in the listener's log.
+  connecting with the reason buried in the listener's log. "Defined" and
+  "available" are judged against `LMER_PRESETS_FILE` as the *spawned CLI*
+  resolves it, through the same `.env` tiers as the selector: a presets file
+  that lives only in a forwarded `--env-file` counts, and the names listed are
+  the ones that session could actually have used.
 
 ## CLI-selected presets
 
@@ -337,10 +361,14 @@ The trust model is preserved by resolving at launch: names are validated
 against `LMER_PRESETS_FILE` on the host — a name that is neither a preset
 nor a routable model fails fast (exit 2) listing the available presets, a
 duplicate warns and keeps the first occurrence — and only the resolved
-config crosses into the container, as `LMER_AGENTS` (names) plus
-`LMER_AGENTS_CONFIG` (JSON `{name: {"env": {...}, "prompt": "..."?}}`).
-The presets file never enters the container, so the agent can only spawn
-what was named at launch. Inside the session:
+config crosses into the container, as `LMER_SPAWN_AGENTS` (names) plus
+`LMER_SPAWN_AGENTS_CONFIG` (JSON `{name: {"env": {...}, "prompt": "..."?}}`).
+The container-side names are scoped away from the `LMER_AGENTS` input on
+purpose (issue #283): container env is ambient, so under the input name a
+nested `lmer` invocation inside the session inherited the outer selection
+and tried to resolve it against a presets file that never crossed the
+boundary. The presets file never enters the container, so the agent can
+only spawn what was named at launch. Inside the session:
 
 ```bash
 spawn-harness --list
@@ -376,9 +404,10 @@ instead of quietly shrinking the consolidation to N-1. Whether prose is a
 see [Non-interactive exec mode in docs/HARNESSES.md](./HARNESSES.md#non-interactive-exec-mode-spawn-harness)).
 Children run permission-free (the
 lmer container is the security boundary), stateless (no run dirs, no
-work-repo writes), and cannot fan out further — `LMER_AGENTS` /
-`LMER_AGENTS_CONFIG` are stripped from the child environment, so there are
-no grandchildren. Every child also gets `LMER_NONINTERACTIVE=1` and a
+work-repo writes), and cannot fan out further — both fan-out pairs
+(`LMER_SPAWN_AGENTS` / `LMER_SPAWN_AGENTS_CONFIG` and the host-input
+`LMER_AGENTS` / `LMER_AGENTS_CONFIG`) are stripped from the child
+environment, so there are no grandchildren. Every child also gets `LMER_NONINTERACTIVE=1` and a
 one-paragraph notice at the head of its prompt — "report a gate-worthy
 problem, never end the turn asking for approval" — because an unanswerable
 question in a child is a dropped result, not a pause. The notice is in-band

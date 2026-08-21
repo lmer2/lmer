@@ -107,6 +107,7 @@ FULL = {
     },
     "model_hints": ["acme"],
     "extra_env": {"ACME_NO_UPDATE": "1"},
+    "session_dir": "/home/developer/.acme/sessions",
 }
 
 
@@ -155,6 +156,44 @@ class TestLoader:
         assert h.exec_profile.dashdash_before_prompt is True
         assert h.model_hints == ("acme",)
         assert h.extra_env == (("ACME_NO_UPDATE", "1"),)
+        assert h.session_dir == "/home/developer/.acme/sessions"
+
+    def test_session_dir_is_absent_unless_declared(self, tmp_path, capsys):
+        # Optional: a manifest that says nothing about where it writes is not
+        # a broken one, so it must not warn either.
+        write_harness(tmp_path, "acme", MINIMAL)
+        assert load_user_harnesses(tmp_path)["acme"].session_dir is None
+        assert capsys.readouterr().err == ""
+
+    def test_session_dir_is_a_known_key(self, tmp_path, capsys):
+        write_harness(tmp_path, "acme", dict(MINIMAL, session_dir="/home/developer/.a"))
+        assert load_user_harnesses(tmp_path)["acme"].session_dir == "/home/developer/.a"
+        assert "unknown manifest key" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "sessions",                       # relative: no host dir derives from it
+            "/home/developer/../../sessions",  # traversal out of the container home
+            "",
+            "   ",
+            5,
+            # ':'/','/whitespace would break the host:container[:mode] mount
+            # argument the platform builds from this — and that parser fails the
+            # whole launch, a launch that may not even be on this harness.
+            "/home/developer/.a:rw",
+            "/home/developer/.a,b",
+            "/home/developer/.a b",
+        ],
+    )
+    def test_an_invalid_session_dir_is_ignored_not_fatal(self, tmp_path, capsys, bad):
+        # The field only buys a transcript mount, so a bad one costs the chat
+        # view's source — never the harness, and never the session.
+        write_harness(tmp_path, "acme", dict(MINIMAL, session_dir=bad))
+        loaded = load_user_harnesses(tmp_path)
+        assert set(loaded) == {"acme"}, "a mis-declared session_dir must still load"
+        assert loaded["acme"].session_dir is None
+        assert "session_dir" in capsys.readouterr().err
 
     def test_broken_entry_skipped_others_load(self, tmp_path, capsys):
         broken = write_harness(tmp_path, "broken", None)
@@ -452,13 +491,13 @@ class TestRegistryIntegration:
         # run the harness default instead of what the agent asked for.
         manifest = dict(
             MINIMAL,
-            binary="kimiish",
+            binary="envish",
             exec={"base_args": ["run"]},  # no model_args, no effort_args
         )
-        write_harness(tmp_path, "kimiish", manifest)
-        h = load_user_harnesses(tmp_path)["kimiish"]
+        write_harness(tmp_path, "envish", manifest)
+        h = load_user_harnesses(tmp_path)["envish"]
         argv, warnings = build_exec_argv(h, "go", model="some/model", effort="high")
-        assert argv == ["kimiish", "run", "go"]
+        assert argv == ["envish", "run", "go"]
         # Informational (not alarming): names the model not added to argv and
         # that an env-configured wrapper still delivers it.
         assert any("some/model" in w and "no model flag" in w for w in warnings)
@@ -899,6 +938,19 @@ class TestCliSourceGuards:
         pattern = re.compile(r"""["']LMER_HARNESS_CACHE["']\s*:""")
         assert pattern.search(source), (
             "LMER_HARNESS_CACHE entry missing from cli.py env dict"
+        )
+
+    def test_cli_env_dict_declares_mount_links(self):
+        """Without this entry the staged mounts (#293/#290) arrive with no
+        instruction to link them, so a user harness looks for its credentials
+        and its session directory at a path nothing was mounted at."""
+        from lmer_cli.mounts import MOUNT_LINKS_ENV
+
+        assert MOUNT_LINKS_ENV == "LMER_MOUNT_LINKS"
+        source = CLI_PY.read_text()
+        pattern = re.compile(r"""MOUNT_LINKS_ENV\s*:\s*format_mount_links\(""")
+        assert pattern.search(source), (
+            "LMER_MOUNT_LINKS entry missing from cli.py env dict"
         )
 
 

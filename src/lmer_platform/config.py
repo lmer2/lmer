@@ -83,6 +83,9 @@ from urllib.parse import urlsplit
 # the same trade :mod:`lmer_platform.workrepo` makes, and it says why there.
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.runtime import RuntimeErrorDetect, detect_runtime
+# The token lookup's own host parser: the issuing-host default seeded below has
+# to agree with what :func:`lmer_cli.tokens._gitlab_token_issuing_host` reads.
+from lmer_cli.tokens import _host_from_git_url
 from lmer_cli.util import get_bool_env
 # The forge names are the URL builder's, imported rather than spelled again here:
 # what ``work_repo_forge`` accepts has to be exactly what
@@ -112,6 +115,9 @@ __all__ = [
     "update_stored", "validate_assistant_override",
     "CHECKIN_SETTING_KEYS", "DEFAULT_CHECKIN_WINDOW_SECONDS",
     "ENV_CHECKIN_WINDOW", "checkin_settings", "validate_checkin_window",
+    "INT_SETTINGS", "NUDGE_SETTING_KEYS", "DEFAULT_NUDGE_AFTER_SECONDS",
+    "DEFAULT_NUDGE_PENDING_THRESHOLD", "ENV_NUDGE_AFTER_SECONDS",
+    "ENV_NUDGE_PENDING_THRESHOLD", "nudge_settings", "validate_int_setting",
     "DEFAULT_STALL_IDLE_SECONDS", "DEFAULT_STALL_BACKSTOP_SECONDS",
     "ENV_STALL_IDLE_SECONDS", "ENV_STALL_BACKSTOP_SECONDS",
 ]
@@ -148,6 +154,20 @@ DEFAULT_MAX_FOLLOWUP_ROUNDS = 5
 #: operator's number, and a reminder interval rather than a deadline — a run past
 #: it costs one line in one digest. ``0`` turns check-in digests off.
 DEFAULT_CHECKIN_WINDOW_SECONDS = 3600
+
+#: How long an unretrieved digest spool waits — and the assistant stays quiet —
+#: before the daemon types a reminder into its session (issue #317). The
+#: operator's number. ``0`` turns the nudge off, and is the only off-switch.
+#: Full mechanics: ``docs/PLATFORM-QUICKSTART.md``, "Digest nudges".
+DEFAULT_NUDGE_AFTER_SECONDS = 180
+#: How many digests have to be waiting. 1 because everything in the spool is
+#: material by construction, so "there is one" is already the condition.
+DEFAULT_NUDGE_PENDING_THRESHOLD = 1
+#: Ceiling on ``nudge_pending_threshold``: the spool it counts is bounded, so a
+#: higher threshold could never be met and would be an undocumented off-switch.
+#: :data:`lmer_platform.assistant.MAX_PENDING`, copied because that module imports
+#: this one; ``tests/test_platform_nudge.py`` pins the copy.
+MAX_NUDGE_PENDING_THRESHOLD = 50
 
 #: How long a live session may produce nothing before halt detection considers
 #: it (#243). An operator's number, not a derived one; silence alone does not
@@ -223,6 +243,101 @@ ENV_CHECKIN_WINDOW = "LMER_PLATFORM_CHECKIN_WINDOW_SECONDS"
 #: second knob costs one line, as in the launch table above.
 CHECKIN_SETTING_KEYS = {
     "window_seconds": ("checkin_window_seconds", ENV_CHECKIN_WINDOW),
+}
+
+#: The digest nudge's two knobs, per platform instance (issue #317).
+#: :data:`CHECKIN_SETTING_KEYS`' group rather than
+#: :data:`ASSISTANT_SETTING_KEYS`', for that table's reason: integers the daemon
+#: reads on its own tick, not argv tokens.
+ENV_NUDGE_AFTER_SECONDS = "LMER_PLATFORM_NUDGE_AFTER_SECONDS"
+ENV_NUDGE_PENDING_THRESHOLD = "LMER_PLATFORM_NUDGE_PENDING_THRESHOLD"
+
+#: setting key -> (PlatformConfig field, env var), as above.
+NUDGE_SETTING_KEYS = {
+    "after_seconds": ("nudge_after_seconds", ENV_NUDGE_AFTER_SECONDS),
+    "pending_threshold": (
+        "nudge_pending_threshold", ENV_NUDGE_PENDING_THRESHOLD
+    ),
+}
+
+
+@dataclass(frozen=True)
+class _IntSettingRule:
+    """What is true of one integer setting, wherever it is being read.
+
+    The three postures this module takes on a value — warn-and-default inside
+    ``load()``, warn-and-fall-through per layer, refuse an explicit write — all
+    need the same three facts, and the alternative to naming them once is one
+    copy of each rule per setting. That is how the copies start to disagree:
+    ``checkin_window_seconds`` had its own set, and a second knob would have
+    arrived with a second.
+    """
+
+    #: The default the warn-and-default posture falls back to.
+    default: int
+    #: Smallest usable value. ``0`` where zero is the off-switch, ``1`` where an
+    #: off-switch lives on a neighbouring setting instead.
+    minimum: int
+    #: Why a value below :attr:`minimum` is refused, in the operator's terms —
+    #: the sentence tells them what zero (or one) would have meant.
+    floor_reason: str
+    #: The log key the warn paths use. Per setting rather than one shared key,
+    #: because a grep for a specific misconfiguration is how these are found.
+    log_key: str
+    #: What the value counts, so the shared warn message keeps its unit.
+    unit: str
+    #: The one-count spelling, declared rather than guessed from the plural.
+    singular_unit: str
+    #: Largest usable value, or ``None`` where a larger number is merely slower
+    #: rather than unreachable. Required wherever the setting is measured against
+    #: something bounded: an unsatisfiable value is an undocumented off-switch.
+    maximum: Optional[int] = None
+    #: Why a value above :attr:`maximum` is refused; names the real off-switch.
+    ceiling_reason: Optional[str] = None
+
+
+#: PlatformConfig field -> its rule, for every integer setting resolved by the
+#: warn-don't-refuse path. The strict ones (``bind_port``) keep :func:`_env_int`,
+#: which raises: a daemon bound where nobody expects it beats one that will not
+#: start.
+INT_SETTINGS = {
+    "checkin_window_seconds": _IntSettingRule(
+        default=DEFAULT_CHECKIN_WINDOW_SECONDS,
+        minimum=0,
+        floor_reason=(
+            "a window cannot be negative — 0 disables check-in digests"
+        ),
+        log_key="platform_checkin_window_invalid",
+        unit="seconds",
+        singular_unit="second",
+    ),
+    "nudge_after_seconds": _IntSettingRule(
+        default=DEFAULT_NUDGE_AFTER_SECONDS,
+        minimum=0,
+        floor_reason=(
+            "an interval cannot be negative — 0 disables the digest nudge"
+        ),
+        log_key="platform_nudge_after_invalid",
+        unit="seconds",
+        singular_unit="second",
+    ),
+    "nudge_pending_threshold": _IntSettingRule(
+        default=DEFAULT_NUDGE_PENDING_THRESHOLD,
+        minimum=1,
+        floor_reason=(
+            "at least one digest has to be waiting for a nudge to be about "
+            "anything — disable the nudge with nudge_after_seconds=0 instead"
+        ),
+        log_key="platform_nudge_threshold_invalid",
+        unit="digests",
+        singular_unit="digest",
+        maximum=MAX_NUDGE_PENDING_THRESHOLD,
+        ceiling_reason=(
+            f"the digest spool holds at most {MAX_NUDGE_PENDING_THRESHOLD}, so a "
+            "higher threshold could never be met — disable the nudge with "
+            "nudge_after_seconds=0 instead"
+        ),
+    ),
 }
 
 #: setting key -> (PlatformConfig field, env var). The one table the loader,
@@ -340,6 +455,10 @@ class PlatformConfig:
     #: it (issue #244), in seconds. ``0`` disables check-in digests; see
     #: :data:`ENV_CHECKIN_WINDOW` for why this sits apart from the four above.
     checkin_window_seconds: int = DEFAULT_CHECKIN_WINDOW_SECONDS
+    #: The digest nudge's interval and threshold (issue #317), in seconds and in
+    #: digests. See :data:`NUDGE_SETTING_KEYS` and :data:`INT_SETTINGS`.
+    nudge_after_seconds: int = DEFAULT_NUDGE_AFTER_SECONDS
+    nudge_pending_threshold: int = DEFAULT_NUDGE_PENDING_THRESHOLD
 
     @property
     def secret_path(self) -> Path:
@@ -454,9 +573,10 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
     slots = _slots_value(config.slots)
     if slots != config.slots:
         config = replace(config, slots=slots)
-    window = _checkin_window_value(config.checkin_window_seconds)
-    if window != config.checkin_window_seconds:
-        config = replace(config, checkin_window_seconds=window)
+    for field_name in INT_SETTINGS:
+        usable = _int_setting_value(getattr(config, field_name), field=field_name)
+        if usable != getattr(config, field_name):
+            config = replace(config, **{field_name: usable})
     return config
 
 
@@ -480,30 +600,33 @@ def _slots_value(value: object) -> tuple:
     return ()
 
 
-def _checkin_window_value(value: object) -> int:
-    """A usable check-in window, or the default with a warning.
+def _int_setting_value(value: object, *, field: str) -> int:
+    """A usable value for one integer setting, or its default with a warning.
 
     :func:`_assistant_value`'s posture: this resolves inside ``load()``, so
     refusing would be a host that will not boot over a number whose only effect
-    is how often a reminder is spooled. An *explicit* write gets the opposite
-    treatment (:func:`validate_checkin_window`).
+    is how often a reminder is spooled or a line is typed. An *explicit* write
+    gets the opposite treatment (:func:`validate_int_setting`).
     """
-    coerced = _coerced_window(value)
-    reason = _checkin_window_reason(coerced)
+    rule = INT_SETTINGS[field]
+    coerced = _coerced_int(value)
+    reason = _int_setting_reason(coerced, field=field)
     if reason is None:
         return int(coerced)
+    unit = rule.singular_unit if rule.default == 1 else rule.unit
     logger.warning(
-        "platform_checkin_window_invalid value=%r — %s; using the default of "
-        "%ds instead", value, reason, DEFAULT_CHECKIN_WINDOW_SECONDS,
+        "%s value=%r — %s; using the default of %d %s instead",
+        rule.log_key, value, reason, rule.default, unit,
     )
-    return DEFAULT_CHECKIN_WINDOW_SECONDS
+    return rule.default
 
 
-def _coerced_window(value: object) -> object:
+def _coerced_int(value: object) -> object:
     """*value* as an int when it is one written down, else unchanged.
 
-    Every layer that carries this value can carry text — an export, a form field,
-    a hand-edited file. Anything that is not a number keeps its own refusal below.
+    Every layer that carries these values can carry text — an export, a form
+    field, a hand-edited file. Anything that is not a number keeps its own
+    refusal below.
     """
     if isinstance(value, str):
         try:
@@ -513,31 +636,44 @@ def _coerced_window(value: object) -> object:
     return value
 
 
-def _checkin_window_reason(value: object) -> Optional[str]:
-    """Why *value* cannot be a check-in window — ``None`` when it can.
+def _int_setting_reason(value: object, *, field: str) -> Optional[str]:
+    """Why *value* cannot be *field* — ``None`` when it can.
 
     One rule set behind both postures, as :func:`_unusable_reason` is for the
     launch settings. Call it on a coerced value.
     """
+    rule = INT_SETTINGS[field]
     if isinstance(value, bool) or not isinstance(value, int):
-        return f"it is not a whole number of seconds ({type(value).__name__})"
-    if value < 0:
-        return "a window cannot be negative — 0 disables check-in digests"
+        return f"it is not a whole number ({type(value).__name__})"
+    if value < rule.minimum:
+        return rule.floor_reason
+    if rule.maximum is not None and value > rule.maximum:
+        return rule.ceiling_reason
     return None
 
 
-def validate_checkin_window(value: object) -> int:
-    """A usable check-in window from an explicit ask, or a refusal.
+def validate_int_setting(field: str, value: object) -> int:
+    """A usable value for *field* from an explicit ask, or a refusal.
 
     The caller is attached and asking for exactly this value, so an unusable one
-    is a :class:`ConfigError` for the route to answer 400 with: a window silently
+    is a :class:`ConfigError` for the route to answer 400 with: a value silently
     normalised to the default is a setting the operator believes they changed.
     """
-    coerced = _coerced_window(value)
-    reason = _checkin_window_reason(coerced)
+    coerced = _coerced_int(value)
+    reason = _int_setting_reason(coerced, field=field)
     if reason is not None:
-        raise ConfigError(f"checkin_window_seconds is unusable ({value!r}): {reason}")
+        raise ConfigError(f"{field} is unusable ({value!r}): {reason}")
     return int(coerced)
+
+
+def validate_checkin_window(value: object) -> int:
+    """:func:`validate_int_setting` for the check-in window.
+
+    Kept as its own name because the route that answers 400 with it reads better
+    for saying which setting it is validating, and because it was the first of
+    these and is what callers already import.
+    """
+    return validate_int_setting("checkin_window_seconds", value)
 
 
 def _assistant_value(value: object, *, field: str) -> Optional[str]:
@@ -842,11 +978,14 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         # Not `_env_int`: it raises, which is right for a bind port and wrong
         # for a reminder interval. Cleaned here rather than in ``_validate`` so
         # an unusable export costs its own layer and lets ``config.json`` show
-        # through — which is what :func:`checkin_settings` answers, and the two
-        # must not disagree.
-        "checkin_window_seconds": _layer_window(
-            _env_str(ENV_CHECKIN_WINDOW), layer="env"
-        ),
+        # through — which is what :func:`checkin_settings` and
+        # :func:`nudge_settings` answer, and the two readers must not disagree.
+        **{
+            field: _layer_int(_env_str(env_var), layer="env", field=field)
+            for field, env_var in (
+                *CHECKIN_SETTING_KEYS.values(), *NUDGE_SETTING_KEYS.values(),
+            )
+        },
         **{
             field: _env_str(env_var)
             for field, env_var in ASSISTANT_SETTING_KEYS.values()
@@ -873,7 +1012,31 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
             )
         values.update({k: v for k, v in overrides.items() if v is not None})
 
-    return _validate(PlatformConfig(**values))
+    config = _validate(PlatformConfig(**values))
+    _seed_gitlab_token_host(config.work_repo_url)
+    return config
+
+
+def _seed_gitlab_token_host(work_repo_url: Optional[str]) -> None:
+    """Default the generic token's issuing host to the resolved work repo.
+
+    ``lmer_cli.tokens`` scopes a generic ``GITLAB_TOKEN`` to the host that
+    issued it, and its default for that host reads ``LMER_WORK_REPO`` — which
+    a platform deployment configured through ``config.json`` legitimately never
+    exports, so the token would be refused for the work repo's own host
+    (issue #161 review finding). Seeding the variable here, at the single point
+    where the work-repo URL is resolved, also carries the answer to spawned
+    children through the environment.
+
+    ``setdefault``: an explicit ``LMER_GITLAB_TOKEN_HOST`` is the operator's
+    decision and always wins, and repeated :func:`load` calls stay idempotent.
+    ``LMER_WORK_REPO`` itself is deliberately NOT seeded — other code branches
+    on whether it is set at all.
+    """
+    host = _host_from_git_url(work_repo_url or "")
+    if not host:
+        return
+    os.environ.setdefault("LMER_GITLAB_TOKEN_HOST", host)
 
 
 def save(config: PlatformConfig) -> None:
@@ -997,6 +1160,22 @@ def checkin_settings() -> dict:
     :func:`assistant_settings`' sibling, read **fresh** for a stronger version of
     its reason: the detector reads this every tick, so an operator who widens the
     window expects the next sweep to use it, not the next restart.
+    """
+    return _int_group_settings(CHECKIN_SETTING_KEYS, group="check-in")
+
+
+def nudge_settings() -> dict:
+    """The nudge group's effective settings, one per :data:`NUDGE_SETTING_KEYS`.
+
+    :func:`checkin_settings`' sibling on the same terms and for the same reason:
+    the detector reads both every tick, so a threshold an operator raises applies
+    to the next tick rather than the next restart.
+    """
+    return _int_group_settings(NUDGE_SETTING_KEYS, group="nudge")
+
+
+def _int_group_settings(keys: dict, *, group: str) -> dict:
+    """One integer setting group, resolved layer by layer.
 
     An unusable layer falls through with a warning, so the effective answer is
     the one the tick will read — a screen reporting a value the daemon would have
@@ -1006,17 +1185,17 @@ def checkin_settings() -> dict:
         stored = read_json(config_path())
     except StoreError as exc:
         logger.error(
-            "platform_config_unreadable error=%s — check-in settings resolve "
-            "from the environment and defaults only", exc,
+            "platform_config_unreadable error=%s — %s settings resolve "
+            "from the environment and defaults only", exc, group,
         )
         stored = None
     if not isinstance(stored, dict):
         stored = {}
     resolved = {}
-    for key, (field, env_var) in CHECKIN_SETTING_KEYS.items():
+    for key, (field, env_var) in keys.items():
         raw = stored.get(field)
-        env_value = _layer_window(_env_str(env_var), layer="env")
-        file_value = _layer_window(raw, layer="config.json")
+        env_value = _layer_int(_env_str(env_var), layer="env", field=field)
+        file_value = _layer_int(raw, layer="config.json", field=field)
         if env_value is not None:
             resolved[key] = AssistantSetting(
                 value=env_value, source="env", stored=raw
@@ -1028,37 +1207,38 @@ def checkin_settings() -> dict:
             )
             continue
         resolved[key] = AssistantSetting(
-            value=DEFAULT_CHECKIN_WINDOW_SECONDS, source="default", stored=raw
+            value=INT_SETTINGS[field].default, source="default", stored=raw
         )
     return resolved
 
 
-#: Bad ``(layer, value)`` pairs already warned about. This resolution runs on
-#: every fleet read, so one typo in an export would otherwise warn every few
-#: seconds for the life of the daemon. Keyed on the value too, so a
+#: Bad ``(field, layer, value)`` triples already warned about. This resolution
+#: runs on every fleet read, so one typo in an export would otherwise warn every
+#: few seconds for the life of the daemon. Keyed on the value too, so a
 #: corrected-then-broken-again one is announced again.
-_WARNED_WINDOWS: set = set()
+_WARNED_INT_SETTINGS: set = set()
 
 
-def _layer_window(raw: object, *, layer: str) -> Optional[int]:
-    """One layer's window, or ``None`` when it says nothing usable.
+def _layer_int(raw: object, *, layer: str, field: str) -> Optional[int]:
+    """One layer's value for *field*, or ``None`` when it says nothing usable.
 
-    ``_assistant_value``'s shape for the integer group: a bad value costs *that
-    layer*, so an export of ``"soon"`` resolves to what ``config.json`` says.
+    ``_assistant_value``'s shape for the integer settings: a bad value costs
+    *that layer*, so an export of ``"soon"`` resolves to what ``config.json``
+    says.
     """
     if raw is None:
         return None
-    coerced = _coerced_window(raw)
-    reason = _checkin_window_reason(coerced)
+    coerced = _coerced_int(raw)
+    reason = _int_setting_reason(coerced, field=field)
     if reason is None:
         return int(coerced)
-    seen = (layer, repr(raw))
-    if seen not in _WARNED_WINDOWS:
-        _WARNED_WINDOWS.add(seen)
+    seen = (field, layer, repr(raw))
+    if seen not in _WARNED_INT_SETTINGS:
+        _WARNED_INT_SETTINGS.add(seen)
         logger.warning(
-            "platform_checkin_window_invalid layer=%s value=%r — %s; resolving "
-            "as if this layer were unset (said once per value)",
-            layer, raw, reason,
+            "%s layer=%s value=%r — %s; resolving as if this layer were unset "
+            "(said once per value)",
+            INT_SETTINGS[field].log_key, layer, raw, reason,
         )
     return None
 

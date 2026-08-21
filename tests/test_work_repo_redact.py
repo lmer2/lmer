@@ -9,7 +9,13 @@ from unittest.mock import patch
 
 import pytest
 
-from work_repo.utils import redact_secrets, _collect_secret_values, _REDACTED
+from work_repo.utils import (
+    redact_secrets,
+    _collect_secret_values,
+    _REDACTED,
+    is_secret_env_name,
+    strip_url_credentials,
+)
 from work_repo.loggers import YamlFileLogger
 from work_repo.cli import cmd_log, cmd_report
 
@@ -322,3 +328,81 @@ class TestCmdReportRedaction:
                 report_files = list(target_dir.glob("*.md"))
                 assert len(report_files) == 1
                 assert report_files[0].read_text() == original_content
+
+
+class TestIsSecretEnvName:
+    """The shared sensitive-name rule (issue #285)."""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "GITLAB_TOKEN",
+            "LMER_FASTAPI_TOKEN",
+            "lmer_api_key",
+            "MY_SECRET",
+            "DB_PASSWORD",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ],
+    )
+    def test_sensitive_names_match(self, name):
+        assert is_secret_env_name(name)
+
+    @pytest.mark.parametrize(
+        "name",
+        ["LMER_REPO_URL", "LMER_TASK_TARGET", "HOME", "LMER_WORK_REPO"],
+    )
+    def test_plain_names_do_not_match(self, name):
+        assert not is_secret_env_name(name)
+
+
+class TestStripUrlCredentials:
+    """URL-preserving credential strip shared by the /start surfaces."""
+
+    def test_strips_oauth2_userinfo(self):
+        secret = "glpat-" + "a1b2c3d4e5f6g7h8i9j0"
+        url = f"https://oauth2:{secret}@gitlab.example.com/org/repo.git"
+        result = strip_url_credentials(url)
+        assert result == "https://gitlab.example.com/org/repo.git"
+        assert secret not in result
+
+    def test_strips_userinfo_but_keeps_port(self):
+        url = "https://user:secretpass@gitlab.example.com:8443/org/repo.git"
+        assert (
+            strip_url_credentials(url)
+            == "https://gitlab.example.com:8443/org/repo.git"
+        )
+
+    def test_plain_url_unchanged(self):
+        url = "https://gitlab.example.com/org/repo.git"
+        assert strip_url_credentials(url) == url
+
+    def test_scp_style_ssh_remote_unchanged(self):
+        url = "git@gitlab.example.com:org/repo.git"
+        assert strip_url_credentials(url) == url
+
+    def test_ssh_scheme_userinfo_is_stripped(self):
+        """Fail-closed pin: ssh:// userinfo is plumbing, not a credential,
+        but the filter cannot tell — the username is stripped (yielding an
+        uncloneable-but-informative URL) rather than risking a token in a
+        username-only credential form."""
+        url = "ssh://git@gitlab.example.com/org/repo.git"
+        assert (
+            strip_url_credentials(url)
+            == "ssh://gitlab.example.com/org/repo.git"
+        )
+
+    def test_empty_and_none_pass_through(self):
+        assert strip_url_credentials("") == ""
+        assert strip_url_credentials(None) is None
+
+    def test_non_url_value_unchanged(self):
+        assert strip_url_credentials("develop") == "develop"
+
+    def test_fails_closed_on_unparseable_url(self):
+        # An out-of-range port makes urlparse(...).port raise; the helper
+        # must still strip the credential, never return it verbatim.
+        secret = "glpat-" + "a1b2c3d4e5f6g7h8i9j0"
+        url = f"https://oauth2:{secret}@gitlab.example.com:99999/repo.git"
+        result = strip_url_credentials(url)
+        assert secret not in result
+        assert "oauth2" not in result

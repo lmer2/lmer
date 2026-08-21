@@ -76,7 +76,20 @@ Located in `~/.claude/`:
 - `commits.log` - Commits made via pc
 - `violations.log` - Rule violations (if any)
 
-## Claude Code Stop Hooks
+## Lifecycle Stop Hooks
+
+### codex_ask_guard.py
+
+Installed for Codex through the image-managed
+`agent-files/codex/requirements.toml`. In an interactive orchestrated session,
+it waits while any `lmer-ask` question is open and uses Codex's native Stop
+block to continue when the oldest unread answer appears. An answer already on
+disk when Stop fires is handled immediately. The hook never reads answer text;
+the continuation tells the agent to retrieve it with `lmer-ask wait`.
+
+The managed policy pins Codex's `hooks` feature on. Channel errors, a settled
+channel, repeated hook turns, non-interactive children, and the 3540-second
+timeout all fail open.
 
 ### run_state_guard.py
 
@@ -100,6 +113,54 @@ truthy enables the guard; `LMER_RUN_STATE_GUARD=0` disables it.
 The hook fails open: unreadable payload, git errors, `work` failures, or
 sentinel/counter I/O errors all result in exit 0 with no output. It only
 reads state and never mutates the run, the workspace, or the work repo.
+
+### signal_guard.py
+
+Registered as the third `Stop` hook in `agent-files/claude/settings.json`.
+In an orchestrated session (`LMER_ASK_DIR` set), it blocks a stop once when
+the turn shows an unreported milestone: a successful milestone-shaped command
+in the transcript (the `_MILESTONE_PATTERNS` list — `gate-push`,
+`gitlab-review --create-mr`/`--review-file`/`--reply-thread`,
+`github-review --review-file`, `work state set --status=complete`)
+or a run record reporting itself complete, with no signal-equivalent act after
+it (a successful `lmer-signal`; a newer signal file in the channel dir, but
+only when the transcript holds no signal of its own — ordered evidence wins
+over a file with no position in the turn; or a newly opened `lmer-ask`
+question). The reminder asks the agent to run `lmer-signal`; the hook **never
+signals on the agent's behalf** — a signal must keep meaning a milestone. The
+GitLab and GitHub post-review wrappers own their milestone instead: after the
+review command succeeds they call `lmer-signal` directly. Signalling is
+best-effort: no orchestrator channel or no installed signal command warns but
+does not turn an already-posted review into a failed wrapper that a caller might
+retry. A failed review exits with the review command's status and never signals
+success. The transcript guard deliberately does not infer wrapper execution;
+parsing command text cannot establish the post succeeded, and doing so produced
+a redundant second-review reminder after the wrapper had already signalled.
+
+Fires once per distinct milestone, capped at 3 per session via a `/tmp`
+marker keyed on `LMER_SESSION_ID` and written atomically (a torn marker reads
+as corrupt, which would disable the guard for the session). Kill switch:
+`LMER_SIGNAL_GUARD` with `get_bool_env` semantics. Fan-out children
+(`LMER_NONINTERACTIVE`) are skipped entirely — a `claude -p` child's only
+output is its last turn, so a Stop block would replace the result its parent
+is waiting for. Fails open on every error path, including a marker write
+failure (which drops the nudge rather than risk an uncapped one).
+
+Both channel-dir suppressors are bounded against baselines in the marker, so
+one signal (or one long-lived open question) cannot silence every later
+milestone in the session.
+
+Adding a milestone-shaped command to lmer means adding a row to
+`_MILESTONE_PATTERNS` — the list is the single place the guard learns what a
+milestone looks like, and
+`tests/test_signal_guard.py::TestPatternsMatchRealCommands` pins each row's
+flag against the real argparse parser (a row once named a `--post-review`
+flag that no CLI has).
+
+The list is known spellings, not a classifier: a milestone reached through a
+slash command (which produces no Bash `tool_use` block), a subagent, or an MCP
+tool is invisible, so silence from this hook means "nothing to report" rather
+than "nothing happened".
 
 ## Testing
 

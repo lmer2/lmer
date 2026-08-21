@@ -116,7 +116,12 @@ conversation window is lost.
   with the orange border and the robot is uber lmer itself; `chat` on that
   row (or the robot in the app bar) opens its drawer.
 - **Spawn a run** — the `run` button. Taskdef + target, optionally a preset,
-  a fan-out roster (`--agents`), a title.
+  a fan-out roster (`--agents`), a title. A plain clone URL is a complete target
+  by itself: the platform derives the run identity from it, records that
+  repository, tracks the run, and keeps the title without requiring the repo-URL
+  field to repeat the same value. GitLab/GitHub web routes and generic web-page
+  URLs are not treated as repository evidence; use the repo-URL field when an
+  HTTP clone URL is not recognisable as a forge root or does not end in `.git`.
 - **Answer a question** — a run stopped on a question shows a reply box.
   Answering a *stopped* run starts a fresh session with the answer attached;
   replying to a *live* one is delivered into the waiting session.
@@ -127,6 +132,23 @@ conversation window is lost.
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
   drawer when needed.
+- **A narrower app** — the toggle in the app bar holds the whole app — the bar, the
+  run list, the content and uber lmer's drawer — in a 1620px band in the middle of
+  the screen instead of spreading it across a wide window. It is the effect of
+  narrowing the browser, for a window that has other tabs in it. Offered on a desktop
+  only (below the band's own width it does nothing) and remembered between loads.
+  Uber lmer stays where it always is, in the right-hand drawer — and with the band
+  on it comes up open, because the band's width is the smallest one that still
+  fits the run view beside that drawer.
+- **redraw** (terminal view, beside the x1/x1.5/x2 height presets) — for a terminal
+  that has gone garbled. It always rebuilds *this* view: the log tail is re-read into
+  a fresh emulator, which is what repairs output this browser missed across a
+  reconnect. If **fit to my screen** is on it also asks the session itself to
+  repaint, by holding it one row taller for a moment before the rebuild hands its
+  real size back — that half is a write to a PTY every watcher shares, which is why
+  the fit switch (already the one gate on writing sizes) decides whether it happens.
+  Whether a given TUI repaints on being resized is the TUI's own behaviour; if it
+  does not, tap again or use its own redraw key.
 - **uber lmer settings** — how its session is *run* (model, harness, preset,
   agents fan-out), per platform instance: the settings entry in the drawer's
   overflow menu, or `GET`/`POST /api/assistant/config`. Each value shows which
@@ -135,6 +157,12 @@ conversation window is lost.
   the **next** incarnation — the running one keeps its context window until
   you restart it, and the dialog offers the restart. Standing orders are the
   chat's to edit and are deliberately not in this dialog.
+- **A message that never settles** — a message you sent is shown as a bubble until
+  the harness writes that turn into its transcript, which is how a queued message
+  stays visible. When one gets stuck there — a transcript gap, which is a bug rather
+  than a wait — the × on the bubble takes it off the screen. Display only, for as
+  long as the page is loaded: the message was sent, nothing is deleted, and if the
+  turn does land later it appears as the ordinary transcript turn it always was.
 - **Adopt / forget** — runs started outside the platform can be adopted into
   the fleet view (`+ run` → adopt, or `POST /api/runs/adopt`); ended runs can
   be forgotten from their card (undo window; nothing on disk is touched).
@@ -185,6 +213,125 @@ conversation window is lost.
   renders the new chip as the raw word `stalled`. A restart is what makes the two
   config fields take effect; there is no migration, and an existing
   `config.json` without them takes the defaults.
+
+- **Digest nudges** — the daemon spools digests for uber lmer, and nothing reads
+  that spool until uber lmer takes it. When digests sit there while the session
+  is quiet, the daemon types one reminder into it. Defaults: one digest, three
+  minutes. Full behaviour in the section below.
+
+## Digest nudges
+
+The digest spool is pull-only: the daemon detects questions, crashes, finished
+work and signalled milestones, writes a digest, and waits. What reads it is a
+watch uber lmer arms on itself — and a watch stops. A skipped re-arm, a stale
+edge detector, a harness with no background-monitor tool at all: each ends with
+digests sitting unread. Measured on 2026-08-19: ten digests over seventeen
+minutes, live questions among them, and the operator noticed before the
+assistant did.
+
+So the daemon nudges. On each detection tick (30s) it types **one sentence**
+into uber lmer's own session, over the same input path a wind-down uses:
+
+```
+[lmer platform] 4 digests have been waiting in your spool for 6 minutes and this
+session has been quiet. This is an automatic reminder from the daemon, not the
+operator, and it is not a new task: take the spool with POST
+/api/assistant/pending, ...
+```
+
+**No digest is ever pushed.** The reminder says something is waiting;
+`POST /api/assistant/pending` remains the only way out of the spool, which stays
+the one bounded, scrubbed source.
+
+### When a nudge fires
+
+All five, or nothing is typed:
+
+| condition | why it is there |
+|---|---|
+| the interval is non-zero | `0` is the off-switch, and the only one |
+| an assistant is running | there is otherwise no session to type into |
+| at least *N* digests are waiting | a threshold, not a trigger: one nudge covers however many arrived |
+| the accumulation has waited past *X* | dated from the moment the spool went from empty to holding something |
+| the session has been quiet for *X*, and has drawn at least one byte | a working assistant does not need telling, and a session whose harness has not rendered yet has no input to read |
+
+The accumulation's age is deliberately **not** the age of the oldest digest still
+in the spool. The spool holds at most 50, so on a loud fleet the retained ages
+drift younger as older digests are evicted — reading them would mean the busiest
+fleet is the one never nudged. A state written before this stamp existed falls
+back to the oldest retained digest, and an inherited spool keeps its age across
+the upgrade rather than being re-dated by the next digest to arrive.
+
+"Quiet" is the in-container supervisor's own `idle_seconds`, which measures time
+since the session last produced **output**. A long silent tool call therefore
+reads as quiet, and a reminder can land mid-turn; the agent picks it up at its
+next boundary. Where the daemon cannot obtain the reading at all — an older
+image, a control plane that did not answer — it nudges anyway, because treating
+"unknown" as "busy" would switch the safety net off on exactly the hosts least
+able to notice. It does not then claim the session was quiet.
+
+### One reminder per interval, and how it self-heals
+
+The nudge stamps the spool, and the stamp restarts the interval clock — so a
+spool still unread *X* later is nudged again, while the wait the sentence reports
+stays the accumulation's own. Taking the spool clears the stamp and ends the
+accumulation; whatever arrives next is a new one, owed its own reminder. It is
+never one reminder per digest.
+
+If clock correction leaves that stamp in the future, the daemon durably clamps
+it to the current time once. The ordinary interval can then elapse across ticks
+and daemon restarts; if the correction cannot be written, that future value is
+ignored for the decision so it cannot silence the accumulation indefinitely.
+
+The repeat is the remedy for the one thing the platform cannot know: the input
+path proves the bytes reached the control plane and cannot prove the harness
+registered the Enter that submits them. A reminder that vanished leaves an idle
+session and a full spool, and the next window covers it. A reminder that landed
+makes the session busy, which stops the next one with no bookkeeping at all —
+the same property that means there is no separate "is it draining right now"
+check.
+
+Two error paths matter, and they are opposite:
+
+- A send that was **refused**, or a control plane that could not be reached,
+  typed nothing. Nothing is marked and the next tick retries.
+- A send that raised **after** delivering — a control plane acknowledging
+  different bytes than were sent — put the bytes in the session. It is bounded
+  like a clean send, because repeating it every tick is the failure the bound
+  exists to prevent. A transport failure cannot be told from either and is
+  treated as retryable: a duplicate reminder beats a lost window.
+
+The bound does not depend on the state file being writable. The daemon remembers
+the nudge in memory for the accumulation it was about, which matters because the
+outage that stops it recording a nudge also stops uber lmer draining the spool —
+without that memory, an unwritable `assistant.json` turned the interval into the
+30-second tick.
+
+### Configuration
+
+| variable | default | what it sets |
+|---|---|---|
+| `LMER_PLATFORM_NUDGE_AFTER_SECONDS` | `180` | how long the spool waits, and how long the session must have been quiet |
+| `LMER_PLATFORM_NUDGE_PENDING_THRESHOLD` | `1` | how many digests it takes |
+
+Both also live in `config.json` and on `GET`/`POST /api/assistant/config` under
+`nudge`, and both are re-read on every tick — a change applies without a daemon
+restart or an assistant rotation. Precedence is the platform's usual chain: the
+export beats the file beats the default, and each value reports which layer
+decided it.
+
+`LMER_PLATFORM_NUDGE_AFTER_SECONDS=0` disables the nudge entirely and is the only
+off-switch. The threshold has a floor of `1` — a nudge about an empty spool is
+not a feature — and a ceiling of `50`, the spool's own capacity, since a higher
+threshold could never be met and would be a second off-switch nobody documented.
+An unusable value costs its own layer with a warning and falls through to the
+next, rather than stopping the daemon over a reminder interval; an explicit write
+through the API is refused with a 400 naming the field.
+
+**On upgrade:** restart the platform daemon to run the new tick stage. There is
+no migration — the three state fields are additive and tolerate absence — and no
+image rebuild or container passthrough, since the daemon reads both settings
+itself. A host that does not want the feature sets the interval to `0`.
 
 ## Where things live
 

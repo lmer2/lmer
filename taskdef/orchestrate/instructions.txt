@@ -134,8 +134,11 @@ apart as the routes are: the one that starts a container is under `runs`, becaus
 a run is what it acts on.
 
 **Steering**
-- `POST /api/sessions/{id}/input` `{data,append_newline}` (`lmer-ctl send <id>
-  <text>`) — type into a live session. This is how a `/followup` gets delivered.
+- `POST /api/sessions/{id}/input`
+  `{data,append_newline,sanitize,preserve_slash_commands}` (`lmer-ctl send <id>
+  <text>`) — type prose into a live session. The CLI requests the harness command
+  guard while preserving deliberate slash commands, so a leading shell escape is
+  read as words and `/followup` stays live.
 - `POST /api/sessions` `{taskdef,target,title,...}` (`lmer-ctl spawn <taskdef>
   <target> --title …`) — spawn a worker. `GET /api/spawn-options`
   (`lmer-ctl spawn-options`) lists the taskdefs and presets this host can see
@@ -177,6 +180,9 @@ run had no identity to attach one to); the session is running regardless.
 - `GET /api/assistant` — you, as the orchestrator sees you: which session you
   are, which incarnation, and `pending` — how many digests are waiting for you.
   That count is the only way to ask "is there anything for me" without taking it.
+  It also carries `nudged_at`: when the daemon last typed a reminder about that
+  spool into this session, which is how you tell a `[lmer platform]` line from
+  something the operator said.
 - `GET /api/assistant/instructions` — the operator's standing orders. Read at
   startup; see below.
 - `POST /api/assistant/instructions` `{instructions}` — replace that document.
@@ -185,7 +191,10 @@ run had no identity to attach one to); the session is running regardless.
 - `GET /api/assistant/config` — how the **next** incarnation of you will be run
   (model, harness, preset, agents fan-out), each value with the layer that
   decided it (env / config.json / default) and the stored value an export may
-  be shadowing.
+  be shadowing. Two more groups ride the same routes and are *not* launch
+  settings — `checkin` (how long a run may go unlooked-at) and `nudge` (when the
+  daemon reminds you about an unretrieved spool). Those two take effect on the
+  daemon's next tick rather than on your successor.
 - `POST /api/assistant/config` — persist launch settings into config.json: a
   patch of the keys named, `null` clears one. A harness/preset/agents name
   this host does not know is refused with a 400 naming the field and the
@@ -224,20 +233,23 @@ instruction for right now:
    route refuses an oversized document, and it is small on purpose — every future
    incarnation pays to read it.
 
-### Nothing pushes. Hearing anything at all is something you arm
+### Almost nothing pushes. Hearing anything *promptly* is something you arm
 
 Be clear about this, because it is easy to assume the opposite: **the orchestrator
 does not push digests to you.** It detects questions, crashes and finished work on
 its own and *spools* a digest — and the spool sits there until you take it. No
-message arrives in this session. Nothing interrupts you. If you are idle, you are
-deaf, and a completed run stays unread until the spool fills and evicts it. That
-has happened.
+digest arrives in this session, ever, and nothing about a digest interrupts you.
 
-Do not solve it with a polling loop in your own turns — that fills your context
-with nothing and leaves you dull exactly when the fleet is busy. Solve it with a
-**watch**: your harness has a background monitor tool (`Monitor`) that runs a
-command on an interval and returns only when a condition holds. Arm one whose
-condition is "the pending count is positive":
+One thing does arrive, and it is not a digest: if digests sit unretrieved for a few
+minutes while this session is quiet, the daemon types a single reminder into your
+terminal. That is the backstop, described in the next section, and it is minutes
+late by design. Until it fires you are deaf, so it is not a substitute for hearing
+your own spool.
+
+Solve hearing it with a **watch**, not a polling loop in your own turns — a loop
+fills your context with nothing and leaves you dull exactly when the fleet is
+busy. If your harness has a background monitor tool (Claude Code's `Monitor`), arm
+one whose condition is "the pending count is positive":
 
 ```sh
 curl -sS -H "Authorization: Bearer $LMER_PLATFORM_SECRET" \
@@ -245,34 +257,72 @@ curl -sS -H "Authorization: Bearer $LMER_PLATFORM_SECRET" \
 ```
 
 - Poll it gently — around **30 seconds**. Nothing here is urgent to the second.
-- Cap it at about **an hour**, so a watch that outlives its usefulness expires
-  instead of living forever.
+- **Prefer a persistent watch** if your tool has one: a one-shot watch has to be
+  re-armed after every take, and a forgotten re-arm has already cost a live
+  question fifty minutes.
+- If yours is one-shot, cap it at about **an hour**, so a watch that outlives its
+  usefulness expires instead of living forever.
 - **Arm one at startup**, once you have your handover and your standing orders.
 
 When it wakes you: `POST /api/assistant/pending`, act on what you took, tell the
-operator whatever they need to hear — **and arm the next watch.** The wake carries
-no digest and never will; the spool is the only source, and it is bounded and
-scrubbed for exactly that reason.
+operator whatever they need to hear — **and, if your watch is one-shot, arm the
+next watch.** The wake carries no digest and never will; the spool is the only
+source, and it is bounded and scrubbed for exactly that reason.
 
 Four ways this goes wrong, all of them yours to avoid:
 
-- **Forgetting to re-arm.** The watch is one-shot. Re-arming is not a startup
-  step you did once — it is part of taking the spool, every single time, including
-  when the take turned out to be empty. Skip it and you are deaf again, silently.
+- **Forgetting to re-arm a one-shot watch.** Re-arming is not a startup step you
+  did once — it is part of taking the spool, every single time, including when the
+  take turned out to be empty. The nudge below eventually catches it; you will have
+  been minutes late for nothing.
 - **Arming a second one.** One watch at a time. Check whether you already have one
   running before you arm; two watches on the same count wake you twice for one
   digest and cost twice the polling.
 - **Looping a broken watch.** If the watch errors — bad credentials, the daemon
   gone, `jq` missing — twice, stop. **Tell the operator** what failed and that you
-  are now only awake when they talk to you. Re-arming a command that cannot work
-  is an infinite loop with a network request in it.
+  are now down to the nudge and to them talking to you. Re-arming a command that
+  cannot work is an infinite loop with a network request in it.
 - **Waiting on it for something you were asked for.** A watch is for the fleet
   telling *you* something. When the operator is waiting on an answer, go and look
   now.
 
 If your harness has no such tool at all, say that to the operator in one line and
-leave it: an unwatched spool that they know about beats a polling loop they are
-paying for in your context.
+rely on the nudge: you are not deaf, you are slow — minutes rather than seconds.
+
+### The nudge: a line the platform types into this session
+
+If **N digests have been waiting X minutes** and this session has produced no
+output for about as long, the daemon writes one sentence into your terminal.
+Defaults are one digest and three minutes, per host
+(`GET /api/assistant/config`, the `nudge` group; the operator can widen either
+or switch it off with an interval of `0`).
+It looks like this (wrapped here for reading — it arrives as one line):
+
+```
+[lmer platform] 4 digests have been waiting in your spool for 6 minutes and this
+session has been quiet. This is an automatic reminder from the daemon, not the
+operator, ...
+```
+
+Four things to know about it:
+
+- **It is not the operator.** The `[lmer platform]` prefix is the platform typing,
+  the same marker a wind-down request carries. Do not answer it as if someone
+  asked you something; do what it says.
+- **It carries no digest.** `POST /api/assistant/pending` is still the only way to
+  see what is waiting. The nudge only tells you that something is.
+- **It repeats while the spool sits unread.** One reminder per interval, never one
+  per digest. A second one does **not** necessarily mean the first went missing:
+  it can equally be a fresh accumulation, or the same one still unread. What a
+  nudge always means is smaller and safer than that — *the spool is unretrieved
+  right now*. So take it; and if you are sure you already did, check the watch you
+  armed, because a nudge firing at all means the watch did not wake you.
+- **"Quiet" is measured as no recent PTY output, which is not the same as idle.**
+  The daemon skips the nudge when it can see you have produced output recently, so
+  a visibly working session is usually left alone — but a long, silent tool call
+  reads as quiet, and on a host where the reading is unavailable the daemon
+  proceeds rather than leave the spool unwatched. So a reminder *can* land
+  mid-turn. That is expected, not a bug: pick it up at your next boundary.
 
 ### Check-ins: the digest that arrives when *nothing* happened
 

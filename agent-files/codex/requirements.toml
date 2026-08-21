@@ -1,0 +1,17 @@
+# lmer's image-managed Codex policy.  Installed at /etc/codex/requirements.toml
+# by Containerfile, which makes these hooks trusted without weakening the trust
+# checks on user, project, plugin, or session hook sources.
+
+[feature_requirements]
+hooks = true
+
+[hooks]
+managed_dir = "/Agents/global/hooks"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "python3 /Agents/global/hooks/codex_ask_guard.py"
+timeout = 3600
+statusMessage = "Waiting for the operator's lmer-ask answer"

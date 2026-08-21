@@ -33,6 +33,22 @@ gitlab-review myorg/myproject 123 --all-comments
 gitlab-review myorg/myproject 123 --resolve-thread <discussion_id>
 ```
 
+### Reply Inside a Thread
+```bash
+# Reply into an existing MR discussion thread (body comes from a file)
+gitlab-review myorg/myproject 123 --reply-thread <discussion_id> --comment-file reply.md
+
+# Reply and resolve in one invocation (reply is posted first)
+gitlab-review myorg/myproject 123 --reply-thread <discussion_id> --comment-file reply.md --resolve-thread <discussion_id>
+```
+
+Discussion IDs are full 40-character SHA1s — copy them from `--comments`
+output. A truncated ID is rejected up front (the API would otherwise return
+a bare 404 that reads like a token-scope failure). Resolution follows GitLab's
+`resolvable` fact, including for non-diff discussions. Standalone notes that
+advertise no resolved state are refused before any write. Replying works on any
+thread type.
+
 ### Post Review Comments
 
 Post reviews to merge requests using a JSON file containing all review data:
@@ -220,9 +236,11 @@ GITLAB_HOST=gitlab.example.com gitlab-review myorg/myproject --list
 The tool looks for authentication tokens in this order:
 1. `--token` command line argument
 2. Host-specific variables: `GITLAB_TOKEN_{sanitized_host}` (hostname with dots/hyphens replaced by underscores)
-3. `GITLAB_TOKEN` environment variable (generic fallback)
+3. `GITLAB_TOKEN` environment variable — used **only** for the host that issued it (`LMER_GITLAB_TOKEN_HOST`, defaulting to the host in `LMER_WORK_REPO`)
 
-Example: for `gitlab.example.com`, the tool checks `GITLAB_TOKEN_gitlab_example_com`, then falls back to `GITLAB_TOKEN`.
+Example: for `gitlab.example.com`, the tool checks `GITLAB_TOKEN_gitlab_example_com`, then `GITLAB_TOKEN` if `gitlab.example.com` is its issuing host.
+
+When the generic token is refused, a line like `⚠️  GITLAB_TOKEN not used for <host>: issued for <other host>` goes to stderr. Read that as "this host has no credential", not as a bad token — a 404 or a "token required" error right after it means you need `GITLAB_TOKEN_{sanitized_host}` for that host (or `--token`).
 
 ### Pagination
 

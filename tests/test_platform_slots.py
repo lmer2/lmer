@@ -510,6 +510,8 @@ def test_to_dict_is_the_row_the_payload_carries(
         "preset": "webapp_dev",
         "description": "Web app",
         "service": "webapp-web",
+        "service_group": None,
+        "members": [],
         "state": "free",
         "reason": None,
         "occupant": None,
@@ -734,27 +736,31 @@ def test_a_genuinely_unknown_name_still_says_that(
 
 # --- abbreviations cannot evade the rebinding guard ---------------------------
 
-@pytest.mark.parametrize("args, flag", [
+@pytest.mark.parametrize("args, expected", [
     # The two spellings iteration 1 covered…
     (["--service", "other-web"], "--service"),
     (["--service=other-web"], "--service"),
     (["--checkout", "/srv/elsewhere"], "--checkout"),
     (["--checkout=/srv/elsewhere"], "--checkout"),
-    # …and the abbreviations that evaded it. `lmer` leaves allow_abbrev on and
-    # nothing else shares the --se/--che prefixes, so every one of these rebinds
-    # exactly as the full spelling does.
-    (["--serv", "other-web"], "--service"),
-    (["--serv=other-web"], "--service"),
-    (["--se", "other-web"], "--service"),
-    (["--servic=other-web"], "--service"),
+    # …the abbreviations that evaded it, and — since --service-group joined the
+    # parser (issue #312) — the ones that are now ambiguous between the two.
+    # Either way the slot is unusable with a stated reason, which is the whole
+    # point: what must never happen is a slot that guards one binding while its
+    # session runs against another.
+    (["--serv", "other-web"], "cannot parse"),
+    (["--serv=other-web"], "cannot parse"),
+    (["--se", "other-web"], "cannot parse"),
+    (["--servic=other-web"], "cannot parse"),
+    (["--service-group=other-stack"], "--service-group"),
+    (["--service-g", "other-stack"], "--service-group"),
     (["--check", "/srv/elsewhere"], "--checkout"),
     (["--che=/srv/elsewhere"], "--checkout"),
     (["--checkou", "/srv/elsewhere"], "--checkout"),
     # Position must not matter either.
-    (["--ports", "2", "--se", "other-web"], "--service"),
+    (["--ports", "2", "--se", "other-web"], "cannot parse"),
 ])
 def test_every_spelling_that_rebinds_is_caught(
-    platform_root, tmp_path, monkeypatch, service_up, args, flag
+    platform_root, tmp_path, monkeypatch, service_up, args, expected
 ):
     """Decided by parsing, not by matching token text — so the guard covers
     every abbreviation argparse accepts, including ones it may learn later."""
@@ -768,32 +774,39 @@ def test_every_spelling_that_rebinds_is_caught(
     row = slots.slot_rows(cfg.load())[0]
 
     assert row.state == slots.SLOT_MISCONFIGURED, f"{args} evaded the guard"
-    assert flag in row.reason
+    assert expected in row.reason
     assert row.service is None
 
 
 @pytest.mark.parametrize("args", [
     ["--serv", "other-web"], ["--se", "other-web"], ["--che=/x"],
+    ["--service-g", "other-stack"],
 ])
-def test_the_abbreviations_really_do_rebind(args):
+def test_the_abbreviations_really_do_rebind_or_refuse(args):
     """The premise, pinned against the real parser rather than asserted.
 
-    If argparse ever stopped accepting these, this test would fail and the
-    parametrisation above could be trimmed — rather than the guard quietly
-    over-refusing forever.
+    Each abbreviation either rebinds the slot or is refused outright — since
+    ``--service-group`` joined the parser the ``--se``/``--serv`` family is
+    ambiguous and argparse refuses it, which is a loud failure rather than a
+    mis-binding. Pinned here so the guard's parametrisation above can be trimmed
+    if that ever changes, rather than quietly over-refusing forever.
     """
-    from lmer_cli.cli import parse_args
+    from lmer_cli.cli import ParseRefused, parse_args
     from lmer_cli.presets import Preset
 
     preset = Preset(
         name="sneaky", checkout="/srv/w", service="webapp-web", args=args,
     )
-    namespace, _ = parse_args(preset.cli_tokens() + ["chat"])
-
-    rebound = (
-        namespace.service != preset.service
-        or namespace.checkout != preset.checkout
-    )
+    try:
+        namespace, _ = parse_args(preset.cli_tokens() + ["chat"], quiet=True)
+    except ParseRefused:
+        rebound = True  # refused outright: the session could not start at all
+    else:
+        rebound = (
+            namespace.service != preset.service
+            or namespace.checkout != preset.checkout
+            or namespace.service_group != preset.service_group
+        )
     assert rebound, f"{args} no longer rebinds; the guard may be over-refusing"
     assert slots._rebinding_arg(preset) is not None
 
@@ -1026,7 +1039,9 @@ def _preset_file(tmp_path, monkeypatch, spec):
     # while running in ordinary mode.
     (["--service", ""], "--service"),
     (["--service="], "--service"),
-    (["--se="], "--service"),
+    # Ambiguous since --service-group joined the parser: refused rather than
+    # applied, which is the same verdict for the slot (unusable, reason given).
+    (["--se="], "cannot parse"),
     (["--checkout", ""], "--checkout"),
 ])
 def test_an_emptied_binding_is_a_rebinding(
@@ -1231,3 +1246,250 @@ def test_a_valid_presets_file_with_no_entries_is_not_called_malformed(
     reason = slots.slot_rows(cfg.load())[0].reason
 
     assert "defines no valid entries" in reason
+
+
+# --- service groups: a session holds every member (issue #312) -----------------
+
+def test_a_group_slot_resolves_to_its_project(platform_root, presets_file):
+    """A group slot is usable without naming a single service."""
+    _store_slots([{"name": "stack", "preset": "stack_dev"}])
+
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert row.service_group == "stack"
+    assert row.service is None
+    assert row.state == slots.SLOT_FREE
+    assert row.to_dict()["service_group"] == "stack"
+
+
+def test_a_group_slot_probes_the_project_not_a_service(
+    platform_root, presets_file
+):
+    """One query for the group, and it asks about the project."""
+    _store_slots([{"name": "stack", "preset": "stack_dev"}])
+
+    slots.slot_rows(cfg.load())
+
+    assert presets_file == [("a-runtime", "stack", False)]
+
+
+def test_a_group_whose_project_is_down_reads_service_down(
+    platform_root, tmp_path, monkeypatch, presets_file
+):
+    _preset_file(tmp_path, monkeypatch, {
+        "gone": {"checkout": "/srv/x", "service_group": "not-running"},
+    })
+    _store_slots([{"name": "stack", "preset": "gone"}])
+
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert row.state == slots.SLOT_SERVICE_DOWN
+    assert "not-running" in row.reason
+
+
+def test_a_group_session_blocks_a_slot_on_any_member(
+    platform_root, presets_file
+):
+    """The rule the operator asked for: the group session can retarget to
+    webapp-web without asking anyone, so the slot that names it is not free.
+
+    Declared alone, so this measures *occupancy* — the group slot is not in the
+    config, which is the state after an operator removes or repoints it while a
+    session runs (the config-level half is the reservation test below)."""
+    _store_slots([{"name": "webapp", "preset": "webapp_dev"}])  # service webapp-web
+    _register("s-group", pid=os.getpid(), slot="stack")
+    registry.update("s-group", task={
+        "preset": "stack_dev",
+        "slot_service_group": "stack",
+        "slot_services": ["web", "db", "webapp-web"],
+    })
+
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert row.state == slots.SLOT_OCCUPIED
+    assert row.service_occupants
+    assert "stack" in row.reason
+    assert not row.usable
+
+
+def test_a_single_service_session_blocks_a_group_slot_over_its_member(
+    platform_root, presets_file
+):
+    """The mirror, and the one that was missing: a session already in
+    webapp-web must make the group over that project read occupied, or the gate
+    grants a second agent into the container the first one is working in."""
+    _store_slots([{"name": "stack", "preset": "stack_dev"}])
+    _register("s-single", pid=os.getpid(), slot="webapp")
+    registry.update("s-single", task={
+        "preset": "webapp_dev", "slot_service": "webapp-web",
+    })
+
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert row.state == slots.SLOT_OCCUPIED, (
+        "a group whose member is held must not read free"
+    )
+    assert row.service_occupants
+    assert "webapp-web" in row.reason
+    assert not row.usable
+
+
+def test_two_slots_overlapping_through_a_group_do_not_both_read_free(
+    platform_root, presets_file
+):
+    """At baseline, with no session anywhere: the member slot resolves second
+    and says so, rather than both rows reading free until someone spawns."""
+    rows_by_order = {}
+    for order, entries in (
+        ("group first", [
+            {"name": "stack", "preset": "stack_dev"},
+            {"name": "webapp", "preset": "webapp_dev"},
+        ]),
+        ("member first", [
+            {"name": "webapp", "preset": "webapp_dev"},
+            {"name": "stack", "preset": "stack_dev"},
+        ]),
+    ):
+        _store_slots(entries)
+        slots.clear_probe_cache()
+        rows_by_order[order] = {
+            r.definition.name: r for r in slots.slot_rows(cfg.load())
+        }
+
+    first = rows_by_order["group first"]
+    assert first["stack"].usable
+    assert first["webapp"].state == slots.SLOT_MISCONFIGURED
+    assert "already bound by slot 'stack'" in first["webapp"].reason
+
+    second = rows_by_order["member first"]
+    assert second["webapp"].usable
+    assert second["stack"].state == slots.SLOT_MISCONFIGURED
+    assert "webapp-web" in second["stack"].reason
+
+
+def test_a_group_session_leaves_an_unrelated_service_alone(
+    platform_root, presets_file
+):
+    """The paired half: holding a group is not holding the whole host."""
+    _store_slots([
+        {"name": "stack", "preset": "stack_dev"},
+        {"name": "other", "preset": "other_dev"},   # service other-web
+    ])
+    _register("s-group", pid=os.getpid(), slot="stack")
+    registry.update("s-group", task={
+        "preset": "stack_dev",
+        "slot_service_group": "stack",
+        "slot_services": ["web", "db", "webapp-web"],
+    })
+
+    rows = {r.definition.name: r for r in slots.slot_rows(cfg.load())}
+
+    assert rows["other"].usable
+
+
+def test_a_second_group_slot_on_one_project_does_not_also_grant(
+    platform_root, presets_file
+):
+    """One project, one slot — the group form of the one-service-one-slot rule."""
+    _store_slots([
+        {"name": "stack", "preset": "stack_dev"},
+        {"name": "stack-again", "preset": "stack_alt"},
+    ])
+
+    rows = {r.definition.name: r for r in slots.slot_rows(cfg.load())}
+
+    assert rows["stack"].usable
+    assert rows["stack-again"].state == slots.SLOT_MISCONFIGURED
+    assert "already bound by slot 'stack'" in rows["stack-again"].reason
+    assert "service group 'stack'" in rows["stack-again"].reason
+
+
+def test_a_live_group_session_blocks_a_group_slot_of_another_name(
+    platform_root, tmp_path, monkeypatch, presets_file
+):
+    """Measured from the sessions, not the file: fixing a second group slot's
+    preset while a session runs must not hand it a project already in use."""
+    _preset_file(tmp_path, monkeypatch, {
+        "one": {"checkout": "/srv/stack", "service_group": "stack"},
+        "two": {"checkout": "/srv/stack", "service_group": "stack"},
+    })
+    _store_slots([{"name": "a", "preset": "one"}, {"name": "b", "preset": "two"}])
+    _register("s-a", pid=os.getpid(), slot="a")
+    registry.update("s-a", task={
+        "preset": "one", "slot_service_group": "stack",
+        "slot_services": ["web"],
+    })
+    # 'b' was unusable (the collision rule) — now it is the first resolver.
+    _store_slots([{"name": "b", "preset": "two"}])
+    slots.clear_probe_cache()
+
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert row.state == slots.SLOT_OCCUPIED
+    assert "service group 'stack'" in row.reason
+
+
+def test_a_group_session_that_records_nothing_falls_back_to_its_preset(
+    platform_root, presets_file
+):
+    """A legacy-shaped group entry blocks its preset's group, not nothing."""
+    _store_slots([{"name": "stack", "preset": "stack_dev"}])
+    _register("s-legacy", pid=os.getpid(), slot="stack")
+    registry.update("s-legacy", task={"preset": "stack_dev"})
+
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert row.state == slots.SLOT_OCCUPIED
+
+
+def test_a_group_slot_with_a_starting_member_is_still_keyed_on_the_group(
+    platform_root, presets_file
+):
+    """`service` on a group preset says where the session starts, not what it
+    holds — the session may retarget away from it at any moment."""
+    _store_slots([{"name": "stack", "preset": "stack_start"}])
+
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert (row.service, row.service_group) == ("web", "stack")
+    assert row.bindings[0] == ("group", "stack")
+    # …and every member, so the slot is not free while one of them is held.
+    assert ("service", "webapp-web") in row.bindings
+
+
+def test_a_group_preset_whose_args_rebind_the_group_is_unusable(
+    platform_root, tmp_path, monkeypatch, presets_file
+):
+    """Same guard as --service, for the same reason: the slot must guard what
+    the session actually binds to."""
+    _preset_file(tmp_path, monkeypatch, {
+        "sneaky": {
+            "checkout": "/srv/stack", "service_group": "stack",
+            "args": ["--service-group", "other-stack"],
+        },
+    })
+    _store_slots([{"name": "stack", "preset": "sneaky"}])
+
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert row.state == slots.SLOT_MISCONFIGURED
+    assert "--service-group" in row.reason
+
+
+def test_group_members_are_read_uncached_for_the_record(presets_file):
+    """What a spawn records comes from a fresh read, never the poll cache, and
+    covers both spellings a slot preset could name a held container by."""
+    assert slots.group_members("stack") == [
+        # service names…
+        "db", "web", "webapp-web",
+        # …then the container names of the same containers.
+        "stack-db-1", "stack-web-1", "stack-webapp-web-1",
+    ]
+    assert presets_file == [("a-runtime", "stack", False)]
+
+
+def test_group_members_raises_when_the_project_is_gone(presets_file):
+    """An empty member list would read as a session holding nothing, so the
+    spawn gate has to hear about this rather than record a blank."""
+    with pytest.raises(ServiceError):
+        slots.group_members("not-running")

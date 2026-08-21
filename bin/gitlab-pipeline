@@ -21,8 +21,10 @@ Examples:
 Environment:
     GITLAB_HOST: GitLab instance hostname (e.g. gitlab.example.com)
     GITLAB_TOKEN_<sanitized_host>: API token for a specific host (host name with
-        dots/hyphens replaced by underscores, e.g. GITLAB_TOKEN_gitlab_example_com)
-    GITLAB_TOKEN: Fallback API token
+        dots/hyphens replaced by underscores, e.g. GITLAB_TOKEN_gitlab_example_com).
+        Always applies to that host.
+    GITLAB_TOKEN: Fallback API token, used ONLY for the host that issued it
+        (LMER_GITLAB_TOKEN_HOST, defaulting to the LMER_WORK_REPO host)
 """
 
 import argparse

@@ -311,13 +311,32 @@ def find_successor_run_dir(identifier: str, base: Optional[Path] = None) -> Opti
             continue
         if not isinstance(state, dict) or state.get("status") != "in-progress":
             continue
-        vacated = state.get("reslugged_from")
-        if not isinstance(vacated, list) or identifier not in vacated:
+        if not has_vacated(state, identifier):
             continue
         matches.append((str(state.get("created") or ""), child.name, child))
     if not matches:
         return None
     return max(matches)[2]
+
+
+def vacated_slugs(state: dict) -> tuple[str, ...]:
+    """Recorded slug identities this run has vacated, in stored order.
+
+    ``reslugged_from`` is optional append-only history. Defining its accepted
+    persisted shape here keeps the work CLI and platform readers from drifting
+    on malformed or legacy state.
+    """
+    if not isinstance(state, dict):
+        return ()
+    raw = state.get("reslugged_from")
+    if not isinstance(raw, list):
+        return ()
+    return tuple(slug for slug in raw if isinstance(slug, str))
+
+
+def has_vacated(state: dict, slug: str) -> bool:
+    """Whether *state* explicitly records having vacated *slug*."""
+    return isinstance(slug, str) and slug in vacated_slugs(state)
 
 
 def resolve_run_dir(slug: str, base: Optional[Path] = None) -> Optional[Path]:
@@ -667,8 +686,7 @@ def reslug_run(
     # and re-running the tail of an interrupted re-slug must not double it.
     # An optional field: runs that never re-slugged simply do not have it,
     # which is exactly what excludes them from successor matching.
-    vacated = state.get("reslugged_from")
-    vacated = list(vacated) if isinstance(vacated, list) else []
+    vacated = list(vacated_slugs(state))
     if old_slug and old_slug not in vacated:
         vacated.append(old_slug)
     state["reslugged_from"] = vacated
@@ -1687,6 +1705,10 @@ def emit_gate_event(
     summary: Optional[str] = None,
     argv: Optional[list] = None,
     commit_sha: Optional[str] = None,
+    test_scope: Optional[str] = None,
+    test_targets: Optional[list] = None,
+    test_cache_verdict: Optional[str] = None,
+    test_cache_reason: Optional[str] = None,
 ) -> None:
     """Record a gate command outcome ('pass' | 'fail' | 'bypass') on the
     current run, as a machine-written receipt (issue #88): the `data`
@@ -1695,7 +1717,17 @@ def emit_gate_event(
     present; the remaining fields land only when the caller measured them
     (`summary` is best-effort and simply absent when unparseable — never
     fabricated). Guarded so gate behavior is byte-identical when no run
-    exists, and no failure here can ever change a gate's exit code."""
+    exists, and no failure here can ever change a gate's exit code.
+
+    `test_scope`/`test_targets` say WHAT the tests check covered (#269), while
+    `test_cache_verdict`/`test_cache_reason` say whether that coverage ran or
+    came from the cache and why the lookup hit, missed, or was disabled (#287).
+    They are separate structured fields rather than prose in `summary`
+    because `outcome` is 'pass' with exit code 0 whether the whole suite
+    ran, a narrowed subset ran, or nothing ran because an earlier pass on
+    the same tree was reused — a receipt that cannot tell those apart lets
+    a subset green be read back as a full-suite green. Absent means the
+    caller could not say, never 'full'."""
     try:
         rdir = run_dir()
         if rdir is None or _state_path(rdir) is None:
@@ -1714,6 +1746,21 @@ def emit_gate_event(
             data["argv"] = [redact_secrets(str(arg)) for arg in argv]
         if commit_sha is not None:
             data["commit_sha"] = commit_sha
+        if test_scope is not None:
+            data["test_scope"] = redact_secrets(str(test_scope))
+        if test_targets:
+            # Truthiness, not `is not None`: an empty target list would state
+            # "these are the paths that ran" while naming none, which is the
+            # fabricated claim this field exists to prevent.
+            data["test_targets"] = [
+                redact_secrets(str(target)) for target in test_targets
+            ]
+        if test_cache_verdict is not None:
+            data["test_cache_verdict"] = redact_secrets(
+                str(test_cache_verdict)
+            )
+        if test_cache_reason is not None:
+            data["test_cache_reason"] = redact_secrets(str(test_cache_reason))
         append_event(rdir, "gate", note=f"{gate}: {outcome}", data=data)
     except Exception:
         pass

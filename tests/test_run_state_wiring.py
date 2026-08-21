@@ -271,7 +271,9 @@ class TestGateReceiptStubs:
         the receipt path works with the stub and dies with the import."""
         from work_repo.run_state import emit_gate_event
         accepted = set(inspect.signature(emit_gate_event).parameters)
-        assert {"exit_code", "duration_s", "summary", "argv", "commit_sha"} <= accepted
+        assert {"exit_code", "duration_s", "summary", "argv", "commit_sha",
+                "test_scope", "test_targets", "test_cache_verdict",
+                "test_cache_reason"} <= accepted
 
     def test_bins_pass_receipt_fields(self):
         for name in self.GATE_BINS:
@@ -279,6 +281,28 @@ class TestGateReceiptStubs:
             for field in ("exit_code=", "duration_s=", "summary=", "argv="):
                 assert field in text, f"{name}: receipt field {field} dropped"
         assert "commit_sha=" in (REPO_ROOT / "bin" / "gate-commit").read_text()
+
+    def test_bins_pass_the_test_scope_through(self):
+        """A subset or cache-served run passes with exit code 0 like a full
+        one, so every bin has to hand the scope to the receipt (#269) — and
+        via the one shared helper, not three local reimplementations."""
+        for name in self.GATE_BINS:
+            text = (REPO_ROOT / "bin" / name).read_text()
+            assert "receipt_test_fields()" in text, \
+                f"{name}: test scope never reaches the receipt"
+
+    def test_the_shared_helper_names_the_receipt_fields(self):
+        """The helper's keys ARE the emit_gate_event kwargs — the bins splat
+        them, so a rename that only lands on one side is a TypeError."""
+        from lmer_cli.gates import CheckResult, CheckStatus, GateSystem
+        from work_repo.run_state import emit_gate_event
+
+        gate = GateSystem()
+        gate.results = [CheckResult("Python Tests", CheckStatus.PASSED,
+                                    scope_targets=["tests/"])]
+        fields = gate.receipt_test_fields()
+        assert fields, "the helper reported nothing for a full suite run"
+        assert set(fields) <= set(inspect.signature(emit_gate_event).parameters)
 
 
 class TestAgentBriefs:

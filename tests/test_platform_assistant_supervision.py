@@ -40,6 +40,7 @@ turned clock and asserted on the delays that *would* have been waited.
 import contextlib
 import os
 import sys
+import threading
 import time
 
 import pytest
@@ -175,7 +176,9 @@ def wait_for_replacement(previous_id, timeout=20.0):
     A bounded wait on a *fact* rather than an assertion about a duration: the
     respawn happens on the supervisor's own thread, and this container has one CPU,
     so the only honest thing to wait for is the registry saying a different session
-    is up. Nothing here asserts how long it took.
+    is up. Registry replacement and generation are now one publication, so the
+    first replacement status is already complete. Nothing here asserts how long it
+    took.
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -185,6 +188,139 @@ def wait_for_replacement(previous_id, timeout=20.0):
         if time.monotonic() >= deadline:
             return current
         time.sleep(0.05)
+
+
+def test_status_cannot_observe_a_spawn_before_its_generation_is_published(
+    platform_root, fake_lmer, monkeypatch
+):
+    """Hold the exact registry/state publication gap from the CI failure.
+
+    ``spawn_session`` registers the live child before ``assistant.start`` writes
+    the state that names it and increments the generation. Under load a status
+    reader landed between those writes and returned a real new session with the
+    previous generation and ``tracked=False``. The supervision loop then made a
+    decision from a status that never existed as a complete transition.
+
+    No scheduler race in this test: the state write is held after the registry
+    entry exists, and an observed lock announces when the reader has actually
+    tried to enter. It must remain blocked until publication is released, then
+    see the complete new pair.
+    """
+    config = cfg.load({"lmer_bin": str(fake_lmer)})
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+
+    publication_reached = threading.Event()
+    release_publication = threading.Event()
+    status_waiting = threading.Event()
+    status_done = threading.Event()
+    real_write = assistant._write_state
+    real_lock = assistant._PUBLICATION_LOCK
+    started = {}
+    observed = {}
+
+    def held_write(state):
+        publication_reached.set()
+        assert release_publication.wait(timeout=10), "the publication was never released"
+        return real_write(state)
+
+    reader = None
+
+    class ObservedLock:
+        def __enter__(self):
+            if threading.current_thread() is reader:
+                status_waiting.set()
+            return real_lock.__enter__()
+
+        def __exit__(self, *exc_info):
+            return real_lock.__exit__(*exc_info)
+
+    def launch():
+        started["status"] = assistant.start(config)
+
+    def read_status():
+        observed["status"] = assistant.status()
+        status_done.set()
+
+    monkeypatch.setattr(assistant, "_write_state", held_write)
+    monkeypatch.setattr(assistant, "_PUBLICATION_LOCK", ObservedLock())
+    launcher = threading.Thread(target=launch, name="held-assistant-start")
+    reader = threading.Thread(target=read_status, name="assistant-status-reader")
+    try:
+        launcher.start()
+        assert publication_reached.wait(timeout=10), (
+            "the spawn never reached the state-publication boundary"
+        )
+        # The live entry is already public; only its matching state is held.
+        assert registry.list_sessions(live_only=True), "the registry publication is absent"
+
+        reader.start()
+        assert status_waiting.wait(timeout=10), "the status reader never reached the lock"
+        assert status_done.is_set() is False, (
+            "status crossed the publication gap and returned a torn registry/state pair"
+        )
+
+        release_publication.set()
+        launcher.join(timeout=10)
+        reader.join(timeout=10)
+        assert not launcher.is_alive() and not reader.is_alive()
+
+        current = observed["status"]
+        assert current.running is True
+        assert current.tracked is True
+        assert current.session_id == started["status"].session_id
+        assert current.generation == started["status"].generation == 1
+    finally:
+        release_publication.set()
+        launcher.join(timeout=10)
+        if reader.ident is not None:
+            reader.join(timeout=10)
+        kill_live_assistant()
+
+
+def test_status_does_not_wait_for_the_container_spawn(
+    platform_root, fake_lmer, monkeypatch
+):
+    """The transition lock may cover spawn; the publication lock must not."""
+    config = cfg.load({"lmer_bin": str(fake_lmer)})
+    spawn_held = threading.Event()
+    release_spawn = threading.Event()
+    status_done = threading.Event()
+    started = {}
+
+    def held_spawn(_config, _request, *, kind, publish_registration):
+        spawn_held.set()
+        assert release_spawn.wait(timeout=10), "the held spawn was never released"
+
+        def register():
+            registry.register("s-1", kind=kind, pid=os.getpid())
+
+        publish_registration(register, "s-1", os.getpid())
+        return _fake_spawn_result()
+
+    def launch():
+        started["status"] = assistant.start(config)
+
+    def read_status():
+        assistant.status()
+        status_done.set()
+
+    monkeypatch.setattr(assistant.spawn, "spawn_session", held_spawn)
+    launcher = threading.Thread(target=launch)
+    reader = threading.Thread(target=read_status)
+    try:
+        launcher.start()
+        assert spawn_held.wait(timeout=10)
+        reader.start()
+        reader.join(timeout=1)
+        assert status_done.is_set(), "status waited for the whole container spawn"
+        release_spawn.set()
+        launcher.join(timeout=10)
+        assert started["status"].generation == 1
+    finally:
+        release_spawn.set()
+        launcher.join(timeout=10)
+        reader.join(timeout=10)
+        registry.remove("s-1")
 
 
 def pin_runtime(monkeypatch, name):

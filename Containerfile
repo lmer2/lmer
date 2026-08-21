@@ -120,6 +120,13 @@ RUN mkdir -p /Agents/global /workspace /work /napkin /taskdef && \
     chown -R developer:developer /Agents && \
     chown developer:developer /workspace /work /napkin /taskdef
 
+# Codex lifecycle hooks installed by lmer are system-managed: they run without
+# a per-session trust dialog while user/project hooks retain Codex's normal
+# review gate. The requirements file names scripts from /Agents/global/hooks,
+# which is part of this image (and live-mounted in self-development sessions).
+RUN install -d -m 0755 /etc/codex
+COPY --chown=root:root agent-files/codex/requirements.toml /etc/codex/requirements.toml
+
 # === DEVELOPER: uv + python deps (cached until pyproject.toml/uv.lock change) ===
 
 # Switch to non-root user for all user-space installations
@@ -220,8 +227,13 @@ COPY --chown=developer:developer .mcp.json /home/developer/.mcp.json
 # === DEVELOPER: shell + git config (cached) ===
 
 # Add container detection to profile
+# CONTAINER_LIMITS is derived per shell from the container's own cgroup: the
+# CPU, memory and pids limits are set per run (LMER_CPUS/LMER_MEMORY/
+# LMER_PIDS_LIMIT), so a literal baked here would be wrong for every run that
+# overrides one. The cgroup root is passed explicitly because a sourced script
+# inherits the sourcing shell's positional parameters, and the script reads $1.
 RUN echo 'export CLAUDE_CONTAINER=true' >> ~/.bashrc && \
-    echo 'export CONTAINER_LIMITS="CPU:1core Memory:2GB Processes:512"' >> ~/.bashrc && \
+    echo '[ -f /home/developer/container-limits.sh ] && . /home/developer/container-limits.sh /sys/fs/cgroup' >> ~/.bashrc && \
     echo '[ -d /Agents/global ] && export GLOBAL_RULES_MOUNTED=true || echo "⚠️ WARNING: /Agents/global not mounted - running without safety rules!"' >> ~/.bashrc && \
     echo '# Auto-activate workspace venv if present' >> ~/.bashrc && \
     echo 'if [ -f /workspace/.venv/bin/activate ]; then' >> ~/.bashrc && \
@@ -241,8 +253,9 @@ RUN git config --global user.name "Developer" && \
 
 # Create entrypoint script
 COPY --chown=developer:developer Ctl/container/entrypoint.sh /home/developer/entrypoint.sh
+COPY --chown=developer:developer Ctl/container/container-limits.sh /home/developer/container-limits.sh
 COPY --chown=developer:developer libexec/claude-runner.sh /home/developer/claude-runner.sh
-RUN chmod +x /home/developer/entrypoint.sh /home/developer/claude-runner.sh
+RUN chmod +x /home/developer/entrypoint.sh /home/developer/container-limits.sh /home/developer/claude-runner.sh
 
 # Verify FIPS mode
 RUN python3 -c "import ssl; print('FIPS mode:', ssl.FIPS_mode())" || \

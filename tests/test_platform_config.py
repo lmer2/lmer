@@ -13,9 +13,13 @@ import stat
 
 import pytest
 
+from lmer_cli import tokens
 from lmer_platform import config as cfg
 from lmer_platform import store
 from tests.conftest import strip_lmer_env
+
+#: Stand-in for a generic PAT; never a real credential shape in use anywhere.
+STUB_CREDENTIAL = "glpat-notarealcredential"
 
 
 @pytest.fixture(autouse=True)
@@ -176,6 +180,76 @@ def test_config_file_work_repo_url_wins_over_env(platform_root, monkeypatch):
     cfg.save(cfg.PlatformConfig(work_repo_url="https://git.example.com/a/work.git"))
     monkeypatch.setenv(cfg.ENV_WORK_REPO, "git@git.example.com:other/work.git")
     assert cfg.load().work_repo_url == "https://git.example.com/a/work.git"
+
+
+class TestGitlabTokenIssuingHostSeeding:
+    """The generic token's issuing host defaults to the resolved work repo.
+
+    ``lmer_cli.tokens`` scopes a generic ``GITLAB_TOKEN`` to the host that
+    issued it and defaults that host from ``LMER_WORK_REPO`` — a variable a
+    config.json-configured deployment never exports, which would refuse the
+    token for the work repo's own host (issue #161 review).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_token_env(self, monkeypatch):
+        for name in ("GITLAB_TOKEN", "GITLAB_TOKEN_git_example_com"):
+            monkeypatch.delenv(name, raising=False)
+        # The refusal notice is deduped process-wide; a leftover entry would
+        # hide the very lookup these tests drive.
+        tokens._warned.clear()
+        yield
+        tokens._warned.clear()
+
+    def test_config_file_url_seeds_the_issuing_host(self, platform_root,
+                                                    monkeypatch):
+        cfg.save(cfg.PlatformConfig(
+            work_repo_url="https://git.example.com/agents/work.git"))
+        monkeypatch.setenv("GITLAB_TOKEN", STUB_CREDENTIAL)
+
+        cfg.load()
+
+        assert os.environ["LMER_GITLAB_TOKEN_HOST"] == "git.example.com"
+        assert tokens._get_gitlab_token("git.example.com") == STUB_CREDENTIAL
+
+    def test_ssh_form_seeds_the_host_too(self, platform_root, monkeypatch):
+        cfg.save(cfg.PlatformConfig(
+            work_repo_url="git@git.example.com:agents/work.git"))
+
+        cfg.load()
+
+        assert os.environ["LMER_GITLAB_TOKEN_HOST"] == "git.example.com"
+
+    def test_explicit_setting_survives_load(self, platform_root, monkeypatch):
+        monkeypatch.setenv("LMER_GITLAB_TOKEN_HOST", "gitlab.other.com")
+        cfg.save(cfg.PlatformConfig(
+            work_repo_url="https://git.example.com/agents/work.git"))
+
+        cfg.load()
+
+        assert os.environ["LMER_GITLAB_TOKEN_HOST"] == "gitlab.other.com"
+
+    def test_no_work_repo_url_seeds_nothing(self, platform_root):
+        cfg.load()
+
+        assert "LMER_GITLAB_TOKEN_HOST" not in os.environ
+
+    def test_unparseable_work_repo_url_seeds_nothing(self, platform_root):
+        cfg.load({"work_repo_url": "/srv/local/work"})
+
+        assert "LMER_GITLAB_TOKEN_HOST" not in os.environ
+
+    def test_repeated_loads_are_idempotent(self, platform_root, monkeypatch):
+        cfg.save(cfg.PlatformConfig(
+            work_repo_url="https://git.example.com/agents/work.git"))
+        cfg.load()
+        # A second resolution must not overwrite what the first (or an
+        # operator) put there.
+        monkeypatch.setenv("LMER_GITLAB_TOKEN_HOST", "gitlab.other.com")
+
+        cfg.load()
+
+        assert os.environ["LMER_GITLAB_TOKEN_HOST"] == "gitlab.other.com"
 
 
 def test_work_repo_forge_resolves_override_over_env_over_file(
@@ -1144,7 +1218,7 @@ def test_an_unusable_window_costs_its_layer_not_the_daemon(
     makes it the one memo here with no stat key to expire it — so this test
     clears it rather than assuming nothing earlier in the session tripped it.
     """
-    cfg._WARNED_WINDOWS.clear()
+    cfg._WARNED_INT_SETTINGS.clear()
     store.write_json(cfg.config_path(), {"checkin_window_seconds": 900})
     monkeypatch.setenv(cfg.ENV_CHECKIN_WINDOW, "soon")
     # Both readers, and the same answer from each: the loaded config and the
@@ -1174,6 +1248,114 @@ def test_validate_checkin_window_refuses_an_explicit_bad_value(platform_root):
 def test_validate_checkin_window_accepts_numeric_text(platform_root):
     assert cfg.validate_checkin_window("7200") == 7200
     assert cfg.validate_checkin_window(0) == 0
+
+
+# --- the digest nudge's two knobs (issue #317) --------------------------------
+#
+# The check-in window's group, and the same chain, so what these pin is what is
+# *different*: two knobs rather than one, one of which has a minimum of 1 rather
+# than 0 because a threshold of nothing would be a nudge about an empty spool.
+# The off-switch is therefore on the interval and only there.
+
+def test_the_nudge_defaults_to_three_minutes_and_one_digest(platform_root):
+    """The operator's numbers (ask 000002 on the #317 run), not derived ones."""
+    config = cfg.load()
+    assert config.nudge_after_seconds == 180
+    assert config.nudge_pending_threshold == 1
+    settings = cfg.nudge_settings()
+    assert settings["after_seconds"].value == 180
+    assert settings["after_seconds"].source == "default"
+    assert settings["pending_threshold"].value == 1
+    assert settings["pending_threshold"].source == "default"
+
+
+def test_the_nudge_knobs_resolve_env_over_file_over_default(
+    platform_root, monkeypatch
+):
+    store.write_json(cfg.config_path(), {
+        "nudge_after_seconds": 900, "nudge_pending_threshold": 3,
+    })
+    assert cfg.load().nudge_after_seconds == 900
+    assert cfg.nudge_settings()["pending_threshold"].source == "config.json"
+
+    monkeypatch.setenv(cfg.ENV_NUDGE_AFTER_SECONDS, "60")
+    monkeypatch.setenv(cfg.ENV_NUDGE_PENDING_THRESHOLD, "2")
+    assert cfg.load().nudge_after_seconds == 60
+    assert cfg.load().nudge_pending_threshold == 2
+    after = cfg.nudge_settings()["after_seconds"]
+    assert (after.value, after.source) == (60, "env")
+    assert after.stored == 900, "the screen edits the file, not the export"
+
+
+def test_zero_is_the_nudge_off_switch_and_lives_on_the_interval(platform_root):
+    cfg.update_stored({"nudge_after_seconds": 0})
+    assert cfg.load().nudge_after_seconds == 0
+    assert cfg.nudge_settings()["after_seconds"].value == 0
+
+
+def test_a_threshold_of_zero_is_a_mistake_not_an_off_switch(
+    platform_root, monkeypatch, caplog
+):
+    """The one place the two knobs' rules differ, and it is the whole reason
+    they carry a minimum each: a nudge about an empty spool is not a feature
+    somebody switched on, and the refusal says where the off-switch is."""
+    cfg._WARNED_INT_SETTINGS.clear()
+    monkeypatch.setenv(cfg.ENV_NUDGE_PENDING_THRESHOLD, "0")
+
+    assert cfg.load().nudge_pending_threshold == 1
+    assert cfg.nudge_settings()["pending_threshold"].source == "default"
+    assert any(
+        "platform_nudge_threshold_invalid" in record.message
+        for record in caplog.records
+    )
+    with pytest.raises(cfg.ConfigError) as excinfo:
+        cfg.validate_int_setting("nudge_pending_threshold", 0)
+    assert "nudge_after_seconds=0" in str(excinfo.value), (
+        "the refusal has to name the off-switch it is not"
+    )
+
+
+def test_an_unusable_nudge_layer_costs_only_itself(
+    platform_root, monkeypatch, caplog
+):
+    cfg._WARNED_INT_SETTINGS.clear()
+    store.write_json(cfg.config_path(), {"nudge_after_seconds": 300})
+    monkeypatch.setenv(cfg.ENV_NUDGE_AFTER_SECONDS, "soon")
+
+    # Both readers, and the same answer from each: the loaded config and the
+    # fresh resolution the tick uses must not disagree about three layers.
+    assert cfg.load().nudge_after_seconds == 300
+    assert cfg.nudge_settings()["after_seconds"].value == 300
+    assert cfg.nudge_settings()["after_seconds"].source == "config.json"
+    assert any(
+        "platform_nudge_after_invalid" in record.message
+        for record in caplog.records
+    )
+
+
+def test_a_negative_interval_in_the_file_falls_back_to_the_default(platform_root):
+    store.write_json(cfg.config_path(), {"nudge_after_seconds": -60})
+    assert cfg.load().nudge_after_seconds == 180
+
+
+def test_the_two_setting_groups_warn_under_their_own_log_keys(platform_root):
+    """One machinery, three log keys, because a grep for one misconfiguration
+    must not turn up the others (:data:`cfg.INT_SETTINGS`)."""
+    keys = {rule.log_key for rule in cfg.INT_SETTINGS.values()}
+    assert len(keys) == len(cfg.INT_SETTINGS)
+    assert set(cfg.INT_SETTINGS) == {
+        "checkin_window_seconds", "nudge_after_seconds",
+        "nudge_pending_threshold",
+    }
+
+
+def test_validate_int_setting_accepts_numeric_text(platform_root):
+    assert cfg.validate_int_setting("nudge_after_seconds", "600") == 600
+    assert cfg.validate_int_setting("nudge_pending_threshold", "4") == 4
+    for bad in ("soon", 3.5, True, None, -1):
+        with pytest.raises(cfg.ConfigError) as excinfo:
+            cfg.validate_int_setting("nudge_after_seconds", bad)
+        assert "nudge_after_seconds" in str(excinfo.value)
 
 
 # --- halt-detection thresholds (#243) ----------------------------------------

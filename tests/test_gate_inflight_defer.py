@@ -204,6 +204,32 @@ class TestDeferral:
         commit_work_path(RUN_REL, "run-state: test")
         assert len(_commits(work_repo)) == before + 1
 
+    def test_a_zombie_gates_marker_does_not_defer(self, work_repo, monkeypatch):
+        """A gate is usually a child of the session that commits next, and an
+        exited-but-unwaited-on child still answers kill(pid, 0). Reading that as
+        live deferred every commit behind a finished gate — exit zero, so
+        nobody noticed until the run dir was still dirty at session end (#261)."""
+        proc = subprocess.Popen(["true"])
+        try:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not gate_lock._is_zombie(proc.pid):
+                time.sleep(0.02)
+            assert gate_lock._is_zombie(proc.pid) is True, "expected an unreaped zombie"
+
+            directory = gate_lock.lock_dir()
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{proc.pid}.json").write_text(
+                json.dumps(
+                    {"pid": proc.pid, "gate": "gate-check", "started_at": time.time()}
+                ),
+                encoding="utf-8",
+            )
+            before = len(_commits(work_repo))
+            commit_work_path(RUN_REL, "run-state: test")
+            assert len(_commits(work_repo)) == before + 1
+        finally:
+            proc.wait()
+
     def test_own_marker_does_not_defer_the_holder(self, work_repo, monkeypatch):
         """`work verify` holds a marker while its own bookkeeping runs."""
         directory = gate_lock.lock_dir()

@@ -1,0 +1,10 @@
+{"type":"lmer.meta","format":1,"harness":"opencode","generator":"opencode-converter/0.1","native_format":"opencode-export/1"}
+{"type":"lmer.message","role":"user","kind":"said","text":"say hi","at":"2026-08-14T19:39:05.101Z"}
+{"type":"lmer.message","role":"user","kind":"injected","text":"Session environment: cwd /workspace, branch prep-release.","at":"2026-08-14T19:39:05.140Z"}
+{"type":"lmer.message","role":"assistant","kind":"said","text":"Hello from the fake model.","at":"2026-08-14T19:39:06.752Z","tools":[{"id":"call_1","name":"bash","detail":"echo transcript probe","status":"pending"}]}
+{"type":"lmer.tool_update","id":"call_1","status":"ok"}
+{"type":"lmer.turn_metrics","turn":1,"tokens":{"in":10,"out":7}}
+{"type":"lmer.message","role":"user","kind":"said","text":"now read the file that is not there","at":"2026-08-14T19:39:11.008Z"}
+{"type":"lmer.message","role":"assistant","kind":"said","text":"That file does not exist.","at":"2026-08-14T19:39:12.415Z","tools":[{"name":"read","detail":"/workspace/missing.txt","status":"failed","error":"ENOENT: no such file or directory"}]}
+{"type":"lmer.message","role":"assistant","kind":"said","text":"API Error: 400 billing_error","at":"2026-08-14T19:39:13.900Z","api_refusal":true,"api_error":"billing_error","api_error_status":400}
+{"type":"lmer.message","role":"assistant","kind":"said","text":"Done — anything else?","at":"2026-08-14T19:39:20.377Z"}

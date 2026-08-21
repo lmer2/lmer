@@ -261,7 +261,7 @@ STALL_PATHS = ("unanswered", "api_error", "backstop")
 #: Roles meaning *something was said to the session*. Named rather than written
 #: as "not the assistant", which swept in the ``system`` role of a local-command
 #: record — so typing ``/usage`` into a healthy run manufactured a halt.
-INPUT_ROLES = ("user", transcripts.MONITOR_ROLE)
+INPUT_ROLES = ("user", transcripts.MONITOR_ROLE, transcripts.PLATFORM_ROLE)
 
 
 @dataclass(frozen=True)
@@ -421,13 +421,13 @@ class RunView:
 
     @property
     def harness(self) -> Optional[str]:
-        """The agent harness the spawn *named*, if it named one.
+        """The agent harness the session resolved for itself.
 
-        ``None`` is not "the default one": with no ``--harness`` the harness is
+        A named ``--harness`` is recorded at spawn. With no flag, the harness is
         resolved inside the session (``LMER_HARNESS``, then the model hint in
-        ``LMER_LLM_NAME`` — :mod:`lmer_cli.harness`) and the host never learns
-        which one won. Reporting a guess here would put a wrong name on the row of
-        every session started from a preset that sets ``LMER_HARNESS``.
+        ``LMER_LLM_NAME`` — :mod:`lmer_cli.harness`) and reported through the
+        same late facts file as the resolved model. ``None`` remains ordinary for
+        sessions running an older image that did not report it.
         """
         return self._task.get("harness")
 

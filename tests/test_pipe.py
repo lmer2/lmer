@@ -13,6 +13,7 @@ import requests
 import uvicorn
 
 from lmer_cli import pipe, supervisor
+from tests.conftest import strip_lmer_env
 
 
 # ---------------------------------------------------------------------------
@@ -24,6 +25,7 @@ from lmer_cli import pipe, supervisor
 
 @pytest.fixture(autouse=True)
 def _bypass_proxies(monkeypatch):
+    strip_lmer_env(monkeypatch)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
 
@@ -128,15 +130,10 @@ class TestEndToEnd:
             monkeypatch.setenv("LMER_FASTAPI_TOKEN", "test-token")
             rc = pipe.main(["send", "/start", "--quiet"])
         assert rc == 0
-        # Server presses Enter with \r (Enter in raw-mode TUIs), not \n, as a
-        # write of its own: a CR in the same write as the text is read as part of
-        # a paste and inserted as a newline instead of submitting (#210,
-        # supervisor._submit_payload). `pipe send` means "type this and press
-        # Enter", so it takes the same /input path as every other caller — and
-        # that path sends the submit exactly ONCE, because a second, blind CR
-        # would fire whatever dialog happened to be on screen
-        # (supervisor._SUBMIT_UNCONFIRMED_NOTE).
-        assert sink == [b"/start", b"\r"], (
+        # Claude does not execute a slash command delivered as a bracketed paste
+        # (#210), so control-plane commands remain keystrokes. Enter is still its
+        # own one-and-only write: a second blind CR could fire another dialog.
+        assert [bytes(part) for part in sink] == [b"/start", b"\r"], (
             f"the submit must be one CR, written on its own: {sink}"
         )
 

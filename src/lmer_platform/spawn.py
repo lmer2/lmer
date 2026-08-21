@@ -57,16 +57,15 @@ identity up front and tracks the run before the container has committed anything
 Without that, a session's first minutes — precisely when someone is watching —
 would show a row with no identity.
 
-Which repo URL, though, is a question with three answers, and the third is why
+Which repo URL, though, is a question with four answers, and the last two are why
 ``lmer develop <MR-url>`` needs no repo flag on the command line: **the target
 usually contains the repository**. So a spawn that was handed no URL and has no
-``LMER_REPO_URL`` to fall back on derives one from the target
-(:func:`_identity_url_from_target`) rather than giving up on the identity — the
-alternative, which this module used to do, is a run that is never tracked and
-therefore vanishes from the fleet view the moment its session is reaped. A
-derived URL is *identity only* (see :func:`_repo_urls`): it is a reconstruction,
-not evidence of where the code is cloned from, and recording a reconstruction is
-how a run acquires a repo URL nobody supplied.
+``LMER_REPO_URL`` to fall back on uses a plain repository-URL target as the run's
+repository of record, or derives identity from a resource target such as an issue
+or merge request (:func:`_identity_url_from_target`). The distinction is evidence:
+the former is the clone target the caller supplied, while the latter is a
+reconstruction. A reconstructed URL remains *identity only* (see
+:func:`_repo_urls`) so a run never acquires a clone URL nobody supplied.
 
 The residual case survives — a target that is a branch name or a sentence names
 no repository, and nothing can be derived from it — so it is said out loud at
@@ -126,17 +125,30 @@ import subprocess
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass, replace
-from pathlib import Path
-from typing import Optional
+from pathlib import Path, PurePosixPath
+from typing import Callable, Optional
+from urllib.parse import urlparse
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
 from lmer_cli.container.clone_and_exec import _scrub_credentials
+from lmer_cli.container.sources import url_has_embedded_credential
+from lmer_cli.harness import HARNESSES, known_harnesses
+from lmer_cli.mounts import (
+    # Imported rather than restated: credential staging (there) and the
+    # session-dir acceptance rule (here) must read one literal.
+    CONTAINER_HOME,
+    CONTAINER_MOUNT_STAGING_DIR,
+    MOUNT_LINKS_ENV,
+    format_mount_links,
+)
 from lmer_cli.supervisor import (
     CONTAINER_SESSION_LOG_DIR,
     DEFAULT_PORT_RANGE,
     SESSION_LOG_NAME,
     _pick_port,
 )
+from lmer_cli.service import ServiceError
+from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
 from . import ask, meta, registry, runs, slots
@@ -450,9 +462,9 @@ class SpawnRequest:
       ``LMER_REPO_URL`` fallback and tells ``lmer`` to skip the clone.
 
     A caller that fills in none of the three is the ordinary case rather than a
-    mistake — ``lmer develop <MR-url>`` takes no repo flag either — and the
-    identity is then read out of ``target`` itself
-    (:func:`_identity_url_from_target`), still without recording anything.
+    mistake — ``lmer develop <MR-url>`` takes no repo flag either. A plain clone
+    URL target becomes repository evidence; a resource URL target contributes
+    identity only (:func:`_repo_urls`).
 
     ``title`` and ``description`` are the odd pair here: they are the only fields
     that say nothing about the invocation. Nothing spells them in argv, ``lmer``
@@ -702,6 +714,85 @@ def _identity_url_from_target(target: str) -> Optional[str]:
     return scrubbed
 
 
+_PLAIN_REPO_SCHEMES = frozenset({"http", "https", "ssh", "git"})
+_KNOWN_HTTP_FORGES = frozenset({
+    "github.com", "gitlab.com", "bitbucket.org", "codeberg.org",
+})
+
+
+def _known_http_forge(host: str) -> bool:
+    """Whether *host* makes a suffix-less HTTP project URL unambiguous."""
+    host = host.lower()
+    first_label = host.split(".", 1)[0]
+    return (
+        host in _KNOWN_HTTP_FORGES
+        or first_label in {"git", "gitlab", "github", "bitbucket", "codeberg"}
+    )
+
+
+def _github_http_forge(host: str) -> bool:
+    """Whether *host* uses GitHub's fixed ``owner/repo`` project root."""
+    host = host.lower()
+    return host == "github.com" or host.split(".", 1)[0] == "github"
+
+
+def _plain_repo_url_from_target(target: str) -> Optional[str]:
+    """Return a repository URL used directly as *target*, or ``None``.
+
+    Parsing a host and path does not prove a URL is cloneable: ordinary GitLab
+    file, pipeline and wiki pages have the same shape. This predicate therefore
+    accepts only Git transports, HTTPS URLs ending in ``.git``, or suffix-less
+    HTTP(S) roots on a recognisable forge host. GitLab's ``/-/`` web routes and
+    GitHub's routes below ``owner/repo`` are always excluded.
+
+    Embedded HTTP credentials are transport material, not repository identity,
+    so they are stripped before the URL becomes the repository of record. Bare
+    SSH userinfo (``git@``) is protocol plumbing and is preserved.
+    """
+    if not target or _derive_repo_url_from_task_target(target):
+        return None
+    if target.startswith("git@"):
+        parsed = None
+    else:
+        try:
+            parsed = urlparse(target)
+            scheme = parsed.scheme.lower()
+            hostname = parsed.hostname or ""
+        except ValueError:
+            return None
+        if scheme not in _PLAIN_REPO_SCHEMES:
+            return None
+        if parsed.query or parsed.fragment or "/-/" in parsed.path:
+            return None
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if _github_http_forge(hostname) and len(path_parts) != 2:
+            return None
+        if scheme in {"http", "https"} and not (
+            parsed.path.rstrip("/").endswith(".git")
+            or _known_http_forge(hostname)
+        ):
+            return None
+        if (
+            scheme not in {"http", "https"}
+            and url_has_embedded_credential(target)
+        ):
+            return None
+    recorded = (
+        _scrub_credentials(target)
+        if parsed is not None and scheme in {"http", "https"}
+        else target
+    )
+    host, project = _parse_repo_url(recorded)
+    if not host or not project:
+        return None
+    logger.info(
+        "platform_spawn_repo_from_target repo=%s — plain repository URL target "
+        "available as repository evidence",
+        recorded,
+    )
+    return recorded
+
+
 def _repo_urls(request: SpawnRequest) -> tuple:
     """``(recorded, identity)`` — the run's repo of record, and what to derive from.
 
@@ -726,12 +817,14 @@ def _repo_urls(request: SpawnRequest) -> tuple:
     - a caller that supplied its own ``identity_repo_url``, which is a caller
       saying it already knows where this run belongs.
 
-    The target is the **last** source of an identity and never a source of a
-    record. Last, because the two above it are evidence and it is a
-    reconstruction: a supplied ``repo_url`` is the caller naming the repository,
-    an exported ``LMER_REPO_URL`` is the operator naming it for this daemon, and
-    a caller-supplied ``identity_repo_url`` is a caller stating where the run
-    already belongs. Never recorded, for the reason
+    A plain repository-URL target is also evidence: it is the clone target the
+    caller supplied, so it becomes both the record and identity when no stronger
+    source is present. A resource target remains the **last** source of identity
+    and never a source of record, because its URL is reconstructed. The ordering
+    keeps a supplied ``repo_url`` first, an exported ``LMER_REPO_URL`` next, and
+    a caller-supplied ``identity_repo_url`` ahead of either target shape.
+
+    A reconstructed resource URL is never recorded, for the reason
     :func:`lmer_platform.answer._identity_repo_url` sets out at length: a
     recorded reconstruction round-trips, so it satisfies every later identity
     check, and a run whose repo was *derived once* would pass
@@ -747,6 +840,8 @@ def _repo_urls(request: SpawnRequest) -> tuple:
         None if request.identity_repo_url
         else configured_repo_url()
     )
+    if recorded is None and not request.identity_repo_url:
+        recorded = _plain_repo_url_from_target(request.target)
     identity = (
         recorded
         or request.identity_repo_url
@@ -924,13 +1019,13 @@ def ports_file_for(session_id: str) -> Path:
     honored by ``lmer_cli.cli``). A file rather than an import keeps ``lmer_cli``
     free of any dependency on this package.
 
-    T51 put a second fact through the same channel, the model the session
-    resolved (see :func:`absorb_ports`), because it has the same shape: known
-    only inside the launch, and unguessable from here — the daemon's own
-    environment is not evidence about a run. The name stayed as it is on both
-    sides: it is an interface between two independently-installed programs, and
-    an older ``lmer`` writing a ports-only file into a newer platform is exactly
-    the case that must keep working.
+    T51 put the session-resolved model through the same channel, and #318 added
+    the resolved harness (see :func:`absorb_ports`). Both have the same shape:
+    known only inside the launch and unguessable here — the daemon's environment
+    is not evidence about a preset/model-selected run. The name stayed as it is
+    on both sides: it is an interface between independently-installed programs,
+    and an older ``lmer`` writing a ports-only file into a newer platform is
+    exactly the case that must keep working.
     """
     return logs_dir() / f"{session_id}.ports.json"
 
@@ -997,19 +1092,347 @@ def _prepare_transcript_dir(session_id: str) -> Optional[Path]:
     return directory
 
 
-def _transcript_mount_flags(directory: Path) -> list:
-    """``lmer`` flags that mount *directory* in as the harness's projects dir.
+def _container_dir_key(container_dir: str) -> str:
+    """*container_dir* as the runtime will compare it: no trailing slash.
 
-    ``rw`` is not optional here: the harness writes its JSONL into this
-    directory for the life of the session. The container-side destination comes
-    from :data:`lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR` rather than
-    being spelled out again, so the path this mounts at and the path the reader
-    expects are one fact.
+    Exact equality on the normalised path and nothing else. A *nested* path is
+    not a collision — the runtime mounts ``/a`` and ``/a/b`` happily — and
+    guessing at nesting here would refuse mounts that work.
     """
+    return str(PurePosixPath(container_dir))
+
+
+def _below_destination(destination: str, ancestor: str) -> bool:
+    """Whether *destination* is strictly below *ancestor*.
+
+    Compared as path components rather than as a string prefix: ``/home/dev2``
+    starts with ``/home/dev`` and is nowhere below it. *Strictly*, because an
+    equality is a collision and is reported as one, with its own reason.
+    """
+    parts = PurePosixPath(destination).parts
+    top = PurePosixPath(ancestor).parts
+    return len(parts) > len(top) and parts[:len(top)] == top
+
+
+def _below_container_home(destination: str) -> bool:
+    """Whether *destination* is strictly below :data:`CONTAINER_HOME`.
+
+    Named after the rule it enforces — the container home is the ancestor a
+    declared session directory has to be under.
+    """
+    return _below_destination(destination, CONTAINER_HOME)
+
+
+def _covered_destination(destination: str, *owners: dict) -> tuple:
+    """The first destination in *owners* that *destination* contains, and its owner.
+
+    ``(None, None)`` when it contains none of them. An exact match is not
+    "covered" — that is the equality collision, which is reported separately and
+    with its own reason. Components again, for the reason
+    :func:`_below_container_home` gives.
+    """
+    parts = PurePosixPath(destination).parts
+    for mapping in owners:
+        for other, owner in mapping.items():
+            other_parts = PurePosixPath(other).parts
+            if len(other_parts) > len(parts) and other_parts[:len(parts)] == parts:
+                return other, owner
+    return None, None
+
+
+def _reserved_session_destinations() -> dict:
+    """``{container path: what already owns it}`` for a user harness's ``session_dir``.
+
+    Every entry is a destination this spawn (or ``lmer`` itself) already mounts
+    something at, so a drop-in manifest naming one of them is a claim on
+    somebody else's mount. What that costs depends on which flag delivers the
+    mount:
+
+    * the harness session directories, the ask channel and the session log
+      arrive as ``--mount-dir``, and that parser dedupes duplicate destinations
+      itself — warn, last wins (:func:`lmer_cli.cli.parse_dir_mount_specs`). So
+      the drop-in's mount would quietly take over what lands at a platform
+      destination, the same silent redirect :func:`_reject_mount_hijack` refuses
+      for a caller's own ``--mount-dir``.
+    * ``/workspace`` and ``/Agents/global`` are ``lmer``'s own ``-v`` mounts,
+      which no dedupe sees. The docker *client* sends both binds unmerged
+      (measured on 29.6.2), so the refusal is the daemon's — one drop-in line
+      would abort *every* platform spawn, on every harness, until the file was
+      found and edited.
+
+    The manifest field's own contract is warn-and-ignore
+    (:func:`lmer_cli.user_harnesses._parse_session_dir`), so the collision is
+    checked here, at the site that knows what the platform mounts.
+
+    Built from the constants where there are constants and from literals where
+    ``lmer``'s own layout has none. The built-in harnesses' declared directories
+    are in it too: they are mounted on every spawn regardless of which harness
+    the session resolves to (:func:`_transcript_mount_flags`).
+    """
+    reserved = {
+        _container_dir_key(harness.session_dir): f"the built-in {name} harness"
+        for name, harness in HARNESSES.items()
+        if harness.session_dir
+    }
+    reserved.update({
+        _container_dir_key("/workspace"): "the session's workspace",
+        _container_dir_key("/Agents/global"): "the agent-files tree",
+        _container_dir_key(ask.CONTAINER_ASK_DIR): "the session's ask channel",
+        _container_dir_key(CONTAINER_SESSION_LOG_DIR): "the session's own log",
+        _container_dir_key(CONTAINER_HARNESSES_DIR): "the user-harness drop-ins",
+        _container_dir_key(CONTAINER_MOUNT_STAGING_DIR):
+            "the mount staging area (lmer-internal)",
+    })
+    return reserved
+
+
+def _within_staging_area(destination: str) -> bool:
+    """Whether *destination* is the staging directory or sits below it.
+
+    A declared path in the staging area would put a mount on top of the
+    platform's own staging layout and ask the linker to link a path to itself
+    or to another harness's mount. Equality is answered here (not only by the
+    reserved map) because :func:`_reject_mount_hijack` calls this where no
+    reserved map exists.
+    """
+    staging = _container_dir_key(CONTAINER_MOUNT_STAGING_DIR)
+    return (
+        _container_dir_key(destination) == staging
+        or _below_destination(destination, CONTAINER_MOUNT_STAGING_DIR)
+    )
+
+
+def _harness_session_dirs() -> dict:
+    """``{harness name: the container directory it writes its session JSONL in}``.
+
+    Read out of the registry (:func:`lmer_cli.harness.known_harnesses`, which
+    merges user drop-ins into the built-ins) rather than listed here, because
+    where a harness writes is a fact about that harness. The platform spawns
+    claude, pi and codex but mounted only claude's projects directory, so a pi
+    or a codex session's transcript died with its ``--rm`` container and the
+    chat view drew a blank page for a run that had said plenty (#280).
+
+    Each name becomes a host subdirectory name below, so a name that is not a
+    single path component would put a mount outside the directory this session
+    owns. The user-harness loader already refuses anything but
+    ``[a-z][a-z0-9_-]*`` — this is that guarantee checked where it is depended
+    on rather than trusted across a module boundary.
+
+    A *user* harness's declared directory has to earn its mount, because that
+    mount is made ``rw`` on every spawn whatever harness the session resolves to
+    (:func:`_transcript_mount_flags`), and the host side of it is an empty 0700
+    directory. Three things are asked of it, and failing any of them costs that
+    harness its mount and nothing else:
+
+    * it is not a destination the platform already mounts at
+      (:func:`_reserved_session_destinations`) or one an earlier drop-in claimed.
+      What that collision would cost is in that function's docstring: a silent
+      redirect for the ``--mount-dir`` destinations, an aborted launch for
+      ``lmer``'s own ``-v`` ones.
+    * it is *strictly below* :data:`CONTAINER_HOME`. ``"/home/developer"``
+      itself, ``/etc`` or ``/`` pass the manifest parser's shape check (absolute,
+      no ``..``) and the equality check above, and would bind an empty directory
+      over the container's home or its system tree — hiding the harness binaries
+      in ``~/.npm-global/bin`` and ``~/.local/bin``, so no session on any harness
+      could start.
+    * it does not *contain* another destination this spawn mounts.
+      ``/home/developer/.pi`` is neither equal to nor outside the home, and
+      mounting an empty directory there hides whatever the image keeps beside
+      pi's session directory — its configuration and its credentials.
+    * it is not inside the mount staging area (:func:`_within_staging_area`),
+      which is where a user harness's mount is actually bound.
+
+    What passes is *declared*, and stays declared here: the staging of a user
+    harness's mount destination happens afterwards
+    (:func:`_harness_mount_destinations`), on paths these rules have already
+    accepted, so the checks keep reading the path the manifest wrote.
+
+    The checks cover the destinations the *platform* mounts, not the image's
+    own layout or ``lmer``'s ``-v`` set: a declared directory that shadows,
+    say, ``~/.npm-global`` is below the home, covers nothing in the reserved
+    map, and still mounts — these rules narrow the blast radius, they do not
+    make an arbitrary manifest safe.
+
+    Built-ins are exempt: their declarations are fixed in this repository, so a
+    bad one is not a runtime condition but an edit here, and the
+    ``CONTAINER_TRANSCRIPT_DIR`` drift check below is the one that catches that
+    class.
+    """
+    container_transcript_dir = _transcripts().CONTAINER_TRANSCRIPT_DIR
+    reserved = _reserved_session_destinations()
+    claimed = {}
+    dirs = {}
+    for name, harness in known_harnesses().items():
+        if not harness.session_dir:
+            continue
+        if name in (".", "..") or name != Path(name).name:
+            logger.warning(
+                "platform_transcript_harness_name_refused harness=%r — a name "
+                "that is not one path component cannot be a transcript "
+                "subdirectory; this harness's transcript is not mounted out",
+                name,
+            )
+            continue
+        if harness.source_dir is not None:
+            destination = _container_dir_key(harness.session_dir)
+            owner = reserved.get(destination) or claimed.get(destination)
+            if owner is not None:
+                logger.warning(
+                    "platform_transcript_session_dir_taken harness=%s path=%s "
+                    "owner=%s — a second mount at one container path would "
+                    "silently take over what lands there (or, for lmer's own -v "
+                    "destinations, abort every session); this harness's "
+                    "transcript is not mounted out and the session starts "
+                    "without it",
+                    name, harness.session_dir, owner,
+                )
+                continue
+            if _within_staging_area(destination):
+                logger.warning(
+                    "platform_transcript_session_dir_in_staging harness=%s "
+                    "path=%s staging=%s — that directory is where the platform "
+                    "stages this harness's own mount, so a declaration inside it "
+                    "would collide with the staging layout and with the "
+                    "entrypoint's link; this harness's transcript is not mounted "
+                    "out and the session starts without it",
+                    name, harness.session_dir, CONTAINER_MOUNT_STAGING_DIR,
+                )
+                continue
+            if not _below_container_home(destination):
+                logger.warning(
+                    "platform_transcript_session_dir_outside_home harness=%s "
+                    "path=%s home=%s — the platform mounts a session directory "
+                    "rw on every spawn, and an empty host directory bound over "
+                    "the container home or a system path hides what the image "
+                    "put there, harness binaries included; this harness's "
+                    "transcript is not mounted out and the session starts "
+                    "without it",
+                    name, harness.session_dir, CONTAINER_HOME,
+                )
+                continue
+            covered, covered_owner = _covered_destination(
+                destination, reserved, claimed
+            )
+            if covered is not None:
+                logger.warning(
+                    "platform_transcript_session_dir_covers harness=%s path=%s "
+                    "covers=%s owner=%s — an empty directory mounted over one "
+                    "the platform mounts inside of hides what the container "
+                    "keeps beside it, a harness's own configuration included; "
+                    "this harness's transcript is not mounted out and the "
+                    "session starts without it",
+                    name, harness.session_dir, covered, covered_owner,
+                )
+                continue
+            claimed[destination] = f"the {name} harness"
+        dirs[name] = harness.session_dir
+    if container_transcript_dir not in dirs.values():
+        # Not a runtime condition: claude's mount destination, the constant the
+        # reader and the redirect refusal are written against, and claude's
+        # registry entry are one fact — the only way here is an edit to one of
+        # them. Loud on every spawn beats a chat view that quietly reads a
+        # directory nothing was mounted at.
+        raise RuntimeError(
+            f"no harness declares {container_transcript_dir!r} as its session "
+            "directory: lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR and "
+            "lmer_cli.harness's claude entry have drifted apart"
+        )
+    return dirs
+
+
+def _harness_mount_destinations() -> dict:
+    """``{harness name: the container path its transcript subdirectory binds at}``.
+
+    The declared directory (:func:`_harness_session_dirs`) for a built-in; a
+    staged path under :data:`lmer_cli.mounts.CONTAINER_MOUNT_STAGING_DIR` for a
+    user harness, whose declared parents the image may not ship — the runtime
+    would create them root-owned and the harness would EACCES writing beside
+    its mount (issue #293; the why lives on that constant). The declared path
+    comes back as an entrypoint symlink (:func:`_harness_session_links`).
+    """
+    registry_entries = known_harnesses()
+    destinations = {}
+    for name, declared in _harness_session_dirs().items():
+        entry = registry_entries.get(name)
+        if entry is not None and entry.source_dir is not None:
+            destinations[name] = f"{CONTAINER_MOUNT_STAGING_DIR}/sessions/{name}"
+        else:
+            destinations[name] = declared
+    return destinations
+
+
+def _harness_session_links() -> list:
+    """``[(declared, staged)]`` for every harness whose mount is staged.
+
+    The container entrypoint turns each pair into a symlink, so a harness still
+    finds its session directory where its manifest says it is. Derived from the
+    same two functions the mount is built from rather than recomputed, so a link
+    can only ever name a destination this spawn also mounts.
+    """
+    destinations = _harness_mount_destinations()
     return [
-        "--mount-dir",
-        f"{directory}:{_transcripts().CONTAINER_TRANSCRIPT_DIR}:rw",
+        (declared, destinations[name])
+        for name, declared in _harness_session_dirs().items()
+        if destinations.get(name) not in (None, declared)
     ]
+
+
+def _prepare_transcript_subdirs(directory: Path) -> list:
+    """One transcript subdirectory per harness under *directory*, 0700.
+
+    Returns ``[(host_dir, container_dir)]`` for the ones that could be created.
+    Named after the harness, and *under* the session's own transcript directory,
+    so everything a session writes stays inside the one tree the reader scans and
+    the exit scrub rewrites: :func:`lmer_platform.transcripts.locate_sources`
+    walks it recursively, so a file a level down is found without teaching the
+    reader this layout, and a session that predates it — files at the root, from
+    the days when claude's projects dir was mounted straight in — still reads.
+
+    Created with the mode rather than chmod'ed into it, for the reason
+    :func:`_prepare_transcript_dir` gives, and safe from the leaf-only pitfall it
+    names (T93) because *directory* was made through the store there and a
+    harness name is a single path component.
+
+    Fail-soft per harness rather than per session: a subdirectory that cannot be
+    made costs that one harness its transcript mount, the others still mount, and
+    the session starts either way.
+    """
+    mode = _transcripts().SESSION_DIR_MODE
+    prepared = []
+    for name, container_dir in _harness_mount_destinations().items():
+        subdir = directory / name
+        try:
+            subdir.mkdir(mode=mode, exist_ok=True)
+            subdir.chmod(mode)
+        except OSError as exc:
+            logger.warning(
+                "platform_transcript_subdir_unusable harness=%s path=%s error=%s "
+                "— a session on this harness leaves no transcript behind; the PTY "
+                "log is its complete record",
+                name, subdir, exc,
+            )
+            continue
+        prepared.append((subdir, container_dir))
+    return prepared
+
+
+def _transcript_mount_flags(mounts: list) -> list:
+    """``lmer`` flags that mount each *mounts* pair in where its harness writes.
+
+    ``rw`` is not optional here: the harness writes its JSONL into its directory
+    for the life of the session. The container-side destinations come from
+    :func:`_harness_mount_destinations` rather than being spelled out again, so
+    the paths these mount at and the paths the harnesses reach — directly for a
+    built-in, through the entrypoint's symlink for a staged user harness — are
+    one fact. Every declared harness is mounted, not just the session's: which
+    harness a request resolves to is decided inside the child ``lmer`` (flag,
+    env, preset, model hint), so the alternative to a few empty directories is
+    guessing — and guessing wrong is a session whose transcript is gone.
+    """
+    flags: list = []
+    for host_dir, container_dir in mounts:
+        flags += ["--mount-dir", f"{host_dir}:{container_dir}:rw"]
+    return flags
 
 
 def ask_dir_for(session_id: str) -> Path:
@@ -1181,17 +1604,25 @@ def _reported_model(payload: dict) -> Optional[str]:
     return model.strip()
 
 
+def _reported_harness(payload: dict) -> Optional[str]:
+    """The resolved harness a session reported for itself, if usable."""
+    harness = payload.get("harness")
+    if not isinstance(harness, str) or not harness.strip():
+        return None
+    return harness.strip()
+
+
 def absorb_ports(sessions: list) -> list:
     """Fold what running sessions reported about themselves into their entries.
 
-    Two facts today, both from :func:`ports_file_for`: the published port mapping
-    and the model the session resolved. Called on the read path because both
+    Three facts today, all from :func:`ports_file_for`: the published port mapping,
+    model and harness the session resolved. Called on the read path because they
     appear *after* the spawn returns — ``lmer`` publishes ports while starting the
     container and settles the model just before that, which is strictly later than
     the moment the registry entry is written.
 
     Each fact is folded only when the entry lacks it, which is what makes this
-    converge and then stop doing work — and, for the model, what keeps the
+    converge and then stop doing work — and, for model/harness, what keeps the
     precedence right in the other direction: a spawn that *named* a model already
     recorded it, so there is nothing here to learn. Only a session that named none
     (the ordinary case, where the model comes from the daemon's environment or a
@@ -1215,8 +1646,9 @@ def absorb_ports(sessions: list) -> list:
         # missing model: the fleet view already treats it as no metadata at all
         # (lmer_platform.inventory), and it stays exactly as its writer left it.
         wants_model = isinstance(task, dict) and not task.get("model")
+        wants_harness = isinstance(task, dict) and not task.get("harness")
         # Nothing left to learn about this session: stop reading its file.
-        if not session_id or not (wants_ports or wants_model):
+        if not session_id or not (wants_ports or wants_model or wants_harness):
             updated.append(entry)
             continue
         path = ports_file_for(session_id)
@@ -1240,11 +1672,17 @@ def absorb_ports(sessions: list) -> list:
         if wants_ports and isinstance(ports, list) and ports:
             changes["ports"] = ports
         model = _reported_model(payload)
-        if wants_model and model:
+        harness = _reported_harness(payload)
+        if (wants_model and model) or (wants_harness and harness):
             # The whole block, because registry.update merges at the top level
             # only; a bare ``{"model": …}`` would drop the taskdef and target the
             # fleet view labels the row with.
-            changes["task"] = {**task, "model": model}
+            resolved = dict(task)
+            if wants_model and model:
+                resolved["model"] = model
+            if wants_harness and harness:
+                resolved["harness"] = harness
+            changes["task"] = resolved
         if not changes:
             updated.append(entry)
             continue
@@ -1302,14 +1740,26 @@ def _protected_mount_destinations() -> dict:
 
     Resolved at call time rather than at import: the transcript constant lives
     behind the lazy import that breaks this package's one import cycle (see
-    :func:`_transcripts`).
+    :func:`_transcripts`), and the harnesses that declare a session directory
+    include the user drop-ins, which are read from disk.
+
+    Every *declared* session directory is protected, not just claude's, and the
+    declared one even where the mount is staged: a caller's mount at the declared
+    path lands exactly where the entrypoint wants to put the harness's symlink,
+    so it would either swallow the transcript or leave the link unmade.
+    :data:`lmer_cli.mounts.CONTAINER_MOUNT_STAGING_DIR` is protected too, but by
+    :func:`_reject_mount_hijack` rather than by an entry here — what has to be
+    refused there is the whole subtree, not one path.
     """
-    return {
-        _transcripts().CONTAINER_TRANSCRIPT_DIR: (
+    protected = {
+        session_dir: (
             "the platform mounts the session's transcript there and scrubs it on "
             "exit, so redirecting it would leave an unscrubbed transcript outside "
             "the directory it owns"
-        ),
+        )
+        for session_dir in _harness_session_dirs().values()
+    }
+    protected.update({
         ask.CONTAINER_ASK_DIR: (
             "the platform mounts the session's ask channel there, so redirecting "
             "it would send the session's questions somewhere no operator is "
@@ -1321,7 +1771,8 @@ def _protected_mount_destinations() -> dict:
             "record of everything the session drew in a directory nobody reads "
             "back — and leave the terminal view showing an empty file"
         ),
-    }
+    })
+    return protected
 
 
 def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
@@ -1334,15 +1785,32 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     :func:`_protected_mount_destinations` for what each redirect would cost.
     Rejecting exactly those destinations keeps the permission the flag exists for
     and removes the aims that lie.
+
+    The staging area is refused as a *subtree*, for ``--mount-file`` too (it
+    holds staged credential *files*): a caller's mount in there can hand the
+    session's harness credentials the caller chose. The protected-destination
+    list stays a ``--mount-dir`` rule — those destinations are all directories.
     """
-    if not "--mount-dir".startswith(name):
+    aims_at_dir = "--mount-dir".startswith(name)
+    aims_at_file = "--mount-file".startswith(name)
+    if not (aims_at_dir or aims_at_file):
         return
     spec = arg.split("=", 1)[1] if "=" in arg else (following[0] if following else "")
-    # Grammar is host:container[:mode]; the destination is the second field.
+    # Grammar is host:container[:mode] for both flags; the destination is the
+    # second field.
     parts = str(spec).split(":")
     if len(parts) < 2:
         return
     destination = parts[1].rstrip("/")
+    if _within_staging_area(destination):
+        raise SpawnError(
+            f"{name} may not target {CONTAINER_MOUNT_STAGING_DIR} or anything "
+            "below it: the platform stages its own user-harness mounts there, so a "
+            "mount inside it would shadow one of them — or hand the session's "
+            "harness a file or directory the caller chose"
+        )
+    if not aims_at_dir:
+        return
     for protected, reason in _protected_mount_destinations().items():
         if destination == protected.rstrip("/"):
             raise SpawnError(f"--mount-dir may not target {protected}: {reason}")
@@ -1436,13 +1904,13 @@ def live_session_for_run(
     the key was spelled. The divergence the triple tolerates is the renamed run
     (:func:`lmer_platform.workrepo.resolve_run_dir`): a run keeps its slug as its
     identity while its *directory* may be named after it (``review-mr-172`` living
-    in ``runs/review-mr-172--review-mr-172``), every session registers under that
-    slug (:func:`derive_run_identity` mirrors the container's
-    ``run_state.derive_slug``), so a renamed run's session is found here whatever
-    its directory is called. What this deliberately does not do is treat a
-    directory name as an identity: a caller holding the run's *tracked* name — which
-    for a renamed run is that directory name — checks it as a second candidate
-    itself, because only the caller knows it.
+    in ``runs/review-mr-172--review-mr-172``, in an internal work repo rather than
+    this one), every session registers under that slug (:func:`derive_run_identity`
+    mirrors the container's ``run_state.derive_slug``), so a renamed run's session
+    is found here whatever its directory is called. What this deliberately does
+    not do is treat a directory name as an identity: a caller holding the run's
+    *tracked* name — which for a renamed run is that directory name — checks it as
+    a second candidate itself, because only the caller knows it.
 
     Liveness is the registry's own lazy reading (``live_only`` →
     :func:`lmer_platform.registry.is_live`, a pid probe on read), so a DEAD entry
@@ -1762,11 +2230,13 @@ def _claim_slot(
 ) -> tuple:
     """Check the requested service slot and fill its preset in (issue #245).
 
-    Returns ``(request, service)``: unchanged and ``None`` when no slot was
-    asked for, otherwise a copy carrying the slot's preset and the dev service
-    it resolved to. The service is returned so it can be *recorded* on the
-    session's entry — occupancy by service then reads what this session took
-    rather than re-deriving it from a presets file that may have changed since.
+    Returns ``(request, service, service_group, members)``: all ``None`` when no
+    slot was asked for, otherwise a copy carrying the slot's preset and what the
+    slot resolved to — the dev service, and for a group slot the compose project
+    plus the member services it covers (issue #312). They are returned so they
+    can be *recorded* on the session's entry: occupancy then reads what this
+    session took rather than re-deriving it from a presets file that may have
+    changed since.
     Nothing else is written: the claim *is* that registry entry, which is why
     there is no release path and a session that dies frees its slot unaided.
 
@@ -1792,7 +2262,7 @@ def _claim_slot(
     many there are, and the daemon logs ``slot_double_occupancy``.
     """
     if request.slot is None:
-        return request, None
+        return request, None, None, None
 
     status = slots.slot_status(config, request.slot, cached=False)
     if status is None:
@@ -1823,15 +2293,39 @@ def _claim_slot(
             f"service slot {request.slot!r}: {status.service_busy_reason}"
         )
     if status.service_down_reason is not None:
-        raise SpawnError(
-            f"service slot {request.slot!r} targets service "
-            f"{status.service!r}, which is not running: "
-            f"{status.service_down_reason}"
+        target = (
+            f"service group {status.service_group!r}" if status.service_group
+            else f"service {status.service!r}"
         )
+        raise SpawnError(
+            f"service slot {request.slot!r} targets {target}, which is not "
+            f"running: {status.service_down_reason}"
+        )
+
+    # What a group session takes, read once at the claim. Uncached and here
+    # rather than on the poll path, for the reason the probe above is uncached:
+    # this is the record every later occupancy answer is derived from, so it
+    # cannot afford a stale reading. A group that has gone since the probe is a
+    # refusal, not an empty member list — an empty list would read as a session
+    # holding nothing.
+    members = None
+    if status.service_group:
+        try:
+            members = slots.group_members(status.service_group)
+        except ServiceError as exc:
+            raise SpawnError(
+                f"service slot {request.slot!r}: could not resolve the members "
+                f"of service group {status.service_group!r}: {exc}"
+            )
 
     # ``validate`` has already refused a request naming both, so the preset
     # field is empty and this fills it.
-    return replace(request, preset=status.definition.preset), status.service
+    return (
+        replace(request, preset=status.definition.preset),
+        status.service,
+        status.service_group,
+        members,
+    )
 
 
 def spawn_session(
@@ -1839,6 +2333,9 @@ def spawn_session(
     request: SpawnRequest,
     *,
     kind: str = "worker",
+    publish_registration: Optional[
+        Callable[[Callable[[], None], str, int], None]
+    ] = None,
 ) -> SpawnResult:
     """Start a session, register it, and track its run.
 
@@ -1873,7 +2370,7 @@ def spawn_session(
 
     # After the cap, so a host that is simply full says so rather than blaming
     # the slot.
-    request, slot_service = _claim_slot(config, request)
+    request, slot_service, slot_group, slot_services = _claim_slot(config, request)
 
     # Two URLs, because "what this run's repo is" and "what its identity is
     # derived from" are separable claims — only the first is recorded anywhere.
@@ -1898,11 +2395,17 @@ def spawn_session(
     except OSError as exc:
         raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
 
-    # The transcript's host home, mounted in as the harness's projects dir so the
-    # JSONL the chat view reads outlives the container (`lmer` runs it --rm). Only
-    # for sessions the platform spawns: persisting every lmer invocation's
-    # transcript is a separate decision, and this is not the place to take it.
+    # The transcript's host home, with one subdirectory per harness mounted in
+    # where that harness writes its session JSONL, so the file the chat view reads
+    # outlives the container (`lmer` runs it --rm) whichever harness ran. Only for
+    # sessions the platform spawns: persisting every lmer invocation's transcript
+    # is a separate decision, and this is not the place to take it.
     transcript_dir = _prepare_transcript_dir(session_id)
+    transcript_mounts = (
+        _prepare_transcript_subdirs(transcript_dir)
+        if transcript_dir is not None
+        else []
+    )
     # The session's ask channel (T23): where it posts questions for the operator
     # and reads the answers back.
     ask_dir = _prepare_ask_dir(session_id)
@@ -1915,8 +2418,8 @@ def spawn_session(
     # --fastapi, so calling it twice would interleave the mounts in reverse and
     # make the command's shape depend on the order of these lines.
     host_flags: list = []
-    if transcript_dir is not None:
-        host_flags += _transcript_mount_flags(transcript_dir)
+    if transcript_mounts:
+        host_flags += _transcript_mount_flags(transcript_mounts)
     if ask_dir is not None:
         host_flags += _ask_mount_flags(ask_dir)
     if container_log_dir is not None:
@@ -1944,8 +2447,26 @@ def spawn_session(
     else:
         # Never inherited: the daemon's own environment carrying this variable
         # (a daemon started from inside a session, say) would otherwise tell an
-        # agent it has a channel that was never mounted.
-        child_env.pop(ask.ASK_DIR_ENV, None)
+        # agent it has a channel that was never mounted. Blank rather than
+        # absent, because the child is `lmer` and it seeds its own environment
+        # from .env files first-wins — a key that is merely absent is a key a
+        # file may re-supply. Blank already reads as unset on every consumer
+        # (resolve_channel_dir strips it; the runners render the ask fragment
+        # only on a non-blank value).
+        child_env[ask.ASK_DIR_ENV] = ""
+    # The declared→staged link pairs for the entrypoint (#293), filtered to
+    # mounts actually prepared. Seeded fresh, never inherited (a daemon's own
+    # environment would carry another session's pairs), and blank rather than
+    # absent for the reason the two variables below give.
+    mounted_destinations = {container_dir for _, container_dir in transcript_mounts}
+    child_env[MOUNT_LINKS_ENV] = format_mount_links(
+        "",
+        [
+            (declared, staged)
+            for declared, staged in _harness_session_links()
+            if staged in mounted_destinations
+        ],
+    )
     if request.no_repo:
         # Spec D17, structurally: `lmer` skips repo resolution on this and the
         # container skips the workspace clone, so the session has nothing to edit
@@ -1955,8 +2476,12 @@ def spawn_session(
         # Also never inherited, and for the sharper version of the same reason: a
         # daemon whose shell exported LMER_NO_REPO would otherwise hand every
         # worker an empty /workspace while its request still names a repository —
-        # a session that looks like it is working on code it does not have.
-        child_env.pop(NO_REPO_ENV, None)
+        # a session that looks like it is working on code it does not have. Blank
+        # for the same reason as above: deleting the key only hides it from this
+        # environment, and the child's own .env seeding would hand it straight
+        # back. Blank is falsy to get_bool_env on the host and never equals "1"
+        # in the container, so it reads as unset the whole way down.
+        child_env[NO_REPO_ENV] = ""
 
     master_fd, slave_fd = pty.openpty()
     try:
@@ -1985,45 +2510,61 @@ def spawn_session(
     # Register before starting the drain thread: the thread's cleanup path
     # removes the entry, and it must never run against an entry that was never
     # written.
-    registry.register(
-        session_id,
-        kind=kind,
-        pid=process.pid,
-        task={
-            "taskdef": request.taskdef,
-            "target": request.target,
-            "repo": repo_url,
-            "preset": request.preset,
-            # Names only, which is all that was ever passed: the presets these
-            # select stay on the host (their env can hold credentials), and the
-            # entry is a debugging artifact people paste around.
-            "agents": request.agents,
-            "harness": request.harness,
-            # What the spawn *asked* for, which is ``None`` for the ordinary
-            # request that names no model. The session overwrites it with what
-            # it actually resolved as soon as it reports back (absorb_ports), so
-            # this key answers "which model is driving this run" rather than
-            # only "which model was requested".
-            "model": request.model,
-            # Recorded rather than re-derived, because the presets file is hot:
-            # a slot repointed while this session runs must not change what it
-            # is understood to be holding (issue #245).
-            "slot_service": slot_service,
-        },
-        run={"host": host, "project": project, "slug": slug},
-        # The *only* record that the slot is taken — nothing writes an occupancy
-        # file — so a session that dies takes its claim with it (issue #245).
-        slot=request.slot,
-        # Reachability, minus the credential: ``token_ref`` is a path, and
-        # registry.register rejects an inline ``token`` outright (spec §6.2).
-        control={
-            "host": _CONTROL_HOST,
-            "port": control_port,
-            "token_ref": str(token_file),
-        },
-        log_path=str(log_file),
-        started_at=utc_now_iso(),
-    )
+    def register() -> None:
+        registry.register(
+            session_id,
+            kind=kind,
+            pid=process.pid,
+            task={
+                "taskdef": request.taskdef,
+                "target": request.target,
+                "repo": repo_url,
+                "preset": request.preset,
+                # Names only, which is all that was ever passed: the presets these
+                # select stay on the host (their env can hold credentials), and the
+                # entry is a debugging artifact people paste around.
+                "agents": request.agents,
+                "harness": request.harness,
+                # What the spawn *asked* for, which is ``None`` for the ordinary
+                # request that names no model. The session overwrites it with what
+                # it actually resolved as soon as it reports back (absorb_ports), so
+                # this key answers "which model is driving this run" rather than
+                # only "which model was requested".
+                "model": request.model,
+                # Recorded rather than re-derived, because the presets file is hot:
+                # a slot repointed while this session runs must not change what it
+                # is understood to be holding (issue #245).
+                "slot_service": slot_service,
+                # A group session can retarget to any member, so it holds all of
+                # them; the members are resolved once, here, rather than re-read on
+                # every poll (issue #312).
+                "slot_service_group": slot_group,
+                "slot_services": slot_services,
+            },
+            run={"host": host, "project": project, "slug": slug},
+            # The *only* record that the slot is taken — nothing writes an occupancy
+            # file — so a session that dies takes its claim with it (issue #245).
+            slot=request.slot,
+            # Reachability, minus the credential: ``token_ref`` is a path, and
+            # registry.register rejects an inline ``token`` outright (spec §6.2).
+            control={
+                "host": _CONTROL_HOST,
+                "port": control_port,
+                "token_ref": str(token_file),
+            },
+            log_path=str(log_file),
+            started_at=utc_now_iso(),
+        )
+
+    # Most sessions publish only their registry entry. The assistant also has a
+    # lifecycle-state pointer that must become visible with that entry, so it
+    # supplies a tiny publication wrapper. It runs only after process startup and
+    # receives registration as a thunk, keeping its lock around the two writes
+    # rather than around the whole spawn.
+    if publish_registration is None:
+        register()
+    else:
+        publish_registration(register, session_id, process.pid)
 
     # Track the run so it appears in this orchestrator's fleet view (D25). Only
     # possible with a full identity; a session whose repo URL could not be parsed

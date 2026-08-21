@@ -1,4 +1,6 @@
 """Tests for Containerfile configuration."""
+import tomllib
+
 import pytest
 from pathlib import Path
 
@@ -162,9 +164,80 @@ class TestPyYamlEntrypointGuarantee:
         assert "pyyaml>=6.0" in content, "pyproject.toml no longer requires pyyaml>=6.0"
 
 
+class TestContainerLimitsDerived:
+    """CONTAINER_LIMITS comes from the cgroup at shell startup, not from a literal.
+
+    CPU, memory and pids limits are per-run settings, so any value written into
+    ~/.bashrc at build time is wrong for every run that overrides one.
+    """
+
+    def test_no_baked_container_limits_literal(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert 'CONTAINER_LIMITS="CPU:' not in content, \
+            "Containerfile still bakes a literal CONTAINER_LIMITS value into ~/.bashrc"
+
+    def test_bashrc_sources_container_limits_script(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert ". /home/developer/container-limits.sh /sys/fs/cgroup' >> ~/.bashrc" in content, \
+            "~/.bashrc does not source container-limits.sh with an explicit cgroup root"
+
+    def test_container_limits_script_is_copied_and_executable(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert (
+            "COPY --chown=developer:developer Ctl/container/container-limits.sh "
+            "/home/developer/container-limits.sh"
+        ) in content, "container-limits.sh is not copied into the image"
+        chmod_line = next(
+            line for line in content.splitlines()
+            if line.startswith("RUN chmod +x /home/developer/entrypoint.sh")
+        )
+        assert "/home/developer/container-limits.sh" in chmod_line, \
+            "container-limits.sh is not chmod +x'd alongside the entrypoint"
+
+    def test_script_exists_in_repo(self, project_root):
+        script = project_root / "Ctl" / "container" / "container-limits.sh"
+        assert script.is_file(), "Ctl/container/container-limits.sh not found"
+
+
 class TestBuildProvenanceBaked:
     def test_containerfile_bakes_build_commit(self):
         content = (Path(__file__).parent.parent / "Containerfile").read_text()
         assert "ARG LMER_BUILD_COMMIT" in content
         assert "ENV LMER_BUILD_COMMIT" in content
         assert "/Agents/global/BUILD_INFO" in content
+
+
+class TestCodexManagedHooks:
+    """lmer's hook is trusted without trusting arbitrary repository hooks."""
+
+    def test_image_installs_system_requirements(self, project_root):
+        content = (project_root / "Containerfile").read_text()
+        assert (
+            "COPY --chown=root:root agent-files/codex/requirements.toml "
+            "/etc/codex/requirements.toml"
+            in content
+        )
+        assert content.index("/etc/codex/requirements.toml") < content.index(
+            "USER developer"
+        ), "system requirements must be installed while the image is still root"
+
+    def test_requirements_enable_only_the_lmer_ask_guard(self, project_root):
+        path = project_root / "agent-files" / "codex" / "requirements.toml"
+        requirements = tomllib.loads(path.read_text())
+        assert requirements["feature_requirements"]["hooks"] is True, (
+            "managed Stop hooks must not be disabled by a lower config layer"
+        )
+        assert requirements["hooks"]["managed_dir"] == "/Agents/global/hooks"
+        stop = requirements["hooks"]["Stop"]
+        assert len(stop) == 1
+        assert stop[0]["hooks"] == [
+            {
+                "type": "command",
+                "command": "python3 /Agents/global/hooks/codex_ask_guard.py",
+                "timeout": 3600,
+                "statusMessage": "Waiting for the operator's lmer-ask answer",
+            }
+        ]
+        assert "allow_managed_hooks_only" not in requirements, (
+            "user and project hooks must keep their ordinary trust path"
+        )

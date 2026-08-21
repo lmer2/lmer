@@ -194,13 +194,17 @@ Tokens are resolved in the following priority order.
 2. **`GITLAB_TOKEN_worklog`** — deprecated; honored as a fallback for existing setups.
 3. Host-specific tokens (see below).
 4. For GitHub hosts only: `GH_TOKEN`, then `GITHUB_TOKEN`.
-5. **`GITLAB_TOKEN`** — generic fallback.
+5. **`GITLAB_TOKEN`** — last resort, and only for its issuing host (see below).
 
 #### For All Other Repositories (highest to lowest)
 
 1. **`GITLAB_TOKEN_{suffix}`** — host-specific token (see suffix resolution below).
 2. For GitHub hosts only: `GH_TOKEN`, then `GITHUB_TOKEN`.
-3. **`GITLAB_TOKEN`** — generic fallback.
+3. **`GITLAB_TOKEN`** — last resort, and only for its issuing host (see below).
+
+#### The Generic `GITLAB_TOKEN` Is Scoped to One Host
+
+The generic token applies **only** to the host that issued it: `LMER_GITLAB_TOKEN_HOST` when set, otherwise the host in `LMER_WORK_REPO`. Any other host — and every host when neither is available — falls through to "no token" with a one-time stderr notice, so a GitLab PAT is never sent to `github.com` or another third party. Give such a host its own `GITLAB_TOKEN_{suffix}`, or let the clone run anonymously. The steps above it are unaffected.
 
 GitHub-host detection covers `github.com`, `*.github.com`, and `*.ghe.com` (GitHub Enterprise Cloud). GitHub Enterprise Server on a custom domain is not auto-detected — set a per-host `GITLAB_TOKEN_<suffix>` for those.
 
@@ -228,23 +232,60 @@ GH_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 GITLAB_TOKEN_git_example_com=glpat-yyyyyyyyyyyyyyyyyyyy      # For git.example.com
 GITLAB_TOKEN_gitlab_myorg_com=glpat-zzzzzzzzzzzzzzzzzzzz     # For gitlab.myorg.com
 
-# Generic fallback (lowest priority)
+# Generic token (lowest priority, and only for the host that issued it —
+# LMER_GITLAB_TOKEN_HOST, defaulting to the LMER_WORK_REPO host)
 GITLAB_TOKEN=glpat-aaaaaaaaaaaaaaaaaaaaaa
+LMER_GITLAB_TOKEN_HOST=git.example.com
 ```
 
-### URL Conversion Behavior
+### Container Credential-File Behavior
 
-When a token is available, LMER automatically rewrites SSH URLs to HTTPS-with-token:
+When a token is available, LMER still resolves it on the host with the
+precedence above and converts SSH clone targets to HTTPS. The credentialed URL
+form is only transient transport into the clone boundary:
 
 ```
 # Original (SSH)
 git@github.com:owner/work.git
 
-# Converted (HTTPS with token)
+# Transient resolved form
 https://oauth2:<token>@github.com/owner/work.git
+
+# URL passed to git and stored as origin
+https://github.com/owner/work.git
 ```
 
 The `oauth2:` username works for both GitLab and GitHub — GitHub ignores the basic-auth username when the password is a valid PAT.
+
+Immediately before each container-side clone, lmer moves the userinfo into a
+session-local `~/.git-credentials-{host}-*` file created with mode `0600`.
+This includes password-style (`oauth2:<token>@`) and username-only
+(`<token>@`) HTTPS userinfo; SSH's protocol username (`ssh://git@`) is not a
+credential and remains unchanged.
+Clone-time Git configuration references that file and uses the clean URL. The
+new repository retains only the non-secret credential-helper file reference,
+so later fetches and pushes continue to authenticate while:
+
+- the token is absent from Git process arguments;
+- `git remote -v` shows a clean URL; and
+- `.git/config` contains no token.
+
+Each resolved repository credential gets its own session file. Dedicated work,
+napkin, or taskdef credentials therefore remain distinct even when those
+repositories share a host. The files live only in the session container and are
+removed with it.
+
+Only container-internal clones lmer creates and owns receive the repository-local
+helper reference or a clean-remote migration. A checkout supplied with
+`--checkout`, including a service-mode bind mount, keeps its existing remotes and
+local credential config byte-for-byte; the same rule covers secondary-clone
+subdirectories beneath that host mount. Fresh secondary clones there use the
+session file only through process-scoped Git config. Lmer removes userinfo from
+the URL retained in the agent's environment. Declared-source checks in
+`bin/doctor` attach a disposable mode-`0600` copy of the work-repo session file,
+so private sources remain checkable without letting Git approve or reject a
+credential in the live file or putting it back into an environment URL or
+repository config.
 
 ### Fallback to SSH
 
@@ -281,14 +322,17 @@ Work Repo Clone:
   2. GITLAB_TOKEN_worklog          (deprecated)
   3. GITLAB_TOKEN_{host-suffix}
   4. GH_TOKEN, then GITHUB_TOKEN   (github.com / *.github.com / *.ghe.com only)
-  5. GITLAB_TOKEN
+  5. GITLAB_TOKEN                  (issuing host only — see below)
   6. (No token) → Use SSH
 
 Target Repo Clone:
   1. GITLAB_TOKEN_{host-suffix}
   2. GH_TOKEN, then GITHUB_TOKEN   (github.com / *.github.com / *.ghe.com only)
-  3. GITLAB_TOKEN
+  3. GITLAB_TOKEN                  (issuing host only — see below)
   4. (No token) → Use SSH
+
+Issuing host = LMER_GITLAB_TOKEN_HOST, else the host in LMER_WORK_REPO.
+Any other host: no token, plus a one-time stderr notice.
 ```
 
 ### Troubleshooting
@@ -312,8 +356,20 @@ curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user
 
 If the wrong token is being used, check:
 1. The sanitized hostname suffix (dots/hyphens become underscores).
-2. Whether a generic `GITLAB_TOKEN` is overriding host-specific tokens.
-3. Whether you intended a work-repo lookup but the work-repo token vars aren't set.
+2. Whether you intended a work-repo lookup but the work-repo token vars aren't set.
+
+#### The Generic `GITLAB_TOKEN` Was Refused
+
+A clone or API call that runs unauthenticated while `GITLAB_TOKEN` is set means the host asking is not the token's issuing host. LMER says so once, on stderr:
+
+```
+⚠️  GITLAB_TOKEN not used for github.com: issued for git.example.com — set GITLAB_TOKEN_github_com for this host
+⚠️  GITLAB_TOKEN not used for git.example.com: issuing host unknown — set LMER_GITLAB_TOKEN_HOST or GITLAB_TOKEN_git_example_com
+```
+
+Two remedies, depending on which line you got:
+- The generic token belongs to a host other than the work-repo host (or `LMER_WORK_REPO` is unset): export `LMER_GITLAB_TOKEN_HOST=<that host>`.
+- You want *this* host authenticated with its own credential: set `GITLAB_TOKEN_{suffix}` for it. That is the only way a third-party host gets a token, and it is deliberate — the generic one is never widened.
 
 #### Token Not Found
 

@@ -30,6 +30,9 @@ build:
   opening, and a card of them in the header would push the attention alert and the
   answer box off a phone screen, which is the one thing being above the tabs is
   for
+- the ports the run published ride that same line rather than the overview's
+  session card, because a run that published one is a run with something to look
+  at and the tab it was behind is not the tab it is looked at from
 - the heading line is the *title* this orchestrator gave the run when it gave it
   one, with the label under it and the run's own name never lost (T65) — the
   operator asked: "if meta.title is set it should be used in the details header and
@@ -400,10 +403,16 @@ def test_the_lmer_panes_speak_the_icon_language_the_rest_of_the_app_does():
         f"{TAB_ICONS['lmer']} is this view's word for a run's session, and the "
         "fleet card no longer uses it for the harness driving one"
     )
-    history = _read(components / "AskHistory.vue")
-    assert PANE_ICONS["chat"] in history, (
+    # On the entry component since #274: the record composes it and draws no icon
+    # of its own, so the shape the pane is being matched against is there.
+    entry = _read(components / "AskEntry.vue")
+    assert PANE_ICONS["chat"] in entry, (
         f"the operator-chat pane draws {PANE_ICONS['chat']} and the record it "
         "renders draws something else"
+    )
+    assert "<AskEntry" in _read(components / "AskHistory.vue"), (
+        "the record draws its entries itself again, so the icon this test just "
+        "read is not the one the pane shows"
     )
     # And the two conversations stay apart: reading what the session said and
     # replying to what it asked are different acts, and this is the view where the
@@ -695,6 +704,56 @@ def test_a_long_target_scrolls_inside_the_header_instead_of_widening_the_page():
         assert declaration in rule.group(1), (
             f".scroll-x no longer declares {declaration}, which is one of the "
             "three that keep a long target inside its own box"
+        )
+
+
+def test_the_ports_a_run_published_are_reachable_from_whichever_tab_is_open():
+    """A hosted service is the reason to open the run, not a fact about it.
+
+    The chips lived in the overview's live-session card, which is the tab an
+    operator watching a service is least likely to be on: reaching the thing the
+    run built meant leaving the terminal for a panel whose facts they were not
+    after. On the identity line they sit beside the taskdef and the target, in the
+    region a remembered tab cannot hide.
+
+    Moved rather than copied, which is the half only a source-level guard holds:
+    two sets of the same links are two things to keep in step, and the shape they
+    are drawn with is one edit from disagreeing.
+    """
+    identity = _identity_line()
+    chip = re.search(r'<v-chip\b[^>]*v-for="port in run\.ports"[^>]*>', identity, re.S)
+    assert chip, (
+        "the ports this run published are not on the header's identity line, so "
+        "opening a hosted service means finding the tab that lists them"
+    )
+    assert ':href="portUrl(port)"' in chip.group(0), (
+        "the chip is not a way through to the service, or it builds the URL itself "
+        "instead of asking format.js — which is where the fleet row's chips ask"
+    )
+    assert "portUrl" in _format_imports(), (
+        "the header does not take the port's URL from format.js: it imports "
+        f"{sorted(_format_imports())}"
+    )
+    for attribute in ('target="_blank"', 'rel="noopener"'):
+        assert attribute in chip.group(0), (
+            f"the port chip lost {attribute}; the service is another origin and "
+            "this app is the tab the operator came back to"
+        )
+
+    # Nothing at all for a run with no ports, which is most of them: the daemon
+    # reads `ports` off the live session's registry entry, so a run with nothing
+    # running has none — and the `v-if="session"` the old site relied on is not up
+    # here to say so.
+    gate = re.search(r'<template v-if="run\.ports\?\.length">', identity)
+    assert gate and gate.start() < chip.start(), (
+        "the port chips are not gated on there being any, so a run with none "
+        "renders an artifact on the line that names it"
+    )
+
+    for panel in _panels("tab").values():
+        assert "run.ports" not in panel, (
+            "a tab panel lists the ports too: the header copy is then the second "
+            "of two, and the pair drifts the moment one of them is restyled"
         )
 
 

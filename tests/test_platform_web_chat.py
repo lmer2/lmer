@@ -40,13 +40,19 @@ and all of it is invisible in a desktop window:
   delivers a background monitor's event as a turn in the operator's own role, so
   the server re-attributes it (:mod:`tests.test_platform_transcripts` holds that
   end) and this view has to draw it as the event it is rather than as a bubble;
-- and, since T121, that a message you sent stops being *pending* once the run has
-  it. Reported live: one stuck at the tail of the conversation as if it had just
-  been sent, for the rest of the run, while the transcript above it held the same
-  message as an ordinary earlier turn and the agent had plainly acted on it. That
-  half is executed rather than read — the transcript copy of a message is not the
-  bytes that were sent, and which of them still match is not a question source
-  text answers.
+- and, since T121, what makes a message you sent stop being *pending* — and, since
+  #254, what may not. The transcript having the message is the only thing that
+  settles a bubble; nothing removes one for want of a confirmation. The bug that
+  bought that rule: a message typed at a session that was still working is queued
+  and unwritten for as long as the current turn runs, and the old arrival backstop
+  let a *stranger's* turn plus any later reply drop its bubble — so the operator's
+  words left the screen having never appeared in the history they were sent into.
+  Both halves are executed rather than read — the transcript copy of a message is
+  not the bytes that were sent, and which of them still match is not a question
+  source text answers. One of those copies is the platform's own doing and is the
+  reason the settle rule knows about the ``!`` defusal: a message the supervisor
+  gave a ``.`` to (#254) comes back with the prefix on it, and a bubble that cannot
+  recognise its own defused turn is a message shown twice for the rest of the run.
 
 Rendering, and how any of it feels one-handed, is verified by building the bundle
 and by live test LT3 on a real phone.
@@ -100,6 +106,20 @@ def _read(path):
     return path.read_text(encoding="utf-8")
 
 
+def _chat_declarations():
+    """Chat.vue's scoped stylesheet with its comments taken out.
+
+    Because two of the guards below are about what this stylesheet *declares* —
+    which wrap, and how many of them — and the comments beside those declarations
+    name the value that was rejected and the one Markdown.vue keeps. Read as text,
+    the prose explaining why ``break-word`` is wrong is indistinguishable from a
+    rule using it.
+    """
+    style = _read(CHAT)
+    style = style[style.index("<style"):]
+    return re.sub(r"/\*.*?\*/", " ", style, flags=re.S)
+
+
 def _chat_rule(selector):
     """One declaration block from Chat.vue's scoped stylesheet.
 
@@ -120,8 +140,16 @@ def test_your_own_lines_are_still_shown_exactly_as_you_sent_them():
     halves rendered the same way, a long scroll is one wall of formatted prose.
     """
     text = _read(CHAT)
-    assert 'v-if="message.text && message.role === \'user\'"' in text, (
+    branch = re.search(
+        r'<p\s+v-if="([^"]+)"\s+class="text-body-medium said plain"',
+        text,
+        re.S,
+    )
+    assert branch and "message.role === 'user'" in branch.group(1), (
         "the user's own turns go through the renderer too"
+    )
+    assert "message.role === 'platform'" in branch.group(1), (
+        "platform-authored prose is no longer shown as exact bytes"
     )
     assert text.count("said plain") == 2, (
         "a sent message and one still pending must both be shown verbatim"
@@ -188,6 +216,59 @@ def test_the_cap_on_one_message_survives_a_rendered_one():
     assert "const following = ref(true)" in text
     assert "if (follow) nextTick(stickToBottom)" in text
     assert "max-height: 30dvh" in _chat_rule(".said")
+
+
+def test_a_long_line_anywhere_in_a_turn_wraps_instead_of_scrolling_the_pane():
+    """The operator, with a screenshot: a long URL leaves the conversation with a
+    horizontal scrollbar under it (#286).
+
+    What overflowed was not a message body — those two have said ``anywhere`` since
+    T44 — it was a **tool row**, whose text is a flex item, so its min-content width
+    is the whole unbreakable URL and the turn grows to it. ``.chat`` asks for
+    ``overflow-y: auto``, which makes the other axis ``auto`` as well, and that is
+    the scrollbar. So the declaration moved to the bubble every kind of content sits
+    in: measured in a 689px pane — the width the report came from — the pane
+    overflowed by 129px before and by nothing after.
+
+    Two things this pins beyond "a wrap is declared somewhere".
+
+    ``anywhere`` rather than ``break-word``, which is the whole of why one of them
+    fixes it: only ``anywhere`` reduces min-content, and min-content is what a flex
+    item refuses to shrink below. ``break-word`` measures the identical 129px, so a
+    later edit that swaps them would read as the same rule and restore the bug.
+
+    And *one* place, because the parts of a turn that can hold a URL are not a list
+    anybody keeps: the body, a tool's detail, a watch's line, and whatever the next
+    kind of content is. Inheritance covers them all; a per-kind declaration covers
+    the ones somebody remembered. Markdown.vue's fence is the deliberate opt-out and
+    stays one — a rule on the element beats an inherited value, which is
+    :mod:`tests.test_platform_web_markdown`'s to hold.
+    """
+    text = _read(CHAT)
+    declared = _chat_declarations()
+    assert "overflow-wrap: anywhere" in _chat_rule(".turn"), (
+        "the bubble no longer wraps, so a long URL in any part of it scrolls the "
+        "conversation sideways"
+    )
+    assert "break-word" not in declared, (
+        "break-word does not shrink min-content, so a tool row still widens the "
+        "turn it is in — it reads like a wrap and measures like none"
+    )
+    assert declared.count("overflow-wrap") == 1, (
+        "a second wrap declaration in this stylesheet; the turn's is inherited by "
+        "every kind of content in it, and a per-kind copy is one the next kind "
+        "will not have"
+    )
+    # And the two surfaces that had none of their own are inside that turn, which
+    # is what makes inheriting it the fix rather than a coincidence.
+    turns = text.index('v-for="message in visible"')
+    bubbles = text.index('v-for="item in pending"')
+    inside = text[turns:bubbles]
+    for surface in ('class="tools ground-action"', "said watch"):
+        assert surface in inside, (
+            f"{surface} is no longer rendered inside a turn, so it inherits no "
+            "wrap from one"
+        )
 
 
 # --- the colour coding (T84) --------------------------------------------------
@@ -460,6 +541,20 @@ def test_a_watch_firing_is_drawn_as_an_event_and_not_as_anybodys_bubble():
     )
 
 
+def test_platform_typed_input_is_labelled_as_machinery_not_as_the_operator():
+    text = _read(CHAT)
+    ground = _chat_function("function ground(message)")
+
+    assert "platform: 'lmer platform'" in text
+    assert "return message.role === 'assistant' ? 'agent' : 'action'" in ground
+    assert re.search(r"message\.role === 'user'", text), (
+        "the verbatim operator branch no longer identifies operator turns by role"
+    )
+    assert "message.role === 'user' || message.role === 'platform'" in text, (
+        "platform text is rendered as markdown instead of the exact bytes typed"
+    )
+
+
 # --- the composer ---------------------------------------------------------------
 
 def test_the_composer_names_the_session_and_can_be_told_a_better_name():
@@ -559,11 +654,19 @@ def _chat_body(signature):
 
 
 #: One Node run over the component's own settle rule, once per case: the two refs
-#: it reads are the plain boxes ``ref()`` hands it, and the JS half only reports
-#: which bubbles it left standing. Every assertion is in Python.
+#: it reads are the plain boxes ``ref()`` hands it, the turn memory beside them is
+#: the component's own ``Set``, and the JS half only reports which bubbles it left
+#: standing. Every assertion is in Python.
+#:
+#: The bubbles are reported whole rather than as their texts, because two identical
+#: messages are what the pairing rule is *about* and a list of texts cannot say which
+#: of the two survived. ``since`` and ``at`` are what tell them apart — neither is
+#: read by the rule (``at`` is the label's, and the clock test below pins that), so
+#: carrying a distinct one on each bubble tags it without changing what it is.
 _SETTLE_PROBE = """
 const messages = { value: [] }
 const pending = { value: [] }
+const consumed = new Set()
 
 %s
 
@@ -574,10 +677,92 @@ const seen = {}
 for (const [name, probe] of Object.entries(cases)) {
   messages.value = probe.messages
   pending.value = probe.pending
+  // Each case is a view of its own, so it starts with no memory of the last one's
+  // turns — what `start()` does with the same three boxes.
+  consumed.clear()
   settlePending()
-  seen[name] = pending.value.map((item) => item.text)
+  seen[name] = pending.value.map(
+    (item) => ({ text: item.text, since: item.since, at: item.at }),
+  )
 }
 console.log(JSON.stringify(seen))
+"""
+
+#: The same rule run over a transcript that *grows*, which is the shape a poll makes:
+#: ``absorb`` appends a page and calls ``settlePending`` on what it has so far. One
+#: bubble, many passes, and the JS half reports what was left standing after each —
+#: which is the only way to ask whether a bubble survives the run rather than the
+#: call (#254).
+_CYCLES_PROBE = """
+const messages = { value: [] }
+const pending = { value: [] }
+const consumed = new Set()
+
+%s
+
+%s
+
+const probe = %s
+pending.value = probe.pending
+const kept = []
+for (const page of probe.pages) {
+  messages.value = [...messages.value, ...page]
+  settlePending()
+  kept.push(pending.value.map((item) => item.text))
+}
+console.log(JSON.stringify(kept))
+"""
+
+#: The same growing transcript, with the bubbles reported whole. Two identical
+#: messages are what the pairing rule is *about*, and which of the pair is still up
+#: cannot be read off a list of texts — ``at`` is what tells them apart, and the rule
+#: never reads it (the clock test below pins that). An empty page is a pass like any
+#: other here, because a poll that finds nothing still absorbs and still settles.
+_PAIR_CYCLES_PROBE = """
+const messages = { value: [] }
+const pending = { value: [] }
+const consumed = new Set()
+
+%s
+
+%s
+
+const probe = %s
+pending.value = probe.pending
+const kept = []
+for (const page of probe.pages) {
+  messages.value = [...messages.value, ...page]
+  settlePending()
+  kept.push(pending.value.map((item) => ({ text: item.text, at: item.at })))
+}
+console.log(JSON.stringify(kept))
+"""
+
+#: The same rule across a *restart* — a respawn puts a different session behind the
+#: same run, and ``start()`` empties the three boxes this holds. Mirrored here rather
+#: than run, because ``start()`` is a fetch; the test beside the one using this pins
+#: that the real function drops all three, so the mirror cannot drift from it.
+_RESTART_PROBE = """
+const messages = { value: [] }
+const pending = { value: [] }
+const consumed = new Set()
+
+%s
+
+%s
+
+const probe = %s
+const kept = []
+for (const view of probe.views) {
+  messages.value = []
+  pending.value = []
+  consumed.clear()
+  messages.value = view.messages
+  pending.value = view.pending
+  settlePending()
+  kept.push(pending.value.map((item) => item.text))
+}
+console.log(JSON.stringify(kept))
 """
 
 #: ``send()`` itself, run against a stubbed control plane (issue 194). Everything
@@ -602,6 +787,11 @@ const sending = { value: false }
 const problem = { value: null }
 const pending = { value: [] }
 const following = { value: false }
+// The component's bubble counter, which lives beside `pending` in the module scope
+// rather than inside the function under test. Here because a bubble's id is what
+// the dismiss is given (issue 286) and what the render key is, so a probe that left
+// it undefined would report no bubbles at all rather than a wrong one.
+let bubbleId = 0
 const stale = () => false
 const nextTick = () => {}
 const stickToBottom = () => {}
@@ -626,6 +816,7 @@ const typed = %s
     draft.value = typed
     await send()
     held[name] = pending.value.map((item) => ({
+      id: item.id,
       text: item.text,
       submitConfirmed: item.submitConfirmed,
       since: item.since,
@@ -637,10 +828,11 @@ const typed = %s
 
 #: The label ladder, run rather than read (issue 194). ``props`` and the grace
 #: constant are what the function closes over in the component; the cases are the
-#: three rungs, and the JS half only reports the caption it produced.
+#: rungs, and the JS half only reports the caption it produced. There are two rungs
+#: since #254 and the second one is empty, which is exactly why this stays executed:
+#: "the function returns nothing here" is a value, and only running it shows it.
 _LABEL_PROBE = """
 const PENDING_GRACE_MS = %d
-const SUBMIT_UNCONFIRMED_LABEL = %s
 const props = { now: 0 }
 
 %s
@@ -688,6 +880,15 @@ def _long_paste():
     return text
 
 
+def _multi_kb_fenced_paste():
+    """Issue #297's shape: large enough to span terminal reads, one code fence."""
+    from lmer_platform import transcripts
+
+    text = "```python\n" + "print('one submitted turn')\n" * 250 + "```"
+    assert 4095 < len(text) < transcripts.TEXT_LIMIT
+    return text
+
+
 def _cases():
     """Every fixture, built once. Case name → the page and the bubbles held."""
     working = _agent_turn("Working on it.", _STAMPS[0])
@@ -717,6 +918,15 @@ def _cases():
                 _agent_turn("That is a broken mount.", _STAMPS[2]),
             ]),
             "pending": [{"text": _long_paste(), "at": 0, "since": 1}],
+        },
+        "multi_kb_fenced_paste": {
+            "messages": _conversation([
+                working,
+                _operator_turn(_multi_kb_fenced_paste()),
+            ]),
+            "pending": [
+                {"text": _multi_kb_fenced_paste(), "at": 0, "since": 1}
+            ],
         },
         # No reply after the turn, so only the whitespace layer can settle this one.
         "recorded_in_pieces": {
@@ -759,11 +969,11 @@ def _cases():
             ]),
             "pending": [{"text": "yes", "at": 0, "since": 2}],
         },
-        # What the arrival-evidence layer accepts as the price of its wide bound
-        # (#237): the turn at `since` is a *stranger's* message, not this one, and
-        # this message is nowhere in the transcript — yet the reply after that turn
-        # settles the bubble. Checked rather than described, because it is the cost
-        # the component's comment claims to accept.
+        # The shape #254 was reported over, and the one the old arrival backstop
+        # dropped: the turn past `since` is a *stranger's* message, this message is
+        # nowhere in the transcript, and a reply follows that stranger's turn. All
+        # the backstop asked for, and none of it about this message — which is the
+        # ordinary state of a message queued at a session that was already working.
         "a_strangers_turn_and_a_reply": {
             "messages": _conversation([
                 _agent_turn("Working on it.", _STAMPS[0]),
@@ -774,8 +984,9 @@ def _cases():
         },
         # Two identical sends inside one poll interval: the cursor never moved
         # between them, so they share a `since` and the seq guard cannot separate
-        # them. One recorded turn, and no reply after it, so the text match is the
-        # only layer in play — and it may answer for one of them, not both.
+        # them at all. One recorded turn, so exactly one of them may clear — and the
+        # two `at`s are how the assertion can say *which*, since the rule never reads
+        # one (it is the label's field) and the texts are identical by construction.
         "two_identical_sends_one_interval": {
             "messages": _conversation([
                 _agent_turn("Ready.", _STAMPS[0]),
@@ -783,14 +994,13 @@ def _cases():
             ]),
             "pending": [
                 {"text": "yes", "at": 0, "since": 1},
-                {"text": "yes", "at": 0, "since": 1},
+                {"text": "yes", "at": 1000, "since": 1},
             ],
         },
-        # The same pair once a reply follows that turn — which is the ordinary case
-        # within a poll or two. `claimed` is a text-match rule and the arrival branch
-        # does not consult it, so the turn the first bubble took is still arrival
-        # evidence for the second: both settle. Same accepted cost as the stranger's
-        # turn above, which is why it is pinned in the same place.
+        # The same pair once a reply follows that turn. Still one recorded turn, so
+        # the second "yes" is still in flight and still on the screen: a reply is not
+        # a second message. Before #254 this pair both settled here, on evidence that
+        # was about neither of them.
         "two_identical_sends_then_a_reply": {
             "messages": _conversation([
                 _agent_turn("Ready.", _STAMPS[0]),
@@ -799,30 +1009,107 @@ def _cases():
             ]),
             "pending": [
                 {"text": "yes", "at": 0, "since": 1},
-                {"text": "yes", "at": 0, "since": 1},
+                {"text": "yes", "at": 1000, "since": 1},
             ],
+        },
+        # And the same pair once the harness has written *both* down, which is what
+        # actually clears them: two identical messages resolve to two turns, in the
+        # order they were sent, or one of them is a message the operator sent that
+        # the view never shows again.
+        "two_identical_sends_two_turns": {
+            "messages": _conversation([
+                _agent_turn("Ready.", _STAMPS[0]),
+                _operator_turn("yes", _STAMPS[1]),
+                _operator_turn("yes", _STAMPS[2]),
+                _agent_turn("Pushed.", _STAMPS[3]),
+            ]),
+            "pending": [
+                {"text": "yes", "at": 0, "since": 1},
+                {"text": "yes", "at": 1000, "since": 1},
+            ],
+        },
+        # Two different messages sent in one interval, the second one answered first
+        # — the ask channel merges an answer in by its own clock, so the transcript's
+        # order is not always the send order. Each bubble takes its own words.
+        "two_sends_answered_out_of_order": {
+            "messages": _conversation([
+                _agent_turn("Ready.", _STAMPS[0]),
+                _operator_turn("go ahead", _STAMPS[1]),
+            ]),
+            "pending": [
+                {"text": "yes", "at": 0, "since": 1},
+                {"text": "go ahead", "at": 1000, "since": 1},
+            ],
+        },
+        # The message the platform defused on the way in (#254): on claude the
+        # supervisor gives the first column to a `.` before typing, so the turn the
+        # harness records is not the string the composer sent. The whitespace layer
+        # cannot bridge this one — a `.` is not whitespace and does not collapse —
+        # so without the defused form the bubble outlives its own delivery and the
+        # message stays on the screen twice for the rest of the run.
+        "defused_on_the_way_in": {
+            "messages": _conversation([
+                working, _operator_turn(_AS_THE_SESSION_RECORDS_IT),
+            ]),
+            "pending": [
+                {"text": _A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND, "at": 0, "since": 1},
+            ],
+        },
+        # The same recorded turn beside a *different* `!` message: the second form is
+        # the defused rendering of this item's own words and of nothing else, or one
+        # message's bubble comes down on another message's turn.
+        "another_messages_defused_turn": {
+            "messages": _conversation([
+                working, _operator_turn(_AS_THE_SESSION_RECORDS_IT),
+            ]),
+            "pending": [{"text": "!207 was merged", "at": 0, "since": 1}],
+        },
+        # And a dotted turn beside a message that was never a command. ". yes" is not
+        # the defused rendering of "yes" — nothing would have defused it, because the
+        # transform only ever fires on a leading `!` — so this is a stranger's turn
+        # that happens to start with a dot, and it settles nothing.
+        "a_dotted_turn_that_defused_nothing": {
+            "messages": _conversation([working, _operator_turn(". yes")]),
+            "pending": [{"text": "yes", "at": 0, "since": 1}],
         },
     }
 
 
-def _settled():
-    """Run the settle rule over every case. Returns case name → bubbles left."""
+def _run_probe(script, what):
+    """One Node run of *script*, with its parsed output. *what* names it on failure."""
     node = node_binary()
     if not node:
         require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
 
-    script = _SETTLE_PROBE % (
-        _chat_body("function comparable"),
-        _chat_body("function settlePending"),
-        json.dumps(_cases()),
-    )
     result = subprocess.run(
         [node, "-e", script], capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, (
-        f"the settle probe failed:\n{result.stdout}\n{result.stderr}"
+        f"the {what} probe failed:\n{result.stdout}\n{result.stderr}"
     )
     return json.loads(result.stdout)
+
+
+def _bubbles():
+    """Run the settle rule over every case. Case name → the bubbles left, whole.
+
+    Whole because the pairing rule is about messages that are identical *as text*:
+    which of two "yes" bubbles is still up is the assertion, and only the fields the
+    fixtures tag them with can answer it.
+    """
+    return _run_probe(_SETTLE_PROBE % (
+        _chat_body("function comparable"),
+        _chat_body("function settlePending"),
+        json.dumps(_cases()),
+    ), "settle")
+
+
+def _settled():
+    """The same run, as the texts left standing — what most cases are about."""
+    return {
+        name: [item["text"] for item in items]
+        for name, items in _bubbles().items()
+    }
 
 
 def test_the_transcript_really_does_come_back_saying_something_else():
@@ -868,28 +1155,41 @@ def test_the_transcript_really_does_come_back_saying_something_else():
     )
 
 
-def test_a_message_the_run_answered_stops_being_pending():
-    """The report: a sent message stuck at the tail of the conversation for the
-    rest of the run, while the transcript above it held that same message as an
-    ordinary earlier turn and the agent had acted on it.
+def test_a_message_the_transcript_rewrote_keeps_its_bubble_and_this_is_the_cost():
+    """The side of #254's trade that is paid rather than collected, pinned so it is
+    a checked fact and not a line in a comment.
 
     All three are cases no text rule can settle — the words really are different by
-    the time they come back — so what settles them is arrival: an operator turn
-    recorded after the send's cursor, with a turn of the agent's after *that*. The
-    bubble is a stand-in for the transcript's copy, and once the transcript has one,
-    a second copy of the message on the screen is the bug being fixed.
+    the time they come back — and the arrival backstop is what used to clear them
+    (T121: a sent message stuck at the tail of the conversation for the rest of the
+    run, while the transcript above it held the same message as an ordinary turn and
+    the agent had plainly acted on it). It is gone, so these bubbles stay up beside
+    the transcript's own rewritten copy of themselves, for the rest of the run.
+
+    That is the operator's call in #254 and the direction of it is the whole point:
+    the same message shown twice, rather than a message shown nowhere. What bought it
+    is the case below — the backstop cleared these three by accepting evidence about
+    *any* message, which is the same rule that dropped a queued message's bubble
+    before the harness had written it down. #238 is where this cost actually ends, on
+    the server, by making a message correlatable instead of guessable.
     """
     settled = _settled()
 
-    for case in ("quoted_markup", "masked_credential", "kept_by_its_tail"):
-        assert settled[case] == [], (
-            f"{case}: the bubble is still pending after the run answered it — "
-            f"{settled[case]}"
+    for case, sent in (
+        ("quoted_markup", _QUOTING_MARKUP),
+        ("masked_credential", _NAMING_A_TOKEN),
+        ("kept_by_its_tail", _long_paste()),
+    ):
+        assert settled[case] == [sent], (
+            f"{case}: the bubble was dropped for a transcript turn that does not "
+            "hold this message's words — if a new settle path was added, it decides "
+            "on something other than the text and #254's decision is what it has to "
+            f"argue with — {settled[case]}"
         )
 
 
 def test_the_text_match_forgives_whitespace_and_nothing_else():
-    """The other layer, and it is the one that settles a bubble on the words.
+    """The one layer left, and it settles a bubble on the words.
 
     A turn the harness recorded in pieces comes back joined with a blank line
     between them, so the transcript's copy and the sent string differ by one
@@ -897,14 +1197,19 @@ def test_the_text_match_forgives_whitespace_and_nothing_else():
     than that: two messages whose words differ stay two messages, and a message
     that is a *prefix* of a longer turn is not that turn.
 
-    Isolated deliberately: neither of those cases has an agent turn after the
-    operator's, so the arrival backstop cannot be what answers them.
+    Both halves matter more since #254 than they did when they were written: with
+    the arrival backstop gone, a bubble this rule cannot match is a bubble nothing
+    else will clear, and a bubble it matches too loosely is a message the operator
+    sent that the view stops showing.
     """
     settled = _settled()
 
     assert settled["recorded_in_pieces"] == [], (
         "a turn the harness recorded in two blocks never matches what was typed, "
         f"so the bubble outlives it — {settled['recorded_in_pieces']}"
+    )
+    assert settled["multi_kb_fenced_paste"] == [], (
+        "the one multi-kilobyte fenced turn did not settle its pending bubble"
     )
     assert settled["different_words"] == ["rebase on main"], (
         "a different message settled this bubble, so the match now forgives words"
@@ -914,8 +1219,57 @@ def test_the_text_match_forgives_whitespace_and_nothing_else():
     )
 
 
+def test_a_message_the_platform_defused_settles_on_its_own_defused_turn():
+    """The one rewriting this end can undo exactly, and the regression the dot
+    introduced (#254).
+
+    A chat message that starts with `!` is typed at a claude session with a `.` in
+    front of it, or Claude Code runs the sentence as a shell command. The earlier
+    version of that defusal was a leading *space*, which the whitespace collapse
+    forgave by accident: the recorded copy matched its bubble and this component
+    never had to know the mechanic existed. A `.` does not collapse, so the same
+    rule would leave every defused message's bubble up for the rest of the run, next
+    to the transcript's dotted copy of it — the same message twice, on the ordinary
+    path rather than the rewritten-copy one the trade above accepted.
+
+    So a pending item that starts with `!` accepts its own defused rendering as its
+    turn, and the two guards are what keep that from being a loophole: the second
+    form belongs to one item's words, and it is offered only by an item the transform
+    would actually have fired on. A dotted turn is otherwise a stranger's turn, and
+    the visible prefix stays in the transcript either way — this decides what settles
+    a bubble, not what is shown.
+    """
+    from lmer_cli.supervisor import _sanitize_user_chat
+
+    # The other end of the pair, because two processes have to agree on one string:
+    # the client reconstructs what the supervisor typed, and neither file can see the
+    # other. A prefix changed on one side alone is a bubble that never settles again.
+    assert _sanitize_user_chat(_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND, "claude") == (
+        _AS_THE_SESSION_RECORDS_IT
+    ), "the supervisor defuses a message into something this view does not expect"
+    assert _sanitize_user_chat(_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND, "codex") == (
+        _AS_THE_SESSION_RECORDS_IT
+    ), "Codex defuses a message into something this view does not expect"
+
+    settled = _settled()
+
+    assert settled["defused_on_the_way_in"] == [], (
+        "the bubble survived the transcript holding this very message as the session "
+        "recorded it, so every message an operator opens with `!` is shown twice for "
+        f"the rest of the run — {settled['defused_on_the_way_in']}"
+    )
+    assert settled["another_messages_defused_turn"] == ["!207 was merged"], (
+        "a defused turn settled a different message's bubble, so the second form is "
+        "matched as any dotted turn rather than as this item's own words"
+    )
+    assert settled["a_dotted_turn_that_defused_nothing"] == ["yes"], (
+        "a turn that merely starts with a dot settled a message the transform would "
+        "never have touched, which is a stranger's turn taking a bubble down"
+    )
+
+
 def test_a_bubble_stays_up_until_the_transcript_has_the_message():
-    """The two ways the backstop must not fire, and both are the same failure: the
+    """The ways a bubble must not go, and all of them are the same failure: the
     operator's words gone from the view with nothing holding them.
 
     A session that was working when the message went keeps streaming the turn it
@@ -926,7 +1280,7 @@ def test_a_bubble_stays_up_until_the_transcript_has_the_message():
     timeline by their own clock (T67), not by the queue a typed message is in.
 
     The seq guard rides along here: the identical answer *earlier* in the
-    conversation is the case it was written for, and neither layer may reach back
+    conversation is the case it was written for, and the match may not reach back
     past the cursor to find it.
     """
     settled = _settled()
@@ -945,9 +1299,9 @@ def test_a_bubble_stays_up_until_the_transcript_has_the_message():
     )
 
 
-def test_the_text_match_answers_for_one_bubble_per_turn():
-    """Two identical sends inside one poll interval, and the guard that separates
-    them on the text path (review of !202).
+def test_two_identical_messages_need_two_turns_and_take_them_in_send_order():
+    """Two identical sends inside one poll interval, which is the pair the whole
+    pairing rule exists for (review of !202, and #254's half of it).
 
     They share a cursor, so they share a `since`, and the seq guard — written for
     exactly the double-"yes" pair — cannot tell them apart at all. Before the turn
@@ -955,62 +1309,422 @@ def test_the_text_match_answers_for_one_bubble_per_turn():
     second message vanished while it was still in flight even with nothing else in
     the transcript.
 
-    What is pinned here is that rule and only that rule: a turn is matched by text
-    once, and the earlier send takes it because `pending` is in send order. It is
-    **not** a claim that the pair survives a poll — the arrival branch does not
-    consult `claimed`, so a reply after this turn settles the second bubble as well.
-    That shape is `two_identical_sends_then_a_reply`, asserted with the other
-    accepted costs below, and this transcript deliberately stops short of it.
+    Two things are pinned, and the second one is what #254 changed. A turn is taken
+    by one bubble, and it is the *oldest* unmatched one that takes it, which is
+    checked on the bubble left standing rather than on their count: `pending` is in
+    send order and `filter` walks it in that order, so the pair resolves onto the
+    transcript in the order it was typed. And the second bubble is then held until
+    its own turn lands — a reply is not a second message, where before #254 the
+    arrival backstop cleared it on the first bubble's turn plus any reply, which was
+    evidence about neither of them. Both identical messages resolve, to two turns.
     """
-    settled = _settled()
+    bubbles = _bubbles()
 
-    assert settled["two_identical_sends_one_interval"] == ["yes"], (
+    left = bubbles["two_identical_sends_one_interval"]
+    assert [item["text"] for item in left] == ["yes"], (
         "the text match answered for a different number than one bubble — "
-        f"{settled['two_identical_sends_one_interval']}; both gone means one turn "
-        "matched two messages by text, none means the first no longer settles "
-        "against its own turn"
+        f"{left}; both gone means one turn matched two messages by text, none "
+        "means the first no longer settles against its own turn"
+    )
+    assert left[0]["at"] == 1000, (
+        "the turn was taken by the message sent second, so a pair of identical "
+        "sends resolves onto the transcript in the wrong order — the first one "
+        "is the one that was recorded"
+    )
+
+    held = [item["at"] for item in bubbles["two_identical_sends_then_a_reply"]]
+    assert held == [1000], (
+        "a reply after the first bubble's turn cleared the second bubble as well, "
+        f"which is the #254 drop arriving through the double send — {held}"
+    )
+
+    assert bubbles["two_identical_sends_two_turns"] == [], (
+        "two identical messages did not resolve to two recorded turns, so one of "
+        "them is a message the operator sent that the view holds forever — "
+        f"{bubbles['two_identical_sends_two_turns']}"
+    )
+
+    assert [item["at"] for item in bubbles["two_sends_answered_out_of_order"]] == [0], (
+        "the bubble whose words are in the transcript is not the one that settled, "
+        "so the pairing follows position rather than text"
     )
 
 
-def test_the_arrival_backstop_accepts_a_strangers_turn_and_this_is_the_cost():
-    """The known false settle, pinned as behaviour rather than left as prose
-    (review of !202).
+#: The dismiss run against the settle rule, in one Node process, because the
+#: question is not "does the array get shorter" — it is whether the rule that pairs
+#: bubbles with turns still works over the gap a dismissal leaves. Its pairing walks
+#: `pending` in send order and takes the oldest unmatched bubble, so a pair with the
+#: first one removed is the case where a wrong implementation shows: the survivor
+#: has to take the next turn that arrives, not wait for a second one.
+_DISMISS_PROBE = """
+const messages = { value: [] }
+const pending = { value: [] }
+const consumed = new Set()
 
-    The arrival-evidence layer asks two questions about the transcript and neither
-    is about text, so a turn it accepts as evidence need not be this message's: an
-    unrelated operator turn at or past the send's cursor, with any later reply,
-    settles this bubble — and what settles is dropped and never re-added. For a
-    message that was never actually submitted that removes its "not confirmed"
-    warning for the rest of the run.
+%s
 
-    That is accepted deliberately (#237): the alternative is the bound that leaves
-    every bubble unsettleable, which is the reported bug. It is recorded here so
-    the trade is a checked fact — if a later change narrows the bound, this test
-    fails and says which cost was being paid, rather than a comment quietly going
-    stale. #238 closes the window at its source by sourcing the bound from the
-    server.
+%s
 
-    The second shape is the same cost reached through the same branch, and it is
-    what bounds the text-match guard above: the turn the first of two identical
-    bubbles took is still arrival evidence for the second, because `claimed` is a
-    text-match rule that the arrival scan does not read. So the pair is separated
-    only until a reply lands. Excluding claimed turns there would hold the pair for
-    a whole pass and was deliberately not done — it would not touch the residue
-    that `claimed` is rebuilt per call, which is the half no client-side rule can
-    close.
+%s
+
+const probe = %s
+pending.value = probe.pending
+const after = {}
+dismissPending(probe.dismiss)
+after.dismissed = pending.value.map((item) => item.id)
+messages.value = probe.messages
+settlePending()
+after.settled = pending.value.map((item) => item.id)
+console.log(JSON.stringify(after))
+"""
+
+
+def _dismissed(pending, dismiss, messages):
+    """Run ``dismissPending`` then ``settlePending``. Ids left after each."""
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    script = _DISMISS_PROBE % (
+        _chat_body("function dismissPending"),
+        _chat_body("function comparable"),
+        _chat_body("function settlePending"),
+        json.dumps({"pending": pending, "dismiss": dismiss, "messages": messages}),
+    )
+    result = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"the dismiss probe failed:\n{result.stdout}\n{result.stderr}"
+    )
+    return json.loads(result.stdout)
+
+
+def test_the_operator_can_take_an_unsettled_bubble_off_the_screen():
+    """The operator, with a screenshot of a message they sent five turns earlier
+    still sitting at the bottom of the pane: *"for now i just want an UX authored fix
+    that just lets me manually remove a message from the display only"* (issue 286).
+
+    Two goes at the cause are behind that "for now" — issue 237's cursor race, and
+    issue 238's transcript gap, which is still open — so what is added is an escape
+    hatch and not a third theory. It removes the bubble from this pane and nothing
+    else: no route is called, the send already succeeded, and a turn that does land
+    later arrives as the ordinary transcript turn it always was.
+
+    Run rather than read, and run *with* the settle rule, because the property worth
+    having is not that an array gets shorter. The pairing walks `pending` in send
+    order and gives a turn to the oldest unmatched bubble, so a pair whose first
+    bubble was dismissed is the case that separates a working dismissal from one that
+    strands the survivor: the message still on its way has to settle against the next
+    turn that arrives, not wait for a second one that never comes.
+    """
+    pair = [
+        {"id": 1, "text": "yes", "since": 0, "at": 0},
+        {"id": 2, "text": "yes", "since": 0, "at": 1000},
+    ]
+    turn = [{"role": "user", "kind": "said", "seq": 4, "text": "yes"}]
+
+    after = _dismissed(pair, 1, turn)
+    assert after["dismissed"] == [2], (
+        "the dismiss took the wrong bubble, or more than one: two identical "
+        f"messages are two bubbles and the id is what tells them apart — {after}"
+    )
+    assert after["settled"] == [], (
+        "the bubble left standing did not settle against the next recorded turn, so "
+        "dismissing the older of two identical messages leaves the newer one waiting "
+        "for a turn of its own — and where the dismissed message's turn never lands, "
+        f"which is the case this feature is for, that wait has no end — {after}"
+    )
+
+    # A dismiss of something that is not held is a no-op rather than a wrong drop:
+    # two taps on one bubble is one gesture as far as the operator is concerned.
+    assert _dismissed(pair, 9, [])["dismissed"] == [1, 2]
+
+
+def test_the_dismiss_is_the_operators_and_not_a_timer_in_disguise():
+    """The rule this feature had to be added *under*: nothing about a bubble is
+    decided by a clock (see the test of that name).
+
+    A control that only appeared once the grace window had expired would be the
+    rejected timeout wearing a button's clothes — the same clock deciding, one step
+    removed, when a message the operator sent may leave the screen. So the affordance
+    is on every bubble and reads no clock, and what removes one is now the transcript
+    or a tap, neither of which is a timer.
+
+    The rest is what "display only" has to mean in the code: no route, no storage,
+    and nothing else in the component that remembers a bubble is touched. `consumed`
+    is the one that would be tempting — it holds the turns that settled earlier
+    bubbles — and a dismissed bubble settled against nothing, so there is nothing in
+    it to forget.
+    """
+    body = _chat_function("function dismissPending")
+    for forbidden, why in (
+        ("Date.now", "the dismiss reads a clock"),
+        ("props.now", "the dismiss reads the shell's clock"),
+        ("PENDING_GRACE_MS", "the dismiss is gated on the grace window"),
+        ("consumed", "the dismiss reaches into the turn memory"),
+        ("localStorage", "a dismissal is remembered between loads"),
+        ("await", "the dismiss calls something"),
+    ):
+        assert forbidden not in body, f"{why}: {body}"
+
+    text = _read(CHAT)
+    label = _chat_function("function pendingLabel")
+    assert "props.now - item.at" in label and "PENDING_GRACE_MS" in label, (
+        "the clock moved out of the label, which is the only thing it is for"
+    )
+    # And the control is on the bubbles that can get stuck, not on the transcript's
+    # own turns: a turn removed from the display would be back on the next poll. The
+    # markup alone, since the script above it is where the function is declared.
+    markup = text[text.index("<template>"):]
+    bubbles = markup.index('v-for="item in pending"')
+    assert "dismissPending(item.id)" in markup[bubbles:], (
+        "nothing in the pending bubble calls the dismiss"
+    )
+    assert "dismissPending" not in markup[:bubbles], (
+        "a transcript turn offers a dismiss, which the next poll undoes"
+    )
+    assert ":key=\"item.id\"" in markup[bubbles:], (
+        "the bubbles are keyed by position again, so dropping one renames the rest "
+        "— which is a removal that redraws the wrong bubble"
+    )
+    dismiss = re.search(r"<v-btn\b[^>]*dismissPending[^>]*>", markup[bubbles:], re.S)
+    assert dismiss and "aria-label" in dismiss.group(0), (
+        "the dismiss is an icon button with no name, so it is unusable to a screen "
+        "reader and unlabelled to everyone else"
+    )
+
+
+def test_a_strangers_turn_no_longer_takes_a_message_off_the_screen():
+    """#254, at the exact rule it was reported against.
+
+    This assertion used to read ``== []``, and that encoded the bug: the arrival
+    backstop asked two questions about the transcript, neither of them about text,
+    so any operator turn past the send's cursor with any later reply cleared this
+    bubble — and a settled item is dropped, never re-added. The fixture is a
+    stranger's message and a stranger's reply, and it is not a rare shape: a
+    message typed at a working session is queued and unwritten while that session
+    finishes what it was doing, which is precisely when somebody else's turn and a
+    reply to it land. The operator's message then left the screen having never
+    appeared in the history it was sent into — messages "in between turns" going
+    missing, as #254 puts it.
+
+    The decision is the operator's and it is not a tuning: a send this pane accepted
+    is assumed delivered, and only the transcript holding the message takes the
+    bubble down. So the bubble stays, and the cost of that is asserted above — a
+    message whose recorded copy was rewritten is now shown twice.
     """
     settled = _settled()
 
-    assert settled["a_strangers_turn_and_a_reply"] == [], (
-        "a stranger's turn no longer settles the bubble — if that is deliberate, "
-        "the accepted-cost comment in Chat.vue's settlePending header and the "
-        "#238 rationale both need revisiting, not just this assertion"
+    assert settled["a_strangers_turn_and_a_reply"] == [_QUOTING_MARKUP], (
+        "a stranger's turn settled the bubble, so a message queued at a working "
+        "session is dropped from the conversation before the harness writes it "
+        "down — that is #254, and the arrival backstop is where it lived"
     )
-    assert settled["two_identical_sends_then_a_reply"] == [], (
-        "the second of two identical sends is now held past a reply — if the "
-        "arrival scan started skipping claimed turns, the text-match guard's "
-        "comment and the test above both understate what it delivers, and the "
-        f"claim is theirs to widen: {settled['two_identical_sends_then_a_reply']}"
+    settle = _chat_function("function settlePending")
+    assert "assistant" not in settle, (
+        "the settle rule reads the agent's turns again; the only thing it may ask "
+        "is whether the transcript holds this message's words"
+    )
+
+
+#: A message typed at a session that was already working: it sits in the harness's
+#: queue while the current turn finishes, and nothing about it is in the transcript
+#: until then. Plain words on purpose — the normaliser leaves them alone, so when the
+#: turn finally arrives it really does match, and the last pass below can show that
+#: this probe would have noticed a settle.
+_QUEUED_MID_TURN = "check the runner mount before you restart it"
+
+
+def _cycles():
+    """One bubble, and the run going on around it poll by poll.
+
+    The pages are slices of one conversation rather than pages built apart, because
+    ``seq`` is the index of a turn in the whole run — sliced, the numbering is the
+    one a real sequence of polls hands the view.
+    """
+    def stamp(index):
+        return f"2026-07-29T10:{index:02d}:00.000Z"
+
+    conversation = _conversation([
+        _agent_turn("Working on it.", stamp(0)),
+        # Somebody else's message, and a reply to it: everything the old arrival
+        # backstop asked for, and none of it about the queued message.
+        _operator_turn("something entirely different", stamp(1)),
+        _agent_turn("Looked at that instead.", stamp(2)),
+        # The session keeps working, which is why the message is still queued.
+        _agent_turn("Still reading the log.", stamp(3)),
+        _agent_turn("Ran the tests.", stamp(4)),
+        # A second stranger's turn, answered too.
+        _operator_turn("and check the disk while you are there", stamp(5)),
+        _agent_turn("Disk is fine.", stamp(6)),
+        # And finally the harness writes down what it had queued.
+        _operator_turn(_QUEUED_MID_TURN, stamp(7)),
+        _agent_turn("Mount looks wrong, fixing it.", stamp(8)),
+    ])
+    return {
+        "pending": [{"text": _QUEUED_MID_TURN, "at": 0, "since": 1}],
+        "pages": [
+            conversation[:1], conversation[1:3], conversation[3:5],
+            conversation[5:7], conversation[7:],
+        ],
+    }
+
+
+def test_a_bubble_nothing_confirms_survives_every_poll_until_its_turn_arrives():
+    """The failure #254 describes, followed through the polls that produce it.
+
+    One call of the settle rule is not what an operator experiences: a run polls
+    every few seconds for as long as it lives, and each poll asks again. Under the
+    arrival backstop the second page here was already fatal — a stranger's turn and a
+    reply to it — and the message was gone from the conversation four polls before
+    the harness got round to writing it down. There is no timer either: passes go by
+    with nothing about this message in the transcript, and the bubble is still there,
+    because "nothing has confirmed it" is not a reason to remove somebody's words.
+
+    The last page is what keeps this honest: the harness records the queued message,
+    and the bubble goes on the pass that sees it. A probe that could not settle
+    anything would pass every assertion above it.
+    """
+    kept = _run_probe(_CYCLES_PROBE % (
+        _chat_body("function comparable"),
+        _chat_body("function settlePending"),
+        json.dumps(_cycles()),
+    ), "poll cycles")
+
+    assert kept[:-1] == [[_QUEUED_MID_TURN]] * (len(kept) - 1), (
+        "the bubble went before the transcript had the message, and the pass it "
+        f"went on says what took it — {kept}"
+    )
+    assert kept[-1] == [], (
+        "the message is in the transcript and the bubble is still up, so this "
+        "probe cannot tell a bubble that is held from one nothing can settle"
+    )
+
+
+def _identical_sends_across_polls():
+    """The double "yes", with its two turns landing on two different polls.
+
+    Which is the ordinary shape of it: the harness writes a queued message down when
+    it gets to it, so two messages sent inside one interval are rarely recorded
+    inside one. The empty page in the middle is the pass that matters — a poll that
+    brings nothing back still absorbs and still settles, and the first message's turn
+    is the only operator turn the transcript holds while it goes by.
+
+    Slices of one conversation, like ``_cycles``: ``seq`` is the index of a turn in
+    the whole run, so the numbering has to be the one a real sequence of polls sees.
+    """
+    conversation = _conversation([
+        _agent_turn("Ready.", _STAMPS[0]),
+        _operator_turn("yes", _STAMPS[1]),
+        _operator_turn("yes", _STAMPS[2]),
+    ])
+    return {
+        "pending": [
+            {"text": "yes", "at": 0, "since": 1},
+            {"text": "yes", "at": 1000, "since": 1},
+        ],
+        "pages": [conversation[:2], [], conversation[2:]],
+    }
+
+
+def test_the_turn_that_settled_one_bubble_cannot_settle_the_next_one_a_poll_later():
+    """The pairing rule asked across polls instead of within one call.
+
+    Its own comment promises that two identical messages need two recorded turns —
+    but the memory of which turn an earlier bubble took used to be built fresh on
+    every call, and a settled bubble is dropped, so nothing was left to say the turn
+    had been taken. `settlePending` runs on every absorb, empty page included, so the
+    next pass found the same recorded "yes" unclaimed and cleared the second bubble
+    against it: the operator's second message off the screen while it was still in
+    flight, a few seconds later than the bug the rule was written for and by the same
+    route. Single-pass fixtures cannot see it — the pass that drops the bubble is the
+    one that has nothing new to report.
+
+    Both directions are here. The middle pass is the poll that brings back nothing,
+    and the bubble must survive it; the last one holds the second message's own turn,
+    and the bubble must go on it — a rule that simply never settled twice would pass
+    the middle assertion and fail this one.
+    """
+    kept = _run_probe(_PAIR_CYCLES_PROBE % (
+        _chat_body("function comparable"),
+        _chat_body("function settlePending"),
+        json.dumps(_identical_sends_across_polls()),
+    ), "identical sends across polls")
+
+    assert [item["at"] for item in kept[0]] == [1000], (
+        "the page holding the first message's turn did not resolve onto the first "
+        f"bubble — {kept[0]}; both gone means one turn matched two messages by "
+        "text, neither means the match no longer settles at all"
+    )
+    assert [item["at"] for item in kept[1]] == [1000], (
+        "a poll that brought nothing back settled the second bubble against the "
+        "first message's turn, so the second message left the screen without ever "
+        f"being written down — {kept[1]}"
+    )
+    assert kept[2] == [], (
+        "the second message's own turn arrived and its bubble is still up, so the "
+        f"turn memory outlives the turns it is meant to be about — {kept[2]}"
+    )
+
+
+def _restart_views():
+    """One session view's conversation, then the next one's, numbered from scratch.
+
+    A respawn puts a different session behind the same run and the server renumbers
+    what it serves from the beginning, so the same ``seq`` names a different turn on
+    either side of the restart — which is what makes a remembered one dangerous.
+    """
+    return {
+        "views": [
+            {
+                "messages": _conversation([
+                    _agent_turn("Ready.", _STAMPS[0]),
+                    _operator_turn("yes", _STAMPS[1]),
+                ]),
+                "pending": [{"text": "yes", "at": 0, "since": 1}],
+            },
+            {
+                "messages": _conversation([
+                    _agent_turn("Ready again.", _STAMPS[0]),
+                    _operator_turn("yes", _STAMPS[1]),
+                ]),
+                "pending": [{"text": "yes", "at": 0, "since": 1}],
+            },
+        ],
+    }
+
+
+def test_a_new_session_view_remembers_none_of_the_last_ones_turns():
+    """The other end of the turn memory: it is the view's, not the run's.
+
+    The numbers it holds mean something only against the list they were read off. A
+    respawn hands this component a different session, the server numbers that
+    conversation from the beginning, and a seq carried across would say a turn had
+    already been taken when the turn wearing that number is one this view has never
+    seen — the new session's first "yes" held for the rest of the run, which is the
+    same lost message from the opposite direction.
+
+    Two halves, because the probe mirrors the reset rather than running ``start()``
+    (which is a fetch): the reset really is what ``start()`` does, and doing it lets
+    the second view's bubble settle against its own turn.
+    """
+    start = _chat_body("async function start")
+    for dropped in ("messages.value = []", "pending.value = []", "cursor = 0",
+                    "consumed.clear()"):
+        assert dropped in start, (
+            f"a restart keeps `{dropped}` from the session it is leaving, so this "
+            "view opens the next conversation holding the last one's state"
+        )
+
+    kept = _run_probe(_RESTART_PROBE % (
+        _chat_body("function comparable"),
+        _chat_body("function settlePending"),
+        json.dumps(_restart_views()),
+    ), "restart")
+
+    assert kept == [[], []], (
+        "a bubble in the second view was held against a turn the first view "
+        f"consumed, so the memory outlived the numbering it was read from — {kept}"
     )
 
 
@@ -1022,6 +1736,10 @@ def test_nothing_about_the_bubble_is_decided_by_a_clock():
     not read as a send that went nowhere. So the settle rule may consult the
     transcript and nothing else; the clock in this component belongs to the
     *label*, which changes its wording without touching what is held.
+
+    #254 removed the other way out of a bubble and left this one exactly where it
+    was: with the arrival backstop gone, a grace window that expired into a drop
+    would be the same rejected timeout wearing the caption's clothes.
     """
     settle = _chat_function("function settlePending")
     match = _chat_function("function comparable")
@@ -1043,7 +1761,7 @@ def test_nothing_about_the_bubble_is_decided_by_a_clock():
     )
 
 
-# --- and what it says once the grace window is up (issue 194) -----------------
+# --- what it says while it waits, and what it stops saying (issue 194, #254) --
 
 #: A message with a newline in it, which is the shape the issue was reported over.
 _TYPED_AT_A_SESSION = "first line about the failure\nsecond line with /a/path in it"
@@ -1077,9 +1795,9 @@ def _held(typed=_TYPED_AT_A_SESSION):
 
     cases = {
         "unconfirmed": {"reply": _UNCONFIRMED_REPLY},
-        # A control plane that can confirm one. Nothing does today; the rung is kept
-        # so the *reason* the caption is weak stays tied to the fact rather than to
-        # the route's current behaviour.
+        # A control plane that can confirm one. Nothing does today; the case is kept
+        # so what the item records stays tied to what the route answered rather than
+        # to the route's current behaviour.
         "confirmed": {"reply": {
             "session": "probe-session", "bytes_written": 61,
             "submit_confirmed": True,
@@ -1119,14 +1837,21 @@ def test_the_reply_from_the_control_plane_reaches_the_bubble():
     to call the message sent.
 
     So this runs the real `send()` and looks at what it held: the reply's verdict has
-    to be on the item, or the caption below has nothing to be honest with. Executed
-    rather than read, because "the function assigns a field" is what a source check
-    would confirm, and the thing that matters is which value ends up there — an
-    unconfirmed reply must not produce a confirmed item.
+    to be on the item, and it has to be the verdict that was sent. Executed rather
+    than read, because "the function assigns a field" is what a source check would
+    confirm, and the thing that matters is which value ends up there — an unconfirmed
+    reply must not produce a confirmed item.
+
+    No caption reads the field since #254 — a send this pane accepted is assumed
+    delivered, and the rung that hedged about it is gone. It is still carried, and
+    still checked here, because this reply is the only place the view is told: a fact
+    already in hand costs nothing to keep, and re-deriving it later would cost a round
+    trip. Dropping it again would be the #194 bug's first move.
     """
     held = _held()
 
     assert held["unconfirmed"] == [{
+        "id": 1,
         "text": _TYPED_AT_A_SESSION,
         "submitConfirmed": False,
         "since": _CURSOR_AT_SEND,
@@ -1138,8 +1863,8 @@ def test_the_reply_from_the_control_plane_reaches_the_bubble():
         "a reply that said nothing about the submit produced a confirmed item"
     )
     assert held["confirmed"][0]["submitConfirmed"] is True, (
-        "a confirmed submit is being reported as unconfirmed, so the caption would "
-        "hedge about something that is a fact"
+        "a control plane that could confirm a submit is recorded as though it had "
+        "not, so the one fact this reply carries is lost on the way to the item"
     )
 
 
@@ -1180,10 +1905,12 @@ def test_a_poll_that_wins_the_race_cannot_move_the_bubbles_since():
     text, wait out the drain and write the CR — and the harness records the turn
     the moment the TUI takes it — so a poll can absorb this very message and move
     the cursor past it before the POST reply is back. A `since` read *after* the
-    await then points beyond the turn it exists to find, and neither settle layer
-    may look behind it (the double-"yes" guard is that bound), so the bubble can
-    never settle: past the grace window the caption hardens into "not confirmed"
-    for a message the terminal shows delivered and answered.
+    await then points beyond the turn it exists to find, and the match may not look
+    behind it (the double-"yes" guard is that bound), so the bubble can never
+    settle: it hardened into the old warning caption for a message the terminal
+    showed delivered and answered, and since #254 removed the other way out of a
+    bubble it would now sit there for the rest of the run, showing the operator
+    their own message twice.
 
     So `since` has to be the cursor as of *starting* the send, and this runs the
     real `send()` against a stub that advances the cursor mid-flight — the race
@@ -1234,95 +1961,236 @@ def test_a_newline_left_on_the_end_is_taken_off_before_the_message_goes():
         )
 
 
-def _labels():
-    """Run the label ladder over its three rungs. Case name → the caption."""
+#: The composer's send, and then the api.js call it made, run for real against a
+#: scripted ``fetch`` — the whole way from the box the operator typed in to the
+#: body on the wire. Two hops rather than one because the fact being carried is
+#: split across them: the component knows a human typed this, the client turns
+#: that into a field, and a test of either half alone passes while the other end
+#: drops it. The JS half only reports; every assertion is in Python.
+_COMPOSER_WIRE_PROBE = """
+const props = { sessionId: 'probe-session' }
+let cursor = 0
+const draft = { value: %s }
+const sending = { value: false }
+const problem = { value: null }
+const pending = { value: [] }
+const following = { value: false }
+// The component's bubble counter, which lives beside `pending` in the module scope
+// rather than inside the function under test. Here because a bubble's id is what
+// the dismiss is given (issue 286) and what the render key is, so a probe that left
+// it undefined would report no bubbles at all rather than a wrong one.
+let bubbleId = 0
+const stale = () => false
+const nextTick = () => {}
+const stickToBottom = () => {}
+const poll = () => {}
+const generation = 0
+const reply = { session: 'probe-session', bytes_written: 16 }
+const asked = []
+const sendSessionInput = async (sessionId, data, options) => {
+  asked.push({ sessionId, data, options: options ?? null })
+  return reply
+}
+
+%s
+
+const calls = []
+globalThis.fetch = async (path, options) => {
+  calls.push({ path, method: options.method, body: options.body })
+  return { ok: true, status: 200, json: async () => reply }
+}
+const api = await import(%s)
+
+await send()
+const composed = asked[asked.length - 1]
+await api.sendSessionInput(
+  composed.sessionId, composed.data, composed.options ?? undefined,
+)
+const flagged = calls[calls.length - 1]
+await api.sendSessionInput(composed.sessionId, composed.data)
+const unflagged = calls[calls.length - 1]
+console.log(JSON.stringify({ composed, flagged, unflagged }))
+"""
+
+
+def _wire(typed=_TYPED_AT_A_SESSION):
+    """Run the composer and the api client, and report what reached ``fetch``."""
     node = node_binary()
     if not node:
         require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
 
-    grace = int(re.search(
-        r"const PENDING_GRACE_MS = (\d+)", _read(CHAT),
-    ).group(1))
-    unconfirmed = re.search(
-        r"const SUBMIT_UNCONFIRMED_LABEL = \(\n(.*?)\n\)\n", _read(CHAT), re.S,
-    )
-    assert unconfirmed, "the unconfirmed caption is no longer a named constant"
-    cases = {
-        # Inside the grace window, whatever the control plane said: a transcript
-        # that has not caught up in a few seconds is the ordinary case.
-        "still_going": {"now": 1000, "item": {"at": 0, "submitConfirmed": False}},
-        # Past it, and the submit was never confirmed — what every chat send is
-        # today, because a CR typed at a TUI is not an observable submit.
-        "unconfirmed": {"now": grace + 1000, "item": {"at": 0, "submitConfirmed": False}},
-        # Past it, with the submit a fact: only the transcript is behind.
-        "confirmed": {"now": grace + 1000, "item": {"at": 0, "submitConfirmed": True}},
-        # A reply that said nothing about the submit is not a confirmation of one.
-        "silent_reply": {"now": grace + 1000, "item": {"at": 0}},
-    }
-    script = _LABEL_PROBE % (
-        grace,
-        "(" + unconfirmed.group(1) + ")",
-        _chat_body("function pendingLabel"),
-        json.dumps(cases),
+    script = _COMPOSER_WIRE_PROBE % (
+        json.dumps(typed),
+        _chat_body("async function send"),
+        json.dumps(str(WEB / "src" / "api.js")),
     )
     result = subprocess.run(
-        [node, "-e", script], capture_output=True, text=True, timeout=120,
+        [node, "--input-type=module", "-e", script],
+        cwd=str(WEB), capture_output=True, text=True, timeout=120,
     )
     assert result.returncode == 0, (
-        f"the label probe failed:\n{result.stdout}\n{result.stderr}"
+        f"the composer-to-wire probe failed:\n{result.stdout}\n{result.stderr}"
     )
     return json.loads(result.stdout)
 
 
-def test_a_message_the_session_may_never_have_read_is_not_called_sent():
-    """The reported failure, at the layer it was actually in (issue 194).
+#: A message about a merge request, and the one the operator reported (#254): typed
+#: into the chat pane it reached Claude Code's input box with `!` in the first
+#: column, which is that TUI's bash escape, and the sentence ran as a shell command
+#: in their session. It goes through as words — the defusing is the supervisor's,
+#: because it is the end that knows which harness is reading.
+_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND = '!206 was merged'
 
-    An operator typed into this pane and nothing arrived in the session, for a
-    string of messages, and the pane called every one of them sent — so the app
-    reported a working conversation while the run heard nothing. The control plane
-    was not the one being coy about it: ``POST /input`` answers
-    ``submit_confirmed: false`` with a note whenever it typed an Enter it cannot
-    observe landing, which is every message typed at a TUI, and this view threw the
-    reply away.
+#: The same message as the session records it. The supervisor gives the first column
+#: to a `.` and types `". !206 was merged"`, and the prefix is part of the turn the
+#: harness writes down — which is what the settle rule above has to recognise as this
+#: message's own turn. Derived from the sent message so the pair cannot drift, with
+#: the prefix spelled out: read off `_sanitize_user_chat` instead, this would agree
+#: with whatever that function did and could not fail. The other end of the drift —
+#: that the supervisor really produces this string — is asserted in the settle test.
+_AS_THE_SESSION_RECORDS_IT = f'. {_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND}'
 
-    A CR is not a submit it can see: a dialog on screen consumes the keystrokes and
-    answers *itself* with the Enter, and a re-render can swallow it — both
-    reproduced against a real claude TUI while this was diagnosed. So past the grace
-    window the caption may not say the word "sent", and it has to name the one place
-    an operator can see which happened.
+
+def test_a_message_from_the_composer_is_marked_as_typed_by_a_person():
+    """Executed, both hops. The chat pane is the only place that knows a human
+    wrote these words in a box, and the supervisor cannot infer it: the same route
+    carries the terminal's keystrokes, where a leading `!` is an escape somebody
+    means. So the composer says so, and the flag has to survive the client — a
+    component that sets an option api.js drops puts nothing on the wire, and
+    neither half fails on its own.
+
+    The message is not touched here, which is the other half of the design: this
+    end asserts a fact, the far end decides what to do about it.
+    """
+    seen = _wire(_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND)
+
+    assert seen["composed"]["options"] == {"sanitize": True}, (
+        "the composer is not marking its message as one a person typed: "
+        f"{seen['composed']['options']}"
+    )
+    assert seen["composed"]["data"] == _A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND, (
+        "the message was edited in the browser — the words that go are the "
+        "operator's, and what a TUI would make of them is decided in the session"
+    )
+    body = json.loads(seen["flagged"]["body"])
+    assert body["sanitize"] is True, f"the flag never reached the wire: {body}"
+    assert body["data"] == _A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND
+    assert body["append_newline"] is True, "a chat message is typed AND submitted"
+
+
+def test_multi_kilobyte_fenced_paste_reaches_the_wire_as_one_message():
+    payload = _multi_kb_fenced_paste()
+    seen = _wire(payload)
+
+    assert seen["composed"]["data"] == payload
+    body = json.loads(seen["flagged"]["body"])
+    assert body["data"] == payload
+    assert body["append_newline"] is True
+
+
+def test_a_send_nobody_flagged_puts_nothing_new_on_the_wire():
+    """Every other caller of this client — the terminal's keystrokes, anything
+    typing on the operator's behalf — sends the body it always has. Absent rather
+    than `false`, so a session running an older image sees a request it already
+    understands."""
+    seen = _wire(_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND)
+
+    body = json.loads(seen["unflagged"]["body"])
+    assert body == {
+        "data": _A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND, "append_newline": True,
+    }, f"an unflagged send grew a field: {body}"
+
+
+def _grace():
+    """The grace window, read from the component so the cases are its real rungs."""
+    return int(re.search(r"const PENDING_GRACE_MS = (\d+)", _read(CHAT)).group(1))
+
+
+def _labels():
+    """Run the label ladder over its rungs. Case name → the caption."""
+    grace = _grace()
+    cases = {
+        # Inside the grace window, whatever the control plane said: a transcript
+        # that has not caught up in a few seconds is the ordinary case, and "did
+        # that go through?" is a question worth answering while it is fresh.
+        "still_going": {"now": 1000, "item": {"at": 0, "submitConfirmed": False}},
+        # A moment past it, and the submit was never confirmed — which is what
+        # every chat send is today, because a CR typed at a TUI is not an
+        # observable submit (#194).
+        "unconfirmed": {"now": grace + 1000, "item": {"at": 0, "submitConfirmed": False}},
+        # Past it, with the submit a fact. Nothing answers this way today; the case
+        # is kept so the caption is checked to be the same one either way, rather
+        # than tracking a field that has stopped deciding anything.
+        "confirmed": {"now": grace + 1000, "item": {"at": 0, "submitConfirmed": True}},
+        # A reply that said nothing about the submit.
+        "silent_reply": {"now": grace + 1000, "item": {"at": 0}},
+        # Hours later, on a bubble the transcript never matched: a message the run
+        # took and rewrote on the way back (see the settle cases above) sits here
+        # for the rest of the run, and this is what it looks like by then.
+        "long_past_grace": {
+            "now": grace * 100, "item": {"at": 0, "submitConfirmed": False},
+        },
+    }
+    return _run_probe(_LABEL_PROBE % (
+        grace,
+        _chat_body("function pendingLabel"),
+        json.dumps(cases),
+    ), "label")
+
+
+def test_a_message_past_the_grace_window_is_captioned_like_any_other_you_sent():
+    """What #254 decided the bubble is, said in captions.
+
+    The rung that used to be here warned, past the grace window, that the session
+    might never have read the message and that it could be sitting unsent in an
+    input box. Every word of that is possible and it printed on *every* message this
+    pane sends — the supervisor types a submit CR at a TUI and cannot observe it
+    landing (#194), so nothing a chat send does is ever confirmed — which made it a
+    warning about the ordinary case, printed beside messages the session had plainly
+    answered. The operator's call: assume the message was delivered, say nothing, and
+    leave the rare real case to the terminal view, which is where it is visible
+    either way.
+
+    So there is no wording left to check for honesty; what is checked is that there
+    is none. A caption is what makes a bubble look provisional, and a bubble nothing
+    is ever going to confirm must not keep one — including the one that has been up
+    for hours because the transcript's copy of it came back rewritten.
     """
     said = _labels()
 
-    # The word on its own, because "unsent" is exactly what this caption is allowed
-    # — and required — to say.
-    assert not re.search(r"\bsent\b", said["unconfirmed"]), (
-        f"an unconfirmed submit is still reported as sent — {said['unconfirmed']!r}"
-    )
-    assert "terminal" in said["unconfirmed"], (
-        "the caption does not say where the message can be seen and submitted — "
-        f"{said['unconfirmed']!r}"
-    )
-    assert said["silent_reply"] == said["unconfirmed"], (
-        "a reply that said nothing about the submit is treated as a confirmation; "
-        "the fallback has to be the quiet answer"
+    for case in ("unconfirmed", "silent_reply", "confirmed", "long_past_grace"):
+        assert said[case] == "", (
+            f"{case}: a bubble past the grace window is still captioned "
+            f"{said[case]!r}, so the view is hedging about a message #254 decided "
+            "is delivered"
+        )
+    assert "SUBMIT_UNCONFIRMED_LABEL" not in _read(CHAT), (
+        "the unconfirmed caption is back as a constant; the wording is what #254 "
+        "removed, not just the rung that reached it"
     )
 
 
-def test_the_two_honest_captions_are_still_there():
-    """The change is one rung, not a rewrite: a send in flight still says so, and a
-    submit that IS a fact still gets the sentence about the transcript being behind.
+def test_the_only_caption_left_is_the_one_for_a_send_in_flight():
+    """The rung that stayed, and it is the honest half of the old ladder.
 
-    Both matter for the same reason the third rung does — a message on its way must
-    not read as a failure. The grace window is what separates them, and it is the
-    only thing in this component a clock decides.
+    A message really is on its way for the seconds between the POST and the harness
+    writing the turn down, and saying so answers the question an operator asks in
+    exactly that window. It is also the only thing in this component a clock decides
+    — what is *held* is the transcript's business (`settlePending`), and the window
+    expiring changes a caption and nothing else.
     """
     said = _labels()
 
     assert said["still_going"] == "sending…", (
         f"a send inside the grace window says {said['still_going']!r}"
     )
-    assert said["confirmed"] == "sent — the transcript has not caught up yet", (
-        f"a confirmed submit lost its caption — {said['confirmed']!r}"
+    assert set(said.values()) == {"sending…", ""}, (
+        f"the label grew a rung: {sorted(set(said.values()))}. Two are all there "
+        "are — a send in flight, and a message like any other"
+    )
+    assert "v-if=\"pendingLabel(item)\"" in _read(CHAT), (
+        "the header renders the caption unconditionally, so a bubble past the "
+        "grace window shows a separator with nothing after it"
     )
 
 

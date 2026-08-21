@@ -1,9 +1,39 @@
 {% if LMER_SERVICE_MODE is defined and LMER_SERVICE_MODE == '1' %}
 ## Service Mode
 
+{% if LMER_SERVICE_GROUP is defined and LMER_SERVICE_GROUP %}
+A development environment is running. This session is attached to the whole
+service group `{{ LMER_SERVICE_GROUP }}` (a compose project){% if LMER_SERVICE_NAME %}, starting on
+service `{{ LMER_SERVICE_NAME }}`{% else %}, with **no service targeted yet**{% endif %}.
+{% else %}
 A development environment is running with service `{{ LMER_SERVICE_NAME }}`.
+{% endif %}
 Your workspace at `/workspace` contains the project source code from the
 developer's local checkout on the host.
+
+{% if LMER_SERVICE_GROUP is defined and LMER_SERVICE_GROUP %}
+### Choosing which service you target
+
+`target-exec` and `target-logs` run against one member of the group at a time.
+Switch between them yourself — no respawn, no second container:
+
+```bash
+# The group, the current target, and every running member
+target-switch
+
+# Point target-exec/target-logs at another member
+target-switch <service>
+```
+
+The switch takes effect for every command you start afterwards. Members are
+re-read from the running stack each time, so a service that restarted is still
+reachable and one that is down is simply not listed.
+
+The selection records a **container id**, so if your current target is recreated
+(`compose up -d`, `--force-recreate`) `target-exec` starts failing with "no such
+container". Re-run `target-switch <service>` to pick up the new container — the
+listing is always current even when your selection has gone stale.
+{% endif %}
 
 ### How the shared volume works
 
@@ -11,6 +41,11 @@ Both your `/workspace` and the service container mount from the **same host
 directory**. However, the service container may mount only specific
 subdirectories (not the entire repo). To find out what's shared:
 
+{% if LMER_SERVICE_CONTAINER %}
+{% if LMER_SERVICE_GROUP is defined and LMER_SERVICE_GROUP %}
+(The container id below is the one this session launched with; after a
+`target-switch` use the id that `target-switch` prints for the current target.)
+{% endif %}
 ```bash
 # See how the service container mounts the source
 docker inspect {{ LMER_SERVICE_CONTAINER }} --format '{% raw %}{{json .Mounts}}{% endraw %}' | python3 -m json.tool
@@ -18,6 +53,14 @@ docker inspect {{ LMER_SERVICE_CONTAINER }} --format '{% raw %}{{json .Mounts}}{
 # Check the service container's working directory
 target-exec pwd
 ```
+{% else %}
+```bash
+# Once you have picked a target with target-switch, it prints that container's
+# id — pass it to `docker inspect <id> --format '{% raw %}{{json .Mounts}}{% endraw %}'` to see how the
+# service mounts the source, or ask the container directly:
+target-exec pwd
+```
+{% endif %}
 
 Edits to files under shared mount points are immediately visible in both
 directions. Files outside the service container's mounts are only in `/workspace`.

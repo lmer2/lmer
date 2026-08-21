@@ -41,7 +41,12 @@ from typing import Optional
 # that will actually decide it rather than by a second opinion about its grammar.
 from lmer_cli.cli import ParseRefused, parse_args
 from lmer_cli.presets import PRESETS_FILE_ENV, load_presets
-from lmer_cli.service import ServiceError, resolve_container
+from lmer_cli.service import (
+    ServiceError,
+    member_names,
+    resolve_container,
+    resolve_group,
+)
 
 from .config import PlatformConfig, _detected_runtime
 from .registry import list_sessions
@@ -53,8 +58,26 @@ __all__ = [
     "SLOT_STATES", "PROBE_TTL_SECONDS",
     "SlotDefinition", "SlotStatus",
     "parse_slots", "slot_definitions", "slot_status", "slot_rows",
-    "probe_service", "clear_probe_cache",
+    "probe_service", "probe_group", "group_members", "group_membership",
+    "clear_probe_cache",
 ]
+
+#: What a slot binds, and what a live session holds: ``("service", name)`` or
+#: ``("group", compose project)``. A *pair* rather than a bare string because a
+#: group session holds every member of its project (issue #312), so occupancy
+#: became a set relation between two kinds of thing, and a namespaced key is
+#: what keeps a compose project from colliding with a service of the same name.
+_SERVICE = "service"
+_GROUP = "group"
+
+
+def _describe(binding: tuple) -> str:
+    """A binding key in the words an operator uses for it."""
+    kind, value = binding
+    return (
+        f"service group {value!r}" if kind == _GROUP else f"service {value!r}"
+    )
+
 
 #: Nothing holds the slot and its service is up — a spawn into it would run.
 SLOT_FREE = "free"
@@ -108,8 +131,17 @@ class SlotStatus:
     """
 
     definition: SlotDefinition
-    #: The service the slot's preset targets, or ``None`` when it has none.
+    #: The service the slot's preset targets, or ``None`` when it has none. For
+    #: a group slot this is the member the session *starts* on, which may be
+    #: ``None``: what the slot guards is :attr:`service_group`.
     service: Optional[str] = None
+    #: The compose project the slot's preset attaches to, or ``None``. A group
+    #: slot holds every running member of it (issue #312).
+    service_group: Optional[str] = None
+    #: For a group slot, the names its members can be addressed by, as the probe
+    #: last read them. Empty for a single-service slot, and for a group whose
+    #: project could not be read — where ``service_down_reason`` says why.
+    members: tuple = ()
     #: Why this slot cannot be used at all, or ``None``. A configuration fault.
     unusable_reason: Optional[str] = None
     #: Every live session holding this slot, oldest first. More than one means
@@ -123,6 +155,28 @@ class SlotStatus:
     service_occupants: tuple = ()
     #: Why the dev service is not usable, or ``None``.
     service_down_reason: Optional[str] = None
+    #: The binding keys those occupants actually hold. A group slot can be
+    #: blocked by its project or by any one member, and an operator reading
+    #: "already in use" needs to know which container that is about.
+    contested: tuple = ()
+
+    @property
+    def bindings(self) -> tuple:
+        """What this slot takes when a session holds it.
+
+        A group takes the project *and* every member: the project key is what a
+        second group session collides on, and the member keys are what a
+        single-service session already holding one of those containers collides
+        on. Both directions, because the harm — two agents in one dev container
+        — does not care which of them started first.
+        """
+        if self.service_group:
+            return ((_GROUP, self.service_group),) + tuple(
+                (_SERVICE, member) for member in self.members
+            )
+        if self.service:
+            return ((_SERVICE, self.service),)
+        return ()
 
     @property
     def occupant(self) -> Optional[dict]:
@@ -168,9 +222,23 @@ class SlotStatus:
             for slot, held in self.service_occupants
         )
         return (
-            f"service {self.service!r} is already in use by {who} — one service "
-            "takes one slot"
+            f"{self._contested_description} is already in use by {who} — one "
+            "service takes one slot"
         )
+
+    @property
+    def _contested_description(self) -> str:
+        """What is taken, in the words that name the container in question."""
+        binding = self.contested[0] if self.contested else (
+            self.bindings[0] if self.bindings else None
+        )
+        if binding is None:
+            return "service"
+        if self.service_group and binding[0] == _SERVICE:
+            # Blocked through one member rather than through the project: say
+            # which, or the operator goes looking at the wrong container.
+            return f"{_describe(binding)}, a member of service group {self.service_group!r},"
+        return _describe(binding)
 
     @property
     def reason(self) -> Optional[str]:
@@ -192,6 +260,8 @@ class SlotStatus:
             "preset": self.definition.preset,
             "description": self.definition.description,
             "service": self.service,
+            "service_group": self.service_group,
+            "members": list(self.members),
             "state": self.state,
             "reason": self.reason,
             "occupant": self.occupant,
@@ -286,10 +356,12 @@ def slot_definitions(config: PlatformConfig) -> list[SlotDefinition]:
 
 # --- the service probe ------------------------------------------------------
 
-#: ``(runtime, service) -> (monotonic deadline, reason or None)``. Guarded by
+#: ``(runtime, kind, name) -> (deadline, reason or None, member names)``.
+#: The members ride along because the group probe already resolved them and
+#: occupancy needs them (issue #312). Guarded by
 #: :data:`_PROBE_LOCK`: the daemon serves its routes from a threadpool, so two
 #: polls can overlap.
-_PROBE_CACHE: dict[tuple[str, str], tuple[float, Optional[str]]] = {}
+_PROBE_CACHE: dict[tuple[str, str, str], tuple[float, Optional[str], tuple]] = {}
 _PROBE_LOCK = threading.Lock()
 
 #: Slot name → the session ids last warned about, so a collision warns on a
@@ -323,20 +395,102 @@ def probe_service(
     itself: holding it would serialise every other slot behind a slow query,
     and the worst a concurrent miss costs is the same query run twice.
     """
+    return _probe((_SERVICE, service), runtime=runtime, cached=cached)
+
+
+def probe_group(
+    project: str,
+    *,
+    runtime: Optional[str] = None,
+    cached: bool = True,
+) -> Optional[str]:
+    """Why compose project *project* is not usable right now, or ``None``.
+
+    A group passes on **one** running member. Members of a live stack stop and
+    start under it, and which of them are up is a question ``target-switch``
+    answers at the moment of switching; the slot's question is only whether the
+    stack is there at all.
+    """
+    return _probe((_GROUP, project), runtime=runtime, cached=cached)
+
+
+def group_members(
+    project: str, *, runtime: Optional[str] = None
+) -> list[str]:
+    """Every name a group session's containers can be addressed by, uncached.
+
+    Both compose service names and container names (:func:`member_names`),
+    because a single-service slot's preset may name either spelling and both
+    reach a container this session can retarget to.
+
+    Called once per group spawn to *record* what that session takes — never on
+    the poll path, which is why it does not touch the probe cache.
+    """
     if runtime is None:
         runtime = _detected_runtime()
     if runtime is None:
-        return "no container runtime is available on this host"
+        raise ServiceError("no container runtime is available on this host")
+    return member_names(resolve_group(runtime, project, announce=False))
 
-    key = (runtime, service)
+
+def _probe(
+    binding: tuple,
+    *,
+    runtime: Optional[str] = None,
+    cached: bool = True,
+) -> Optional[str]:
+    """Why *binding* is not usable right now, or ``None``."""
+    return _probe_full(binding, runtime=runtime, cached=cached)[0]
+
+
+def group_membership(
+    project: str,
+    *,
+    runtime: Optional[str] = None,
+    cached: bool = True,
+) -> tuple:
+    """``(reason, member names)`` for a group, off the one probe.
+
+    Occupancy needs the membership and the row needs the reason, and both come
+    out of the same query — so they are one cached answer rather than two calls
+    that could disagree about a stack that changed between them.
+    """
+    return _probe_full((_GROUP, project), runtime=runtime, cached=cached)
+
+
+def _probe_full(
+    binding: tuple,
+    *,
+    runtime: Optional[str] = None,
+    cached: bool = True,
+) -> tuple:
+    """``(reason, members)``: the shared body of every probe above.
+
+    ``members`` is empty for a service binding and for a group that did not
+    resolve — a group nobody can read holds nothing, which is what leaves its
+    row saying *why* rather than silently blocking every member on this host.
+    """
+    if runtime is None:
+        runtime = _detected_runtime()
+    if runtime is None:
+        return "no container runtime is available on this host", ()
+
+    kind, name = binding
+    key = (runtime, kind, name)
     if cached:
         with _PROBE_LOCK:
             entry = _PROBE_CACHE.get(key)
         if entry is not None and entry[0] > time.monotonic():
-            return entry[1]
+            return entry[1], entry[2]
 
+    members: tuple = ()
     try:
-        resolve_container(runtime, service, announce=False)
+        if kind == _GROUP:
+            members = tuple(
+                member_names(resolve_group(runtime, name, announce=False))
+            )
+        else:
+            resolve_container(runtime, name, announce=False)
         reason: Optional[str] = None
     except ServiceError as exc:
         # The resolver's own text, so the row can tell "nothing matched" from
@@ -348,8 +502,8 @@ def probe_service(
     # runtime's ten-second timeout, and an answer dated from before it would
     # arrive having already spent a third of its life.
     with _PROBE_LOCK:
-        _PROBE_CACHE[key] = (time.monotonic() + PROBE_TTL_SECONDS, reason)
-    return reason
+        _PROBE_CACHE[key] = (time.monotonic() + PROBE_TTL_SECONDS, reason, members)
+    return reason, members
 
 
 # --- status -----------------------------------------------------------------
@@ -382,39 +536,60 @@ def _occupant_of(entry: dict) -> dict:
     }
 
 
-def _session_services(
+def _session_bindings(
     entry: dict, presets: dict, resolved: dict, name: str
 ) -> tuple:
-    """Every dev service a live session may be bound to, most exact first.
+    """Every binding a live session may hold, most exact first.
 
-    ``task.slot_service`` is what the gate resolved for this session and is the
-    whole answer wherever it exists. A *legacy* entry written before the gate
-    recorded it gets two candidates instead — the current service of the preset
-    it names, and the slot's current resolution — rather than the first that
-    matches: a legacy entry whose slot was repointed would otherwise have its
-    block *moved* rather than widened, leaving the service it really holds
-    reading free for the gate to grant.
+    What the gate recorded for this session is the whole answer wherever it
+    exists: ``task.slot_service`` for a single service, and for a group
+    (issue #312) ``task.slot_service_group`` plus ``task.slot_services`` — the
+    members resolved at spawn. A group session yields **all** of them, because
+    it can retarget to any of them without asking anyone.
+
+    A *legacy* entry written before the gate recorded anything gets candidates
+    instead — the current binding of the preset it names, and the slot's current
+    resolution — rather than the first that matches: a legacy entry whose slot
+    was repointed would otherwise have its block *moved* rather than widened,
+    leaving the service it really holds reading free for the gate to grant.
 
     Not covered: if the *preset* was edited since the session launched, neither
-    candidate is the service that session holds and nothing on disk records it.
-    The population is entries predating this version, so it drains as they end;
-    ``docs/SERVICE-MODE.md`` says so under "Not in this slice".
+    candidate is what that session holds and nothing on disk records it; and a
+    container that joined the group after a group session started is switchable
+    but unrecorded, so a slot on it reads free. Both are in
+    ``docs/SERVICE-MODE.md`` under "Not in this slice".
     """
     task = entry.get("task") if isinstance(entry.get("task"), dict) else {}
-    recorded = task.get("slot_service")
-    if isinstance(recorded, str) and recorded:
-        return (recorded,)
+    recorded: list = []
+    group = task.get("slot_service_group")
+    if isinstance(group, str) and group:
+        recorded.append((_GROUP, group))
+        members = task.get("slot_services")
+        if isinstance(members, list):
+            recorded += [
+                (_SERVICE, member) for member in members
+                if isinstance(member, str) and member
+            ]
+    service = task.get("slot_service")
+    if isinstance(service, str) and service:
+        binding = (_SERVICE, service)
+        if binding not in recorded:
+            recorded.append(binding)
+    if recorded:
+        return tuple(recorded)
 
-    candidates = []
+    candidates: list = []
     preset_name = task.get("preset")
     if isinstance(preset_name, str) and preset_name:
         preset = presets.get(preset_name)
-        service = getattr(preset, "service", None) if preset is not None else None
-        if service:
-            candidates.append(service)
-    current = resolved.get(name)
-    if current and current not in candidates:
-        candidates.append(current)
+        if preset is not None:
+            for kind, attr in ((_GROUP, "service_group"), (_SERVICE, "service")):
+                value = getattr(preset, attr, None)
+                if value:
+                    candidates.append((kind, value))
+    for current in resolved.get(name) or ():
+        if current not in candidates:
+            candidates.append(current)
     return tuple(candidates)
 
 
@@ -437,24 +612,25 @@ def _held(
     confidently wrong.
     """
     by_name: dict[str, list] = {}
-    by_service: dict[str, list] = {}
+    by_binding: dict[tuple, list] = {}
     for entry in _live_entries(sessions):
         name = entry.get("slot")
         if not isinstance(name, str) or not name:
             continue
         occupant = _occupant_of(entry)
         by_name.setdefault(name, []).append(occupant)
-        # Possibly more than one for a legacy entry: an inferred service blocks
-        # every candidate, so the guess widens the refusal instead of moving it.
-        for service in _session_services(entry, presets, resolved, name):
-            holders = by_service.setdefault(service, [])
+        # More than one for a group session (it holds every member) and for a
+        # legacy entry (an inferred binding blocks every candidate, so the guess
+        # widens the refusal instead of moving it).
+        for binding in _session_bindings(entry, presets, resolved, name):
+            holders = by_binding.setdefault(binding, [])
             if occupant not in holders_of(holders):
                 holders.append((name, occupant))
 
     _warn_on_collisions(by_name)
     return (
         {name: tuple(held) for name, held in by_name.items()},
-        {service: tuple(held) for service, held in by_service.items()},
+        {binding: tuple(held) for binding, held in by_binding.items()},
     )
 
 
@@ -497,14 +673,18 @@ _REBIND_CACHE: dict[tuple, Optional[str]] = {}
 def _rebinding_arg(preset: object) -> Optional[str]:
     """Which of the slot's bindings the preset's ``args`` would re-decide.
 
-    ``"--service"``, ``"--checkout"``, :data:`ARGS_UNPARSEABLE`, or ``None``.
+    ``"--service"``, ``"--service-group"``, ``"--checkout"``,
+    :data:`ARGS_UNPARSEABLE`, or ``None``.
 
     Decided by parsing and comparing **outcomes** rather than matching token
     spellings, because three cases defeat a spelling matcher:
 
-    - ``lmer``'s parser leaves ``allow_abbrev`` on and nothing else shares the
-      ``--se``/``--che`` prefixes, so ``--serv`` and ``--che=/x`` rebind exactly
-      as the full spelling does.
+    - ``lmer``'s parser leaves ``allow_abbrev`` on, so ``--che=/x`` rebinds
+      exactly as ``--checkout`` does. Since ``--service-group`` joined the
+      parser (issue #312) the ``--se``/``--serv`` family is ambiguous instead
+      and argparse refuses it outright — :data:`ARGS_UNPARSEABLE`, a different
+      reason for the same verdict, and one no spelling matcher would have got
+      right either.
     - ``--service ""`` is a rebinding: ``lmer`` reads service mode off that
       value's truthiness, so the session would hold a service slot while running
       in ordinary mode — this module's opening invariant inverted.
@@ -522,6 +702,7 @@ def _rebinding_arg(preset: object) -> Optional[str]:
     key = (
         getattr(preset, "checkout", None),
         getattr(preset, "service", None),
+        getattr(preset, "service_group", None),
         tuple(args),
     )
     with _PROBE_LOCK:
@@ -565,6 +746,10 @@ def _binding_fault(preset: object, args: list) -> Optional[str]:
         return ARGS_UNPARSEABLE
     if final.service != getattr(preset, "service", None):
         return "--service"
+    # A group is the whole of what a group slot guards, so args that re-decide
+    # it move the slot's binding exactly as --service does (issue #312).
+    if final.service_group != getattr(preset, "service_group", None):
+        return "--service-group"
     if final.checkout != getattr(preset, "checkout", None):
         return "--checkout"
     return None
@@ -594,75 +779,107 @@ def _no_presets_reason(preset_name: str) -> str:
 
 
 def _resolve_definition(
-    definition: SlotDefinition, presets: dict, claimed: dict
-) -> tuple[Optional[str], Optional[str]]:
-    """``(service, unusable_reason)`` for one definition against *presets*.
+    definition: SlotDefinition, presets: dict, claimed: dict, groups: dict
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """``(service, service_group, unusable_reason)`` for one definition.
 
-    *claimed* maps an already-bound service to the slot that bound it, and is
-    updated here as definitions resolve in declaration order.
+    *claimed* maps an already-bound binding key to the slot that bound it, and
+    is updated here as definitions resolve in declaration order. *groups* maps a
+    compose project to ``(reason, member names)`` as the probe last read it, so
+    a group slot reserves its members too — two slots that overlap only through
+    a group's membership are otherwise both free at baseline, and the operator
+    finds out at the second spawn instead of on the row.
     """
     preset = presets.get(definition.preset)
     if preset is None:
         if not presets:
             # A different fault from a name that is merely absent: blaming the
             # wrong one sends the operator to check the thing that is right.
-            return None, _no_presets_reason(definition.preset)
-        return None, (
+            return None, None, _no_presets_reason(definition.preset)
+        return None, None, (
             f"preset {definition.preset!r} is not defined on this host"
         )
 
     rebinding = _rebinding_arg(preset)
     if rebinding == ARGS_UNPARSEABLE:
-        return None, (
+        return None, None, (
             f"preset {definition.preset!r} has args lmer cannot parse, so the "
             "session it would start could not run at all"
         )
     if rebinding is not None:
         # Unusable rather than quietly guarding the wrong container: the binding
         # a slot claims has to be the one the session gets.
-        return None, (
+        return None, None, (
             f"preset {definition.preset!r} sets {rebinding} in its args (or an "
             "abbreviation of it), which overrides the preset's own value — the "
             "slot cannot guarantee what the session binds to"
         )
 
     service = getattr(preset, "service", None)
-    if not service:
+    service_group = getattr(preset, "service_group", None)
+    if not service and not service_group:
         # Occupying a slot has to *be* running in service mode, so this would
         # produce a session holding a slot against nothing.
-        return None, (
+        return None, None, (
             f"preset {definition.preset!r} sets no service, so it cannot "
             "put a session into service mode"
         )
 
+    # A group slot is guarded as the group *and* as each of its members: its
+    # `service` only says which member the session starts on, and the session
+    # may retarget to any of the others.
+    if service_group:
+        bindings = ((_GROUP, service_group),) + tuple(
+            (_SERVICE, member) for member in (groups.get(service_group) or ())
+        )
+    else:
+        bindings = ((_SERVICE, service),)
+
     # The resource a slot protects is the *service*, not the name over it: two
     # slots resolving to one service would each read free and each grant. First
     # declaration wins, as with a duplicate name and for the same reason.
-    owner = claimed.get(service)
-    if owner is not None:
-        return None, (
-            f"service {service!r} is already bound by slot {owner!r} — one "
-            "service takes one slot, or they would both read free and both "
-            "grant"
-        )
-    claimed[service] = definition.name
-    return service, None
+    for binding in bindings:
+        owner = claimed.get(binding)
+        if owner is not None:
+            return None, None, (
+                f"{_describe(binding)} is already bound by slot {owner!r} — one "
+                "service takes one slot, or they would both read free and both "
+                "grant"
+            )
+    for binding in bindings:
+        claimed[binding] = definition.name
+    return service, service_group, None
 
 
 def _resolve_all(
-    definitions: list, presets: dict
+    definitions: list, presets: dict, groups: Optional[dict] = None
 ) -> list[tuple]:
-    """``[(definition, service, unusable_reason), …]`` in declaration order.
+    """``[(definition, service, service_group, unusable_reason), …]``, in order.
 
-    Resolution only — no occupancy, no probing. The service-collision rule needs
-    every earlier definition resolved before a later one can be judged, while
-    the probe is per-slot and expensive, so splitting them lets
-    :func:`slot_status` apply the identical rule to one slot without probing the
-    rest of the host.
+    *groups* is ``project -> member names`` for the group presets these slots
+    name, read once by the caller (:func:`_group_state`) and passed in so the
+    membership behind the reservation rule is the same one occupancy uses.
+
+    Resolution only — no occupancy, and no probing *here*: the service-collision
+    rule needs every earlier definition resolved before a later one can be
+    judged, so keeping the two apart lets :func:`slot_status` apply the identical
+    rule to one slot while probing only that slot's service.
+
+    It does not save the group reads, and since issue #312 it cannot: a later
+    slot collides with an earlier *group* slot only through that group's
+    members, so :func:`slot_status` resolves every declared group's membership
+    (via :func:`_group_state`) before calling this — one query per group project,
+    memoised on the poll path and deliberately uncached on the claim path, where
+    a spawn into any slot therefore pays a fresh read per group project this
+    host declares. Bounded by the number of group *slot definitions*, not by
+    sessions or members. Scoping those reads to the projects declared at or
+    before the requested slot would be sound; it is not done because the saving
+    is a fraction of a small constant and the rule is easier to trust whole.
     """
-    claimed: dict[str, str] = {}
+    groups = groups or {}
+    claimed: dict[tuple, str] = {}
     return [
-        (definition,) + _resolve_definition(definition, presets, claimed)
+        (definition,) + _resolve_definition(definition, presets, claimed, groups)
         for definition in definitions
     ]
 
@@ -685,32 +902,79 @@ def slot_rows(
 
     # Once for all slots, not once each: both of these are file reads.
     presets = load_presets()
-    resolutions = _resolve_all(definitions, presets)
-    by_name, by_service = _held(
-        sessions, presets,
-        {definition.name: service for definition, service, _ in resolutions},
-    )
     runtime = _detected_runtime()
+    groups = _group_state(definitions, presets, runtime=runtime, cached=cached)
+    resolutions = _resolve_all(definitions, presets, _members_only(groups))
+    by_name, by_binding = _held(
+        sessions, presets, _resolved_bindings(resolutions, groups)
+    )
 
     return [
         _status_for(
-            definition, service, unusable, by_name, by_service,
-            runtime=runtime, cached=cached,
+            definition, service, group, unusable, by_name, by_binding,
+            groups=groups, runtime=runtime, cached=cached,
         )
-        for definition, service, unusable in resolutions
+        for definition, service, group, unusable in resolutions
     ]
+
+
+def _group_state(
+    definitions: list, presets: dict, *, runtime: Optional[str], cached: bool
+) -> dict:
+    """``project -> (reason, members)`` for every group preset a slot names.
+
+    One read per project per poll, shared by the reservation rule, occupancy and
+    the row's own service state — the group probe resolves the membership
+    anyway, so reusing its answer costs nothing over the probe these slots would
+    have paid for regardless.
+    """
+    projects = []
+    for definition in definitions:
+        preset = presets.get(definition.preset)
+        project = getattr(preset, "service_group", None) if preset else None
+        if project and project not in projects:
+            projects.append(project)
+    return {
+        project: group_membership(project, runtime=runtime, cached=cached)
+        for project in projects
+    }
+
+
+def _members_only(groups: dict) -> dict:
+    """``project -> members`` out of :func:`_group_state`'s pairs."""
+    return {project: members for project, (_, members) in groups.items()}
+
+
+def _resolved_bindings(resolutions: list, groups: dict) -> dict:
+    """``slot name -> its binding keys``, for the legacy-entry inference."""
+    return {
+        definition.name: SlotStatus(
+            definition=definition, service=service, service_group=group,
+            members=(groups.get(group) or (None, ()))[1] if group else (),
+        ).bindings
+        for definition, service, group, _ in resolutions
+    }
 
 
 def _status_for(
     definition: SlotDefinition,
     service: Optional[str],
+    service_group: Optional[str],
     unusable: Optional[str],
     by_name: dict,
-    by_service: dict,
+    by_binding: dict,
     *,
+    groups: dict,
     runtime: Optional[str],
     cached: bool,
 ) -> SlotStatus:
+    group_reason, members = (
+        groups.get(service_group) or (None, ())
+    ) if service_group else (None, ())
+    resolved = SlotStatus(
+        definition=definition, service=service, service_group=service_group,
+        members=members,
+    )
     occupants = by_name.get(definition.name, ())
     # Holders of this slot's service that claimed it under another name. The
     # rule this backstops is derived from a file that changes while sessions
@@ -718,30 +982,45 @@ def _status_for(
     # live session out of the way.
     service_occupants = tuple(
         (slot_name, held)
-        for slot_name, held in (by_service.get(service) or ())
+        for binding in resolved.bindings
+        for slot_name, held in (by_binding.get(binding) or ())
         if slot_name != definition.name
-    ) if service else ()
+    )
+    contested = tuple(
+        binding for binding in resolved.bindings
+        if any(
+            slot_name != definition.name
+            for slot_name, _ in (by_binding.get(binding) or ())
+        )
+    )
 
     # Skip the probe where its answer cannot change anything, which is also what
     # keeps a fleet of busy slots from costing a query each. ``service`` is None
     # exactly when ``unusable`` is set, so the last test is the middle one over
     # again; both are spelled out because that pairing is a contract of
     # :func:`_resolve_definition` rather than an invariant here.
-    if occupants or service_occupants or unusable is not None or service is None:
+    if occupants or service_occupants or unusable is not None or not resolved.bindings:
         return SlotStatus(
             definition=definition,
             service=service,
+            service_group=service_group,
+            members=members,
             unusable_reason=unusable,
             occupants=occupants,
             service_occupants=service_occupants,
+            contested=contested,
         )
 
     return SlotStatus(
         definition=definition,
         service=service,
+        service_group=service_group,
+        members=members,
         occupants=(),
-        service_down_reason=probe_service(
-            service, runtime=runtime, cached=cached
+        # A group's answer is already in hand: :func:`_group_state` read it for
+        # the membership, off the same probe this would have run.
+        service_down_reason=group_reason if service_group else _probe(
+            resolved.bindings[0], runtime=runtime, cached=cached
         ),
     )
 
@@ -759,24 +1038,31 @@ def slot_status(
     name must not produce a session that quietly holds nothing.
 
     Every definition is resolved — the one-service-one-slot rule is order
-    dependent — but only the named slot is probed.
+    dependent. Only the named slot's *service* is probed, but every **group**
+    any declared slot names is (:func:`_group_state`, issue #312): a group's
+    membership is what the reservation rule expands and what occupancy compares
+    against, so it has to be known for the other definitions too and not only
+    for this one. One query per group project, shared with that group row's own
+    service state — reused from the memo under ``cached``, and read fresh
+    otherwise, so the spawn gate's ``cached=False`` call pays one per group
+    project this host declares even when the slot it asks about names no group.
     """
     definitions = slot_definitions(config)
     if not any(definition.name == name for definition in definitions):
         return None
 
     presets = load_presets()
-    resolutions = _resolve_all(definitions, presets)
-    by_name, by_service = _held(
-        sessions, presets,
-        {definition.name: service for definition, service, _ in resolutions},
-    )
     runtime = _detected_runtime()
-    for definition, service, unusable in resolutions:
+    groups = _group_state(definitions, presets, runtime=runtime, cached=cached)
+    resolutions = _resolve_all(definitions, presets, _members_only(groups))
+    by_name, by_binding = _held(
+        sessions, presets, _resolved_bindings(resolutions, groups)
+    )
+    for definition, service, group, unusable in resolutions:
         if definition.name != name:
             continue
         return _status_for(
-            definition, service, unusable, by_name, by_service,
-            runtime=runtime, cached=cached,
+            definition, service, group, unusable, by_name, by_binding,
+            groups=groups, runtime=runtime, cached=cached,
         )
     return None

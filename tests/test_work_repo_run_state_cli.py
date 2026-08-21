@@ -28,6 +28,14 @@ def _tmp_answer_markers(monkeypatch, tmp_path):
     (tmp_path / "markers").mkdir(exist_ok=True)
 
 
+@pytest.fixture(autouse=True)
+def _tmp_goal_dir(monkeypatch, tmp_path):
+    """Keep the `work goal` fallback file out of the real /tmp — a suite run
+    must never write where a live session's goal lives (issue #277)."""
+    monkeypatch.setattr(work_cli, "GOAL_FILE_DIR", str(tmp_path / "goals"))
+    (tmp_path / "goals").mkdir(exist_ok=True)
+
+
 @pytest.fixture
 def run_env(monkeypatch, tmp_path):
     monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tmp_path))
@@ -1430,6 +1438,88 @@ class TestGoalEstimate:
         # lands after the decide — "used so far").
         assert _main(["session-start"]) == 0
         assert "Estimate: ~2 sessions — used: 1 session" in capsys.readouterr().out
+
+
+class TestGoalFileIsolation:
+    """The run-less goal fallback is per-session, not per-host (issue #277)."""
+
+    def test_two_sessions_keep_independent_goals(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.setenv("LMER_SESSION_ID", "s-alpha")
+        assert _main(["goal", "alpha goal"]) == 0
+        monkeypatch.setenv("LMER_SESSION_ID", "s-beta")
+        assert _main(["goal", "beta goal"]) == 0
+        capsys.readouterr()
+        assert _main(["goal"]) == 0
+        assert "beta goal" in capsys.readouterr().out
+        monkeypatch.setenv("LMER_SESSION_ID", "s-alpha")
+        assert _main(["goal"]) == 0
+        assert "alpha goal" in capsys.readouterr().out
+
+    def test_other_session_never_writes_our_file(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("LMER_SESSION_ID", "s-alpha")
+        _main(["goal", "alpha goal"])
+        ours = work_cli._goal_file()
+        monkeypatch.setenv("LMER_SESSION_ID", "s-beta")
+        _main(["goal", "beta goal"])
+        assert work_cli._goal_file() != ours
+        assert ours.read_text(encoding="utf-8") == "alpha goal"
+
+    def test_unscoped_legacy_path_is_never_written(self, monkeypatch, tmp_path):
+        # The shared path every process used to share (issue #277).
+        monkeypatch.setenv("LMER_SESSION_ID", "s-alpha")
+        _main(["goal", "alpha goal"])
+        monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+        _main(["goal", "unknown-session goal"])
+        assert not (tmp_path / "goals" / "lmer_work_goal.txt").exists()
+
+    def test_same_session_id_is_stable_across_invocations(self, monkeypatch, capsys):
+        monkeypatch.setenv("LMER_SESSION_ID", "s-alpha")
+        first = work_cli._goal_file()
+        assert _main(["goal", "alpha goal"]) == 0
+        assert work_cli._goal_file() == first
+        capsys.readouterr()
+        assert _main(["goal"]) == 0
+        assert "alpha goal" in capsys.readouterr().out
+
+    def test_missing_session_id_still_works_and_is_scoped(self, monkeypatch, capsys):
+        # The "unknown" default is a session id like any other: it works, and
+        # it does not collide with a named session.
+        monkeypatch.delenv("LMER_SESSION_ID", raising=False)
+        assert _main(["goal", "unknown-session goal"]) == 0
+        unknown_file = work_cli._goal_file()
+        monkeypatch.setenv("LMER_SESSION_ID", "unknown")
+        assert work_cli._goal_file() == unknown_file  # same literal, same file
+        monkeypatch.setenv("LMER_SESSION_ID", "s-alpha")
+        assert work_cli._goal_file() != unknown_file
+        capsys.readouterr()
+        assert _main(["goal"]) == 0
+        assert "No goal set" in capsys.readouterr().err
+
+    def test_ids_that_sanitize_alike_stay_apart(self, monkeypatch):
+        # Sanitization is many-to-one, so it alone would re-create the bug.
+        monkeypatch.setenv("LMER_SESSION_ID", "s/1")
+        slashed = work_cli._goal_file()
+        monkeypatch.setenv("LMER_SESSION_ID", "s-1")
+        assert work_cli._goal_file() != slashed
+
+    def test_hostile_session_id_stays_in_the_goal_dir(self, monkeypatch, tmp_path):
+        # The id is environment-supplied: no separators, no traversal, and a
+        # long id still yields a usable file name.
+        for hostile in ("../../etc/passwd", "a/b/c", "x" * 400, "", "  "):
+            monkeypatch.setenv("LMER_SESSION_ID", hostile)
+            path = work_cli._goal_file()
+            assert path.parent == tmp_path / "goals"
+            assert path.name.startswith("lmer_work_goal.")
+            assert path.name.endswith(".txt")
+            assert len(path.name) < 100
+            path.write_text("ok", encoding="utf-8")
+            assert path.read_text(encoding="utf-8") == "ok"
+
+    def test_default_directory_is_tmp(self, monkeypatch):
+        # The documented location (lmer-docs/WORK-REPO.md) when nothing patches it.
+        monkeypatch.setattr(work_cli, "GOAL_FILE_DIR", None)
+        monkeypatch.setenv("LMER_SESSION_ID", "s-alpha")
+        assert work_cli._goal_file().parent == Path("/tmp")
 
 
 class TestBinWorkExitCodes:

@@ -99,6 +99,8 @@
       "Bash(target-exec:*)",
       "Bash(target-logs)",
       "Bash(target-logs:*)",
+      "Bash(target-switch)",
+      "Bash(target-switch:*)",
       "Bash(tee:*)",
       "Bash(test:*)",
       "Bash(touch:*)",
@@ -183,6 +185,10 @@
           {
             "type": "command",
             "command": "python3 /Agents/global/hooks/run_state_guard.py"
+          },
+          {
+            "type": "command",
+            "command": "python3 /Agents/global/hooks/signal_guard.py"
           }
         ]
       }

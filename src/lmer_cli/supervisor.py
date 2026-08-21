@@ -73,7 +73,7 @@ from typing import Callable, Iterable, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
-from .harness import UnknownHarnessError, resolve_harness
+from .harness import UnknownHarnessError, resolve_harness, resolve_harness_name
 from .util import decode_escape_bytes
 
 
@@ -520,6 +520,15 @@ class SessionLog:
 class _InputBody(BaseModel):
     data: str
     append_newline: bool = False
+    #: "This is prose meant to steer the session", whether a human composed it
+    #: in chat or an assistant sent it through ``lmer-ctl``. Everything else
+    #: (which harness is running, what its TUI does with the text) is decided
+    #: here, in :func:`_sanitize_user_chat`. Off by default, so raw terminal
+    #: keystrokes and lifecycle injections keep their command semantics.
+    sanitize: bool = False
+    #: A steering caller can still intend a registered slash command. This only
+    #: narrows ``sanitize``; it never transforms or enables commands by itself.
+    preserve_slash_commands: bool = False
 
 
 class _OutputResponse(BaseModel):
@@ -866,6 +875,236 @@ def _split_submit_cr(payload: str) -> str:
     return payload[:-1] if _ends_with_submit_cr(payload) else payload
 
 
+#: What each harness's input box grabs when it is the **first character** of
+#: the composer, keyed by resolved harness name. This is the project's record of
+#: those escapes, and the only thing :func:`_sanitize_user_chat` consults — a
+#: newly discovered escape, or a new harness, is an edit to this mapping rather
+#: than to any code.
+#:
+#: This table records only the first half of the mechanic: characters known to
+#: be first-column escapes in each harness's composer. Claude reserves ``!``
+#: (bash, the reported failure in #254), ``#`` (memory) and ``/`` (slash
+#: command). Codex reserves ``!`` for local shell commands; its ``/`` commands
+#: are deliberate chat features and ``@`` is a file search/reference, so neither
+#: is rewritten here. Pi loads lmer's ``/name`` prompt templates into the same
+#: box.
+#:
+#: Chat defusal additionally needs the ``. `` prefix to be inert. That has been
+#: established for Claude and approved for Codex's shell escape, so
+#: :data:`CHAT_DEFUSAL_HARNESSES` keeps that second fact separate. Pi's known
+#: slash-command escape can therefore stay unframed without rewriting human chat
+#: on an unmeasured assumption about its prefix.
+#:
+#: A harness that is absent — a user-defined one from ``~/.lmer/harnesses`` or
+#: one added to the registry without a line here — gets an empty set and its
+#: payload back byte for byte.
+#:
+#: ``@`` is deliberately in no set: Claude and Codex read it as a file reference
+#: *anywhere* in a message, so it is not a first-column escape and prefixing it
+#: would break the reference rather than protect anything.
+HARNESS_FIRST_COLUMN_ESCAPES: dict[str, frozenset[str]] = {
+    "claude": frozenset({"!", "#", "/"}),
+    "codex": frozenset({"!"}),
+    "pi": frozenset({"/"}),
+}
+
+#: Harnesses where the visible chat defusal prefix has also been measured.
+CHAT_DEFUSAL_HARNESSES = frozenset({"claude", "codex"})
+
+#: Put in front of a chat message whose first character is a recorded escape for
+#: a harness in :data:`CHAT_DEFUSAL_HARNESSES`, so the escape is no longer in
+#: column one. The two characters are load-bearing in different ways — see
+#: :func:`_sanitize_user_chat` for the dot and the space — and
+#: :func:`_check_first_column_escapes` holds the half of what the dot needs that
+#: this project's own data can answer.
+DEFUSAL_PREFIX = ". "
+
+
+def _check_first_column_escapes(
+    escapes: Mapping[str, frozenset[str]], prefix: str
+) -> None:
+    """Fail loudly if the escape data breaks what the defusal rests on.
+
+    Run over the constants at import (below), so a data change that would make
+    every defusal a no-op — or a *different* command — cannot reach a session:
+    the module does not load. The mapping is a literal, so this can only fail on
+    a source edit, never on a runtime input.
+    """
+    first = prefix[:1]
+    if not first or first.isspace():
+        raise RuntimeError(
+            f"defusal prefix {prefix!r} starts with whitespace (or is empty): an "
+            "input box that trims before testing the first character would see "
+            "the escape again, and the defusal would be an invisible no-op"
+        )
+    for harness, chars in escapes.items():
+        if any(len(char) != 1 or char.isspace() for char in sorted(chars)):
+            raise RuntimeError(
+                f"{harness}'s first-column escapes {sorted(chars)} are not all "
+                "single visible characters; the test is against one character, "
+                "so an empty entry would defuse every message and a longer one "
+                "would never match"
+            )
+        if first in chars:
+            raise RuntimeError(
+                f"{first!r} is a first-column escape for {harness}, so the "
+                f"defusal prefix {prefix!r} would hand it a command instead of "
+                "taking the column away from one"
+            )
+
+
+_check_first_column_escapes(HARNESS_FIRST_COLUMN_ESCAPES, DEFUSAL_PREFIX)
+
+
+def _sanitize_user_chat(
+    payload: str, harness: str, *, preserve_slash_commands: bool = False
+) -> str:
+    """Defuse a chat message the TUI would run as a command instead of reading.
+
+    A harness TUI reserves the **first character of its input box** for escapes:
+    on Claude a ``!`` runs the rest of the line as a shell command, a ``#``
+    writes it to memory, and a ``/`` runs a slash command; on Codex, ``!`` runs a
+    local shell command. A message typed into the platform's chat pane travels
+    through that same box, so "!206 was merged" and "#254 is done" — sentences —
+    become commands. Which characters those are is a fact about each input box
+    and lives in :data:`HARNESS_FIRST_COLUMN_ESCAPES`; this function is only the
+    rule applied to it.
+
+    :data:`DEFUSAL_PREFIX` takes the first column, and the harness reads the
+    message with its ``!`` still in it, which is why this transforms rather than
+    refuses: the operator meant the words. The test is on the payload exactly as
+    sent — no stripping — so a message that opens with a space was never in the
+    first column to begin with and is left alone.
+
+    A dot, not the leading space this was first written with. The space rested on
+    the input box *preserving* it, which nobody promised: any implementation that
+    trims leading whitespace before testing the first character sees the escape
+    again, and that defusal would be a silent no-op — the write succeeds, the
+    receipt covers the pre-transform bytes, the chat pane assumes delivery, and
+    the only detector is a human seeing shell output in the terminal view. A
+    ``.`` cannot be trimmed away: skipping whitespace before the test is exactly
+    what leaves a ``.`` as the character being tested, so on either kind of
+    implementation the escape is definitively not in the first column.
+
+    One assumption is left — that ``.`` is not itself a first-column escape —
+    and nothing in this module proves it. The escape sets are this project's
+    *recorded observations* of each harness's input box, not an interface any
+    harness declares: a harness update can change what column one grabs, and no
+    check here would notice. What :func:`_check_first_column_escapes` enforces is
+    the property the data can carry — that no recorded escape set contains the
+    prefix character — which turns a bad edit to the table into a load-time
+    failure. It is a self-consistency check on this project's own record, not a
+    reading of the harness. The evidence for the dot itself is an observation
+    too: the prefix was typed into Claude's box in !212, once, and the same
+    guard was explicitly selected for Codex's shell escape in #321.
+
+    The failure modes divide along that line. An escape missing from a set is the
+    pre-#254 behavior for that character — the message is read as a command, as
+    it was before any of this. A spurious entry costs a visible ``. `` in front
+    of a message that did not need one. A future build that *starts* reading a
+    leading ``.`` as an escape is the one that cannot be recovered from here: the
+    table would still be self-consistent while every defusal handed the harness a
+    different command.
+
+    The space after the dot is for whoever reads the conversation back: the
+    message is recorded as ". !206 was merged", a sentence behind a prefix rather
+    than a typo glued to a word. Nothing hides the prefix and nothing should —
+    the operator accepted a visible one.
+
+    A harness with no recorded escapes gets its payload back untouched: the flag
+    says "this is prose meant to steer the session", and what to do about that is
+    decided here and nowhere else. Refusing such a payload instead of transforming
+    it is a change to this function alone. The function's historical name reflects
+    its first caller; ``lmer-ctl send`` now makes the same assertion for assistant
+    steering.
+    """
+    escapes = (
+        HARNESS_FIRST_COLUMN_ESCAPES.get(harness, frozenset())
+        if harness in CHAT_DEFUSAL_HARNESSES
+        else frozenset()
+    )
+    if preserve_slash_commands:
+        escapes = escapes - {"/"}
+    if payload[:1] in escapes:
+        return DEFUSAL_PREFIX + payload
+    return payload
+
+
+def _active_harness_name() -> str:
+    """The resolved harness name (``LMER_HARNESS``), for the routes that differ.
+
+    Degrades silently like :func:`_resolve_harness_profile`: that function already
+    warned about the broken variable at startup, and this one is read per request.
+    An empty name is deliberate here — protocol decisions must not treat a
+    malformed user-defined harness as Claude merely because Claude is the
+    historical command fallback.
+    """
+    try:
+        return resolve_harness_name()
+    except UnknownHarnessError:
+        return ""
+
+
+_CODEX_FOLLOWUP = "/followup"
+_CODEX_FOLLOWUP_INSTRUCTION = (
+    "Run `bash /Agents/global/hooks/followup.sh` now and follow the "
+    "instructions in its output."
+)
+
+# Probed built-in TUIs that explicitly enable xterm bracketed-paste mode. Keep
+# user-defined harnesses conservative: their input protocol is not implied by a
+# cosmetic name or by their command shape.
+_BRACKETED_PASTE_HARNESSES = frozenset({"claude", "codex", "pi"})
+
+#: Harnesses whose recorded command escapes must be sent as keystrokes rather
+#: than as a paste. Kept separate from chat defusal: Codex executes leading
+#: ``!`` from a paste too, and adding it to the escape table must not silently
+#: remove the paste boundary from an unsanitized long payload. The characters
+#: themselves still have one owner in :data:`HARNESS_FIRST_COLUMN_ESCAPES`.
+_KEYSTROKE_ESCAPE_HARNESSES = frozenset({"claude", "pi"})
+
+
+def _bracketed_paste_for(harness: str, payload: str) -> bool:
+    """Whether *payload* is safe to frame for the resolved harness.
+
+    Claude enables mode 2004 but does not execute a slash command delivered as
+    a paste (#210), and Pi has slash-command prompt templates in the same input
+    box. Their recorded command escapes therefore stay as keystrokes. Codex
+    executes its leading ``!`` even from a paste, so it keeps the paste boundary;
+    sanitized chat and ctl steering acquire the inert ``. `` prefix first.
+    Ordinary multi-line prose keeps item #318's paste boundary in every case.
+    """
+    if harness not in _BRACKETED_PASTE_HARNESSES:
+        return False
+    keystroke_escapes = (
+        HARNESS_FIRST_COLUMN_ESCAPES.get(harness, frozenset())
+        if harness in _KEYSTROKE_ESCAPE_HARNESSES
+        else frozenset()
+    )
+    return payload[:1] not in keystroke_escapes
+
+
+def _rewrite_harness_command(payload: str, harness: str) -> str:
+    """Translate lmer command spellings a harness cannot register directly.
+
+    Current Codex builds no longer discover custom prompt files, so both
+    ``/followup`` and the former ``/prompts:followup`` spelling are rejected by
+    its slash-command parser. The control plane sees a complete submitted
+    message (unlike the terminal's per-keystroke path), so it can translate the
+    exact command to a plain-text instruction that invokes the same lmer hook.
+    Argument text and a trailing CR/LF remain appended verbatim.
+
+    Only a command token in column one is eligible: prose, leading whitespace,
+    ``/followups`` and every other harness remain byte-for-byte passthrough.
+    """
+    if harness != "codex" or not payload.startswith(_CODEX_FOLLOWUP):
+        return payload
+    tail = payload[len(_CODEX_FOLLOWUP):]
+    if tail and not tail[:1].isspace():
+        return payload
+    return _CODEX_FOLLOWUP_INSTRUCTION + tail
+
+
 def _submit_payload(
     write: Callable[[bytes], int],
     payload: str,
@@ -873,6 +1112,7 @@ def _submit_payload(
     probe: Optional[Callable[[], Optional[int]]] = None,
     settle: float = DEFAULT_SUBMIT_ENTER_DELAY,
     drain_timeout: float = SUBMIT_DRAIN_TIMEOUT_SECONDS,
+    bracketed_paste: bool = False,
 ) -> tuple[int, str]:
     """Type *payload*, then press Enter **as a write of its own**.
 
@@ -893,8 +1133,19 @@ def _submit_payload(
     run's evidence document: they are host-specific numbers, and what this code
     depends on is the ordering, not their values.
 
-    The text is **one write**, and the whole of it is what the wait watches. Do not
-    split off a tail to measure instead: a byte offset into UTF-8 severs a
+    The text is **one write**, and the whole of it is what the wait watches.  For
+    a TUI that enables bracketed paste, *bracketed_paste* wraps that write in the
+    terminal's explicit paste-start/paste-end sequences.  The built-in Claude,
+    Codex and Pi TUIs enable the protocol: the end sequence gives their input
+    parsers an explicit boundary
+    before the separate Enter instead of asking a scheduler delay to imply one.
+    A payload that already contains the paste-end sequence is left unframed so
+    its remainder cannot escape the bracket and be interpreted as keystrokes.
+    The sequences are terminal protocol, so ``bytes_written`` includes them while
+    the control-plane delivery receipt continues to describe only the caller's
+    payload.
+
+    Do not split off a tail to measure instead: a byte offset into UTF-8 severs a
     multi-byte character across two reads, and the extra wait doubles a lock-hold
     budget the platform's control timeout depends on. What one write gives up:
     above the queue's 4095-byte ceiling, the moment the queue reads
@@ -916,6 +1167,8 @@ def _submit_payload(
     if not text:
         return write(_SUBMIT_CR), SUBMIT_TEXT_UNKNOWN
     data = text.encode("utf-8")
+    if bracketed_paste and _BRACKETED_PASTE_END not in data:
+        data = _BRACKETED_PASTE_START + data + _BRACKETED_PASTE_END
     if probe is None:
         # No terminal to ask: the settle carries the gap alone, which is weaker,
         # and the verdict says so rather than implying more.
@@ -938,6 +1191,7 @@ def _make_submit(
     slave_path: Optional[str],
     *,
     drain_timeout: float = SUBMIT_DRAIN_TIMEOUT_SECONDS,
+    harness: str = "",
 ) -> Callable[[str], tuple[int, str]]:
     """A submit closure for one PTY: types a message and presses Enter, atomically.
 
@@ -956,6 +1210,9 @@ def _make_submit(
     cannot stop the child's output from being read (which would deadlock the very
     drain being waited for).
 
+    The caller supplies the resolved harness in production. An omitted harness
+    is deliberately conservative for protocol-level callers and tests.
+
     *slave_path* of ``None`` — a terminal that could not name itself — leaves the
     settle to carry it alone, and the verdict is :data:`SUBMIT_TEXT_UNKNOWN` so
     nobody downstream reads a weaker delivery as a stronger one.
@@ -970,6 +1227,7 @@ def _make_submit(
                 probe=probe,
                 settle=_resolve_submit_enter_delay(),
                 drain_timeout=drain_timeout,
+                bracketed_paste=_bracketed_paste_for(harness, payload),
             )
 
     return submit
@@ -1115,7 +1373,12 @@ def _build_fastapi_app(
     def _unlocked_submit(payload: str) -> tuple[int, str]:
         """Fallback for an app with no terminal behind it — see ``submit`` above."""
         return _submit_payload(
-            write_input, payload, settle=_resolve_submit_enter_delay()
+            write_input,
+            payload,
+            settle=_resolve_submit_enter_delay(),
+            bracketed_paste=_bracketed_paste_for(
+                _active_harness_name(), payload
+            ),
         )
 
     submit_payload = submit if submit is not None else _unlocked_submit
@@ -1139,6 +1402,19 @@ def _build_fastapi_app(
             "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
             "payload_length": len(payload_bytes),
         }
+        # After the receipt, deliberately: the receipt exists to prove the wire
+        # was clean, and the sender checks it against the hash of what IT sent
+        # (``session_io.send_input``, which refuses a mismatch loudly). Hashing
+        # the transformed text would turn every sanitized message into that
+        # alarm. What this line does is not corruption in transit — it is what
+        # the caller asked for by setting the flag.
+        if body.sanitize:
+            payload = _sanitize_user_chat(
+                payload,
+                _active_harness_name(),
+                preserve_slash_commands=body.preserve_slash_commands,
+            )
+            payload_bytes = payload.encode("utf-8")
         # Append CR (\r), not LF (\n): claude's TUI runs in raw mode where
         # the Enter key arrives as \r. \n would be inserted as a literal
         # newline in the input box and never submit. The field is named
@@ -1146,6 +1422,12 @@ def _build_fastapi_app(
         # behavior is "press Enter after the text".
         if not body.append_newline:
             return {"bytes_written": write_input(payload_bytes), **receipt}
+
+        # A whole submitted command can use lmer's portable spelling even when
+        # the harness namespaces custom commands.  Deliberately after the raw
+        # keystroke return above: translating one byte at a time is impossible,
+        # and the direct terminal documents Codex's native spelling instead.
+        payload = _rewrite_harness_command(payload, _active_harness_name())
 
         # Type it and submit it, ONCE — and with the Enter as a write of its own,
         # because a CR glued to the text is read as part of a paste and inserted
@@ -1617,6 +1899,8 @@ def _start_auto_start_thread(
 #: What "press Enter" is on the wire: CR, not LF. A raw-mode TUI reads ``\r`` as
 #: Enter and inserts ``\n`` as a literal newline in the input box.
 _SUBMIT_CR = b"\r"
+_BRACKETED_PASTE_START = b"\x1b[200~"
+_BRACKETED_PASTE_END = b"\x1b[201~"
 
 #: What ``/input`` says about a submit it cannot see land.
 #:
@@ -1982,7 +2266,9 @@ def run_supervisor(
     # Types a message and presses Enter as two writes with nothing able to land
     # between them — see :func:`_make_submit`, which owns that guarantee and is
     # tested on it directly.
-    submit_to_child = _make_submit(master_fd, write_lock, slave_path)
+    submit_to_child = _make_submit(
+        master_fd, write_lock, slave_path, harness=_active_harness_name()
+    )
 
     # The FastAPI control plane touches the PTY's geometry through these two
     # closures instead of being handed the fd, so the app never has to know it

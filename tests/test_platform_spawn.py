@@ -13,6 +13,7 @@ actually holds over the sessions it is about — workers, since the orchestratin
 assistant holds its own slot (T75).
 """
 
+import dataclasses
 import json
 import os
 import stat
@@ -22,8 +23,12 @@ from pathlib import Path
 
 import pytest
 
+from ask_channel import protocol
 from lmer_cli import supervisor
 from lmer_cli.cli import parse_args, parse_dir_mount_specs
+from lmer_cli.harness import HARNESSES
+from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINKS_ENV
+from lmer_cli.user_harnesses import HARNESSES_DIR_ENV, clear_user_harness_cache
 from lmer_platform import config as cfg
 from lmer_platform import ask, registry, runs, session_io, spawn, store, transcripts
 from tests.conftest import strip_lmer_env
@@ -36,6 +41,25 @@ def _clean_lmer_env(monkeypatch):
     for name in ("LMER_REPO_URL", "LMER_PLATFORM_PORTS_FILE", "LMER_TASK",
                  "LMER_TASK_TARGET"):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_user_harnesses(tmp_path, monkeypatch, _clean_lmer_env):
+    """A spawn reads the harness registry now (#280), user drop-ins included.
+
+    Autouse and empty, so the mounts a spawn builds are this checkout's built-ins
+    and never whatever the developer running the suite happens to have in
+    ``~/.lmer/harnesses`` — which is what the default resolves to once
+    ``strip_lmer_env`` has removed the override. Ordered after that stripping
+    explicitly rather than by definition order, since it is the variable being
+    stripped that this sets.
+    """
+    root = tmp_path / "harnesses"
+    root.mkdir()
+    monkeypatch.setenv(HARNESSES_DIR_ENV, str(root))
+    clear_user_harness_cache()
+    yield root
+    clear_user_harness_cache()
 
 
 @pytest.fixture
@@ -433,11 +457,11 @@ def test_session_without_run_identity_is_still_registered(config, caplog, monkey
 # registry entry — which a clean exit removes, taking the row out of the fleet view
 # and leaving nothing behind but a log line.
 #
-# So the target is read as a third source of an identity, using the same helper
-# `lmer` runs on it, and never as a source of a *record*: a derived URL is a
-# reconstruction (and in the GitLab case a tokenised one), and recording a
-# reconstruction is what answer.py's `_identity_repo_url` docstring explains at
-# length would silently satisfy `resume.RepoUrlRequired` forever after.
+# A plain repository-URL target is evidence and is recorded. A resource target is
+# read as an identity using the same helper `lmer` runs on it, but its derived URL
+# remains a reconstruction (and in the GitLab case a tokenised one). Recording
+# that reconstruction is what answer.py's `_identity_repo_url` docstring explains
+# at length would silently satisfy `resume.RepoUrlRequired` forever after.
 
 #: A target whose project name ends in one of the characters `.git` is made of.
 #: Named because the parity test below cannot see what was wrong with it: until
@@ -457,6 +481,29 @@ DERIVABLE_TARGETS = [
     "https://gitlab.example.com/agents/global/-/merge_requests/7",
     GIT_CHAR_TAILED_TARGET,
     "https://github.com/owner/repo/pull/9",
+]
+
+#: Plain repository URLs are already clone targets, not resource URLs from which
+#: a clone target has to be reconstructed. Both URL spellings the shared parser
+#: supports are pinned because they take different branches.
+PLAIN_REPO_TARGETS = [
+    "https://gitlab.example.com/agents/global",
+    "https://gitlab.example.com/agents/global.git",
+    "git@gitlab.example.com:agents/global.git",
+    "ssh://git@gitlab.example.com/agents/global.git",
+]
+
+#: URL-shaped targets that are not repository roots. Before #255 these remained
+#: untracked and produced the actionable warning; recognising repo targets must
+#: not turn web pages or unsupported transports into persistent clone records.
+NON_REPO_URL_TARGETS = [
+    "https://gitlab.example.com/agents/global/-/tree/main",
+    "https://gitlab.example.com/agents/global/-/pipelines/1691",
+    "https://gitlab.example.com/agents/global/-/blob/main/README.md",
+    "https://gitlab.example.com/agents/global/-/wikis/home",
+    "https://github.com/owner/repo/tree/main",
+    "https://docs.example.com/guide/getting-started",
+    "ftp://gitlab.example.com/group/project",
 ]
 
 #: Targets that name no repository at all: the residual case, and the one the
@@ -532,6 +579,74 @@ def test_a_target_that_carries_the_repository_identifies_the_run(config, target)
     )
     assert tracked.source == "spawned"
     assert tracked.last_session_id == result.session_id
+
+
+@pytest.mark.parametrize("target", PLAIN_REPO_TARGETS)
+def test_a_plain_repo_url_target_is_recorded_and_tracks_the_run(config, target):
+    """A repository URL target is supplied repository evidence, not a guess."""
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+
+    assert (result.host, result.project) == (
+        "gitlab.example.com", "agents/global"
+    )
+    tracked = runs.get_tracked(result.host, result.project, result.slug)
+    assert tracked is not None
+    assert tracked.repo == target
+    assert result.warning is None
+
+
+def test_the_entry_records_a_plain_repo_url_target(config, monkeypatch):
+    """The registry and tracked index carry the same supplied repository."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    target = PLAIN_REPO_TARGETS[0]
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+    try:
+        assert registry.read_session(result.session_id)["task"]["repo"] == target
+        assert runs.get_tracked(
+            result.host, result.project, result.slug
+        ).repo == target
+    finally:
+        os.kill(result.pid, 9)
+
+
+@pytest.mark.parametrize("target", NON_REPO_URL_TARGETS)
+def test_a_url_shaped_non_repo_target_stays_untracked_and_warns(config, target):
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+
+    assert spawn._plain_repo_url_from_target(target) is None
+    assert (result.host, result.project) == (None, None)
+    assert runs.list_tracked() == []
+    assert result.warning is not None
+    assert "not tracked" in result.warning
+
+
+@pytest.mark.parametrize(("target", "clean", "secret"), [
+    (
+        f"https://oauth2:{HOST_TOKEN}@gitlab.example.com/agents/global.git",
+        "https://gitlab.example.com/agents/global.git",
+        HOST_TOKEN,
+    ),
+    (
+        "https://ghp-not-a-real-token@github.com/owner/repo",
+        "https://github.com/owner/repo",
+        "ghp-not-a-real-token",
+    ),
+])
+def test_embedded_http_credential_is_not_recorded_as_the_run_repo(
+    config, monkeypatch, target, clean, secret
+):
+    """The target may carry transport auth; persistent repo fields may not."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(config, request_for(repo_url=None, target=target))
+    try:
+        entry = registry.read_session(result.session_id)
+        tracked = runs.get_tracked(result.host, result.project, result.slug)
+        assert entry["task"]["repo"] == clean
+        assert tracked.repo == clean
+        assert secret not in entry["task"]["repo"]
+        assert secret not in tracked.repo
+    finally:
+        os.kill(result.pid, 9)
 
 
 @pytest.mark.parametrize("target", DERIVABLE_TARGETS)
@@ -615,7 +730,9 @@ def test_the_daemon_s_own_repo_url_still_beats_the_target(config, monkeypatch):
     dropping a URL the operator did supply.
     """
     monkeypatch.setenv("LMER_REPO_URL", "https://gitlab.example.com/agents/other.git")
-    result = spawn.spawn_session(config, request_for(repo_url=None))
+    result = spawn.spawn_session(
+        config, request_for(repo_url=None, target=PLAIN_REPO_TARGETS[0])
+    )
 
     assert result.project == "agents/other"
     assert runs.get_tracked(result.host, result.project, result.slug).repo == (
@@ -623,7 +740,8 @@ def test_the_daemon_s_own_repo_url_still_beats_the_target(config, monkeypatch):
     )
 
 
-def test_a_supplied_identity_url_still_beats_the_target(config):
+@pytest.mark.parametrize("target", [DERIVABLE_TARGETS[0], PLAIN_REPO_TARGETS[0]])
+def test_a_supplied_identity_url_still_beats_the_target(config, target):
     """answer.py's reconstruction is a caller stating where the run already belongs.
 
     It is filed under a run that exists in the index; the target's project is a
@@ -633,13 +751,17 @@ def test_a_supplied_identity_url_still_beats_the_target(config):
     result = spawn.spawn_session(config, request_for(
         repo_url=None,
         identity_repo_url="https://gitlab.example.com/agents/elsewhere",
-        target=DERIVABLE_TARGETS[0],
+        target=target,
     ))
 
     assert result.project == "agents/elsewhere"
+    assert runs.get_tracked(result.host, result.project, result.slug).repo is None
 
 
-def test_a_no_repo_session_derives_nothing_from_its_target(config, monkeypatch):
+@pytest.mark.parametrize("target", [DERIVABLE_TARGETS[0], PLAIN_REPO_TARGETS[0]])
+def test_a_no_repo_session_derives_nothing_from_its_target(
+    config, monkeypatch, target
+):
     """Spec D17 outranks the target, and the assistant is why.
 
     It spawns with ``no_repo=True`` and a perfectly derivable target; a session
@@ -648,7 +770,7 @@ def test_a_no_repo_session_derives_nothing_from_its_target(config, monkeypatch):
     """
     monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
     result = spawn.spawn_session(
-        config, request_for(repo_url=None, target=DERIVABLE_TARGETS[0], no_repo=True)
+        config, request_for(repo_url=None, target=target, no_repo=True)
     )
     try:
         assert (result.host, result.project) == (None, None)
@@ -1332,6 +1454,10 @@ def test_an_ordinary_session_never_inherits_the_daemons_no_repo(
     The request still names a repository, so nothing downstream would look wrong
     — the session would simply have no code to work on. Same reasoning as the ask
     channel's variable, one step sharper.
+
+    Blank rather than absent: blank is the "unset" reading everywhere the
+    variable is consumed, and it is what survives the child's first-wins ``.env``
+    seeding (see test_the_blanked_variables_survive_the_childs_env_file_seeding).
     """
     script, dump = env_dumping_lmer
     config = cfg.load({"lmer_bin": str(script)})
@@ -1340,7 +1466,10 @@ def test_an_ordinary_session_never_inherits_the_daemons_no_repo(
     result = spawn.spawn_session(config, request_for())
     try:
         assert wait_for(lambda: dump.is_file() and dump.stat().st_size)
-        assert spawn.NO_REPO_ENV not in env_from_dump(dump)
+        assert env_from_dump(dump).get(spawn.NO_REPO_ENV) == "", (
+            "the daemon's value must not reach the child, and the key must "
+            "still be present so the child's .env cannot re-supply it"
+        )
     finally:
         os.kill(result.pid, 9)
 
@@ -1792,15 +1921,32 @@ SESSION_TRANSCRIPT = "\n".join([
 
 
 def transcript_file(session_id):
-    """Where the stub's transcript lands, one level down like the harness's."""
-    return spawn.transcript_dir_for(session_id) / "-workspace" / "session.jsonl"
+    """Where the stub's transcript lands: claude's subdirectory, one level down.
+
+    The subdirectory is the harness's name (#280) and the level below it is the
+    per-workspace one claude keeps, so this is the full path a real claude session
+    writes through the mount.
+    """
+    return (
+        spawn.transcript_dir_for(session_id) / "claude" / "-workspace" / "session.jsonl"
+    )
+
+
+#: Where each built-in harness writes its session JSONL inside the container, from
+#: the registry rather than restated here — the registry is what the spawn reads,
+#: so a declaration that changes has to change these tests' expectations with it.
+HARNESS_SESSION_DIRS = {
+    name: harness.session_dir
+    for name, harness in HARNESSES.items()
+    if harness.session_dir
+}
 
 
 #: Every container destination a spawn mounts a platform-owned directory at. Held
 #: as a set rather than a count so a test that adds a mount has to say which one,
 #: and so "the mounts do not collide" keeps meaning all of them.
 PLATFORM_MOUNT_DESTINATIONS = {
-    transcripts.CONTAINER_TRANSCRIPT_DIR,
+    *HARNESS_SESSION_DIRS.values(),
     ask.CONTAINER_ASK_DIR,
     supervisor.CONTAINER_SESSION_LOG_DIR,
 }
@@ -1846,6 +1992,80 @@ def test_the_transcript_directory_is_private_to_this_user(config):
     assert mode == 0o700, f"expected 0700, got {oct(mode)}"
 
 
+def test_every_built_in_harness_gets_its_own_transcript_mount(config):
+    """#280: pi and codex do not write where claude does.
+
+    One host subdirectory per harness, each mounted at the path that harness
+    actually writes its session JSONL to — mounting only claude's projects
+    directory left a pi or codex session's transcript to die with its --rm
+    container, and the chat view with nothing to read.
+    """
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+    assert set(HARNESS_SESSION_DIRS) == {"claude", "codex", "pi"}
+    for name, container_dir in HARNESS_SESSION_DIRS.items():
+        assert mount_spec_for(result.command, container_dir) == (
+            f"{root / name}:{container_dir}:rw"
+        )
+
+
+def test_each_harness_transcript_subdirectory_is_private_to_this_user(config):
+    """Each holds everything a session said, and each is rw-mounted into it."""
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+    for name in HARNESS_SESSION_DIRS:
+        mode = stat.S_IMODE((root / name).stat().st_mode)
+        assert mode == 0o700, f"expected 0700 on {name}, got {oct(mode)}"
+
+
+def test_a_transcript_subdirectory_that_cannot_be_made_costs_only_its_harness(
+    tmp_path, caplog
+):
+    """Fail-soft per harness, not per session: the others still mount.
+
+    Blocked with a regular file where the subdirectory would go, which is an
+    OSError from mkdir on any platform and needs no permission games.
+    """
+    (tmp_path / "pi").write_text("x", encoding="utf-8")
+    prepared = spawn._prepare_transcript_subdirs(tmp_path)
+    names = [host_dir.name for host_dir, _ in prepared]
+    assert "pi" not in names
+    assert "claude" in names and "codex" in names
+    assert any(
+        "platform_transcript_subdir_unusable" in r.message for r in caplog.records
+    )
+
+
+def test_a_harness_name_that_is_not_one_path_component_is_refused(monkeypatch, caplog):
+    """A harness name becomes a subdirectory name, and the user-harness loader's
+    name rule ([a-z][a-z0-9_-]*) is what keeps it inside the session's own
+    directory. Checked here rather than trusted across the module boundary: a
+    mount built from '..' would land outside the tree the exit scrub walks."""
+    smuggled = dataclasses.replace(HARNESSES["pi"], name="../evil")
+    monkeypatch.setattr(
+        spawn, "known_harnesses", lambda: {**HARNESSES, "../evil": smuggled}
+    )
+    assert "../evil" not in spawn._harness_session_dirs()
+    assert any(
+        "platform_transcript_harness_name_refused" in r.message for r in caplog.records
+    )
+
+
+def test_a_claude_session_dir_that_drifts_from_the_reader_is_loud(monkeypatch):
+    """One fact in two places: claude's declared session directory and the
+    constant the reader and the redirect refusal are written against. A drift
+    must fail every spawn immediately rather than present later as a chat view
+    reading a directory nothing was mounted at."""
+    moved = dataclasses.replace(
+        HARNESSES["claude"], session_dir="/home/developer/.claude/moved"
+    )
+    monkeypatch.setattr(
+        spawn, "known_harnesses", lambda: {**HARNESSES, "claude": moved}
+    )
+    with pytest.raises(RuntimeError, match="drifted apart"):
+        spawn._harness_session_dirs()
+
+
 def test_the_mount_argument_satisfies_lmer_s_own_validator(config):
     """The two halves of this feature live in different packages.
 
@@ -1857,7 +2077,7 @@ def test_the_mount_argument_satisfies_lmer_s_own_validator(config):
     spec = mount_spec_for(result.command, transcripts.CONTAINER_TRANSCRIPT_DIR)
     specs = parse_dir_mount_specs([spec], "")
     assert len(specs) == 1
-    assert specs[0].host == spawn.transcript_dir_for(result.session_id)
+    assert specs[0].host == spawn.transcript_dir_for(result.session_id) / "claude"
     assert specs[0].container == transcripts.CONTAINER_TRANSCRIPT_DIR
     assert specs[0].mode == "rw", "the harness writes into it for the whole session"
 
@@ -2013,6 +2233,264 @@ def test_a_session_whose_transcript_directory_cannot_be_created_still_starts(
     finally:
         os.kill(result.pid, 9)
     assert any("platform_transcript_dir_unusable" in r.message for r in caplog.records)
+
+
+def write_user_harness(root, name, session_dir=None):
+    """A drop-in harness under *root*, declaring where it writes if asked to."""
+    directory = root / name
+    directory.mkdir()
+    manifest = {"schema": 1, "binary": name}
+    if session_dir is not None:
+        manifest["session_dir"] = session_dir
+    (directory / "harness.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (directory / "runner.sh").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    clear_user_harness_cache()
+    return directory
+
+
+def test_a_user_harness_that_declares_where_it_writes_gets_a_mount(
+    config, _no_user_harnesses
+):
+    """Registry-driven, not a list of three: a harness installed without touching
+    this codebase (issue #132) says where it writes in its manifest, and that is
+    all the platform needs to keep its transcripts.
+
+    The mount lands in the staging area rather than at the declared path (#293):
+    ``~/.acme`` is a directory the image never heard of, so binding straight at
+    ``~/.acme/sessions`` has the runtime create ``~/.acme`` root-owned before any
+    container process exists. The declared path is delivered as a symlink by the
+    entrypoint instead — see the link pair asserted below.
+    """
+    write_user_harness(_no_user_harnesses, "acme", "/home/developer/.acme/sessions")
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+
+    staged = f"{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme"
+    assert mount_spec_for(result.command, staged) == f"{root / 'acme'}:{staged}:rw"
+    assert not [
+        spec for spec in mount_specs_in(result.command)
+        if spec.split(":")[1:2] == ["/home/developer/.acme/sessions"]
+    ], "the declared path is where the entrypoint puts the symlink, not a mount"
+    assert spawn._harness_session_links() == [
+        ("/home/developer/.acme/sessions", staged)
+    ]
+    assert stat.S_IMODE((root / "acme").stat().st_mode) == 0o700
+
+
+def test_a_built_in_harness_still_mounts_at_the_path_it_declares(config):
+    """Staging is for user harnesses only (#293).
+
+    The image ships ~/.claude, ~/.codex and ~/.pi developer-owned, so those
+    destinations already have the parents they need — there is nothing for the
+    runtime to create root-owned, and a symlink hop would only add a way for the
+    transcript to go missing.
+    """
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+    for name, container_dir in HARNESS_SESSION_DIRS.items():
+        assert mount_spec_for(result.command, container_dir) == (
+            f"{root / name}:{container_dir}:rw"
+        )
+        assert CONTAINER_MOUNT_STAGING_DIR not in container_dir
+    assert spawn._harness_session_links() == [], "no built-in needs a link"
+
+
+@pytest.mark.parametrize("bad", ["acme/sessions", "/home/developer/../acme"])
+def test_a_user_harness_with_an_unusable_session_dir_costs_only_its_own_mount(
+    config, _no_user_harnesses, bad
+):
+    """A relative path derives no host directory and a traversal leaves the tree
+    the platform owns. Neither may cost the session — the drop-in still loads,
+    and every other mount is still there."""
+    write_user_harness(_no_user_harnesses, "acme", bad)
+    result = spawn.spawn_session(config, request_for())
+
+    specs = mount_specs_in(result.command)
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+    assert not [spec for spec in specs if "acme" in spec]
+    assert not (spawn.transcript_dir_for(result.session_id) / "acme").exists()
+
+
+@pytest.mark.parametrize("taken", [
+    "/workspace",                          # the unconditional workspace mount
+    "/workspace/",                         # …and the same path spelled loosely
+    "/Agents/global",                      # the agent-files tree
+    HARNESSES["claude"].session_dir,       # a built-in's transcript mount
+])
+def test_a_user_harness_claiming_a_platform_directory_is_skipped_not_obeyed(
+    config, _no_user_harnesses, caplog, taken
+):
+    """One drop-in line must not quietly take over a platform mount — or, for
+    ``lmer``'s own ``-v`` destinations, break every spawn on every harness.
+
+    The transcript mounts are delivered as ``--mount-dir``, whose parser dedupes
+    duplicate destinations itself (warn, last wins), so a manifest naming one of
+    them would silently redirect what lands there. ``/workspace`` and
+    ``/Agents/global`` are ``-v`` mounts that no dedupe sees, and Docker and
+    Podman refuse a duplicate ``-v`` destination outright, so a manifest naming
+    one of those would take the whole fleet down until someone found the file.
+    The field's contract is warn-and-ignore, so either collision costs that
+    harness its transcript mount and nothing else.
+    """
+    write_user_harness(_no_user_harnesses, "acme", taken)
+    result = spawn.spawn_session(config, request_for())
+
+    specs = mount_specs_in(result.command)
+    assert not [spec for spec in specs if "acme" in spec]
+    # The session still started — spawn_session raises when it refuses — and the
+    # built-ins still have all their mounts. (Not asserted via the registry
+    # entry: the stub session can exit and be reaped before the read, and this
+    # test is about the mount set, not the entry's lifetime.)
+    for container_dir in HARNESS_SESSION_DIRS.values():
+        assert mount_spec_for(result.command, container_dir)
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+    assert any(
+        "platform_transcript_session_dir_taken" in r.message for r in caplog.records
+    )
+
+
+def test_two_user_harnesses_sharing_a_session_dir_keep_the_first(
+    config, _no_user_harnesses, caplog
+):
+    """Same refusal, between drop-ins: unchecked, the second mount at that
+    destination would silently displace the first — ``--mount-dir``'s parser
+    dedupes and the last entry wins — so one drop-in would swallow another
+    harness's transcripts. Load order is the drop-in directory sorted by name, so
+    "acme" is the one that keeps its transcript."""
+    shared = "/home/developer/.shared/sessions"
+    write_user_harness(_no_user_harnesses, "acme", shared)
+    write_user_harness(_no_user_harnesses, "bravo", shared)
+    result = spawn.spawn_session(config, request_for())
+    root = spawn.transcript_dir_for(result.session_id)
+
+    # The collision is decided on the declared path; what the winner then gets
+    # is its staged mount (#293) and the link back to the declared one.
+    staged = f"{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme"
+    assert mount_spec_for(result.command, staged) == f"{root / 'acme'}:{staged}:rw"
+    assert spawn._harness_session_links() == [(shared, staged)]
+    assert not [spec for spec in mount_specs_in(result.command) if "bravo" in spec]
+    assert any(
+        "platform_transcript_session_dir_taken harness=bravo" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize("declared, event", [
+    # The container home itself: absolute, no "..", equal to nothing the
+    # platform mounts — and an empty 0700 directory bound over it hides
+    # ~/.npm-global/bin and ~/.local/bin, so no harness could start at all.
+    ("/home/developer", "platform_transcript_session_dir_outside_home"),
+    # Outside the home entirely; /etc and / are the same argument.
+    ("/etc", "platform_transcript_session_dir_outside_home"),
+    # Inside the home, equal to nothing, but the parent of pi's session
+    # directory: mounting it hides pi's configuration beside it.
+    ("/home/developer/.pi", "platform_transcript_session_dir_covers"),
+])
+def test_a_user_harness_declaring_a_directory_above_the_platforms_is_skipped(
+    config, _no_user_harnesses, caplog, declared, event
+):
+    """Passing the manifest parser's shape check is not enough to be mounted.
+
+    The mount is ``rw``, made on every spawn whatever harness the session
+    resolves to, and its host side is an empty directory — so a declaration that
+    is an *ancestor* of the container's own layout hides that layout rather than
+    colliding with it, which no equality check sees. Same warn-and-skip cost as a
+    collision: the harness loses its transcript mount, the session starts.
+    ``/home/developer/.acme/sessions`` is the well-behaved shape and still mounts
+    (test_a_user_harness_that_declares_where_it_writes_gets_a_mount).
+    """
+    write_user_harness(_no_user_harnesses, "acme", declared)
+    result = spawn.spawn_session(config, request_for())
+
+    specs = mount_specs_in(result.command)
+    assert not [spec for spec in specs if "acme" in spec]
+    # The session still started — spawn_session raises when it refuses — and the
+    # built-ins still have all their mounts. (Same reaper-race reasoning as the
+    # platform-directory test above: the stub session's registry entry can be
+    # gone before a read.)
+    for container_dir in HARNESS_SESSION_DIRS.values():
+        assert mount_spec_for(result.command, container_dir)
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+    assert any(event in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("declared", [
+    # The staging root itself, which is a reserved destination like the ask
+    # channel and the workspace.
+    CONTAINER_MOUNT_STAGING_DIR,
+    # And inside it, where the platform generates this very harness's mount
+    # destination — a containment no equality check and no "does it cover a
+    # platform mount" check can see, since it points the other way.
+    f"{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme",
+    f"{CONTAINER_MOUNT_STAGING_DIR}/creds/0",
+])
+def test_a_user_harness_declaring_a_directory_in_the_staging_area_is_skipped(
+    config, _no_user_harnesses, caplog, declared
+):
+    """The staging area is lmer's own (#293), so a manifest may not claim it.
+
+    A declaration in there would have the platform stage a mount on top of its
+    own staging layout, and hand the entrypoint a pair whose two halves name the
+    same tree. Same warn-and-skip cost as every other refused declaration: the
+    harness loses its transcript mount and the session starts.
+    """
+    write_user_harness(_no_user_harnesses, "acme", declared)
+    result = spawn.spawn_session(config, request_for())
+
+    specs = mount_specs_in(result.command)
+    assert not [spec for spec in specs if "acme" in spec]
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+    assert any(
+        "platform_transcript_session_dir_in_staging" in r.getMessage()
+        or "platform_transcript_session_dir_taken" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_the_child_is_told_which_declared_paths_to_link(
+    config, _no_user_harnesses, monkeypatch
+):
+    """The container half of the fix travels as LMER_MOUNT_LINKS (#293).
+
+    The pair is what the entrypoint's linker consumes; without it the staged
+    mount is delivered to a path no harness looks at, which is the same missing
+    transcript the staging was introduced to avoid.
+    """
+    write_user_harness(_no_user_harnesses, "acme", "/home/developer/.acme/sessions")
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    spawn.spawn_session(config, request_for())
+    assert captured[MOUNT_LINKS_ENV] == (
+        f"/home/developer/.acme/sessions:{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme"
+    )
+
+
+def test_a_session_with_nothing_to_link_is_told_that_in_blank(config, monkeypatch):
+    """Blank, not absent — the child is ``lmer`` and it seeds its environment
+    from .env files first-wins, so a deleted key is one a stale file may
+    re-supply (the LMER_ASK_DIR/LMER_NO_REPO precedent). An inherited value is
+    dropped for the sharper version of the same reason: a daemon started from
+    inside a session carries that session's pairs, which name mounts this
+    container does not have."""
+    monkeypatch.setenv(MOUNT_LINKS_ENV, "/somebody/elses:/staged/mount")
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    spawn.spawn_session(config, request_for())
+    assert captured[MOUNT_LINKS_ENV] == "", (
+        "no user harness declared anything, so there is nothing to link"
+    )
 
 
 def test_scrubbing_a_session_that_wrote_no_transcript_is_not_fatal(config):
@@ -2217,6 +2695,20 @@ def test_a_mount_aimed_at_the_transcript_destination_is_refused(config, hijack):
         spawn.spawn_session(config, request_for(extra_args=hijack))
 
 
+@pytest.mark.parametrize("container_dir", sorted(HARNESS_SESSION_DIRS.values()))
+def test_a_mount_aimed_at_any_harness_transcript_destination_is_refused(
+    config, container_dir
+):
+    """The refusal follows the mounts (#280): every declared session directory is
+    a place the platform now mounts, so every one of them is a place a redirect
+    would leave an unscrubbed transcript outside the tree it owns."""
+    with pytest.raises(spawn.SpawnError, match="may not target"):
+        spawn.spawn_session(
+            config,
+            request_for(extra_args=("--mount-dir", f"/tmp/mine:{container_dir}:rw")),
+        )
+
+
 @pytest.mark.parametrize("hijack", [
     ("--mount-dir", f"/tmp/mine:{supervisor.CONTAINER_SESSION_LOG_DIR}:rw"),
     ("--mount-dir=/tmp/mine:" + supervisor.CONTAINER_SESSION_LOG_DIR,),
@@ -2231,6 +2723,60 @@ def test_a_mount_aimed_at_the_session_log_destination_is_refused(config, hijack)
     """
     with pytest.raises(spawn.SpawnError, match="may not target"):
         spawn.spawn_session(config, request_for(extra_args=hijack))
+
+
+@pytest.mark.parametrize("hijack", [
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}:rw"),
+    ("--mount-dir=/tmp/mine:" + CONTAINER_MOUNT_STAGING_DIR,),
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/:rw"),
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/sessions:rw"),
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme:rw"),
+    ("--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/creds/0:ro"),
+])
+def test_a_mount_aimed_into_the_staging_area_is_refused(config, hijack):
+    """The whole subtree, not one path (#293): the platform's user-harness mounts
+    land at generated paths under it, so a caller's mount anywhere inside can
+    shadow one — or supply the directory the entrypoint links a declared path
+    to, which is a harness reading credentials the caller chose."""
+    with pytest.raises(spawn.SpawnError, match="may not target"):
+        spawn.spawn_session(config, request_for(extra_args=hijack))
+
+
+@pytest.mark.parametrize("hijack", [
+    ("--mount-file", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/creds/0:ro"),
+    ("--mount-file=/tmp/mine:" + f"{CONTAINER_MOUNT_STAGING_DIR}/creds/0",),
+    ("--mount-file", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}/sessions/acme/x.jsonl"),
+])
+def test_a_file_mount_aimed_into_the_staging_area_is_refused(config, hijack):
+    """``--mount-file`` reaches the staging area too, and is the flag that fits
+    it: a staged *credential* is a file (``.lmer-mounts/creds/<n>``), so the
+    subtree refusal has to cover the file flag or the session's harness can be
+    handed a credential the caller supplied."""
+    with pytest.raises(spawn.SpawnError, match="may not target"):
+        spawn.spawn_session(config, request_for(extra_args=hijack))
+
+
+def test_an_unrelated_mount_file_is_still_allowed(config):
+    """Only the staging aim is refused; the flag keeps everything else it does —
+    the protected session/ask/log destinations stay a --mount-dir rule, since
+    every one of them is a directory."""
+    result = spawn.spawn_session(
+        config,
+        request_for(extra_args=("--mount-file", "/tmp/mine:/home/developer/.netrc:ro")),
+    )
+    assert "/tmp/mine:/home/developer/.netrc:ro" in result.command
+
+
+def test_a_mount_beside_the_staging_area_is_not_refused(config):
+    """Components, not a string prefix: ``.lmer-mounts-backup`` starts with the
+    staging path and is nowhere inside it."""
+    result = spawn.spawn_session(
+        config,
+        request_for(extra_args=(
+            "--mount-dir", f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}-backup:ro",
+        )),
+    )
+    assert f"/tmp/mine:{CONTAINER_MOUNT_STAGING_DIR}-backup:ro" in result.command
 
 
 def test_an_unrelated_mount_dir_is_still_allowed(config):
@@ -2365,7 +2911,10 @@ def test_a_session_whose_channel_cannot_be_created_still_starts(
 
     result = spawn.spawn_session(config, request_for())
     assert result.session_id
-    assert ask.ASK_DIR_ENV not in captured
+    assert captured[ask.ASK_DIR_ENV] == "", (
+        "blank is the channel protocol's own 'not set', and unlike a deleted "
+        "key it cannot be re-supplied by the child's .env seeding"
+    )
     assert not [
         spec for spec in mount_specs_in(result.command)
         if spec.split(":")[1:2] == [ask.CONTAINER_ASK_DIR]
@@ -2385,7 +2934,75 @@ def test_an_inherited_ask_dir_is_not_passed_through(config, monkeypatch):
     monkeypatch.setattr(spawn.subprocess, "Popen", spy)
     monkeypatch.setattr(spawn.ask, "prepare_ask_dir", lambda sid: None)
     spawn.spawn_session(config, request_for())
-    assert ask.ASK_DIR_ENV not in captured
+    assert captured[ask.ASK_DIR_ENV] == ""
+    with pytest.raises(protocol.ChannelUnavailable):
+        # The value the child's own resolver gets, not just the string: blank
+        # is the "this session was not orchestrated" exit, same as absent.
+        protocol.resolve_channel_dir(env=captured)
+
+
+def test_the_blanked_variables_survive_the_childs_env_file_seeding(
+    config, monkeypatch, tmp_path
+):
+    """Neither withheld variable can come back through the child's ``.env``.
+
+    The child is ``lmer``, and its ``main()`` seeds its own environment from
+    ``.env`` files first-wins — skipping only a variable that is already
+    *present* — before either of these is read. Withholding them by deletion
+    would therefore be undone by the very files the child reads next: a
+    deployment with ``LMER_NO_REPO=1`` in its ``.env`` would get workers running
+    on an empty /workspace while their request names a repository, and the ask
+    variable has the same shape. One file tier is enough to prove it; the
+    seeding rule is the same at every tier.
+
+    Regression contract: with either variable deleted rather than blanked, the
+    seeding below re-supplies it and these assertions fail.
+    """
+    from lmer_cli.cli import apply_env_file_defaults
+    from lmer_cli.util import get_bool_env
+
+    env_file = tmp_path / "deploy.env"
+    env_file.write_text(
+        f"{spawn.NO_REPO_ENV}=1\n{ask.ASK_DIR_ENV}=/somebody/elses/channel\n",
+        encoding="utf-8",
+    )
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    # No channel to mount, and a request that names a repository: the one spawn
+    # where both variables are the daemon's to withhold.
+    monkeypatch.setattr(spawn.ask, "prepare_ask_dir", lambda sid: None)
+    spawn.spawn_session(config, request_for())
+
+    # The child's real seeding, run against the environment it was handed.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "environ", captured)
+        apply_env_file_defaults([("deployment .env", env_file)])
+        no_repo_reading = get_bool_env(spawn.NO_REPO_ENV)
+
+    assert captured[spawn.NO_REPO_ENV] == "", (
+        "a blank value is present, so first-wins seeding must skip it"
+    )
+    assert not no_repo_reading, (
+        "and the child must still resolve a session that has its repository"
+    )
+    assert captured[ask.ASK_DIR_ENV] == ""
+    with pytest.raises(protocol.ChannelUnavailable):
+        protocol.resolve_channel_dir(env=captured)
+
+    # Control: the same file does seed an environment that lacks both keys, so
+    # the assertions above rest on the blanking, not on a no-op seeding.
+    without_them: dict[str, str] = {}
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "environ", without_them)
+        apply_env_file_defaults([("deployment .env", env_file)])
+    assert without_them[spawn.NO_REPO_ENV] == "1"
+    assert without_them[ask.ASK_DIR_ENV] == "/somebody/elses/channel"
 
 
 @pytest.mark.parametrize("hijack", [
@@ -2756,3 +3373,135 @@ def test_a_spawn_is_refused_when_its_service_is_held_under_another_slot(
 
     with pytest.raises(spawn.SlotOccupied, match="already in use by s-b"):
         spawn.spawn_session(config, request_for(slot="a"))
+
+
+# --- service groups: what a group spawn records and refuses (issue #312) ------
+
+GROUP_SLOTS = [{"name": "stack", "preset": "stack_dev"}]
+
+
+def test_a_group_spawn_records_the_members_it_holds(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """The record every later occupancy answer is derived from: a group session
+    can retarget to any member, so all of them go on the entry."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(
+        slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
+    )
+
+    try:
+        task = registry.read_session(result.session_id)["task"]
+        assert task["slot_service_group"] == "stack"
+        # Both spellings of every member: a single-service slot's preset may
+        # name the compose service or the exact container.
+        assert task["slot_services"] == [
+            "db", "web", "webapp-web",
+            "stack-db-1", "stack-web-1", "stack-webapp-web-1",
+        ]
+        assert task["slot_service"] is None  # no starting member on this preset
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_an_ordinary_slot_spawn_records_no_group(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """Nothing about a single-service slot changes."""
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+    result = spawn.spawn_session(
+        slot_config(fake_lmer), request_for(slot="webapp")
+    )
+
+    try:
+        task = registry.read_session(result.session_id)["task"]
+        assert task["slot_service"] == "webapp-web"
+        assert task["slot_service_group"] is None
+        assert task["slot_services"] is None
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_a_second_session_on_a_held_group_is_refused(
+    platform_root, fake_lmer, slot_host
+):
+    registry.register("s-holder", pid=os.getpid(), slot="stack")
+    registry.update("s-holder", task={
+        "preset": "stack_dev", "slot_service_group": "stack",
+        "slot_services": ["stack-web"],
+    })
+
+    with pytest.raises(spawn.SlotOccupied, match="s-holder"):
+        spawn.spawn_session(
+            slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
+        )
+
+
+def test_a_slot_on_a_member_is_refused_while_a_group_session_runs(
+    platform_root, fake_lmer, slot_host
+):
+    """The point of the accounting: one agent per dev service, however the
+    session that holds it got there. Only the member slot is declared, so the
+    refusal comes from the live session rather than from the config."""
+    registry.register("s-holder", pid=os.getpid(), slot="stack")
+    registry.update("s-holder", task={
+        "preset": "stack_dev", "slot_service_group": "stack",
+        "slot_services": ["web", "db", "webapp-web"],
+    })
+
+    with pytest.raises(spawn.SlotOccupied, match="s-holder"):
+        spawn.spawn_session(
+            slot_config(fake_lmer, [{"name": "webapp", "preset": "webapp_dev"}]),
+            request_for(slot="webapp"),
+        )
+
+
+def test_a_group_slot_is_refused_while_a_session_holds_one_of_its_members(
+    platform_root, fake_lmer, slot_host
+):
+    """The mirror — the direction that used to be granted. A live session in
+    webapp-web must stop a group spawn over the project containing it."""
+    registry.register("s-single", pid=os.getpid(), slot="webapp")
+    registry.update("s-single", task={
+        "preset": "webapp_dev", "slot_service": "webapp-web",
+    })
+
+    with pytest.raises(spawn.SlotOccupied, match="s-single") as exc:
+        spawn.spawn_session(
+            slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
+        )
+
+    assert "webapp-web" in str(exc.value)
+
+
+def test_two_slots_overlapping_through_a_group_refuse_at_the_config_level(
+    platform_root, fake_lmer, slot_host
+):
+    """Declared together they overlap permanently, so the later one is unusable
+    rather than merely busy — the same verdict two slots on one service get."""
+    entries = GROUP_SLOTS + [{"name": "webapp", "preset": "webapp_dev"}]
+
+    with pytest.raises(spawn.SpawnError, match="already bound by slot 'stack'") as exc:
+        spawn.spawn_session(
+            slot_config(fake_lmer, entries), request_for(slot="webapp")
+        )
+
+    assert not isinstance(exc.value, spawn.SlotOccupied)
+
+
+def test_a_group_that_vanished_between_probe_and_claim_is_refused(
+    platform_root, fake_lmer, slot_host, monkeypatch
+):
+    """Recording an empty member list would read as a session holding nothing."""
+    from lmer_cli.service import ServiceError
+    from lmer_platform import slots as slots_mod
+
+    monkeypatch.setattr(
+        slots_mod, "group_members",
+        lambda project, **kw: (_ for _ in ()).throw(ServiceError("gone")),
+    )
+
+    with pytest.raises(spawn.SpawnError, match="could not resolve the members"):
+        spawn.spawn_session(
+            slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
+        )

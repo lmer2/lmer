@@ -275,10 +275,10 @@ The container runs with:
 - Non-root user (`developer`)
 - Dropped capabilities (only essential ones retained: CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID)
 - No new privileges flag (`--security-opt no-new-privileges`)
-- Resource limits when running via the `lmer` CLI:
-  - CPU: 1 core
-  - Memory: 2GB
-  - Process limit: 512
+- Resource limits when running via the `lmer` CLI (defaults; each overridable, see [LMER-CLI.md](./LMER-CLI.md)):
+  - CPU: 1 core (`LMER_CPUS`)
+  - Memory: 2GB (`LMER_MEMORY`)
+  - Process limit: 512 (`LMER_PIDS_LIMIT`)
 
 ## Makefile Commands
 
@@ -313,7 +313,7 @@ Set via the host environment, `~/.lmer/.env`, or a project-local `.env` file:
 - `OPENSSL_FIPS=1` - Enable FIPS mode in OpenSSL
 - `PYTHONHASHSEED=0` - Deterministic hashing
 - `CLAUDE_CONTAINER=true` - Container detection flag
-- `CONTAINER_LIMITS=CPU:1core Memory:2GB Processes:512` - Resource limit info
+- `CONTAINER_LIMITS` - **(derived, not settable)** Resource limit info (e.g. `CPU:2cores Memory:2GiB Processes:32000`), composed at shell startup by `Ctl/container/container-limits.sh` from the container's own cgroup (v1 or v2), so it always reflects the limits actually applied — `LMER_CPUS`, `LMER_MEMORY` and `LMER_PIDS_LIMIT` reach it automatically. Any inherited value is overwritten. A limit the kernel does not enforce reads as `unlimited`; a value the cgroup does not expose reads as `unknown`. It is a display string for a human reader, not a machine interface — code that needs a number should read the cgroup files directly. Running the script instead of sourcing it prints the current value
 - `LMER_WORK_REPO_TOKEN` - Provider-agnostic dedicated work-repo token (highest priority for work-repo lookups)
 - `GITLAB_TOKEN_*`, `GITLAB_TOKEN` - GitLab tokens (host-specific via sanitized hostname suffix, plus generic fallback)
 - `GH_TOKEN`, `GITHUB_TOKEN` - GitHub tokens (consulted for `github.com`, `*.github.com`, `*.ghe.com` hosts)
@@ -321,13 +321,26 @@ Set via the host environment, `~/.lmer/.env`, or a project-local `.env` file:
 - `LMER_HARNESS` - Agent harness the session runs (`claude` default; `codex`, `pi` — all baked into the image; see [HARNESSES.md](./HARNESSES.md))
 - `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, ... - Provider API keys for non-claude harnesses (forwarded from `.env` like any other variable)
 
+Git repository credentials cross the container boundary only long enough for
+the clone entrypoint to write mode-`0600` session files named
+`~/.git-credentials-{host}-*`. Every container-internal lmer-created clone uses
+a clean URL plus a non-secret `credential.helper` reference to its file. The
+clean URL becomes the remote; the helper reference remains for later fetches
+and pushes; no token is written to repository config or placed in Git argv.
+Separate files preserve different target/work/auxiliary credentials on the same
+host. Operator-owned `--checkout` and service-mode bind mounts, including
+secondary-clone subdirectories beneath them, never receive container-only
+repository config or remote rewrites. Fresh secondary clones on those mounts
+use the session file only through process-scoped Git config. The entrypoint only
+scrubs the corresponding retained environment URL.
+
 ### How the environment reaches the container
 
 No environment **value** is ever placed in the `docker`/`podman run` command
 line. `/proc/<pid>/cmdline` is world-readable, so a `-e NAME=value` argument
 exposes the value to every user on the host for as long as the session runs
-— and a session's environment routinely carries a credentialed work-repo
-clone URL, git forge tokens and the FastAPI bearer token.
+— and the launch environment may transiently carry a resolved work-repo
+credential, git forge tokens and the FastAPI bearer token.
 
 The CLI uses two transports (`runtime.build_container_env`):
 

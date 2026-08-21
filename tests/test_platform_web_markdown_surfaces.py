@@ -56,8 +56,11 @@ COMPONENTS = WEB / "src" / "components"
 #: component, valued by the expression each ``<Markdown>`` is bound to.
 INLINE_SURFACES = {
     "RunDetail.vue": {"run.attention.note", "run.goal", "event.note"},
-    "AskChannel.vue": {"closureReason(entry)"},
-    "AskHistory.vue": {"closureReason(entry)"},
+    # One entry, drawn the same way in both views of the channel (#274). It was two
+    # identical rows here, one per view, which is the duplication that extraction
+    # removed — and an inventory that still listed two would be describing an app
+    # where one of them could quietly become a document.
+    "AskEntry.vue": {"closureReason(entry)"},
 }
 
 #: Surfaces that render it whole: a bubble or a card, written to be read, where a
@@ -65,8 +68,7 @@ INLINE_SURFACES = {
 BLOCK_SURFACES = {
     "Chat.vue": {"message.text"},
     "AskBox.vue": {"question.text"},
-    "AskChannel.vue": {"entry.text"},
-    "AskHistory.vue": {"entry.text"},
+    "AskEntry.vue": {"entry.text"},
     "AnswerBox.vue": {"note"},
     "RunMeta.vue": {"record.description"},
 }
@@ -275,24 +277,37 @@ def test_what_the_operator_wrote_is_still_shown_as_they_wrote_it():
     A reply went to the session as bytes. Rendering it would mean a view claiming
     the operator typed something they did not — and in the record, which is the
     view that exists to say what was actually said.
+
+    One component draws an entry for both views since #274, so the property is
+    asserted once, where it can only be broken once — and the two views are
+    checked to still be drawing their entries with it, because a view that stopped
+    would take the guard with it.
     """
-    for name in ("AskChannel.vue", "AskHistory.vue"):
-        text = _component(name)
-        assert "you: {{ entry.answer.text }}" in text, (
-            f"{name} renders the operator's own reply"
-        )
-        for element in _elements(text):
-            assert "answer" not in _bound_text(element), (
-                f"{name} renders a reply as markup: {element}"
-            )
-    # An option is literally the text a tap puts in the box, so the record shows
-    # the same characters the dock would have sent.
-    history = _component("AskHistory.vue")
-    assert "it offered: {{ options(entry) }}" in history
-    assert "<v-chip" not in history, (
-        "the record offers the options as chips, which reads as a menu on a view "
-        "that sends nothing"
+    entry = _component("AskEntry.vue")
+    assert "you: {{ entry.answer.text }}" in entry, (
+        "AskEntry.vue renders the operator's own reply"
     )
+    for element in _elements(entry):
+        assert "answer" not in _bound_text(element), (
+            f"AskEntry.vue renders a reply as markup: {element}"
+        )
+    for name in ("AskChannel.vue", "AskHistory.vue"):
+        assert "<AskEntry" in _component(name), (
+            f"{name} draws a channel entry itself again, so what it does with a "
+            "reply is nowhere in this file"
+        )
+    # An option is literally the text a tap puts in the box, so the record shows
+    # the same characters the dock would have sent. The line is the entry
+    # component's, drawn only where it is asked for — the record asks.
+    assert "it offered: {{ options(entry) }}" in entry
+    assert "show-options" in _component("AskHistory.vue"), (
+        "the record no longer asks for the alternatives a question offered"
+    )
+    for name in ("AskEntry.vue", "AskHistory.vue"):
+        assert "<v-chip" not in _component(name), (
+            f"{name} offers the options as chips, which reads as a menu on a view "
+            "that sends nothing"
+        )
 
 
 def test_every_new_consumer_still_defers_the_chunk():
@@ -307,9 +322,16 @@ def test_every_new_consumer_still_defers_the_chunk():
         assert "import('./Markdown.vue')" in text, (
             f"{name} renders agent words without deferring the renderer"
         )
-        assert not re.search(r"^\s*import\s+.*from\s+'\./Markdown\.vue'", text, re.M), (
-            f"{name} imports the renderer statically, which puts markdown-it and "
-            "DOMPurify back in the chunk the fleet view loads"
+    # The static half is asked of every component rather than of the inventory: one
+    # anywhere puts markdown-it and DOMPurify back in the chunk the fleet view
+    # loads, including from a component that renders nothing itself and only holds
+    # the import.
+    for path in sorted(COMPONENTS.glob("*.vue")):
+        assert not re.search(
+            r"^\s*import\s+.*from\s+'\./Markdown\.vue'", _read(path), re.M,
+        ), (
+            f"{path.name} imports the renderer statically, which puts markdown-it "
+            "and DOMPurify back in the chunk the fleet view loads"
         )
 
 

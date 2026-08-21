@@ -1798,7 +1798,7 @@ def test_a_refusal_quoted_by_someone_else_is_unanswered_not_a_refusal(tmp_path):
     assert "refused" not in run.attention.note
 
 
-@pytest.mark.parametrize("role", ["system", "monitor"])
+@pytest.mark.parametrize("role", ["system", "monitor", "platform"])
 def test_only_input_roles_raise_the_unanswered_claim(tmp_path, role):
     """``unanswered`` names the roles that are input rather than "not assistant".
 
