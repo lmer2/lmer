@@ -22,7 +22,7 @@ NC := \033[0m # No Color
 .DEFAULT_GOAL := help
 
 .PHONY: help build build-nocache lmer lmer-shell claude claude-shell \
-        test test-all fips-check security-scan rebuild info version
+        test test-all fips-check security-scan dep-up rebuild info version
 
 ## Help
 help: ## Show this help message
@@ -141,6 +141,13 @@ security-scan: ## Run security scan on image
 	fi
 
 ## Maintenance
+dep-up: ## Upgrade every locked dependency to the newest version its declared range allows
+	@echo "$(GREEN)⬆️  Upgrading Python lockfile (uv.lock)...$(NC)"
+	@uv lock --upgrade
+	@echo "$(GREEN)⬆️  Upgrading web lockfile (web/package-lock.json)...$(NC)"
+	@cd web && npm update --package-lock-only
+	@echo "$(GREEN)✅ Lockfiles upgraded. Review the diff, run the gate, commit.$(NC)"
+
 rebuild: build-nocache ## Full rebuild from scratch (no cache)
 	@echo "$(GREEN)✅ Full rebuild complete$(NC)"
 
