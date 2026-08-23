@@ -21,7 +21,8 @@ the wrong place, and starting anyway would leave it there.
 Where each value lives
 ----------------------
 ``config.json`` (``matrix``)   ``name``, ``homeserver``, ``server_name``,
-                               ``room_id``, ``authenticated_media``, ``allow``,
+                               ``room_id``, ``control_url``,
+                               ``authenticated_media``, ``allow``,
                                ``poll_seconds``, ``remind_seconds``
 environment                    the three secrets above
 
@@ -111,6 +112,12 @@ class MatrixConfig:
     server_name: str
     allow: Mapping[str, frozenset]
     room_id: Optional[str] = None
+    #: Where a **person in the room** reaches the control UI. Configured rather
+    #: than derived, because everything the bridge otherwise knows is a bind
+    #: pair — ``http://127.0.0.1:8765`` is where the daemon listens, not a link
+    #: anyone can open from a phone. Unset means the messages carry no link at
+    #: all, which is honest; a loopback URL in a chat room is not (!244 review).
+    control_url: Optional[str] = None
     #: The operator asserting that ``matrix_enable_authenticated_media`` is on
     #: at the homeserver — the same change that installs the registration.
     #:
@@ -210,6 +217,10 @@ def load(stored: Optional[Mapping[str, Any]] = None) -> MatrixConfig:
         server_name=server_name.strip(),
         allow=parse_allow(stored.get("allow")),
         room_id=room_id,
+        control_url=_optional_url(
+            stored, "control_url",
+            "a person in the room opens to see the fleet",
+        ),
         authenticated_media=_require_bool(stored, "authenticated_media"),
         poll_seconds=_require_positive_int(stored, "poll_seconds",
                                            DEFAULT_POLL_SECONDS),
@@ -292,6 +303,24 @@ def load_secrets(environ: Optional[Mapping[str, str]] = None) -> Secrets:
         hs_token=values[ENV_HS_CREDENTIAL],
         recovery_key=values[ENV_RECOVERY_KEY],
     )
+
+
+def _optional_url(stored: Mapping[str, Any], key: str, purpose: str) -> Optional[str]:
+    """An http(s) URL, or ``None``, or a refusal naming the key.
+
+    Refused rather than ignored when malformed: a URL nobody can open is worse
+    in a chat room than no URL at all, because the reader spends a tap finding
+    that out.
+    """
+    value = stored.get(key)
+    if value is None:
+        return None
+    parsed = urlparse(value if isinstance(value, str) else "")
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise MatrixConfigError(
+            f"`matrix.{key}` must be the http(s) URL {purpose}, got {value!r}"
+        )
+    return value.rstrip("/")
 
 
 def _refuse_secrets_in_file(stored: Mapping[str, Any]) -> None:
