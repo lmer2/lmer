@@ -20,7 +20,7 @@ from matrix_bridge import config as mxcfg
 from tests.conftest import strip_lmer_env
 
 VALID = {
-    "name": "alice",
+    "name": "bridge-a",
     "homeserver": "https://matrix.example.net",
     "allow": {
         "@alice:matrix.example.net": ["read", "answer-live", "answer-stopped"],
@@ -56,7 +56,7 @@ def stored(**changes):
 
 def test_a_valid_section_loads_with_the_documented_defaults():
     config = mxcfg.load(stored())
-    assert config.name == "alice"
+    assert config.name == "bridge-a"
     assert config.homeserver == "https://matrix.example.net"
     assert config.room_id is None
     assert config.poll_seconds == 15
@@ -75,8 +75,8 @@ def test_the_sender_and_namespace_come_from_the_name():
     """D2: two bridges on one homeserver cannot claim overlapping namespaces,
     because both are derived from a name that is already unique per daemon."""
     config = mxcfg.load(stored())
-    assert config.sender == "@lmer-alice:matrix.example.net"
-    assert config.user_namespace == "@lmer-alice_.*"
+    assert config.sender == "@lmer-bridge-a:matrix.example.net"
+    assert config.user_namespace == "@lmer-bridge-a_.*"
 
     other = mxcfg.load(stored(name="peer"))
     assert other.user_namespace != config.user_namespace
@@ -179,10 +179,10 @@ def test_a_slice_two_capability_is_refused_as_reserved(capability):
 
 @pytest.mark.parametrize("key", [
     "matrix.example.net",          # a bare domain
-    "@alice",                      # no server
-    "alice:matrix.example.net",    # no sigil
+    "@bridge-a",                      # no server
+    "bridge-a:matrix.example.net",    # no sigil
     "@*:matrix.example.net",       # a pattern
-    "@alice:*",                    # a pattern on the server half
+    "@bridge-a:*",                    # a pattern on the server half
 ])
 def test_only_an_explicit_mxid_is_an_allowlist_key(key):
     """The deliberate divergence from ``LMER_PUSH_ALLOW_LIST``: this homeserver
@@ -291,5 +291,5 @@ def test_the_bridge_reads_the_section_through_the_platform_loader(platform_root)
     store.write_json(path, {"matrix": stored(room_id="!room:matrix.example.net")})
 
     config = mxcfg.load()
-    assert config.name == "alice"
+    assert config.name == "bridge-a"
     assert config.room_id == "!room:matrix.example.net"

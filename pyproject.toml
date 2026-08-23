@@ -85,6 +85,10 @@ lmer = "lmer_cli.cli:main"
 lmer-supervisor = "lmer_cli.supervisor:main"
 lmer-pipe = "lmer_cli.pipe:main"
 lmer-ctl = "lmer_platform.ctl:main"
+# Declared unconditionally although its dependencies live in the `matrix`
+# extra: a missing extra then costs an ImportError from this one command
+# rather than a failed install of lmer (see the extra's own note).
+lmer-matrix-bridge = "matrix_bridge.cli:main"
 gitlab-review = "gitlab_reviewer.cli:main"
 lmer-slack = "slack_chat.cli:main"
 lmer-slack-listener = "slack_chat.listener:main"

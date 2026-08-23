@@ -26,7 +26,7 @@ from tests.matrix_fakes import FakeHomeserver
 
 ROOM = "!room:matrix.example.net"
 STORED = {
-    "name": "alice",
+    "name": "bridge-a",
     "homeserver": "https://matrix.example.net",
     "authenticated_media": True,
     "allow": {
@@ -417,3 +417,34 @@ def test_the_real_transport_registers_its_handler():
     source = inspect.getsource(mxclient.MautrixHomeserver.on_event)
     assert "matrix_event_handler" in source
     assert "_decrypt" in source
+
+
+# --- the outbound client does not depend on the listener ---------------------
+
+async def test_the_outbound_client_is_built_without_starting_a_server():
+    """!245 review, iteration 2. ``AppService.intent`` raises
+    ``AttributeError("the intent attribute can only be used after starting")``
+    until the web server is up, and the transport used to take its outbound
+    client from there. Two things broke on that: ``run`` died on its first
+    homeserver call before the listener could exist, and ``check`` could not ask
+    the homeserver anything at all without binding the port a running bridge is
+    already on.
+
+    Exercised against the real library, since that is where the coupling was —
+    skipped only where the ``matrix`` extra is not installed (CI installs it).
+    Async because ``AppServiceAPI`` builds an ``aiohttp`` session and needs a
+    running loop, which every real caller of this method has.
+    """
+    mautrix_appservice = pytest.importorskip("mautrix.appservice")
+
+    homeserver = mxclient.MautrixHomeserver(
+        mxcfg.load(dict(STORED, room_id=ROOM)),
+        mxcfg.Secrets(as_token="as", hs_token="hs", recovery_key="rk"),
+    )
+
+    intent = homeserver._appservice_client()
+
+    assert isinstance(intent, mautrix_appservice.IntentAPI)
+    assert homeserver._listening is False, "nothing was started to get it"
+    with pytest.raises(AttributeError):
+        homeserver._appservice().intent  # the coupling that used to be used

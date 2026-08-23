@@ -29,7 +29,7 @@ from tests.conftest import strip_lmer_env
 from tests.matrix_fakes import FakeHomeserver
 
 STORED = {
-    "name": "alice",
+    "name": "bridge-a",
     "homeserver": "https://matrix.example.net",
     "room_id": "!room:matrix.example.net",
     "allow": {"@alice:matrix.example.net": ["read", "answer-live"]},
