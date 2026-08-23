@@ -21,7 +21,8 @@ the wrong place, and starting anyway would leave it there.
 Where each value lives
 ----------------------
 ``config.json`` (``matrix``)   ``name``, ``homeserver``, ``server_name``,
-                               ``room_id``, ``control_url``,
+                               ``url``, ``control_url``, ``bind_address``,
+                               ``bind_port``, ``room_id``,
                                ``authenticated_media``, ``allow``,
                                ``poll_seconds``, ``remind_seconds``
 environment                    the three secrets above
@@ -32,6 +33,13 @@ open a connection without a URL, and D2's sender MXID ``@lmer-<name>:<server>``
 cannot be spelled without a server name. ``server_name`` defaults to the
 homeserver URL's host, which is the common case and wrong only under
 well-known delegation — where the operator sets it.
+
+``url``, ``bind_address`` and ``bind_port`` arrived with the ``register`` verb
+for the same reason: an appservice registration is a *homeserver* telling
+itself where to push transactions, so the registration cannot be emitted
+without the address the homeserver will use, and the bridge cannot listen
+without one to bind. ``url`` is required only by ``register`` and ``run``;
+``check`` reports its absence rather than refusing over it.
 """
 from __future__ import annotations
 
@@ -70,6 +78,14 @@ ENV_RECOVERY_KEY = "LMER_MATRIX_RECOVERY_KEY"
 #: is a reminder a human does not resent.
 DEFAULT_POLL_SECONDS = 15
 DEFAULT_REMIND_SECONDS = 1800
+
+#: Where the appservice listens for the homeserver's transactions. Loopback by
+#: default because the homeserver reaches it through whatever the operator put
+#: in ``url`` — a reverse proxy, an SSH tunnel — and a bridge holding the
+#: fleet's answer routes should not be the thing that decides to listen on
+#: every interface.
+DEFAULT_BIND_ADDRESS = "127.0.0.1"
+DEFAULT_BIND_PORT = 29331
 
 #: ``@localpart:server`` — the shape, not the existence. The homeserver decides
 #: whether an MXID exists; this decides whether the operator wrote one at all.
@@ -112,12 +128,17 @@ class MatrixConfig:
     server_name: str
     allow: Mapping[str, frozenset]
     room_id: Optional[str] = None
+    #: Where the *homeserver* reaches this bridge. Goes into the registration
+    #: verbatim; ``None`` until an operator has decided how it is reached.
+    url: Optional[str] = None
     #: Where a **person in the room** reaches the control UI. Configured rather
     #: than derived, because everything the bridge otherwise knows is a bind
     #: pair — ``http://127.0.0.1:8765`` is where the daemon listens, not a link
     #: anyone can open from a phone. Unset means the messages carry no link at
     #: all, which is honest; a loopback URL in a chat room is not (!244 review).
     control_url: Optional[str] = None
+    bind_address: str = DEFAULT_BIND_ADDRESS
+    bind_port: int = DEFAULT_BIND_PORT
     #: The operator asserting that ``matrix_enable_authenticated_media`` is on
     #: at the homeserver — the same change that installs the registration.
     #:
@@ -211,16 +232,33 @@ def load(stored: Optional[Mapping[str, Any]] = None) -> MatrixConfig:
                 f"(an alias is not one), got {room_id!r}"
             )
 
+    url = _optional_url(stored, "url", "the homeserver pushes transactions to")
+    control_url = _optional_url(
+        stored, "control_url", "a person in the room opens to see the fleet",
+    )
+
+    bind_address = stored.get("bind_address", DEFAULT_BIND_ADDRESS)
+    if not isinstance(bind_address, str) or not bind_address.strip():
+        raise MatrixConfigError("`matrix.bind_address` must be a non-empty string")
+
+    bind_port = stored.get("bind_port", DEFAULT_BIND_PORT)
+    if isinstance(bind_port, bool) or not isinstance(bind_port, int) \
+            or not 1 <= bind_port <= 65535:
+        raise MatrixConfigError(
+            f"`matrix.bind_port` must be a port between 1 and 65535, got "
+            f"{bind_port!r}"
+        )
+
     return MatrixConfig(
         name=name,
         homeserver=homeserver.rstrip("/"),
         server_name=server_name.strip(),
         allow=parse_allow(stored.get("allow")),
         room_id=room_id,
-        control_url=_optional_url(
-            stored, "control_url",
-            "a person in the room opens to see the fleet",
-        ),
+        url=url,
+        control_url=control_url,
+        bind_address=bind_address.strip(),
+        bind_port=bind_port,
         authenticated_media=_require_bool(stored, "authenticated_media"),
         poll_seconds=_require_positive_int(stored, "poll_seconds",
                                            DEFAULT_POLL_SECONDS),

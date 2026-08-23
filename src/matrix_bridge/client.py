@@ -14,7 +14,7 @@ believing.
 store — sits behind :class:`Homeserver`, a protocol with nine methods. The
 library is imported inside :class:`MautrixHomeserver`, never at module scope, so
 importing this module costs nothing and works anywhere. That adapter is first
-exercised for real against charasis in T9; everything above it is exercised now.
+exercised against a real homeserver in T9; everything above it is exercised now.
 
 The three rules this file exists to keep
 ----------------------------------------
@@ -43,6 +43,7 @@ messages.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -252,6 +253,15 @@ class Homeserver:
         """``True``/``False``/``None`` — on, off, or could not be confirmed."""
         raise NotImplementedError
 
+    async def whoami(self) -> str:
+        """The MXID the homeserver says this appservice is.
+
+        The single most likely cause of a quiet room — a registration that was
+        never installed, or an ``as_token`` that does not match — and one
+        authenticated read with no side effects (!245 review).
+        """
+        raise NotImplementedError
+
     async def send_text(
         self, room_id: str, text: str, *, thread_root: Optional[str] = None,
     ) -> str:
@@ -265,6 +275,26 @@ class Homeserver:
 
     def on_event(self, callback: Callable[[Any], Any]) -> None:
         """Deliver inbound room events to *callback*."""
+        raise NotImplementedError
+
+    async def listen(self, host: str, port: int) -> None:
+        """Start the appservice's HTTP server and return.
+
+        The homeserver **pushes** to an appservice; without this there is no
+        inbound path at all, and `run` would sit in its poll loop looking
+        healthy while every reply in the room went nowhere (!245 review).
+
+        Separate from :meth:`serve_forever` because of *when* it has to happen:
+        ``mautrix``' ``AppService.intent`` raises ``AttributeError`` until
+        ``start()`` has run, so every outbound call — including the first one
+        ``MatrixClient.start`` makes — is downstream of this. A listener started
+        inside the same ``gather`` as the poll loop is started too late to be
+        reached at all (!245 review, iteration 2).
+        """
+        raise NotImplementedError
+
+    async def serve_forever(self) -> None:
+        """Keep the listener up until cancelled, then shut it down."""
         raise NotImplementedError
 
 
@@ -292,6 +322,22 @@ class MatrixClient:
     @property
     def store_path(self) -> Path:
         return self.config.state_dir / CRYPTO_DIRNAME / STORE_FILENAME
+
+    async def listen(self, host: str, port: int) -> None:
+        """Start the inbound listener. Runs **before** :meth:`start`.
+
+        Order is the whole point (!245 review, iteration 2): the transport's
+        outbound client used to come from the appservice, which does not exist
+        until its web server is up — so a listener started after the first
+        homeserver call could never be reached. The transport no longer couples
+        the two, and this method keeps the order explicit at the call site
+        rather than implicit in a ``gather``.
+        """
+        await self.homeserver.listen(host, port)
+
+    async def serve_forever(self) -> None:
+        """Keep the listener up until cancelled."""
+        await self.homeserver.serve_forever()
 
     async def start(self) -> None:
         """Open the crypto store, then the room. Refuses rather than degrades."""
@@ -449,6 +495,8 @@ class MatrixClient:
     def on_event(self, callback: Callable[[Any], Any]) -> None:
         self.homeserver.on_event(callback)
 
+
+
     async def _send(
         self, room_id: str, text: str, *, thread_root: Optional[str],
     ) -> str:
@@ -493,6 +541,8 @@ class MautrixHomeserver(Homeserver):
         self.config = config
         self._secrets = secrets
         self._as = None
+        self._client = None
+        self._listening = False
         self._crypto = None
         self._crypto_client = None
         self._database = None
@@ -648,6 +698,12 @@ class MautrixHomeserver(Homeserver):
         """
         return self.config.authenticated_media
 
+    async def whoami(self) -> str:
+        response = await self._appservice_client().api.request(
+            "GET", "/_matrix/client/v3/account/whoami",
+        )
+        return (response or {}).get("user_id") or ""
+
     async def send_text(
         self, room_id: str, text: str, *, thread_root: Optional[str] = None,
     ) -> str:
@@ -679,6 +735,18 @@ class MautrixHomeserver(Homeserver):
         if thread_root:
             content.set_thread_parent(thread_root)
         return await self._send_encrypted(room_id, content)
+
+    async def listen(self, host: str, port: int) -> None:
+        await self._appservice().start(host, port)
+        self._listening = True
+        logger.info("matrix_appservice_listening host=%s port=%s", host, port)
+
+    async def serve_forever(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if self._listening:
+                await self._appservice().stop()
 
     def on_event(self, callback: Callable[[Any], Any]) -> None:
         """Deliver every room event the homeserver pushes to *callback*.
@@ -847,12 +915,52 @@ class MautrixHomeserver(Homeserver):
                 hs_token=self._secrets.hs_token,
                 bot_localpart=f"lmer-{self.config.name}",
                 id=f"lmer-{self.config.name}",
+                # Both default to False, and both are the *service* side of an
+                # opt-in whose other half is in the registration and the
+                # homeserver's config (!245 review). Without `ephemeral_events`
+                # mautrix drops the to-device messages MSC2409 delivers — the
+                # room keys — and without `encryption_events` it drops the OTK
+                # counts and device lists MSC3202 puts on each transaction, so
+                # the three handlers wired in `open_store` would never be
+                # called. Three places have to agree or none of it works.
+                ephemeral_events=True,
+                encryption_events=True,
             )
         return self._as
 
     def _appservice_client(self):
-        """The sender's intent: every room call the bridge makes as itself."""
-        return self._appservice().intent
+        """The sender's intent: every room call the bridge makes as itself.
+
+        Built here rather than taken from ``AppService.intent``, which raises
+        ``AttributeError("the intent attribute can only be used after
+        starting")`` until the web server is up. That coupling is what made the
+        listener fix unreachable — ``MatrixClient.start`` calls the homeserver
+        before any listener could exist — and it would have made
+        ``lmer-matrix-bridge check`` impossible to write at all, since a
+        diagnostic must not bind the port a running bridge is already on.
+
+        This is the same object ``AppService.start`` constructs
+        (``AppServiceAPI(...).bot_intent()``, appservice.py:163-171), with the
+        same token and state store; the appservice is left to do what only it
+        can, which is receive.
+        """
+        from mautrix.appservice import AppServiceAPI
+
+        if self._client is None:
+            appservice = self._appservice()
+            self._client = AppServiceAPI(
+                base_url=self.config.homeserver,
+                bot_mxid=self.config.sender,
+                token=self._secrets.as_token,
+                # Not optional despite the signature's default: the constructor
+                # calls `log.getChild(...)` unconditionally. Passing the
+                # appservice's own logger also keeps both clients' output under
+                # one name.
+                log=appservice.log,
+                state_store=appservice.state_store,
+                bridge_name=appservice.bridge_name,
+            ).bot_intent()
+        return self._client
 
 def connect(config: MatrixConfig, secrets: Secrets) -> MatrixClient:
     """A client wired to the real homeserver. The only construction path."""

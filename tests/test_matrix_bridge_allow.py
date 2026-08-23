@@ -71,7 +71,7 @@ def test_an_empty_allowlist_permits_nothing():
 
 
 @pytest.mark.parametrize("mxid", [
-    "alice", "@alice", "ALICE:matrix.example.net", "@Alice:matrix.example.net",
+    "bridge-a", "@bridge-a", "ALICE:matrix.example.net", "@Alice:matrix.example.net",
     "@alice:matrix.example.net ", " @alice:matrix.example.net",
 ])
 def test_a_near_miss_is_not_a_match(mxid):

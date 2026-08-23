@@ -42,6 +42,8 @@ class FakeHomeserver(Homeserver):
     encrypted: bool = True
     #: Tri-state, exactly as the real one: on, off, or could not be confirmed.
     authenticated_media_flag: Optional[bool] = True
+    #: What the homeserver says this appservice's token belongs to.
+    whoami_as: str = ""
     backup: Optional[bytes] = None
     #: Set to raise from :meth:`open_store`, for the unreadable-store cases.
     open_store_error: Optional[Exception] = None
@@ -67,6 +69,12 @@ class FakeHomeserver(Homeserver):
     opened: list = field(default_factory=list)
     backups_written: int = 0
     callback: Optional[Callable[[Any], Any]] = None
+    #: ``(host, port)`` once :meth:`listen` has been awaited — the fact that
+    #: proves the bridge is listening at all (!245 review).
+    listening: Optional[tuple] = None
+    #: Refuse every homeserver call until :meth:`listen` has run, the way
+    #: ``mautrix``' ``AppService.intent`` does. See :meth:`_require_listener`.
+    requires_listener: bool = False
     _event_serial: int = 0
 
     # --- the store ------------------------------------------------------------
@@ -77,6 +85,7 @@ class FakeHomeserver(Homeserver):
         self.opened.append({"path": path, "restore": restore})
 
     async def has_backup(self) -> bool:
+        self._require_listener()
         if self.backup_error is not None:
             raise self.backup_error
         return self.backup is not None
@@ -99,10 +108,12 @@ class FakeHomeserver(Homeserver):
     # --- the room -------------------------------------------------------------
 
     async def create_room(self, *, invite: Sequence[str]) -> str:
+        self._require_listener()
         self.created.append(list(invite))
         return self.room_id
 
     async def join_room(self, room_id: str) -> None:
+        self._require_listener()
         self.joined.append(room_id)
 
     async def room_is_encrypted(self, room_id: str) -> bool:
@@ -110,6 +121,10 @@ class FakeHomeserver(Homeserver):
 
     async def authenticated_media(self) -> Optional[bool]:
         return self.authenticated_media_flag
+
+    async def whoami(self) -> str:
+        self._require_listener()
+        return self.whoami_as
 
     # --- sending --------------------------------------------------------------
 
@@ -140,6 +155,30 @@ class FakeHomeserver(Homeserver):
 
     def on_event(self, callback: Callable[[Any], Any]) -> None:
         self.callback = callback
+
+    async def listen(self, host: str, port: int) -> None:
+        """Record the bind, the way the real listener does."""
+        self.listening = (host, port)
+
+    async def serve_forever(self) -> None:
+        import asyncio
+
+        await asyncio.Event().wait()
+
+    def _require_listener(self) -> None:
+        """Raise the way ``AppService.intent`` does before ``start()``.
+
+        Off by default because the tests above the seam are about
+        :class:`MatrixClient`'s decisions, where the listener is irrelevant.
+        The end-to-end ordering test turns it on, because ordering is the one
+        thing a fake that never complains cannot catch — and not catching it is
+        exactly how a listener started after the first homeserver call shipped
+        twice (!245 review).
+        """
+        if self.requires_listener and self.listening is None:
+            raise AttributeError(
+                "the intent attribute can only be used after starting"
+            )
 
     async def deliver(self, event: Any) -> Any:
         """Push *event* at whoever registered, the way the homeserver would.
