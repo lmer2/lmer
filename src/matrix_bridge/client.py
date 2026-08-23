@@ -231,6 +231,78 @@ class Homeserver:
         """Open the crypto store at *path*, restoring from backup first."""
         raise NotImplementedError
 
+    async def open_database(self, path: Path):
+        """The store's database, its crypto store and its state store.
+
+        Split out of :meth:`open_store` so it can be exercised without a
+        homeserver — everything after it in that method is network (device
+        creation, key sharing). The first real deployment failed *here* while
+        looking healthy everywhere else, so this is the part that needs a test
+        driving the real thing rather than a fake.
+
+        **Two upgrade tables, on one database.** ``Database.start()`` runs only
+        the one it was created with — the crypto tables. The state store under
+        ``PgCryptoStateStore`` is the *client* state store, whose
+        ``mx_room_state`` / ``mx_user_profile`` come from a different table, so
+        without the second call nothing creates them: every send then fails in
+        member lookup with ``no such table: mx_room_state``, surfacing as
+        ``EncryptionError: No group session created``. They coexist on one file
+        because their version tables differ (``crypto_version``, ``mx_version``).
+        """
+        from mautrix.client.state_store.asyncpg import upgrade as client_upgrade
+        from mautrix.crypto import PgCryptoStore
+        from mautrix.util.async_db import Database
+
+        database = Database.create(
+            f"sqlite:///{path}", upgrade_table=PgCryptoStore.upgrade_table,
+        )
+        await database.start()
+        await client_upgrade.upgrade_table.upgrade(database)
+
+        store = PgCryptoStore("", _PICKLE_KEY, database)
+        await store.open()
+        state_store = _state_store_class()(database)
+        self._state_store = state_store
+        return database, store, state_store
+
+    def _adopt_state_store(self, state_store) -> None:
+        """Point an already-built appservice at the real store — *and its handler*.
+
+        Reassigning ``az.state_store`` is not enough (!246 review): the
+        constructor registers ``self.state_store.update_state`` as an event
+        handler (``appservice.py:130``), and that is a **bound method of the
+        object it was constructed with**. Leave it and inbound membership
+        updates keep landing in the placeholder store while the crypto machine
+        reads the database one — the two disagreeing about who is in the room,
+        which is exactly what decides whether a group session is shared with
+        the right devices.
+
+        So the old handler is dropped and the new store's registered in its
+        place.
+        """
+        if self._as is None:
+            return
+        previous = self._as.state_store
+        self._as.state_store = state_store
+        self._as.event_handlers = [
+            handler for handler in self._as.event_handlers
+            if getattr(handler, "__self__", None) is not previous
+        ]
+        self._as.matrix_event_handler(state_store.update_state)
+
+    async def _reset_outbound_client(self) -> None:
+        """Drop the outbound client so the next call rebuilds it — closing its
+        session first.
+
+        Dropping the reference alone orphans the ``aiohttp`` session it was
+        built with (!246 review): a leak introduced by the commit that fixed a
+        different leak. The session is ours precisely so it can be closed.
+        """
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+        self._client = None
+
     async def has_backup(self) -> bool:
         """Is there an encrypted store export to restore from?"""
         raise NotImplementedError
@@ -276,6 +348,9 @@ class Homeserver:
     def on_event(self, callback: Callable[[Any], Any]) -> None:
         """Deliver inbound room events to *callback*."""
         raise NotImplementedError
+
+    async def aclose(self) -> None:
+        """Release anything this transport opened. Safe to call twice."""
 
     async def listen(self, host: str, port: int) -> None:
         """Start the appservice's HTTP server and return.
@@ -338,6 +413,10 @@ class MatrixClient:
     async def serve_forever(self) -> None:
         """Keep the listener up until cancelled."""
         await self.homeserver.serve_forever()
+
+    async def aclose(self) -> None:
+        """Release what the transport opened."""
+        await self.homeserver.aclose()
 
     async def start(self) -> None:
         """Open the crypto store, then the room. Refuses rather than degrades."""
@@ -525,6 +604,29 @@ def _record_room_id(room_id: str) -> None:
     platform_config.update_stored({"matrix": stored})
 
 
+def _state_store_class():
+    """One store serving both roles the bridge needs, over one database.
+
+    ``AppService`` wants an ``ASStateStore`` (membership, power levels) and
+    ``OlmMachine`` wants a crypto ``StateStore`` (is this room encrypted, which
+    rooms are shared). Both are backed by the *same* ``mx_room_state`` /
+    ``mx_user_profile`` tables, so one object can be both — which is what stops
+    the appservice falling back to a ``FileStateStore`` at a relative path,
+    unwritable in the image's working directory (found on the first real
+    deployment).
+
+    Built here rather than at module scope because the base classes come from
+    ``mautrix``, which this module never imports at import time.
+    """
+    from mautrix.appservice.state_store.asyncpg import PgASStateStore
+    from mautrix.crypto import PgCryptoStateStore
+
+    class BridgeStateStore(PgASStateStore, PgCryptoStateStore):
+        pass
+
+    return BridgeStateStore
+
+
 class MautrixHomeserver(Homeserver):
     """:class:`Homeserver` over ``mautrix-python``'s appservice and crypto.
 
@@ -542,6 +644,8 @@ class MautrixHomeserver(Homeserver):
         self._secrets = secrets
         self._as = None
         self._client = None
+        self._session = None
+        self._state_store = None
         self._listening = False
         self._crypto = None
         self._crypto_client = None
@@ -561,21 +665,19 @@ class MautrixHomeserver(Homeserver):
         device the homeserver does not know about.
         """
         from mautrix.client import Client
-        from mautrix.crypto import OlmMachine, PgCryptoStateStore, PgCryptoStore
+        from mautrix.crypto import OlmMachine
         from mautrix.types import TrustState
-        from mautrix.util.async_db import Database
 
         path.parent.mkdir(parents=True, exist_ok=True)
         if restore:
             await self._restore(path)
 
-        database = Database.create(
-            f"sqlite:///{path}", upgrade_table=PgCryptoStore.upgrade_table,
-        )
-        await database.start()
-        store = PgCryptoStore("", _PICKLE_KEY, database)
-        await store.open()
-        state_store = PgCryptoStateStore(database)
+        database, store, state_store = await self.open_database(path)
+        # Order-independence, deliberately: whichever of `listen()` and
+        # `open_store()` ran first, both the appservice and the outbound client
+        # must end up on *this* store rather than on the placeholder one.
+        self._adopt_state_store(state_store)
+        await self._reset_outbound_client()
 
         appservice = self._appservice()
         client = Client(
@@ -747,6 +849,20 @@ class MautrixHomeserver(Homeserver):
         finally:
             if self._listening:
                 await self._appservice().stop()
+            await self.aclose()
+
+    async def aclose(self) -> None:
+        """Release what this transport opened: the HTTP session, the database.
+
+        Called on the way out of ``serve_forever`` and by the CLI's short-lived
+        verbs. Without it every ``check`` exited with aiohttp's "Unclosed client
+        session" warning — harmless, and exactly the kind of noise that trains
+        an operator to ignore a diagnostic's output.
+        """
+        await self._reset_outbound_client()
+        if self._database is not None:
+            await self._database.stop()
+            self._database = None
 
     def on_event(self, callback: Callable[[Any], Any]) -> None:
         """Deliver every room event the homeserver pushes to *callback*.
@@ -909,6 +1025,7 @@ class MautrixHomeserver(Homeserver):
 
         if self._as is None:
             self._as = AppService(
+                state_store=self._appservice_state_store(),
                 server=self.config.homeserver,
                 domain=self.config.server_name,
                 as_token=self._secrets.as_token,
@@ -928,6 +1045,30 @@ class MautrixHomeserver(Homeserver):
             )
         return self._as
 
+    def _appservice_state_store(self):
+        """The shared store once the crypto store is open; memory before it.
+
+        Never mautrix's default, which is a ``FileStateStore`` at the *relative*
+        path ``mx-state.json`` — unwritable in the image's working directory,
+        and wrong even where it is writable, since it would be a second copy of
+        state the database already holds. An in-memory store is the honest
+        placeholder for the one verb that runs without a database
+        (``check``, which must not create one).
+        """
+        if self._state_store is not None:
+            return self._state_store
+
+        from mautrix.appservice.state_store import ASStateStore
+        from mautrix.client.state_store import MemoryStateStore
+
+        # Composed rather than imported: `ASStateStore` is abstract and mautrix
+        # ships no in-memory concrete pairing of the two — `FileASStateStore` is
+        # the file-backed one this exists to avoid.
+        class MemoryASStateStore(MemoryStateStore, ASStateStore):
+            pass
+
+        return MemoryASStateStore()
+
     def _appservice_client(self):
         """The sender's intent: every room call the bridge makes as itself.
 
@@ -944,14 +1085,20 @@ class MautrixHomeserver(Homeserver):
         same token and state store; the appservice is left to do what only it
         can, which is receive.
         """
+        import aiohttp
         from mautrix.appservice import AppServiceAPI
 
         if self._client is None:
             appservice = self._appservice()
+            self._session = aiohttp.ClientSession()
             self._client = AppServiceAPI(
                 base_url=self.config.homeserver,
                 bot_mxid=self.config.sender,
                 token=self._secrets.as_token,
+                # Ours, so it can be closed. Left to `AppServiceAPI` it makes
+                # its own and nothing ever closes it, which `check` reported as
+                # an "Unclosed client session" warning on every exit.
+                client_session=self._session,
                 # Not optional despite the signature's default: the constructor
                 # calls `log.getChild(...)` unconditionally. Passing the
                 # appservice's own logger also keeps both clients' output under

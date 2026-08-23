@@ -1,0 +1,133 @@
+# The lmer Matrix bridge as a container image (#327).
+#
+# A third artifact of this repository, beside Containerfile (the *session* image
+# agents work in) and Dockerfile.platform (the control plane). This one runs one
+# process — `lmer-matrix-bridge run` — which is a plain network service: it
+# accepts appservice transactions from a homeserver over HTTP and calls the lmer
+# platform daemon's API over HTTP. It needs no container runtime, no git, no
+# harness CLIs and no browser.
+#
+#   podman build -f Dockerfile.matrix-bridge -t lmer-matrix-bridge:dev \
+#       --build-arg BUILD_UID="$(id -u)" --build-arg BUILD_GID="$(id -g)" \
+#       --build-arg LMER_BUILD_COMMIT="$(git rev-parse HEAD)" .
+#
+# This is how the bridge is deployed. Spec D1 originally said host-side; it was
+# amended by operator decision on 2026-08-23 — the bridge runs in a container and
+# host-side is ruled out.
+#
+# D1's original reasoning was reachability — a container talking to its host's
+# loopback — and that half has an answer this image uses (see the platform URL
+# note below). The platform daemon keeps its own host install because it starts
+# podman session containers itself; nothing here does.
+#
+# What the decision did not settle is the credential note below: it is about
+# *what* the bridge is given, not *where* it runs, and it is still open.
+#
+# What it needs at run time, and why each one:
+#
+#   ~/.lmer/platform/             read-write, the DIRECTORY rather than
+#                                  individual files. The bridge reads `matrix.*`
+#                                  from config.json and D5 has it write
+#                                  `matrix.room_id` back; that write is a temp
+#                                  file plus a rename, which a file bind-mount
+#                                  breaks. Its own state — the crypto store (D7)
+#                                  and the thread map (D5) — lives under
+#                                  `matrix/` and must survive a restart.
+#
+#                                  Mounting the directory hands the container
+#                                  everything else in it too: `secret` and
+#                                  `assistant-credential`, `assistant.env`,
+#                                  `sessions/` (every session's PTY scrollback),
+#                                  `logs/`, the work-repo mirror and the fleet
+#                                  snapshots. That is the mount's real scope and
+#                                  it bounds what any better credential could
+#                                  buy.
+#   LMER_MATRIX_AS_TOKEN           the three secrets, environment-only by design
+#   LMER_MATRIX_HS_TOKEN           (matrix_bridge.config), so a unit injects them
+#   LMER_MATRIX_RECOVERY_KEY       from an env-file rather than a login shell.
+#   LMER_PLATFORM_URL              where the *daemon* is, from in here. Its own
+#   LMER_PLATFORM_SECRET           bind pair is this container's loopback and not
+#                                  a route. There is no CLI verb that prints the
+#                                  right URL (`lmer platform doctor` does not
+#                                  exist — the verbs are run/status/secret/
+#                                  rescan/runs/adopt/forget/setup-ui/spawn/
+#                                  resume): a routable bind address is used
+#                                  as-is, and on podman it is
+#                                  http://host.containers.internal:<bind_port>
+#                                  (`config.container_base_url`, rules 2 and 4).
+#                                  LMER_PLATFORM_CONTAINER_URL overrides it.
+#
+#                                  READ BEFORE DEPLOYING: the credential here is
+#                                  the platform's SHARED secret. It arrives as
+#                                  CALLER_OPERATOR — indistinguishable from the
+#                                  human — and stays valid until the secret is
+#                                  rotated by hand. It is NOT what lmer gives a
+#                                  session container: workers get no credential
+#                                  at all, and the assistant gets a minted,
+#                                  per-incarnation, revocable one (#244). That
+#                                  trade is the operator's to weigh and has not
+#                                  been decided.
+#
+# The listener binds `matrix.bind_address` — inside a container that has to be
+# 0.0.0.0, since the container's loopback reaches nothing else — and the
+# registration's `url` is the address the *homeserver* reaches this container
+# on, which for a published port is the host's address. `lmer-matrix-bridge
+# check` reports that pair as its `reachability` line.
+
+FROM python:3.12-slim
+
+LABEL org.opencontainers.image.title="lmer-matrix-bridge"
+LABEL org.opencontainers.image.description="lmer Matrix bridge — one platform daemon in a Matrix room"
+
+# ca-certificates: every outbound call is HTTPS to a homeserver.
+#
+# No compiler: `mautrix[encryption]` pulls python-olm, which ships manylinux
+# wheels with libolm vendored for CPython on x86_64 and aarch64. On anything
+# else pip would build it from the sdist (which vendors libolm's sources and
+# needs gcc/g++/make), and the build fails here rather than shipping a toolchain
+# nothing else uses.
+#
+# THE ARCHITECTURE THIS IMAGE IS ACTUALLY BUILT FOR IS ONE, NOT TWO. The two
+# above are the architectures the *dependency* supports; the CI job runs a plain
+# `docker build` with no buildx and no `--platform`, on an x86_64 runner, so the
+# published tag carries an x86_64 manifest only — as do this repository's other
+# two images, which build the same way. On an arm64 deployment host `podman
+# pull` then fails with no matching manifest, at first start, after everything
+# else is configured. Nothing here is wrong for an x86_64 deployment; it is
+# written down so the claim above and the build agree, or the gap is explicit
+# (!246 review).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Same reason the other two images take these: the platform state dir is
+# bind-mounted from the host, so the user inside has to own the files outside.
+ARG BUILD_UID=1000
+ARG BUILD_GID=1000
+RUN groupadd -g "$BUILD_GID" bridge && \
+    useradd -m -s /bin/bash -u "$BUILD_UID" -g "$BUILD_GID" bridge
+
+# Installed with the `matrix` extra, which is where the bridge's dependencies
+# live (they are optional for everyone else — see pyproject.toml). Not editable
+# and not mounted: this image *is* the deployment artifact.
+WORKDIR /opt/lmer
+COPY pyproject.toml README.md LICENSE ./
+COPY src/ ./src/
+RUN pip install --no-cache-dir '.[matrix]'
+
+# Provenance, after the heavy layers so a changing commit does not bust them.
+ARG LMER_BUILD_COMMIT=unknown
+ENV LMER_BUILD_COMMIT=${LMER_BUILD_COMMIT}
+RUN printf '%s\n' "${LMER_BUILD_COMMIT}" > /opt/lmer/BUILD_INFO
+
+USER bridge
+
+# Documentation only, as EXPOSE always is: the port the bridge listens on is
+# `matrix.bind_port` in config.json, and the unit publishes whatever that is.
+EXPOSE 29331
+
+# `run`, not a shell. `check` and `register` are the other two verbs and are run
+# with `podman run --rm … lmer-matrix-bridge check`.
+ENTRYPOINT ["lmer-matrix-bridge"]
+CMD ["run"]

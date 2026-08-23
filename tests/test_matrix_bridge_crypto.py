@@ -340,3 +340,78 @@ async def test_an_empty_export_never_replaces_a_backup(client, homeserver):
     await client.open_store()
     assert homeserver.backup == b"a good export"
     assert homeserver.backups_written == 0, "nothing was written at all"
+
+
+# --- the store the transport actually builds ---------------------------------
+
+async def test_the_opened_store_has_the_tables_every_send_needs(tmp_path):
+    """The defect the first real deployment found, driven against the real
+    library rather than a fake.
+
+    ``Database.start()`` runs only the upgrade table it was created with — the
+    crypto one. The state store underneath ``PgCryptoStateStore`` is the
+    *client* state store, whose ``mx_room_state`` / ``mx_user_profile`` come
+    from a different table, so nothing created them: every send then failed in
+    member lookup with ``no such table: mx_room_state``, surfacing as
+    ``EncryptionError: No group session created`` and announcing nothing.
+
+    The room was created and ``room_id`` was written back before that happened,
+    so the failure looked like a working deployment that had gone mute — which
+    is why this test drives the store rather than asserting on the source.
+    """
+    pytest.importorskip("mautrix")
+
+    # The transport's own method, not a re-creation of it: a test that built
+    # its own database would pin the technique and pass with the fix removed.
+    homeserver = mxclient.MautrixHomeserver(
+        mxcfg.load(STORED),
+        mxcfg.Secrets(as_token="as", hs_token="hs", recovery_key="rk"),
+    )
+    database, _store, state_store = await homeserver.open_database(
+        tmp_path / "store.db"
+    )
+    try:
+
+        # The three calls a send makes, in the order it makes them. Each one is
+        # a table that has to exist.
+        assert await state_store.is_encrypted("!room:matrix.example.net") in (
+            None, False, True,
+        )
+        assert await state_store.find_shared_rooms("@alice:matrix.example.net") == []
+        assert await state_store.get_members("!room:matrix.example.net") == []
+
+        tables = {
+            row["name"] for row in await database.fetch(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        assert {"mx_room_state", "mx_user_profile"} <= tables, sorted(tables)
+        assert {"crypto_account", "crypto_megolm_outbound_session"} <= tables
+    finally:
+        await database.stop()
+
+
+async def test_one_store_serves_the_appservice_and_the_crypto_machine(tmp_path):
+    """The second half of the same deployment report: with no ``state_store``,
+    ``AppService`` falls back to a ``FileStateStore`` at the *relative* path
+    ``mx-state.json`` — unwritable in the image's working directory, and a
+    second copy of state the database already holds even where it is writable.
+    """
+    pytest.importorskip("mautrix")
+    from mautrix.appservice.state_store import ASStateStore
+    from mautrix.crypto import StateStore as CryptoStateStore
+
+    store_class = mxclient._state_store_class()
+    assert issubclass(store_class, ASStateStore), "the appservice's interface"
+    assert issubclass(store_class, CryptoStateStore), "the crypto machine's"
+
+
+def test_the_transport_never_leaves_the_appservice_on_a_file_state_store():
+    """A source-level pin for the branch a test cannot reach without a
+    homeserver: the appservice is always constructed with a state store of our
+    choosing, never mautrix's default.
+    """
+    import inspect
+
+    source = inspect.getsource(mxclient.MautrixHomeserver._appservice)
+    assert "state_store=self._appservice_state_store()" in source

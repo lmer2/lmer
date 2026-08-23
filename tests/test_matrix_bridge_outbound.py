@@ -19,7 +19,7 @@ import json
 
 import pytest
 
-from lmer_platform.client import Endpoint
+from lmer_platform.client import Endpoint, PlatformError
 from lmer_platform import store
 from matrix_bridge import config as mxcfg
 from matrix_bridge import outbound as mxout
@@ -455,9 +455,11 @@ async def test_the_credential_is_a_header_on_the_state_call(
 
 # --- where the endpoint comes from -------------------------------------------
 
-def test_the_endpoint_is_the_local_daemon(platform_root, monkeypatch):
-    """Not the container pair ``lmer-ctl`` reads: the bridge is host-side, and
-    the credential comes off the daemon's own file (D1)."""
+def test_the_endpoint_is_the_local_daemon_when_nothing_says_otherwise(
+    platform_root, monkeypatch,
+):
+    """The host install: the daemon's own state directory answers both
+    questions and the credential never leaves the filesystem."""
     from lmer_platform import config as platform_config
 
     secret = platform_config.ensure_secret(platform_config.load())
@@ -466,11 +468,70 @@ def test_the_endpoint_is_the_local_daemon(platform_root, monkeypatch):
     assert endpoint.base_url == platform_config.load().base_url
 
 
-def test_a_missing_credential_is_named_not_guessed(platform_root):
-    from lmer_platform.client import PlatformError
+def test_the_environment_pair_wins_for_a_containerised_bridge(
+    platform_root, monkeypatch,
+):
+    """Inside a container the daemon's bind pair is *this container's* loopback
+    and not a route to anything, so the operator's pair has to win.
 
-    with pytest.raises(PlatformError, match="no platform credential"):
+    Note what the pair is and is not: worker sessions get no credential at all,
+    and the assistant — the one container that does — gets a minted
+    per-incarnation credential (#244), not this shared secret. See
+    ``platform_endpoint``'s docstring; the trade is the operator's to weigh and
+    has not been decided."""
+    from lmer_platform import config as platform_config
+    from lmer_platform import ctl
+
+    platform_config.ensure_secret(platform_config.load())
+    monkeypatch.setenv(ctl.ENV_PLATFORM_URL, "http://10.0.0.5:8765")
+    monkeypatch.setenv(ctl.ENV_PLATFORM_CREDENTIAL, "the-daemons-secret")
+
+    endpoint = mxout.platform_endpoint()
+
+    assert endpoint.base_url == "http://10.0.0.5:8765"
+    assert endpoint.credential == "the-daemons-secret", (
+        "the file is not consulted, so it need not be mounted"
+    )
+
+
+@pytest.mark.parametrize("present, missing", [
+    ("ENV_PLATFORM_URL", "ENV_PLATFORM_CREDENTIAL"),
+    ("ENV_PLATFORM_CREDENTIAL", "ENV_PLATFORM_URL"),
+])
+def test_half_the_pair_is_refused_rather_than_ignored(
+    platform_root, monkeypatch, present, missing,
+):
+    """!246 review: swallowing ``CtlError`` collapsed "neither set" and "exactly
+    one set" into the same fallback, so a bridge given a URL and no credential
+    quietly talked to a *different* daemon than the operator named. The pair is
+    all-or-nothing by ctl's own reasoning — a URL with no credential is a 401
+    machine, a credential with no URL has nothing to spend itself on."""
+    from lmer_platform import config as platform_config
+    from lmer_platform import ctl
+
+    platform_config.ensure_secret(platform_config.load())
+    monkeypatch.setenv(getattr(ctl, present), "value")
+    monkeypatch.delenv(getattr(ctl, missing), raising=False)
+
+    with pytest.raises(PlatformError) as excinfo:
         mxout.platform_endpoint()
+
+    message = str(excinfo.value)
+    assert getattr(ctl, missing) in message
+    assert getattr(ctl, present) in message
+
+
+def test_neither_source_is_a_refusal_naming_both(platform_root):
+    from lmer_platform import ctl
+
+    with pytest.raises(PlatformError) as excinfo:
+        mxout.platform_endpoint()
+    message = str(excinfo.value)
+    assert ctl.ENV_PLATFORM_URL in message
+    assert "secret" in message
+
+
+
 
 
 # --- what a failed send must not do ------------------------------------------

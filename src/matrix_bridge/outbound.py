@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Optional
@@ -214,21 +215,71 @@ def compose(transition: Transition, *, control_url: Optional[str]) -> str:
 
 
 def platform_endpoint() -> Endpoint:
-    """The local daemon, from its own state directory.
+    """Where the daemon is: the environment pair if it is set, else the local file.
 
-    Not :func:`lmer_platform.ctl.resolve_endpoint`: that reads the pair the host
-    writes *into a container*, and the bridge is host-side (D1). The credential
-    is read from the file and goes straight into a header — it is never an
-    argument, an environment variable of this process, or part of a URL.
+    Two shapes, because the bridge now ships both ways (D1, amended):
+
+    **Containerised** — the operator exports ``LMER_PLATFORM_URL`` and
+    ``LMER_PLATFORM_SECRET``, **both or neither**, the pair :func:`lmer_platform.ctl.resolve_endpoint`
+    reads. The URL half is not an optimisation: the daemon's own ``base_url`` is
+    its bind pair, and inside a container ``127.0.0.1`` is *this container's*
+    loopback rather than a route to anything —
+    :func:`lmer_platform.config.container_base_url` works out what a container
+    should use, and ``LMER_PLATFORM_CONTAINER_URL`` overrides it.
+
+    **What the credential half costs, stated rather than waved past.** An
+    earlier version of this docstring called it "the same pair lmer already
+    writes into every session container". That is false: worker sessions get
+    **no** credential (``ask_channel/protocol.py`` — the mounted channel is the
+    authorization), and the one container that does get the pair, the assistant,
+    gets a *minted, per-incarnation, revocable* credential (#244,
+    :func:`lmer_platform.config.mint_assistant_credential`) that the API maps to
+    ``CALLER_ASSISTANT``. This path hands a container the **shared secret**: it
+    arrives as ``CALLER_OPERATOR``, indistinguishable from the human, and stays
+    valid until someone rotates the daemon's secret by hand. That is a real
+    reduction against what #244 bought. The **packaging** decision is made — D1
+    says container, by operator decision on 2026-08-23 — and the **credential**
+    decision is separate and still open: minting the bridge its own ``Caller``
+    is the standing recommendation in the run's spec.
+
+    **On the host** — no pair, so the daemon's state directory answers both
+    questions, and the credential never leaves the filesystem.
+
+    The environment wins when both are available, for the reason it wins
+    everywhere else in this project: an export is someone saying something the
+    file cannot know.
     """
+    from lmer_platform import ctl
+
+    url = (os.environ.get(ctl.ENV_PLATFORM_URL) or "").strip()
+    credential = (os.environ.get(ctl.ENV_PLATFORM_CREDENTIAL) or "").strip()
+    if url and credential:
+        return Endpoint(url.rstrip("/"), credential)
+    if url or credential:
+        # Half the pair is not "no pair" (!246 review). ``resolve_endpoint`` is
+        # all-or-nothing by design — ctl's own words: a URL with no credential
+        # is a 401 machine and a credential with no URL has nothing to spend
+        # itself on — so falling back to the file here would quietly ignore
+        # what the operator did set and talk to a different daemon than the one
+        # they named.
+        missing = ctl.ENV_PLATFORM_CREDENTIAL if url else ctl.ENV_PLATFORM_URL
+        present = ctl.ENV_PLATFORM_URL if url else ctl.ENV_PLATFORM_CREDENTIAL
+        raise PlatformError(
+            f"{present} is set but {missing} is not. They are a pair: a URL "
+            f"with no credential is a 401 machine and a credential with no URL "
+            f"has nothing to spend itself on. Set both, or neither — with "
+            f"neither, the bridge reads the daemon's own state directory."
+        )
+
     config = platform_config.load()
     credential = platform_config.read_secret(config)
     if not credential:
         raise PlatformError(
-            f"no platform credential at {config.secret_path}: the bridge talks "
-            f"to the daemon on this host, and reads what opens it from that "
-            f"file. Start the daemon, or point the bridge at the right state "
-            f"directory."
+            f"no platform to talk to: this process has neither the "
+            f"{ctl.ENV_PLATFORM_URL}/{ctl.ENV_PLATFORM_CREDENTIAL} pair a "
+            f"containerised bridge is given, nor a readable credential at "
+            f"{config.secret_path} to talk to a daemon on this host. Start the "
+            f"daemon, or export the pair (see docs/MATRIX-CHAT.md)."
         )
     return Endpoint(config.base_url, credential)
 

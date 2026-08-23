@@ -14,6 +14,8 @@ created room's id recorded so the next start joins instead of creating a second
 room, and nothing sent before there is a room to send it to.
 """
 
+import io
+
 import pytest
 
 from lmer_platform import config as platform_config
@@ -61,6 +63,15 @@ def homeserver():
 @pytest.fixture
 def client(config, homeserver):
     return mxclient.MatrixClient(config, homeserver, record_room_id=lambda _: None)
+
+
+@pytest.fixture
+def configured_room_client(config, homeserver):
+    """A client and the fake behind it, for tests that read the fake back."""
+    return (
+        mxclient.MatrixClient(config, homeserver, record_room_id=lambda _: None),
+        homeserver,
+    )
 
 
 # --- the upload decision, as a rule ------------------------------------------
@@ -448,3 +459,95 @@ async def test_the_outbound_client_is_built_without_starting_a_server():
     assert homeserver._listening is False, "nothing was started to get it"
     with pytest.raises(AttributeError):
         homeserver._appservice().intent  # the coupling that used to be used
+
+
+# --- what the transport opens, it closes -------------------------------------
+
+async def test_check_closes_the_session_it_opened(configured_room_client):
+    """The claim the `closed` flag exists for, now actually asserted (!246
+    review): the fake modelled a release path nothing tested, which is how a
+    second leak shipped in the commit that fixed the first one."""
+    from lmer_platform.client import Endpoint
+
+    from matrix_bridge import cli as mxcli
+
+    client, homeserver = configured_room_client
+    homeserver.whoami_as = client.config.sender
+
+    await mxcli.check_remote(
+        client.config, client, Endpoint("http://127.0.0.1:8600", "secret"),
+        transport=_ok_transport(), out=io.StringIO(),
+    )
+
+    assert homeserver.closed is True, "check left the transport open"
+
+
+def _ok_transport():
+    class Reply:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {}
+
+    class Transport:
+        def request(self, *args, **kwargs):
+            return Reply()
+
+    return Transport()
+
+
+async def test_resetting_the_outbound_client_closes_its_session():
+    """The bug this pins is one line: dropping the client reference without
+    closing its session orphans it (!246 review). Driven against the real
+    transport, since the session is the real library's."""
+    pytest.importorskip("mautrix")
+
+    homeserver = mxclient.MautrixHomeserver(
+        mxcfg.load(dict(STORED, room_id=ROOM)),
+        mxcfg.Secrets(as_token="as", hs_token="hs", recovery_key="rk"),
+    )
+    homeserver._appservice_client()
+    session = homeserver._session
+    assert session is not None and not session.closed
+
+    await homeserver._reset_outbound_client()
+
+    assert session.closed is True, "the session was orphaned, not closed"
+    assert homeserver._session is None and homeserver._client is None
+
+
+async def test_adopting_the_state_store_moves_the_event_handler_too():
+    """Reassigning ``az.state_store`` leaves the constructor's handler bound to
+    the old object, so inbound membership updates would keep landing in the
+    placeholder store while the crypto machine read the database one (!246
+    review)."""
+    pytest.importorskip("mautrix")
+
+    homeserver = mxclient.MautrixHomeserver(
+        mxcfg.load(dict(STORED, room_id=ROOM)),
+        mxcfg.Secrets(as_token="as", hs_token="hs", recovery_key="rk"),
+    )
+    appservice = homeserver._appservice()
+    placeholder = appservice.state_store
+    assert any(
+        getattr(h, "__self__", None) is placeholder
+        for h in appservice.event_handlers
+    ), "the constructor registers a handler bound to the store it was given"
+
+    class Adopted:
+        async def update_state(self, event):
+            return None
+
+    adopted = Adopted()
+    homeserver._adopt_state_store(adopted)
+
+    assert appservice.state_store is adopted
+    assert not any(
+        getattr(h, "__self__", None) is placeholder
+        for h in appservice.event_handlers
+    ), "the old store still receives events"
+    assert any(
+        getattr(h, "__self__", None) is adopted
+        for h in appservice.event_handlers
+    ), "the new store receives none"
