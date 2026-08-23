@@ -391,6 +391,10 @@ the store, the room, the allowlist, the media assertion, reachability, whether
 the homeserver accepts the appservice, and whether the daemon answers. A `FAIL`
 line there is a `run` that will not start.
 
+In the journal, a clean stop reads as `matrix_bridge_stopping signal=SIGTERM`
+followed by `matrix_bridge_stopped` and exit 0 — a restart missing that pair
+was a crash, not a requested stop.
+
 ### Updating the image
 
 CI pushes `lmer-matrix-bridge:<commit-sha>` on the default branch and on tags,

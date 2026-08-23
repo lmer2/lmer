@@ -35,7 +35,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import signal
 import sys
 from typing import Optional, Sequence
 
@@ -473,25 +475,127 @@ async def _check_homeserver(config, client, *, out) -> bool:
     return good and encrypted
 
 
-async def serve(config: mxcfg.MatrixConfig, secrets: mxcfg.Secrets) -> None:
+async def serve(
+    config: mxcfg.MatrixConfig, secrets: mxcfg.Secrets, *,
+    stop: Optional[asyncio.Event] = None,
+    hurry: Optional[asyncio.Event] = None,
+) -> None:
     """Spec §5's startup sequence, then the two halves, running together.
 
-    Both halves, in this order (!245 review, two iterations of the same
-    finding). First the listener: the homeserver *pushes* transactions, so
-    without it the bridge announces runs and can receive nothing — and it has
-    to come before the first homeserver call rather than beside the poll loop,
-    because the first call is in ``start()`` thirteen lines above the gather.
-    Then the startup sequence, then the two loops gathered so either one's
-    failure ends the process rather than leaving half a bridge running, which
-    is the state hardest to notice.
+    The startup sequence lives in :func:`_start_bridge` and is raced against
+    the stop event; then the two loops run in one ``TaskGroup`` so either
+    one's failure ends the process rather than leaving half a bridge running,
+    which is the state hardest to notice.
+
+    ``stop``/``hurry`` are the shutdown seam (issue #349), injectable so a
+    test can drive a shutdown without sending the process a real signal.
+    SIGTERM and SIGINT set ``stop``; a second signal while draining sets
+    ``hurry``, which forfeits the outbound grace. ``add_signal_handler``
+    rather than ``signal.signal`` so the handler runs on the loop thread and
+    may touch asyncio state — and this process is PID 1 in its container,
+    where an uninstalled SIGTERM is not defaulted but *dropped*: without a
+    handler every ``podman stop`` was the 10-second grace and then SIGKILL.
     """
+    stop = stop if stop is not None else asyncio.Event()
+    hurry = hurry if hurry is not None else asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def request_stop(signame: str) -> None:
+        if stop.is_set():
+            # One signal is polite, two is now: skip the drain's grace.
+            logger.info("matrix_bridge_stopping signal=%s immediate=1", signame)
+            hurry.set()
+            return
+        logger.info("matrix_bridge_stopping signal=%s", signame)
+        stop.set()
+
     client = mxclient.connect(config, secrets)
-    # The listener first, and this ordering is the fix (!245 review,
-    # iteration 2): `start()` calls the homeserver, and the transport's
-    # outbound client used to be `AppService.intent`, which raises until the
-    # web server is up. Starting the listener inside the gather below meant the
-    # process died on the first homeserver call, thirteen lines before the line
-    # that would have started it.
+    # Installed before the startup sequence, not just before the run loops: a
+    # stop request landing while the store opens should still end in a clean
+    # exit, not a SIGKILL. After ``connect``, so a refused config never leaves
+    # handlers behind on the loop.
+    installed = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, request_stop, sig.name)
+        installed.append(sig)
+    try:
+        # Startup races the stop event rather than merely following the
+        # handler install (!247 review): `start()` is homeserver round trips
+        # with no timeout of their own, and a homeserver that accepts the
+        # connection but does not answer would otherwise hold a recorded stop
+        # request hostage past podman's grace — the SIGKILL again, moved to
+        # the exact window where a bad deployment has the operator stopping
+        # the unit. A stop here aborts the startup and exits 0.
+        startup = asyncio.ensure_future(_start_bridge(config, client))
+        stopping = asyncio.ensure_future(stop.wait())
+        try:
+            await asyncio.wait(
+                {startup, stopping}, return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            stopping.cancel()
+        if not startup.done():
+            startup.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await startup
+            return
+        outbound = await startup
+
+        logger.info(
+            "matrix_bridge_started room=%s poll=%ss listen=%s:%s", client.room_id,
+            config.poll_seconds, config.bind_address, config.bind_port,
+        )
+        try:
+            # A TaskGroup, not a gather: when one half fails, gather raises
+            # immediately and leaves the sibling running as an orphan — the
+            # `finally` below would then close the session and database under
+            # an outbound tick still inside its drain grace, which is the
+            # announced-but-unrecorded hazard this shutdown exists to close.
+            # The group cancels the sibling and does not exit until both
+            # halves have actually finished.
+            async with asyncio.TaskGroup() as group:
+                group.create_task(client.serve_forever(stop))
+                group.create_task(
+                    poll_forever(outbound, config.poll_seconds, stop, hurry)
+                )
+        except BaseExceptionGroup as exc_group:
+            # Both halves are done; surface the real failure the way the
+            # gather used to, so `main()`'s error handling still sees the
+            # exception itself rather than a wrapper it does not catch.
+            raise exc_group.exceptions[0] from exc_group
+    finally:
+        # Drain order (issue #349): the listener went down inside
+        # ``serve_forever`` (inbound transactions are redelivered, so refusing
+        # them is safe), the poll loop finished or gave up its last tick —
+        # only now may the session and the database close under them.
+        try:
+            await client.aclose()
+        except Exception:
+            # Raising here would turn a requested stop into a crash exit (or
+            # mask the failure that got us here); the journal line is the
+            # operator's signal either way.
+            logger.exception("matrix_bridge_close_failed")
+        for sig in installed:
+            loop.remove_signal_handler(sig)
+        if stop.is_set():
+            logger.info("matrix_bridge_stopped")
+
+
+async def _start_bridge(config: mxcfg.MatrixConfig, client) -> "mxout.Outbound":
+    """Spec §5's startup sequence: listener, store, room, wiring, baseline.
+
+    Both halves of the listener ordering finding (!245 review, two
+    iterations): the homeserver *pushes* transactions, so without the
+    listener the bridge announces runs and can receive nothing — and it has
+    to come before the first homeserver call rather than beside the poll
+    loop, because ``start()`` calls the homeserver and the transport's
+    outbound client used to be ``AppService.intent``, which raises until the
+    web server is up. A listener started beside the run loops was started
+    too late to be reached at all.
+
+    A coroutine of its own so ``serve`` can race it against the stop event
+    and cancel it wholesale (!247 review).
+    """
     await client.listen(config.bind_address, config.bind_port)
     await client.start()
 
@@ -502,26 +606,88 @@ async def serve(config: mxcfg.MatrixConfig, secrets: mxcfg.Secrets) -> None:
 
     client.on_event(inbound.handle)
     await outbound.start()
-    logger.info(
-        "matrix_bridge_started room=%s poll=%ss listen=%s:%s", client.room_id,
-        config.poll_seconds, config.bind_address, config.bind_port,
-    )
-    await asyncio.gather(
-        client.serve_forever(),
-        poll_forever(outbound, config.poll_seconds),
-    )
+    return outbound
 
 
-async def poll_forever(outbound, poll_seconds: int) -> None:
-    """The outbound half: one tick per interval, forever."""
+#: Seconds a stop request waits for an in-flight outbound tick before
+#: cancelling it — enough for one send round-trip, and comfortably inside
+#: podman's 10-second SIGTERM window with the rest of the teardown behind it.
+STOP_TICK_GRACE_SECONDS = 5.0
+
+
+async def poll_forever(
+    outbound, poll_seconds: int,
+    stop: asyncio.Event, hurry: asyncio.Event, *,
+    tick_grace: float = STOP_TICK_GRACE_SECONDS,
+) -> None:
+    """The outbound half: one tick per interval, until *stop*.
+
+    A stop during the sleep returns at once — no tick starts after stop. A
+    stop during a tick lets that tick finish for *tick_grace* seconds before
+    cancelling it: the tick's send-then-bind order (``outbound.py``) means a
+    hard kill can leave a run announced but unrecorded, so the common case —
+    one send already in flight — gets to complete. ``hurry`` (a second
+    signal) forfeits the grace.
+    """
     while True:
-        await asyncio.sleep(poll_seconds)
         try:
-            await outbound.tick()
-        except Exception:
-            # A tick that raises must not end the bridge: the next one may
-            # succeed, and a dead bridge answers nothing at all.
-            logger.exception("matrix_outbound_tick_failed")
+            await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
+            return
+        except asyncio.TimeoutError:
+            # A stop landing in the same wake-up as the interval expiring
+            # still raises TimeoutError (!247 review) — without this check
+            # that one tick starts *after* stop, gets the full grace, and can
+            # be cancelled mid-send: the exact window the drain closes,
+            # reopened on the shutdown path.
+            if stop.is_set():
+                return
+
+        tick = asyncio.ensure_future(outbound.tick())
+        cancelled_by_us = False
+        try:
+            await _first_of(tick, stop.wait())
+            if not tick.done():
+                await _first_of(tick, hurry.wait(), timeout=tick_grace)
+            if not tick.done():
+                tick.cancel()
+                cancelled_by_us = True
+            try:
+                await tick
+            except asyncio.CancelledError:
+                # Swallow only the cancellation *we* issued — an external
+                # cancel of this coroutine (the TaskGroup reaping a failed
+                # sibling) must keep propagating even though the tick shows
+                # cancelled too.
+                if not cancelled_by_us or asyncio.current_task().cancelling():
+                    raise
+                logger.info(
+                    "matrix_outbound_tick_cancelled reason=%s",
+                    "hurry" if hurry.is_set() else "stop_grace",
+                )
+            except Exception:
+                # A tick that raises must not end the bridge: the next one may
+                # succeed, and a dead bridge answers nothing at all.
+                logger.exception("matrix_outbound_tick_failed")
+        finally:
+            # An external cancellation while parked in a wait above must not
+            # orphan the tick against a transport about to close.
+            if not tick.done():
+                tick.cancel()
+                with contextlib.suppress(BaseException):
+                    await tick
+        if stop.is_set():
+            return
+
+
+async def _first_of(tick: "asyncio.Future", event_wait, *, timeout=None) -> None:
+    """Park until *tick* finishes, *event_wait* fires, or *timeout* runs out."""
+    waiter = asyncio.ensure_future(event_wait)
+    try:
+        await asyncio.wait(
+            {tick, waiter}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        waiter.cancel()
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -622,12 +788,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"lmer-matrix-bridge: {exc}", file=sys.stderr)
         return EXIT_FAILURE
     try:
+        # No KeyboardInterrupt catch: `serve` handles SIGINT itself, so an
+        # interactive Ctrl-C and a `systemctl stop` take the same drain path
+        # and both exit 0 (issue #349).
         asyncio.run(serve(config, secrets))
     except (mxclient.MatrixClientError, PlatformError) as exc:
         print(f"lmer-matrix-bridge: {exc}", file=sys.stderr)
         return EXIT_FAILURE
-    except KeyboardInterrupt:
-        return 0
     return 0
 
 
