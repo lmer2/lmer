@@ -116,10 +116,28 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
 from typing import Any, Optional, Sequence
 
-import requests
+from lmer_platform.client import (
+    Call,
+    Endpoint,
+    PlatformError,
+    TransportError,
+    request as _request,
+)
+
+#: The names above are :mod:`lmer_platform.client`'s, re-exported here because
+#: this CLI was their first home and because ``ctl.Endpoint`` / ``ctl.Call`` read
+#: naturally in a subcommand. ``CtlError`` is the client's base failure under its
+#: old name: every ``except CtlError`` here still catches a
+#: :class:`~lmer_platform.client.TransportError`, which is a subclass of it.
+CtlError = PlatformError
+
+__all__ = [
+    "Call", "CtlError", "Endpoint", "TransportError",
+    "main", "resolve_endpoint",
+]
+
 
 #: The pair the host writes into the assistant's container, spelled here rather
 #: than imported from :mod:`lmer_platform.assistant`: importing that module pulls
@@ -152,56 +170,6 @@ DEFAULT_TIMEOUT_SECONDS = 120.0
 _DETAIL_LIMIT = 2000
 
 
-class CtlError(RuntimeError):
-    """Something this process can say without asking the daemon.
-
-    Missing configuration, a transport failure, or an argument that cannot be
-    turned into a request at all. Never a refusal — those belong to the daemon
-    and are passed through with its status.
-    """
-
-    #: The ``error`` discriminator this failure prints. Distinguishing "the
-    #: platform was never asked" from "there was nothing to ask it with" is worth
-    #: a field: the first is a fleet the operator should hear about, the second is
-    #: this session's own launch.
-    error = "configuration"
-
-
-class TransportError(CtlError):
-    """The platform was asked and did not answer."""
-
-    error = "unreachable"
-
-
-@dataclass(frozen=True)
-class Endpoint:
-    """Where the platform is and what opens it."""
-
-    base_url: str
-    credential: str
-
-    def url(self, path: str) -> str:
-        return f"{self.base_url}{path}"
-
-    def headers(self) -> dict:
-        return {"Authorization": f"Bearer {self.credential}"}
-
-
-@dataclass(frozen=True)
-class Call:
-    """One request: the route, and what this invocation puts in it.
-
-    A subcommand's whole job is to return one of these. Keeping the HTTP in a
-    single place downstream is what stops a verb from acquiring a retry, a second
-    request, or an opinion about the reply.
-    """
-
-    method: str
-    path: str
-    params: Optional[dict] = None
-    body: Optional[dict] = None
-
-
 def resolve_endpoint() -> Endpoint:
     """The platform's address and credential, or a refusal naming both variables.
 
@@ -227,39 +195,6 @@ def resolve_endpoint() -> Endpoint:
     if reason:
         message = f"{message} The host recorded why it wrote neither: {reason}"
     raise CtlError(message)
-
-
-def _request(
-    endpoint: Endpoint, call: Call, *, timeout: float, transport=None
-) -> Any:
-    """Issue *call*. Returns the response object; raises on a transport failure.
-
-    *transport* is the seam the tests drive the real FastAPI app through, and the
-    only reason this parameter exists. It is anything with ``requests``' own
-    ``request(method, url, …)`` signature — the module itself by default.
-
-    The credential is a header and the query string is built by the transport
-    from ``params``, both for :func:`lmer_platform.session_io._call`'s reason:
-    ``requests`` echoes the URL it was given into its exception messages, so
-    nothing secret may be formatted into one.
-    """
-    caller = transport if transport is not None else requests
-    try:
-        return caller.request(
-            call.method,
-            endpoint.url(call.path),
-            params=call.params,
-            json=call.body,
-            headers=endpoint.headers(),
-            timeout=timeout,
-        )
-    except requests.RequestException as exc:
-        # Only the real transport's failures are caught. An injected one runs
-        # in-process, where an exception is a bug in this file and should look
-        # like one rather than arriving as a fleet problem.
-        raise TransportError(
-            f"cannot reach the platform at {endpoint.base_url} ({exc})"
-        ) from exc
 
 
 def _payload(text: str) -> Any:
@@ -909,7 +844,7 @@ def _add_runs(sub) -> None:
 def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
     """Parse, issue one request, print the reply. Returns the exit code.
 
-    *transport* is the injectable HTTP seam — see :func:`_request`.
+    *transport* is the injectable HTTP seam — see :func:`lmer_platform.client.request`.
     """
     parser = create_parser()
     args = parser.parse_args(argv)
