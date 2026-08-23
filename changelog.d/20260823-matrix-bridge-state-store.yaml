@@ -1,0 +1,4 @@
+fixed:
+- "Matrix bridge: every outbound message failed with `EncryptionError: No group session created` because the crypto store's database was created with only the crypto upgrade table, leaving `mx_room_state` and `mx_user_profile` — the tables member lookup reads — absent. Both upgrade tables now run on that database"
+- "Matrix bridge: the appservice was constructed without a state store, so mautrix defaulted to a file-backed one at a relative path, unwritable in the image's working directory. The appservice and the crypto machine now share one database-backed store"
+- "`lmer-matrix-bridge check` no longer exits with an 'Unclosed client session' warning: the HTTP session it opens is now closed on the way out"

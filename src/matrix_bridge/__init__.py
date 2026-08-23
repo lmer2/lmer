@@ -1,9 +1,20 @@
 """``lmer-matrix-bridge`` — the fleet, reachable from Matrix (issue #327).
 
-One bridge serves one platform daemon (spec D1). It runs on the host where
-``~/.lmer/platform/`` is, reads that daemon's secret locally, and speaks to the
-same HTTP API every other client speaks to — so it needs no route of its own and
-the credential never travels.
+One bridge serves one platform daemon (spec D1), and speaks to the same HTTP API
+every other client speaks to — so it needs no route of its own.
+
+**It runs in a container** (D1, amended by operator decision 2026-08-23;
+host-side is ruled out). ``Dockerfile.matrix-bridge`` is the image, and the
+daemon's URL and credential come from the environment —
+``LMER_PLATFORM_URL``/``LMER_PLATFORM_SECRET``, both or neither. The file
+fallback in :func:`matrix_bridge.outbound.platform_endpoint` still works and
+still has tests; it is what a developer uses for a quick run beside a daemon,
+not a deployment.
+
+One cost of the environment path is worth keeping in view rather than in a
+changelog: it carries the platform's *shared* secret for that daemon, which the
+API attributes as the operator rather than as this bridge. Minting the bridge a
+credential of its own is an open recommendation, recorded in the spec.
 
 What it does, in slice 1: a run that wants a human is announced in one Matrix
 room, in a thread of its own (D5, D9); an allowlisted person replies in that

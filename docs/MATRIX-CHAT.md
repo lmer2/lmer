@@ -21,7 +21,7 @@ message carries four things and nothing else:
 ```
 Matrix bridge — stopped on a question — replying here starts a session to continue the run
 Which target branch should the MR use?
-http://your-platform-host:8765
+http://your-platform-host:8600
 ```
 
 - what the run is (its title, else its name)
@@ -52,11 +52,24 @@ relation is what identifies the run.
 
 ## Setting it up
 
-### 1. The bridge is host-side
+### 1. The bridge runs beside the daemon
 
-It runs where `~/.lmer/platform/` is — the same host as the daemon — and reads
-that daemon's secret locally. Nothing is containerised, and the platform
-credential never travels. Install lmer with the extra that carries the Matrix
+One bridge serves one platform daemon. It is a plain network service: it accepts
+appservice transactions from the homeserver over HTTP and calls the daemon's API
+over HTTP.
+
+**It is deployed as a container** — spec D1 was amended by operator decision on
+2026-08-23 and host-side is ruled out. §5 has the deployment; §5b keeps the host
+install as a developer convenience for a quick run beside a daemon, not as a
+supported shape. What the container arrangement costs in credential terms is in
+"What the credential costs", and is a separate open question from where it
+runs.
+
+Either way it needs the daemon's `~/.lmer/platform/` state: the `matrix` section
+of `config.json`, and a directory of its own for the crypto store and thread
+map.
+
+For the host install, install lmer with the extra that carries the Matrix
 libraries:
 
 ```bash
@@ -204,7 +217,255 @@ fleet's answer routes should not listen on every interface by accident — so a
 containerised homeserver needs this changed. Note that a homeserver in a pod
 resolves `127.0.0.1` as *its own* loopback, not the host's.
 
-### 5. Run it under something that restarts it
+### 5. Run it as a container — the deployment
+
+> Spec D1 was amended by operator decision on 2026-08-23: the bridge runs in a
+> container and host-side is ruled out. The credential difference below is a
+> separate question that is still open — it is about *what* the bridge is given,
+> not *where* it runs.
+
+The image is `Dockerfile.matrix-bridge`, built and pushed by CI. It is one
+process talking HTTP in both directions, so it needs no container runtime of its
+own, no git and no browser.
+
+```ini
+# ~/.config/containers/systemd/lmer-matrix-bridge.container   (rootless quadlet)
+[Unit]
+Description=lmer Matrix bridge
+# No After=network-online.target: that target does not exist in the systemd
+# *user* manager, so ordering against it is inert. Restart=always is what covers
+# a start before the network is up.
+
+[Container]
+# For the proof of concept this is the tag you built locally from the branch —
+# see "Deploying from a branch" below. Once the image is published it becomes
+# registry.../lmer-matrix-bridge:<commit-sha>. No AutoUpdate=registry either
+# way until a publish job exists: nothing promotes a moving tag for this image,
+# so the directive would read as a working update mechanism with nothing behind
+# it.
+Image=localhost/lmer-matrix-bridge:poc
+EnvironmentFile=%h/.lmer/matrix-bridge.env
+# The listener. Publish on one interface rather than all of them: §4a's rule
+# ("a bridge holding the fleet's answer routes should not listen on every
+# interface by accident") still applies on the host side, even though inside
+# the container the bind must be 0.0.0.0.
+PublishPort=<host address>:29331:29331
+# The **directory**, not config.json on its own. The bridge writes
+# `matrix.room_id` back after creating the room, and that write is
+# `store.write_json`: a temp file in the destination directory, then
+# rename onto the target. A bind-mounted *file* breaks both halves — the temp
+# lands in an unmounted directory and the rename hits a mount point — so the
+# room id would never reach the host, and `Restart=always` would then create a
+# new room every ten seconds. The directory keeps the rename inside one mount.
+#
+# Mounting the directory brings in everything else the daemon keeps there, not
+# just config.json: `secret` and `assistant-credential` (the platform's two
+# credentials), `assistant.env`, `sessions/` — which holds every session's PTY
+# scrollback — `logs/`, the work-repo mirror and the fleet snapshots. The
+# container gets read-write access to all of it. That is a real consequence and
+# it is what decides whether a minted bridge credential would buy anything:
+# see "What the credential costs" below.
+Volume=%h/.lmer/platform:/home/bridge/.lmer/platform:rw
+# Rootless podman maps the host user to container uid 0 and everything else
+# into the subuid range, so the mounted files — owned by the host user — look
+# root-owned inside while the image runs as uid 1000. config.json is mode 0600
+# and the platform dir is 0700, so without this the bridge cannot read its own
+# config. This is what `lmer` passes for sessions (`lmer_cli/runtime.py`) and
+# what `scripts/platform-container-run.sh` passes for the platform container.
+#
+# NEEDS PODMAN >= 4.3: plain `keep-id` is much older, but the uid=/gid=
+# parameters are not, and on an older podman this line fails at unit start.
+# They are spelled out because the image bakes BUILD_UID=1000; on a host whose
+# own uid is 1000, plain `keep-id` is equivalent.
+UserNS=keep-id:uid=1000,gid=1000
+# No `,Z` on the volume above: relabelling writes a container-private SELinux
+# category onto the operator's own home tree, and a second container mounting
+# the same paths would take them away from this one.
+# `scripts/platform-container-run.sh` refuses `,z` here for that reason and
+# disables labelling instead; this is the quadlet equivalent.
+SecurityLabelDisable=true
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+mkdir -p ~/.lmer/platform/matrix ~/.config/containers/systemd
+install -m 0600 /dev/null ~/.lmer/matrix-bridge.env
+# `matrix.bind_address` must be 0.0.0.0 for a container: `check` fails on a
+# loopback bind when it detects it is running in one, because loopback there
+# reaches nothing at all.
+# the three Matrix secrets, plus where the daemon is from inside the container:
+#   LMER_MATRIX_AS_TOKEN=…
+#   LMER_MATRIX_HS_TOKEN=…
+#   LMER_MATRIX_RECOVERY_KEY=…
+#   LMER_PLATFORM_URL=http://<host address>:8600   # the daemon's default port
+#   LMER_PLATFORM_SECRET=…
+systemctl --user daemon-reload
+systemctl --user start lmer-matrix-bridge
+loginctl enable-linger "$USER"     # so it survives logout
+```
+
+The `mkdir` is not decoration: both volume sources must exist before the unit
+starts. Podman creates a missing bind source as a **directory**, so an absent
+`config.json` becomes a directory where the bridge expects a file, and the
+failure arrives as a confusing parse error rather than "that path is missing".
+
+Two things a container changes, and neither is optional:
+
+- **`matrix.bind_address` must be `0.0.0.0`.** Inside a container, loopback is
+  the container's own and reaches nothing else. The registration's `url` is
+  then the address the *homeserver* reaches the published port on.
+- **The daemon is not on this container's loopback either.** Export
+  `LMER_PLATFORM_URL` and `LMER_PLATFORM_SECRET` — **both or neither**; half
+  the pair is refused rather than quietly ignored. There is no CLI verb that
+  prints the right URL (`lmer platform doctor` does not exist; the verbs are
+  `run`, `status`, `secret`, `rescan`, `runs`, `adopt`, `forget`, `setup-ui`,
+  `spawn`, `resume`), so derive it: a routable `bind_address` is used as-is,
+  and on podman it is `http://host.containers.internal:<bind_port>`
+  (`lmer_platform.config.container_base_url`, rules 2 and 4).
+  `LMER_PLATFORM_CONTAINER_URL` overrides the derivation.
+
+### Deploying from a branch (the proof of concept)
+
+Nothing is published for this image yet, so the PoC builds it locally from the
+branch and points the unit at that tag. In order, on the daemon's host:
+
+```bash
+# 1. The branch and the image. Build with the DEFAULT uid: the unit below maps
+#    your host user onto uid 1000 inside, so the image's user must be 1000.
+#    Do not pass --build-arg BUILD_UID=$(id -u) for this path.
+git clone https://git.20c.com/agents/global.git && cd global
+git checkout design/issue-327-matrix-chat-w4
+podman build -f Dockerfile.matrix-bridge -t localhost/lmer-matrix-bridge:poc \
+    --build-arg LMER_BUILD_COMMIT="$(git rev-parse HEAD)" .
+
+# 2. The state directory and the env-file. Both volume sources must exist
+#    first: podman creates a missing bind source as a directory, and an absent
+#    config.json would become one.
+mkdir -p ~/.lmer/platform/matrix ~/.config/containers/systemd
+install -m 0600 /dev/null ~/.lmer/matrix-bridge.env
+
+# 3. The five variables, into that file (no export, no quotes needed):
+#      LMER_MATRIX_AS_TOKEN=...        # you mint these two; openssl rand -hex 32
+#      LMER_MATRIX_HS_TOKEN=...
+#      LMER_MATRIX_RECOVERY_KEY=...    # your passphrase; back it up, it is the
+#                                      # only thing that cannot be reconstructed
+#      LMER_PLATFORM_URL=http://<host address>:8600
+#      LMER_PLATFORM_SECRET=...        # cat ~/.lmer/platform/secret
+
+# 4. The matrix section in the daemon's config.json. Four keys are required —
+#    name, homeserver, server_name, allow — plus the two the container needs:
+#    bind_address 0.0.0.0 (loopback reaches nothing in a container) and url (the
+#    address the homeserver dials). Leave room_id out; the bridge creates the
+#    room and writes it back.
+
+# 5. The registration, for the homeserver side. Placeholders by default:
+podman run --rm \
+    -v ~/.lmer/platform:/home/bridge/.lmer/platform:ro \
+    --userns=keep-id:uid=1000,gid=1000 \
+    localhost/lmer-matrix-bridge:poc register > lmer-matrix-bridge.yaml
+#    Fill in the two tokens from step 3, install it where the homeserver reads
+#    app_service_config_files, set the two experimental_features keys from the
+#    file's own header, and restart the homeserver.
+
+# 6. Check before starting anything. It changes nothing:
+podman run --rm --env-file ~/.lmer/matrix-bridge.env \
+    -v ~/.lmer/platform:/home/bridge/.lmer/platform:rw \
+    --userns=keep-id:uid=1000,gid=1000 --security-opt label=disable \
+    localhost/lmer-matrix-bridge:poc check
+
+# 7. The unit (§5's quadlet, with Image=localhost/lmer-matrix-bridge:poc), then:
+systemctl --user daemon-reload
+systemctl --user start lmer-matrix-bridge
+loginctl enable-linger "$USER"
+journalctl --user -u lmer-matrix-bridge -f
+```
+
+Step 6 is the one to read carefully: `check` reports the config, the secrets,
+the store, the room, the allowlist, the media assertion, reachability, whether
+the homeserver accepts the appservice, and whether the daemon answers. A `FAIL`
+line there is a `run` that will not start.
+
+### Updating the image
+
+CI pushes `lmer-matrix-bridge:<commit-sha>` on the default branch and on tags,
+and **nothing promotes those to a moving tag** — there is no publish job for
+this image, unlike the session and platform images. So updating is deliberate
+rather than automatic:
+
+```bash
+podman pull registry.example.org/lmer/lmer-matrix-bridge:<new-commit-sha>
+# edit Image= in the unit to the new tag
+systemctl --user daemon-reload
+systemctl --user restart lmer-matrix-bridge
+```
+
+That is also why the unit above carries no `AutoUpdate=registry`: it would name
+an update mechanism that has nothing to update from. If the operator approves
+the container shape, the follow-up is a `publish-matrix-bridge-container` job
+promoting the built image **by digest** to the release tag and `latest`, exactly
+as `publish-platform-container` does — at which point `AutoUpdate=registry`
+against `:latest` becomes meaningful and belongs here. That job is deliberately
+not in this MR: it is release-pipeline surface for an artifact whose existence
+is still the operator's call.
+
+### What the credential costs
+
+**This is unsettled, and it is the operator's call — do not deploy past it.**
+
+The value you put in `LMER_PLATFORM_SECRET` is the platform's **shared secret**.
+An earlier draft of this page called it "the same pair lmer writes into every
+session container", which is false and was the sentence that made the question
+disappear:
+
+- Worker sessions get **no credential at all** — the mounted ask channel *is*
+  the authorization (`ask_channel/protocol.py`).
+- Exactly **one** container gets the pair: the assistant, a documented exception
+  granted by operator request on 2026-07-27.
+- And it does not get this value. It gets a **minted, per-incarnation,
+  revocable** credential (#244) that the API attributes as `CALLER_ASSISTANT`;
+  the shared secret is attributed as `CALLER_OPERATOR`.
+
+So the trade, plainly: the bridge's calls arrive **as the operator**, the
+credential is valid **until someone rotates the daemon's secret by hand** (which
+silently 401s the bridge), and it lives in a **hand-maintained file**. Two things
+improve: the value never reaches argv, and the bridge's scrub masks it by value
+in anything it posts to the room.
+
+**And note what the volume already gives the container**, because it bounds what
+a better credential could buy: mounting `~/.lmer/platform` read-write hands it
+`secret` and `assistant-credential` themselves, `assistant.env`, `sessions/`
+(every session's PTY scrollback), `logs/`, the work-repo mirror and the fleet
+snapshots. A bridge with a minted, revocable credential that can also read the
+shared secret off the mounted filesystem is only as constrained as that mount —
+so if the credential question is settled by minting one, the mount is the next
+question, not a settled one.
+
+The recommendation in the run's spec is to **mint the bridge its own credential**
+— a third caller, the same shape as the assistant's — so that packaging the
+bridge as a container does not cost the attribution #244 bought. That is still
+open, and it is a decision about the credential rather than about where the
+bridge runs, which D1 has settled.
+
+The secrets belong in the env-file (mode `0600`), not in a shell profile.
+Note what that does and does not hide: quadlet's `EnvironmentFile=` becomes
+podman's `--env-file`, so the *values* become the container's config and are
+readable through `podman inspect`, `/proc/<pid>/environ`, and from inside the
+container. Nothing lands in an image layer and nothing reaches the journal.
+(§5's host unit is the case where systemd itself reads the file.)
+
+### 5b. Run it on the host — developer convenience only
+
+**Not a supported deployment** since D1 was amended: use it to run the bridge
+beside a daemon on a workstation, not to deploy one. `uv tool install
+'lmer[matrix]'` and a systemd **user** unit.
+
+
 
 `lmer-matrix-bridge run` is a foreground process; nothing supervises it, and a
 bridge that died with your shell session is a room that goes quiet without
@@ -273,8 +534,13 @@ the bridge creates the room.
 
 `url` depends on your bind, in three cases:
 
-- **Loopback** (the default): unset is a **note**. The registration falls back to
-  `http://127.0.0.1:<port>`, which is honest — only this host can reach it.
+- **Loopback** (the default): unset is a **note**. The registration falls back
+  to `http://127.0.0.1:<port>`, which is honest — only this host can reach it.
+  **In a container**, `check` says so more sharply: loopback there reaches the
+  homeserver only if it shares the same network namespace (the same pod), and
+  nothing outside it otherwise. It is a note rather than a failure because the
+  same-pod case is a legitimate deployment and config cannot tell the two
+  apart.
 - **A routable address** (`10.0.0.5`): unset is **fine**. The registration falls
   back to `http://10.0.0.5:<port>`, which is an address the homeserver can dial.
 - **A wildcard** (`0.0.0.0`): unset is a **failure** and `check` exits 1, because

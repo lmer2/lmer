@@ -50,6 +50,20 @@ def _clean_lmer_env(monkeypatch):
     strip_lmer_env(monkeypatch)
 
 
+@pytest.fixture(autouse=True)
+def _on_a_host(monkeypatch):
+    """Pin the container detection to "host" for every test but the one about it.
+
+    This suite frequently runs *inside* a container (lmer's own session image
+    leaves ``/run/.containerenv``), and since a loopback bind in a container is
+    now a failure, the ambient answer would decide the verdict of every test
+    with a default bind. Which environment a test means is part of the test, so
+    it is stated rather than inherited — the same reason ``strip_lmer_env``
+    exists above.
+    """
+    monkeypatch.setattr(mxcli, "_in_a_container", lambda: False)
+
+
 @pytest.fixture
 def platform_root(tmp_path, monkeypatch):
     root = tmp_path / "platform"
@@ -314,6 +328,50 @@ def test_check_says_whether_the_homeserver_can_reach_the_bridge(
     line = next(l for l in out.getvalue().splitlines() if "reachability" in l)
     assert line.startswith(verdict), f"{label}: {line}"
     assert expected in line, f"{label}: {line}"
+
+
+def test_a_loopback_bind_inside_a_container_names_its_assumption(
+    platform_root, secrets, monkeypatch,
+):
+    """!246 review, twice. Proposing the container shape turned
+    ``DEFAULT_BIND_ADDRESS`` into a trap for anyone who runs it — the container
+    reads the same config.json as the host install D1 specifies. But the first
+    fix made it a **failure**, and that is wrong for a homeserver sharing this
+    network namespace (the same pod), where a loopback listener is reached
+    perfectly well. Config cannot tell those apart, so it names the assumption
+    instead — the rule the reverse-proxy case already settled, and a check that
+    refuses a correct deployment is worse than one that stays quiet.
+    """
+    config = mxcfg.load(dict(STORED, bind_address="127.0.0.1"))
+
+    monkeypatch.setattr(mxcli, "_in_a_container", lambda: False)
+    on_host = io.StringIO()
+    assert mxcli.check(config, secrets, build_client(config), out=on_host) is True
+    assert "note  reachability" in on_host.getvalue()
+
+    monkeypatch.setattr(mxcli, "_in_a_container", lambda: True)
+    inside = io.StringIO()
+    assert mxcli.check(config, secrets, build_client(config), out=inside) is True, (
+        "a same-pod homeserver is a legitimate deployment and must not fail"
+    )
+    line = next(l for l in inside.getvalue().splitlines() if "reachability" in l)
+    assert line.startswith(mxcli.NOTE)
+    assert "shares this network namespace" in line
+
+
+def test_the_container_marker_is_read_from_the_filesystem():
+    """Both runtimes leave one: podman ``/run/.containerenv``, docker
+    ``/.dockerenv``.
+
+    Read through the module rather than the fixture-patched name, since the
+    autouse fixture above replaces the function this is about.
+    """
+    from pathlib import Path
+
+    source = Path(mxcli.__file__).read_text()
+    body = source.split("def _in_a_container()")[1].split("\ndef ")[0]
+    assert "/run/.containerenv" in body
+    assert "/.dockerenv" in body
 
 
 def test_a_working_reverse_proxy_never_fails_the_verb(platform_root, secrets):

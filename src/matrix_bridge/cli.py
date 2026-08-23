@@ -250,6 +250,19 @@ _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 _WILDCARD = {"0.0.0.0", "::", ""}
 
 
+def _in_a_container() -> bool:
+    """Is this process inside a container?
+
+    Both runtimes leave a marker: podman writes ``/run/.containerenv``, docker
+    ``/.dockerenv``. Neither is a guarantee of anything else, but their presence
+    is enough for the one question this answers — whether a loopback bind can
+    reach anybody (!246 review).
+    """
+    from pathlib import Path
+
+    return Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+
+
 def _reachability(config) -> tuple:
     """Can the homeserver reach the address the registration names?
 
@@ -285,6 +298,24 @@ def _reachability(config) -> tuple:
     bind = config.bind_address
     listening_everywhere = bind in _WILDCARD
     listening_on_loopback = bind in _LOOPBACK
+
+    # The default bind is loopback, which is right for the host install D1
+    # specifies and usually wrong in a container — where it reaches nothing
+    # outside the network namespace. Usually, not always: a homeserver sharing
+    # this namespace (the same pod) reaches a loopback listener perfectly well,
+    # and that is a legitimate topology to deploy (!246 review). Config cannot
+    # tell the two apart, so this is a note naming the assumption rather than a
+    # refusal — the same rule the reverse-proxy case settled on. A check that
+    # refuses to start a correct deployment is worse than one that stays quiet.
+    if listening_on_loopback and _in_a_container():
+        return (
+            NOTE, "reachability",
+            f"`matrix.bind_address` is {bind} and this process is in a "
+            f"container: that reaches the homeserver only if it shares this "
+            f"network namespace (the same pod). If it does not — a separate "
+            f"pod, another host — set 0.0.0.0 and publish the port, because "
+            f"loopback here reaches nothing outside this container.",
+        )
 
     if not config.url:
         if listening_everywhere:
@@ -392,7 +423,12 @@ async def check_remote(config, client, endpoint, *, transport, out) -> bool:
         print(f"{NOTE}  homeserver: not asked — no secrets to ask it with",
               file=out)
     else:
-        ok = await _check_homeserver(config, client, out=out) and ok
+        try:
+            ok = await _check_homeserver(config, client, out=out) and ok
+        finally:
+            # A diagnostic that exits with an "Unclosed client session" warning
+            # trains an operator to ignore its output.
+            await client.aclose()
 
     try:
         response = request(endpoint, Call("GET", "/api/health"), timeout=30.0,

@@ -69,6 +69,9 @@ class FakeHomeserver(Homeserver):
     opened: list = field(default_factory=list)
     backups_written: int = 0
     callback: Optional[Callable[[Any], Any]] = None
+    #: Whether :meth:`aclose` has run — the fake models the real transport's
+    #: release path so a test can tell a leaked session from a closed one.
+    closed: bool = False
     #: ``(host, port)`` once :meth:`listen` has been awaited — the fact that
     #: proves the bridge is listening at all (!245 review).
     listening: Optional[tuple] = None
@@ -164,6 +167,9 @@ class FakeHomeserver(Homeserver):
         import asyncio
 
         await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.closed = True
 
     def _require_listener(self) -> None:
         """Raise the way ``AppService.intent`` does before ``start()``.
