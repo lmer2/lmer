@@ -19,8 +19,8 @@ from matrix_bridge.threads import RunKey, ThreadMap
 
 ROOT = "$root-event-id"
 OTHER_ROOT = "$other-root-event-id"
-RUN = RunKey("git.20c.com", "agents/global", "develop-327")
-OTHER_RUN = RunKey("git.20c.com", "agents/global", "review-mr-242")
+RUN = RunKey("gitlab.example.com", "group/project", "develop-327")
+OTHER_RUN = RunKey("gitlab.example.com", "group/project", "review-mr-1")
 
 
 @pytest.fixture
@@ -32,24 +32,24 @@ def path(tmp_path, monkeypatch):
 # --- the run key -------------------------------------------------------------
 
 def test_a_run_key_round_trips_through_its_text_form():
-    assert str(RUN) == "git.20c.com/agents/global/develop-327"
+    assert str(RUN) == "gitlab.example.com/group/project/develop-327"
     assert RunKey.parse(str(RUN)) == RUN
 
 
 def test_a_project_may_contain_slashes():
-    """``gh/peeringdb/peeringdb`` is one project, not three path segments —
+    """``group/team/project`` is one project, not three path segments —
     which is why the key is split from both ends rather than by count."""
-    key = RunKey.parse("git.20c.com/gh/peeringdb/peeringdb/develop-1")
-    assert key == RunKey("git.20c.com", "gh/peeringdb/peeringdb", "develop-1")
+    key = RunKey.parse("gitlab.example.com/group/team/project/develop-1")
+    assert key == RunKey("gitlab.example.com", "group/team/project", "develop-1")
 
 
 def test_something_that_is_not_a_run_key_is_refused():
     with pytest.raises(ValueError):
-        RunKey.parse("git.20c.com/agents")
+        RunKey.parse("gitlab.example.com/agents")
 
 
 def test_a_state_row_becomes_a_key():
-    row = {"host": "git.20c.com", "project": "agents/global",
+    row = {"host": "gitlab.example.com", "project": "group/project",
            "slug": "develop-327", "attention": {"reason": "question"}}
     assert RunKey.from_row(row) == RUN
 

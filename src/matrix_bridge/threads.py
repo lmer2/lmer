@@ -49,7 +49,7 @@ class RunKey:
         """``host/project/slug``, where the project itself contains slashes.
 
         Split from both ends rather than by count: a GitLab project is a path
-        (``agents/global``, ``gh/peeringdb/peeringdb``) and only the first and
+        (``group/project``, ``group/team/project``) and only the first and
         last segments are fixed.
         """
         parts = text.split("/")

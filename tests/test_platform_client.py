@@ -170,6 +170,23 @@ def test_a_call_with_no_params_or_body_sends_neither(endpoint):
     assert recorder.calls[0]["json"] is None
 
 
+def test_extra_headers_ride_along_but_never_replace_the_credential(endpoint):
+    """``X-Lmer-Principal`` is why this parameter exists: one credential is
+    shared by every Matrix principal the bridge speaks for, so the daemon's log
+    would otherwise record only the bridge. A caller that tried to send its own
+    ``Authorization`` loses to the endpoint's."""
+    recorder = Recorder()
+    client.request(
+        endpoint, client.Call("POST", "/api/runs/answer"), timeout=5.0,
+        transport=recorder,
+        headers={"X-Lmer-Principal": "@alice:matrix.example.net",
+                 "Authorization": "Bearer not-this-one"},
+    )
+    sent = recorder.calls[0]["headers"]
+    assert sent["X-Lmer-Principal"] == "@alice:matrix.example.net"
+    assert sent["Authorization"] == f"Bearer {SECRET}"
+
+
 # --- against the real app ----------------------------------------------------
 
 def test_a_route_answers_through_the_transport_seam(app_transport):

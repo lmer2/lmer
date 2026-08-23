@@ -86,13 +86,21 @@ class Call:
 
 
 def request(
-    endpoint: Endpoint, call: Call, *, timeout: float, transport=None
+    endpoint: Endpoint, call: Call, *, timeout: float, transport=None,
+    headers: Optional[dict] = None,
 ) -> Any:
     """Issue *call*. Returns the response object; raises on a transport failure.
 
     *transport* is the seam the tests drive the real FastAPI app through, and the
     only reason this parameter exists. It is anything with ``requests``' own
     ``request(method, url, …)`` signature — the module itself by default.
+
+    *headers* is for a client that carries something about *who asked* —
+    ``lmer-matrix-bridge`` sends ``X-Lmer-Principal`` with the Matrix id whose
+    message caused the call, because one platform credential is shared by every
+    principal it bridges and the daemon's log would otherwise record only the
+    bridge. The endpoint's own headers are merged **last**, so nothing passed
+    here can replace the ``Authorization`` header with one of its own.
 
     The credential is a header and the query string is built by the transport
     from ``params``, both for :func:`lmer_platform.session_io._call`'s reason:
@@ -106,7 +114,7 @@ def request(
             endpoint.url(call.path),
             params=call.params,
             json=call.body,
-            headers=endpoint.headers(),
+            headers={**(headers or {}), **endpoint.headers()},
             timeout=timeout,
         )
     except requests.RequestException as exc:
