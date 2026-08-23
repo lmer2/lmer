@@ -54,7 +54,13 @@ pytest:
     # python:3.12 image does not ship it, so the merge tests fail without
     # this install. The runtime container (Containerfile) installs jq too.
     - apt-get update && apt-get install -y --no-install-recommends jq
-    - pip install uv && uv sync --frozen
+    # `--extra matrix` deliberately: the Matrix bridge's dependencies live in an
+    # optional extra (issue #327), and a plain `uv sync` leaves them out — which
+    # turned the bridge's own guards into silent skips and made a green pipeline
+    # mean less than it looked like it meant (!242/!243 review). Every extra this
+    # project defines belongs in this line for the same reason: a dependency CI
+    # never installs is a dependency CI never tests.
+    - pip install uv && uv sync --frozen --extra matrix
     # The Node the guards above run under, fetched with the same command an
     # operator runs on a host: `setup-ui` downloads the pinned Node
     # (lmer_platform.ui_build.NODE_VERSION, SHA-256 verified) into

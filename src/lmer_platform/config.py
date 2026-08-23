@@ -459,6 +459,20 @@ class PlatformConfig:
     #: digests. See :data:`NUDGE_SETTING_KEYS` and :data:`INT_SETTINGS`.
     nudge_after_seconds: int = DEFAULT_NUDGE_AFTER_SECONDS
     nudge_pending_threshold: int = DEFAULT_NUDGE_PENDING_THRESHOLD
+    #: The Matrix bridge's settings (issue #327) — the raw ``config.json``
+    #: mapping, deliberately unparsed here for the reason :attr:`slots` gives:
+    #: :mod:`matrix_bridge.config` is the only module that knows what a
+    #: capability is, and a typo in an allowlist must refuse *the bridge*
+    #: rather than a daemon that would then be unreconfigurable through its own
+    #: UI. Validated here only as far as "it is a mapping".
+    #:
+    #: It is a field rather than an unknown key the loader tolerates because the
+    #: bridge writes back: D5 records the room id after creating the room, and
+    #: :func:`update_stored` refuses unknown fields — while :func:`save` would
+    #: *delete* an unknown key outright, taking the operator's allowlist with
+    #: it. No environment override, for :attr:`slots`' second reason: a JSON
+    #: mapping in an env var is a footgun.
+    matrix: Optional[dict] = None
 
     @property
     def secret_path(self) -> Path:
@@ -573,6 +587,9 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
     slots = _slots_value(config.slots)
     if slots != config.slots:
         config = replace(config, slots=slots)
+    matrix = _matrix_value(config.matrix)
+    if matrix != config.matrix:
+        config = replace(config, matrix=matrix)
     for field_name in INT_SETTINGS:
         usable = _int_setting_value(getattr(config, field_name), field=field_name)
         if usable != getattr(config, field_name):
@@ -598,6 +615,26 @@ def _slots_value(value: object) -> tuple:
         "slot entries; no service slots are declared", value,
     )
     return ()
+
+
+def _matrix_value(value: object) -> Optional[dict]:
+    """The Matrix bridge's mapping, or ``None`` with a warning.
+
+    :func:`_slots_value`'s house rule, for :func:`_slots_value`'s reason: this
+    daemon does not read the mapping, and refusing to boot over the bridge's
+    config would take the UI down with it. What is *inside* the mapping is
+    :mod:`matrix_bridge.config`'s to refuse — loudly, because the bridge has no
+    UI to be fixed through and an allowlist is the only authorization it has.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    logger.warning(
+        "platform_config_unusable field=matrix value=%r — expected a mapping "
+        "of the bridge's settings; the Matrix bridge will refuse to start", value,
+    )
+    return None
 
 
 def _int_setting_value(value: object, *, field: str) -> int:
