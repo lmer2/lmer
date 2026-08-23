@@ -75,6 +75,11 @@ class FakeHomeserver(Homeserver):
     #: ``(host, port)`` once :meth:`listen` has been awaited — the fact that
     #: proves the bridge is listening at all (!245 review).
     listening: Optional[tuple] = None
+    #: The teardown steps in the order they ran — ``"listener"`` when
+    #: :meth:`serve_forever` stopped the listener on its way out, ``"aclose"``
+    #: per :meth:`aclose` call. The shutdown tests (#349) assert on the order
+    #: and the count, not just the flags.
+    shutdown_order: list = field(default_factory=list)
     #: Refuse every homeserver call until :meth:`listen` has run, the way
     #: ``mautrix``' ``AppService.intent`` does. See :meth:`_require_listener`.
     requires_listener: bool = False
@@ -163,13 +168,18 @@ class FakeHomeserver(Homeserver):
         """Record the bind, the way the real listener does."""
         self.listening = (host, port)
 
-    async def serve_forever(self) -> None:
+    async def serve_forever(self, stop=None) -> None:
         import asyncio
 
-        await asyncio.Event().wait()
+        try:
+            await (stop if stop is not None else asyncio.Event()).wait()
+        finally:
+            if self.listening is not None:
+                self.shutdown_order.append("listener")
 
     async def aclose(self) -> None:
         self.closed = True
+        self.shutdown_order.append("aclose")
 
     def _require_listener(self) -> None:
         """Raise the way ``AppService.intent`` does before ``start()``.

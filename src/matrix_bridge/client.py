@@ -368,8 +368,12 @@ class Homeserver:
         """
         raise NotImplementedError
 
-    async def serve_forever(self) -> None:
-        """Keep the listener up until cancelled, then shut it down."""
+    async def serve_forever(self, stop: Optional[asyncio.Event] = None) -> None:
+        """Keep the listener up until *stop* is set (or cancelled), then shut it
+        down. The transport itself stays open: closing it is :meth:`aclose`,
+        which the caller runs after **both** halves of the bridge have drained
+        — an in-flight outbound send still needs the session this listener
+        never owned (issue #349)."""
         raise NotImplementedError
 
 
@@ -410,9 +414,9 @@ class MatrixClient:
         """
         await self.homeserver.listen(host, port)
 
-    async def serve_forever(self) -> None:
-        """Keep the listener up until cancelled."""
-        await self.homeserver.serve_forever()
+    async def serve_forever(self, stop: Optional[asyncio.Event] = None) -> None:
+        """Keep the listener up until *stop* is set (or cancelled)."""
+        await self.homeserver.serve_forever(stop)
 
     async def aclose(self) -> None:
         """Release what the transport opened."""
@@ -843,21 +847,26 @@ class MautrixHomeserver(Homeserver):
         self._listening = True
         logger.info("matrix_appservice_listening host=%s port=%s", host, port)
 
-    async def serve_forever(self) -> None:
+    async def serve_forever(self, stop: Optional[asyncio.Event] = None) -> None:
+        # Only the listener stops here. The session and the database outlive
+        # this coroutine deliberately (issue #349): a stop request first
+        # silences inbound — the homeserver redelivers unacknowledged
+        # transactions, so refusing connections loses nothing — while an
+        # in-flight outbound tick may still need both to finish its send.
+        # ``serve()`` calls :meth:`aclose` once that drain is done.
         try:
-            await asyncio.Event().wait()
+            await (stop if stop is not None else asyncio.Event()).wait()
         finally:
             if self._listening:
                 await self._appservice().stop()
-            await self.aclose()
 
     async def aclose(self) -> None:
         """Release what this transport opened: the HTTP session, the database.
 
-        Called on the way out of ``serve_forever`` and by the CLI's short-lived
-        verbs. Without it every ``check`` exited with aiohttp's "Unclosed client
-        session" warning — harmless, and exactly the kind of noise that trains
-        an operator to ignore a diagnostic's output.
+        Called by ``serve()`` after both halves have drained, and by the CLI's
+        short-lived verbs. Without it every ``check`` exited with aiohttp's
+        "Unclosed client session" warning — harmless, and exactly the kind of
+        noise that trains an operator to ignore a diagnostic's output.
         """
         await self._reset_outbound_client()
         if self._database is not None:

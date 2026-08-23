@@ -666,3 +666,344 @@ async def test_run_reaches_the_running_state_with_the_listener_up(
 
 async def _none():
     return None
+
+
+# --- shutdown (#349) ----------------------------------------------------------
+#
+# The bridge is PID 1 in its container, where an uninstalled SIGTERM is not
+# defaulted but dropped — before the handler existed, every stop was podman's
+# 10-second grace and then SIGKILL, with the crypto store open. What is pinned
+# here: a stop request drains and returns (listener down before the transport
+# closes), the real signals take the same path, no tick starts after stop, an
+# in-flight tick gets a bounded grace, and a second signal forfeits it.
+
+def _bridge(configured, monkeypatch):
+    """A serve()-able bridge on the fake transport, mirroring the listener test."""
+    homeserver = FakeHomeserver(
+        room_id=STORED["room_id"], whoami_as=configured.sender,
+    )
+    client = mxclient.MatrixClient(
+        configured, homeserver, record_room_id=lambda _: None,
+    )
+    client.store_path.parent.mkdir(parents=True, exist_ok=True)
+    client.store_path.write_bytes(b"a crypto store")
+
+    monkeypatch.setattr(mxcli.mxclient, "connect", lambda config, secrets: client)
+    monkeypatch.setattr(
+        mxcli.mxout, "platform_endpoint",
+        lambda: Endpoint("http://127.0.0.1:8765", "secret-value"),
+    )
+    monkeypatch.setattr(mxcli.mxout.Outbound, "snapshot", lambda self: _none())
+    return homeserver
+
+
+async def _until_running(task, homeserver):
+    import asyncio
+
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if task.done() or (homeserver.callback and homeserver.joined):
+            break
+    if task.done() and task.exception():
+        raise AssertionError(
+            f"the bridge never reached its running state: {task.exception()!r}"
+        )
+
+
+async def test_a_stop_request_drains_and_serve_returns(
+    configured, secrets, monkeypatch,
+):
+    """``stop.set()`` mid-run: ``serve`` returns on its own, having stopped the
+    listener **before** closing the transport — an in-flight send still needs
+    the session the listener never owned — and closed it exactly once."""
+    import asyncio
+
+    homeserver = _bridge(configured, monkeypatch)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(mxcli.serve(configured, secrets, stop=stop))
+    await _until_running(task, homeserver)
+
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert homeserver.shutdown_order == ["listener", "aclose"]
+    assert homeserver.closed
+
+
+def _assert_sigterm_handled(signal_module):
+    """A guard in front of every real ``os.kill`` below (!247 review nit): if
+    the handler ever stops being installed, SIGTERM's default disposition
+    would terminate the whole pytest process instead of failing one test."""
+    disposition = signal_module.getsignal(signal_module.SIGTERM)
+    assert disposition not in (
+        signal_module.SIG_DFL, signal_module.SIG_IGN,
+    ), "no SIGTERM handler installed — sending the signal would kill pytest"
+
+
+async def test_a_stop_during_startup_aborts_it(
+    configured, secrets, monkeypatch, caplog,
+):
+    """The !247 review's blocking finding: startup is homeserver round trips
+    with no timeout, and it is exactly when a bad deployment has the operator
+    stopping the unit — so a stop request there must abort the startup and
+    exit cleanly, not sit recorded-but-ignored until the SIGKILL."""
+    import asyncio
+    import logging
+
+    caplog.set_level(logging.INFO, logger="matrix_bridge")
+    homeserver = _bridge(configured, monkeypatch)
+    release = asyncio.Event()
+
+    async def unanswering_start(self):
+        # A homeserver that accepts the connection and never answers.
+        await release.wait()
+
+    monkeypatch.setattr(mxclient.MatrixClient, "start", unanswering_start)
+    stop = asyncio.Event()
+    task = asyncio.ensure_future(mxcli.serve(configured, secrets, stop=stop))
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert not task.done(), "the bridge must still be inside its startup"
+
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert homeserver.closed, "the abort still releases the transport"
+    messages = [record.getMessage() for record in caplog.records]
+    assert not any(m.startswith("matrix_bridge_started") for m in messages), (
+        "an aborted startup must not claim the bridge ran"
+    )
+    assert "matrix_bridge_stopped" in messages
+
+
+async def test_sigterm_and_the_journal_take_the_same_stop_path(
+    configured, secrets, monkeypatch, caplog,
+):
+    """A real SIGTERM through the loop's handler: same drain, plus the two
+    journal lines an operator tells a requested stop from a crash by."""
+    import asyncio
+    import logging
+    import os
+    import signal as signal_module
+
+    caplog.set_level(logging.INFO, logger="matrix_bridge")
+    homeserver = _bridge(configured, monkeypatch)
+    task = asyncio.ensure_future(mxcli.serve(configured, secrets))
+    await _until_running(task, homeserver)
+
+    _assert_sigterm_handled(signal_module)
+    os.kill(os.getpid(), signal_module.SIGTERM)
+    await asyncio.wait_for(task, timeout=5)
+
+    assert homeserver.shutdown_order == ["listener", "aclose"]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(m == "matrix_bridge_stopping signal=SIGTERM" for m in messages)
+    assert "matrix_bridge_stopped" in messages
+    # And the handlers are gone with the serve that installed them: a False
+    # return says the loop had nothing left to remove.
+    loop = asyncio.get_running_loop()
+    assert loop.remove_signal_handler(signal_module.SIGTERM) is False
+    assert loop.remove_signal_handler(signal_module.SIGINT) is False
+
+
+async def test_a_failing_half_still_tears_down_in_order(
+    configured, secrets, monkeypatch,
+):
+    """One half crashing must not close the transport under the other: the
+    group drains both halves first — listener down, then aclose — and the
+    failure itself still reaches ``main()``'s error handling unwrapped."""
+    import asyncio
+
+    homeserver = _bridge(configured, monkeypatch)
+
+    async def failing_poll(outbound, poll_seconds, stop, hurry, **kwargs):
+        raise mxclient.MatrixClientError("the poll half died")
+
+    monkeypatch.setattr(mxcli, "poll_forever", failing_poll)
+    with pytest.raises(mxclient.MatrixClientError):
+        await asyncio.wait_for(mxcli.serve(configured, secrets), timeout=5)
+    assert homeserver.shutdown_order == ["listener", "aclose"]
+
+
+async def test_a_second_sigterm_reaches_the_hurry_path(
+    configured, secrets, monkeypatch, caplog,
+):
+    """Two real signals through the real handler: the second one journals
+    ``immediate=1`` and sets the event the drain forfeits its grace on."""
+    import asyncio
+    import logging
+    import os
+    import signal as signal_module
+
+    caplog.set_level(logging.INFO, logger="matrix_bridge")
+    homeserver = _bridge(configured, monkeypatch)
+    stop, hurry = asyncio.Event(), asyncio.Event()
+
+    async def parked_poll(outbound, poll_seconds, stop, hurry, **kwargs):
+        # Keep the bridge draining until the second signal, the way an
+        # in-flight tick inside its grace would.
+        await hurry.wait()
+
+    monkeypatch.setattr(mxcli, "poll_forever", parked_poll)
+    task = asyncio.ensure_future(
+        mxcli.serve(configured, secrets, stop=stop, hurry=hurry)
+    )
+    await _until_running(task, homeserver)
+
+    _assert_sigterm_handled(signal_module)
+    os.kill(os.getpid(), signal_module.SIGTERM)
+    await asyncio.wait_for(stop.wait(), timeout=5)
+    os.kill(os.getpid(), signal_module.SIGTERM)
+    await asyncio.wait_for(task, timeout=5)
+
+    assert hurry.is_set()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        m == "matrix_bridge_stopping signal=SIGTERM immediate=1"
+        for m in messages
+    )
+
+
+class _TickProbe:
+    """An outbound whose ticks the test controls and observes."""
+
+    def __init__(self, *, park: bool = False, fail_first: bool = False):
+        import asyncio
+
+        self.park = park          # a tick that never finishes on its own
+        self.fail_first = fail_first  # the first tick raises
+        self.release = asyncio.Event()  # lets a parked tick finish
+        self.started = 0
+        self.finished = 0
+        self.cancelled = 0
+
+    async def tick(self):
+        import asyncio
+
+        self.started += 1
+        if self.fail_first and self.started == 1:
+            raise RuntimeError("this tick failed; the next may succeed")
+        try:
+            if self.park:
+                await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        self.finished += 1
+        return []
+
+
+async def test_no_tick_starts_after_stop():
+    """A stop during the sleep returns at once, with nothing new in flight."""
+    import asyncio
+
+    outbound = _TickProbe()
+    stop, hurry = asyncio.Event(), asyncio.Event()
+    task = asyncio.ensure_future(
+        mxcli.poll_forever(outbound, 3600, stop, hurry)
+    )
+    await asyncio.sleep(0)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert outbound.started == 0
+
+
+async def test_a_stop_in_the_same_wakeup_as_the_interval_starts_no_tick():
+    """!247 review: ``wait_for`` raises ``TimeoutError`` even when stop lands
+    in the same wake-up as the interval expiring — without the post-timeout
+    check, that one tick starts after stop and can then be cancelled
+    mid-send. The event subclass delivers the stop at exactly that moment:
+    inside the waiter's cancellation, after the timeout has already won."""
+    import asyncio
+
+    class StopAtExpiry(asyncio.Event):
+        async def wait(self):
+            try:
+                return await super().wait()
+            except asyncio.CancelledError:
+                self.set()
+                raise
+
+    outbound = _TickProbe()
+    stop, hurry = StopAtExpiry(), asyncio.Event()
+    # A nonzero interval so the waiter is genuinely parked when the timeout
+    # cancels it — timeout=0 short-circuits before the coroutine first runs
+    # and the hook above would never fire.
+    task = asyncio.ensure_future(
+        mxcli.poll_forever(outbound, 0.01, stop, hurry)
+    )
+    await asyncio.wait_for(task, timeout=5)
+    assert outbound.started == 0, "no tick may start after stop"
+
+
+async def test_a_failing_tick_does_not_end_the_loop():
+    """The pre-#349 promise, re-pinned through the rewritten loop: a tick that
+    raises is logged and the next interval still ticks."""
+    import asyncio
+
+    outbound = _TickProbe(fail_first=True)
+    stop, hurry = asyncio.Event(), asyncio.Event()
+    task = asyncio.ensure_future(
+        mxcli.poll_forever(outbound, 0, stop, hurry)
+    )
+    while outbound.finished == 0:
+        await asyncio.sleep(0)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert outbound.started >= 2, "the loop must survive the failing tick"
+
+
+async def test_an_in_flight_tick_finishes_inside_the_grace():
+    """A stop mid-tick lets the tick complete: this is the drain that closes
+    the send-then-bind window in the common case."""
+    import asyncio
+
+    outbound = _TickProbe(park=True)
+    stop, hurry = asyncio.Event(), asyncio.Event()
+    task = asyncio.ensure_future(
+        mxcli.poll_forever(outbound, 0, stop, hurry, tick_grace=30)
+    )
+    while outbound.started == 0:
+        await asyncio.sleep(0)
+    stop.set()
+    await asyncio.sleep(0)
+    outbound.release.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert outbound.finished == 1
+    assert outbound.cancelled == 0
+
+
+async def test_a_slow_tick_is_cancelled_after_the_grace():
+    import asyncio
+
+    outbound = _TickProbe(park=True)
+    stop, hurry = asyncio.Event(), asyncio.Event()
+    task = asyncio.ensure_future(
+        mxcli.poll_forever(outbound, 0, stop, hurry, tick_grace=0.05)
+    )
+    while outbound.started == 0:
+        await asyncio.sleep(0)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert outbound.cancelled == 1
+    assert outbound.finished == 0
+
+
+async def test_a_second_signal_forfeits_the_grace():
+    """One signal is polite, two is now: the parked tick dies immediately even
+    though its grace has barely started."""
+    import asyncio
+
+    outbound = _TickProbe(park=True)
+    stop, hurry = asyncio.Event(), asyncio.Event()
+    task = asyncio.ensure_future(
+        mxcli.poll_forever(outbound, 0, stop, hurry, tick_grace=3600)
+    )
+    while outbound.started == 0:
+        await asyncio.sleep(0)
+    stop.set()
+    await asyncio.sleep(0)
+    hurry.set()
+    await asyncio.wait_for(task, timeout=5)
+    assert outbound.cancelled == 1
+    assert outbound.finished == 0
