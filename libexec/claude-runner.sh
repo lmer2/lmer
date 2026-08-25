@@ -243,6 +243,12 @@ elif [ -f "$SETTINGS_LOCAL" ] && ! command -v jq >/dev/null 2>&1; then
     echo "⚠️  Found settings.local.json but jq not available for merging"
 fi
 
+# LMER_CLAUDE_OUTPUT_STYLE (issue #257). Last of the settings writers on purpose:
+# the launch's own variable outranks whatever any tree or personal file merged in.
+# The styles directory is derived from the settings file so the test seam moves
+# both together.
+claude_apply_output_style "$SETTINGS_FILE" "$(dirname "$SETTINGS_FILE")/output-styles"
+
 # Check for Danger Zone mode (skip permissions)
 if [ "$LMER_DANGER_ZONE" = "1" ]; then
     echo "⚠️  DANGER ZONE: Skipping all permissions checks!"

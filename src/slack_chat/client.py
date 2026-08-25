@@ -1,6 +1,7 @@
 """Slack Web API client for chat operations."""
 
 import os
+import re
 import time
 import requests
 from typing import Any, Dict, List, Optional
@@ -8,6 +9,33 @@ from typing import Any, Dict, List, Optional
 
 # Maximum number of times to retry after an HTTP 429 response.
 _MAX_RETRIES = 3
+
+# A run reference as an agent writes it (issue #241). The inner shape is the same
+# grammar `web/src/runref.js` admits; `tests/test_slack_run_references.py` runs one
+# corpus through both so the two copies cannot drift.
+_RUN_REF_LINK = re.compile(
+    # `(?<!\\)` because `\[x](lmer://…)` is literal text in CommonMark, not a link.
+    r"!?(?<!\\)\[([^\]\n]*)\]\("
+    r"lmer://run/([A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*){2,})"
+    r"\)"
+)
+
+
+def strip_run_references(text: str) -> str:
+    r"""Reduce every run reference in *text* to the label it shows (issue #241).
+
+    Slack's `mrkdwn` has no `[label](url)` form (it spells links `<url|label>`)
+    and nothing here converts markdown to it, so a reference posted verbatim
+    arrives as raw characters where the run's name should be. Converted rather
+    than left to the assistant, which cannot know whether its chat is bridged.
+
+    An escaped `\[` is not a link and is left whole; an empty label keeps the key
+    so nothing is dropped. **The substitution is context-free** — it does not know
+    what a code span or a fenced block is, so a reference written as an *example*
+    is reduced too. Parsing CommonMark is more machinery than that earns; see
+    `docs/PLATFORM-QUICKSTART.md`, "Run references in chat".
+    """
+    return _RUN_REF_LINK.sub(lambda m: m.group(1) or m.group(2), text)
 
 
 class SlackError(Exception):
@@ -121,7 +149,9 @@ class SlackClient:
         payload = {
             "channel": channel,
             "thread_ts": thread_ts,
-            "text": text,
+            # The single egress: converting per caller would leave the next
+            # poster added here a surface that leaks raw markdown (#241).
+            "text": strip_run_references(text),
         }
         data = self._request("POST", "chat.postMessage", json=payload)
         ts = data.get("ts")

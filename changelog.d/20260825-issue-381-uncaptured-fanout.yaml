@@ -1,0 +1,2 @@
+fixed:
+- "spawn-harness now detects a child that exits 0 with no usable answer even without `--output`: stdout is teed and measured instead of the check being skipped (#152)"

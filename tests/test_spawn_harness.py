@@ -856,14 +856,58 @@ class TestDegenerateOutputEndToEnd:
         assert "NO USABLE OUTPUT" not in content
         assert "no usable output" not in capsys.readouterr().err
 
-    def test_without_output_file_nothing_is_checked(self, tmp_path, capsys):
-        # Stdout flows straight through to ours, so there is no captured file
-        # to inspect — documented limitation, not a silent failure.
+    @pytest.mark.parametrize(
+        "stdout_text, expected_fragment",
+        [
+            ("", "stdout is empty"),
+            ("   \n\n\t\n", "stdout is whitespace only"),
+            ("ok\n", "below the"),
+        ],
+    )
+    def test_without_output_the_stream_is_checked_too(
+        self, tmp_path, capsys, stdout_text, expected_fragment
+    ):
+        """Issue #152: the skip used to be silent."""
         code, _, _ = _run_main(
-            tmp_path, ["opus-review", "--prompt", "p"], stdout_text=""
+            tmp_path, ["opus-review", "--prompt", "p"], stdout_text=stdout_text
+        )
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "no usable output" in err
+        assert expected_fragment in err
+        # Nothing to append a footer to, and the warning says which case it is.
+        assert "no file to mark" in err
+
+    def test_an_uncaptured_real_answer_is_not_warned_about(self, tmp_path, capsys):
+        """Why this is a tee and not a notice on every uncaptured run."""
+        code, _, _ = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p"], stdout_text="no findings\n"
         )
         assert code == 0
         assert "no usable output" not in capsys.readouterr().err
+
+    def test_an_uncaptured_failure_is_not_also_called_degenerate(
+        self, tmp_path, capsys
+    ):
+        """A non-zero exit already announced itself."""
+        code, _, _ = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p"], exit_code=3, stdout_text=""
+        )
+        assert code == 3
+        assert "no usable output" not in capsys.readouterr().err
+
+    def test_the_tee_forwards_the_child_bytes_unchanged(self, tmp_path, capfd):
+        """capfd, not capsys: the bytes that reach fd 1, through the real
+        `sys.stdout.buffer` write. Multi-byte and no trailing newline, because
+        both are ways a pass-through rewrites an answer."""
+        answer = "reviewed — ✅ no findings, naïve as that sounds"
+        code, _, _ = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p"], stdout_text=answer
+        )
+        assert code == 0
+        captured = capfd.readouterr()
+        assert answer in captured.out
+        assert "no usable output" not in captured.err
 
     def test_unreadable_output_does_not_accuse_the_agent(self, tmp_path, capsys):
         missing = tmp_path / "vanished.md"
@@ -1163,3 +1207,231 @@ class TestBinWrapper:
         )
         assert result.returncode == 0
         assert "opus-review" in result.stdout
+
+
+class TestStdoutTally:
+    """The streaming half of the classifier's inputs (issue #152): same answer,
+    same verdict, captured or streamed."""
+
+    @staticmethod
+    def _tally(chunks):
+        tally = spawn_harness._StdoutTally()
+        for chunk in chunks:
+            tally.feed(chunk)
+        tally.finish()
+        return tally
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "",
+            "   \n\n\t\n",
+            "ok\n",
+            "n/a",
+            "no findings\n",
+            "a         b\n",
+            "  padded answer that is long enough  \n",
+        ],
+    )
+    def test_counts_match_the_file_path(self, content):
+        tally = self._tally([content.encode()])
+        assert tally.total == len(content)
+        assert tally.stripped == len(content.strip())
+        assert spawn_harness.classify_degenerate_counts(
+            tally.total, tally.stripped
+        ) == spawn_harness.classify_degenerate_output(content)
+
+    def test_interior_whitespace_counts_as_the_file_counts_it(self):
+        """`a         b` is 11 stripped characters — a real answer by the floor's
+        own rule — so counting non-whitespace ones would call it a stub."""
+        tally = self._tally([b"a         b"])
+        assert tally.stripped == 11
+        assert spawn_harness.classify_degenerate_counts(
+            tally.total, tally.stripped
+        ) is None
+
+    def test_chunk_boundaries_do_not_change_the_verdict(self):
+        content = "   leading and trailing space   "
+        whole = self._tally([content.encode()])
+        split = self._tally([content[:5].encode(), content[5:].encode()])
+        assert (split.total, split.stripped) == (whole.total, whole.stripped)
+
+    def test_a_multibyte_character_split_across_reads_is_one_character(self):
+        raw = "✅ ok".encode()
+        split = self._tally([raw[:1], raw[1:]])
+        assert (split.total, split.stripped) == (len("✅ ok"), len("✅ ok"))
+
+    def test_it_is_not_done_until_the_stream_ended(self):
+        """`done` separates "the answer" from "some of the answer"."""
+        tally = spawn_harness._StdoutTally()
+        tally.feed(b"partial")
+        assert not tally.done
+        tally.finish()
+        assert tally.done
+
+
+class _FakeStream:
+    """A `proc.stdout` stand-in that hands out fixed chunks, then EOF."""
+
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+        self.reads = 0
+        self.closed = False
+
+    def read1(self, _size):
+        self.reads += 1
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self):
+        self.closed = True
+
+
+class TestTeeSurvivesADeadReader:
+    """What happens when *our* stdout goes away mid-run (issue #152 follow-up).
+
+    The contract: forwarding may fail, draining may not. With a pipe between the
+    child and our stdout, nothing else reads `proc.stdout` — the child blocks once
+    the buffer fills and `--timeout` has no default.
+    """
+
+    def test_a_broken_pipe_does_not_stop_the_drain(self, monkeypatch, capsys):
+        chunks = [b"first chunk ", b"second chunk ", b"third chunk"]
+        stream = _FakeStream(chunks)
+        monkeypatch.setattr(
+            spawn_harness,
+            "_write_stdout_bytes",
+            lambda data: (_ for _ in ()).throw(BrokenPipeError(32, "Broken pipe")),
+        )
+        tally = spawn_harness._StdoutTally()
+
+        spawn_harness._pump_stdout(stream, tally)
+
+        # Every chunk plus the EOF read: the child is never blocked.
+        assert stream.reads == len(chunks) + 1
+        assert stream.closed
+        # And the answer was still measured.
+        assert tally.done
+        assert tally.total == sum(len(chunk) for chunk in chunks)
+        err = capsys.readouterr().err
+        assert "cannot forward the child's stdout" in err
+        # Once, not once per chunk.
+        assert err.count("cannot forward") == 1
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            # A dead descriptor.
+            BrokenPipeError(32, "Broken pipe"),
+            OSError(9, "Bad file descriptor"),
+            # A closed stream *object*, which is not an OSError at all. Its own
+            # door into the same room: before this was caught, the exception
+            # escaped, and while `finally: stream.close()` kept the hang away, it
+            # skipped `_abandon_stdout` — the call that stops the interpreter's
+            # shutdown flush from replacing the child's exit code with 120.
+            ValueError("I/O operation on closed file"),
+        ],
+    )
+    def test_every_write_failure_is_a_drain_not_a_crash(
+        self, monkeypatch, capsys, failure
+    ):
+        stream = _FakeStream([b"first ", b"second"])
+
+        def explode(_data):
+            raise failure
+
+        monkeypatch.setattr(spawn_harness, "_write_stdout_bytes", explode)
+        tally = spawn_harness._StdoutTally()
+
+        spawn_harness._pump_stdout(stream, tally)
+
+        assert stream.reads == 3, "the drain stopped, so the child could block"
+        assert stream.closed
+        assert tally.done, "no verdict is possible if the tally never finished"
+        assert "cannot forward the child's stdout" in capsys.readouterr().err
+
+    def test_a_child_still_reports_its_answer_when_forwarding_fails(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """End to end: the exit code is still the child's, and the check runs."""
+        monkeypatch.setattr(
+            spawn_harness,
+            "_write_stdout_bytes",
+            lambda data: (_ for _ in ()).throw(BrokenPipeError(32, "Broken pipe")),
+        )
+        code, _, _ = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p"], stdout_text="no findings\n"
+        )
+        assert code == 0
+        err = capsys.readouterr().err
+        assert "cannot forward the child's stdout" in err
+        # A real answer, so no degenerate warning — the check ran, it just passed.
+        assert "no usable output" not in err
+
+    def test_a_degenerate_answer_is_still_caught_when_forwarding_fails(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.setattr(
+            spawn_harness,
+            "_write_stdout_bytes",
+            lambda data: (_ for _ in ()).throw(BrokenPipeError(32, "Broken pipe")),
+        )
+        code, _, _ = _run_main(
+            tmp_path, ["opus-review", "--prompt", "p"], stdout_text="ok\n"
+        )
+        assert code == 0
+        assert "no usable output" in capsys.readouterr().err
+
+    def test_a_real_dead_pipe_leaves_the_child_s_exit_code_alone(self, tmp_path):
+        """The whole failure in the shape it happens in: two of its three parts —
+        the child blocking on a full pipe buffer, and CPython's shutdown flush
+        exiting 120 — only exist in a real process."""
+        fake_bin, _, _ = _make_stub(
+            tmp_path,
+            "claude",
+            # Past the 64 KiB pipe buffer the child would block on.
+            stdout_text="padding line that is long enough to matter\n" * 40000,
+        )
+        env = {
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+            "HOME": str(tmp_path),
+            "PYTHONPATH": str(BIN_WRAPPER.parent.parent / "src"),
+            "LMER_SPAWN_AGENTS": ",".join(CONFIG),
+            **_config_env(CONFIG),
+        }
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)  # the consumer is gone: `spawn-harness … | head`
+        try:
+            proc = subprocess.Popen(
+                [
+                    sys.executable, "-m", "lmer_cli.container.spawn_harness",
+                    "opus-review", "--prompt", "p", "--heartbeat", "0",
+                ],
+                env=env, stdout=write_fd, stderr=subprocess.PIPE,
+            )
+        finally:
+            os.close(write_fd)
+        try:
+            _, err = proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:  # pragma: no cover - the bug itself
+            proc.kill()
+            proc.communicate()
+            raise AssertionError(
+                "spawn-harness hung: nothing drained the child's stdout, so it "
+                "blocked once the pipe buffer filled"
+            )
+        stderr = err.decode(errors="replace")
+        # Not 120 from a failed shutdown flush, and not the child's EPIPE death.
+        assert proc.returncode == 0, f"rc={proc.returncode}\n{stderr}"
+        assert "cannot forward the child's stdout" in stderr
+        assert "Exception ignored" not in stderr
+
+    def test_an_unfinished_tally_produces_no_verdict(self, capsys):
+        """A prefix is not an answer: the bounded join can leave the counters mid-feed,
+        and judging that reports "missing" about a child that answered in full."""
+        tally = spawn_harness._StdoutTally()
+        tally.feed(b"")  # nothing decoded yet, and crucially not finished
+
+        assert spawn_harness.warn_degenerate_stream("opus-review", tally) is None
+        err = capsys.readouterr().err
+        assert "check was skipped" in err
+        assert "no usable output" not in err
