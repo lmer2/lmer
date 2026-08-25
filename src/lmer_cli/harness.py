@@ -233,6 +233,10 @@ class Harness:
     #: dies with the session and the chat view has nothing to read back.
     #: ``None`` for a harness that writes no transcript worth keeping.
     session_dir: Optional[str] = None
+    #: Absolute CONTAINER directory this harness keeps its agent memory in, so an
+    #: orchestrator can mount it out of a ``--rm`` container (issue #325).
+    #: ``None`` for a harness with no *native* memory feature.
+    memory_dir: Optional[str] = None
     #: For user-installed harnesses (lmer_cli.user_harnesses): the host
     #: directory the definition was loaded from. ``None`` for built-ins —
     #: the "is this a user harness" discriminator.
@@ -279,6 +283,11 @@ HARNESSES: dict[str, Harness] = {
         # lmer_platform.transcripts.CONTAINER_TRANSCRIPT_DIR, which
         # lmer_platform.spawn refuses to spawn without agreeing with.
         session_dir="/home/developer/.claude/projects",
+        # Below session_dir by claude's layout, which is why it needs a mount of
+        # its own: the platform binds a per-session transcript directory at the
+        # parent. ``-workspace`` is claude's encoding of the container cwd, the
+        # same encoding work_repo.memory relies on.
+        memory_dir="/home/developer/.claude/projects/-workspace/memory",
     ),
     "codex": Harness(
         name="codex",

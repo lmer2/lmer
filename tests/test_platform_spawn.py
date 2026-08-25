@@ -15,6 +15,7 @@ assistant holds its own slot (T75).
 
 import dataclasses
 import json
+import logging
 import os
 import stat
 import sys
@@ -30,7 +31,9 @@ from lmer_cli.harness import HARNESSES
 from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINKS_ENV
 from lmer_cli.user_harnesses import HARNESSES_DIR_ENV, clear_user_harness_cache
 from lmer_platform import config as cfg
-from lmer_platform import ask, registry, runs, session_io, spawn, store, transcripts
+from lmer_platform import (
+    ask, memory, registry, runs, session_io, spawn, store, transcripts,
+)
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
 
@@ -3505,3 +3508,235 @@ def test_a_group_that_vanished_between_probe_and_claim_is_refused(
         spawn.spawn_session(
             slot_config(fake_lmer, GROUP_SLOTS), request_for(slot="stack")
         )
+
+
+# ── The assistant's memory store (#325) ──────────────────────────────────────
+# Four properties: the mount exists for the assistant, for nobody else, the
+# entrypoint is told to link the declared path to it, and what one incarnation
+# wrote is there for the next.
+
+
+def env_of_spawn(monkeypatch, config, **kwargs):
+    """Spawn once and return the environment the child was launched with."""
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **popen_kwargs):
+        captured.update(popen_kwargs.get("env") or {})
+        return real_popen(command, **popen_kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    spawn.spawn_session(config, request_for(), **kwargs)
+    return captured
+
+
+def test_the_assistant_gets_a_memory_mount(config):
+    """Mounted where the entrypoint links the harness's declared path from, and
+    ``rw`` because the harness writes its memory files there."""
+    result = spawn.spawn_session(
+        config, request_for(), kind=registry.ASSISTANT_KIND
+    )
+    spec = mount_spec_for(result.command, memory.CONTAINER_STAGED_DIR)
+    host_dir, _, mode = spec.rsplit(":", 2)
+    assert Path(host_dir) == memory.memory_dir()
+    assert mode == "rw"
+
+
+def test_a_worker_gets_no_memory_mount(config):
+    """The store is the assistant's operational state, and a worker's memory has
+    a route of its own — one it curates through the work repo, per project."""
+    result = spawn.spawn_session(config, request_for())
+    specs = mount_specs_in(result.command)
+    assert not [
+        spec for spec in specs
+        if spec.split(":")[1:2] == [memory.CONTAINER_STAGED_DIR]
+    ]
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS), specs
+
+
+def test_the_assistant_is_told_to_link_its_declared_memory_path(
+    config, _no_user_harnesses, monkeypatch
+):
+    """Without the pair the store is mounted at a path no harness reads, which
+    is the same empty memory directory this feature exists to fix."""
+    captured = env_of_spawn(monkeypatch, config, kind=registry.ASSISTANT_KIND)
+    pairs = captured[MOUNT_LINKS_ENV].split(",")
+    assert (
+        f"{HARNESSES['claude'].memory_dir}:{memory.CONTAINER_STAGED_DIR}" in pairs
+    )
+
+
+def test_a_worker_is_told_to_link_no_memory_path(
+    config, _no_user_harnesses, monkeypatch
+):
+    """The paired half: a link with nothing mounted behind it would have the
+    entrypoint replace a worker's memory directory with a dangling symlink."""
+    captured = env_of_spawn(monkeypatch, config)
+    assert memory.CONTAINER_STAGED_DIR not in captured[MOUNT_LINKS_ENV]
+
+
+def test_what_one_incarnation_saved_is_mounted_for_the_next(config):
+    """Issue #325 in one assertion: the store is per host, not per session."""
+    first = spawn.spawn_session(
+        config, request_for(), kind=registry.ASSISTANT_KIND
+    )
+    first_dir = Path(
+        mount_spec_for(first.command, memory.CONTAINER_STAGED_DIR).rsplit(":", 2)[0]
+    )
+    (first_dir / "MEMORY.md").write_text("- [/work goes stale]\n", encoding="utf-8")
+
+    # Both incarnations are the same run (the assistant's target never changes),
+    # so the second spawn has to wait for the first entry to be reaped or
+    # ``_refuse_if_run_is_live`` refuses it — which is the one-run-one-session
+    # rule working, not this feature failing.
+    assert wait_for(lambda: registry.read_session(first.session_id) is None)
+    second = spawn.spawn_session(
+        config, request_for(), kind=registry.ASSISTANT_KIND
+    )
+    second_dir = Path(
+        mount_spec_for(second.command, memory.CONTAINER_STAGED_DIR).rsplit(":", 2)[0]
+    )
+    assert second_dir == first_dir
+    assert (second_dir / "MEMORY.md").is_file()
+
+
+def test_the_assistant_cannot_mirror_its_memory_into_the_work_repo(
+    config, monkeypatch
+):
+    """Platform-local is a constraint, not a default: the shared-repo route is
+    closed in the child's environment rather than left to refuse for a reason
+    (no repo identity) that has nothing to do with this decision."""
+    monkeypatch.setenv(memory.PERSIST_ENV_VAR, "1")
+    captured = env_of_spawn(monkeypatch, config, kind=registry.ASSISTANT_KIND)
+    assert captured[memory.PERSIST_ENV_VAR] == "", (
+        "blank, not deleted — the child re-seeds a missing key from .env files"
+    )
+
+
+def test_a_worker_keeps_the_work_repo_memory_route(config, monkeypatch):
+    """The narrowness of the rule above, asserted: closing the route for every
+    session would silently turn the operator's per-project memory off."""
+    monkeypatch.setenv(memory.PERSIST_ENV_VAR, "1")
+    captured = env_of_spawn(monkeypatch, config)
+    assert captured[memory.PERSIST_ENV_VAR] == "1"
+
+
+def test_an_oversized_memory_store_is_reported_when_the_assistant_starts(
+    config, caplog
+):
+    """Warned about at the moment it is about to be read, and still complete
+    afterwards: curation is the assistant's, so nothing here removes a file."""
+    store_dir = memory.prepare_memory_dir()
+    (store_dir / "huge.md").write_text(
+        "x" * (memory.WARN_BYTES + 1), encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING, logger="lmer_platform.memory"):
+        spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+    assert any(
+        "platform_assistant_memory_large" in record.getMessage()
+        for record in caplog.records
+    )
+    assert (store_dir / "huge.md").is_file()
+
+
+def test_the_assistants_mounts_do_not_collide(config):
+    """The memory destination sits inside the staging area while the transcript
+    mount sits at claude's projects dir — different subtrees, but only the real
+    validator settles whether the whole set is acceptable to a runtime."""
+    result = spawn.spawn_session(
+        config, request_for(), kind=registry.ASSISTANT_KIND
+    )
+    specs = parse_dir_mount_specs(mount_specs_in(result.command), "")
+    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS) + 1
+    assert memory.CONTAINER_STAGED_DIR in [spec.container for spec in specs]
+
+
+def test_a_drop_in_cannot_claim_the_memory_store_path(
+    config, _no_user_harnesses, caplog
+):
+    """The linker skips a declared path that is already a mountpoint, so a drop-in
+    claiming it puts the assistant's memory back inside the container — and lands
+    its own transcripts in the memory store — with nothing said either side."""
+    write_user_harness(_no_user_harnesses, "acme", HARNESSES["claude"].memory_dir)
+    with caplog.at_level(logging.WARNING, logger="lmer_platform.spawn"):
+        result = spawn.spawn_session(
+            config, request_for(), kind=registry.ASSISTANT_KIND
+        )
+    specs = mount_specs_in(result.command)
+    assert not [spec for spec in specs if "acme" in spec]
+    assert any(
+        "platform_transcript_session_dir_taken" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+#: Every aim that leaves the memory link unmade. Six of these got through the
+#: first version of the rule, which compared raw strings and skipped
+#: --mount-file (review of !263).
+MEMORY_LINK_HIJACKS = [
+    ("--mount-dir", HARNESSES["claude"].memory_dir),
+    ("--mount-dir", HARNESSES["claude"].memory_dir + "/"),
+    ("--mount-dir", "/home/developer/.claude/projects/-workspace/./memory"),
+    ("--mount-dir", "/home/developer/.claude/projects/-workspace"),
+    ("--mount-dir", HARNESSES["claude"].memory_dir + "/sub"),
+    ("--mount-file", HARNESSES["claude"].memory_dir),
+    ("--mount-file", HARNESSES["claude"].memory_dir + "/MEMORY.md"),
+]
+
+
+@pytest.mark.parametrize(
+    "flag,destination", MEMORY_LINK_HIJACKS,
+    ids=[f"{flag}:{dest}" for flag, dest in MEMORY_LINK_HIJACKS],
+)
+def test_a_mount_that_would_defeat_the_memory_link_is_refused(
+    config, flag, destination
+):
+    """Containment, not a string comparison."""
+    with pytest.raises(spawn.SpawnError, match="may not target"):
+        spawn.spawn_session(
+            config,
+            request_for(extra_args=(flag, f"/tmp/mine:{destination}:rw")),
+        )
+
+
+@pytest.mark.parametrize("flag,destination", [
+    # Above session_dir the platform mounts nothing of its own, so the rule stops.
+    ("--mount-dir", "/home/developer/.claude"),
+    ("--mount-dir", "/data/corpus"),
+    ("--mount-file", "/home/developer/.config/thing.json"),
+])
+def test_the_memory_refusal_stops_where_its_reason_stops(
+    config, flag, destination
+):
+    """A rule refusing everything nearby would take the flag's purpose with it."""
+    result = spawn.spawn_session(
+        config, request_for(extra_args=(flag, f"/tmp:{destination}:ro"))
+    )
+    assert result.session_id
+
+
+def test_a_store_that_could_not_be_prepared_leaves_the_route_closed(
+    config, _no_user_harnesses, monkeypatch
+):
+    """Fail-soft: no store, but the shared-repo route stays closed and nothing is
+    linked (a pair naming an unmounted staged path would leave the harness's
+    memory directory a dangling symlink)."""
+    monkeypatch.setenv(memory.PERSIST_ENV_VAR, "1")
+    monkeypatch.setattr(memory, "prepare_memory_dir", lambda: None)
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured.update(kwargs.get("env") or {})
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    result = spawn.spawn_session(
+        config, request_for(), kind=registry.ASSISTANT_KIND
+    )
+    assert captured[memory.PERSIST_ENV_VAR] == ""
+    assert memory.CONTAINER_STAGED_DIR not in captured[MOUNT_LINKS_ENV]
+    assert not [
+        spec for spec in mount_specs_in(result.command)
+        if spec.split(":")[1:2] == [memory.CONTAINER_STAGED_DIR]
+    ]
