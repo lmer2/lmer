@@ -327,10 +327,30 @@ structurally (turn-limit truncation, in-band errors); issue #138 covers the
 hook-side session signal for sessions that fire hooks, which `spawn-harness`
 children do not.
 
-One limitation worth knowing: without `--output` the child's stdout flows
-straight through and cannot be inspected, so the check is skipped (fan-out
-invocations are expected to capture, but nothing enforces it — in that mode a
-dropped result is as invisible as it was before this existed; issue #152).
+Without `--output` the same check still applies (issue #152). The child's
+stdout is *teed* rather than inherited: every byte is forwarded to
+`spawn-harness`'s own stdout unchanged, while a running tally measures what a
+captured file would have measured — total length and the span between the first
+and last non-whitespace character, which is `len(content.strip())` exactly. Both
+paths ask the same rule set (`classify_degenerate_counts`), so a fan-out gets the
+same verdict whether or not it remembered to capture. Two differences remain, and
+neither is a caveat about detection: there is no file to append a footer to, so
+the warning says so and stands alone; and in this mode the child's stdout is a
+pipe rather than whatever `spawn-harness` itself was given, which a harness that
+inspects `isatty()` could in principle notice. The earlier behavior — the check
+silently skipped, so a fan-out that forgot `--output` consolidated from N-1
+agents with every signal looking healthy — is gone.
+
+One pipeline behavior does change with the tee, and it is a deliberate trade. If
+`spawn-harness`'s own stdout dies while the child is running (`spawn-harness … |
+head`, a consumer that was killed), the child used to inherit that descriptor and
+take the `EPIPE` itself, ending in a fraction of a second. Now the tee absorbs
+it: the failure is reported once on stderr (`cannot forward the child's
+stdout`), the child's output stops being passed through, and its stdout keeps
+being **drained** so the child runs to completion and its exit code is still
+mirrored. Draining is not optional — with nothing reading the pipe the child
+blocks as soon as the 64 KiB buffer fills, and `--timeout` has no default, so the
+wrapper would hang indefinitely while the heartbeat reported a healthy run.
 
 | | claude | codex | pi |
 |---|---|---|---|

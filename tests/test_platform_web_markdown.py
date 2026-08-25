@@ -143,6 +143,9 @@ def _probe(body):
         "import MarkdownIt from 'markdown-it'",
         "import DOMPurify from 'dompurify'",
         "import assert from 'node:assert/strict'",
+        # The render path imports the run-reference shape from the module that
+        # owns it (issue #241), so the probe resolves it from the real file too.
+        "import { RUN_REF_RE } from './src/runref.js'",
         _render_path(),
         body,
         "console.log('probe ok')",
@@ -178,6 +181,13 @@ HOSTILE = [
     "[click](https://ok.invalid/x \"onload=alert(1)\")",
     "<style>body{display:none}</style>",
     "<base href=\"http://elsewhere.invalid/\">",
+    # The one non-web scheme admitted is a run reference of exactly one shape
+    # (issue #241); everything else wearing it is hostile input.
+    "[click](lmer://spawn/gitlab.example.com/acme/widget/x)",
+    "[click](lmer://run/h/p/s?spawn=1)",
+    "[click](lmer://run/h/p/s/../../etc/passwd)",
+    "[click](lmer:javascript:alert(1))",
+    "[click](lmerx://run/h/p/s)",
 ]
 
 # Tag names that must never appear as tags, whatever else changes. The tag
@@ -437,6 +447,47 @@ def test_an_external_link_cannot_reach_back_into_this_page():
         "  assert.match(html, /<a /, `no link at all in ${html}`)",
         "  assert.match(html, /rel=\"noopener noreferrer\"/, html)",
         "  assert.match(html, /target=\"_blank\"/, html)",
+        "}",
+    ])
+    _probe(body)
+
+
+def test_a_run_reference_is_a_link_and_nothing_wearing_its_scheme_is():
+    """The one non-web scheme admitted here (issue #241), and only its shape.
+
+    Executed, because both halves fail invisibly: too strict renders a reference
+    as text, too loose puts a hole in an allowlist that denies by default.
+    """
+    body = "\n".join([
+        "const ref = 'lmer://run/gitlab.example.com/acme/widget/develop-issue-381'",
+        "assert.ok(markdown.validateLink(ref), 'a run reference was refused')",
+        "const html = markdown.render(`[the run](${ref})`)",
+        "assert.match(html, new RegExp(`href=\"${ref}\"`), html)",
+        "assert.match(html, />the run</, 'the label is the visible text')",
+        # A scheme the browser cannot open must not be sent to a new tab.
+        "assert.ok(!html.includes('target='), `run reference got a target: ${html}`)",
+        "assert.ok(!html.includes('rel='), `run reference got a rel: ${html}`)",
+        "const rejected = ['lmer://run/h/s', 'lmer://run/h/p/s?spawn=1',",
+        "  'lmer://run/h/p/s#frag', 'lmer://spawn/h/p/s', 'lmer:run/h/p/s',",
+        "  'lmer://run/h/p/s/../../etc', 'lmerx://run/h/p/s', 'lmer://run//p/s']",
+        "for (const url of rejected) {",
+        "  assert.ok(!markdown.validateLink(url), `${url} was accepted as a link`)",
+        "  const out = markdown.render(`[click](${url})`)",
+        "  assert.ok(!out.includes('href'), `${url} still produced an href: ${out}`)",
+        "}",
+        # Layer 2 must admit what layer 1 built and nothing more — where a stray
+        # `i` flag on the combined pattern was widening the scheme.
+        "for (const url of [ref, 'https://ok.invalid/x', 'HTTPS://ok.invalid/x',",
+        "                   'mailto:a@ok.invalid']) {",
+        "  assert.ok(LINK_OK(url), `${url} was refused by the parser`)",
+        "  assert.ok(SANITIZE.ALLOWED_URI_REGEXP.test(url), `${url} was refused by the sanitiser`)",
+        "}",
+        "for (const url of ['LMER://run/h/p/s', 'lmer://RUN/h/p/s', 'LmEr://Run/H/P/S',",
+        "                   'lmer://run/h/p/s?spawn=1', 'javascript:alert(1)',",
+        "                   'JAVASCRIPT:alert(1)', 'data:text/html,x']) {",
+        "  assert.ok(!LINK_OK(url), `${url} was accepted by the parser`)",
+        "  assert.ok(!SANITIZE.ALLOWED_URI_REGEXP.test(url),",
+        "    `${url} was accepted by the sanitiser but not by the parser`)",
         "}",
     ])
     _probe(body)

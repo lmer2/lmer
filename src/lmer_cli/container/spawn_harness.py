@@ -42,17 +42,20 @@ Unlike the fail-soft provisioning modules in this package, this is an
 explicitly invoked tool: configuration problems fail loudly (exit 2), the
 child's exit code is mirrored, and a ``--timeout`` expiry exits 124.
 
-A child that succeeds while producing *nothing* is the one failure the exit
-code cannot express: an empty, whitespace-only or stub-length ``--output``
-warns on stderr and gets its own footer, while the real (zero) exit code is
-still mirrored — see :func:`classify_degenerate_output` (issue #139). Whether
-prose amounts to a *complete* answer is deliberately not guessed at here; that
-function explains why.
+A child that succeeds while producing *nothing* is the one failure the exit code
+cannot express: an empty, whitespace-only or stub-length answer warns on stderr
+while the child's own exit code is still mirrored (#139). With ``--output`` the
+captured file is re-read and footered; without it the stdout is teed and measured
+as it streams, so the check no longer depends on the caller having captured
+(#152). Whether prose amounts to a *complete* answer is deliberately not guessed
+at — see :func:`classify_degenerate_output`. Operator-facing account of the tee
+and what it changes about a pipeline: ``docs/HARNESSES.md``.
 """
 
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import signal
@@ -85,6 +88,7 @@ from lmer_cli.presets import (
     SPAWN_AGENTS_CONFIG_ENV,
     SPAWN_AGENTS_ENV,
 )
+from lmer_cli.model_aliases import expand_model_alias, load_model_aliases
 from lmer_cli.user_harnesses import CONTAINER_HARNESS_CACHE_DIR
 
 #: Exit code for a child killed by ``--timeout`` (the coreutils convention).
@@ -95,6 +99,9 @@ DEFAULT_HEARTBEAT_SECONDS = 60.0
 
 #: How many trailing stderr lines the failure footer preserves.
 STDERR_TAIL_LINES = 40
+
+#: Only the tally is kept, so this batches syscalls rather than holding an answer.
+STDOUT_CHUNK_BYTES = 65536
 
 #: Below this many non-whitespace-padded characters, a successful child's
 #: output counts as degenerate. Deliberately low: a legitimately terse answer
@@ -220,7 +227,63 @@ def build_child_env(
     ):
         child.pop(key, None)
     child[NONINTERACTIVE_ENV] = "1"
+    _expand_spawn_time_model(child, extra_env)
     return child
+
+
+def _expand_spawn_time_model(
+    child_env: Dict[str, str], extra_env: Dict[str, str]
+) -> None:
+    """Expand an alias named at spawn time — and only one (issue #309).
+
+    Scoped to ``--env LMER_LLM_NAME=<alias>`` deliberately: the routes a *launch*
+    supplies have already been through the table on the host, because the host
+    expands what it forwards (the session's own ``LMER_LLM_NAME``, and each agent
+    preset's model in ``_resolve_agents_cli``). Expanding whatever the composed
+    env happens to hold would therefore be a *second* pass on an already-resolved
+    value, which a chained table turns into a different model:
+    with ``big=opus,opus=claude-haiku-4-5``, ``lmer --model big`` runs ``opus``
+    while its fan-out children would have run ``claude-haiku-4-5``. One value,
+    one expansion, wherever it was written down.
+
+    It happens before :func:`select_harness` reads the name, for the same reason
+    the host expands before harness resolution: an unexpanded alias implies no
+    harness family, so the child would run the right model on the wrong harness.
+
+    One route is deliberately *not* covered, since "already resolved on the host"
+    is not true of it: an in-container ``export LMER_LLM_NAME=<alias>`` before
+    calling ``spawn-harness``. ``docs/LMER-CLI.md`` names the in-container case as
+    the spawn-time ``--env`` name specifically, so the alias has to be written
+    where the child's model is written.
+    """
+    named = extra_env.get(LLM_NAME_ENV)
+    if not (named or "").strip():
+        return
+    aliases, warnings = load_model_aliases(child_env)
+    for note in warnings:
+        print(f"⚠️  spawn-harness: {note}", file=sys.stderr)
+    expanded = expand_model_alias(named, aliases)
+    if expanded and expanded != named:
+        print(
+            f"🎛️  spawn-harness: model alias {named} → {expanded}",
+            file=sys.stderr,
+        )
+        child_env[LLM_NAME_ENV] = expanded
+
+
+def _selection_overlay(
+    agent_env: Dict[str, str], extra_env: Dict[str, str], child_env: Dict[str, str]
+) -> Dict[str, str]:
+    """The overlay :func:`select_harness` reads, carrying the expanded model.
+
+    The harness is decided from the overlay, not the composed env, so an overlay
+    still holding the alias would route the model to the session's harness. The
+    value is copied from ``child_env`` rather than expanded again.
+    """
+    overlay = {**agent_env, **extra_env}
+    if LLM_NAME_ENV in overlay and LLM_NAME_ENV in child_env:
+        overlay[LLM_NAME_ENV] = child_env[LLM_NAME_ENV]
+    return overlay
 
 
 def select_harness(
@@ -382,6 +445,124 @@ def resolve_prompt(ns: argparse.Namespace, agent: dict) -> str:
     return f"{NONINTERACTIVE_NOTICE}\n\n{prompt}"
 
 
+class _StdoutTally:
+    """What a stream of stdout bytes would have said about itself as a file.
+
+    Positions of the first and last non-whitespace character rather than a
+    *count* of them: ``"a         b"`` is eleven stripped characters and two
+    non-whitespace ones, and counting would call a real answer a stub. Nothing is
+    buffered — an answer can be megabytes and none of it is needed to decide
+    whether there is one — and decoding is incremental so a multi-byte character
+    split across reads is still one character.
+    """
+
+    def __init__(self) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.total = 0
+        self._first: Optional[int] = None
+        self._last: Optional[int] = None
+        #: EOF reached and decoder flushed. Until then the counters are a prefix,
+        #: and a verdict off a prefix is worse than none.
+        self.done = False
+
+    def feed(self, chunk: bytes) -> None:
+        self._account(self._decoder.decode(chunk))
+
+    def finish(self) -> None:
+        """Flush the decoder — a truncated final sequence is still a character."""
+        self._account(self._decoder.decode(b"", final=True))
+        self.done = True
+
+    def _account(self, text: str) -> None:
+        if not text:
+            return
+        lstripped = text.lstrip()
+        if lstripped:
+            if self._first is None:
+                self._first = self.total + (len(text) - len(lstripped))
+            self._last = self.total + len(text.rstrip()) - 1
+        self.total += len(text)
+
+    @property
+    def stripped(self) -> int:
+        if self._first is None or self._last is None:
+            return 0
+        return self._last - self._first + 1
+
+
+def _write_stdout_bytes(data: bytes) -> None:
+    """Forward the child's bytes to our stdout, unchanged.
+
+    Bytes, so the tee cannot re-encode somebody's answer in passing. The text
+    fallback is for a captured ``sys.stdout`` with no ``buffer`` (pytest).
+    """
+    stream = getattr(sys.stdout, "buffer", None)
+    if stream is None:
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+    else:
+        stream.write(data)
+    sys.stdout.flush()
+
+
+def _abandon_stdout() -> None:
+    """Point our stdout at ``/dev/null`` once its reader has gone.
+
+    CPython flushes the standard streams at interpreter shutdown, and a flush
+    that raises there exits **120**, replacing the child's exit code that this
+    tool promises to mirror (measured: child 0, wrapper 120). A captured stdout
+    with no descriptor behind it has no such flush to fail.
+    """
+    try:
+        target = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(target, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+    finally:
+        os.close(target)
+
+
+def _pump_stdout(stream, tally: "_StdoutTally") -> None:
+    """Tee the child's stdout: every byte forwarded, and counted on the way.
+
+    ``read1`` rather than ``read``, so a finished answer is not held until the
+    buffer fills or the child exits.
+
+    **Reading never stops, even when forwarding fails.** With a pipe between the
+    child and our stdout, we are its only reader: an exception here leaves the
+    child blocked once the 64 KiB buffer fills, and ``--timeout`` has no default,
+    so the hang is unbounded while the heartbeat reports a healthy run. Both
+    exception families are caught because they are two doors to the same place —
+    a dead descriptor raises ``OSError``, a closed stream object ``ValueError`` —
+    and an escape would skip :func:`_abandon_stdout`.
+    """
+    dropped = False
+    try:
+        for chunk in iter(lambda: stream.read1(STDOUT_CHUNK_BYTES), b""):
+            tally.feed(chunk)
+            if dropped:
+                continue
+            try:
+                _write_stdout_bytes(chunk)
+            except (OSError, ValueError) as exc:
+                dropped = True
+                print(
+                    f"⚠️  spawn-harness: cannot forward the child's stdout "
+                    f"({exc}) — still draining it so the child can finish, but "
+                    "its output is no longer being passed through",
+                    file=sys.stderr,
+                )
+                _abandon_stdout()
+        tally.finish()
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
 def _pump_stderr(stream, tail: "deque") -> None:
     """Pass the child's stderr through to ours, keeping a tail for the
     failure footer."""
@@ -491,14 +672,27 @@ def classify_degenerate_output(content: str) -> Optional[str]:
     a judgment about content, which needs a model rather than a heuristic. See
     issue #153; #138 covers the hook-side session signal.
     """
-    if not content:
-        return "output file is empty"
-    stripped = content.strip()
-    if not stripped:
-        return "output file is whitespace only"
-    if len(stripped) < DEGENERATE_MIN_CHARS:
+    return classify_degenerate_counts(len(content), len(content.strip()))
+
+
+def classify_degenerate_counts(
+    total_chars: int, stripped_chars: int, noun: str = "output file"
+) -> Optional[str]:
+    """The same three signals, expressed as counts (issue #152).
+
+    One rule set for both callers — a finished file and a stream being counted
+    (:class:`_StdoutTally`) — so the verdict cannot depend on whether the caller
+    remembered ``--output``. *stripped_chars* is ``len(content.strip())``: the
+    distance between the outermost non-whitespace characters, not a count of
+    them. *noun* names what was inspected.
+    """
+    if total_chars == 0:
+        return f"{noun} is empty"
+    if stripped_chars == 0:
+        return f"{noun} is whitespace only"
+    if stripped_chars < DEGENERATE_MIN_CHARS:
         return (
-            f"output is {len(stripped)} characters, below the "
+            f"output is {stripped_chars} characters, below the "
             f"{DEGENERATE_MIN_CHARS}-character floor"
         )
     return None
@@ -571,6 +765,56 @@ def warn_degenerate_output(agent_name: str, output: str) -> Optional[str]:
     return reason
 
 
+def warn_degenerate_stream(agent_name: str, tally: "_StdoutTally") -> Optional[str]:
+    """Warn when an *uncaptured* child exited 0 having streamed nothing usable.
+
+    No footer, for want of a file to put one in; the warning says so. The exit
+    code stays the child's own, as on the captured path.
+    """
+    if not tally.done:
+        # The counters are a prefix, and judging a prefix would report "the result
+        # is missing" about a child that answered in full — the inverse of the
+        # failure this check exists to catch.
+        print(
+            f"⚠️  spawn-harness: agent {agent_name!r} exited 0 but its stdout "
+            "was still being drained, so the no-usable-output check was skipped",
+            file=sys.stderr,
+        )
+        return None
+    reason = classify_degenerate_counts(tally.total, tally.stripped, noun="stdout")
+    if reason is None:
+        return None
+    print(
+        f"⚠️  spawn-harness: agent {agent_name!r} exited 0 but produced no "
+        f"usable output — {reason}; the result is missing, not empty by choice "
+        "— re-run the agent or drop it from the consolidation explicitly "
+        "(no --output was given, so there is no file to mark)",
+        file=sys.stderr,
+    )
+    return reason
+
+
+#: Bounded: a blocked write on our own stdout must not become a hung wrapper.
+PUMP_JOIN_SECONDS = 5
+
+
+def _start_pump(target, stream, sink) -> "threading.Thread":
+    """Start one daemon pump thread over *stream*."""
+    thread = threading.Thread(target=target, args=(stream, sink), daemon=True)
+    thread.start()
+    return thread
+
+
+def _join_pumps(pumps: list) -> None:
+    """Drain every pump, each within its own bound.
+
+    One helper because three exit paths need it and forgetting one fails silently
+    — a truncated tail, or a verdict read off a prefix.
+    """
+    for pump in pumps:
+        pump.join(timeout=PUMP_JOIN_SECONDS)
+
+
 def _kill_process_group(proc: "subprocess.Popen") -> None:
     """SIGKILL the child's whole process group and reap it."""
     try:
@@ -625,21 +869,26 @@ def run_child(
     except OSError as exc:
         raise _fail(f"Cannot write --output: {exc}") from None
     stderr_tail: deque = deque(maxlen=STDERR_TAIL_LINES)
+    # Uncaptured runs are teed rather than inherited (issue #152), so the
+    # degenerate-output check applies with or without --output.
+    tally = None if stdout else _StdoutTally()
+    # One list, one join helper: a stream some exit path forgets is a child
+    # writing into a buffer nobody reads.
+    pumps: list = []
     try:
         try:
             proc = subprocess.Popen(
                 argv,
                 env=child_env,
-                stdout=stdout,
+                stdout=stdout if stdout else subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
         except OSError as exc:
             raise _fail(f"Cannot run {argv[0]!r}: {exc}") from None
-        pump = threading.Thread(
-            target=_pump_stderr, args=(proc.stderr, stderr_tail), daemon=True
-        )
-        pump.start()
+        pumps.append(_start_pump(_pump_stderr, proc.stderr, stderr_tail))
+        if tally is not None:
+            pumps.append(_start_pump(_pump_stdout, proc.stdout, tally))
         try:
             # SIGTERM's default handler would exit without unwinding — map it
             # to SystemExit so the interrupt cleanup below runs. Restored on
@@ -671,7 +920,7 @@ def run_child(
                         )
         except BaseException as exc:
             _kill_process_group(proc)
-            pump.join(timeout=5)
+            _join_pumps(pumps)
             print("❌ spawn-harness interrupted — child killed", file=sys.stderr)
             if stdout:
                 # Narrow on purpose: only the footer write is guarded, so the
@@ -689,7 +938,7 @@ def run_child(
         if timed_out:
             _kill_process_group(proc)
             print(f"❌ Child timed out after {timeout:g}s", file=sys.stderr)
-        pump.join(timeout=5)
+        _join_pumps(pumps)
         if timed_out:
             if stdout:
                 _write_failure_footer(
@@ -708,6 +957,11 @@ def run_child(
                 _close_output(stdout, output)
                 stdout = None
                 warn_degenerate_output(agent_name, output)
+        elif tally is not None and code == 0:
+            # Same check on the streamed answer. Only for a clean exit: a
+            # non-zero code already announced the failure, and a killed child's
+            # silence is explained by the kill.
+            warn_degenerate_stream(agent_name, tally)
         return code
     finally:
         if stdout:
@@ -787,7 +1041,11 @@ def main(argv: Optional[list] = None) -> None:
     extra_env = parse_env_pairs(ns.env)
     agent_env = agent.get("env", {})
     child_env = build_child_env(dict(os.environ), agent_env, extra_env)
-    harness = select_harness(child_env, {**agent_env, **extra_env}, dict(os.environ))
+    harness = select_harness(
+        child_env,
+        _selection_overlay(agent_env, extra_env, child_env),
+        dict(os.environ),
+    )
     warn_missing_credentials(ns.agent, harness, dict(os.environ))
     apply_harness_extra_env(child_env, harness)
     prepend_user_harness_path(child_env, harness)

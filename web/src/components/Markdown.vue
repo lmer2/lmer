@@ -85,10 +85,26 @@ import { computed } from 'vue'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
 
+// Imported, never restated: the shape both layers admit has to be the one the
+// dispatcher parses, or a reference renders as a live link and then refuses to
+// resolve (issue #241).
+import { RUN_REF_RE, dispatchRunRef, parseRunRef } from '../runref.js'
+
 // --- render path (extracted by tests/test_platform_web_markdown.py) ----------
 // Deny by default. The difference between this and a list of the schemes known to
 // be dangerous is that the next dangerous one is already covered.
-const SAFE_LINK = /^(?:https?|mailto):/i
+// Case in the pattern rather than an `i` flag: ALLOWED_URI_REGEXP below combines
+// this source with RUN_REF_RE's, and a flag there would apply to both halves,
+// admitting `LMER://RUN/…` — which the parser and the click handler both refuse.
+const SAFE_LINK = /^(?:[Hh][Tt][Tt][Pp][Ss]?|[Mm][Aa][Ii][Ll][Tt][Oo]):/
+
+// A run reference is admitted beside the web schemes and only as a whole, which
+// is what keeps the scheme from being an escape hatch out of the allowlist: one
+// shape, and it names a view.
+const LINK_OK = (url) => {
+  const raw = url.trim()
+  return SAFE_LINK.test(raw) || RUN_REF_RE.test(raw)
+}
 
 const markdown = new MarkdownIt({
   html: false,
@@ -108,7 +124,7 @@ const markdown = new MarkdownIt({
 // which an <img> gets built at all.
 markdown.disable(['image'])
 
-markdown.validateLink = (url) => SAFE_LINK.test(url.trim())
+markdown.validateLink = LINK_OK
 
 // A link the agent wrote leaves this page and cannot reach back into it:
 // `noopener` is the one that matters (window.opener is a live handle on this
@@ -116,8 +132,12 @@ markdown.validateLink = (url) => SAFE_LINK.test(url.trim())
 const renderLinkOpen = markdown.renderer.rules.link_open
   || ((tokens, index, options, env, self) => self.renderToken(tokens, index, options, env, self))
 markdown.renderer.rules.link_open = (tokens, index, options, env, self) => {
-  tokens[index].attrSet('target', '_blank')
-  tokens[index].attrSet('rel', 'noopener noreferrer')
+  // Not for a run reference: `_blank` on a scheme the browser cannot open is a
+  // blank tab, and the click handler keeps that link on this page anyway.
+  if (!RUN_REF_RE.test((tokens[index].attrGet('href') || '').trim())) {
+    tokens[index].attrSet('target', '_blank')
+    tokens[index].attrSet('rel', 'noopener noreferrer')
+  }
   return renderLinkOpen(tokens, index, options, env, self)
 }
 
@@ -132,7 +152,13 @@ const SANITIZE = {
     'table', 'thead', 'tbody', 'tr', 'th', 'td',
   ],
   ALLOWED_ATTR: ['href', 'title', 'target', 'rel'],
-  ALLOWED_URI_REGEXP: SAFE_LINK,
+  // Both halves of what the parser accepted, and nothing wider.
+  ALLOWED_URI_REGEXP: new RegExp(`${SAFE_LINK.source}|${RUN_REF_RE.source}`),
+  // Required, not decorative: DOMPurify checks the *value* of every allowed
+  // attribute that is not declared URI-safe against ALLOWED_URI_REGEXP, so a
+  // narrow one silently dropped `_blank` and `noopener noreferrer` in the browser
+  // while markdown-it's output — all a Node probe sees — still had them.
+  ADD_URI_SAFE_ATTR: ['target', 'rel'],
   ALLOW_DATA_ATTR: false,
   ALLOW_ARIA_ATTR: false,
 }
@@ -207,6 +233,32 @@ const props = defineProps({
 const rendered = computed(() => (props.inline
   ? renderMarkdownInline(props.text)
   : renderMarkdown(props.text)))
+
+// Delegated, because the markup is injected: one listener per rendered block,
+// which also covers text that arrives later. `preventDefault` runs for any run
+// reference, dispatched or not — a click that reached the browser would hand the
+// href to whatever the OS registered for the scheme.
+//
+// Bound for `auxclick` too (`click` is the primary button only), which is why the
+// handler filters on `button`: `auxclick` fires for every non-primary button, and
+// a right-click must keep doing nothing but open its own menu. A context-menu
+// "open in new tab" is not cancellable, so the claim is about clicks, not about
+// the href never leaving the page.
+function onClick(event) {
+  // `auxclick` is every non-primary button, not just the middle one — so
+  // without this a right-click switched the view *and* opened the context menu
+  // (`preventDefault` on auxclick does not suppress `contextmenu`, which is a
+  // separate event). Before this handler bound auxclick at all, a right-click on
+  // a reference did nothing, so the filter restores that rather than inventing a
+  // rule: button 0 arrives as `click`, button 1 is the middle click this is for.
+  if (event.type === 'auxclick' && event.button !== 1) return
+  const anchor = event.target?.closest?.('a')
+  if (!anchor) return
+  const ref = parseRunRef(anchor.getAttribute('href') || '')
+  if (!ref) return
+  event.preventDefault()
+  dispatchRunRef(ref)
+}
 </script>
 
 <template>
@@ -217,7 +269,13 @@ const rendered = computed(() => (props.inline
        inline mode, because that output goes *inside* a line somebody else wrote
        and a block root would break it in two. One element either way, so there is
        still exactly one binding to keep an eye on. -->
-  <component :is="inline ? 'span' : 'div'" class="markdown" v-html="rendered" />
+  <component
+    :is="inline ? 'span' : 'div'"
+    class="markdown"
+    v-html="rendered"
+    @click="onClick"
+    @auxclick="onClick"
+  />
 </template>
 
 <style scoped>

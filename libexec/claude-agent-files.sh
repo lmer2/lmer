@@ -169,3 +169,88 @@ claude_merge_work_settings() {
     printf '%s\n' "$merged" > "$settings_file"
     echo "✅ Merged work-repo permissions.allow into $settings_file"
 }
+
+# claude_output_style_named_here <style> <styles_dir>
+#   Advisory: does <style> plausibly name a style claude can resolve?
+#
+#   Lenient on purpose. Which spelling claude matches — file stem or frontmatter
+#   `name:` — is not something claude promises, and the built-in set moves, so a
+#   strict check would warn about working configurations. Nothing behavioural
+#   hangs on the answer: the key is written either way.
+claude_output_style_named_here() {
+    local style="$1"
+    local styles_dir="$2"
+    local wanted="${style,,}"
+    local item stem name
+
+    case "$wanted" in
+        default|explanatory|learning) return 0 ;;
+    esac
+
+    [ -d "$styles_dir" ] || return 1
+
+    for item in "$styles_dir"/*; do
+        [ -f "$item" ] || continue
+        stem=$(basename "$item")
+        stem="${stem%.md}"
+        if [ "${stem,,}" = "$wanted" ]; then
+            return 0
+        fi
+        # Compared as a string, not matched as a pattern: a style name is
+        # operator-supplied text and would otherwise be a regex reaching grep.
+        name=$(head -n 20 "$item" 2>/dev/null \
+            | sed -n 's/^name:[[:space:]]*//p' | head -n 1)
+        name="${name%$'\r'}"
+        name="${name#\"}"; name="${name%\"}"
+        name="${name#\'}"; name="${name%\'}"
+        name="${name%"${name##*[![:space:]]}"}"
+        if [ -n "$name" ] && [ "${name,,}" = "$wanted" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# claude_apply_output_style <settings_file> <styles_dir>
+#   Select the output style named by LMER_CLAUDE_OUTPUT_STYLE (issue #257). The
+#   ships-vs-selects boundary this sits on: docs/LMER-CLI.md, "Output styles:
+#   shipping one and selecting one are separate".
+#
+#   Called last, after every settings merge, so the launch's own variable is the
+#   last word on the key. An implausible name warns and is still written — which
+#   names claude resolves is claude's business.
+claude_apply_output_style() {
+    local settings_file="$1"
+    local styles_dir="$2"
+    local style="${LMER_CLAUDE_OUTPUT_STYLE}"
+    local merged
+
+    [ -n "$style" ] || return 0
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "⚠️  LMER_CLAUDE_OUTPUT_STYLE=$style but jq is unavailable — outputStyle not set"
+        return 0
+    fi
+
+    if ! claude_output_style_named_here "$style" "$styles_dir"; then
+        echo "⚠️  Output style '$style' does not match any file in $styles_dir (by file stem or 'name:' frontmatter) and is not a built-in — setting outputStyle to it as given; claude uses its default if it cannot resolve the name"
+    fi
+
+    if [ -f "$settings_file" ]; then
+        if ! merged=$(jq --arg style "$style" '.outputStyle = $style' "$settings_file" 2>/dev/null) \
+           || [ -z "$merged" ]; then
+            echo "⚠️  Failed to set outputStyle in $settings_file — leaving it unchanged"
+            return 0
+        fi
+    else
+        # No settings file at all: the operator still asked for a style, and a
+        # file carrying only this key is a valid one.
+        merged=$(jq -n --arg style "$style" '{outputStyle: $style}')
+        mkdir -p "$(dirname "$settings_file")"
+    fi
+
+    # settings.json may be a symlink into a read-only mount (as above).
+    [ -L "$settings_file" ] && rm "$settings_file"
+    printf '%s\n' "$merged" > "$settings_file"
+    echo "✅ Output style '$style' selected in $settings_file"
+}

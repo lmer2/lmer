@@ -132,6 +132,28 @@ conversation window is lost.
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
   drawer when needed.
+- **Run references in chat** — the assistant writes a run's name as a link whose
+  href is `lmer://run/<host>/<project>/<slug>`, and tapping it opens that run's
+  view. Details worth knowing:
+  - It is an **in-app dispatch, not navigation**: no history entry, no URL to
+    paste or bookmark, nothing that survives a reload. Run views are deliberately
+    not browser-addressable (issue #241).
+  - A reference **can only select a view**. The grammar carries three key
+    segments and nothing else — no verb, no payload, no URL to navigate to — and
+    only that exact shape is rendered as a link at all: `lmer://run/…?spawn=1`
+    and any other `lmer:` URL come out as plain text.
+  - A reference to a run this platform does not track opens nothing and says so,
+    naming the key. Adopt the run and the same reference becomes a switch.
+  - A left or middle click is handled in-app; a context-menu "open link in new
+    tab" is not an event the page can cancel, so it hands the href to the OS,
+    where nothing is registered for it.
+  - **On the way to Slack** the reference is reduced to its visible label before
+    posting, because Slack's own link syntax is different (`<url|label>`) and
+    CommonMark links render there as raw characters. The reduction is a text
+    substitution, not a markdown parse: it does not know what a code span is, so
+    a reference written *as an example* is reduced too. An escaped `\[` is left
+    alone, as is a label containing brackets.
+  - Web-only: it reaches you after a bundle build and a UI image roll.
 - **A narrower app** — the toggle in the app bar holds the whole app — the bar, the
   run list, the content and uber lmer's drawer — in a 1620px band in the middle of
   the screen instead of spreading it across a wide window. It is the effect of

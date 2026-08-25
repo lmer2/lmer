@@ -28,6 +28,7 @@ import {
 import {
   rememberChoice, rememberFlag, storedChoice, storedFlag,
 } from './preferences.js'
+import { onRunRef } from './runref.js'
 
 const POLL_MS = 10000
 
@@ -70,6 +71,11 @@ const THEME_LABELS = {
   light: 'light',
   dark: 'dark',
 }
+
+// A run reference naming a run this host does not track (issue #241) — the
+// wording RelatedRuns.vue uses for the same case.
+const NOT_TRACKED_HINT = 'this orchestrator does not track that run, so there is '
+  + 'no page to open — adopt it from "spawn or adopt" first'
 
 const state = ref(null)
 const error = ref(null)
@@ -448,8 +454,31 @@ function open(run) {
   if (mobile.value) navOpen.value = false
 }
 
+// --- run references written in chat (issue #241) -----------------------------
+//
+// The resolver lives here because this is where the fleet lives: whether a
+// reference is live is the same question as whether its key is in that list. An
+// untracked key is not a switch — the fleet list is what a run is selected out of,
+// so it would land on an empty page (RelatedRuns.vue's reasoning) — so it reports
+// instead.
+const runRefNotice = ref(null)
+let stopRunRefs = null
+
+function openRunRef(ref) {
+  const run = runs.value.find((candidate) => keyOf(candidate) === ref.key)
+  if (!run) {
+    runRefNotice.value = `${ref.key} — ${NOT_TRACKED_HINT}`
+    return
+  }
+  runRefNotice.value = null
+  open(run)
+  // On a phone the assistant's drawer is an overlay over the run it just opened.
+  if (mobile.value) uberOpen.value = false
+}
+
 onMounted(() => {
   load()
+  stopRunRefs = onRunRef(openRunRef)
   poll = setInterval(load, POLL_MS)
   // Separate, faster tick so "3m ago" ages without refetching the fleet.
   tick = setInterval(() => { now.value = Date.now() }, 1000)
@@ -458,6 +487,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  if (stopRunRefs) stopRunRefs()
   clearInterval(poll)
   clearInterval(tick)
   document.removeEventListener('visibilitychange', refetchOnReturn)
@@ -795,6 +825,19 @@ onUnmounted(() => {
       <template #actions>
         <v-btn variant="text" @click="undoForget">{{ undoLabel }}</v-btn>
       </template>
+    </v-snackbar>
+
+    <!-- Its own bar rather than the content column's error alert: the tap happens
+         in a drawer that covers that column on a phone, and an explanation nobody
+         sees is the dead link this feature exists to remove. Timed, because
+         nothing is pending. -->
+    <v-snackbar
+      :model-value="!!runRefNotice"
+      :timeout="8000"
+      multi-line
+      @update:model-value="runRefNotice = null"
+    >
+      {{ runRefNotice }}
     </v-snackbar>
   </v-app>
 </template>
