@@ -15,6 +15,8 @@ assistant) on a host:
 - `LMER_PLATFORM_CONTAINER_URL` and the surviving-assistant restart gotcha
 - A tour of the fleet view, spawning, answering, wind down vs exit, uber lmer
 - Digest nudges: when the daemon reminds uber lmer that its spool is unread
+- uber lmer's memory: the host-local store its incarnations share, what its
+  file count does and does not show
 
 **Best for**: Getting the platform running and usable in a few minutes.
 

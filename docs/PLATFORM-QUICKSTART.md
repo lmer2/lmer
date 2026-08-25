@@ -333,11 +333,58 @@ no migration — the three state fields are additive and tolerate absence — an
 image rebuild or container passthrough, since the daemon reads both settings
 itself. A host that does not want the feature sets the interval to `0`.
 
+## uber lmer's memory
+
+The assistant's harness keeps an agent-memory directory — small fact files and an
+index it re-reads at the start of every incarnation. That directory lives inside
+the container, so it used to reset on every rotation: a lesson learned in the
+morning was gone by the afternoon. The platform now mounts one host directory into
+every incarnation instead.
+
+- **Where:** `~/.lmer/platform/assistant-memory/`, one per host, owner-only. It
+  survives rotation, a daemon restart, and the container's `--rm`.
+- **Platform-local, deliberately.** This is the same kind of state as the handoff
+  note and the standing orders — it is *this* host's, and it syncs nowhere. Worker
+  sessions have their own per-project memory route through the work repo
+  (`LMER_PERSIST_AGENT_MEMORY`); for assistant sessions that route is switched off
+  inside the container, so operational notes about your fleet cannot end up in a
+  shared repository.
+- **Curated by the assistant, not by the platform.** Nothing here is ever trimmed
+  or deleted. Above 256 KiB or 50 files a spawn logs a warning and records an
+  `assistant_memory_large` event, and `GET /api/assistant` reports the store's
+  file count and size in its `memory` block.
+- **What that count does and does not tell you.** It reports accumulation: a store
+  that grows is proof the container-side link is live, and one that never grows
+  across many incarnations is worth investigating. It is *not* a liveness check —
+  a store that already holds files keeps reporting them even if the harness stops
+  reading the path (that path is the harness's own encoding of its working
+  directory, which nothing promises). The authoritative answer is in the session's
+  own log, where the container entrypoint prints either `🔗 Linked <path> → …` or a
+  `⚠️` line naming why it could not.
+- **How it gets in, and why not more simply.** The host directory is bound at a
+  staging path (`~/.lmer-mounts/assistant/memory`) and the container entrypoint
+  symlinks the harness's own memory path to it. It is not bound at that path
+  directly, because a container runtime creates a mount destination's missing
+  parents **root-owned before any container process runs** — and the harness's
+  memory path sits inside the per-session transcript mount, so a direct bind
+  would leave claude unable to write its own session JSONL beside it (the
+  `#293`/`#290` failure). The entrypoint makes the link as the container user,
+  which leaves the whole parent chain owned by the account that writes it. A
+  session image whose entrypoint predates that linker makes no link and keeps its
+  memory per-session, which is the pre-existing behaviour.
+- **claude reads it natively; other harnesses have to be told.** claude is the only
+  built-in that declares a memory path, and the link is made from that declaration
+  on every assistant spawn regardless of which harness the session runs — so an
+  assistant running codex or pi does get the store mounted and linked, but neither
+  has a memory feature that reads it on its own. What tells those sessions the
+  store exists, and where, is the `orchestrate` taskdef; nothing else does.
+
 ## Where things live
 
 | what | where |
 |---|---|
 | platform state, logs, UI | `~/.lmer/platform/` |
+| uber lmer's memory store | `~/.lmer/platform/assistant-memory/` |
 | per-instance config (incl. service slots) | `~/.lmer/platform/config.json` |
 | shared secret | `lmer platform secret` |
 | per-session host log | `~/.lmer/platform/logs/<session-id>.log` |

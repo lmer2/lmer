@@ -151,7 +151,7 @@ from lmer_cli.service import ServiceError
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
-from . import ask, meta, registry, runs, slots
+from . import ask, memory, meta, registry, runs, slots
 from .config import ENV_REPO_URL, PlatformConfig, configured_repo_url
 from .store import StoreError, append_event, logs_dir, utc_now_iso
 from . import store
@@ -1183,6 +1183,14 @@ def _reserved_session_destinations() -> dict:
         _container_dir_key(CONTAINER_MOUNT_STAGING_DIR):
             "the mount staging area (lmer-internal)",
     })
+    # The declared agent-memory paths (#325): nothing is mounted at these — the
+    # entrypoint links them — and the linker skips a declared path that is
+    # already a mountpoint, so a drop-in claiming one costs the assistant its
+    # memory silently.
+    reserved.update({
+        _container_dir_key(declared): f"the built-in {name} harness's agent memory"
+        for name, declared in memory.harness_memory_dirs().items()
+    })
     return reserved
 
 
@@ -1775,6 +1783,38 @@ def _protected_mount_destinations() -> dict:
     return protected
 
 
+def _memory_link_conflict(destination: str) -> Optional[tuple]:
+    """``(path, reason)`` when *destination* would defeat an agent-memory link.
+
+    A subtree question, not a destination one, hence separate from
+    :func:`_protected_mount_destinations`: at the declared path, anywhere below
+    it (one ``--mount-file`` is enough to have the runtime create it root-owned),
+    or between it and the harness's ``session_dir``.
+
+    Stops at ``session_dir`` deliberately — above that the platform mounts
+    nothing of its own, so a refusal would be a different rule about shadowing
+    the image.
+    """
+    for name, declared in memory.harness_memory_dirs().items():
+        key = _container_dir_key(declared)
+        session_dir = HARNESSES[name].session_dir
+        between = (
+            session_dir is not None
+            and _below_destination(key, destination)
+            and _below_destination(destination, session_dir)
+        )
+        if destination == key or _below_destination(destination, key) or between:
+            return (
+                declared,
+                f"the entrypoint links the {name} harness's agent-memory path "
+                "there, and a mount at, below or just above it has the runtime "
+                "create that path root-owned before the container starts — so "
+                "the link is never made and the harness cannot write beside its "
+                "transcript (#293)"
+            )
+    return None
+
+
 def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     """Refuse a caller-supplied mount aimed at a destination the platform owns.
 
@@ -1790,6 +1830,10 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     holds staged credential *files*): a caller's mount in there can hand the
     session's harness credentials the caller chose. The protected-destination
     list stays a ``--mount-dir`` rule — those destinations are all directories.
+
+    Destinations are compared normalised (``./`` and ``//`` collapse to the same
+    path a runtime would mount at); link conflicts are a subtree rule on both
+    flags — :func:`_memory_link_conflict`.
     """
     aims_at_dir = "--mount-dir".startswith(name)
     aims_at_file = "--mount-file".startswith(name)
@@ -1801,7 +1845,7 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     parts = str(spec).split(":")
     if len(parts) < 2:
         return
-    destination = parts[1].rstrip("/")
+    destination = _container_dir_key(parts[1])
     if _within_staging_area(destination):
         raise SpawnError(
             f"{name} may not target {CONTAINER_MOUNT_STAGING_DIR} or anything "
@@ -1809,10 +1853,14 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
             "mount inside it would shadow one of them — or hand the session's "
             "harness a file or directory the caller chose"
         )
+    conflict = _memory_link_conflict(destination)
+    if conflict is not None:
+        protected, reason = conflict
+        raise SpawnError(f"{name} may not target {protected}: {reason}")
     if not aims_at_dir:
         return
     for protected, reason in _protected_mount_destinations().items():
-        if destination == protected.rstrip("/"):
+        if destination == _container_dir_key(protected):
             raise SpawnError(f"--mount-dir may not target {protected}: {reason}")
 
 
@@ -2413,6 +2461,14 @@ def spawn_session(
     # directory is the offer; the file inside it is the session's answer, and the
     # read path takes "no file" for exactly the answer it is.
     container_log_dir = _prepare_container_log_dir(session_id)
+    # The assistant's memory store (#325): one directory per *host*, so what one
+    # incarnation learned is on disk for the next. Gated on the kind, not offered
+    # as a request field — a worker's memory has its own route (the work repo).
+    memory_dir = (
+        memory.prepare_memory_dir() if kind == registry.ASSISTANT_KIND else None
+    )
+    if memory_dir is not None:
+        memory.observe(memory_dir)
 
     # One insertion, not one per mount: _with_host_flags inserts right after
     # --fastapi, so calling it twice would interleave the mounts in reverse and
@@ -2424,6 +2480,8 @@ def spawn_session(
         host_flags += _ask_mount_flags(ask_dir)
     if container_log_dir is not None:
         host_flags += _container_log_mount_flags(container_log_dir)
+    if memory_dir is not None:
+        host_flags += memory.mount_flags(memory_dir)
     if host_flags:
         command = _with_host_flags(command, host_flags)
 
@@ -2459,14 +2517,16 @@ def spawn_session(
     # environment would carry another session's pairs), and blank rather than
     # absent for the reason the two variables below give.
     mounted_destinations = {container_dir for _, container_dir in transcript_mounts}
-    child_env[MOUNT_LINKS_ENV] = format_mount_links(
-        "",
-        [
-            (declared, staged)
-            for declared, staged in _harness_session_links()
-            if staged in mounted_destinations
-        ],
-    )
+    link_pairs = [
+        (declared, staged)
+        for declared, staged in _harness_session_links()
+        if staged in mounted_destinations
+    ]
+    if memory_dir is not None:
+        # Staged like a user harness's session dir, and for the same ownership
+        # reason (#293) — see lmer_platform.memory.
+        link_pairs += memory.memory_links()
+    child_env[MOUNT_LINKS_ENV] = format_mount_links("", link_pairs)
     if request.no_repo:
         # Spec D17, structurally: `lmer` skips repo resolution on this and the
         # container skips the workspace clone, so the session has nothing to edit
@@ -2482,6 +2542,13 @@ def spawn_session(
         # back. Blank is falsy to get_bool_env on the host and never equals "1"
         # in the container, so it reads as unset the whole way down.
         child_env[NO_REPO_ENV] = ""
+    if kind == registry.ASSISTANT_KIND:
+        # Platform-local only (#325): the shared-work-repo mirror is closed here
+        # rather than left to fail for want of a repo identity. On the kind and
+        # not on the mount above, so a store that could not be prepared does not
+        # reopen the route it replaces; blank rather than deleted for the
+        # LMER_NO_REPO reason.
+        child_env[memory.PERSIST_ENV_VAR] = ""
 
     master_fd, slave_fd = pty.openpty()
     try:
