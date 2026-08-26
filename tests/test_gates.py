@@ -206,6 +206,93 @@ class TestGateSystem:
         assert "FAILED tests/test_main.py::test_function" in result.full_output
 
     @patch('subprocess.run')
+    def test_check_tests_redacts_ambient_secret_from_every_output_sink(
+        self, mock_run, monkeypatch, tmp_path
+    ):
+        """A pytest assertion may reproduce env state; no gate sink may."""
+        secret = "issue-326-ambient-secret"
+        monkeypatch.setenv("LMER_RELEASE_GITHUB_TOKEN", secret)
+
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(
+                returncode=1,
+                stdout=f"FAILED tests/test_x.py\nAssertionError: {secret}\n",
+                stderr="",
+            )
+
+        mock_run.side_effect = side_effect
+
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.FAILED
+        assert secret not in result.full_output
+        assert secret not in "\n".join(result.details or [])
+        assert "***REDACTED***" in result.full_output
+
+        log_path = tmp_path / "gate-check.log"
+        self.gate.results = [result]
+        self.gate.write_log_file(path=log_path)
+        log = log_path.read_text()
+        assert secret not in log
+        assert "***REDACTED***" in log
+
+    @patch.object(gate_cache, "record_pass", return_value={"recorded": True})
+    @patch.object(gate_cache, "read_pass", return_value=None)
+    @patch.object(gate_cache, "compute_fingerprint")
+    @patch('subprocess.run')
+    def test_check_tests_redacts_the_passing_cache_summary(
+        self, mock_run, compute_fingerprint, _read_pass, record_pass,
+        monkeypatch
+    ):
+        """A passing summary is scrubbed before it reaches the cache sink."""
+        secret = "issue-326-passing-cache-secret"
+        monkeypatch.setenv("LMER_RELEASE_GITHUB_TOKEN", secret)
+        fingerprint = gate_cache.Fingerprint(
+            key="k", tree="t", working=gate_cache.CLEAN_TREE
+        )
+        compute_fingerprint.return_value = fingerprint
+        self.gate._changed_paths = MagicMock(return_value=None)
+
+        def side_effect(cmd, *args, **kwargs):
+            if self._is_probe_call(cmd):
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(
+                returncode=0,
+                stdout=f"{secret} 5 passed in 0.5s\n",
+                stderr="",
+            )
+
+        mock_run.side_effect = side_effect
+
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.PASSED
+        summary = record_pass.call_args.kwargs["summary"]
+        assert secret not in summary
+        assert "***REDACTED***" in summary
+
+    @patch('subprocess.run')
+    def test_custom_runner_redacts_ambient_secret_from_output_sinks(
+        self, mock_run, monkeypatch
+    ):
+        secret = "issue-326-custom-runner-secret"
+        monkeypatch.setenv("LMER_RELEASE_GITHUB_TOKEN", secret)
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout=f"runner failed: {secret}\n",
+            stderr="",
+        )
+
+        result = self.gate._run_custom_test_runner(Path("runner.sh"))
+
+        assert result.status == CheckStatus.FAILED
+        assert secret not in result.full_output
+        assert secret not in "\n".join(result.details or [])
+        assert "***REDACTED***" in result.full_output
+
+    @patch('subprocess.run')
     def test_check_tests_uses_venv_python_when_importable(self, mock_run, tmp_path):
         """Venv python that can import pytest is used for the pytest run."""
         (tmp_path / "tests").mkdir()
@@ -292,6 +379,25 @@ class TestGateSystem:
         assert result.full_output is not None
         assert "black.....................................Failed" in result.full_output
         assert "Fix it." in result.full_output
+
+    @patch('subprocess.run')
+    def test_check_precommit_redacts_ambient_secret_from_output_sinks(
+        self, mock_run, monkeypatch
+    ):
+        secret = "issue-326-precommit-secret"
+        monkeypatch.setenv("LMER_RELEASE_GITHUB_TOKEN", secret)
+        mock_run.return_value = MagicMock(
+            returncode=1,
+            stdout=f"hook failed: {secret}\n",
+            stderr="",
+        )
+
+        result = self.gate.check_precommit()
+
+        assert result.status == CheckStatus.FAILED
+        assert secret not in result.full_output
+        assert secret not in "\n".join(result.details or [])
+        assert "***REDACTED***" in result.full_output
 
     @patch('subprocess.run')
     def test_check_precommit_fail_surfaces_non_precommit_output(self, mock_run):

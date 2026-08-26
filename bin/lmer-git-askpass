@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+
+case "${1:-}" in
+    'Username for '*)
+        printf '%s\n' "${LMER_GIT_ASKPASS_USERNAME:?LMER_GIT_ASKPASS_USERNAME is required}"
+        ;;
+    'Password for '*)
+        printf '%s\n' "${LMER_GIT_ASKPASS_PASSWORD:?LMER_GIT_ASKPASS_PASSWORD is required}"
+        ;;
+    *)
+        printf 'lmer-git-askpass: unrecognized Git prompt: %s\n' "${1:-<empty>}" >&2
+        exit 1
+        ;;
+esac

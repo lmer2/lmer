@@ -95,6 +95,28 @@ On merge detection:
 6. Record receipts (verification events, Actions run URL, PyPI URL) and
    complete the run.
 
+Git operations in both legs authenticate through the maintained,
+action-free `/Agents/global/bin/lmer-git-askpass` helper. Each command passes
+its username and credential through `LMER_GIT_ASKPASS_USERNAME` and
+`LMER_GIT_ASKPASS_PASSWORD`. These are internal, taskdef-owned inputs scoped to
+that one command—not host configuration for an operator to set, and not
+container-passthrough variables. `GIT_ASKPASS` selects the helper and
+`GIT_TERMINAL_PROMPT=0` makes an unrecognized prompt fail closed. The helper
+only answers Git's pinned-English username/password prompts; credentials never
+enter URLs, argv, Git config, or persistent files.
+
+Leg 1 verifies the generic `GITLAB_TOKEN` issuing host before expanding the
+token: `LMER_GITLAB_TOKEN_HOST` names it explicitly, or the host is derived
+from `LMER_WORK_REPO` when that variable is unset. The resolved host must be
+the canonical GitLab host. Leg 2 scopes the GitHub PAT to each mirror command.
+In particular, GitHub gate pushes do not use numbered Git config because the
+inherited environment also runs the test suite. As a backstop, captured
+pytest, custom test-runner, and pre-commit output is scrubbed for known token
+shapes, URL credentials, and eligible values (at least eight characters) from
+secret-named environment variables before terminal summaries, gate logs, or
+test cache records are written. Known locator variables such as
+`LMER_GITLAB_TOKEN_HOST` are excluded from the value sweep.
+
 ## 3. Watch, resume, single-flight, idempotency
 
 **Watch is best-effort; run state is the contract.** The watcher session
