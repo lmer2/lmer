@@ -34,40 +34,41 @@ elsewhere, generate one, or re-implement provisioning. A missing or rejected
 credential is a hard error naming the credential requirement (see HARD
 RULES), never a workaround.
 
-`release.github_target` is a bare `https://` URL and the container carries
-NO credential helper for the mirror host, with `~/.gitconfig` a read-only
-mount so one cannot be added persistently. Every operation against the
-`github` remote — the fetch in step 2, both `ls-remote` checks, and both
-`bin/gate-push` invocations — therefore fails unauthenticated. Supply the
-PAT through git's numbered-config environment, which lives only in a
-process's own env, never in a file and never on a command line.
+`release.github_target` is a bare `https://` URL and the container carries no
+persistent credential helper for the mirror host, with `~/.gitconfig` a
+read-only mount. Every operation against the `github` remote — the fetch in
+step 2, both `ls-remote` checks, and both `bin/gate-push` invocations —
+therefore fails unauthenticated. Supply the PAT through lmer's action-free
+ASKPASS helper. The helper only answers Git's credential prompts from its own
+environment; it performs no network or filesystem action.
 
 Supply it PER COMMAND, never once for the leg: each command runs in a fresh
 shell, so an `export` in one invocation does not reach the next. The prefix
 below goes in front of EACH `github`-remote command, in the same shell
 invocation as that command — the step-2 fetch, both `ls-remote` checks, and
 both `bin/gate-push` invocations (`bin/gate-push` shells out to `git`, so
-the numbered config reaches git through the environment it inherits):
+ASKPASS reaches Git through the environment it inherits):
 
 ```
-# <mirror-host> is the host of `release.github_target` — read it off that
-# URL, never typed from memory. `x-access-token` is the fixed username the
-# forge expects for a PAT; the token is the password half.
-# N is the next free index, derived from whatever numbered config this
-# shell inherited, so an inherited entry is never overwritten.
-N="${GIT_CONFIG_COUNT:-0}"
+# `x-access-token` is the fixed username the forge expects for a PAT; the
+# provisioned token is the password half. LC_ALL=C makes Git's ASKPASS prompt
+# vocabulary match the helper's audited Username/Password contract.
 (
-  export GIT_CONFIG_COUNT="$((N + 1))"
-  export "GIT_CONFIG_KEY_$N=url.https://x-access-token:${LMER_RELEASE_GITHUB_TOKEN}@<mirror-host>/.insteadOf"
-  export "GIT_CONFIG_VALUE_$N=https://<mirror-host>/"
+  export LC_ALL=C
+  export GIT_ASKPASS=/Agents/global/bin/lmer-git-askpass
+  export GIT_TERMINAL_PROMPT=0
+  export LMER_GIT_ASKPASS_USERNAME=x-access-token
+  export LMER_GIT_ASKPASS_PASSWORD="${LMER_RELEASE_GITHUB_TOKEN}"
   <the github-remote command>
 )
 ```
 
-The subshell keeps the rewrite scoped to the one command that needs it, and
-`export` is a builtin, so the token never reaches any process's command
-line. Never write the token into the remote URL, a config file, or run
-state — the rewrite is what keeps it in the environment only.
+The subshell keeps ASKPASS scoped to the one command that needs it, and
+`export` is a builtin, so the token never reaches any process's command line.
+Never write the token into the remote URL, a config file, or run state. In
+particular, do not use numbered Git config around `bin/gate-push`: the gate
+runs pytest in its inherited environment, and tests own their isolated Git
+config entries.
 
 ### Step 1 — `leg2-record-merge` — record the merge SHA
 
@@ -184,10 +185,10 @@ to report, never something to route around.
 - [ ] Record: `work release record receipt github-tag-push`
 
 Every `github`-remote command in this step — the `ls-remote` skip check and
-both pushes — carries the credential prefix from the credentials section in
+both pushes — carries the ASKPASS prefix from the credentials section in
 its own shell invocation; nothing persists from the commands before it.
-`bin/gate-push` shells out to `git`, so the numbered-config environment
-passes through, but nothing else supplies the credential. A
+`bin/gate-push` shells out to `git`, so the ASKPASS environment passes
+through, but nothing else supplies the credential. A
 rejected push (a 403 from a missing or read-only credential, a protection
 rule) is a hard error naming the credential requirement — never an
 alternative push path, per HARD RULES. Note the ordering cost of getting

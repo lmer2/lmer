@@ -22,6 +22,13 @@ _SECRET_NAME_PATTERNS = re.compile(
     r"(TOKEN|KEY|SECRET|PASSWORD|CREDENTIALS)", re.IGNORECASE
 )
 
+# Secret-named variables whose values are structurally locators rather than
+# credentials. Without this exact-name exclusion, the ambient value sweep
+# stamps the configured hostname out of every matching URL and emits a false
+# leak warning. Known token shapes and URL userinfo remain independently
+# redacted from text regardless of the variable that carried them.
+_SECRET_VALUE_LOCATOR_NAMES = frozenset({"LMER_GITLAB_TOKEN_HOST"})
+
 # Known token value prefixes — match directly in text regardless of env var name.
 # Each pattern captures the full token (prefix + sufficient trailing characters).
 # High-entropy tails keep the {20,} floor; the shorter {10,} families (Slack,
@@ -52,16 +59,20 @@ def _collect_secret_values() -> list[str]:
     Collect sensitive values from environment variables.
 
     Scans all env vars whose names match common secret patterns
-    (TOKEN, KEY, SECRET, PASSWORD, CREDENTIALS) and returns their values,
-    sorted longest-first so longer tokens are replaced before
-    any shorter substrings.
+    (TOKEN, KEY, SECRET, PASSWORD, CREDENTIALS), excluding known locator
+    variables, and returns their values sorted longest-first so longer tokens
+    are replaced before any shorter substrings.
 
     Returns:
         List of secret values (longest first)
     """
     secrets = set()
     for name, value in os.environ.items():
-        if _SECRET_NAME_PATTERNS.search(name) and len(value) >= _MIN_SECRET_LENGTH:
+        if (
+            name.upper() not in _SECRET_VALUE_LOCATOR_NAMES
+            and _SECRET_NAME_PATTERNS.search(name)
+            and len(value) >= _MIN_SECRET_LENGTH
+        ):
             secrets.add(value)
     # Sort longest-first to avoid partial replacements
     return sorted(secrets, key=len, reverse=True)

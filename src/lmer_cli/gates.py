@@ -24,7 +24,7 @@ import yaml
 from lmer_cli import gate_cache, precommit_cache, push_allow
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.util import get_bool_env
-from work_repo.utils import project_info_dir, task_info_dir
+from work_repo.utils import project_info_dir, redact_secrets, task_info_dir
 
 
 class CheckStatus(Enum):
@@ -181,6 +181,11 @@ def pytest_summary_line(output: Optional[str]) -> Optional[str]:
         if PYTEST_SUMMARY_RE.search(line):
             return line
     return None
+
+
+def _capture(result: subprocess.CompletedProcess) -> str:
+    """Join and redact subprocess output before any gate sink can read it."""
+    return redact_secrets((result.stdout or "") + (result.stderr or ""))
 
 
 def receipt_argv() -> List[str]:
@@ -409,7 +414,7 @@ class GateSystem:
             cwd=self.project_root,
         )
 
-        combined_output = (result.stdout or "") + (result.stderr or "")
+        combined_output = _capture(result)
         non_empty = [line for line in combined_output.splitlines() if line.strip()]
 
         if result.returncode == 0:
@@ -651,9 +656,8 @@ class GateSystem:
         )
 
         code = result.returncode
-        stdout = result.stdout
-        stderr = result.stderr
-        combined_output = stdout + stderr
+        stdout = result.stdout or ""
+        combined_output = _capture(result)
 
         if code == 0:
             # Extract test count from pytest output
@@ -982,9 +986,7 @@ class GateSystem:
         )
 
         code = result.returncode
-        stdout = result.stdout
-        stderr = result.stderr
-        combined_output = stdout + stderr
+        combined_output = _capture(result)
 
         if code == 0:
             if fingerprint is not None:
@@ -1012,7 +1014,7 @@ class GateSystem:
         # *impersonate* pre-commit (e.g. `uv run pre-commit` printing a uv
         # build error before pre-commit ever runs). Showing the raw tail
         # makes the real failure visible instead of inventing a summary.
-        combined = (stdout + stderr).rstrip()
+        combined = combined_output.rstrip()
         if combined:
             lines = [line for line in combined.split('\n') if line.strip()]
             details = lines[-15:]

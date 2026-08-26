@@ -29,10 +29,12 @@ import pytest
 
 from hooks.start import render_taskdef_template
 from tests.conftest import strip_lmer_env
+from tests.test_release_askpass import ASKPASS
 
 REPO_TASKDEF = Path(__file__).parent.parent / "taskdef"
 INSTRUCTIONS = REPO_TASKDEF / "release" / "instructions.txt"
 LEG2_PARTIAL = REPO_TASKDEF / "release-leg2.jinja2"
+ASKPASS_CONTAINER_PATH = f"/Agents/global/bin/{ASKPASS.name}"
 
 # The leg-2 step ladder, in the only order it may render in.
 STEP_HEADINGS = (
@@ -309,10 +311,19 @@ class TestLeg2ConsumptionContracts:
         assert "repo|refs/tags/*" in leg2
 
     def test_credentials_are_consumed_not_reimplemented(self):
-        squashed = _squash(_leg2())
+        leg2 = _leg2()
+        squashed = _squash(leg2)
         assert "Credentials are provisioned, never fetched" in squashed
         assert "/release-signing-key" in squashed
         assert "LMER_RELEASE_SIGNING_KEY" in squashed
+        assert f"GIT_ASKPASS={ASKPASS_CONTAINER_PATH}" in leg2
+        assert "LMER_GIT_ASKPASS_USERNAME=x-access-token" in leg2
+        assert (
+            'LMER_GIT_ASKPASS_PASSWORD="${LMER_RELEASE_GITHUB_TOKEN}"'
+            in leg2
+        )
+        assert "GIT_CONFIG_COUNT" not in leg2
+        assert "GIT_CONFIG_KEY_" not in leg2
         assert (
             "do NOT hunt for keys elsewhere, generate one, or re-implement "
             "provisioning" in squashed

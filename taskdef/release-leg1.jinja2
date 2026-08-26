@@ -32,12 +32,21 @@ never commit to `prep-release` directly. The branch is renamed to its final
 Until ctl itself ships through this flow, it installs from its canonical
 git.20c.com repository at a PINNED commit — never a branch, never HEAD.
 
-The container carries NO credential helper for `git.20c.com`, and
-`~/.gitconfig` is a read-only mount, so one cannot be added persistently. A
-bare `uv tool install` from that host therefore fails with `could not read
-Username for 'https://git.20c.com': terminal prompts disabled`. Supply the
-session's token through git's numbered-config environment instead — it
-lives only in this process, never in a file and never on a command line:
+The container carries no persistent credential helper for `git.20c.com`, and
+`~/.gitconfig` is a read-only mount. A bare `uv tool install` from that host
+therefore fails with `could not read Username for 'https://git.20c.com':
+terminal prompts disabled`. The generic `GITLAB_TOKEN` is scoped to its
+issuing host and must never be sent elsewhere. `LMER_GITLAB_TOKEN_HOST` names
+that host explicitly; when it is unset, the host is derived from
+`LMER_WORK_REPO`, matching lmer's token lookup contract. The command below
+enforces that the resolved host is `git.20c.com` before the token is expanded.
+A missing token, an unknown issuing host, or a different issuing host is a hard
+stop naming the credential requirement.
+
+Supply that token through lmer's action-free ASKPASS helper. The helper only
+answers Git's username and password prompts from the environment passed to the
+one install process; it performs no network or filesystem action, and the
+credential never enters a URL, argv, Git config, or persistent file:
 
 ```
 # Pinned ctl commit. Bumping this pin is a reviewed edit to this taskdef,
@@ -54,11 +63,37 @@ lives only in this process, never in a file and never on a command line:
 # install there fails with "upload-pack: not our ref".
 CTL_PINNED_REF=5af16ceaa103095f53594fe6aa33246d05f72ba7
 
-# If this session already inherits numbered git config, use the next free
-# index instead of 0 and raise GIT_CONFIG_COUNT rather than overwrite it.
-GIT_CONFIG_COUNT=1 \
-  GIT_CONFIG_KEY_0="url.https://oauth2:${GITLAB_TOKEN_git_20c_com}@git.20c.com/.insteadOf" \
-  GIT_CONFIG_VALUE_0="https://git.20c.com/" \
+GITLAB_TOKEN_ISSUING_HOST="${LMER_GITLAB_TOKEN_HOST:-}"
+if [ -z "$GITLAB_TOKEN_ISSUING_HOST" ]; then
+  GITLAB_TOKEN_ISSUING_HOST="${LMER_WORK_REPO:-}"
+  case "$GITLAB_TOKEN_ISSUING_HOST" in
+    *://*)
+      GITLAB_TOKEN_ISSUING_HOST="${GITLAB_TOKEN_ISSUING_HOST#*://}"
+      GITLAB_TOKEN_ISSUING_HOST="${GITLAB_TOKEN_ISSUING_HOST%%/*}"
+      GITLAB_TOKEN_ISSUING_HOST="${GITLAB_TOKEN_ISSUING_HOST##*@}"
+      GITLAB_TOKEN_ISSUING_HOST="${GITLAB_TOKEN_ISSUING_HOST%%:*}"
+      ;;
+    *@*:*)
+      GITLAB_TOKEN_ISSUING_HOST="${GITLAB_TOKEN_ISSUING_HOST##*@}"
+      GITLAB_TOKEN_ISSUING_HOST="${GITLAB_TOKEN_ISSUING_HOST%%:*}"
+      ;;
+    *)
+      GITLAB_TOKEN_ISSUING_HOST=""
+      ;;
+  esac
+fi
+
+GITLAB_TOKEN_ISSUING_HOST="$(printf '%s' "$GITLAB_TOKEN_ISSUING_HOST" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+if [ "$GITLAB_TOKEN_ISSUING_HOST" != "git.20c.com" ]; then
+  printf '%s\n' "ctl install requires GITLAB_TOKEN issued by git.20c.com; set LMER_GITLAB_TOKEN_HOST or LMER_WORK_REPO so the issuing host can be verified" >&2
+  exit 1
+fi
+
+LC_ALL=C \
+  GIT_ASKPASS=/Agents/global/bin/lmer-git-askpass \
+  GIT_TERMINAL_PROMPT=0 \
+  LMER_GIT_ASKPASS_USERNAME=oauth2 \
+  LMER_GIT_ASKPASS_PASSWORD="${GITLAB_TOKEN}" \
   uv tool install "git+https://git.20c.com/gh/20c/ctl@${CTL_PINNED_REF}"
 ```
 
