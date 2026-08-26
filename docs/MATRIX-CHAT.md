@@ -339,8 +339,8 @@ branch and points the unit at that tag. In order, on the daemon's host:
 # 1. The branch and the image. Build with the DEFAULT uid: the unit below maps
 #    your host user onto uid 1000 inside, so the image's user must be 1000.
 #    Do not pass --build-arg BUILD_UID=$(id -u) for this path.
-git clone https://git.20c.com/agents/global.git && cd global
-git checkout design/issue-327-matrix-chat-w4
+git clone https://github.com/lmer2/lmer && cd lmer
+git checkout main
 podman build -f Dockerfile.matrix-bridge -t localhost/lmer-matrix-bridge:poc \
     --build-arg LMER_BUILD_COMMIT="$(git rev-parse HEAD)" .
 
