@@ -1,2 +1,0 @@
-fixed:
-- "Links in agent text open in a new tab with `noopener noreferrer` again — the sanitiser had been dropping both attributes in the browser (#381)"

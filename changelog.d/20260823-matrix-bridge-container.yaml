@@ -1,4 +1,0 @@
-added:
-- "Container image for the Matrix bridge (`Dockerfile.matrix-bridge`), built by CI, with a rootless quadlet unit in docs/MATRIX-CHAT.md. This is how the bridge is deployed: spec D1 was amended by operator decision to require a container, and the host install remains only as a developer convenience"
-changed:
-- "`lmer-matrix-bridge` reaches the platform daemon through `LMER_PLATFORM_URL`/`LMER_PLATFORM_SECRET` when they are set, falling back to the daemon's local secret file. A containerised bridge cannot use the daemon's bind address, which is its own loopback from inside. Note the trade: the value supplied that way is the platform's *shared* secret, so the bridge's calls arrive as the operator rather than as an attributable caller, and it stays valid until the secret is rotated by hand — unlike the minted per-incarnation credential the assistant container gets"

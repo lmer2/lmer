@@ -4,6 +4,38 @@
 ## Unreleased
 
 
+## 0.9.0
+### Added
+- `lmer-matrix-bridge`: reach one platform daemon from a Matrix room — a run that needs a human opens a thread, and an allowlisted reply in that thread answers it. Encrypted room, per-MXID capabilities, `register` and `check` verbs; see docs/MATRIX-CHAT.md
+- `matrix` optional dependency extra, carrying the Matrix client libraries the bridge needs. Install `lmer[matrix]` to use it; every other part of lmer installs unchanged without it
+- `matrix` section in the platform's `config.json`, holding the bridge's name, homeserver, room and allowlist
+- Container image for the Matrix bridge (`Dockerfile.matrix-bridge`), built by CI, with a rootless quadlet unit in docs/MATRIX-CHAT.md. This is how the bridge is deployed: spec D1 was amended by operator decision to require a container, and the host install remains only as a developer convenience
+- The platform assistant's agent memory now persists across incarnations in a host-local store, reported by the assistant status route
+- `LMER_MODEL_ALIASES` maps short local names to model ids (`sol=gpt-5.6-sol`), expanded before harness selection so the alias alone is enough (#309)
+- `LMER_CLAUDE_OUTPUT_STYLE` selects a Claude output style at session start; an unrecognised name warns instead of failing (#257)
+- Clickable run references in chat: the assistant writes `lmer://run/<host>/<project>/<slug>` and a tap opens that run's view; an untracked run says so instead (#241)
+- Run references posted to Slack are reduced to the label they show, so a Slack-bridged operator reads the run's name instead of raw link markup (#241)
+- Added a maintained action-free Git ASKPASS helper for command-scoped release credentials
+- Draw simple marks on an image — an arrow, a box, freehand — before sending it in a chat
+- Attach files to a chat: drag, paste or pick one and the agent on the other end can read it
+- Configurable upload types and per-file size limit for chat attachments
+### Fixed
+- Matrix bridge: every outbound message failed with `EncryptionError: No group session created` because the crypto store's database was created with only the crypto upgrade table, leaving `mx_room_state` and `mx_user_profile` — the tables member lookup reads — absent. Both upgrade tables now run on that database
+- Matrix bridge: the appservice was constructed without a state store, so mautrix defaulted to a file-backed one at a relative path, unwritable in the image's working directory. The appservice and the crypto machine now share one database-backed store
+- `lmer-matrix-bridge check` no longer exits with an 'Unclosed client session' warning: the HTTP session it opens is now closed on the way out
+- Matrix bridge now handles SIGTERM/SIGINT: a container stop drains and exits 0 instead of hanging until SIGKILL.
+- Links in agent text open in a new tab with `noopener noreferrer` again — the sanitiser had been dropping both attributes in the browser (#381)
+- spawn-harness now detects a child that exits 0 with no usable answer even without `--output`: stdout is teed and measured instead of the check being skipped (#152)
+- Fixed release credentials colliding with gate tests and enforced the GitLab token issuing-host boundary
+- Redacted ambient credentials from captured pytest, custom test-runner, and pre-commit output before terminal, log, or cache sinks
+### Changed
+- `lmer_platform.client` is now a public module: `Endpoint`, `Call` and `request()` moved out of `lmer-ctl`, which re-exports them. Any host-side client of the platform API can use it; `lmer-ctl`'s own behaviour is unchanged
+- `lmer-matrix-bridge` reaches the platform daemon through `LMER_PLATFORM_URL`/`LMER_PLATFORM_SECRET` when they are set, falling back to the daemon's local secret file. A containerised bridge cannot use the daemon's bind address, which is its own loopback from inside. Note the trade: the value supplied that way is the platform's *shared* secret, so the bridge's calls arrive as the operator rather than as an attributable caller, and it stays valid until the secret is rotated by hand — unlike the minted per-incarnation credential the assistant container gets
+- Platform assistant sessions now have the shared-work-repo agent-memory route switched off outright, keeping their memory host-local
+### Security
+- Relocked every Python and web dependency onto the newest version its declared range allows, clearing five published advisories in shipped dependencies: aiohttp 3.14.1 → 3.14.3 (GHSA-cq5v-8q36-5273, GHSA-mfx4-hv73-q22v, GHSA-mq44-7p77-q5h7), dompurify 3.4.12 → 3.4.14 (GHSA-55q2-fjhq-7xh7) and nanoid 3.3.16 → 3.3.18 (GHSA-2v37-7h3g-55p8) (#316)
+
+
 ## 0.8.0
 ### Added
 - LMER_CPUS and LMER_MEMORY environment variables to override the container CPU (default 1) and memory (default 2g) limits; invalid values warn and keep the default

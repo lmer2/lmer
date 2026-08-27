@@ -1,2 +1,0 @@
-added:
-- "`LMER_MODEL_ALIASES` maps short local names to model ids (`sol=gpt-5.6-sol`), expanded before harness selection so the alias alone is enough (#309)"
