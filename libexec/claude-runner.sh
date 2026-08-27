@@ -474,6 +474,12 @@ if [ -n "$(printf '%s' "$LMER_ASK_DIR" | tr -d '[:space:]')" ]; then
     append_prompt_fragment "orchestrator-ask.md.jinja2" "Operator ask channel" || true
 fi
 
+# The chat upload store (issue 246), gated the same way and for the same reason:
+# the variable is set only where the store was actually mounted.
+if [ -n "$(printf '%s' "$LMER_UPLOADS_DIR" | tr -d '[:space:]')" ]; then
+    append_prompt_fragment "orchestrator-uploads.md.jinja2" "Operator upload store" || true
+fi
+
 # ── Non-interactive session notice ──
 # Claude Code discovers only CLAUDE.md natively, so AGENTS.md — and with it the
 # NON-INTERACTIVE SESSIONS rule — reaches the model solely through the system

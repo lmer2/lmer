@@ -6,14 +6,19 @@ you feed session-specific context (e.g. the human user's identity) to the
 model without hard-coding text in shell and without modifying the target
 project's `AGENTS.md`.
 
-`human-identity` is the only *templated* fragment today, but the pieces
-(`render-prompt-fragment.py`, the template search, the append step) are
-deliberately generic and intended to be reused for future fragments. Two
-more fragments ship as plain markdown (`prompts/agent-memory.md`,
+Three fragments go through the renderer: `human-identity`,
+`orchestrator-ask` and `orchestrator-uploads`. Two of them *interpolate* a
+session value — `human-identity` the operator's identity and
+`orchestrator-uploads` the container path the operator's attachments arrive
+at (`LMER_UPLOADS_DIR`, issue 246) — while `orchestrator-ask` is templated
+without substituting anything, since what it teaches is a CLI rather than a
+path. Two more fragments ship as plain markdown (`prompts/agent-memory.md`,
 `prompts/non-interactive.md`): they carry no session values, so they skip
 the renderer and are concatenated directly. Everything below about *when*
-a fragment is injected applies to them unchanged — each is gated on its own
-env var (`LMER_PERSIST_AGENT_MEMORY`, `LMER_NONINTERACTIVE`).
+a fragment is injected applies to all of them unchanged — each is gated on
+its own env var (`LMER_HUMAN_IDENTITY`, `LMER_ASK_DIR`, `LMER_UPLOADS_DIR`,
+`LMER_PERSIST_AGENT_MEMORY`, `LMER_NONINTERACTIVE`), and a fragment whose
+variable is unset or blank is not rendered at all.
 
 ## How it works
 
@@ -217,4 +222,6 @@ rather than `printf` / heredoc inside `claude-runner.sh` means:
 | `libexec/claude-runner.sh` | Orchestrates which fragments to inject per session. |
 | `src/lmer_cli/util.py` | Host-side resolver helpers (e.g. `resolve_human_identity`). |
 | `src/lmer_cli/cli.py` | Forwards relevant `LMER_*` vars host → container. |
+| `libexec/harness-common.sh` | The same choices for every non-claude harness, written to its global context file. |
 | `tests/test_human_identity.py` | Reference test suite for a fragment. |
+| `tests/test_platform_uploads_fragment.py` | The same layers for a fragment that interpolates a session path. |

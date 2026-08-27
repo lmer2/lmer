@@ -1339,13 +1339,17 @@ def test_a_negative_interval_in_the_file_falls_back_to_the_default(platform_root
 
 
 def test_the_two_setting_groups_warn_under_their_own_log_keys(platform_root):
-    """One machinery, three log keys, because a grep for one misconfiguration
+    """One machinery, one log key each, because a grep for one misconfiguration
     must not turn up the others (:data:`cfg.INT_SETTINGS`)."""
     keys = {rule.log_key for rule in cfg.INT_SETTINGS.values()}
     assert len(keys) == len(cfg.INT_SETTINGS)
     assert set(cfg.INT_SETTINGS) == {
         "checkin_window_seconds", "nudge_after_seconds",
         "nudge_pending_threshold",
+        # The chat upload cap (issue 246) resolves through the same warn-
+        # don't-refuse path: a host that will not boot cannot be reconfigured
+        # through its own UI, and this is a number bounding one request.
+        "upload_max_bytes",
     }
 
 

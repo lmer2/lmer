@@ -2880,6 +2880,13 @@ def main(argv: list[str] | None = None) -> int:
         # spawner made, and a value without the matching mount is a session that
         # blocks forever on answers nobody can write.
         "LMER_ASK_DIR": os.environ.get("LMER_ASK_DIR"),
+        # Container-side path of the operator's chat upload store (issue #246),
+        # forwarded for exactly the reasons above: it is a *container* path, the
+        # in-container prompt fragment is gated on it, and it is one half of a
+        # mount the spawner made rather than an operator control — a value
+        # without the matching mount is an agent told to read files out of an
+        # empty directory. No flag, for the same reason.
+        "LMER_UPLOADS_DIR": os.environ.get("LMER_UPLOADS_DIR"),
         # Env contributed by special target types (Slack tokens + parsed
         # thread context today). Keys of types with no matching target are
         # seeded with None so the .env merge below cannot forward them.

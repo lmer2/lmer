@@ -96,8 +96,10 @@ from . import reattach
 from . import relations
 from . import session_io
 from . import transcripts
+from . import uploads
 from .answer import AnswerError, AnswerRequest, answer_run
 from .ask import AskChannelError
+from .uploads import UploadError
 from .assistant import AssistantError
 from .config import (
     ASSISTANT_SETTING_KEYS,
@@ -109,6 +111,8 @@ from .config import (
     checkin_settings,
     configured_repo_url,
     nudge_settings,
+    upload_settings,
+    upload_types,
     update_stored,
     validate_assistant_override,
     validate_int_setting,
@@ -499,6 +503,20 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
         "nudge": {
             key: setting.to_dict()
             for key, setting in nudge_settings().items()
+        },
+        # The chat-upload group (issue 246). Here because the write route already
+        # accepts ``upload_max_bytes`` — it is in ``INT_SETTINGS`` — and a key a
+        # route persists and reports under ``changed`` while showing nothing of
+        # it back is a 200 an operator cannot check (!272 review). ``types`` rides
+        # along read-only: it is a list, so it is not one of the integer keys the
+        # write accepts, and an operator reading a cap without the allowlist
+        # beside it knows half the answer.
+        "uploads": {
+            **{
+                key: setting.to_dict()
+                for key, setting in upload_settings().items()
+            },
+            "types": list(upload_types()),
         },
         "note": _CONFIG_SCOPE_NOTE,
     }
@@ -1147,7 +1165,9 @@ def create_app(
     """
     import anyio
     from fastapi import Depends, FastAPI, Header, HTTPException, Query
-    from fastapi.responses import FileResponse, PlainTextResponse
+    from fastapi.responses import (
+        FileResponse, PlainTextResponse, StreamingResponse,
+    )
     from starlette.websockets import WebSocketDisconnect
 
     if not secret:
@@ -1353,6 +1373,14 @@ def create_app(
             "Not the same as POST /api/runs/answer: that respawns a run that\n"
             "stopped on a question, while this drops a reply into a directory a\n"
             "still-running session is polling. No container is started.\n\n"
+            "Files you hand a session (its chat's attachments):\n"
+            "  POST /api/sessions/{id}/uploads      store one {name,data:base64};\n"
+            "                                       the reply's `reference` is the\n"
+            "                                       line to put in the message\n"
+            "  GET  /api/sessions/{id}/uploads/{name}  read one back\n\n"
+            "Stored host-side and bind-mounted into the container, because the\n"
+            "input route types bytes at a PTY and has nowhere for a file. A\n"
+            "session started before this existed has no store and is told so.\n\n"
             "Ending one session — two verbs, never interchangeable:\n"
             "  POST /api/sessions/{id}/wind-down  ask the agent to wrap up and end\n"
             "                                     itself {note} — 202, nothing has\n"
@@ -1779,6 +1807,122 @@ def create_app(
             "question_id": recorded["question_id"],
             "answered_at": recorded["answered_at"],
         }
+
+    # --- files the operator hands a session (issue #246) ---------------------
+    #
+    # The chat's write path types bytes at a PTY, which has nowhere for an
+    # attachment in it, so a file goes the way the ask channel's questions do: the
+    # daemon writes it into a directory bind-mounted into the container and the
+    # message names the path. The store is per session for a worker and per host
+    # for uber lmer (:mod:`lmer_platform.uploads`), and this route knows which
+    # only through the registry entry's ``kind``.
+    #
+    # Two routes, both scoped to one session's own store: what can be written and
+    # what can be read back. Neither takes a path — the write composes the stored
+    # name and the read matches against the store's listing — so there is no join
+    # of caller text onto a filesystem path anywhere in the feature.
+
+    @app.post(
+        "/api/sessions/{session_id}/uploads", dependencies=guard, status_code=201
+    )
+    def session_upload(
+        session_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Store one file for a live session and say how to refer to it.
+
+        The body is ``{"name": …, "data": <base64>}``. Base64 in a JSON body
+        rather than multipart because FastAPI's file parsing needs a packaged
+        dependency this project does not otherwise carry, and a screenshot is
+        small enough that 33% of wire overhead is not the constraint — the
+        transport is a swap behind this route if that ever changes.
+
+        The reply carries ``reference``: the exact line the client puts in the
+        message it then sends through ``POST …/input``. Composing it here keeps
+        one wording, and the pane recognises the same line when the turn comes
+        back from the transcript.
+
+        Nothing is typed at the session by this route. Storing a file and telling
+        the agent about it are two acts, and an operator who attached something
+        and then thought better of it has sent nothing.
+        """
+        try:
+            entry = session_io.require_session(session_id)
+            live = session_io.session_is_live(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        if not live:
+            # 410 rather than the store's 409: a session that has ended is not a
+            # session that would take a file after a restart of *itself*. Nothing
+            # is reading the store, and the message the file would have been
+            # attached to has nowhere to go either — the same news
+            # ``ask.SessionGone`` gives an answer aimed at a session that left.
+            raise HTTPException(
+                status_code=410,
+                detail=(
+                    "this session has exited, so a file handed to it would reach "
+                    "nobody. Its conversation is still readable, and resuming the "
+                    "run is what starts something that can be sent to."
+                ),
+            )
+        try:
+            # The limits are resolved **per request**, not read off the config
+            # this app was built with: ``POST /api/assistant/config`` persists
+            # ``upload_max_bytes`` — it is in ``INT_SETTINGS``, which is where
+            # that route's accepted integer keys come from — and answers 200, so
+            # a closure value would have told the operator a change had landed
+            # while every upload went on using the old cap until the daemon
+            # restarted (!272 review). Same posture as the check-in and nudge
+            # groups, which the detector re-reads every tick.
+            stored = uploads.store_upload(
+                session_id,
+                entry,
+                body.get("name"),
+                body.get("data"),
+                allowed=upload_types(),
+                max_bytes=upload_settings()["max_bytes"].value,
+            )
+        except UploadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return stored.to_dict()
+
+    @app.get("/api/sessions/{session_id}/uploads/{name}", dependencies=guard)
+    def session_upload_file(session_id: str, name: str):
+        """Serve one file back out of this session's own store.
+
+        What it is for is the chat pane: an operator on a phone opening the run
+        hours later sees the screenshot they sent, not a path. So the response is
+        the bytes, with the type **re-read from the file** — the session can
+        replace it through the mount, and a remembered type would describe a file
+        that is no longer there.
+
+        ``inline`` only for the image types, and ``nosniff`` on everything: a
+        browser deciding for itself what a file is, is the one thing this must
+        not leave open, since the content came from outside.
+        """
+        try:
+            entry = session_io.require_session(session_id)
+            handle, kind, stored = uploads.open_stored(session_id, entry, name)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except UploadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        disposition = "inline" if kind.inline else "attachment"
+        # Streamed from the descriptor the store opened rather than re-opened from
+        # a path: ``FileResponse`` resolves the name again at send time, and the
+        # container has ``rw`` on that directory for the whole of it — see
+        # :func:`lmer_platform.uploads.open_stored` (!272 review).
+        return StreamingResponse(
+            handle,
+            media_type=kind.content_type,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                # The stored name, which this route matched a listing against —
+                # never the caller's text.
+                "Content-Disposition": f'{disposition}; filename="{stored}"',
+            },
+        )
 
     # --- ending one session (spec §7.5 / D22, T27) ---------------------------
     #

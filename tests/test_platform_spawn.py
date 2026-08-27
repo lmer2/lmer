@@ -32,7 +32,7 @@ from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINKS_ENV
 from lmer_cli.user_harnesses import HARNESSES_DIR_ENV, clear_user_harness_cache
 from lmer_platform import config as cfg
 from lmer_platform import (
-    ask, memory, registry, runs, session_io, spawn, store, transcripts,
+    ask, memory, registry, runs, session_io, spawn, store, transcripts, uploads,
 )
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
@@ -132,6 +132,23 @@ def fake_lmer(tmp_path):
         'ask_host="${ask_spec%%:*}"\n'
         'if [ -n "$ask_host" ] && [ -d "$ask_host" ]; then\n'
         '  printf "%s" "${LMER_ASK_DIR-<unset>}" > "$ask_host/child-saw-env"\n'
+        "fi\n"
+        # The upload store's two halves, recorded the same way and for the same
+        # reason (#246): a mount without the variable is a store no agent is told
+        # to read, and a variable without the mount is an agent sent to an empty
+        # directory.
+        'up_spec=""; prev=""\n'
+        'for arg in "$@"; do\n'
+        '  if [ "$prev" = "--mount-dir" ]; then\n'
+        "    case \"$arg\" in\n"
+        f'      *:{uploads.CONTAINER_UPLOADS_DIR}:*) up_spec="$arg" ;;\n'
+        "    esac\n"
+        "  fi\n"
+        '  prev="$arg"\n'
+        "done\n"
+        'up_host="${up_spec%%:*}"\n'
+        'if [ -n "$up_host" ] && [ -d "$up_host" ]; then\n'
+        '  printf "%s" "${LMER_UPLOADS_DIR-<unset>}" > "$up_host/child-saw-env"\n'
         "fi\n"
         # With FAKE_LMER_SESSION_LOG set the stub stands in for a *newer image*:
         # one whose in-container supervisor writes the session's own log into the
@@ -1951,6 +1968,7 @@ HARNESS_SESSION_DIRS = {
 PLATFORM_MOUNT_DESTINATIONS = {
     *HARNESS_SESSION_DIRS.values(),
     ask.CONTAINER_ASK_DIR,
+    uploads.CONTAINER_UPLOADS_DIR,
     supervisor.CONTAINER_SESSION_LOG_DIR,
 }
 
@@ -3022,6 +3040,146 @@ def test_a_mount_aimed_at_the_ask_channel_is_refused(config, hijack):
 def test_the_container_path_is_the_one_the_guard_protects():
     """The literal in the hijack parameters above, kept honest."""
     assert ask.CONTAINER_ASK_DIR == "/home/developer/.lmer-ask"
+
+
+# --- the chat upload store (#246) ---------------------------------------------
+#
+# A third per-session directory, and the same two halves as the ask channel: the
+# mount, and the variable that tells the agent it has one. A file the operator
+# attaches to the chat is written into this directory host-side while the session
+# runs, so it has to be mounted before the container starts — nothing can add one
+# to a container that is already up, which is exactly what the route's refusal
+# says to a session spawned before this shipped.
+
+def test_the_upload_store_exists_before_the_session_starts(config):
+    result = spawn.spawn_session(config, request_for())
+    directory = spawn.upload_dir_for(result.session_id, registry.WORKER_KIND)
+    assert directory.is_dir()
+    assert directory.parent == store.logs_dir(), "beside the PTY log, by design"
+
+
+def test_the_upload_store_is_private_to_this_user(config):
+    """It holds whatever was on the operator's screen, credentials included."""
+    result = spawn.spawn_session(config, request_for())
+    directory = spawn.upload_dir_for(result.session_id, registry.WORKER_KIND)
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+def test_the_upload_mount_satisfies_lmer_s_own_validator(config):
+    """Handed to the parser that will actually read it, as the others are."""
+    result = spawn.spawn_session(config, request_for())
+    spec = mount_spec_for(result.command, uploads.CONTAINER_UPLOADS_DIR)
+    specs = parse_dir_mount_specs([spec], "")
+    assert len(specs) == 1
+    assert specs[0].host == spawn.upload_dir_for(
+        result.session_id, registry.WORKER_KIND
+    )
+    assert specs[0].container == uploads.CONTAINER_UPLOADS_DIR
+    assert specs[0].mode == "rw", (
+        "the daemon writes attachments in and the session moves them out"
+    )
+
+
+def test_the_child_sees_both_halves_of_the_upload_store(config):
+    """As the spawned process actually got them: the stub finds the mount by its
+    destination and writes what ``LMER_UPLOADS_DIR`` held into it."""
+    result = spawn.spawn_session(config, request_for())
+    marker = spawn.upload_dir_for(
+        result.session_id, registry.WORKER_KIND
+    ) / "child-saw-env"
+    assert wait_for(marker.is_file), "the stub never found the upload mount"
+    assert marker.read_text(encoding="utf-8") == uploads.CONTAINER_UPLOADS_DIR
+
+
+def test_the_registry_entry_records_that_this_session_can_be_handed_a_file(config):
+    """The route reads this rather than looking for the directory: uber lmer's
+    store is per host, so its existence says nothing about the container that is
+    running now."""
+    result = spawn.spawn_session(config, request_for(extra_args=("--sleep",)))
+    entry = registry.read_session(result.session_id) or {}
+    assert entry.get("uploads", {}).get("container_path") == (
+        uploads.CONTAINER_UPLOADS_DIR
+    )
+    assert entry["uploads"]["path"] == str(
+        spawn.upload_dir_for(result.session_id, registry.WORKER_KIND)
+    )
+
+
+def test_uber_lmer_uploads_land_in_the_host_store_not_a_session_one(
+    config, monkeypatch
+):
+    """Clarification 3: one directory the assistant manages across incarnations,
+    which is the same choice its memory store makes (#325)."""
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        captured["command"] = list(command)
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+    spec = mount_spec_for(captured["command"], uploads.CONTAINER_UPLOADS_DIR)
+    assert spec.split(":")[0] == str(uploads.assistant_upload_dir())
+    assert captured["env"][uploads.UPLOADS_DIR_ENV] == uploads.CONTAINER_UPLOADS_DIR
+
+
+def test_a_session_whose_upload_store_cannot_be_created_still_starts(
+    config, monkeypatch, caplog
+):
+    """Fail-soft, and honest on both sides: no directory means no variable, so
+    nothing tells the agent to read a place nothing was mounted at."""
+    monkeypatch.setattr(uploads, "prepare_upload_dir", lambda _directory: None)
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        captured["command"] = list(command)
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    result = spawn.spawn_session(config, request_for(extra_args=("--sleep",)))
+    assert result.session_id
+    assert uploads.CONTAINER_UPLOADS_DIR not in [
+        spec.split(":")[1] for spec in mount_specs_in(captured["command"])
+    ]
+    assert captured["env"][uploads.UPLOADS_DIR_ENV] == ""
+    entry = registry.read_session(result.session_id) or {}
+    assert entry.get("uploads") == {}, "and the entry says so, so the route refuses"
+
+
+def test_the_variable_is_never_inherited_from_the_daemon(config, monkeypatch):
+    """A daemon started from inside a session carries the variable. Inheriting it
+    would tell a session with no mount that it has one."""
+    monkeypatch.setenv(uploads.UPLOADS_DIR_ENV, "/somewhere/else")
+    monkeypatch.setattr(uploads, "prepare_upload_dir", lambda _directory: None)
+    captured = {}
+    real_popen = spawn.subprocess.Popen
+
+    def spy(command, **kwargs):
+        captured.update(dict(kwargs.get("env") or {}))
+        return real_popen(command, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", spy)
+    spawn.spawn_session(config, request_for())
+    assert captured[uploads.UPLOADS_DIR_ENV] == ""
+
+
+@pytest.mark.parametrize("hijack", [
+    ("--mount-dir", f"/tmp:{uploads.CONTAINER_UPLOADS_DIR}:rw"),
+    ("--mount-dir", f"/tmp:{uploads.CONTAINER_UPLOADS_DIR}"),
+])
+def test_a_caller_may_not_redirect_the_upload_store(config, hijack):
+    """Last-wins dedupe would hand a caller the operator's attachments."""
+    with pytest.raises(spawn.SpawnError, match="may not target"):
+        spawn.spawn_session(config, request_for(extra_args=hijack))
+
+
+def test_the_upload_container_path_is_the_one_the_guard_protects():
+    """The literal in the parameters above, kept honest."""
+    assert uploads.CONTAINER_UPLOADS_DIR == "/home/developer/.lmer-uploads"
 
 
 # --- the exit observation point ----------------------------------------------

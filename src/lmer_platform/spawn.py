@@ -151,7 +151,7 @@ from lmer_cli.service import ServiceError
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
-from . import ask, memory, meta, registry, runs, slots
+from . import ask, memory, meta, registry, runs, slots, uploads
 from .config import ENV_REPO_URL, PlatformConfig, configured_repo_url
 from .store import StoreError, append_event, logs_dir, utc_now_iso
 from . import store
@@ -166,6 +166,7 @@ __all__ = [
     "PRESET_FLAG", "AGENTS_FLAG", "MODEL_FLAG", "NO_REPO_ENV",
     "resolve_lmer_bin", "derive_run_identity", "spawn_session", "log_path_for",
     "token_file_for", "read_control_token", "transcript_dir_for", "ask_dir_for",
+    "upload_dir_for",
     "container_log_dir_for", "container_log_path_for",
 ]
 
@@ -1178,6 +1179,8 @@ def _reserved_session_destinations() -> dict:
         _container_dir_key("/workspace"): "the session's workspace",
         _container_dir_key("/Agents/global"): "the agent-files tree",
         _container_dir_key(ask.CONTAINER_ASK_DIR): "the session's ask channel",
+        _container_dir_key(uploads.CONTAINER_UPLOADS_DIR):
+            "the session's chat upload store",
         _container_dir_key(CONTAINER_SESSION_LOG_DIR): "the session's own log",
         _container_dir_key(CONTAINER_HARNESSES_DIR): "the user-harness drop-ins",
         _container_dir_key(CONTAINER_MOUNT_STAGING_DIR):
@@ -1473,6 +1476,36 @@ def _ask_mount_flags(directory: Path) -> list:
     drift apart.
     """
     return ["--mount-dir", f"{directory}:{ask.CONTAINER_ASK_DIR}:rw"]
+
+
+def upload_dir_for(session_id: str, kind: str) -> Path:
+    """Host directory holding the files the operator attaches to this session's
+    chat (issue #246).
+
+    Pass-through to :func:`lmer_platform.uploads.upload_dir_for`, kept here so
+    the spawn side has one name for every directory it mounts. The *kind* is the
+    argument because the two surfaces keep their uploads in different places —
+    a worker's are its own, uber lmer's are the host's — and this is the layer
+    that knows which is being started.
+    """
+    return uploads.upload_dir_for(session_id, kind)
+
+
+def _prepare_upload_dir(session_id: str, kind: str) -> Optional[Path]:
+    """Create the session's upload store. ``None`` if that failed.
+
+    Fail-soft for the ask channel's reason, with the same honest far end: no
+    directory means no ``LMER_UPLOADS_DIR``, so no prompt fragment tells the
+    agent to look in a place nothing was mounted at, and
+    :func:`lmer_platform.uploads.mounted_store` refuses the upload rather than
+    writing a file nobody will read.
+    """
+    return uploads.prepare_upload_dir(upload_dir_for(session_id, kind))
+
+
+def _upload_mount_flags(directory: Path) -> list:
+    """``lmer`` flags that mount *directory* in as the session's upload store."""
+    return uploads.mount_flags(directory)
 
 
 def _prepare_container_log_dir(session_id: str) -> Optional[Path]:
@@ -1778,6 +1811,12 @@ def _protected_mount_destinations() -> dict:
             "log as this session's scrollback, so redirecting it would put the "
             "record of everything the session drew in a directory nobody reads "
             "back — and leave the terminal view showing an empty file"
+        ),
+        uploads.CONTAINER_UPLOADS_DIR: (
+            "the platform writes the files the operator attaches to this "
+            "session's chat there, so redirecting it would hand a caller's "
+            "directory whatever the operator uploads next — and leave the agent "
+            "reading files nobody sent it"
         ),
     })
     return protected
@@ -2469,6 +2508,11 @@ def spawn_session(
     )
     if memory_dir is not None:
         memory.observe(memory_dir)
+    # Where the files the operator attaches to this session's chat land (#246).
+    # Every session gets one, worker and assistant alike — a screenshot is most
+    # useful to the run that just built the thing in it — and the *kind* decides
+    # only which store that is.
+    upload_dir = _prepare_upload_dir(session_id, kind)
 
     # One insertion, not one per mount: _with_host_flags inserts right after
     # --fastapi, so calling it twice would interleave the mounts in reverse and
@@ -2482,6 +2526,8 @@ def spawn_session(
         host_flags += _container_log_mount_flags(container_log_dir)
     if memory_dir is not None:
         host_flags += memory.mount_flags(memory_dir)
+    if upload_dir is not None:
+        host_flags += _upload_mount_flags(upload_dir)
     if host_flags:
         command = _with_host_flags(command, host_flags)
 
@@ -2500,6 +2546,15 @@ def spawn_session(
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
     }
+    if upload_dir is not None:
+        child_env[uploads.UPLOADS_DIR_ENV] = uploads.CONTAINER_UPLOADS_DIR
+    else:
+        # Blanked rather than deleted, for ASK_DIR_ENV's reason below: the child
+        # is `lmer`, which seeds its own environment from .env files first-wins,
+        # so a merely absent key is one a file may re-supply — and this variable
+        # is what gates the prompt fragment that tells an agent to read files out
+        # of a directory this session has not got.
+        child_env[uploads.UPLOADS_DIR_ENV] = ""
     if ask_dir is not None:
         child_env[ask.ASK_DIR_ENV] = ask.CONTAINER_ASK_DIR
     else:
@@ -2620,6 +2675,12 @@ def spawn_session(
                 "token_ref": str(token_file),
             },
             log_path=str(log_file),
+            # Whether this session can be handed a file, recorded by the only
+            # actor that knows: the store exists on the host as soon as one
+            # spawn has made it (uber lmer's is per host), so its presence says
+            # nothing about the container that is running now — see
+            # lmer_platform.uploads.registry_pointer.
+            uploads=uploads.registry_pointer(upload_dir),
             started_at=utc_now_iso(),
         )
 
