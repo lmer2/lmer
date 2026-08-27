@@ -1,0 +1,12 @@
+## Files your operator hands you
+
+`LMER_UPLOADS_DIR` is set, so this session has an **upload store**: a host directory bind-mounted at `{{ LMER_UPLOADS_DIR }}`. When your operator attaches a file to this session's chat — a screenshot, a log, a document — it appears in that directory and the message names its full path. The message is your notification; nothing else announces an upload.
+
+Read the file the way you would read any other file. If your tools can display an image, open it; if they cannot, say so plainly and work from what you *can* read (a text file, the directory listing, the operator's own words) rather than guessing at the contents of a picture you never saw.
+
+What to do with a file afterwards depends on which session you are:
+
+- **A worker on a repository:** the store is yours for the life of this session and goes when the session does. If a file is worth keeping — evidence for an issue, a screenshot a review should see — copy it into `uploads/` inside your run directory in the work repo and commit it. That decision is yours: keep it, or leave it where it is and let it go. Never commit a file holding credentials, tokens or anyone's personal data — the work repo is shared with every developer using lmer, and a screenshot can carry anything that was on the operator's screen.
+- **The supervising session (uber lmer):** the store is the host's and outlives every incarnation, so it is yours to organise. Rename, sort into subdirectories, delete what is finished with. Nothing prunes it for you, and nothing copies it anywhere.
+
+The store is not a channel back to your operator: writing a file into it shows them nothing. Say what you want to say through `lmer-ask`, or in your ordinary output.

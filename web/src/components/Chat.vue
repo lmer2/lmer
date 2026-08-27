@@ -98,12 +98,21 @@ import {
   mdiAlertCircleOutline,
   mdiClose,
   mdiCogOutline,
+  mdiDraw,
+  mdiFileDocumentOutline,
+  mdiPaperclip,
   mdiRefresh,
   mdiSend,
   mdiUnfoldMoreHorizontal,
 } from '@mdi/js'
-import { fetchSessionMessages, sendSessionInput } from '../api.js'
+import {
+  fetchSessionMessages, sendSessionInput, sessionUploadUrl, uploadSessionFile,
+} from '../api.js'
 import { ago } from '../format.js'
+// The optional sketch phase (issue 246, slice 2). Its own chunk, like the
+// renderer and the terminal: it is a canvas and three tools that most sends
+// never open, and the fleet view must not pay for it on first paint.
+const SketchPad = defineAsyncComponent(() => import('./SketchPad.vue'))
 
 // The renderer arrives as its own chunk, fetched the first time a view renders one
 // — Markdown.vue's header has the numbers and the reason (the fleet view is the
@@ -216,6 +225,166 @@ let cursor = 0
 // nothing renders it. Dropped with `pending` and the cursor in `start()`, and the
 // rule it exists for is the last paragraph above `settlePending`.
 const consumed = new Set()
+
+// --- files the operator hands this session (issue 246) -----------------------
+//
+// Three ways in, one tray: a drop on the composer, a paste into it, and the file
+// picker — which is also the camera roll on a phone, and the reason the picker is
+// not the afterthought it looks like. What they produce is identical, so they all
+// end in `stage()`.
+//
+// The tray is *staged*, not sent: the files go to the daemon when the message
+// does, so an operator who attaches something and then thinks better of it has
+// shown it to nobody. `send()` uploads first and types second — a message naming
+// a file that failed to store would send the agent to a path that is not there.
+const attachments = ref([])
+let attachmentId = 0
+const picker = ref(null)
+const dragging = ref(false)
+
+// What the OS file dialog is *hinted* with, and deliberately the widest set lmer
+// can ever accept rather than this host's configured list. A superset can only
+// offer a file the daemon then refuses — with a sentence naming what it takes,
+// which is shown in this pane — while a client-side copy of the allowlist that
+// drifted narrow would *hide* an allowed file from the picker, on a phone, with
+// nothing to explain why. The daemon is the only place the policy lives
+// (lmer_platform.uploads.KNOWN_TYPES); this is a hint, and
+// tests/test_platform_web_uploads.py pins it as a superset of that table.
+const ACCEPT = [
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+  'application/pdf', 'text/plain',
+].join(',')
+
+// A bound rather than a policy: a folder dropped by accident is hundreds of
+// files, and uploading them one request at a time is not what the operator meant.
+const MAX_ATTACHMENTS = 5
+
+function stage(files) {
+  const arriving = Array.from(files || [])
+  if (!arriving.length) return
+  const room = MAX_ATTACHMENTS - attachments.value.length
+  if (room <= 0) {
+    problem.value = `${MAX_ATTACHMENTS} files at a time — send these first`
+    return
+  }
+  if (arriving.length > room) {
+    // Said out loud: silently keeping the first few would read as all of them
+    // having been attached.
+    problem.value = `only the first ${room} of those were attached (${MAX_ATTACHMENTS} at a time)`
+  }
+  for (const file of arriving.slice(0, room)) {
+    attachments.value = [...attachments.value, {
+      id: (attachmentId += 1),
+      file,
+      // The browser's name for it, shown here and sent as a suggestion. What it
+      // is stored as is the daemon's answer (it sanitises and timestamps), and
+      // what it is *taken* as comes off the bytes — so nothing here is a claim
+      // about the file's type.
+      name: file.name || 'pasted-file',
+      size: file.size,
+      // A local preview, so what was attached is visible before anything has
+      // been uploaded. Only for images, and only from the file already in the
+      // browser — this needs no round trip and no route.
+      preview: file.type?.startsWith('image/') ? URL.createObjectURL(file) : null,
+    }]
+  }
+}
+
+// --- the optional sketch phase (issue 246) -----------------------------------
+//
+// Before sending, an image can be drawn on: highlight an area, point an arrow at
+// something. Optional in the strong sense — nothing is re-encoded unless the
+// operator accepts a mark, and an attachment nobody marks up is uploaded exactly
+// as it was picked.
+const marking = ref(null)
+
+const markingFile = computed(
+  () => attachments.value.find((item) => item.id === marking.value)?.file || null,
+)
+
+function markUp(id) {
+  marking.value = id
+}
+
+// The marked-up copy takes the original's place in the tray: it is the same
+// attachment, with the marks the operator just made. The old preview is revoked
+// here because this is the one place a staged file is replaced rather than
+// removed, and the browser holds the bitmap alive until it is.
+function useMarked(file) {
+  attachments.value = attachments.value.map((item) => {
+    if (item.id !== marking.value) return item
+    if (item.preview) URL.revokeObjectURL(item.preview)
+    // `stored` is dropped, not carried: it is a memo about *bytes already
+    // uploaded*, and these are different bytes. A send that failed after its
+    // upload landed — the case the memo exists for — left one set, and marking
+    // the file up then sending again uploaded nothing and named the original,
+    // unmarked file. The tray said `…-marked.png`, the send succeeded, and the
+    // agent got the image without the marks (!273 review). This is the only
+    // place an entry's bytes are replaced; `stage` and `unstage` never move a
+    // memo onto a different file.
+    const { stored: _replaced, ...rest } = item
+    return {
+      ...rest,
+      file,
+      name: file.name,
+      size: file.size,
+      preview: URL.createObjectURL(file),
+    }
+  })
+  marking.value = null
+}
+
+function unstage(id) {
+  const going = attachments.value.find((item) => item.id === id)
+  if (going?.preview) URL.revokeObjectURL(going.preview)
+  attachments.value = attachments.value.filter((item) => item.id !== id)
+}
+
+function onPick(event) {
+  stage(event.target.files)
+  // Cleared so picking the same file twice in a row fires `change` the second
+  // time: the input's value is what the event compares against.
+  event.target.value = ''
+}
+
+function onPaste(event) {
+  const files = event.clipboardData?.files
+  if (!files?.length) return
+  // Only when there are files. A paste of text must stay a paste of text —
+  // preventing the default here would break pasting a command into the box.
+  event.preventDefault()
+  stage(files)
+}
+
+function onDrop(event) {
+  dragging.value = false
+  stage(event.dataTransfer?.files)
+}
+
+// Read once, for the upload: the daemon takes base64 in a JSON body, and a data
+// URL is what a browser will hand over without a second API. The header before
+// the comma is dropped here so the daemon is never sent one.
+function base64Of(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error(`${file.name || 'that file'} could not be read`))
+    reader.onload = () => {
+      const text = String(reader.result || '')
+      const comma = text.indexOf(',')
+      resolve(comma >= 0 ? text.slice(comma + 1) : text)
+    }
+    reader.readAsDataURL(file)
+  })
+}
+
+// The previews a bubble carries are object URLs, and they are this component's to
+// release: the browser holds the file alive until they are revoked, and a long
+// session of pasting screenshots is exactly the case where that adds up.
+function release(item) {
+  for (const attachment of item.attachments || []) {
+    if (attachment.preview) URL.revokeObjectURL(attachment.preview)
+  }
+}
 // What names a bubble, since nothing about one is a name: two identical messages
 // are two bubbles, and the transcript has neither of them yet. It is the render key
 // and it is what the dismiss below is given — the index was both, and an index
@@ -234,11 +403,86 @@ let polling = false
 // land in the list that replaced it.
 let generation = 0
 
-const visible = computed(() =>
-  showInjected.value
+// --- an attachment, seen again in the history --------------------------------
+//
+// A turn read back from the transcript is text, and the file it names is in the
+// session's store: this is what turns the one into the other, so an operator
+// opening the run on a phone hours later sees the screenshot they sent rather
+// than a path. The bubble's own preview (see `release`) covers only the device
+// that sent it and only until the page is reloaded.
+//
+// This is a *prediction*, and a small one deliberately. The daemon composes the
+// line, and this end recognises the marker it composed — a contract the caller
+// imposes on itself — but what a harness writes into its transcript for a user
+// turn is the harness's business. If it rewrites the text there is no match, and
+// what is left is the path in full, which is what the agent was given anyway.
+// Nothing automated hangs off it: it decides one <img>.
+const UPLOAD_REFERENCE = /^\[lmer upload\] (\S+) \(([^,)]+)[,)]/gm
+
+// Only images, and only the ones the daemon said were images when it stored
+// them: everything else in a store is a file to open, not a picture to draw.
+function uploadsIn(text) {
+  const found = []
+  for (const [, path, type] of String(text || '').matchAll(UPLOAD_REFERENCE)) {
+    if (!type.startsWith('image/')) continue
+    // The name, not the path: the read route is scoped to this session's own
+    // store and matches the name against what is actually in it, so a path is
+    // neither needed nor useful here.
+    found.push(path.slice(path.lastIndexOf('/') + 1))
+  }
+  return found
+}
+
+// A thumbnail whose file the store no longer holds — a worker that deleted it
+// after copying it into its work dir, an uber lmer incarnation whose entry has
+// been rotated away — is dropped rather than drawn as a broken image. The turn's
+// text still names it, which is the honest fallback.
+const missingUploads = ref(new Set())
+
+function noteMissing(url) {
+  // Keyed by the URL rather than the bare name: two sessions of one run can hold
+  // files of the same name, and a 404 in one store says nothing about the other.
+  missingUploads.value = new Set([...missingUploads.value, url])
+}
+
+// Which session's store to ask. A worker's store is per session, while this
+// pane's history spans **every session of the run** (`transcripts.read_messages`
+// merges them), so resolving every thumbnail against the session the pane is
+// pointed at now means a file uploaded before a resume is looked up in the store
+// of the session that came after it: 404, no image, and a path into a container
+// that no longer exists. Resuming is the ordinary life of a run, so that was the
+// ordinary case rather than an edge one (!272 review).
+//
+// The page already says which transcript each turn was read from (`origin`) and
+// which platform session each of those files belongs to (`sessions[].session`),
+// so this is read off the payload rather than guessed. The fallback is this
+// pane's own session, which is the right answer for a turn that carries no
+// origin — one merged in from the ask channel — and for uber lmer, whose store is
+// per host and the same whichever incarnation is reading it.
+const sessionByOrigin = computed(() => {
+  const map = new Map()
+  for (const source of sessions.value) {
+    if (source.id && source.session) map.set(source.id, source.session)
+  }
+  return map
+})
+
+function uploadUrl(name, message) {
+  const owner = sessionByOrigin.value.get(message?.origin) || props.sessionId
+  return sessionUploadUrl(owner, name)
+}
+
+const visible = computed(() => {
+  const shown = showInjected.value
     ? messages.value
-    : messages.value.filter((message) => message.kind === 'said'),
-)
+    : messages.value.filter((message) => message.kind === 'said')
+  return shown.map((message) => ({
+    ...message,
+    // Only what you sent: these lines are put in a message by this pane, and an
+    // agent quoting one back is quoting, not attaching.
+    uploads: message.role === 'user' ? uploadsIn(message.text) : [],
+  }))
+})
 
 const hiddenCount = computed(
   () => messages.value.length - messages.value.filter((m) => m.kind === 'said').length,
@@ -434,7 +678,10 @@ function settlePending() {
         && (comparable(message.text) === words
           || comparable(message.text) === defused),
     )
-    if (own) consumed.add(own.seq)
+    if (own) {
+      consumed.add(own.seq)
+      release(item)
+    }
     return !own
   })
 }
@@ -502,7 +749,25 @@ async function start() {
   phase.value = 'loading'
   problem.value = null
   messages.value = []
+  // Cleared here as well as in `send`'s `finally`, which is guarded by
+  // `stale(mine)`: a send in flight when the view switches session leaves that
+  // guard true forever, and the composer is `:disabled="sending"` — so the box
+  // was greyed out for the rest of the page's life with nothing shown (!272
+  // review). The window used to be one POST and is now up to five uploads.
+  sending.value = false
+  pending.value.forEach(release)
   pending.value = []
+  // A different session is a different upload store, so which names came back
+  // 404 says nothing about this one's.
+  missingUploads.value = new Set()
+  // Deliberately NOT reset, and this is the whole of the rule: what belongs to
+  // the *conversation* is dropped here, while what belongs to the *operator* —
+  // the draft and the staged attachments — survives a switch, because a person
+  // who composed something and then went to look at another run has not
+  // discarded it. What that costs is one thing, and `send` pays it: an upload
+  // memo is keyed to the session it was made in, so a staged file that crosses a
+  // switch is uploaded again to the session it is actually sent to rather than
+  // named at a path only the previous one has (!272 review round 2).
   following.value = true
   cursor = 0
   // With the numbering they were recorded against: the turns of the session this
@@ -546,9 +811,29 @@ async function loadEarlier() {
 }
 
 async function send() {
-  const text = draft.value.trim()
-  if (!text || sending.value) return
+  const typed = draft.value.trim()
+  // A snapshot of the ids, not a handle on the array. `attachments.value` is
+  // replaced (never mutated) by `unstage` and `stage`, so capturing the array
+  // meant a file removed mid-send was uploaded and named anyway — the tray had
+  // told the operator they pulled it back — while a file dropped mid-send was
+  // thrown away unsent by the unconditional clear at the end (!272 review). The
+  // tray's controls are disabled while `sending` is true, so the first is now
+  // also unreachable; this is what makes the second correct.
+  const staged = [...attachments.value]
+  const sent = new Set(staged.map((item) => item.id))
+  if ((!typed && !staged.length) || sending.value) return
   const mine = generation
+  // The session this send is *about*, read once, before anything is awaited.
+  // `props.sessionId` was read three times across two round trips — to upload to,
+  // to label the memo with, and to type at — and a prop can change in between
+  // (`watch(() => props.sessionId, () => start())` exists because it does). With
+  // the turnover landing inside the upload window, the bytes went to run A and
+  // the memo was stamped `run B`: an aborted send left a memo asserting an upload
+  // that never happened in that session, and the next send believed it (!272
+  // review round 3). One read is what makes the call and the label the same
+  // fact; the `stale(mine)` guards below are what stop this send from *typing*
+  // at a session the operator has left.
+  const target = props.sessionId
   // Where the transcript ended when the message went, read BEFORE the round trip.
   // The poll keeps running while the POST is in flight and the harness writes the
   // turn down as soon as the TUI takes the submit, so a poll can absorb this very
@@ -561,12 +846,48 @@ async function send() {
   sending.value = true
   problem.value = null
   try {
+    // The files first, and every one of them, before a single byte is typed at
+    // the session: the message names the paths they were stored at, so a message
+    // that went while an upload had failed would send the agent looking for a
+    // file that is not there. A failure here throws to the handler below with the
+    // draft and the tray untouched — nothing was sent, and the operator can try
+    // again or drop the attachment.
+    const references = []
+    for (const item of staged) {
+      // Uploaded once **per session**. A send that fails part-way — the second
+      // file refused 415, say — leaves the first on the host with no message
+      // naming it, and the tray keeps both; without the memo, sending again
+      // stored the first a second time under a new name, so one screenshot
+      // became two copies of itself in a directory the agent is told to organise
+      // (!272 review round 1).
+      //
+      // Keyed to the session, because the tray survives a session switch the way
+      // the draft does and an upload does not: a store is per session, so a memo
+      // made in run A skipped the upload in run B and handed B's agent
+      // `~/.lmer-uploads/shot.png` — a path that exists in A's container and not
+      // in its own, and reads as perfectly correct because the container path is
+      // the same in both (!272 review round 2). Re-uploading is exactly what the
+      // upload-before-typing order exists for: a message may only name a file
+      // *this* session has been sent.
+      if (item.stored?.session !== target) {
+        const reply = await uploadSessionFile(target, {
+          name: item.name, data: await base64Of(item.file),
+        })
+        // The daemon's own wording, kept verbatim beside the session it belongs
+        // to — `target`, the same value the call above used. It composes the line
+        // so this end and the transcript-reading end cannot spell it differently.
+        item.stored = { session: target, reference: reply.reference }
+      }
+      if (stale(mine)) return
+      references.push(item.stored.reference)
+    }
+    const text = [...references, typed].filter(Boolean).join('\n\n')
     // `sanitize` because this is a composer: a person typed these words at a
     // session, meaning them as words. That is all this end asserts — the message
     // is not touched here, and what the harness's TUI would otherwise do with it
     // (run a leading `!` as a shell command, issue 254) is decided by the supervisor,
     // which is the only end that knows which harness is on the other side.
-    const reply = await sendSessionInput(props.sessionId, text, { sanitize: true })
+    const reply = await sendSessionInput(target, text, { sanitize: true })
     if (stale(mine)) return
     // Held until the transcript catches up. The send has already succeeded, so
     // this bubble is not a maybe — it is "delivered, not yet written down".
@@ -588,8 +909,20 @@ async function send() {
       at: Date.now(),
       since,
       submitConfirmed: reply?.submit_confirmed === true,
+      // Carried so the bubble shows what was attached rather than only the path
+      // line, in the seconds before the transcript catches up. The previews are
+      // the local ones the tray already had; `release()` revokes them when the
+      // bubble goes.
+      attachments: staged.map(
+        (item) => ({ name: item.name, preview: item.preview }),
+      ),
     }]
     draft.value = ''
+    // Exactly the ids that went, not the whole tray: a file dropped or pasted
+    // while the upload loop was running has not been sent, and clearing it here
+    // would discard it silently. Nothing is revoked — the previews of what *was*
+    // sent now belong to the bubble above.
+    attachments.value = attachments.value.filter((item) => !sent.has(item.id))
     // Unconditionally, unlike a poll: this turn is one the operator just typed,
     // and not showing it would read as the send having gone nowhere.
     following.value = true
@@ -656,6 +989,8 @@ function pendingLabel(item) {
 // outlive a component rebuilt on every visit to a run; a bubble does not survive a
 // remount in the first place, so there is nothing here to outlive.
 function dismissPending(id) {
+  const going = pending.value.find((item) => item.id === id)
+  if (going) release(going)
   pending.value = pending.value.filter((item) => item.id !== id)
 }
 
@@ -673,6 +1008,10 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  pending.value.forEach(release)
+  attachments.value.forEach((item) => {
+    if (item.preview) URL.revokeObjectURL(item.preview)
+  })
   disposed = true
   generation += 1
   clearInterval(timer)
@@ -800,6 +1139,23 @@ watch(rendererLoaded, () => {
             class="text-body-medium said"
           />
 
+          <!-- What you attached, from the session's own store — the same image
+               the bubble showed locally while the turn was in flight, now
+               readable on any device that loads the page. Under the text and not
+               instead of it: the path stays visible, because it is what the
+               agent was actually given. -->
+          <div v-if="message.uploads.length" class="attached">
+            <template v-for="name in message.uploads" :key="name">
+              <img
+                v-if="!missingUploads.has(uploadUrl(name, message))"
+                :src="uploadUrl(name, message)"
+                :alt="name"
+                class="attached-thumb"
+                @error="noteMissing(uploadUrl(name, message))"
+              >
+            </template>
+          </div>
+
           <!-- Tools are collapsed to a line each: name, what it acted on, and
                whether it failed. A wall of JSON is what the terminal is for.
 
@@ -860,6 +1216,20 @@ watch(rendererLoaded, () => {
             />
           </div>
           <p class="text-body-medium said plain">{{ item.text }}</p>
+          <!-- What was attached, from the file still in the browser: this needs
+               no route and no round trip, and it is what makes a paste read as a
+               paste in the seconds before the transcript has the turn. Once the
+               turn lands, the same image is shown from the store instead. -->
+          <div v-if="item.attachments?.length" class="attached">
+            <template v-for="attachment in item.attachments" :key="attachment.name">
+              <img
+                v-if="attachment.preview"
+                :src="attachment.preview"
+                :alt="attachment.name"
+                class="attached-thumb"
+              >
+            </template>
+          </div>
         </div>
       </div>
 
@@ -923,31 +1293,130 @@ watch(rendererLoaded, () => {
              The hint leads with the tap for the same reason the button exists: the
              way in that always works is the one an operator must not have to
              already know. -->
-        <v-textarea
-          v-model="draft"
-          :disabled="sending"
-          :label="composerLabel"
-          hint="Tap send below — Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends too. Typed into the session, then read back from its transcript — so it appears here with a delay"
-          persistent-hint
-          rows="2"
-          auto-grow
-          max-rows="6"
-          autocapitalize="sentences"
-          class="mt-3"
-          @keydown.ctrl.enter.prevent="send"
-          @keydown.meta.enter.prevent="send"
-        />
-        <div class="send-row">
-          <v-btn
-            :prepend-icon="mdiSend"
-            :loading="sending"
-            :disabled="!draft.trim()"
-            color="primary"
-            variant="tonal"
-            size="large"
-            aria-label="send to this session"
-            @click="send"
-          >send</v-btn>
+        <!-- The drop target is the whole composer rather than a dashed rectangle
+             of its own: a screenshot is dragged at the place you were about to
+             type, and a separate target is one more thing to aim at. `.prevent`
+             on dragover is what stops the browser from navigating away to the
+             file — the default action for a drop anywhere on a page. -->
+        <div
+          class="composer"
+          :class="{ 'composer-drop': dragging }"
+          @dragover.prevent="dragging = true"
+          @dragenter.prevent="dragging = true"
+          @dragleave="dragging = false"
+          @drop.prevent="onDrop"
+        >
+          <!-- Staged, not sent: these go when the message does. Each row is the
+               file as the operator will recognise it — the thumbnail for an
+               image — with the remove control on the row it removes. -->
+          <div v-if="attachments.length" class="attachments mt-3">
+            <div v-for="item in attachments" :key="item.id" class="attachment">
+              <img
+                v-if="item.preview"
+                :src="item.preview"
+                :alt="item.name"
+                class="attachment-thumb"
+              >
+              <v-icon v-else :icon="mdiFileDocumentOutline" size="small" />
+              <span class="attachment-name text-body-small">{{ item.name }}</span>
+              <!-- Images only, because there is nothing to draw on otherwise —
+                   and the same test that decided the thumbnail decides this.
+                   Disabled during a send for the reason the remove control below
+                   is: accepting a mark replaces the staged file, and replacing
+                   one whose upload is in flight would send the marks nowhere. -->
+              <v-btn
+                v-if="item.preview"
+                :icon="mdiDraw"
+                :disabled="sending"
+                size="small"
+                variant="text"
+                density="comfortable"
+                :aria-label="`mark up ${item.name}`"
+                @click="markUp(item.id)"
+              />
+              <!-- Disabled while a send is in flight, like the field and the
+                   attach button. Without it, ✕ removed the row while the upload
+                   of that very file carried on and its path went into the
+                   message: the tray had told the operator they pulled it back,
+                   and they had not (!272 review). A send is seconds, and "you
+                   cannot unsend this now" is the honest state. -->
+              <v-btn
+                :icon="mdiClose"
+                :disabled="sending"
+                size="small"
+                variant="text"
+                density="comfortable"
+                :aria-label="`remove ${item.name}`"
+                @click="unstage(item.id)"
+              />
+            </div>
+          </div>
+
+          <v-textarea
+            v-model="draft"
+            :disabled="sending"
+            :label="composerLabel"
+            hint="Tap send below — Enter is a new line, Ctrl+Enter (Cmd on a Mac) sends too. Attach or paste a file and it goes with the message. Typed into the session, then read back from its transcript — so it appears here with a delay"
+            persistent-hint
+            rows="2"
+            auto-grow
+            max-rows="6"
+            autocapitalize="sentences"
+            class="mt-3"
+            @paste="onPaste"
+            @keydown.ctrl.enter.prevent="send"
+            @keydown.meta.enter.prevent="send"
+          />
+          <!-- The picker is hidden and driven from the button below, because a
+               bare file input cannot be made a comfortable tap target and reads
+               as nothing on a phone. On a phone that button is also the camera
+               roll — the same dialog, which is why there is no separate "take a
+               photo" affordance to keep in step. Outside the send row: what is
+               in that row is what an operator can tap, and a hidden element in
+               it is indistinguishable from a control that disappears at some
+               width (tests/test_platform_web_composer.py). -->
+          <!-- Only while something is being marked up: the component is a
+               separate chunk, and mounting it unconditionally would fetch a
+               canvas editor for every conversation anybody opens. -->
+          <SketchPad
+            v-if="marking !== null"
+            :model-value="true"
+            :file="markingFile"
+            @update:model-value="marking = null"
+            @marked="useMarked"
+          />
+
+          <input
+            ref="picker"
+            type="file"
+            multiple
+            :accept="ACCEPT"
+            class="d-none"
+            aria-hidden="true"
+            tabindex="-1"
+            @change="onPick"
+          >
+          <div class="send-row">
+            <v-btn
+              :prepend-icon="mdiPaperclip"
+              :disabled="sending"
+              variant="tonal"
+              size="large"
+              aria-label="attach a file to this message"
+              @click="picker?.click()"
+            >attach</v-btn>
+            <v-spacer />
+            <v-btn
+              :prepend-icon="mdiSend"
+              :loading="sending"
+              :disabled="!draft.trim() && !attachments.length"
+              color="primary"
+              variant="tonal"
+              size="large"
+              aria-label="send to this session"
+              @click="send"
+            >send</v-btn>
+          </div>
         </div>
       </template>
     </v-card-text>
@@ -1068,5 +1537,74 @@ watch(rendererLoaded, () => {
    which is also where the rules that reach into injected markup have to live. */
 .said.plain {
   white-space: pre-wrap;
+}
+
+/* The composer is the drop target (issue 246), so it needs to be one region
+   rather than a textarea and a button row that happen to sit together. The
+   outline appears only while something is over it: a permanent dashed border
+   would be chrome on the one control this pane is mostly used for, and the app's
+   own tone tokens are used so it reads the same in both themes. */
+.composer {
+  border-radius: 8px;
+  outline: 2px dashed transparent;
+  outline-offset: 4px;
+  transition: outline-color 120ms linear;
+}
+
+.composer-drop {
+  outline-color: rgb(var(--v-theme-primary));
+}
+
+/* Staged files: a column of rows rather than a strip of tiles, because the name
+   is what identifies a text file and a phone has no room for a name beside a
+   tile. `min-width: 0` on the name is what lets a long one ellipsise instead of
+   pushing the remove control off the row. */
+.attachments {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.attachment-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Small enough that five of them do not push the composer off a phone screen,
+   and `cover` so a tall screenshot still reads as a picture of something rather
+   than as a sliver. */
+.attachment-thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
+/* An image inside a turn — the bubble's local preview while it is in flight, and
+   the stored file once the turn is in the transcript. Bounded by the pane rather
+   than by its own pixels: a screenshot is wider than this column and taller than
+   the conversation, and `auto` height is what keeps it from being squashed. */
+.attached {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.attached-thumb {
+  max-width: 100%;
+  max-height: 30vh;
+  max-height: 30dvh;
+  width: auto;
+  height: auto;
+  border-radius: 6px;
 }
 </style>

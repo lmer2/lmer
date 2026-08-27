@@ -15,11 +15,13 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     // Stable, named output: one entry, plus one chunk per deliberate split. There
-    // are two, and both exist because the fleet view — the screen a phone loads on
-    // every glance — must not pay for something only a run view uses. The terminal:
-    // xterm is more than half the JS and only the run-detail view opens one. And
-    // the markdown renderer: markdown-it plus DOMPurify are ~59 kB gzipped and the
-    // fleet view renders no markdown at all. Each is reached with
+    // are three, and all of them exist because the fleet view — the screen a phone
+    // loads on every glance — must not pay for something only a run view uses. The
+    // terminal: xterm is more than half the JS and only the run-detail view opens
+    // one. The markdown renderer: markdown-it plus DOMPurify are ~59 kB gzipped and
+    // the fleet view renders no markdown at all. And the sketch pad (issue 246): a
+    // canvas editor that only opens when an operator taps "mark up" on an image
+    // they have already attached, which most sends never do. Each is reached with
     // defineAsyncComponent by every consumer — one static import anywhere pulls the
     // whole thing back into the entry chunk, which is why the guard in
     // tests/test_platform_web_bundle.py asserts against the built output rather

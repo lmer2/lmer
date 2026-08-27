@@ -476,8 +476,24 @@ function openRunRef(ref) {
   if (mobile.value) uberOpen.value = false
 }
 
+// A file dropped anywhere the composer is not. The browser's default action for
+// a drop on a page is to *navigate to the file*, so a screenshot released on the
+// message list — which sits directly above the composer and is the large obvious
+// target — unloaded the SPA and replaced it with the raw image, taking the draft,
+// the staged tray and any unsettled bubbles with it (!272 review). The composer's
+// own handlers stage the file and prevent the default themselves; these make
+// every miss a no-op instead of a page load.
+//
+// On `window` rather than on the app's root element, because the default fires
+// for the document however far the drop lands from any component of ours.
+function swallowStrayDrop(event) {
+  event.preventDefault()
+}
+
 onMounted(() => {
   load()
+  window.addEventListener('dragover', swallowStrayDrop)
+  window.addEventListener('drop', swallowStrayDrop)
   stopRunRefs = onRunRef(openRunRef)
   poll = setInterval(load, POLL_MS)
   // Separate, faster tick so "3m ago" ages without refetching the fleet.
@@ -487,6 +503,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('dragover', swallowStrayDrop)
+  window.removeEventListener('drop', swallowStrayDrop)
   if (stopRunRefs) stopRunRefs()
   clearInterval(poll)
   clearInterval(tick)

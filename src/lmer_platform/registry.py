@@ -215,6 +215,7 @@ def register(
     control: Optional[dict] = None,
     ports: Optional[list] = None,
     transcript: Optional[dict] = None,
+    uploads: Optional[dict] = None,
     container_id: Optional[str] = None,
     slot: Optional[str] = None,
     slack: Optional[dict] = None,
@@ -253,6 +254,12 @@ def register(
         "control": control or {},
         "ports": ports or [],
         "transcript": transcript or {},
+        # The store the spawn mounted for files the operator attaches to this
+        # session's chat, or ``{}`` for a session that has none (issue #246).
+        # Recorded rather than derived: an entry written before this existed
+        # carries the same ``{}``, and both mean "cannot receive a file", which
+        # is the one thing a route needs to know.
+        "uploads": uploads or {},
         "log_path": log_path,
         "slot": slot,
         "slack": slack or {},
