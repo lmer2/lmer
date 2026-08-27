@@ -1,4 +1,0 @@
-added:
-- "The platform assistant's agent memory now persists across incarnations in a host-local store, reported by the assistant status route"
-changed:
-- "Platform assistant sessions now have the shared-work-repo agent-memory route switched off outright, keeping their memory host-local"

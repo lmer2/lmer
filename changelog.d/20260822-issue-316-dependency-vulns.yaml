@@ -1,2 +1,0 @@
-security:
-- "Relocked every Python and web dependency onto the newest version its declared range allows, clearing five published advisories in shipped dependencies: aiohttp 3.14.1 → 3.14.3 (GHSA-cq5v-8q36-5273, GHSA-mfx4-hv73-q22v, GHSA-mq44-7p77-q5h7), dompurify 3.4.12 → 3.4.14 (GHSA-55q2-fjhq-7xh7) and nanoid 3.3.16 → 3.3.18 (GHSA-2v37-7h3g-55p8) (#316)"

@@ -1,2 +1,0 @@
-fixed:
-- "Matrix bridge now handles SIGTERM/SIGINT: a container stop drains and exits 0 instead of hanging until SIGKILL."

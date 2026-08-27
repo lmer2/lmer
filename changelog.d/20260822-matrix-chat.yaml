@@ -1,6 +1,0 @@
-added:
-- "`lmer-matrix-bridge`: reach one platform daemon from a Matrix room — a run that needs a human opens a thread, and an allowlisted reply in that thread answers it. Encrypted room, per-MXID capabilities, `register` and `check` verbs; see docs/MATRIX-CHAT.md"
-- "`matrix` optional dependency extra, carrying the Matrix client libraries the bridge needs. Install `lmer[matrix]` to use it; every other part of lmer installs unchanged without it"
-- "`matrix` section in the platform's `config.json`, holding the bridge's name, homeserver, room and allowlist"
-changed:
-- "`lmer_platform.client` is now a public module: `Endpoint`, `Call` and `request()` moved out of `lmer-ctl`, which re-exports them. Any host-side client of the platform API can use it; `lmer-ctl`'s own behaviour is unchanged"

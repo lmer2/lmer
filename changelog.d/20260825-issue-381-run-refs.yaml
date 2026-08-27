@@ -1,3 +1,0 @@
-added:
-- "Clickable run references in chat: the assistant writes `lmer://run/<host>/<project>/<slug>` and a tap opens that run's view; an untracked run says so instead (#241)"
-- "Run references posted to Slack are reduced to the label they show, so a Slack-bridged operator reads the run's name instead of raw link markup (#241)"

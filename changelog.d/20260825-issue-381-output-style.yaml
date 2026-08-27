@@ -1,2 +1,0 @@
-added:
-- "`LMER_CLAUDE_OUTPUT_STYLE` selects a Claude output style at session start; an unrecognised name warns instead of failing (#257)"
