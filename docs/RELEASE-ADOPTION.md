@@ -19,9 +19,9 @@ credential-provisioning entries only.**
 
 ## 1. Parameterization surface
 
-The release taskdef takes exactly four per-repo parameters (taskdef config
-/ work-repo project info). If an adoption needs anything beyond these, stop
-— that is a design change, not an adoption.
+The release taskdef takes four required per-repo parameters and one
+optional one (taskdef config / work-repo project info). If an adoption needs
+anything beyond these, stop — that is a design change, not an adoption.
 
 - [ ] **GitHub target URL** — the mirror repo the release pushes `main` +
       the signed tag to (e.g. `github.com/lmer2/lmer`).
@@ -32,6 +32,12 @@ The release taskdef takes exactly four per-repo parameters (taskdef config
       material).
 - [ ] **Changelog mechanism** — `changelog.d/` fragments where adopted,
       legacy `CHANGELOG.yaml` roll otherwise.
+- [ ] **Dependency-refresh command** (`dep_refresh`, OPTIONAL) — the
+      command leg 2 runs once the release has shipped, to open the next
+      cycle's lockfile-refresh MR against `prep-release` (lmer:
+      `make dep-up`). Omit it and the flow runs no refresh — an explicit
+      opt-out, recorded as a receipt. Declaring it empty is a hard stop,
+      not an opt-out.
 
 ## 2. Prerequisites — all of them, none optional
 

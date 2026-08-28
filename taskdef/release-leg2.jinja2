@@ -1,10 +1,11 @@
 {#-
   Leg 2 — ship. Included by taskdef/release/instructions.txt under its
-  "## Leg 2 — ship" heading, so this body starts at H3. The four release
+  "## Leg 2 — ship" heading, so this body starts at H3. The release
   parameters (release.github_target, release.tag_prefix, release.signing_key,
-  release.changelog) were resolved in Phase 0.5; leg 2 consumes the first
-  three. Step names extend the derived-step vocabulary of the resume
-  decision table in release-resume.jinja2.
+  release.changelog, and the optional release.dep_refresh) were resolved in
+  Phase 0.5; leg 2 consumes all but release.changelog. Step names extend the
+  derived-step vocabulary of the resume decision table in
+  release-resume.jinja2.
 -#}
 Entry condition: the human merged the release MR (`prep-release` → `main`)
 on GitLab — or a relaunch derived a leg-2 step from run state. Everything in
@@ -249,7 +250,68 @@ GitHub failure leaves no half-released internal state.
       registry and container image from there.
 - [ ] Record: `work release record receipt gitlab-tag-push`
 
-### Step 7 — receipts complete, run complete
+### Step 7 — `leg2-dep-refresh` — open the next cycle's dependency refresh
+
+The release has shipped; `prep-release` now carries exactly what was
+released, and the next cycle starts here. Refreshing dependencies NOW rather
+than during leg 1 is the whole point: the refresh gets a full development
+cycle of soak before it ships, where a relock landed alongside the version
+bump would ship the same day it was resolved. Leg 1's rule that a `uv.lock`
+diff beyond the project's own version line is a stop-and-ask stays exactly
+as it is — this step is where dependency movement is allowed to happen.
+
+This step never blocks the release: the release is already out. It opens an
+MR and completes; a human merges it whenever they merge it.
+
+- [ ] No `dep_refresh` parameter (Phase 0.5) → this repository has not opted
+      in. Record `work release record receipt dep-refresh --note "no
+      dep_refresh parameter declared"` and go to step 8. Do NOT infer a
+      command from the repository tree.
+- [ ] Adoption, never re-creation — FIRST, before creating anything. Check
+      `git ls-remote origin refs/heads/dep-refresh-<X.Y.Z>` and for an open
+      MR titled `dep refresh after <X.Y.Z>`. An open MR means a previous
+      session died between opening it and recording the receipt: ADOPT it —
+      record `work release record receipt dep-refresh --url <its URL>` and
+      go to step 8. A remote branch with no MR means the push landed and the
+      MR did not: fetch it, check it out, and pick up at the "Push and open
+      the MR" bullet. NEVER open a second MR and NEVER force-push over it.
+- [ ] Branch off the freshly released `prep-release`:
+      `git fetch origin prep-release`,
+      `git switch -c dep-refresh-<X.Y.Z> origin/prep-release`. Re-entry in
+      the same container already has the local branch, so `-c` errors —
+      `git switch dep-refresh-<X.Y.Z>` onto it instead, and reset it to
+      `origin/prep-release` only if it carries no refresh yet.
+- [ ] Run the declared `dep_refresh` command verbatim, from the repository
+      root, through `work verify dep-refresh -- <command>` so the run
+      carries a receipt of what it ran and what that produced. `work verify`
+      mirrors the command's exit code: NON-ZERO means the refresh did not
+      run to completion (an unreachable index, a missing target, a `make`
+      target dying on its first line) and the tree may well still be clean —
+      that is NOT "no dependency changes". Record `work release record
+      receipt dep-refresh --note "refresh command failed — <one-line
+      summary>"` and go to step 8, leaving no branch pushed.
+- [ ] Only on a zero exit, read `git status --porcelain`. EMPTY means every
+      dependency was already at the newest version its declared ranges allow
+      — a real outcome, not a failure. Record `work release record receipt
+      dep-refresh --note "no dependency changes"` and go to step 8.
+- [ ] Otherwise stage what the refresh produced, then gate it. Stage every
+      path `git status --porcelain` listed — `bin/gate-commit` commits the
+      index and stages nothing, and its git-status check FAILS on any
+      unstaged or untracked path, so an unstaged lockfile turns into a red
+      gate that never ran the suite. A dependency refresh that breaks the
+      suite is not a refresh: `bin/gate-commit -m "dep refresh after
+      <X.Y.Z>"`. A RED gate is NOT a hard stop for the release — the release
+      already shipped — but it IS a stop for this step: record `work release
+      record receipt dep-refresh --note "refresh failed the gate — <one-line
+      summary>"`, leave the branch unpushed, and say so in the retro. Never
+      commit around a failing gate to get the MR open.
+- [ ] Push with `bin/gate-push` (no arguments — it pushes the current branch
+      to `origin`) and open the MR targeting `prep-release` — NEVER `main`.
+      Title it `dep refresh after <X.Y.Z>`. Say in the description which
+      packages moved and that the diff is lockfiles only.
+- [ ] Record: `work release record receipt dep-refresh --url <MR URL>`
+
+### Step 8 — receipts complete, run complete
 
 - [ ] `work release status` must show every field recorded and nothing left
       to advance. Fill any receipt gap NOW (`--note` that it was recorded
@@ -274,4 +336,5 @@ target to the recorded merge SHA before acting:
 | Actions run green for the recorded SHA | Skip the poll; receipts must name the run that uploaded |
 | Actions run red, refs current | Re-dispatch via the API, keyed on the recorded SHA — never re-tag |
 | GitLab tag already at the merge SHA | Skip the push; ensure the receipt exists |
+| GitLab tag pushed, no `dep-refresh` receipt | Run step 7 — it is idempotent: an existing open `dep-refresh-<X.Y.Z>` MR is ADOPTED (record its URL as the receipt), never a second one |
 | Every receipt recorded | Nothing to advance — close out the run |

@@ -237,6 +237,17 @@ class TestReleaseParameterization:
         assert "NEVER key material" in out
         assert "signing key REFERENCE only" in out
 
+    def test_dep_refresh_is_optional_but_never_inferred(self):
+        """The one optional parameter. Absence is an explicit opt-out that
+        still records a receipt; emptiness is a misconfiguration; and the
+        session may never supply the command itself — inferring it from a
+        Makefile target is exactly the defaulting the flow forbids."""
+        out = _squash(_render())
+        assert "`dep_refresh` is the ONE optional parameter" in out
+        assert "Present but empty → HARD STOP" in out
+        assert "Never invent the command yourself" in out
+        assert "not from a Makefile target you can see" in out
+
 
 class TestReleaseHardRules:
     """The HARD RULES block instructions.txt itself owns."""
