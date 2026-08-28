@@ -342,6 +342,7 @@ class TestStatus:
         assert _record(["receipt", "pypi",
                         "--url", "https://pypi.org/project/x/0.5.0/"]) == 0
         assert _record(["receipt", "gitlab-tag-push"]) == 0
+        assert _record(["receipt", "dep-refresh"]) == 0
         capsys.readouterr()
         assert _main(["release", "status", "--json"]) == 0
         payload = json.loads(capsys.readouterr().out)

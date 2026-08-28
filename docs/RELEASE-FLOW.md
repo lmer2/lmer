@@ -92,8 +92,16 @@ On merge detection:
    fails if the registry does not serve the built digest under it, so
    "the released image is the verified image" is checked in the job log
    rather than assumed (#189).
-6. Record receipts (verification events, Actions run URL, PyPI URL) and
-   complete the run.
+6. **Open the next cycle's dependency refresh.** `prep-release` now carries
+   exactly what shipped, so this is where the new cycle starts: run the
+   adopter's declared `dep_refresh` command, gate the result, and open an MR
+   for the refreshed lockfiles targeting `prep-release`. It never blocks the
+   release — the release is already out — and it deliberately does not
+   happen during leg 1, where a relock would ship the same day it resolved
+   instead of soaking for a cycle. A repository that declares no
+   `dep_refresh` parameter records the receipt with a note and skips it.
+7. Record receipts (verification events, Actions run URL, PyPI URL,
+   dependency-refresh MR) and complete the run.
 
 Git operations in both legs authenticate through the maintained,
 action-free `/Agents/global/bin/lmer-git-askpass` helper. Each command passes

@@ -36,6 +36,7 @@ top wins:
 | Tag pushed to GitHub, Actions not green (`actions-run` receipt missing) | leg2 | `leg2-poll-actions` — poll the Actions run; already green for the tag → record which run actually uploaded; red with refs current → re-dispatch keyed on the recorded SHA. |
 | Actions green, no `pypi` receipt | leg2 | `leg2-record-pypi` — record the PyPI URL receipt. |
 | PyPI recorded, no `gitlab-tag-push` receipt | leg2 | `leg2-push-gitlab-tag` — only now, push the tag to GitLab origin. |
+| GitLab tag pushed, no `dep-refresh` receipt | leg2 | `leg2-dep-refresh` — open the next cycle's dependency-refresh MR against `prep-release`; an existing open one is adopted, never duplicated. A repository declaring no `dep_refresh` parameter records the receipt with a note and advances — the ladder walks receipts, not parameters. |
 | All receipts recorded | complete | `complete` — close out the run (retro, completion state, `work commit`). |
 
 The table names derived steps only. Leg 2's `leg2-record-merge` and

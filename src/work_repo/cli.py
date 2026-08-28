@@ -534,8 +534,8 @@ Examples:
     record_receipt_parser = record_subparsers.add_parser(
         "receipt",
         help="Record a push/upload receipt: github-main-push, "
-             "github-tag-push, actions-run, pypi, gitlab-tag-push; "
-             "re-recordable (prior values stay in events.jsonl)",
+             "github-tag-push, actions-run, pypi, gitlab-tag-push, "
+             "dep-refresh; re-recordable (prior values stay in events.jsonl)",
     )
     record_receipt_parser.add_argument(
         "value", metavar="name", help="Receipt name (leg-2 ladder order)"

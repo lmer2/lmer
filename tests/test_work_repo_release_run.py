@@ -2,10 +2,14 @@
 release.yaml round-trip record/read, the derive_leg()/next_step() ladder
 including the re-entered-leg-2 case, and both mismatch hard stops (version
 at the release-MR merge SHA vs leg 1's record; tag SHA vs merge SHA)."""
+from pathlib import Path
+
 import pytest
 
 from work_repo import release_run, run_state
 from tests.conftest import strip_lmer_env
+
+REPO_ROOT = Path(__file__).parent.parent
 
 SHA_BUMP = "a" * 40
 SHA_MERGE = "b" * 40
@@ -314,6 +318,7 @@ class TestDeriveLeg:
                   ("leg2", "leg2-poll-actions"),
                   ("leg2", "leg2-record-pypi"),
                   ("leg2", "leg2-push-gitlab-tag"),
+                  ("leg2", "leg2-dep-refresh"),
                   ("complete", "complete")]
         steps = [
             lambda: release_run.record_version(tmp_path, "0.5.0"),
@@ -327,6 +332,7 @@ class TestDeriveLeg:
             lambda: release_run.record_receipt(tmp_path, "pypi",
                                                url="https://pypi.org/project/lmer/0.5.0/"),
             lambda: release_run.record_receipt(tmp_path, "gitlab-tag-push"),
+            lambda: release_run.record_receipt(tmp_path, "dep-refresh"),
         ]
         for step, (leg, nxt) in zip(steps, expect):
             release = step()
@@ -474,3 +480,37 @@ class TestUniqueReleaseSlug:
         with pytest.raises(release_run.ReleaseRunError,
                            match="no free release address"):
             release_run.unique_release_slug("release-global", "0.6.0", tmp_path)
+
+
+class TestReceiptNameCopies:
+    """Every prose copy of the receipt-name list names every RECEIPT_NAMES
+    entry. The tuple is the kernel's, but a release session reads the CLI
+    `--help`, the module docstring's frozen verb block and the `work` CLI
+    reference — each presents its list as complete, so a name added to the
+    tuple and nowhere else leaves a user five accepted names out of six.
+    Source-level guard: it fails when the tuple grows, not when a release
+    runs."""
+
+    COPIES = (
+        # `work release record receipt --help` — user-visible.
+        "src/work_repo/cli.py",
+        # The `work` CLI reference `work-view-docs` serves, whose
+        # "Push/upload receipts, in ladder order" block reads as exhaustive.
+        "lmer-docs/WORK-REPO.md",
+        # The release.yaml schema reference.
+        "docs/RUN-STATE.md",
+    )
+
+    @pytest.mark.parametrize("rel", COPIES)
+    def test_copy_names_every_receipt(self, rel):
+        text = (REPO_ROOT / rel).read_text()
+        missing = [n for n in release_run.RECEIPT_NAMES if n not in text]
+        assert not missing, f"{rel} omits {missing}"
+
+    def test_frozen_verb_block_names_every_receipt(self):
+        """The module docstring, checked apart from the file: the tuple
+        literal lives in the same file, so a whole-file substring test
+        would match itself and pass on a stale verb block."""
+        doc = release_run.__doc__
+        missing = [n for n in release_run.RECEIPT_NAMES if n not in doc]
+        assert not missing, f"the frozen verb block omits {missing}"

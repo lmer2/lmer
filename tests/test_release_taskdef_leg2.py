@@ -46,7 +46,9 @@ STEP_HEADINGS = (
     "GitHub: `main` first, THEN the tag",
     "### Step 5 — `leg2-poll-actions` — the GitHub Actions release run",
     "### Step 6 — `leg2-push-gitlab-tag` — the GitLab tag, LAST",
-    "### Step 7 — receipts complete, run complete",
+    "### Step 7 — `leg2-dep-refresh` — open the next cycle's dependency "
+    "refresh",
+    "### Step 8 — receipts complete, run complete",
     "### The idempotency ladder (re-entry map)",
 )
 
@@ -142,6 +144,60 @@ class TestLeg2StepLadder:
         assert "Only after the GitHub run is green" in squashed
         assert "Public-before-internal is deliberate" in squashed
         assert "no half-released internal state" in squashed
+
+    def test_dep_refresh_never_blocks_the_shipped_release(self):
+        """Step 7 runs after the release is out, so none of its failure
+        modes may stop the run: an opted-out repository, a no-op refresh
+        and a red gate all record the receipt and advance."""
+        squashed = _squash(_leg2())
+        assert "This step never blocks the release" in squashed
+        assert "No `dep_refresh` parameter" in squashed
+        assert "EMPTY means every dependency was already at the newest" in squashed
+        assert "A RED gate is NOT a hard stop for the release" in squashed
+        assert "Never commit around a failing gate to get the MR open" in squashed
+
+    def test_dep_refresh_targets_prep_release_and_is_adopted_not_duplicated(self):
+        """The refresh MR follows the same target rule as every other MR in
+        this flow, and re-entry adopts an open one rather than opening a
+        second."""
+        squashed = _squash(_leg2())
+        assert "open the MR targeting `prep-release` — NEVER `main`" in squashed
+        assert "is ADOPTED (record its URL as the receipt), never a second one" in squashed
+
+    def test_dep_refresh_stages_before_the_commit_gate(self):
+        """`bin/gate-commit` commits the index and stages nothing, while its
+        git-status check fails critically on any unstaged path — so an
+        unstaged lockfile would produce a red gate that never ran the suite,
+        which this step's own rule then records as "refresh failed the gate"."""
+        squashed = _squash(_leg2())
+        assert "stage what the refresh produced, then gate it" in squashed
+        assert "`bin/gate-commit` commits the index and stages nothing" in squashed
+        assert "a red gate that never ran the suite" in squashed
+
+    def test_dep_refresh_reads_the_command_exit_code_before_the_tree(self):
+        """A refresh command that dies without touching the tree leaves
+        `git status --porcelain` empty; reading the tree first would record
+        that as "no dependency changes" — the opposite of what happened."""
+        squashed = _squash(_leg2())
+        assert "NON-ZERO means the refresh did not run to completion" in squashed
+        assert 'that is NOT "no dependency changes"' in squashed
+        assert "Only on a zero exit, read `git status --porcelain`" in squashed
+
+    def test_dep_refresh_checks_for_an_existing_branch_or_mr_first(self):
+        """The adopt rule lives in the step body, not only in the ladder
+        table 40-odd lines below it: a session resuming at
+        `leg2-dep-refresh` executes these bullets in order."""
+        squashed = _squash(_leg2())
+        assert "Adoption, never re-creation — FIRST, before creating anything" in squashed
+        assert "git ls-remote origin refs/heads/dep-refresh-<X.Y.Z>" in squashed
+        assert "NEVER open a second MR and NEVER force-push over it" in squashed
+
+    def test_dep_refresh_is_why_leg1_still_refuses_dependency_movement(self):
+        """The two rules are a pair: leg 1 refuses a lockfile diff beyond
+        the version line precisely because this step owns that movement."""
+        squashed = _squash(_leg2())
+        assert "stays exactly as it is" in squashed
+        assert "this step is where dependency movement is allowed to happen" in squashed
 
     def test_every_step_keys_on_the_recorded_merge_sha(self):
         squashed = _squash(_leg2())
