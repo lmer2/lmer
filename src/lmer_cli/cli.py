@@ -186,17 +186,6 @@ RELEASE_TASK_ID = "release"
 RELEASE_GITHUB_TOKEN_ENV = "LMER_RELEASE_GITHUB_TOKEN"
 RELEASE_SIGNING_KEY_ENV = "LMER_RELEASE_SIGNING_KEY"
 
-# Rig-scoped rehearsal credentials (Ctl/rehearsal/README.md, credential
-# isolation): throwaway values with rig-only names, so no provisioning path
-# can reach for the production names. Deliberately provisioned to ANY
-# session — a rehearsal runs as a masterplan (non-release) task — and
-# env-borne only: the rehearsal signing key is a host-side path consumed by
-# the rig scripts, never delivered through the production key mount.
-REHEARSAL_CREDENTIAL_ENVS = (
-    "LMER_REHEARSAL_GITHUB_TOKEN",
-    "LMER_REHEARSAL_TESTPYPI_TOKEN",
-    "LMER_REHEARSAL_SIGNING_KEY",
-)
 
 
 def _resolve_requested_ports(
@@ -1415,9 +1404,7 @@ def _release_credential_env(
     env dict is skipped by both the .env merge and the preset seeding loop
     in main() (the LMER_NAPKIN_TOKEN precedent), so a PAT sitting in a cwd
     ``.env`` / ``~/.lmer/.env`` / ``--env-file`` or a preset's env can never
-    leak into a non-release container. The rig-scoped rehearsal variables
-    ride along unconditionally (any session, values from the host env —
-    the early .env load in main() already folded .env sources in).
+    leak into a non-release container.
 
     ``fatal`` is a reason string when a *configured* signing key is
     rejected by the mount guard — the caller must abort (a release session
@@ -1426,9 +1413,6 @@ def _release_credential_env(
     bump, MR) needs neither.
     """
     entries: dict[str, str | None] = {
-        # Rehearsal trio: plain passthrough to every session (env-borne
-        # only — no mount, even though the key var holds a path).
-        **{k: os.environ.get(k) for k in REHEARSAL_CREDENTIAL_ENVS},
         RELEASE_GITHUB_TOKEN_ENV: None,
         RELEASE_SIGNING_KEY_ENV: None,
     }
@@ -2766,13 +2750,11 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_TASKDEF_REF": os.environ.get("LMER_TASKDEF_REF"),
         "LMER_TASKDEF_TOKEN": None,
         # Release-flow credentials (spec §5), resolved by the release gate
-        # above. Production pair (LMER_RELEASE_GITHUB_TOKEN /
-        # LMER_RELEASE_SIGNING_KEY): real values only in release-taskdef
-        # sessions; every other session carries None seeds so neither the
-        # .env merge below nor the preset seeding loop can forward them
-        # (the LMER_NAPKIN_TOKEN precedent above). Rehearsal trio
-        # (LMER_REHEARSAL_*): rig-scoped throwaways, deliberately
-        # provisioned to any session, env-borne only — never mounted.
+        # above. LMER_RELEASE_GITHUB_TOKEN / LMER_RELEASE_SIGNING_KEY carry
+        # real values only in release-taskdef sessions; every other session
+        # carries None seeds so neither the .env merge below nor the preset
+        # seeding loop can forward them (the LMER_NAPKIN_TOKEN precedent
+        # above).
         **release_env_entries,
         # Task routing env
         "LMER_TASK": task_id if not ns.no_task else None,

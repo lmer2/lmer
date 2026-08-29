@@ -52,8 +52,6 @@ tests:
     - tests/test_platform_web_markdown.py
     - tests/test_platform_web_markdown_surfaces.py
     - tests/test_platform_web_theme.py
-    - tests/test_rehearsal_leg2.py
-    - tests/test_rehearsal_negative_test.py
     - tests/test_release_taskdef.py
     - tests/test_rules_structure.py
     - tests/test_run_state_wiring.py

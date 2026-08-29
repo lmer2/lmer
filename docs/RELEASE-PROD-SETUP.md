@@ -37,10 +37,6 @@ to leg 2.
 - [ ] **(0) Release SSH signing keypair generated** — private half stored in
   the lmer credential-provisioning source (`LMER_RELEASE_SIGNING_KEY`);
   public-key fingerprint recorded here: `<fingerprint>` — date/actor:
-- [ ] **(4) `vars.RELEASE_ALLOWED_SIGNERS` Actions repository variable set**
-  — the release signing PUBLIC key in allowed-signers format, principal `*`
-  (a variable, not a secret; deliberately not a file in the repo) —
-  date/actor:
 - [ ] **(5) Production fine-grained PAT issued** — `contents:write` +
   `workflows:write` on the mirror repo only; expiry noted: `<date>`;
   rotation owner: the repository owner; provisioned via lmer credential
@@ -64,33 +60,47 @@ to leg 2.
   (workflow with `id-token: write` and no API token, releases on the index
   published by it) may record this as **pre-existing**, citing that live
   binding as the evidence — date/actor:
-- [ ] **(11) `vars.RELEASE_RESUME_VERSION` confirmed ABSENT** — the
-  version-reuse gate ([RELEASE-FLOW.md](./RELEASE-FLOW.md) §5) refuses to
-  publish over an already-published version unless this variable names it.
-  It exists to be set for one deliberate resume and cleared immediately
-  after; a value left behind silently re-arms the republish it authorized.
-  Confirm it is unset before each release — date/actor:
+- [ ] **(2) `v*` tag protection on the mirror** — WITH a bypass entry for
+  the bot. Since the release workflow stopped verifying tag signatures,
+  this ruleset is what decides **who may cut a release**: the workflow
+  fires on any `v*` tag push and publishes what it names. **Do not add this
+  rule without the bypass**: without it the bot's own tag push is rejected
+  and leg 2 fails at the tag push. A repo with no tag protection at all
+  pushes fine; a repo with protection and no bypass does not — date/actor:
+- [ ] **(3) `pypi` environment deployment tag-pattern policy** —
+  deployments from `v*` tags only. The environment itself already exists
+  (it is what the trusted-publisher binding names); this item is the
+  protection rule on it, which is what makes the environment binding mean
+  something under PAT compromise — date/actor:
+- [ ] **(12) `pypi` environment required reviewer configured** — at least
+  one human reviewer on the environment `publish-pypi` deploys to. This is
+  the only control in the design that survives compromise of the release
+  PAT: with it, a `v*` tag pushed by anyone still pauses for a human before
+  anything reaches the index. Its cost is deliberate — a release run waits
+  on GitHub for that approval — date/actor:
+
+### Retired receipts — do not re-add
+
+`vars.RELEASE_ALLOWED_SIGNERS` (was **(4)**) and `vars.RELEASE_RESUME_VERSION`
+(was **(11)**) are gone. The workflow's tag-signature verification and its
+version-reuse gate script were deleted, so nothing reads either variable; a
+tick against them asserted nothing. What replaced them is above: **(2)** and
+**(3)** decide who may cut a release, **(12)** is the human gate, and the
+reuse gate is now PyPI's own refusal to accept a version it already holds.
+Tags are still signed (**(0)**); nothing in CI checks the signature.
 
 ## Hardening — recommended, not gating
 
 Each of these closes a real hole, but none of them is required for a release
 run to complete correctly. They are listed separately so that leaving one
 undone is a recorded decision rather than a silent gap — and so that an
-unrelated hardening task cannot block a release.
+unrelated hardening task cannot block a release. The mirror's tag ruleset and
+the `pypi` environment's policy and reviewer are NOT in this section — they
+carry the authorization the workflow used to enforce itself, and they gate.
 
 - [ ] **(1) Mirror branch protection on `main`** — only the bot account can
   push; no force pushes. The flow assumes no out-of-band writers to the
   mirror; this is what enforces that assumption — date/actor:
-- [ ] **(2) `v*` tag protection on the mirror** — WITH a bypass entry for
-  the bot. **Do not add this rule without the bypass**: without it the
-  bot's own tag push is rejected and leg 2 fails at the tag push. A repo
-  with no tag protection at all pushes fine; a repo with protection and no
-  bypass does not — date/actor:
-- [ ] **(3) `pypi` environment deployment tag-pattern policy** —
-  deployments from `v*` tags only. The environment itself already exists
-  (it is what the trusted-publisher binding names); this item is the
-  protection rule on it, which is what makes the environment binding mean
-  something under PAT compromise — date/actor:
 - [ ] **(6) Bot account registered with the signing public key** — so
   signed tags attribute correctly. Display/attribution only; the publish
   path does not depend on it — date/actor:
@@ -103,18 +113,3 @@ unrelated hardening task cannot block a release.
   mirror accepts no PRs; collaborators = bot + owner only. Note that the
   project's issue tracker may deliberately live on the mirror; decide
   rather than default — date/actor:
-
-## Rehearsal
-
-- [ ] **(10) Rehearsal green** — the rig's negative test and leg-2 dry run
-  recorded green evidence
-  ([evidence-negative-test.md](./rehearsal/evidence-negative-test.md),
-  [evidence-leg2.md](./rehearsal/evidence-leg2.md)) before any production
-  release — date/actor:
-
-Waiving this for a given release is possible but never implicit: the waiver
-— its rationale and the residual it accepts — is recorded with that release
-run's records, alongside the run's other receipts. An unrecorded skip is not
-a waiver. A waiver covers the one release it names; it does not retire the
-standing rule in [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md) and does not
-carry over to another adopter.

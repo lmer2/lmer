@@ -247,7 +247,8 @@ class TestLeg2StepLadder:
 
     def test_actions_receipts_record_the_uploading_run(self):
         """Re-run artifact drift: the URL must name the run that uploaded,
-        not the last green one (skip-existing caveat)."""
+        not the last green one — a failed-jobs-only re-run leaves
+        publish-pypi untouched."""
         squashed = _squash(_leg2())
         assert (
             "work release record receipt actions-run --url "
@@ -332,10 +333,10 @@ class TestLeg2Idempotency:
     def test_red_actions_redispatches_never_retags(self):
         squashed = _squash(_leg2())
         assert (
-            "re-dispatch the workflow via the API, keyed on the recorded "
-            "SHA" in squashed
+            "re-dispatch the FAILED JOBS ONLY via the API, keyed on the "
+            "recorded SHA" in squashed
         )
-        assert "gh run rerun <run-id>" in squashed
+        assert "gh run rerun <run-id> --failed" in squashed
         # `gh workflow run` can never work: release.yml has no
         # workflow_dispatch trigger — the rerun is the ONLY re-dispatch.
         assert "gh workflow run" not in squashed
@@ -344,6 +345,31 @@ class TestLeg2Idempotency:
             "the tag is immutable: never deleted, never re-pointed, never "
             "re-signed" in squashed
         )
+
+    def test_redispatch_is_failed_jobs_only_and_says_why(self):
+        """`release.yml` carries no `skip-existing`, so a FULL re-run of a
+        run whose publish already succeeded re-attempts an upload PyPI
+        holds; PyPI refuses it and the run can never converge. The ladder
+        must therefore never instruct a bare `gh run rerun`."""
+        leg2 = _leg2()
+        squashed = _squash(leg2)
+        assert "The `--failed` is not optional." in squashed
+        assert "`release.yml` sets no `skip-existing`" in squashed
+        # No bare re-dispatch anywhere: every `gh run rerun` carries --failed.
+        for line in leg2.splitlines():
+            if "gh run rerun" in line:
+                assert "--failed" in line, (
+                    f"bare `gh run rerun` re-runs publish-pypi: {line.strip()!r}"
+                )
+
+    def test_version_reuse_is_pypi_refusal_not_a_repository_variable(self):
+        """The reuse gate is PyPI refusing a duplicate. The retired
+        `RELEASE_RESUME_VERSION` override must not survive in the ladder."""
+        squashed = _squash(_leg2())
+        assert "RELEASE_RESUME_VERSION" not in squashed
+        assert "Gate version reuse" not in squashed
+        assert "Red at **Publish to PyPI**" in squashed
+        assert "Recovery means cutting a new version" in squashed
 
     def test_the_ladder_table_maps_every_done_state(self):
         squashed = _squash(_leg2())
