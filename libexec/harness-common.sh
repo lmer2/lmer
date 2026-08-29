@@ -186,6 +186,28 @@ harness_render_global_context() {
         fi
     fi
 
+    # The chat upload store (issue 246). Gated on LMER_UPLOADS_DIR, which the
+    # orchestrator sets only when it actually mounted the store — so a session
+    # that cannot be handed a file is never told to look for one. A prompt
+    # fragment for the ask channel's reason: the orchestrator spawns existing
+    # taskdefs that know nothing about it, and this reaches all of them.
+    if [ -n "$(printf '%s' "$LMER_UPLOADS_DIR" | tr -d '[:space:]')" ]; then
+        local uploads_template uploads_renderer
+        uploads_template="$(harness_find_resource "prompts/orchestrator-uploads.md.jinja2")"
+        uploads_renderer="$(harness_find_resource "libexec/render-prompt-fragment.py")"
+        if [ -n "$uploads_template" ] && [ -n "$uploads_renderer" ]; then
+            printf '\n' >> "$tmp"
+            if "${LMER_PYTHON:-python3}" "$uploads_renderer" "$uploads_template" >> "$tmp"; then
+                have_content=1
+                echo "✅ Operator upload store added to global context"
+            else
+                echo "⚠️  Failed to render upload-store template at $uploads_template"
+            fi
+        else
+            echo "⚠️  LMER_UPLOADS_DIR set but upload-store template/renderer not found"
+        fi
+    fi
+
     # Agent memory usage instructions — the memory store is harness-neutral,
     # but the non-claude harnesses have no built-in memory feature, so the
     # read/write/persist contract is delivered as context. Only rendered when

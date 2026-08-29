@@ -63,5 +63,6 @@ tests:
     - tests/test_supervisor.py
     - tests/test_taskdef_render_matrix.py
     - tests/test_user_harnesses.py
+    - tests/test_work_repo_release_run.py
     - tests/test_work_repo_run_state.py
     - tests/test_workrepo_isolation_guard.py

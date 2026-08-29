@@ -376,7 +376,7 @@ from typing import Optional
 from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
 
-from . import registry, spawn
+from . import memory, registry, spawn
 from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
@@ -795,6 +795,10 @@ class AssistantStatus:
     #: so "current" and "next" are two answers and a UI showing only one of
     #: them would read a pending change as a no-op or a lie.
     settings: Optional[dict] = None
+    #: The host's shared memory store (issue #325): path, file count, size.
+    #: Served with no assistant running too — the store outlives all of them.
+    #: Accumulation only, never liveness; see :mod:`lmer_platform.memory`.
+    memory: Optional[dict] = None
 
     @property
     def age_seconds(self) -> Optional[float]:
@@ -816,6 +820,7 @@ class AssistantStatus:
             "nudged_at": self.nudged_at,
             "log_path": self.log_path,
             "settings": self.settings,
+            "memory": self.memory,
             "taskdef": TASKDEF,
             "target": TARGET,
         }
@@ -982,6 +987,10 @@ def status() -> AssistantStatus:
     lock covers only those adjacent writes, so status polling does not wait for a
     process spawn or termination grace period.
     """
+    # Outside the lock: a filesystem walk of a directory no writer here touches,
+    # and _PUBLICATION_LOCK exists so a poll and the lifecycle path never wait on
+    # each other.
+    memory_snapshot = _memory_snapshot()
     with _PUBLICATION_LOCK:
         state = read_state()
         live = _live_assistant()
@@ -997,6 +1006,7 @@ def status() -> AssistantStatus:
                 pending=len(state.pending),
                 handoff=state.handoff,
                 nudged_at=state.nudged_at,
+                memory=memory_snapshot,
             )
         session_id = live.get("id")
         pid = live.get("pid")
@@ -1016,7 +1026,19 @@ def status() -> AssistantStatus:
             nudged_at=state.nudged_at,
             log_path=_opt_str(live.get("log_path")),
             settings=_launched_settings(live),
+            memory=memory_snapshot,
         )
+
+
+def _memory_snapshot() -> dict:
+    """What the shared memory store holds, for :func:`status` to serve.
+
+    A filesystem measurement, so the answer is the same whether an assistant is
+    running, has never run, or runs a harness with no memory feature. Bounded
+    (``MEASURE_ENTRY_CAP``) because a UI polls this route.
+    """
+    directory = memory.memory_dir()
+    return {"path": str(directory), **memory.measure(directory).to_dict()}
 
 
 def _launched_settings(live: dict) -> dict:

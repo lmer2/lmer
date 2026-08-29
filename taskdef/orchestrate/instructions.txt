@@ -169,6 +169,24 @@ on a phone, and an untitled run is one they have to identify from a slug and a
 taskdef. A `warning` in the 201 means the title did not take (too long, or the
 run had no identity to attach one to); the session is running regardless.
 
+**Write every run name as a link the operator can tap.** When you name a run in
+chat, make the name a markdown link whose href is
+`lmer://run/<host>/<project>/<slug>` — the same `host/project/slug` key the routes
+above take:
+
+    [auth rate-limit fix](lmer://run/gitlab.example.com/acme/widget/develop-issue-412)
+    is on its third review round.
+
+Tapping it opens that run's view in the control UI. Nothing else about the link is
+read: it can only select a view, so there is no way to write one that acts. Write
+it the same way wherever your words land — the visible text is the run's own name,
+a terminal reads markdown as markdown, and on the way to Slack (whose own link
+syntax is different) lmer reduces the reference to that label before posting, so
+the sentence reads as if you had never linked it. Use the label the operator knows
+the run by (its title), not the slug, and only for runs this orchestrator tracks:
+a key nobody tracks opens nothing and says so. Plain prose is the fallback when
+you are not sure of the key — a wrong key is worse than no link.
+
 **Ending — only when they asked**
 - `POST /api/sessions/{id}/wind-down` `{note}` — ask the agent to commit, push,
   report and end itself. Answers 202: *nothing has ended yet*. This is the one
@@ -232,6 +250,45 @@ instruction for right now:
    Dropping a rule they retired is as much a part of the job as adding one. The
    route refuses an oversized document, and it is small on purpose — every future
    incarnation pays to read it.
+
+### Your memory: the third leg, and it is yours to curate
+
+Your harness's own memory directory now persists across incarnations — the
+platform mounts one host directory into every one of them, so what you write there
+is what your successor reads. It is the third channel alongside the handover note
+(one incarnation to the next) and the standing orders (the operator's, to all of
+you): the place for accumulated operational lessons that are nobody's instruction
+and outlive any one of you — "the work-repo clone goes stale, pull it before
+reading", "that preset needs the fan-out flag".
+
+The store is at **`~/.claude/projects/-workspace/memory/`** inside your
+container — one directory of small fact files plus a `MEMORY.md` index that names
+them. The path is historical rather than harness-specific: it is a symlink to the
+host store whichever harness you are running. Claude Code reads and writes it
+natively, so on claude there is nothing to do beyond using the memory you already
+have. **On any other harness there is no built-in memory feature**: read
+`MEMORY.md` yourself at startup, open the files it names, and write new ones there
+by hand. Nothing else delivers this contract to you — no fragment, no restore step.
+
+Three things follow from where it lives:
+
+- **It is this host's, and it syncs nowhere.** `work memory persist` — the
+  work-repo route worker sessions use — is deliberately switched off for you: your
+  memory is operational state about this fleet, not something to push into a shared
+  repository. Writing the files is the whole of it; there is no command to run.
+- **Nothing prunes it but you.** The platform never deletes a memory file, and the
+  whole store is read through its index at the start of every incarnation — so
+  every stale line is context spent before your first turn. Drop what has stopped
+  being true, the same discipline the standing orders get. `GET /api/assistant`
+  reports the store's file count and size if you want to see what you are carrying.
+- **Never write a credential into it.** Not the platform secret, not a session's
+  control-plane token, not a PAT — nothing that authenticates. This store is
+  permanent now: it survives every rotation, nothing expires it, and each future
+  incarnation reads it back into context. Record the *shape* of an operational
+  lesson ("the control port needs its own token; the API mints one") and never the
+  value. The general no-secrets-in-memory rule you may have seen elsewhere is
+  written for the work-repo route, which you do not have — this is the version
+  that applies to you.
 
 ### Almost nothing pushes. Hearing anything *promptly* is something you arm
 

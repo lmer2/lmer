@@ -28,6 +28,7 @@ import contextlib
 import json
 import os
 import signal
+import threading
 import stat
 import time
 
@@ -35,9 +36,10 @@ import pytest
 from dotenv import dotenv_values
 
 from lmer_cli import cli, resolve
+from lmer_cli.harness import HARNESSES
 from lmer_platform import assistant
 from lmer_platform import config as cfg
-from lmer_platform import registry, runs, spawn, store
+from lmer_platform import memory, registry, runs, spawn, store
 from tests.conftest import strip_lmer_env
 
 
@@ -2509,3 +2511,94 @@ def test_the_taskdef_says_what_a_check_in_is(platform_root):
     assert "Never wind one down to quieten the digest" in text, (
         "the one dangerous way to make a reminder stop is not ruled out"
     )
+
+
+# ── The shared memory store in status (#325) ─────────────────────────────────
+# Per host and outliving every incarnation, so its state belongs on the status
+# route: a session cannot tell an empty store from one it has not written yet.
+
+
+def test_status_reports_the_shared_memory_store(platform_root):
+    directory = memory.prepare_memory_dir()
+    (directory / "MEMORY.md").write_text("- [one lesson](x.md)\n", encoding="utf-8")
+    reported = assistant.status().memory
+    assert reported["path"] == str(directory)
+    assert reported["files"] == 1
+    assert reported["bytes"] > 0
+    assert reported["large"] is False
+
+
+def test_the_store_is_reported_on_a_host_that_has_never_run_an_assistant(
+    platform_root,
+):
+    """The store is what a *next* incarnation reads, so it is served with nothing
+    running."""
+    reported = assistant.status().memory
+    assert reported["files"] == 0
+    assert reported["path"] == str(memory.memory_dir())
+
+
+def test_the_status_body_carries_the_store(platform_root):
+    """``to_dict`` is what ``GET /api/assistant`` answers with."""
+    body = assistant.status().to_dict()
+    assert body["memory"]["path"] == str(memory.memory_dir())
+    assert set(body["memory"]) == {"path", "files", "bytes", "truncated", "large"}
+
+
+def test_a_large_store_says_so_in_the_status(platform_root):
+    """The spawn's threshold, visible without the daemon's log."""
+    directory = memory.prepare_memory_dir()
+    (directory / "huge.md").write_text("x" * (memory.WARN_BYTES + 1), encoding="utf-8")
+    assert assistant.status().memory["large"] is True
+
+
+def test_the_taskdef_tells_the_assistant_where_its_memory_lives(platform_root):
+    """Issue #325. Only claude reads the store natively, and the fragment that
+    would tell codex or pi is gated on the flag this feature blanks — so the
+    taskdef is the only channel naming the store to those sessions."""
+    text = orchestrate_prose()
+    assert HARNESSES["claude"].memory_dir.replace("/home/developer", "~") in text, (
+        "an incarnation on a harness with no memory feature has no other way to "
+        "find the store"
+    )
+    assert "no built-in memory feature" in text, (
+        "a codex or pi assistant must be told to read and write the store by "
+        "hand rather than assume a feature reads it"
+    )
+    assert "syncs nowhere" in text, (
+        "the work-repo route is closed structurally; the prompt has to say so or "
+        "an incarnation goes looking for `work memory persist`"
+    )
+    assert "Never write a credential into it" in text, (
+        "the store is permanent now and re-read every incarnation, and the "
+        "no-secrets rule the agent sees elsewhere is scoped to the work-repo "
+        "route it does not have"
+    )
+
+
+def test_the_memory_walk_does_not_run_under_the_publication_lock(
+    platform_root, monkeypatch
+):
+    """Measuring inside the lock runs its trade backwards: every ``start``'s
+    publication would queue behind a poller's walk.
+
+    Checked from another thread — the lock is re-entrant, so an acquire on the
+    polling thread would succeed either way."""
+    held = []
+
+    def measuring(directory=None):
+        acquired = assistant._PUBLICATION_LOCK.acquire(timeout=0.2)
+        held.append(not acquired)
+        if acquired:
+            assistant._PUBLICATION_LOCK.release()
+        return memory.Measurement(files=0, bytes=0)
+
+    def probe():
+        thread = threading.Thread(target=lambda: measuring())
+        thread.start()
+        thread.join()
+        return memory.Measurement(files=0, bytes=0)
+
+    monkeypatch.setattr(memory, "measure", lambda directory=None: probe())
+    assistant.status()
+    assert held == [False], "the lock was held while the store was measured"

@@ -87,6 +87,13 @@ from lmer_cli.runtime import RuntimeErrorDetect, detect_runtime
 # to agree with what :func:`lmer_cli.tokens._gitlab_token_issuing_host` reads.
 from lmer_cli.tokens import _host_from_git_url
 from lmer_cli.util import get_bool_env
+
+# Module level, deliberately: this used to be a function-local import explained as
+# laziness for importability, which defended a cycle that does not exist —
+# ``uploads`` reaches only ``registry`` and ``store``, and neither reaches back
+# here (!272 review). The type table lives with the code that sniffs bytes; this
+# module only needs to know which names are checkable.
+from .uploads import KNOWN_TYPES
 # The forge names are the URL builder's, imported rather than spelled again here:
 # what ``work_repo_forge`` accepts has to be exactly what
 # :func:`work_repo.git_ops.forge_web_url` knows how to build paths for, and a
@@ -118,6 +125,9 @@ __all__ = [
     "INT_SETTINGS", "NUDGE_SETTING_KEYS", "DEFAULT_NUDGE_AFTER_SECONDS",
     "DEFAULT_NUDGE_PENDING_THRESHOLD", "ENV_NUDGE_AFTER_SECONDS",
     "ENV_NUDGE_PENDING_THRESHOLD", "nudge_settings", "validate_int_setting",
+    "UPLOAD_SETTING_KEYS", "ENV_UPLOAD_TYPES", "ENV_UPLOAD_MAX_BYTES",
+    "DEFAULT_UPLOAD_TYPES", "DEFAULT_UPLOAD_MAX_BYTES", "MAX_UPLOAD_MAX_BYTES",
+    "upload_settings", "upload_types",
     "DEFAULT_STALL_IDLE_SECONDS", "DEFAULT_STALL_BACKSTOP_SECONDS",
     "ENV_STALL_IDLE_SECONDS", "ENV_STALL_BACKSTOP_SECONDS",
 ]
@@ -168,6 +178,21 @@ DEFAULT_NUDGE_PENDING_THRESHOLD = 1
 #: :data:`lmer_platform.assistant.MAX_PENDING`, copied because that module imports
 #: this one; ``tests/test_platform_nudge.py`` pins the copy.
 MAX_NUDGE_PENDING_THRESHOLD = 50
+
+#: What a chat upload may weigh, per file (issue #246). Generous for what it is
+#: for — a phone screenshot is a few hundred KB — and a bound rather than a
+#: policy: a paste of something enormous is refused with a sentence instead of
+#: filling a state directory.
+DEFAULT_UPLOAD_MAX_BYTES = 8 * 1024 * 1024
+#: Ceiling on it. The payload travels base64 in a JSON body and is held in memory
+#: while it is checked, so this is the size above which the *transport* is the
+#: thing to change (multipart, ``docs/PLATFORM-QUICKSTART.md``) rather than the
+#: number.
+MAX_UPLOAD_MAX_BYTES = 64 * 1024 * 1024
+#: Which file types a chat upload may be — the operator's default (issue #246).
+#: Names from :data:`lmer_platform.uploads.KNOWN_TYPES`, which is wider: an
+#: allowlist an operator can only narrow would not be much of a knob.
+DEFAULT_UPLOAD_TYPES = ("png", "jpeg", "txt")
 
 #: How long a live session may produce nothing before halt detection considers
 #: it (#243). An operator's number, not a derived one; silence alone does not
@@ -251,6 +276,22 @@ CHECKIN_SETTING_KEYS = {
 #: reads on its own tick, not argv tokens.
 ENV_NUDGE_AFTER_SECONDS = "LMER_PLATFORM_NUDGE_AFTER_SECONDS"
 ENV_NUDGE_PENDING_THRESHOLD = "LMER_PLATFORM_NUDGE_PENDING_THRESHOLD"
+
+#: Chat file upload (issue #246): what a file may weigh and which types are
+#: accepted. Both per host — what an operator is willing to have sitting in their
+#: platform state directory is a property of the host, not of a build.
+ENV_UPLOAD_MAX_BYTES = "LMER_PLATFORM_UPLOAD_MAX_BYTES"
+ENV_UPLOAD_TYPES = "LMER_PLATFORM_UPLOAD_TYPES"
+
+#: setting key -> (PlatformConfig field, env var) for the upload group, so it
+#: resolves per read like the two groups above rather than only at daemon start.
+#: The cap earns that because it is in :data:`INT_SETTINGS`, which is what
+#: ``POST /api/assistant/config`` derives its accepted integer keys from: a
+#: setting that route persists and reports as changed has to be one something
+#: re-reads, or the 200 is a lie until the next restart (!272 review).
+UPLOAD_SETTING_KEYS = {
+    "max_bytes": ("upload_max_bytes", ENV_UPLOAD_MAX_BYTES),
+}
 
 #: setting key -> (PlatformConfig field, env var), as above.
 NUDGE_SETTING_KEYS = {
@@ -336,6 +377,25 @@ INT_SETTINGS = {
             f"the digest spool holds at most {MAX_NUDGE_PENDING_THRESHOLD}, so a "
             "higher threshold could never be met — disable the nudge with "
             "nudge_after_seconds=0 instead"
+        ),
+    ),
+    "upload_max_bytes": _IntSettingRule(
+        default=DEFAULT_UPLOAD_MAX_BYTES,
+        minimum=1,
+        floor_reason=(
+            "a file has to be allowed at least one byte — turn uploads off with "
+            'an empty "upload_types": [] in config.json instead (a blank '
+            "LMER_PLATFORM_UPLOAD_TYPES reads as unset and falls through to the "
+            "default)"
+        ),
+        log_key="platform_upload_max_bytes_invalid",
+        unit="bytes",
+        singular_unit="byte",
+        maximum=MAX_UPLOAD_MAX_BYTES,
+        ceiling_reason=(
+            f"an upload is held in memory while it is checked, so above "
+            f"{MAX_UPLOAD_MAX_BYTES} bytes the transport is what needs changing "
+            "rather than the cap"
         ),
     ),
 }
@@ -459,6 +519,26 @@ class PlatformConfig:
     #: digests. See :data:`NUDGE_SETTING_KEYS` and :data:`INT_SETTINGS`.
     nudge_after_seconds: int = DEFAULT_NUDGE_AFTER_SECONDS
     nudge_pending_threshold: int = DEFAULT_NUDGE_PENDING_THRESHOLD
+    #: What a file attached to a chat may weigh, and which types are accepted
+    #: (issue #246). The type list is names, normalised and filtered against
+    #: :data:`lmer_platform.uploads.KNOWN_TYPES` by :func:`_upload_types_value`;
+    #: an empty one is a valid setting and means this host takes no uploads.
+    upload_max_bytes: int = DEFAULT_UPLOAD_MAX_BYTES
+    upload_types: tuple = DEFAULT_UPLOAD_TYPES
+    #: The Matrix bridge's settings (issue #327) — the raw ``config.json``
+    #: mapping, deliberately unparsed here for the reason :attr:`slots` gives:
+    #: :mod:`matrix_bridge.config` is the only module that knows what a
+    #: capability is, and a typo in an allowlist must refuse *the bridge*
+    #: rather than a daemon that would then be unreconfigurable through its own
+    #: UI. Validated here only as far as "it is a mapping".
+    #:
+    #: It is a field rather than an unknown key the loader tolerates because the
+    #: bridge writes back: D5 records the room id after creating the room, and
+    #: :func:`update_stored` refuses unknown fields — while :func:`save` would
+    #: *delete* an unknown key outright, taking the operator's allowlist with
+    #: it. No environment override, for :attr:`slots`' second reason: a JSON
+    #: mapping in an env var is a footgun.
+    matrix: Optional[dict] = None
 
     @property
     def secret_path(self) -> Path:
@@ -573,6 +653,12 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
     slots = _slots_value(config.slots)
     if slots != config.slots:
         config = replace(config, slots=slots)
+    matrix = _matrix_value(config.matrix)
+    if matrix != config.matrix:
+        config = replace(config, matrix=matrix)
+    upload_types = _upload_types_value(config.upload_types)
+    if upload_types != config.upload_types:
+        config = replace(config, upload_types=upload_types)
     for field_name in INT_SETTINGS:
         usable = _int_setting_value(getattr(config, field_name), field=field_name)
         if usable != getattr(config, field_name):
@@ -598,6 +684,74 @@ def _slots_value(value: object) -> tuple:
         "slot entries; no service slots are declared", value,
     )
     return ()
+
+
+def _matrix_value(value: object) -> Optional[dict]:
+    """The Matrix bridge's mapping, or ``None`` with a warning.
+
+    :func:`_slots_value`'s house rule, for :func:`_slots_value`'s reason: this
+    daemon does not read the mapping, and refusing to boot over the bridge's
+    config would take the UI down with it. What is *inside* the mapping is
+    :mod:`matrix_bridge.config`'s to refuse — loudly, because the bridge has no
+    UI to be fixed through and an allowlist is the only authorization it has.
+    """
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    logger.warning(
+        "platform_config_unusable field=matrix value=%r — expected a mapping "
+        "of the bridge's settings; the Matrix bridge will refuse to start", value,
+    )
+    return None
+
+
+def _upload_types_value(value: object) -> tuple:
+    """The allowed upload types, normalised and filtered to what can be checked.
+
+    Two spellings are accepted because two places write this: a JSON list in
+    ``config.json`` and a comma-separated string in
+    :data:`ENV_UPLOAD_TYPES`, each the natural form where it is written. Names
+    are lower-cased and de-duplicated, and their order is kept — it is the order
+    the refusal message lists.
+
+    A name :mod:`lmer_platform.uploads` cannot *identify from the bytes* is
+    dropped with a warning rather than raising: this resolves inside ``load()``,
+    so raising is a daemon that will not boot over a typo in one setting. It is
+    not quietly widened either — a list whose every entry was a typo accepts
+    nothing, which is what was written, and the route's refusal names the empty
+    list rather than pretending the default is in force.
+    """
+    if isinstance(value, str):
+        raw = [part for part in value.replace(",", " ").split()]
+    elif isinstance(value, (list, tuple)):
+        raw = [part for part in value]
+    elif value is None:
+        raw = []
+    else:
+        logger.warning(
+            "platform_config_unusable field=upload_types value=%r — expected a "
+            "list of type names or a comma-separated string; using the default "
+            "%s", value, ", ".join(DEFAULT_UPLOAD_TYPES),
+        )
+        return DEFAULT_UPLOAD_TYPES
+    names: list = []
+    unknown: list = []
+    for part in raw:
+        name = str(part).strip().lower()
+        if not name or name in names:
+            continue
+        if name not in KNOWN_TYPES:
+            unknown.append(name)
+            continue
+        names.append(name)
+    if unknown:
+        logger.warning(
+            "platform_upload_types_unknown names=%s known=%s — dropped; chat "
+            "uploads of those types are refused",
+            ", ".join(unknown), ", ".join(KNOWN_TYPES),
+        )
+    return tuple(names)
 
 
 def _int_setting_value(value: object, *, field: str) -> int:
@@ -990,6 +1144,13 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
             field: _env_str(env_var)
             for field, env_var in ASSISTANT_SETTING_KEYS.values()
         },
+        # Same warn-don't-refuse posture as the two above: an unusable export
+        # costs its own layer and lets ``config.json`` show through.
+        "upload_max_bytes": _layer_int(
+            _env_str(ENV_UPLOAD_MAX_BYTES), layer="env", field="upload_max_bytes",
+        ),
+        # A string here, a JSON list in the file; ``_validate`` normalises both.
+        "upload_types": _env_str(ENV_UPLOAD_TYPES),
     }
     values.update({k: v for k, v in env_values.items() if v is not None})
 
@@ -1172,6 +1333,46 @@ def nudge_settings() -> dict:
     to the next tick rather than the next restart.
     """
     return _int_group_settings(NUDGE_SETTING_KEYS, group="nudge")
+
+
+def upload_settings() -> dict:
+    """The upload group's effective settings, one per :data:`UPLOAD_SETTING_KEYS`.
+
+    :func:`nudge_settings`' sibling, read **fresh** for the same reason narrowed
+    to this feature: the upload route reads it on every request, so an operator
+    who raises the cap through ``POST /api/assistant/config`` expects the next
+    upload to be measured against it rather than the next daemon start.
+    """
+    return _int_group_settings(UPLOAD_SETTING_KEYS, group="upload")
+
+
+def upload_types() -> tuple:
+    """The allowed upload types, resolved fresh on the module's usual chain.
+
+    The list half of the same group, and separate because it is not an integer:
+    :func:`_int_group_settings` is built around one. Same posture though — the
+    route calls this per request, so editing ``config.json`` (by hand or through
+    a future surface) applies without a restart, which is what
+    ``docs/LMER-CLI.md`` says of both.
+    """
+    from_env = _env_str(ENV_UPLOAD_TYPES)
+    if from_env is not None:
+        resolved = _upload_types_value(from_env)
+        # An export naming only unknown types resolves to nothing, and that is
+        # the operator's own list rather than a reason to fall through to a wider
+        # one — the same stance ``_validate`` takes at load time.
+        return resolved
+    try:
+        stored = read_json(config_path())
+    except StoreError as exc:
+        logger.error(
+            "platform_config_unreadable error=%s — upload types resolve from "
+            "the default only", exc,
+        )
+        stored = None
+    if isinstance(stored, dict) and "upload_types" in stored:
+        return _upload_types_value(stored["upload_types"])
+    return DEFAULT_UPLOAD_TYPES
 
 
 def _int_group_settings(keys: dict, *, group: str) -> dict:

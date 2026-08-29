@@ -83,6 +83,8 @@ ENTRY_CSS = "index.css"
 RENDERER_JS = "Markdown.js"
 RENDERER_CSS = "Markdown.css"
 TERMINAL_JS = "Terminal.js"
+#: The sketch pad (issue 246), the third and smallest deliberate split.
+SKETCH_JS = "SketchPad.js"
 
 #: Strings that are in a chunk only if the renderer is: two of markdown-it's rule
 #: names, DOMPurify's trusted-types policy name, and two config keys that both
@@ -102,6 +104,11 @@ RENDERER_MARKERS = (
 #: Same idea for the emulator, whose split this one must not disturb. xterm names
 #: itself in its own class names, so one marker is enough.
 TERMINAL_MARKER = "xterm"
+#: A string only the sketch pad has, and the second attempt at one: a media type
+#: matches the composer's own ``accept`` list, and ``-marked`` matches Vuetify's
+#: ``mdi-checkbox-marked`` in the entry chunk — both would have failed against a
+#: correct build. This is the dialog's own title, which nothing else says.
+SKETCH_MARKER = "mark up the image"
 
 #: The selector every markdown rule is scoped to. Its absence from the entry
 #: stylesheet is how the CSS half of the split is checked.
@@ -341,18 +348,31 @@ def test_the_terminal_chunk_is_still_split(bundle):
     )
 
 
-def test_the_only_deliberate_splits_are_the_two(bundle):
+def test_the_only_deliberate_splits_are_the_named_ones(bundle):
     """Every chunk is a round trip somebody has to wait for.
 
-    Both of these are argued for — one saves 90 kB gzipped, the other 59 kB — and
-    the vite config says as much. A third that nobody named is either an accident
-    or a decision that was never written down, and both are worth a failing test.
+    All three are argued for — the terminal saves 90 kB gzipped, the renderer 59
+    kB, and the sketch pad is a canvas editor that opens only when an operator
+    taps "mark up" on an image they already attached (issue 246) — and the vite
+    config says as much. A fourth that nobody named is either an accident or a
+    decision that was never written down, and both are worth a failing test.
     """
     entry = bundle.files[ENTRY_JS]
     deferred = sorted(set(re.findall(r'import\("(\./[^"]+)"\)', entry)))
-    assert deferred == [f"./{RENDERER_JS}", f"./{TERMINAL_JS}"], (
+    assert deferred == [f"./{RENDERER_JS}", f"./{SKETCH_JS}", f"./{TERMINAL_JS}"], (
         f"the entry chunk defers {deferred}"
     )
+
+
+def test_the_sketch_pad_stays_out_of_the_entry_chunk(bundle):
+    """The split is only worth having if the editor is actually in the chunk: one
+    static import of the component anywhere pulls the whole thing back into the
+    entry, and nothing about the build would look wrong."""
+    assert SKETCH_MARKER not in bundle.files[ENTRY_JS], (
+        f"assets/{ENTRY_JS} carries the sketch pad again"
+    )
+    assert SKETCH_JS in bundle.files, f"no assets/{SKETCH_JS} was emitted"
+    assert SKETCH_MARKER in bundle.files[SKETCH_JS]
 
 
 def test_every_chunk_lands_where_the_daemon_can_serve_it(bundle):

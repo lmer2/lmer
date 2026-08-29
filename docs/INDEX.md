@@ -15,6 +15,8 @@ assistant) on a host:
 - `LMER_PLATFORM_CONTAINER_URL` and the surviving-assistant restart gotcha
 - A tour of the fleet view, spawning, answering, wind down vs exit, uber lmer
 - Digest nudges: when the daemon reminds uber lmer that its spool is unread
+- uber lmer's memory: the host-local store its incarnations share, what its
+  file count does and does not show
 
 **Best for**: Getting the platform running and usable in a few minutes.
 
@@ -200,6 +202,27 @@ How `--service` and `--checkout` let lmer run against an already-running contain
 
 ---
 
+### [MATRIX-CHAT.md](./MATRIX-CHAT.md)
+**Matrix Chat Bridge**
+
+`lmer-matrix-bridge`: one platform daemon in a Matrix room, so a run that needs
+a human can be answered from a phone.
+- What the room shows: a thread per run, transitions only, and why the two
+  question states read differently (one continues a session, one starts a
+  container)
+- Setup: the `matrix` extra, the `matrix` section in `config.json`, the three
+  `LMER_MATRIX_*` secrets, `register` and `check`
+- The allowlist: explicit MXIDs only, humans and bots alike, and why this
+  deliberately does not match domains the way `LMER_PUSH_ALLOW_LIST` does
+- Encryption: the crypto store, the recovery key, and the one state where the
+  bridge refuses to start rather than mint a fresh device
+- Attachments: the three preconditions, and what happens when one fails
+
+**Best for**: Setting up the Matrix bridge, deciding who may answer what, and
+diagnosing a room that has gone quiet.
+
+---
+
 ### [PRESETS.md](./PRESETS.md)
 **Startup Presets**
 
@@ -301,6 +324,7 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - **Setting up containers?** See [CONTAINER.md](./CONTAINER.md) for Docker/Podman configuration
 - **Having auth issues?** Check [AUTHENTICATION.md](./AUTHENTICATION.md) for SSH and API setup
 - **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md), [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md), and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption, rehearsal, and operator setup
+- **Answering runs from your phone?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
 - **Need to troubleshoot?** All documents include troubleshooting sections
 
 ---

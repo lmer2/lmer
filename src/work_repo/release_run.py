@@ -4,8 +4,8 @@ One release run = one release.yaml in the run dir, holding everything leg 1
 and leg 2 record and everything a relaunch re-derives from: the release
 version, the bump-MR merge SHA, the release-MR merge SHA, the signed-tag
 receipt, and the push/upload receipts (GitHub main push, GitHub tag push,
-the Actions run that actually uploaded, the PyPI URL, the GitLab tag push).
-The pure derive_leg()/next_step() answer "bump merged? release MR merged?
+the Actions run that actually uploaded, the PyPI URL, the GitLab tag push,
+the next cycle's dependency refresh). The pure derive_leg()/next_step() answer "bump merged? release MR merged?
 tag created? pushed where? which Actions run actually uploaded?" from
 recorded state alone, so a relaunched session resumes at exactly one next
 action without re-reading remotes (spec §3: watch is best-effort, resume is
@@ -49,8 +49,8 @@ verbs land; same family as the frozen claim verbs `work release claim` /
     work release record tag <vX.Y.Z> --sha <sha>
     work release record receipt <name> [--url <url>] [--note "..."]
         <name> is one of: github-main-push, github-tag-push, actions-run,
-        pypi, gitlab-tag-push (--url required for actions-run and pypi:
-        receipts must record which run/URL actually uploaded)
+        pypi, gitlab-tag-push, dep-refresh (--url required for actions-run
+        and pypi: receipts must record which run/URL actually uploaded)
     work release abort [--reason "..."]
     work release status [--json]
 """
@@ -85,6 +85,11 @@ RECEIPT_NAMES = (
     "actions-run",
     "pypi",
     "gitlab-tag-push",
+    # Recorded even when the adopter declares no `dep_refresh` command (with
+    # a note saying so): the ladder below walks receipts, not parameters, so
+    # a receipt an opted-out repository never writes would park its release
+    # on `leg2-dep-refresh` forever.
+    "dep-refresh",
 )
 URL_REQUIRED_RECEIPTS = ("actions-run", "pypi")
 # Frozen next_step names, in ladder order — the resume decision table
@@ -99,6 +104,7 @@ STEPS = (
     "leg2-poll-actions",
     "leg2-record-pypi",
     "leg2-push-gitlab-tag",
+    "leg2-dep-refresh",
     "complete",
 )
 LEGS = ("leg1", "gate", "leg2", "complete")
@@ -545,6 +551,8 @@ def derive_leg(release: Optional[dict]) -> dict:
         leg, step = "leg2", "leg2-record-pypi"
     elif "gitlab-tag-push" not in receipts:
         leg, step = "leg2", "leg2-push-gitlab-tag"
+    elif "dep-refresh" not in receipts:
+        leg, step = "leg2", "leg2-dep-refresh"
     else:
         leg, step = "complete", "complete"
     return {

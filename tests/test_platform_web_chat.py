@@ -667,6 +667,11 @@ _SETTLE_PROBE = """
 const messages = { value: [] }
 const pending = { value: [] }
 const consumed = new Set()
+// The bubble's own cleanup (issue 246): a settled bubble's local image previews
+// are revoked with it, and there is no browser here to hold one. Stubbed rather
+// than stripped out of the extracted source, so what runs below is the function
+// as it is written.
+const release = () => {}
 
 %s
 
@@ -697,6 +702,11 @@ _CYCLES_PROBE = """
 const messages = { value: [] }
 const pending = { value: [] }
 const consumed = new Set()
+// The bubble's own cleanup (issue 246): a settled bubble's local image previews
+// are revoked with it, and there is no browser here to hold one. Stubbed rather
+// than stripped out of the extracted source, so what runs below is the function
+// as it is written.
+const release = () => {}
 
 %s
 
@@ -722,6 +732,11 @@ _PAIR_CYCLES_PROBE = """
 const messages = { value: [] }
 const pending = { value: [] }
 const consumed = new Set()
+// The bubble's own cleanup (issue 246): a settled bubble's local image previews
+// are revoked with it, and there is no browser here to hold one. Stubbed rather
+// than stripped out of the extracted source, so what runs below is the function
+// as it is written.
+const release = () => {}
 
 %s
 
@@ -746,6 +761,11 @@ _RESTART_PROBE = """
 const messages = { value: [] }
 const pending = { value: [] }
 const consumed = new Set()
+// The bubble's own cleanup (issue 246): a settled bubble's local image previews
+// are revoked with it, and there is no browser here to hold one. Stubbed rather
+// than stripped out of the extracted source, so what runs below is the function
+// as it is written.
+const release = () => {}
 
 %s
 
@@ -787,6 +807,15 @@ const sending = { value: false }
 const problem = { value: null }
 const pending = { value: [] }
 const following = { value: false }
+// The staged-attachment tray (issue 246), empty for every case here: what these
+// cases are about is the message, and a send with nothing attached is the shape
+// they all have. The upload path is not executed anywhere — it needs a browser's
+// FileReader — so it is pinned at source level instead
+// (tests/test_platform_web_uploads.py).
+const attachments = { value: [] }
+const uploadSessionFile = async () => {
+  throw new Error('no case here attaches a file')
+}
 // The component's bubble counter, which lives beside `pending` in the module scope
 // rather than inside the function under test. Here because a bubble's id is what
 // the dismiss is given (issue 286) and what the render key is, so a probe that left
@@ -1360,6 +1389,11 @@ _DISMISS_PROBE = """
 const messages = { value: [] }
 const pending = { value: [] }
 const consumed = new Set()
+// The bubble's own cleanup (issue 246): a settled bubble's local image previews
+// are revoked with it, and there is no browser here to hold one. Stubbed rather
+// than stripped out of the extracted source, so what runs below is the function
+// as it is written.
+const release = () => {}
 
 %s
 
@@ -1975,6 +2009,15 @@ const sending = { value: false }
 const problem = { value: null }
 const pending = { value: [] }
 const following = { value: false }
+// The staged-attachment tray (issue 246), empty for every case here: what these
+// cases are about is the message, and a send with nothing attached is the shape
+// they all have. The upload path is not executed anywhere — it needs a browser's
+// FileReader — so it is pinned at source level instead
+// (tests/test_platform_web_uploads.py).
+const attachments = { value: [] }
+const uploadSessionFile = async () => {
+  throw new Error('no case here attaches a file')
+}
 // The component's bubble counter, which lives beside `pending` in the module scope
 // rather than inside the function under test. Here because a bubble's id is what
 // the dismiss is given (issue 286) and what the render key is, so a probe that left

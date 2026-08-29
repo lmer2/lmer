@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lmer"
-version = "0.8.0"
+version = "0.9.0"
 description = "Containerized harness for running Claude Code against external repositories"
 requires-python = ">=3.12"
 readme = "README.md"
@@ -47,6 +47,30 @@ dependencies = [
 where = ["src"]
 
 [project.optional-dependencies]
+# The Matrix bridge (issue #327), and an extra rather than a core dependency on
+# purpose. `python-olm` is the only package in the whole lock whose wheels are
+# cp312-only and Linux-only, so as a core dependency it would make
+# `uv tool install lmer` compile vendored libolm from source on CPython >=3.13,
+# on macOS and on musl — and fail outright where there is no C toolchain. Spec
+# §11 and issue #327 both say this feature must not become a prerequisite for
+# other lmer work; this is what keeps that true. `lmer-matrix-bridge` is
+# declared unconditionally, so the cost of a missing extra is an ImportError
+# from that one command rather than a failed install of lmer itself.
+#
+# What each is for: `mautrix` is appservice-native and does E2EE through the
+# appservice MSCs (the `encryption` extra brings libolm's Python binding and the
+# Megolm/attachment ciphers); `aiosqlite` is the crypto store's backend, since
+# mautrix's `PgCryptoStore` runs over `mautrix.util.async_db`'s SQLite scheme
+# and a host-side bridge keeps its store in a file; `asyncpg` is not a Postgres
+# driver here at all — `PgCryptoStore` imports its `UniqueViolationError` at
+# module scope, so the SQLite store does not import without it (measured
+# against mautrix 0.21.1, and mautrix's own metadata declares neither outside
+# its `test` extra).
+matrix = [
+    "mautrix[encryption]>=0.21.1",
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.29.0",
+]
 dev = [
     "pytest>=9.0.3",
     "pytest-cov>=4.1.0",
@@ -61,6 +85,10 @@ lmer = "lmer_cli.cli:main"
 lmer-supervisor = "lmer_cli.supervisor:main"
 lmer-pipe = "lmer_cli.pipe:main"
 lmer-ctl = "lmer_platform.ctl:main"
+# Declared unconditionally although its dependencies live in the `matrix`
+# extra: a missing extra then costs an ImportError from this one command
+# rather than a failed install of lmer (see the extra's own note).
+lmer-matrix-bridge = "matrix_bridge.cli:main"
 gitlab-review = "gitlab_reviewer.cli:main"
 lmer-slack = "slack_chat.cli:main"
 lmer-slack-listener = "slack_chat.listener:main"

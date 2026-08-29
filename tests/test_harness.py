@@ -34,8 +34,9 @@ from lmer_cli.harness import (
     resolve_harness_name,
     resolve_harness_selection,
 )
-from lmer_cli.mounts import build_user_mounts
+from lmer_cli.mounts import CONTAINER_HOME, build_user_mounts
 from tests.conftest import strip_lmer_env
+from work_repo.memory import agent_memory_dir
 
 CLI_PY = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
 
@@ -845,3 +846,49 @@ class TestBuildExecArgv:
         # letting the prompt rebind the child's command line.
         with pytest.raises(ValueError, match="starts with '-'"):
             harness_mod.build_exec_argv(HARNESSES["pi"], "  --version")
+
+
+class TestMemoryDirDeclaration:
+    """Where a harness keeps its agent memory (issue #325).
+
+    Two things make the declaration usable: only a harness with a native memory
+    feature declares one, and the path it declares is the path the work-repo
+    route already reads and writes."""
+
+    def test_only_claude_declares_one_today(self):
+        """A declaration for a harness with no memory feature would have the
+        platform mount a path nothing reads."""
+        declared = {
+            name for name, harness in HARNESSES.items() if harness.memory_dir
+        }
+        assert declared == {"claude"}
+
+    def test_the_declaration_is_an_absolute_container_path(self):
+        memory_dir = HARNESSES["claude"].memory_dir
+        # Against the constant rather than the literal: the whole point of a
+        # guard here is to fail when the container home moves, and a hardcoded
+        # "/home/developer/" would still pass while the symlink landed at a path
+        # nothing reads.
+        assert memory_dir.startswith(f"{CONTAINER_HOME}/")
+        # Below session_dir, which is exactly why it needs a mount of its own:
+        # the transcript mount lands on the parent.
+        assert memory_dir.startswith(f"{HARNESSES['claude'].session_dir}/")
+
+    def test_it_names_the_directory_the_work_repo_route_uses(self, monkeypatch):
+        """One path, two consumers (``work memory`` for workers, the platform mount
+        for the assistant), so it is pinned against the writer.
+
+        ``HOME`` is forced to :data:`CONTAINER_HOME`, not a literal: both sides
+        derive from that constant, so moving it fails here rather than passing on
+        a coincidence (review of !263)."""
+        monkeypatch.setenv("HOME", CONTAINER_HOME)
+        monkeypatch.delenv("LMER_AGENT_MEMORY_DIR", raising=False)
+        assert str(agent_memory_dir()) == HARNESSES["claude"].memory_dir
+
+    def test_the_prompt_fragment_names_the_same_directory(self):
+        """The third spelling: unpinned, the fragment drifts into instructions
+        naming a directory nobody mounts."""
+        fragment = (
+            Path(__file__).parent.parent / "prompts" / "agent-memory.md"
+        ).read_text(encoding="utf-8")
+        assert HARNESSES["claude"].memory_dir in fragment

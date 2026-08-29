@@ -292,7 +292,7 @@ __all__ = [
     "ToolCall", "Message", "Source", "MessagePage",
     "transcript_root", "session_transcript_dir", "locate_sources",
     "sessions_for_run", "normalise_records", "read_source", "read_messages",
-    "scrub_transcript", "scrub_session_transcripts",
+    "scrub_transcript", "scrub_session_transcripts", "scrub_credentials",
     "LAST_TURN_TAIL_BYTES", "last_turn",
 ]
 
@@ -1121,6 +1121,17 @@ def sessions_for_run(session_id: str) -> list:
     # would read as a broken page rather than as a missing transcript.
     found.setdefault(session_id, "")
     return sorted(found, key=lambda sid: (found[sid], sid))
+
+
+def scrub_credentials(text: str) -> str:
+    """:func:`_scrub` under a public name, for clients outside this module.
+
+    Promoted (issue #327) because ``lmer-matrix-bridge`` quotes platform text
+    into a chat room and needs exactly this rule — the credential *shapes* a
+    machine's output carries. Importing the private name across modules is what
+    ``lmer_platform.client`` was promoted to avoid; the same applies here.
+    """
+    return _scrub(text)
 
 
 def _scrub(text: str) -> str:

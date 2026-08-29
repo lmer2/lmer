@@ -1,10 +1,11 @@
 {#-
   Leg 2 — ship. Included by taskdef/release/instructions.txt under its
-  "## Leg 2 — ship" heading, so this body starts at H3. The four release
+  "## Leg 2 — ship" heading, so this body starts at H3. The release
   parameters (release.github_target, release.tag_prefix, release.signing_key,
-  release.changelog) were resolved in Phase 0.5; leg 2 consumes the first
-  three. Step names extend the derived-step vocabulary of the resume
-  decision table in release-resume.jinja2.
+  release.changelog, and the optional release.dep_refresh) were resolved in
+  Phase 0.5; leg 2 consumes all but release.changelog. Step names extend the
+  derived-step vocabulary of the resume decision table in
+  release-resume.jinja2.
 -#}
 Entry condition: the human merged the release MR (`prep-release` → `main`)
 on GitLab — or a relaunch derived a leg-2 step from run state. Everything in
@@ -34,40 +35,41 @@ elsewhere, generate one, or re-implement provisioning. A missing or rejected
 credential is a hard error naming the credential requirement (see HARD
 RULES), never a workaround.
 
-`release.github_target` is a bare `https://` URL and the container carries
-NO credential helper for the mirror host, with `~/.gitconfig` a read-only
-mount so one cannot be added persistently. Every operation against the
-`github` remote — the fetch in step 2, both `ls-remote` checks, and both
-`bin/gate-push` invocations — therefore fails unauthenticated. Supply the
-PAT through git's numbered-config environment, which lives only in a
-process's own env, never in a file and never on a command line.
+`release.github_target` is a bare `https://` URL and the container carries no
+persistent credential helper for the mirror host, with `~/.gitconfig` a
+read-only mount. Every operation against the `github` remote — the fetch in
+step 2, both `ls-remote` checks, and both `bin/gate-push` invocations —
+therefore fails unauthenticated. Supply the PAT through lmer's action-free
+ASKPASS helper. The helper only answers Git's credential prompts from its own
+environment; it performs no network or filesystem action.
 
 Supply it PER COMMAND, never once for the leg: each command runs in a fresh
 shell, so an `export` in one invocation does not reach the next. The prefix
 below goes in front of EACH `github`-remote command, in the same shell
 invocation as that command — the step-2 fetch, both `ls-remote` checks, and
 both `bin/gate-push` invocations (`bin/gate-push` shells out to `git`, so
-the numbered config reaches git through the environment it inherits):
+ASKPASS reaches Git through the environment it inherits):
 
 ```
-# <mirror-host> is the host of `release.github_target` — read it off that
-# URL, never typed from memory. `x-access-token` is the fixed username the
-# forge expects for a PAT; the token is the password half.
-# N is the next free index, derived from whatever numbered config this
-# shell inherited, so an inherited entry is never overwritten.
-N="${GIT_CONFIG_COUNT:-0}"
+# `x-access-token` is the fixed username the forge expects for a PAT; the
+# provisioned token is the password half. LC_ALL=C makes Git's ASKPASS prompt
+# vocabulary match the helper's audited Username/Password contract.
 (
-  export GIT_CONFIG_COUNT="$((N + 1))"
-  export "GIT_CONFIG_KEY_$N=url.https://x-access-token:${LMER_RELEASE_GITHUB_TOKEN}@<mirror-host>/.insteadOf"
-  export "GIT_CONFIG_VALUE_$N=https://<mirror-host>/"
+  export LC_ALL=C
+  export GIT_ASKPASS=/Agents/global/bin/lmer-git-askpass
+  export GIT_TERMINAL_PROMPT=0
+  export LMER_GIT_ASKPASS_USERNAME=x-access-token
+  export LMER_GIT_ASKPASS_PASSWORD="${LMER_RELEASE_GITHUB_TOKEN}"
   <the github-remote command>
 )
 ```
 
-The subshell keeps the rewrite scoped to the one command that needs it, and
-`export` is a builtin, so the token never reaches any process's command
-line. Never write the token into the remote URL, a config file, or run
-state — the rewrite is what keeps it in the environment only.
+The subshell keeps ASKPASS scoped to the one command that needs it, and
+`export` is a builtin, so the token never reaches any process's command line.
+Never write the token into the remote URL, a config file, or run state. In
+particular, do not use numbered Git config around `bin/gate-push`: the gate
+runs pytest in its inherited environment, and tests own their isolated Git
+config entries.
 
 ### Step 1 — `leg2-record-merge` — record the merge SHA
 
@@ -184,10 +186,10 @@ to report, never something to route around.
 - [ ] Record: `work release record receipt github-tag-push`
 
 Every `github`-remote command in this step — the `ls-remote` skip check and
-both pushes — carries the credential prefix from the credentials section in
+both pushes — carries the ASKPASS prefix from the credentials section in
 its own shell invocation; nothing persists from the commands before it.
-`bin/gate-push` shells out to `git`, so the numbered-config environment
-passes through, but nothing else supplies the credential. A
+`bin/gate-push` shells out to `git`, so the ASKPASS environment passes
+through, but nothing else supplies the credential. A
 rejected push (a 403 from a missing or read-only credential, a protection
 rule) is a hard error naming the credential requirement — never an
 alternative push path, per HARD RULES. Note the ordering cost of getting
@@ -248,7 +250,68 @@ GitHub failure leaves no half-released internal state.
       registry and container image from there.
 - [ ] Record: `work release record receipt gitlab-tag-push`
 
-### Step 7 — receipts complete, run complete
+### Step 7 — `leg2-dep-refresh` — open the next cycle's dependency refresh
+
+The release has shipped; `prep-release` now carries exactly what was
+released, and the next cycle starts here. Refreshing dependencies NOW rather
+than during leg 1 is the whole point: the refresh gets a full development
+cycle of soak before it ships, where a relock landed alongside the version
+bump would ship the same day it was resolved. Leg 1's rule that a `uv.lock`
+diff beyond the project's own version line is a stop-and-ask stays exactly
+as it is — this step is where dependency movement is allowed to happen.
+
+This step never blocks the release: the release is already out. It opens an
+MR and completes; a human merges it whenever they merge it.
+
+- [ ] No `dep_refresh` parameter (Phase 0.5) → this repository has not opted
+      in. Record `work release record receipt dep-refresh --note "no
+      dep_refresh parameter declared"` and go to step 8. Do NOT infer a
+      command from the repository tree.
+- [ ] Adoption, never re-creation — FIRST, before creating anything. Check
+      `git ls-remote origin refs/heads/dep-refresh-<X.Y.Z>` and for an open
+      MR titled `dep refresh after <X.Y.Z>`. An open MR means a previous
+      session died between opening it and recording the receipt: ADOPT it —
+      record `work release record receipt dep-refresh --url <its URL>` and
+      go to step 8. A remote branch with no MR means the push landed and the
+      MR did not: fetch it, check it out, and pick up at the "Push and open
+      the MR" bullet. NEVER open a second MR and NEVER force-push over it.
+- [ ] Branch off the freshly released `prep-release`:
+      `git fetch origin prep-release`,
+      `git switch -c dep-refresh-<X.Y.Z> origin/prep-release`. Re-entry in
+      the same container already has the local branch, so `-c` errors —
+      `git switch dep-refresh-<X.Y.Z>` onto it instead, and reset it to
+      `origin/prep-release` only if it carries no refresh yet.
+- [ ] Run the declared `dep_refresh` command verbatim, from the repository
+      root, through `work verify dep-refresh -- <command>` so the run
+      carries a receipt of what it ran and what that produced. `work verify`
+      mirrors the command's exit code: NON-ZERO means the refresh did not
+      run to completion (an unreachable index, a missing target, a `make`
+      target dying on its first line) and the tree may well still be clean —
+      that is NOT "no dependency changes". Record `work release record
+      receipt dep-refresh --note "refresh command failed — <one-line
+      summary>"` and go to step 8, leaving no branch pushed.
+- [ ] Only on a zero exit, read `git status --porcelain`. EMPTY means every
+      dependency was already at the newest version its declared ranges allow
+      — a real outcome, not a failure. Record `work release record receipt
+      dep-refresh --note "no dependency changes"` and go to step 8.
+- [ ] Otherwise stage what the refresh produced, then gate it. Stage every
+      path `git status --porcelain` listed — `bin/gate-commit` commits the
+      index and stages nothing, and its git-status check FAILS on any
+      unstaged or untracked path, so an unstaged lockfile turns into a red
+      gate that never ran the suite. A dependency refresh that breaks the
+      suite is not a refresh: `bin/gate-commit -m "dep refresh after
+      <X.Y.Z>"`. A RED gate is NOT a hard stop for the release — the release
+      already shipped — but it IS a stop for this step: record `work release
+      record receipt dep-refresh --note "refresh failed the gate — <one-line
+      summary>"`, leave the branch unpushed, and say so in the retro. Never
+      commit around a failing gate to get the MR open.
+- [ ] Push with `bin/gate-push` (no arguments — it pushes the current branch
+      to `origin`) and open the MR targeting `prep-release` — NEVER `main`.
+      Title it `dep refresh after <X.Y.Z>`. Say in the description which
+      packages moved and that the diff is lockfiles only.
+- [ ] Record: `work release record receipt dep-refresh --url <MR URL>`
+
+### Step 8 — receipts complete, run complete
 
 - [ ] `work release status` must show every field recorded and nothing left
       to advance. Fill any receipt gap NOW (`--note` that it was recorded
@@ -273,4 +336,5 @@ target to the recorded merge SHA before acting:
 | Actions run green for the recorded SHA | Skip the poll; receipts must name the run that uploaded |
 | Actions run red, refs current | Re-dispatch via the API, keyed on the recorded SHA — never re-tag |
 | GitLab tag already at the merge SHA | Skip the push; ensure the receipt exists |
+| GitLab tag pushed, no `dep-refresh` receipt | Run step 7 — it is idempotent: an existing open `dep-refresh-<X.Y.Z>` MR is ADOPTED (record its URL as the receipt), never a second one |
 | Every receipt recorded | Nothing to advance — close out the run |

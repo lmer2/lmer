@@ -763,6 +763,10 @@ work release record receipt github-tag-push
 work release record receipt actions-run --url https://github.com/org/proj/actions/runs/123456
 work release record receipt pypi --url https://pypi.org/project/proj/0.5.0/
 work release record receipt gitlab-tag-push
+
+# The next cycle's dependency refresh, recorded even by a repository that
+# declared no dep_refresh command (the ladder walks receipts, not parameters)
+work release record receipt dep-refresh --url https://gitlab.example.com/org/proj/-/merge_requests/42
 ```
 
 Identity fields (version, both merge SHAs, the tag) are **write-once**:

@@ -132,6 +132,28 @@ conversation window is lost.
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
   drawer when needed.
+- **Run references in chat** — the assistant writes a run's name as a link whose
+  href is `lmer://run/<host>/<project>/<slug>`, and tapping it opens that run's
+  view. Details worth knowing:
+  - It is an **in-app dispatch, not navigation**: no history entry, no URL to
+    paste or bookmark, nothing that survives a reload. Run views are deliberately
+    not browser-addressable (issue #241).
+  - A reference **can only select a view**. The grammar carries three key
+    segments and nothing else — no verb, no payload, no URL to navigate to — and
+    only that exact shape is rendered as a link at all: `lmer://run/…?spawn=1`
+    and any other `lmer:` URL come out as plain text.
+  - A reference to a run this platform does not track opens nothing and says so,
+    naming the key. Adopt the run and the same reference becomes a switch.
+  - A left or middle click is handled in-app; a context-menu "open link in new
+    tab" is not an event the page can cancel, so it hands the href to the OS,
+    where nothing is registered for it.
+  - **On the way to Slack** the reference is reduced to its visible label before
+    posting, because Slack's own link syntax is different (`<url|label>`) and
+    CommonMark links render there as raw characters. The reduction is a text
+    substitution, not a markdown parse: it does not know what a code span is, so
+    a reference written *as an example* is reduced too. An escaped `\[` is left
+    alone, as is a label containing brackets.
+  - Web-only: it reaches you after a bundle build and a UI image roll.
 - **A narrower app** — the toggle in the app bar holds the whole app — the bar, the
   run list, the content and uber lmer's drawer — in a 1620px band in the middle of
   the screen instead of spreading it across a wide window. It is the effect of
@@ -333,11 +355,114 @@ no migration — the three state fields are additive and tolerate absence — an
 image rebuild or container passthrough, since the daemon reads both settings
 itself. A host that does not want the feature sets the interval to `0`.
 
+## uber lmer's memory
+
+The assistant's harness keeps an agent-memory directory — small fact files and an
+index it re-reads at the start of every incarnation. That directory lives inside
+the container, so it used to reset on every rotation: a lesson learned in the
+morning was gone by the afternoon. The platform now mounts one host directory into
+every incarnation instead.
+
+- **Where:** `~/.lmer/platform/assistant-memory/`, one per host, owner-only. It
+  survives rotation, a daemon restart, and the container's `--rm`.
+- **Platform-local, deliberately.** This is the same kind of state as the handoff
+  note and the standing orders — it is *this* host's, and it syncs nowhere. Worker
+  sessions have their own per-project memory route through the work repo
+  (`LMER_PERSIST_AGENT_MEMORY`); for assistant sessions that route is switched off
+  inside the container, so operational notes about your fleet cannot end up in a
+  shared repository.
+- **Curated by the assistant, not by the platform.** Nothing here is ever trimmed
+  or deleted. Above 256 KiB or 50 files a spawn logs a warning and records an
+  `assistant_memory_large` event, and `GET /api/assistant` reports the store's
+  file count and size in its `memory` block.
+- **What that count does and does not tell you.** It reports accumulation: a store
+  that grows is proof the container-side link is live, and one that never grows
+  across many incarnations is worth investigating. It is *not* a liveness check —
+  a store that already holds files keeps reporting them even if the harness stops
+  reading the path (that path is the harness's own encoding of its working
+  directory, which nothing promises). The authoritative answer is in the session's
+  own log, where the container entrypoint prints either `🔗 Linked <path> → …` or a
+  `⚠️` line naming why it could not.
+- **How it gets in, and why not more simply.** The host directory is bound at a
+  staging path (`~/.lmer-mounts/assistant/memory`) and the container entrypoint
+  symlinks the harness's own memory path to it. It is not bound at that path
+  directly, because a container runtime creates a mount destination's missing
+  parents **root-owned before any container process runs** — and the harness's
+  memory path sits inside the per-session transcript mount, so a direct bind
+  would leave claude unable to write its own session JSONL beside it (the
+  `#293`/`#290` failure). The entrypoint makes the link as the container user,
+  which leaves the whole parent chain owned by the account that writes it. A
+  session image whose entrypoint predates that linker makes no link and keeps its
+  memory per-session, which is the pre-existing behaviour.
+- **claude reads it natively; other harnesses have to be told.** claude is the only
+  built-in that declares a memory path, and the link is made from that declaration
+  on every assistant spawn regardless of which harness the session runs — so an
+  assistant running codex or pi does get the store mounted and linked, but neither
+  has a memory feature that reads it on its own. What tells those sessions the
+  store exists, and where, is the `orchestrate` taskdef; nothing else does.
+
+## Chat file upload
+
+Both chats — uber lmer's and any run's — take a file: drag it onto the composer,
+paste it, or tap **attach** (which on a phone is the camera roll). It goes with
+the message, and the message names the path the agent will find it at.
+
+- **How it travels.** `POST /api/sessions/{id}/input` writes raw bytes to a PTY
+  and has nowhere for an attachment, so the daemon stores the file host-side and
+  bind-mounts the store into the container at `/home/developer/.lmer-uploads` —
+  the same mechanism as the ask channel. The message that follows carries a
+  `[lmer upload] …` line naming the container path, which is the agent's
+  notification; nothing else announces one.
+- **Where a worker's files land:** `~/.lmer/platform/logs/<session-id>.uploads/`,
+  beside that session's transcript and PTY log, owner-only (0700, files 0600).
+  **Nothing removes it** — not when the session exits, not when the run is
+  forgotten. Retention is not implemented for any of the per-session directories
+  (`.uploads`, `.ask`, `.transcript`), which is deliberate for the transcript and
+  simply not done here; the earlier wording said this "goes when the session's
+  other per-session state does", which read as cleanup that does not happen
+  (!272 review). Deleting that directory by hand is safe once the session has
+  exited. A run that wants to *keep* a file copies it into `uploads/` in its own
+  run directory in the work repo and commits it — **the run's decision, not the
+  platform's**: the daemon has no host-side checkout to write into, since
+  `/work` is cloned inside the container.
+- **Where uber lmer's land:** `~/.lmer/platform/assistant-uploads/`, one per host,
+  like its memory store. It outlives every rotation and it is the assistant's to
+  organise, rename and delete. Nothing prunes it.
+- **Nothing is pushed anywhere.** An upload can hold whatever was on your screen,
+  credentials included. It stays on this host unless a run deliberately commits
+  it — and the work repo is shared with every developer using lmer, which the
+  prompt fragment tells the agent in as many words.
+- **What is accepted** is `png`, `jpeg` and `txt` by default, up to 8 MiB per
+  file, both configurable (`LMER_PLATFORM_UPLOAD_TYPES`,
+  `LMER_PLATFORM_UPLOAD_MAX_BYTES`, or the matching `config.json` keys; see
+  [docs/LMER-CLI.md](./LMER-CLI.md)). The type is decided by the file's **bytes**,
+  not its name: a PNG called `notes.txt` is stored as a PNG, and an allowlist
+  cannot be got past by renaming a file.
+- **A session started before this shipped cannot be handed a file.** Its
+  container has no such mount and nothing can add one, so the upload is refused
+  with a sentence naming the restart rather than stored where nothing reads it.
+  For uber lmer, **restart** in the chat header is that restart.
+- **Whether the agent can *see* an image depends on its harness.** claude opens
+  one; codex and pi are not equivalent here. The honest fallback is the mechanism
+  itself — the file is on disk and the path is in the message, so an agent that
+  cannot render a picture can still read a text file and act on a listing.
+- **In the history.** An uploaded image is shown back in the chat pane, read from
+  the store of **the session that received it** (`GET
+  /api/sessions/{id}/uploads/{name}`) — a run's conversation spans every session
+  it has had, so the pane resolves each thumbnail against the session whose
+  transcript that turn came from rather than against whichever session is current.
+  So opening the run later, on another device or after a resume, still shows the
+  screenshot rather than a path. A file the store no longer holds — one a run
+  copied out and deleted — leaves the path line and drops the thumbnail.
+
 ## Where things live
 
 | what | where |
 |---|---|
 | platform state, logs, UI | `~/.lmer/platform/` |
+| uber lmer's memory store | `~/.lmer/platform/assistant-memory/` |
+| uber lmer's chat uploads | `~/.lmer/platform/assistant-uploads/` |
+| a run's chat uploads | `~/.lmer/platform/logs/<session-id>.uploads/` |
 | per-instance config (incl. service slots) | `~/.lmer/platform/config.json` |
 | shared secret | `lmer platform secret` |
 | per-session host log | `~/.lmer/platform/logs/<session-id>.log` |

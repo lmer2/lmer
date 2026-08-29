@@ -114,7 +114,20 @@ gracefully and are listed explicitly:
    native memory feature, so the read/write/persist contract is injected
    into the global context file (the `prompts/agent-memory.md` fragment,
    note 3's mechanism); persisting back remains the agent's
-   `work memory persist`, as on claude.
+   `work memory persist`, as on claude. A harness with a *native* memory feature also
+   declares where it keeps it (`memory_dir` in `src/lmer_cli/harness.py` —
+   claude only today), which is what lets the platform mount that directory out
+   of the container: the platform's assistant persists its memory through a host
+   mount rather than the work repo (issue #325 — see
+   [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md#uber-lmers-memory)).
+   **That store is read natively on claude only.** The mount and the symlink are
+   made on every assistant spawn whatever harness the session runs, but a codex
+   or pi assistant has no feature that reads the path and does not get the
+   `prompts/agent-memory.md` fragment either — the fragment is gated on
+   `LMER_PERSIST_AGENT_MEMORY`, which assistant spawns blank. What tells such a
+   session the store exists, and where, is the `orchestrate` taskdef, which names
+   the path and says to read and write it by hand. A harness that grows a native
+   store is a one-field change away from the claude treatment.
 9. Claude-only: codex and pi have no equivalent feature and get nothing, so
    anything *every* harness must obey belongs in the taskdef prompt rather
    than in a style. Shipping a style and selecting one are separate
@@ -314,10 +327,30 @@ structurally (turn-limit truncation, in-band errors); issue #138 covers the
 hook-side session signal for sessions that fire hooks, which `spawn-harness`
 children do not.
 
-One limitation worth knowing: without `--output` the child's stdout flows
-straight through and cannot be inspected, so the check is skipped (fan-out
-invocations are expected to capture, but nothing enforces it — in that mode a
-dropped result is as invisible as it was before this existed; issue #152).
+Without `--output` the same check still applies (issue #152). The child's
+stdout is *teed* rather than inherited: every byte is forwarded to
+`spawn-harness`'s own stdout unchanged, while a running tally measures what a
+captured file would have measured — total length and the span between the first
+and last non-whitespace character, which is `len(content.strip())` exactly. Both
+paths ask the same rule set (`classify_degenerate_counts`), so a fan-out gets the
+same verdict whether or not it remembered to capture. Two differences remain, and
+neither is a caveat about detection: there is no file to append a footer to, so
+the warning says so and stands alone; and in this mode the child's stdout is a
+pipe rather than whatever `spawn-harness` itself was given, which a harness that
+inspects `isatty()` could in principle notice. The earlier behavior — the check
+silently skipped, so a fan-out that forgot `--output` consolidated from N-1
+agents with every signal looking healthy — is gone.
+
+One pipeline behavior does change with the tee, and it is a deliberate trade. If
+`spawn-harness`'s own stdout dies while the child is running (`spawn-harness … |
+head`, a consumer that was killed), the child used to inherit that descriptor and
+take the `EPIPE` itself, ending in a fraction of a second. Now the tee absorbs
+it: the failure is reported once on stderr (`cannot forward the child's
+stdout`), the child's output stops being passed through, and its stdout keeps
+being **drained** so the child runs to completion and its exit code is still
+mirrored. Draining is not optional — with nothing reading the pipe the child
+blocks as soon as the 64 KiB buffer fills, and `--timeout` has no default, so the
+wrapper would hang indefinitely while the heartbeat reported a healthy run.
 
 | | claude | codex | pi |
 |---|---|---|---|

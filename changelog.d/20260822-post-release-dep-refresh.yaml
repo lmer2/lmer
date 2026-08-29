@@ -1,0 +1,2 @@
+changed:
+- "Release flow opens a dependency-refresh MR against prep-release once a release has shipped, for adopters declaring a `dep_refresh` parameter"

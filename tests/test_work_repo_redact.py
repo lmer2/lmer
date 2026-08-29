@@ -82,6 +82,11 @@ class TestCollectSecretValues:
             secrets = _collect_secret_values()
             assert "lowercase-key-value" in secrets
 
+    def test_ignores_secret_named_locator_values(self):
+        env = {"LMER_GITLAB_TOKEN_HOST": "git.example.com"}
+        with patch.dict(os.environ, env, clear=True):
+            assert _collect_secret_values() == []
+
 
 class TestRedactSecrets:
     """Test redact_secrets function."""
@@ -142,6 +147,15 @@ class TestRedactSecrets:
             redact_secrets("Clean text with no secrets")
             captured = capsys.readouterr()
             assert captured.err == ""
+
+    def test_preserves_gitlab_token_host_in_urls_without_a_warning(
+        self, capsys
+    ):
+        env = {"LMER_GITLAB_TOKEN_HOST": "git.example.com"}
+        text = "install https://git.example.com/org/repo"
+        with patch.dict(os.environ, env, clear=True):
+            assert redact_secrets(text) == text
+        assert capsys.readouterr().err == ""
 
     def test_accepts_precomputed_secret_values(self):
         """Can pass secret_values directly to avoid re-scanning env."""

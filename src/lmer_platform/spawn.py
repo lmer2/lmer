@@ -151,7 +151,7 @@ from lmer_cli.service import ServiceError
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
-from . import ask, meta, registry, runs, slots
+from . import ask, memory, meta, registry, runs, slots, uploads
 from .config import ENV_REPO_URL, PlatformConfig, configured_repo_url
 from .store import StoreError, append_event, logs_dir, utc_now_iso
 from . import store
@@ -166,6 +166,7 @@ __all__ = [
     "PRESET_FLAG", "AGENTS_FLAG", "MODEL_FLAG", "NO_REPO_ENV",
     "resolve_lmer_bin", "derive_run_identity", "spawn_session", "log_path_for",
     "token_file_for", "read_control_token", "transcript_dir_for", "ask_dir_for",
+    "upload_dir_for",
     "container_log_dir_for", "container_log_path_for",
 ]
 
@@ -1178,10 +1179,20 @@ def _reserved_session_destinations() -> dict:
         _container_dir_key("/workspace"): "the session's workspace",
         _container_dir_key("/Agents/global"): "the agent-files tree",
         _container_dir_key(ask.CONTAINER_ASK_DIR): "the session's ask channel",
+        _container_dir_key(uploads.CONTAINER_UPLOADS_DIR):
+            "the session's chat upload store",
         _container_dir_key(CONTAINER_SESSION_LOG_DIR): "the session's own log",
         _container_dir_key(CONTAINER_HARNESSES_DIR): "the user-harness drop-ins",
         _container_dir_key(CONTAINER_MOUNT_STAGING_DIR):
             "the mount staging area (lmer-internal)",
+    })
+    # The declared agent-memory paths (#325): nothing is mounted at these — the
+    # entrypoint links them — and the linker skips a declared path that is
+    # already a mountpoint, so a drop-in claiming one costs the assistant its
+    # memory silently.
+    reserved.update({
+        _container_dir_key(declared): f"the built-in {name} harness's agent memory"
+        for name, declared in memory.harness_memory_dirs().items()
     })
     return reserved
 
@@ -1465,6 +1476,36 @@ def _ask_mount_flags(directory: Path) -> list:
     drift apart.
     """
     return ["--mount-dir", f"{directory}:{ask.CONTAINER_ASK_DIR}:rw"]
+
+
+def upload_dir_for(session_id: str, kind: str) -> Path:
+    """Host directory holding the files the operator attaches to this session's
+    chat (issue #246).
+
+    Pass-through to :func:`lmer_platform.uploads.upload_dir_for`, kept here so
+    the spawn side has one name for every directory it mounts. The *kind* is the
+    argument because the two surfaces keep their uploads in different places —
+    a worker's are its own, uber lmer's are the host's — and this is the layer
+    that knows which is being started.
+    """
+    return uploads.upload_dir_for(session_id, kind)
+
+
+def _prepare_upload_dir(session_id: str, kind: str) -> Optional[Path]:
+    """Create the session's upload store. ``None`` if that failed.
+
+    Fail-soft for the ask channel's reason, with the same honest far end: no
+    directory means no ``LMER_UPLOADS_DIR``, so no prompt fragment tells the
+    agent to look in a place nothing was mounted at, and
+    :func:`lmer_platform.uploads.mounted_store` refuses the upload rather than
+    writing a file nobody will read.
+    """
+    return uploads.prepare_upload_dir(upload_dir_for(session_id, kind))
+
+
+def _upload_mount_flags(directory: Path) -> list:
+    """``lmer`` flags that mount *directory* in as the session's upload store."""
+    return uploads.mount_flags(directory)
 
 
 def _prepare_container_log_dir(session_id: str) -> Optional[Path]:
@@ -1771,8 +1812,46 @@ def _protected_mount_destinations() -> dict:
             "record of everything the session drew in a directory nobody reads "
             "back — and leave the terminal view showing an empty file"
         ),
+        uploads.CONTAINER_UPLOADS_DIR: (
+            "the platform writes the files the operator attaches to this "
+            "session's chat there, so redirecting it would hand a caller's "
+            "directory whatever the operator uploads next — and leave the agent "
+            "reading files nobody sent it"
+        ),
     })
     return protected
+
+
+def _memory_link_conflict(destination: str) -> Optional[tuple]:
+    """``(path, reason)`` when *destination* would defeat an agent-memory link.
+
+    A subtree question, not a destination one, hence separate from
+    :func:`_protected_mount_destinations`: at the declared path, anywhere below
+    it (one ``--mount-file`` is enough to have the runtime create it root-owned),
+    or between it and the harness's ``session_dir``.
+
+    Stops at ``session_dir`` deliberately — above that the platform mounts
+    nothing of its own, so a refusal would be a different rule about shadowing
+    the image.
+    """
+    for name, declared in memory.harness_memory_dirs().items():
+        key = _container_dir_key(declared)
+        session_dir = HARNESSES[name].session_dir
+        between = (
+            session_dir is not None
+            and _below_destination(key, destination)
+            and _below_destination(destination, session_dir)
+        )
+        if destination == key or _below_destination(destination, key) or between:
+            return (
+                declared,
+                f"the entrypoint links the {name} harness's agent-memory path "
+                "there, and a mount at, below or just above it has the runtime "
+                "create that path root-owned before the container starts — so "
+                "the link is never made and the harness cannot write beside its "
+                "transcript (#293)"
+            )
+    return None
 
 
 def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
@@ -1790,6 +1869,10 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     holds staged credential *files*): a caller's mount in there can hand the
     session's harness credentials the caller chose. The protected-destination
     list stays a ``--mount-dir`` rule — those destinations are all directories.
+
+    Destinations are compared normalised (``./`` and ``//`` collapse to the same
+    path a runtime would mount at); link conflicts are a subtree rule on both
+    flags — :func:`_memory_link_conflict`.
     """
     aims_at_dir = "--mount-dir".startswith(name)
     aims_at_file = "--mount-file".startswith(name)
@@ -1801,7 +1884,7 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     parts = str(spec).split(":")
     if len(parts) < 2:
         return
-    destination = parts[1].rstrip("/")
+    destination = _container_dir_key(parts[1])
     if _within_staging_area(destination):
         raise SpawnError(
             f"{name} may not target {CONTAINER_MOUNT_STAGING_DIR} or anything "
@@ -1809,10 +1892,14 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
             "mount inside it would shadow one of them — or hand the session's "
             "harness a file or directory the caller chose"
         )
+    conflict = _memory_link_conflict(destination)
+    if conflict is not None:
+        protected, reason = conflict
+        raise SpawnError(f"{name} may not target {protected}: {reason}")
     if not aims_at_dir:
         return
     for protected, reason in _protected_mount_destinations().items():
-        if destination == protected.rstrip("/"):
+        if destination == _container_dir_key(protected):
             raise SpawnError(f"--mount-dir may not target {protected}: {reason}")
 
 
@@ -2413,6 +2500,19 @@ def spawn_session(
     # directory is the offer; the file inside it is the session's answer, and the
     # read path takes "no file" for exactly the answer it is.
     container_log_dir = _prepare_container_log_dir(session_id)
+    # The assistant's memory store (#325): one directory per *host*, so what one
+    # incarnation learned is on disk for the next. Gated on the kind, not offered
+    # as a request field — a worker's memory has its own route (the work repo).
+    memory_dir = (
+        memory.prepare_memory_dir() if kind == registry.ASSISTANT_KIND else None
+    )
+    if memory_dir is not None:
+        memory.observe(memory_dir)
+    # Where the files the operator attaches to this session's chat land (#246).
+    # Every session gets one, worker and assistant alike — a screenshot is most
+    # useful to the run that just built the thing in it — and the *kind* decides
+    # only which store that is.
+    upload_dir = _prepare_upload_dir(session_id, kind)
 
     # One insertion, not one per mount: _with_host_flags inserts right after
     # --fastapi, so calling it twice would interleave the mounts in reverse and
@@ -2424,6 +2524,10 @@ def spawn_session(
         host_flags += _ask_mount_flags(ask_dir)
     if container_log_dir is not None:
         host_flags += _container_log_mount_flags(container_log_dir)
+    if memory_dir is not None:
+        host_flags += memory.mount_flags(memory_dir)
+    if upload_dir is not None:
+        host_flags += _upload_mount_flags(upload_dir)
     if host_flags:
         command = _with_host_flags(command, host_flags)
 
@@ -2442,6 +2546,15 @@ def spawn_session(
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
     }
+    if upload_dir is not None:
+        child_env[uploads.UPLOADS_DIR_ENV] = uploads.CONTAINER_UPLOADS_DIR
+    else:
+        # Blanked rather than deleted, for ASK_DIR_ENV's reason below: the child
+        # is `lmer`, which seeds its own environment from .env files first-wins,
+        # so a merely absent key is one a file may re-supply — and this variable
+        # is what gates the prompt fragment that tells an agent to read files out
+        # of a directory this session has not got.
+        child_env[uploads.UPLOADS_DIR_ENV] = ""
     if ask_dir is not None:
         child_env[ask.ASK_DIR_ENV] = ask.CONTAINER_ASK_DIR
     else:
@@ -2459,14 +2572,16 @@ def spawn_session(
     # environment would carry another session's pairs), and blank rather than
     # absent for the reason the two variables below give.
     mounted_destinations = {container_dir for _, container_dir in transcript_mounts}
-    child_env[MOUNT_LINKS_ENV] = format_mount_links(
-        "",
-        [
-            (declared, staged)
-            for declared, staged in _harness_session_links()
-            if staged in mounted_destinations
-        ],
-    )
+    link_pairs = [
+        (declared, staged)
+        for declared, staged in _harness_session_links()
+        if staged in mounted_destinations
+    ]
+    if memory_dir is not None:
+        # Staged like a user harness's session dir, and for the same ownership
+        # reason (#293) — see lmer_platform.memory.
+        link_pairs += memory.memory_links()
+    child_env[MOUNT_LINKS_ENV] = format_mount_links("", link_pairs)
     if request.no_repo:
         # Spec D17, structurally: `lmer` skips repo resolution on this and the
         # container skips the workspace clone, so the session has nothing to edit
@@ -2482,6 +2597,13 @@ def spawn_session(
         # back. Blank is falsy to get_bool_env on the host and never equals "1"
         # in the container, so it reads as unset the whole way down.
         child_env[NO_REPO_ENV] = ""
+    if kind == registry.ASSISTANT_KIND:
+        # Platform-local only (#325): the shared-work-repo mirror is closed here
+        # rather than left to fail for want of a repo identity. On the kind and
+        # not on the mount above, so a store that could not be prepared does not
+        # reopen the route it replaces; blank rather than deleted for the
+        # LMER_NO_REPO reason.
+        child_env[memory.PERSIST_ENV_VAR] = ""
 
     master_fd, slave_fd = pty.openpty()
     try:
@@ -2553,6 +2675,12 @@ def spawn_session(
                 "token_ref": str(token_file),
             },
             log_path=str(log_file),
+            # Whether this session can be handed a file, recorded by the only
+            # actor that knows: the store exists on the host as soon as one
+            # spawn has made it (uber lmer's is per host), so its presence says
+            # nothing about the container that is running now — see
+            # lmer_platform.uploads.registry_pointer.
+            uploads=uploads.registry_pointer(upload_dir),
             started_at=utc_now_iso(),
         )
 

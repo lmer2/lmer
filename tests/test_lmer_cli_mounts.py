@@ -433,6 +433,9 @@ class TestStagedCredentialMounts:
         """The per-launch token is random by design; pin it so the assertions
         can name the whole staged path instead of matching a prefix."""
         monkeypatch.setattr("lmer_cli.mounts._stage_token", lambda: self.TOKEN)
+        # The exact-args assertions below would otherwise depend on whether
+        # the launching host handed this container an ssh-agent socket (#328).
+        monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
 
     @property
     def stage(self):

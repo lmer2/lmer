@@ -40,7 +40,8 @@ section below:
    (green GitLab pipeline, GitHub `main` ancestry); create the SSH-signed
    tag at exactly the merge SHA; push GitHub `main` first, then the tag;
    poll the Actions release run to completion; only after GitHub is green,
-   push the tag to GitLab. Record receipts and complete the run.
+   push the tag to GitLab. Then open the next cycle's dependency-refresh MR
+   against `prep-release`. Record receipts and complete the run.
 
 A relaunch of this taskdef never starts over: it re-derives the current leg
 from run state and continues (see "Resuming an in-progress release").
@@ -82,7 +83,8 @@ consumes that lock through one verb and obeys its exit code:
 
 Record the phase: `work state set --phase=release-parameters`
 
-Every repository adopting this flow supplies four parameters in a `task.yaml`
+Every repository adopting this flow supplies four required parameters — and
+optionally a fifth — in a `task.yaml`
 manifest inside a `release` taskdef directory. The manifest resolves per-file
 through the standard taskdef tier precedence — first match wins:
 
@@ -105,14 +107,25 @@ release:
   signing_key: <reference to the provisioned release SSH signing key —
     a filesystem path or key identifier, NEVER key material>
   changelog: <exactly "fragments" or "legacy">
+  dep_refresh: <shell command that refreshes the repository's dependency
+    lockfiles — OPTIONAL, see below>
 ```
 
 Resolution rules — all of them hard:
 
 - Use the FIRST `task.yaml` in precedence order that contains a `release:`
   mapping. Do not merge values across tiers; one file wins whole.
+- `dep_refresh` is the ONE optional parameter, and its absence is an
+  explicit "this repository runs no dependency refresh" — not a default
+  filled in for a missing value. Omitted → leg 2's dep-refresh step records
+  its receipt with a note saying the repository declares no command, and
+  does nothing else. Present but empty → HARD STOP naming it: an empty
+  value says a refresh was intended and then named no command, which is a
+  misconfiguration, not an opt-out. Never invent the command yourself —
+  not from a Makefile target you can see, not from the ecosystem's usual
+  incantation. A repository that has not declared one has not opted in.
 - Manifest missing at every tier, `release:` mapping absent, or any of the
-  four keys missing or empty → HARD STOP. Record it before ending the
+  four REQUIRED keys missing or empty → HARD STOP. Record it before ending the
   session, naming the missing key and the expected project-tier path:
   `work state set --stop-reason=critical_error --critical-error
   '{"summary": "release parameters missing", "detail": "<key> not set; expected <work repo>/<host>/<project>/taskdef/release/task.yaml"}'`
@@ -132,10 +145,11 @@ Resolution rules — all of them hard:
   repository (authoring its `release:` manifest) is the repository owner's
   decision, made outside a release session.
 - Environment variables do not override the manifest; the manifest is the
-  single source for these four values.
-- Log the four resolved values with `work log` before proceeding (the
+  single source for these values.
+- Log the resolved values with `work log` before proceeding (the
   signing key REFERENCE only — never key material), so the receipts show
-  what the release ran with.
+  what the release ran with. Log `dep_refresh` as absent when it is absent
+  — a silent omission reads as a session that forgot to look.
 
 ## Phase 0.75: Project info
 

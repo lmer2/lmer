@@ -83,6 +83,15 @@ from .user_harnesses import (
     DEFAULT_HARNESS_CACHE_DIR,
     load_user_harnesses,
 )
+# The lane→agent map belongs to the renderer; the host derives the variable names
+# from it rather than restating a list that could fall out of step.
+from .container.dispatch_agents import ENV_PREFIX as DISPATCH_ENV_PREFIX, LANE_AGENTS
+from .model_aliases import (
+    MODEL_ALIASES_ENV,
+    expand_dispatch_value,
+    expand_model_alias,
+    load_model_aliases,
+)
 from .presets import (
     AGENTS_CONFIG_ENV,
     AGENTS_ENV,
@@ -138,6 +147,10 @@ DEFAULT_PORT_POOL = "8800-8899"
 # published mapping is reachable from the host but not network-exposed.
 # Override with --port-bind / LMER_PORT_BIND (e.g. "0.0.0.0" for LAN access).
 DEFAULT_PORT_BIND = "127.0.0.1"
+
+# The five per-lane dispatch variables (LMER_DISPATCH_<LANE>), derived from the
+# renderer's own lane map so a sixth lane is covered the day it is added.
+DISPATCH_LANE_VARS = tuple(DISPATCH_ENV_PREFIX + lane for lane in sorted(LANE_AGENTS))
 
 # --- Release credential provisioning (release-flow spec §4/§5) --------------
 #
@@ -1595,6 +1608,18 @@ def _resolve_and_apply_preset(
     return ns, rest, applied_env
 
 
+def _load_aliases() -> dict[str, str]:
+    """The operator's alias table, complaining once about a malformed entry.
+
+    Unprefixed: the warning names ``LMER_MODEL_ALIASES`` itself, and tagging it
+    with whichever reader loaded first said the typo was an ``--agents`` problem.
+    """
+    aliases, notes = load_model_aliases(os.environ)
+    for note in notes:
+        warning(f"⚠️  {note}")
+    return aliases
+
+
 def _resolve_agents_cli(ns: argparse.Namespace) -> dict[str, dict] | None | int:
     """Resolve the ``--agents``/``LMER_AGENTS`` fan-out selection (issue #130).
 
@@ -1621,6 +1646,18 @@ def _resolve_agents_cli(ns: argparse.Namespace) -> dict[str, dict] | None | int:
         if not os.environ.get(PRESETS_FILE_ENV, "").strip():
             error(f"   ({PRESETS_FILE_ENV} is not set, so no presets can load)")
         return 2
+    # A child's model too (issue #309), expanded where the preset stops being a
+    # file and becomes this launch's config — what the credential-mount union and
+    # spawn-harness both read.
+    aliases = _load_aliases()
+    if aliases:
+        for agent_name, entry in resolved.items():
+            overlay = entry.get("env") or {}
+            named = overlay.get(LLM_NAME_ENV)
+            expanded = expand_model_alias(named, aliases)
+            if expanded and expanded != named:
+                overlay[LLM_NAME_ENV] = expanded
+                info(f"🎛️  Model alias ({agent_name}): {named} → {expanded}")
     info(f"🤖 Agents: {','.join(resolved)}")
     return resolved
 
@@ -1710,13 +1747,52 @@ def _apply_model_selection(
     *env_sources* is the ``--show-env`` attribution map: without an entry the
     table would report a flag-set value as coming from the environment, which is
     the one thing that table exists to tell apart.
+
+    An operator alias (``LMER_MODEL_ALIASES``, issue #309) is expanded here rather
+    than at the flag, because a preset's or a ``.env``'s ``sol`` has to expand
+    too — and before harness resolution reads it. The expanded value lands in
+    ``os.environ``, so nothing downstream re-derives it.
     """
+    aliases = _load_aliases()
     model = (explicit or "").strip()
     if not model:
-        return os.environ.get(LLM_NAME_ENV) or None
-    os.environ[LLM_NAME_ENV] = model
-    env_sources[LLM_NAME_ENV] = "--model flag"
-    return model
+        inherited = os.environ.get(LLM_NAME_ENV) or None
+        expanded = expand_model_alias(inherited, aliases)
+        if expanded and expanded != inherited:
+            os.environ[LLM_NAME_ENV] = expanded
+            prior = env_sources.get(LLM_NAME_ENV, "environment")
+            env_sources[LLM_NAME_ENV] = f"{prior} → alias {inherited}"
+            info(f"🎛️  Model alias: {inherited} → {expanded}")
+        return expanded
+    expanded = expand_model_alias(model, aliases) or model
+    if expanded != model:
+        info(f"🎛️  Model alias: {model} → {expanded}")
+    os.environ[LLM_NAME_ENV] = expanded
+    env_sources[LLM_NAME_ENV] = (
+        "--model flag" if expanded == model else f"--model flag → alias {model}"
+    )
+    return expanded
+
+
+def _apply_dispatch_aliases(env_sources: dict[str, str]) -> None:
+    """Expand an alias in each ``LMER_DISPATCH_<LANE>`` value (issue #309).
+
+    Into ``os.environ``, not into the container env dict: the variable is what
+    every reader consults (the ``--show-env`` table, the in-container lane
+    renderer), and it keeps those five entries the plain passthroughs
+    ``tests/test_dispatch_env.py`` guards.
+    """
+    aliases = _load_aliases()
+    if not aliases:
+        return
+    for lane in DISPATCH_LANE_VARS:
+        current = os.environ.get(lane)
+        expanded = expand_dispatch_value(current, aliases)
+        if expanded and expanded != current:
+            os.environ[lane] = expanded
+            prior = env_sources.get(lane, "environment")
+            env_sources[lane] = f"{prior} → alias {current}"
+            info(f"🎛️  Model alias ({lane}): {current} → {expanded}")
 
 
 def _resolve_afk_timeout_ms(explicit_value: str | None, slack_bridged: bool) -> str | None:
@@ -2009,6 +2085,7 @@ def main(argv: list[str] | None = None) -> int:
     # a preset's env rather than being mistaken for an export; before harness
     # resolution, so the model can imply the harness that serves it).
     session_model = _apply_model_selection(ns.model, early_env_file_sources)
+    _apply_dispatch_aliases(early_env_file_sources)
 
     # Resolve the agent harness (--harness > LMER_HARNESS > LMER_LLM_NAME
     # model hint > claude). Must run AFTER the early .env load above so
@@ -2548,6 +2625,9 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_GLOBAL_DIR": os.environ.get("LMER_GLOBAL_DIR", "/home/developer/.lmer"),
         "LMER_DANGER_ZONE": os.environ.get("LMER_DANGER_ZONE"),
         "LMER_REASONING_EFFORT": os.environ.get("LMER_REASONING_EFFORT"),
+        # Claude output style for the session (issue #257). Read in-container by
+        # claude-runner.sh, so a host-side value alone would do nothing.
+        "LMER_CLAUDE_OUTPUT_STYLE": os.environ.get("LMER_CLAUDE_OUTPUT_STYLE"),
         # Which host the generic GITLAB_TOKEN was issued for (issue #161).
         # The container's own token lookup (clone_and_exec.py) scopes the
         # generic fallback to that host, so without this passthrough an
@@ -2562,11 +2642,16 @@ def main(argv: list[str] | None = None) -> int:
         # Per-lane model+effort dispatch for Claude subagent defs
         # (model[:effort] per lane; parsed in-container by
         # lmer_cli.container.dispatch_agents via claude-agent-files.sh).
+        # Any alias in a lane value was expanded in the environment before this
+        # dict was built (_apply_dispatch_aliases).
         "LMER_DISPATCH_REVIEW": os.environ.get("LMER_DISPATCH_REVIEW"),
         "LMER_DISPATCH_DESIGN": os.environ.get("LMER_DISPATCH_DESIGN"),
         "LMER_DISPATCH_CODE": os.environ.get("LMER_DISPATCH_CODE"),
         "LMER_DISPATCH_MECHANICAL": os.environ.get("LMER_DISPATCH_MECHANICAL"),
         "LMER_DISPATCH_EXPLORE": os.environ.get("LMER_DISPATCH_EXPLORE"),
+        # The table itself, so a nested `lmer` and a spawn-harness child resolve
+        # the same names. The session's own model is already expanded by now.
+        MODEL_ALIASES_ENV: os.environ.get(MODEL_ALIASES_ENV),
         # Agent fan-out (issue #130): the resolved --agents/LMER_AGENTS preset
         # names and their env overlays (JSON {name: {"env": {...}}}), consumed
         # in-container by spawn-harness. Host-resolved — the presets file
@@ -2795,6 +2880,13 @@ def main(argv: list[str] | None = None) -> int:
         # spawner made, and a value without the matching mount is a session that
         # blocks forever on answers nobody can write.
         "LMER_ASK_DIR": os.environ.get("LMER_ASK_DIR"),
+        # Container-side path of the operator's chat upload store (issue #246),
+        # forwarded for exactly the reasons above: it is a *container* path, the
+        # in-container prompt fragment is gated on it, and it is one half of a
+        # mount the spawner made rather than an operator control — a value
+        # without the matching mount is an agent told to read files out of an
+        # empty directory. No flag, for the same reason.
+        "LMER_UPLOADS_DIR": os.environ.get("LMER_UPLOADS_DIR"),
         # Env contributed by special target types (Slack tokens + parsed
         # thread context today). Keys of types with no matching target are
         # seeded with None so the .env merge below cannot forward them.

@@ -46,6 +46,7 @@ RECEIPT_LADDER = (
     ("actions-run", "leg2-poll-actions"),
     ("pypi", "leg2-record-pypi"),
     ("gitlab-tag-push", "leg2-push-gitlab-tag"),
+    ("dep-refresh", "leg2-dep-refresh"),
 )
 
 
@@ -149,10 +150,10 @@ class TestResumeDerivationLadder:
         assert release_run.next_step(release) == step
 
     def test_every_receipt_subset_derives_exactly_one_step(self):
-        """All 2^5 receipt subsets (identity fields complete) land on the
+        """All 2^6 receipt subsets (identity fields complete) land on the
         step for the FIRST missing receipt in ladder order — out-of-order
         receipts never skip ahead."""
-        for bits in itertools.product((False, True), repeat=5):
+        for bits in itertools.product((False, True), repeat=len(RECEIPT_LADDER)):
             recorded = tuple(
                 name for (name, _), present in zip(RECEIPT_LADDER, bits)
                 if present

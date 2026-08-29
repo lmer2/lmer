@@ -295,6 +295,46 @@ export function sendSessionInput(
   })
 }
 
+// --- files you hand a session (issue #246) ------------------------------------
+
+// The composer's other half. `/input` types bytes at a PTY and has nowhere for a
+// file in it, so an attachment is stored host-side first and the message that
+// follows names the path it was mounted at — which is what the reply's
+// `reference` is: the exact line to include, composed by the daemon so the two
+// ends cannot spell it differently.
+//
+// Base64 in a JSON body rather than a multipart form: the daemon would need a
+// packaged dependency for multipart, and a screenshot is small enough that the
+// 33% is not what matters. FileReader gives a data URL, so the header before the
+// comma is dropped here rather than in every caller.
+//
+// Nothing is sent to the session by this call, and nothing calls it until the
+// operator sends: a file staged and then removed from the tray has been uploaded
+// nowhere.
+//
+// What this does *not* claim, because it was claimed here and was not true: a
+// send that uploads two files and is then refused on the second leaves the first
+// on the host with no message naming it (!272 review). The composer remembers
+// that reply against the tray entry, so sending again names the file already
+// stored instead of storing a second copy — but the copy from the abandoned send
+// is on the host, and only the session it was stored for can remove it.
+export function uploadSessionFile(sessionId, { name, data }) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/uploads`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ name, data }),
+  })
+}
+
+// Where the browser reads one back — an `<img>` src, so it is a URL rather than a
+// fetch. Resolved against the document like every other path here, so the UI keeps
+// working behind a reverse proxy on a subpath; the browser attaches the same
+// credentials it holds for the origin, which is what makes this route no more open
+// than the rest of the API.
+export function sessionUploadUrl(sessionId, name) {
+  return `api/sessions/${encodeURIComponent(sessionId)}/uploads/${encodeURIComponent(name)}`
+}
+
 // --- one session's ask channel -------------------------------------------------
 
 // The live counterpart of answerRun. That one respawns a run that stopped on a

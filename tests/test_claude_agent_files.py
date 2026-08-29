@@ -604,3 +604,168 @@ class TestHelpersFileExistsAndSourceableByRunner:
             "(non-comment) line — otherwise the helper functions won't be "
             "defined when the main flow calls them."
         )
+
+
+class TestClaudeApplyOutputStyle:
+    """claude_apply_output_style <settings_file> <styles_dir> (issue #257).
+
+    Two properties: the key lands in the effective settings file whatever else
+    merged into it, and an unrecognised name warns rather than refuses.
+    """
+
+    def _write_settings(self, path: Path, data: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2))
+
+    def _apply(self, settings: Path, styles: Path, style: str | None):
+        env = {} if style is None else {"LMER_CLAUDE_OUTPUT_STYLE": style}
+        return _run_helper(
+            "claude_apply_output_style", str(settings), str(styles), env=env
+        )
+
+    def test_unset_variable_leaves_settings_untouched(self, trees):
+        home_claude, _global_src, _work_src = trees
+        settings = home_claude / "settings.json"
+        self._write_settings(settings, {"permissions": {"allow": ["Bash(ls:*)"]}})
+        before = settings.read_text()
+
+        result = self._apply(settings, home_claude / "output-styles", None)
+        assert result.returncode == 0, result.stderr
+        assert settings.read_text() == before
+        assert "outputStyle" not in result.stdout
+
+    def test_sets_the_key_and_keeps_the_rest_of_the_file(self, trees):
+        home_claude, _global_src, _work_src = trees
+        settings = home_claude / "settings.json"
+        styles = home_claude / "output-styles"
+        styles.mkdir(parents=True)
+        (styles / "napkin.md").write_text("---\nname: napkin\n---\nbody\n")
+        self._write_settings(
+            settings,
+            {"permissions": {"allow": ["Bash(ls:*)"], "deny": ["Bash(rm:*)"]}},
+        )
+
+        result = self._apply(settings, styles, "napkin")
+        assert result.returncode == 0, result.stderr
+
+        merged = json.loads(settings.read_text())
+        assert merged["outputStyle"] == "napkin"
+        assert merged["permissions"]["allow"] == ["Bash(ls:*)"]
+        assert merged["permissions"]["deny"] == ["Bash(rm:*)"]
+        assert "⚠️" not in result.stdout
+
+    def test_replaces_a_symlinked_settings_file(self, trees):
+        """The read-only-mount case the sibling merges also handle."""
+        home_claude, global_src, _work_src = trees
+        real = global_src / "settings.json"
+        self._write_settings(real, {"permissions": {"allow": ["Bash(ls:*)"]}})
+        settings = home_claude / "settings.json"
+        settings.symlink_to(real)
+
+        result = self._apply(settings, home_claude / "output-styles", "default")
+        assert result.returncode == 0, result.stderr
+        assert not settings.is_symlink()
+        assert json.loads(settings.read_text())["outputStyle"] == "default"
+        # The mount is untouched — writing through the link would have edited it.
+        assert "outputStyle" not in json.loads(real.read_text())
+
+    def test_missing_settings_file_is_created_with_only_the_key(self, trees):
+        home_claude, _global_src, _work_src = trees
+        settings = home_claude / "nested" / "settings.json"
+
+        result = self._apply(settings, home_claude / "output-styles", "default")
+        assert result.returncode == 0, result.stderr
+        assert json.loads(settings.read_text()) == {"outputStyle": "default"}
+
+    @pytest.mark.parametrize(
+        "filename, contents, requested",
+        [
+            # The file stem, with and without matching case.
+            ("napkin.md", "---\nname: Something Else\n---\n", "napkin"),
+            ("Napkin.md", "---\nname: Something Else\n---\n", "napkin"),
+            # The frontmatter name — the other spelling claude could match.
+            ("style-one.md", "---\nname: napkin\n---\n", "napkin"),
+            ("style-two.md", '---\nname: "napkin"\n---\n', "napkin"),
+            ("style-three.md", "---\nname: napkin  \n---\n", "napkin"),
+        ],
+    )
+    def test_plausible_names_do_not_warn(self, trees, filename, contents, requested):
+        home_claude, _global_src, _work_src = trees
+        settings = home_claude / "settings.json"
+        self._write_settings(settings, {})
+        styles = home_claude / "output-styles"
+        styles.mkdir(parents=True)
+        (styles / filename).write_text(contents)
+
+        result = self._apply(settings, styles, requested)
+        assert result.returncode == 0, result.stderr
+        assert "⚠️" not in result.stdout, result.stdout
+        assert json.loads(settings.read_text())["outputStyle"] == requested
+
+    @pytest.mark.parametrize("builtin", ["default", "Explanatory", "Learning"])
+    def test_builtin_names_do_not_warn_without_any_style_files(self, trees, builtin):
+        """No styles directory at all is normal for a built-in."""
+        home_claude, _global_src, _work_src = trees
+        settings = home_claude / "settings.json"
+        self._write_settings(settings, {})
+
+        result = self._apply(settings, home_claude / "output-styles", builtin)
+        assert result.returncode == 0, result.stderr
+        assert "⚠️" not in result.stdout, result.stdout
+        assert json.loads(settings.read_text())["outputStyle"] == builtin
+
+    def test_unknown_name_warns_and_still_sets_the_key(self, trees):
+        home_claude, _global_src, _work_src = trees
+        settings = home_claude / "settings.json"
+        self._write_settings(settings, {})
+        styles = home_claude / "output-styles"
+        styles.mkdir(parents=True)
+        (styles / "napkin.md").write_text("---\nname: napkin\n---\n")
+
+        result = self._apply(settings, styles, "nope")
+        # Warning, not failure: claude's own resolution is the authority.
+        assert result.returncode == 0, result.stderr
+        assert "⚠️" in result.stdout
+        assert "nope" in result.stdout
+        assert json.loads(settings.read_text())["outputStyle"] == "nope"
+
+    def test_style_name_is_not_a_pattern(self, trees):
+        """An operator-supplied name is text, never a regex reaching a matcher."""
+        home_claude, _global_src, _work_src = trees
+        settings = home_claude / "settings.json"
+        self._write_settings(settings, {})
+        styles = home_claude / "output-styles"
+        styles.mkdir(parents=True)
+        (styles / "napkin.md").write_text("---\nname: napkin\n---\n")
+
+        result = self._apply(settings, styles, ".*")
+        assert result.returncode == 0, result.stderr
+        assert "⚠️" in result.stdout, "a wildcard must not match a real style"
+        assert json.loads(settings.read_text())["outputStyle"] == ".*"
+
+    def test_runner_applies_it_after_the_settings_local_merge(self):
+        """Order is the feature. Read from the runner source, because the merges
+        it outranks are in the main flow these tests do not execute."""
+        runner = REPO_ROOT / "libexec" / "claude-runner.sh"
+        text = runner.read_text()
+        apply_at = text.index("claude_apply_output_style \"$SETTINGS_FILE\"")
+        for earlier in (
+            "claude_merge_work_settings",
+            "Merging personal permissions from settings.local.json",
+        ):
+            assert text.index(earlier) < apply_at, (
+                f"{earlier} must run before claude_apply_output_style, or the "
+                "merge would overwrite the selected outputStyle"
+            )
+
+    def test_cli_env_dict_declares_output_style(self):
+        """Guard the container passthrough: the runner that reads it runs inside
+        the container (env-var convention step 4)."""
+        source = (REPO_ROOT / "src" / "lmer_cli" / "cli.py").read_text()
+        pattern = re.compile(
+            r"""["']LMER_CLAUDE_OUTPUT_STYLE["']\s*:\s*os\.environ\.get\(\s*"""
+            r"""["']LMER_CLAUDE_OUTPUT_STYLE["']\s*\)"""
+        )
+        assert pattern.search(source), (
+            "LMER_CLAUDE_OUTPUT_STYLE entry missing from cli.py's container env dict"
+        )

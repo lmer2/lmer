@@ -20,16 +20,20 @@ Rendering conventions mirror tests/test_release_taskdef.py: builtin tier
 pinned to this checkout, LMER_* env stripped per test.
 """
 import re
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from hooks.start import render_taskdef_template
 from tests.conftest import strip_lmer_env
+from tests.test_release_askpass import ASKPASS
 
 REPO_TASKDEF = Path(__file__).parent.parent / "taskdef"
 INSTRUCTIONS = REPO_TASKDEF / "release" / "instructions.txt"
 LEG1_PARTIAL = REPO_TASKDEF / "release-leg1.jinja2"
+ASKPASS_CONTAINER_PATH = f"/Agents/global/bin/{ASKPASS.name}"
 
 LEG1_HEADING = "## Leg 1 — prep (GitLab side)"
 NEXT_HEADING = "## Gate — human merge"
@@ -140,13 +144,60 @@ class TestPinnedRefInstall:
         fails. The working form is named here so a release run does not
         rediscover it at the point of failure."""
         leg1 = _leg1()
-        assert "GIT_CONFIG_COUNT=1" in leg1
-        assert "GIT_CONFIG_KEY_0=" in leg1
-        assert "GIT_CONFIG_VALUE_0=" in leg1
-        assert "GITLAB_TOKEN_git_20c_com" in leg1
+        assert f"GIT_ASKPASS={ASKPASS_CONTAINER_PATH}" in leg1
+        assert "LMER_GIT_ASKPASS_USERNAME=oauth2" in leg1
+        assert 'LMER_GIT_ASKPASS_PASSWORD="${GITLAB_TOKEN}"' in leg1
+        assert "LMER_GITLAB_TOKEN_HOST" in leg1
+        assert "GITLAB_TOKEN_git_20c_com" not in leg1
+        assert "GIT_CONFIG_COUNT" not in leg1
         squashed = _squash(leg1)
-        assert "NO credential helper for `git.20c.com`" in squashed
+        assert "no persistent credential helper for `git.20c.com`" in squashed
         assert "could not read Username" in squashed
+        assert "credential never enters a URL, argv, Git config" in squashed
+
+    @staticmethod
+    def _run_issuing_host_guard(**env_overrides):
+        source = LEG1_PARTIAL.read_text()
+        start = source.index('GITLAB_TOKEN_ISSUING_HOST="')
+        end = source.index("\nLC_ALL=C", start)
+        guard = source[start:end]
+        env = {"PATH": os.environ["PATH"], **env_overrides}
+        return subprocess.run(
+            ["sh", "-eu", "-c", guard],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=5,
+        )
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"LMER_GITLAB_TOKEN_HOST": "  GIT.20C.COM  "},
+            {"LMER_WORK_REPO": "https://git.20c.com/agents/work.git"},
+            {"LMER_WORK_REPO": "git@git.20c.com:agents/work.git"},
+        ],
+    )
+    def test_credential_bootstrap_accepts_only_a_canonical_issuing_host(
+        self, env
+    ):
+        result = self._run_issuing_host_guard(**env)
+        assert result.returncode == 0, result.stderr
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {},
+            {"LMER_GITLAB_TOKEN_HOST": "gitlab.example.com"},
+            {"LMER_WORK_REPO": "https://gitlab.example.com/agents/work.git"},
+        ],
+    )
+    def test_credential_bootstrap_refuses_unknown_or_foreign_issuing_host(
+        self, env
+    ):
+        result = self._run_issuing_host_guard(**env)
+        assert result.returncode != 0
+        assert "requires GITLAB_TOKEN issued by git.20c.com" in result.stderr
 
     def test_no_ctl_config_file_is_required(self):
         """`ctl --help` lists no configured operations in a repo without a
