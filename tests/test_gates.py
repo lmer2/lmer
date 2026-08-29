@@ -19,7 +19,15 @@ from unittest.mock import patch, MagicMock, call
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lmer_cli import gate_cache, precommit_cache
-from lmer_cli.gates import GateSystem, CheckStatus, CheckResult, Colors
+from lmer_cli.gates import (
+    GateSystem,
+    CheckStatus,
+    CheckResult,
+    Colors,
+    TEST_MODE_LABEL_MAX,
+    TEST_MODE_MARKER,
+    runner_mode_label,
+)
 from tests.conftest import strip_lmer_env
 
 
@@ -3734,6 +3742,214 @@ class TestCustomTestRunner:
         monkeypatch.delenv("LMER_REPO_PROJECT", raising=False)
         monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tmp_path))
         assert self.gate._find_custom_test_runner() is None
+
+    def test_declared_mode_reaches_the_passing_message(self, tmp_path, monkeypatch):
+        """A runner's declared mode lands on the always-printed result line."""
+        base = self._setup_work_repo(monkeypatch, tmp_path)
+        self._write_runner(
+            base / "info" / "gate-check-run-tests.sh",
+            f"#!/bin/sh\necho '{TEST_MODE_MARKER}target-exec (svc container)'\n"
+            f"echo '3 passed in 1.2s'\nexit 0\n",
+        )
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.PASSED
+        assert "target-exec (svc container)" in result.message
+
+    def test_declared_mode_reaches_the_failing_message(self, tmp_path, monkeypatch):
+        """A failing runner still fails, and still says which path failed.
+
+        The pair with the test above is the point: a fallback nobody can
+        distinguish from the real thing is a bypass, and one that cannot fail
+        is worse.
+        """
+        base = self._setup_work_repo(monkeypatch, tmp_path)
+        self._write_runner(
+            base / "info" / "gate-check-run-tests.sh",
+            f"#!/bin/sh\necho '{TEST_MODE_MARKER}root uv suite (no service container)'\n"
+            f"echo '1 failed, 2 passed in 1.2s'\nexit 1\n",
+        )
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.FAILED
+        assert "root uv suite (no service container)" in result.message
+
+    def test_runner_without_a_marker_is_unchanged(self, tmp_path, monkeypatch):
+        """Opt-in: a runner that declares nothing reports exactly as before."""
+        base = self._setup_work_repo(monkeypatch, tmp_path)
+        self._write_runner(
+            base / "info" / "gate-check-run-tests.sh",
+            "#!/bin/sh\necho 'ran something'\nexit 0\n",
+        )
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.PASSED
+        assert result.message == "Custom test runner passed (gate-check-run-tests.sh)"
+
+    @pytest.mark.parametrize("broken,expected_status", [
+        (True, CheckStatus.FAILED),
+        (False, CheckStatus.PASSED),
+    ])
+    def test_a_really_failing_test_really_fails_the_gate(
+        self, tmp_path, monkeypatch, broken, expected_status
+    ):
+        """Drive a REAL pytest through the runner, once broken, once not.
+
+        The risk a fallback carries is that it quietly passes when it should
+        not, so this asserts the outcome of an actual failing test rather than
+        a hand-picked exit code (#307's acceptance criteria are explicit about
+        not proving this by assertion).
+        """
+        base = self._setup_work_repo(monkeypatch, tmp_path)
+        suite = tmp_path / "proj"
+        (suite / "tests").mkdir(parents=True)
+        (suite / "tests" / "test_sample.py").write_text(
+            f"def test_sample():\n    assert {'1 == 2' if broken else '1 == 1'}\n"
+        )
+        self._write_runner(
+            base / "info" / "gate-check-run-tests.sh",
+            f"#!/bin/sh\n"
+            f"echo '{TEST_MODE_MARKER}fallback suite'\n"
+            f"exec {sys.executable} -m pytest {suite / 'tests'} "
+            f"-q -p no:cacheprovider\n",
+        )
+
+        self.gate.project_root = suite
+        result = self.gate.check_tests()
+
+        assert result.status == expected_status
+        assert "fallback suite" in result.message
+
+    def test_stdout_marker_beats_a_stderr_marker(self, tmp_path, monkeypatch):
+        """A wrapper declaring on stderr cannot outrank the inner runner.
+
+        stdout and stderr are captured separately, so their lines carry no
+        relative order between them — concatenating and taking the last marker
+        would hand the label to whichever stream sorts last, not to the runner
+        that ran the suite. Logging progress to stderr and results to stdout is
+        a common enough shell habit for this to be reachable.
+        """
+        base = self._setup_work_repo(monkeypatch, tmp_path)
+        self._write_runner(
+            base / "info" / "gate-check-run-tests.sh",
+            f"#!/bin/sh\n"
+            f"echo '{TEST_MODE_MARKER}outer wrapper' >&2\n"
+            f"echo '{TEST_MODE_MARKER}inner suite that actually ran'\n"
+            f"echo '3 passed in 0.1s'\nexit 0\n",
+        )
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.PASSED
+        assert "inner suite that actually ran" in result.message
+        assert "outer wrapper" not in result.message
+
+    def test_stderr_only_marker_is_still_read(self, tmp_path, monkeypatch):
+        """stdout merely wins ties — a runner that only logs to stderr is not
+        silently treated as having declared nothing."""
+        base = self._setup_work_repo(monkeypatch, tmp_path)
+        self._write_runner(
+            base / "info" / "gate-check-run-tests.sh",
+            f"#!/bin/sh\n"
+            f"echo '{TEST_MODE_MARKER}stderr-only suite' >&2\nexit 0\n",
+        )
+
+        self.gate.project_root = tmp_path
+        result = self.gate.check_tests()
+
+        assert result.status == CheckStatus.PASSED
+        assert "stderr-only suite" in result.message
+
+    def test_declared_mode_reaches_the_receipt_summary(self, tmp_path, monkeypatch):
+        """The terminal line is transient; the receipt is the durable record.
+
+        /tmp/gate-check.log is overwritten every run and never pushed, so
+        without this the reviewer reading the run dir later has only a bare
+        pytest tail that looks identical whichever suite ran.
+        """
+        base = self._setup_work_repo(monkeypatch, tmp_path)
+        self._write_runner(
+            base / "info" / "gate-check-run-tests.sh",
+            f"#!/bin/sh\n"
+            f"echo '{TEST_MODE_MARKER}root uv suite (no service container)'\n"
+            f"echo '198 passed, 1 skipped in 42.1s'\nexit 0\n",
+        )
+
+        self.gate.project_root = tmp_path
+        self.gate.results = [self.gate.check_tests()]
+
+        assert self.gate.receipt_summary() == (
+            "root uv suite (no service container): 198 passed, 1 skipped in 42.1s"
+        )
+        # The runner owns its invocation, so the gate still cannot say what it
+        # covered — absent must keep meaning "unknown", never "full suite".
+        assert self.gate.receipt_test_fields() == {}
+
+    def test_runner_without_a_marker_leaves_the_receipt_unprefixed(
+        self, tmp_path, monkeypatch
+    ):
+        """Opt-in reaches the receipt too: no claim, no prefix."""
+        base = self._setup_work_repo(monkeypatch, tmp_path)
+        self._write_runner(
+            base / "info" / "gate-check-run-tests.sh",
+            "#!/bin/sh\necho '198 passed, 1 skipped in 42.1s'\nexit 0\n",
+        )
+
+        self.gate.project_root = tmp_path
+        self.gate.results = [self.gate.check_tests()]
+
+        assert self.gate.receipt_summary() == "198 passed, 1 skipped in 42.1s"
+
+
+class TestRunnerModeLabel:
+    """Tests for the `gate-check: test-mode=` marker parser."""
+
+    def test_no_marker_is_none(self):
+        assert runner_mode_label("ran the suite\n2 passed in 0.1s") is None
+        assert runner_mode_label("") is None
+        assert runner_mode_label(None) is None
+
+    def test_label_is_read_and_stripped(self):
+        assert runner_mode_label(f"{TEST_MODE_MARKER}  root uv suite  ") == "root uv suite"
+
+    def test_indented_marker_still_counts(self):
+        """Runners pipe through `sed`, prefixes and wrappers; leading blanks
+        are not a different claim."""
+        assert runner_mode_label(f"   \t{TEST_MODE_MARKER}fallback") == "fallback"
+
+    def test_marker_must_start_the_line(self):
+        """Otherwise any log line quoting the marker would rename the mode."""
+        assert runner_mode_label(f"note: use {TEST_MODE_MARKER}fallback") is None
+
+    def test_last_marker_wins(self):
+        """A wrapper's claim is superseded by the runner that ran the suite."""
+        output = f"{TEST_MODE_MARKER}outer\nsome output\n{TEST_MODE_MARKER}inner\n"
+        assert runner_mode_label(output) == "inner"
+
+    def test_empty_label_falls_through_to_an_earlier_one(self):
+        """`test-mode=` with nothing after it declares nothing."""
+        assert runner_mode_label(f"{TEST_MODE_MARKER}\n") is None
+        assert runner_mode_label(f"{TEST_MODE_MARKER}real\n{TEST_MODE_MARKER}  \n") == "real"
+
+    def test_control_characters_are_dropped(self):
+        """The label is printed as part of the gate's own verdict line, so it
+        must not be able to repaint it."""
+        label = runner_mode_label(f"{TEST_MODE_MARKER}root\x1b[31m uv\tsuite")
+        assert label == "root[31m uvsuite"
+        assert "\x1b" not in label
+        assert "\t" not in label
+
+    def test_over_long_label_is_truncated(self):
+        label = runner_mode_label(TEST_MODE_MARKER + "x" * 500)
+        assert len(label) == TEST_MODE_LABEL_MAX
+        assert label.endswith("…")
 
 
 class TestResolvePrecommitCommand:

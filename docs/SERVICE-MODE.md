@@ -499,6 +499,65 @@ target-exec bash -c 'cd /srv/www.example.com && source venv/bin/activate && \
   pytest --reuse-db --disable-warnings "$@"'
 ```
 
+### Saying which suite ran
+
+A runner like the one above only works in a session that HAS a service
+container. A session launched without `--service` (or without a preset that
+supplies one) has no `LMER_SERVICE_CONTAINER`, `target-exec` refuses, and the
+gate's test leg fails for a reason that has nothing to do with the change being
+committed — so such a project usually wants a runner that picks a suite it can
+actually run.
+
+A runner that can take more than one path should say which one it took.
+`gate-check` reads one optional line out of the runner's output:
+
+```
+gate-check: test-mode=<label>
+```
+
+and appends the label to the test leg's result, on success and on failure
+alike:
+
+```
+✅ PASSED Python Tests
+    Custom test runner passed (gate-check-run-tests.sh) — root uv suite (no service container)
+```
+
+The marker must start the line (leading whitespace is fine), and the last one
+in the stream wins, so a runner that delegates to another is described by the
+one that ran the suite. Printing nothing is fine — the result then reads
+exactly as it did before.
+
+Print the marker on **stdout**. `gate-check` captures stdout and stderr
+separately, so their lines carry no relative order between them: a marker on
+stdout beats a marker on stderr no matter which was written first, and "the
+last one wins" only ever compares markers on the same stream. A wrapper that
+logs progress to stderr therefore cannot outrank the inner runner that
+declared its mode on stdout — but two runners that each declare on a
+*different* stream resolve by stream, not by who ran last.
+
+A two-mode runner, keeping today's behaviour when there IS a service container:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ -n "${LMER_SERVICE_CONTAINER:-}" ]; then
+    echo "gate-check: test-mode=target-exec (service container)"
+    exec target-exec sh -c 'cd /srv/service/main && pytest tests/ -q'
+fi
+
+echo "gate-check: test-mode=root suite (no service container)"
+cd /workspace
+exec uv run pytest tests/ -q -p no:cacheprovider
+```
+
+The fallback is a different suite, not a waiver: it still runs tests and a
+failure still fails the gate. A runner must never paper over a suite it cannot
+run — no `|| true`, no `exit 0` on a missing dependency. If neither path can
+run, exit non-zero with a message naming what was missing, so the gate fails
+saying so.
+
 ## Comparison with Compose/Sidecar Approach
 
 | Aspect | Sidecar (POC) | Service mode |

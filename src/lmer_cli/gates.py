@@ -48,9 +48,12 @@ class CheckResult:
     # untruncated stdout+stderr, persisted to the gate-check log so failures can
     # be investigated without re-running the slow checks.
     full_output: Optional[str] = None
-    # Set when the check covered less than its name implies (the text-diff
-    # test subset). Receipts and logs read this, so a narrowed run can never
-    # be read back as the full one.
+    # Set when the check ran something other than the unqualified thing its
+    # name implies: the text-diff test subset, a reused cached run, or the
+    # suite a project's own runner declared it took (TEST_MODE_MARKER).
+    # Receipts and logs read this, so a narrowed run can never be read back
+    # as the full one, and a fallback suite can never be read back as the
+    # project's usual one.
     scope: Optional[str] = None
     # The concrete targets the check selected and ran (the tests check's
     # pytest paths). None means the check chose no target list at all — a
@@ -83,6 +86,22 @@ GATE_CHECK_LOG_PATH = Path("/tmp/gate-check.log")
 PYTEST_SUMMARY_RE = re.compile(
     r"\b\d+ (?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|warnings?)\b"
 )
+
+# The one line a project-supplied test runner may print to name the path it
+# took (#307). A project whose suite normally runs inside a service container
+# needs a fallback for sessions that have none, and a fallback nobody can see
+# is indistinguishable from a bypass — so the runner has to be able to say
+# which suite it ran. It SAYS it rather than lmer inferring it: gate-check runs
+# that script as a black box and nothing about a shell script promises any
+# particular output, so a marker lmer defines can only ever be absent, never
+# wrong. Opt-in — a runner that prints nothing reports nothing, exactly as
+# before.
+TEST_MODE_MARKER = "gate-check: test-mode="
+
+# Ceiling for a marker label, which is interpolated into a one-line result. A
+# runner that accidentally pipes a whole log line through the marker gets
+# truncated rather than owning the screen.
+TEST_MODE_LABEL_MAX = 120
 
 # Spec-class deliverable naming for check_deliverable_formats (#102): any path
 # component with a word starting `spec`/`plan`/`report` (spec.docx, docs/specs/,
@@ -180,6 +199,37 @@ def pytest_summary_line(output: Optional[str]) -> Optional[str]:
         line = line.strip().strip("=").strip()
         if PYTEST_SUMMARY_RE.search(line):
             return line
+    return None
+
+
+def runner_mode_label(output: Optional[str]) -> Optional[str]:
+    """The path a custom test runner said it took, or None if it said nothing.
+
+    Reads TEST_MODE_MARKER lines out of ONE captured stream. The LAST one
+    wins, as in pytest_summary_line — and it is what lets a runner that
+    delegates to another runner be described by the inner one that actually ran
+    the suite. Pass a single stream: line order only means anything within one,
+    so the caller reads stdout and stderr separately rather than handing this
+    a concatenation whose interleaving was already lost.
+
+    The label is sanitized on the way in rather than at the print site: it is
+    interpolated into a line the gate prints as its own verdict, so a label
+    carrying ANSI escapes or a newline could repaint that verdict.
+    """
+    for line in reversed((output or "").splitlines()):
+        stripped = line.strip()
+        if not stripped.startswith(TEST_MODE_MARKER):
+            continue
+        label = "".join(
+            ch for ch in stripped[len(TEST_MODE_MARKER):] if ch.isprintable()
+        ).strip()
+        # An empty label is a runner that declared nothing, so keep looking
+        # rather than reporting a mode of "".
+        if not label:
+            continue
+        if len(label) > TEST_MODE_LABEL_MAX:
+            label = label[:TEST_MODE_LABEL_MAX - 1].rstrip() + "…"
+        return label
     return None
 
 
@@ -417,6 +467,24 @@ class GateSystem:
         combined_output = _capture(result)
         non_empty = [line for line in combined_output.splitlines() if line.strip()]
 
+        # Goes on the message rather than into details, which print only under
+        # --verbose and only as a 5-line tail — a runner declaring its mode up
+        # front would fall off the end of that tail unread.
+        #
+        # Read per-stream, not off `combined_output`: the two streams are
+        # captured separately, so concatenating them is not chronological —
+        # every stderr line lands after every stdout line whichever was
+        # written first. Scanning the concatenation would let a wrapper that
+        # logs its own mode to stderr outrank the inner runner that printed
+        # the marker on stdout and actually ran the suite. stdout wins, and
+        # the last marker within a stream wins. Each stream is redacted first,
+        # for the same reason `_capture` redacts: the label is printed, and a
+        # runner that interpolated a token into its own mode line must not put
+        # it on the gate's verdict.
+        label = (runner_mode_label(redact_secrets(result.stdout or ""))
+                 or runner_mode_label(redact_secrets(result.stderr or "")))
+        mode_suffix = f" — {label}" if label else ""
+
         if result.returncode == 0:
             # Surface a tail of the runner's output so a verbose `gate-check`
             # run can confirm something actually executed (the pytest path
@@ -425,18 +493,26 @@ class GateSystem:
             return CheckResult(
                 name="Python Tests",
                 status=CheckStatus.PASSED,
-                message=f"Custom test runner passed ({script.name})",
+                message=f"Custom test runner passed ({script.name}){mode_suffix}",
                 details=details,
                 full_output=combined_output,
+                # The terminal line is overwritten every run (/tmp/gate-check.log)
+                # and never pushed; the receipt is the only durable record. Carry
+                # the declared mode there too, so a reviewer reading the run dir a
+                # week later can tell which suite the gate accepted. `scope_targets`
+                # stays None — a project's runner owns its invocation, so this
+                # gate still cannot say what it covered.
+                scope=label,
             )
 
         details = non_empty[-5:] if non_empty else ["Custom test runner failed - no output"]
         return CheckResult(
             name="Python Tests",
             status=CheckStatus.FAILED,
-            message=f"Custom test runner failed ({script.name})",
+            message=f"Custom test runner failed ({script.name}){mode_suffix}",
             details=details,
             full_output=combined_output,
+            scope=label,
         )
 
     def _changed_paths(self) -> Optional[List[str]]:
@@ -1525,7 +1601,10 @@ class GateSystem:
         a subset run from a full one — and when the suite did not run at all
         because the cache answered for it ("cached full suite: 8727 passed,
         …"), since the receipt is what a reviewer reads later when asking
-        whether this was actually tested. None when neither exists — the
+        whether this was actually tested. A project runner's declared mode
+        (#307) rides the same prefix ("root uv suite (no service container):
+        198 passed, …"), so a fallback suite cannot read back as the
+        project's usual one. None when neither exists — the
         receipt's `summary` field is then simply absent, never fabricated.
 
         Prose, and best-effort: `receipt_test_fields` is what a machine

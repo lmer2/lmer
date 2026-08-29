@@ -1,0 +1,2 @@
+added:
+- "gate-check surfaces the path a project's custom test runner took, from an optional `gate-check: test-mode=<label>` line it prints, on the result line and in the gate receipt's summary (#307)"
