@@ -44,6 +44,20 @@ from lmer_cli.mounts import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_inherited_ssh_agent(monkeypatch):
+    """Drop the host's ``SSH_AUTH_SOCK`` for every test in this module.
+
+    ``build_user_mounts`` forwards the agent socket whenever the variable is
+    set, so on a machine with agent forwarding the tests below that assert on a
+    *complete* argument list see two extra pairs they never asked for. The
+    argument list is the thing under test here; whether the developer happens
+    to run an ssh-agent is not. Tests that are about the forwarding put the
+    variable back themselves.
+    """
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+
+
 class TestSelinuxOpt:
     """Test SELinux option generation"""
 
