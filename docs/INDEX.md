@@ -285,22 +285,9 @@ How a repository adopts the release flow (configuration plus prerequisites, neve
 - Prerequisite checklists: GitHub mirror controls, PyPI trusted publisher, GitLab protected tags, credentials
 - Rotation runbook for the fine-grained PAT and the release SSH signing key
 - Burned-version and GitHub `main` divergence remediation runbooks
-- The bootstrap sequence (lmer first, then ctl) and the pre-production rehearsal checklist
+- The bootstrap sequence (lmer first, then ctl)
 
 **Best for**: Operators onboarding a new repository onto the release flow and running the credential-rotation or repair runbooks.
-
----
-
-### [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md)
-**Release Rehearsal Rig — Runbook**
-
-Operator's runbook for the `Ctl/rehearsal/` scripts that exercise the full leg-2 release path in a scratch GitHub repo + TestPyPI before any production release:
-- Prerequisites, `rig.env` configuration, and the rehearsal-credential isolation rule (production targets and credentials are hard-refused)
-- Standing up the rig with `stand-up.sh` (drift guard, scratch repo, rulesets, throwaway signing key, environment, TestPyPI)
-- The G2 negative tag-verification tests (`unsigned-tag`, `wrong-signer`, `not-main-head`) and the leg-2 walk with idempotency re-entries
-- Evidence file format, offline `--verify-evidence` checks, teardown, and re-standing the rig for another adopter
-
-**Best for**: Running the mandatory rehearsal before a first production release and verifying its recorded evidence.
 
 ---
 
@@ -308,11 +295,10 @@ Operator's runbook for the `Ctl/rehearsal/` scripts that exercise the full leg-2
 **Production Release Setup — Operator Receipts**
 
 One-time, operator-performed production configuration receipts for the lmer release flow — each item ticked with date and actor (never a secret value):
-- Signing keypair, branch/tag protection, `pypi` environment tag-pattern policy, `RELEASE_ALLOWED_SIGNERS` variable
+- Signing keypair, mirror branch protection, and the authorization controls that gate a release: the `v*` tag ruleset, the `pypi` environment tag-pattern policy, and its required reviewer
 - Production PAT issuance and provisioning, bot account signing key, PyPI trusted publisher, GitLab protected tags
-- Mirror PR/collaborator policy and the green-rehearsal gate
+- Mirror PR/collaborator policy
 - Split into **gating** receipts and **hardening** items: a release run must refuse leg 2 while any gating item is unchecked; hardening is tracked separately so it neither blocks a release nor passes unnoticed
-- Rehearsal waivers for a given release are recorded with that release run's records in the work repo — rationale and accepted residual — not in this checklist
 
 **Best for**: The operator completing (and auditors reviewing) the production setup checklist before the first release run.
 
@@ -323,7 +309,7 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - **New to LMER?** Start with [LMER-CLI.md](./LMER-CLI.md) to learn how to use the tool
 - **Setting up containers?** See [CONTAINER.md](./CONTAINER.md) for Docker/Podman configuration
 - **Having auth issues?** Check [AUTHENTICATION.md](./AUTHENTICATION.md) for SSH and API setup
-- **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md), [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md), and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption, rehearsal, and operator setup
+- **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md) and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption and operator setup
 - **Answering runs from your phone?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
 - **Need to troubleshoot?** All documents include troubleshooting sections
 

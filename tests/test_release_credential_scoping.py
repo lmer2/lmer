@@ -19,10 +19,6 @@ container env dict handed to ``build_container_env`` AND the assembled ``-v`` mo
 arguments — so a refactor cannot satisfy the suite by moving the credential
 from one channel to the other.
 
-The rig-scoped rehearsal trio (``LMER_REHEARSAL_*``) is exempt by name: those
-are throwaway credentials deliberately provisioned to every session,
-env-borne only (spec R3/F5/F6).
-
 The behavioral tests run the real ``main()`` with the container runtime
 mocked out (reusing the harness from ``test_lmer_cli_slack_target``) and
 inspect the env dict the CLI hands to ``build_container_env`` plus the full run command
@@ -36,7 +32,6 @@ from unittest.mock import patch
 import pytest
 
 from lmer_cli.cli import (
-    REHEARSAL_CREDENTIAL_ENVS,
     RELEASE_GITHUB_TOKEN_ENV,
     RELEASE_SIGNING_KEY_ENV,
     RELEASE_TASK_ID,
@@ -131,7 +126,7 @@ def _assert_no_production_credentials(captured_env, captured_cmd, home):
 
     Env half: both production keys are PRESENT and None (the None seed is
     the leak blocker — the .env merge and preset seeding loop both skip keys
-    already in the dict), and no non-rehearsal env value carries a secret.
+    already in the dict), and NO env value carries a secret.
     Mount half: the run command contains no ``-v`` argument at all (every
     other mount builder is mocked to []), so in particular no signing-key
     bind and no token smuggled into mount syntax.
@@ -152,11 +147,10 @@ def _assert_no_production_credentials(captured_env, captured_cmd, home):
         f"Signing-key var leaked into a non-release session: "
         f"{captured_env[RELEASE_SIGNING_KEY_ENV]!r}"
     )
-    # No other env key may carry the secrets either (rehearsal trio exempt
-    # by name — rig-scoped throwaways go to every session, spec R3).
+    # No other env key may carry the secrets either. There are no
+    # exemptions: the rig-scoped rehearsal trio that used to be excused here
+    # went with the rehearsal rig.
     for k, v in captured_env.items():
-        if k in REHEARSAL_CREDENTIAL_ENVS:
-            continue
         assert v != _PAT_VALUE, f"PAT value found under unexpected env key {k}"
         assert v != key_path, f"Signing-key path found under unexpected env key {k}"
     # Mount half: nothing was bind-mounted at all.
@@ -363,32 +357,4 @@ class TestReleaseSessionProvisioning:
         assert rc == 0
         assert captured.get(RELEASE_GITHUB_TOKEN_ENV) is None
         assert captured.get(RELEASE_SIGNING_KEY_ENV) is None
-        assert "-v" not in cmd
-
-
-class TestRehearsalExemption:
-    """R3: the rig-scoped rehearsal trio is exempt from the negative
-    guarantee — it reaches every session, env-borne only (no mount even
-    though the key var holds a path)."""
-
-    def test_rehearsal_vars_reach_non_release_session_env_only(self, fake_home):
-        rig_key_path = str(fake_home / ".ssh" / "rig_key")
-        captured: dict = {}
-        cmd: list = []
-        rc = _run_main(
-            ["--no-task", "--exec", "true", REPO_URL],
-            env_in={
-                "LMER_REHEARSAL_GITHUB_TOKEN": "github_pat_rig_dummy",
-                "LMER_REHEARSAL_TESTPYPI_TOKEN": "pypi-rig-dummy",
-                "LMER_REHEARSAL_SIGNING_KEY": rig_key_path,
-            },
-            captured_env=captured,
-            captured_cmd=cmd,
-            home=fake_home,
-        )
-        assert rc == 0
-        assert captured.get("LMER_REHEARSAL_GITHUB_TOKEN") == "github_pat_rig_dummy"
-        assert captured.get("LMER_REHEARSAL_TESTPYPI_TOKEN") == "pypi-rig-dummy"
-        assert captured.get("LMER_REHEARSAL_SIGNING_KEY") == rig_key_path
-        # Env-borne ONLY: the rehearsal key is never delivered as a mount.
         assert "-v" not in cmd

@@ -341,8 +341,8 @@ provenance of the published artifact.
 
 ## 7. First production release — deferred with handoff
 
-The build that produced this flow ships the machinery and the rehearsal
-harness; it does not itself perform a production release. The first
+The build that produced this flow ships the machinery; it does not itself
+perform a production release. The first
 production release of lmer end-to-end through the flow — the build's G4
 goal — is **deferred with handoff**: it executes as a follow-on,
 human-gated release run launched with the shipped `release` taskdef, not
@@ -355,16 +355,13 @@ ever hold (§4).
 All of the following must hold before launching the run:
 
 - **The build is complete and green** — every deliverable of the flow
-  (taskdef, workflow, rehearsal rig, docs) shipped.
-- **Rehearsal evidence recorded and verified** — the G2 negative test and
-  the leg-2 dry run, per the standing rule in
-  [RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md): both aggregate evidence
-  files in `docs/rehearsal/` populated from real run data and passing
-  their offline verifiers. The files ship as pending skeletons and are
-  populated when the rig runs — a pending skeleton is not evidence.
-  Waiving this for a given release is possible but must be **recorded with
-  that release run's records in the work repo — its rationale and the
-  residual it accepts** — an unrecorded skip is not a waiver.
+  (taskdef, workflow, docs) shipped.
+- **No pre-release dry run exists.** The rehearsal rig was removed by
+  operator decision (2026-08-28); there is no longer a way to exercise
+  tag → build → publish → release against TestPyPI before doing it for
+  real. The first production release IS the first exercise of the
+  workflow. Read §5's burned-version remediation before starting, because
+  it is the recovery path if the run goes wrong.
 - **Gating operator receipts complete** — the deployment works the *gating*
   section of [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) in a copy
   filed with that release run's records in the work repo — its own run

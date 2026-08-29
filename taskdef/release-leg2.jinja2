@@ -213,21 +213,31 @@ Find the `release.yml` run for the recorded merge SHA on the mirror
       `work release record receipt actions-run --url <Actions run URL>`
       `work release record receipt pypi --url <PyPI release URL>`
       `--url` is required on both. On a re-run, record the run that
-      UPLOADED, not merely the last green one — `release.yml` publishes
-      with `skip-existing`, so a later green run may have uploaded nothing.
-- [ ] Red, with refs current → re-dispatch the workflow via the API, keyed
-      on the recorded SHA: `gh run rerun <run-id>`. NEVER re-tag to
+      UPLOADED, not merely the last green one — a failed-jobs-only re-run
+      leaves `publish-pypi` untouched, so a later green run may have
+      uploaded nothing.
+- [ ] Red, with refs current → re-dispatch the FAILED JOBS ONLY via the
+      API, keyed on the recorded SHA: `gh run rerun <run-id> --failed`.
+      The `--failed` is not optional. `release.yml` sets no
+      `skip-existing`, so re-running a `publish-pypi` that already
+      succeeded attempts an upload PyPI already holds; PyPI refuses it,
+      and the run can never converge — leaving a published version with a
+      missing GitHub Release and no way forward. `--failed` re-runs the
+      failed jobs AND their dependents, which is right on both sides of a
+      publish: red at `checks` or `build` re-runs everything downstream,
+      and red only at `github-release` re-runs just that job, reusing the
+      original run's `dist` artifact (which is why that job's download
+      step passes `github-token` and `run-id`). NEVER re-tag to
       retrigger — the tag is immutable: never deleted, never re-pointed,
       never re-signed. Then poll again. A run that cannot be re-run is the
       fail-loudly path below.
-- [ ] Red at the **Gate version reuse** step (the version is already on the
-      index) → this is NOT an agent decision. Re-running cannot clear it:
-      the gate fails closed because a resumed publish and a republish of
-      different code are indistinguishable to the pipeline. Report it to
-      the human with the Actions run URL via the fail-loudly path below;
-      authorizing the resume means an admin setting the
-      `RELEASE_RESUME_VERSION` Actions variable to that exact version and
-      clearing it afterwards. Never set or ask for a blanket value.
+- [ ] Red at **Publish to PyPI**, with PyPI reporting the version already
+      exists → this is NOT an agent decision, and re-running cannot clear
+      it. PyPI's refusal to accept a version it already holds IS the
+      version-reuse gate; there is no variable to set and no override.
+      Report it to the human with the Actions run URL via the fail-loudly
+      path below. Recovery means cutting a new version — never
+      republishing over the spent one.
 - [ ] Still red → FAIL LOUDLY with the Actions run URL:
       `work state set --stop-reason=critical_error --critical-error
       '{"summary": "GitHub release run red", "detail": "<Actions run URL>"}'`
@@ -334,7 +344,7 @@ target to the recorded merge SHA before acting:
 | GitHub `main` already at the merge SHA | Skip the push; ensure the receipt exists |
 | GitHub tag ref already at the merge SHA | Skip the push; ensure the receipt exists |
 | Actions run green for the recorded SHA | Skip the poll; receipts must name the run that uploaded |
-| Actions run red, refs current | Re-dispatch via the API, keyed on the recorded SHA — never re-tag |
+| Actions run red, refs current | Re-dispatch the FAILED JOBS ONLY via the API (`gh run rerun <run-id> --failed`), keyed on the recorded SHA — never re-tag, never a full re-run |
 | GitLab tag already at the merge SHA | Skip the push; ensure the receipt exists |
 | GitLab tag pushed, no `dep-refresh` receipt | Run step 7 — it is idempotent: an existing open `dep-refresh-<X.Y.Z>` MR is ADOPTED (record its URL as the receipt), never a second one |
 | Every receipt recorded | Nothing to advance — close out the run |

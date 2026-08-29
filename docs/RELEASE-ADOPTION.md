@@ -183,26 +183,3 @@ A **non-fast-forward push** to the GitHub mirror is a **hard stop**.
 - [ ] **4.** lmer's next release runs in **fragment mode**, and the
       taskdef's ctl dependency switches from git-pinned to the **PyPI
       package**.
-
-## 7. Rehearsal — before the first production release
-
-Do not run the production leg 2 untested. Exercise the **full leg-2 path**
-in a rehearsal rig first (runbook:
-[RELEASE-REHEARSAL.md](./RELEASE-REHEARSAL.md)):
-
-- [ ] Stand up a **scratch GitHub repo** mirroring the production
-      controls: branch protection, tag protection with bot bypass, `pypi`
-      environment with the tag-pattern policy, `RELEASE_ALLOWED_SIGNERS`.
-- [ ] Register a **TestPyPI trusted publisher** against the scratch repo +
-      workflow + environment.
-- [ ] Run leg 2 end-to-end: `main` push, signed tag push, verify job
-      green, TestPyPI shows the version with attestations, Release
-      created.
-- [ ] Run the **negative cases** — each must fail the pipeline **before
-      any publish step**:
-  - [ ] **unsigned** tag,
-  - [ ] **wrong-signer** tag (signed with a key not in
-        `RELEASE_ALLOWED_SIGNERS`),
-  - [ ] tag **not at `main` head**.
-- [ ] Only after all rehearsal cases behave: proceed to the first
-      production release.

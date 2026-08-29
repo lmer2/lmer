@@ -1,18 +1,16 @@
-"""Publish-gate invariants for .github/workflows/release.yml.
+"""Structural invariants of .github/workflows/release.yml.
 
-The release workflow's security posture rests on a handful of structural
-facts: verify-tag-signature runs first and everything else hangs off it,
-the trust anchor comes from an admin-controlled Actions variable (never
-repo content — a tag push runs the workflow from the tag's own tree), the
-main-HEAD comparison is sourced from the GitHub API, and the PyPI publish
-action is SHA-pinned at or above the attestations-by-default floor with
-skip-existing for idempotent re-runs. These tests assert those invariants
-directly against the parsed workflow so a future edit that weakens the
-gate fails CI instead of shipping.
+The release path is four jobs — checks, build, publish-pypi, github-release —
+and its safety rests on structure rather than on scripts: the privileged job
+runs no repository code, `.github/scripts/` does not exist so a pushed tag has
+nothing to substitute, and the two third-party actions are SHA-pinned. These
+tests assert those facts against the parsed workflow, so an edit that weakens
+the shape fails here instead of on a tag that cannot be re-cut.
 """
 
-import os
 import re
+import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -20,17 +18,34 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
-GATE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "verify-tag-signature.sh"
-GATE_SCRIPT_REL = ".github/scripts/verify-tag-signature.sh"
-REUSE_GATE_SCRIPT = REPO_ROOT / ".github" / "scripts" / "gate-version-reuse.py"
+CHECKS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "checks.yml"
+SCRIPTS_DIR = REPO_ROOT / ".github" / "scripts"
 
-GATE_JOB = "verify-tag-signature"
 PUBLISH_ACTION = "pypa/gh-action-pypi-publish"
-SIGNERS_VAR_EXPR = "${{ vars.RELEASE_ALLOWED_SIGNERS }}"
+RELEASE_ACTION = "softprops/action-gh-release"
+PINNED_ACTIONS = (PUBLISH_ACTION, RELEASE_ACTION)
+
+# The job graph, in order. `checks` is the repository's existing CI workflow
+# called on the tagged commit; everything else hangs off it in a straight line.
+JOB_ORDER = ["checks", "build", "publish-pypi", "github-release"]
 
 # v1.12.0 is where gh-action-pypi-publish started emitting PEP 740
-# attestations by default; the pin must never fall below it.
-ATTESTATIONS_FLOOR = (1, 12, 0)
+# attestations by default; the pin must never fall below it. v1.14.2 is the
+# first release whose twine accepts Metadata-Version 2.5 (ctl #44), which is
+# why the floor sits there rather than at 1.12.
+PUBLISH_ACTION_FLOOR = (1, 14, 2)
+
+
+@pytest.fixture(scope="module")
+def gate():
+    """ci/publisher_metadata_gate.py, imported as a module."""
+    sys.path.insert(0, str(REPO_ROOT / "ci"))
+    try:
+        import publisher_metadata_gate
+
+        return publisher_metadata_gate
+    finally:
+        sys.path.pop(0)
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +55,6 @@ def workflow_text():
 
 @pytest.fixture(scope="module")
 def workflow(workflow_text):
-    """The workflow parsed once for the whole module."""
     return yaml.safe_load(workflow_text)
 
 
@@ -49,273 +63,278 @@ def jobs(workflow):
     return workflow["jobs"]
 
 
-@pytest.fixture(scope="module")
-def publish_step(jobs):
-    """The pypa/gh-action-pypi-publish step of the publish-pypi job."""
-    steps = [
-        step
-        for step in jobs["publish-pypi"].get("steps", [])
-        if str(step.get("uses", "")).startswith(f"{PUBLISH_ACTION}@")
-    ]
-    assert len(steps) == 1, (
-        f"expected exactly one {PUBLISH_ACTION} step in publish-pypi, "
-        f"found {len(steps)}"
-    )
-    return steps[0]
-
-
 def _needs(job):
     """A job's needs as a list (GitHub accepts a bare string or a list)."""
     needs = job.get("needs", [])
-    if isinstance(needs, str):
-        return [needs]
-    return list(needs)
+    return [needs] if isinstance(needs, str) else list(needs)
 
 
-def _steps(jobs):
-    """All (job_name, step) pairs; reusable-workflow jobs have no steps."""
-    for name, job in jobs.items():
-        for step in job.get("steps", []):
-            yield name, step
+def _step_using(job, action):
+    """The single step of `job` that uses `action`."""
+    steps = [
+        step
+        for step in job.get("steps", [])
+        if str(step.get("uses", "")).split("@")[0] == action
+    ]
+    assert len(steps) == 1, f"expected exactly one {action} step, found {len(steps)}"
+    return steps[0]
 
 
-class TestGateJobOrdering:
-    def test_gate_is_the_first_job(self, jobs):
-        assert list(jobs)[0] == GATE_JOB
+class TestJobGraph:
+    def test_jobs_are_exactly_the_four_release_jobs(self, jobs):
+        assert list(jobs) == JOB_ORDER
 
-    def test_gate_has_no_needs(self, jobs):
-        assert "needs" not in jobs[GATE_JOB]
+    def test_each_job_needs_the_one_before_it(self, jobs):
+        for earlier, later in zip(JOB_ORDER, JOB_ORDER[1:]):
+            assert _needs(jobs[later]) == [earlier], (
+                f"'{later}' must need '{earlier}' and nothing else"
+            )
 
-    def test_verify_version_exists_and_needs_gate(self, jobs):
-        assert "verify-version" in jobs
-        assert _needs(jobs["verify-version"]) == [GATE_JOB]
+    def test_checks_is_the_root_and_calls_the_ci_workflow(self, jobs):
+        assert "needs" not in jobs["checks"]
+        assert jobs["checks"]["uses"] == "./.github/workflows/checks.yml"
 
-    def test_every_other_job_transitively_needs_gate(self, jobs):
-        """Walk each job's needs graph; all roads must lead to the gate."""
-        for name, job in jobs.items():
-            if name == GATE_JOB:
-                continue
-            seen = set()
-            frontier = _needs(job)
-            assert frontier, f"job '{name}' has no needs; it can run before the gate"
-            while frontier:
-                dep = frontier.pop()
-                if dep in seen:
-                    continue
-                seen.add(dep)
-                assert dep in jobs, f"job '{name}' needs unknown job '{dep}'"
-                frontier.extend(_needs(jobs[dep]))
-            assert GATE_JOB in seen, (
-                f"job '{name}' does not transitively depend on '{GATE_JOB}'"
+    def test_the_called_workflow_accepts_workflow_call(self):
+        """`uses:` only resolves if checks.yml declares the trigger."""
+        checks = yaml.safe_load(CHECKS_WORKFLOW.read_text())
+        # PyYAML parses the bare key `on:` as the boolean True.
+        triggers = checks.get("on", checks.get(True))
+        assert "workflow_call" in triggers
+
+    def test_release_triggers_on_version_tags_only(self, workflow):
+        triggers = workflow.get("on", workflow.get(True))
+        assert list(triggers) == ["push"]
+        assert triggers["push"] == {"tags": ["v*"]}
+
+
+class TestPermissions:
+    def test_workflow_level_is_read_only(self, workflow):
+        assert workflow["permissions"] == {"contents": "read"}
+
+    def test_publish_holds_only_the_oidc_token(self, jobs):
+        """A job-level block REPLACES the workflow-level one rather than
+        merging with it, so anything extra here is a real grant to the job
+        that mints the OIDC token."""
+        assert jobs["publish-pypi"]["permissions"] == {"id-token": "write"}
+
+    def test_github_release_holds_contents_write_and_actions_read(self, jobs):
+        assert jobs["github-release"]["permissions"] == {
+            "contents": "write",
+            "actions": "read",
+        }
+
+    def test_no_other_job_declares_permissions(self, jobs):
+        for name in ("checks", "build"):
+            assert "permissions" not in jobs[name], (
+                f"'{name}' needs no token; the workflow-level read is enough"
             )
 
 
-class TestSignerMaterialProvenance:
-    def test_gate_env_sources_signers_from_actions_variable(self, jobs):
-        gate_steps = jobs[GATE_JOB]["steps"]
-        sourced = [
-            step
-            for step in gate_steps
-            if step.get("env", {}).get("RELEASE_ALLOWED_SIGNERS") == SIGNERS_VAR_EXPR
-        ]
-        assert sourced, (
-            "gate job never sets RELEASE_ALLOWED_SIGNERS from "
-            "vars.RELEASE_ALLOWED_SIGNERS"
+class TestPrivilegedJobRunsNoRepositoryCode:
+    def test_scripts_directory_does_not_exist(self):
+        """With nothing in .github/scripts/ a pushed tag has no repository
+        code to substitute into a privileged job."""
+        assert not SCRIPTS_DIR.exists(), f"{SCRIPTS_DIR} is back"
+
+    def test_publish_job_never_checks_out(self, jobs):
+        uses = [str(step.get("uses", "")) for step in jobs["publish-pypi"]["steps"]]
+        assert not any(u.split("@")[0] == "actions/checkout" for u in uses)
+
+    def test_publish_job_runs_no_shell(self, jobs):
+        assert not any("run" in step for step in jobs["publish-pypi"]["steps"])
+
+    def test_workflow_pins_no_checkout_to_main(self, workflow_text):
+        """The `ref: main` contortions existed to keep tag-borne code out of
+        privileged jobs; no job holds a token and a checkout any more."""
+        assert "ref: main" not in workflow_text
+
+    def test_workflow_names_no_repository_variable(self, workflow_text):
+        assert "vars." not in workflow_text
+
+    def test_no_reference_to_the_retired_gates(self, workflow_text):
+        for retired in (
+            ".github/scripts",
+            "verify-tag-signature",
+            "gate-version-reuse",
+            "RELEASE_ALLOWED_SIGNERS",
+            "RELEASE_RESUME_VERSION",
+        ):
+            assert retired not in workflow_text
+
+
+class TestBuildJob:
+    def test_build_fetches_full_history(self, jobs):
+        checkout = _step_using(jobs["build"], "actions/checkout")
+        assert checkout["with"]["fetch-depth"] == 0
+
+    def test_build_checks_the_tag_against_pyproject(self, jobs):
+        """setuptools-scm is not adopted yet (#335), so the tag and the
+        static version must be compared somewhere."""
+        runs = "\n".join(
+            str(step.get("run", "")) for step in jobs["build"]["steps"]
         )
+        assert "GITHUB_REF_NAME" in runs
+        assert "pyproject.toml" in runs
 
-    def test_every_signers_env_assignment_uses_the_variable(self, jobs):
-        """Anywhere the workflow injects signer material, it must be vars."""
-        for name, step in _steps(jobs):
-            env = step.get("env", {})
-            if "RELEASE_ALLOWED_SIGNERS" in env:
-                assert env["RELEASE_ALLOWED_SIGNERS"] == SIGNERS_VAR_EXPR, (
-                    f"job '{name}' sets RELEASE_ALLOWED_SIGNERS from "
-                    f"{env['RELEASE_ALLOWED_SIGNERS']!r}, not the admin-controlled "
-                    "Actions variable"
-                )
-
-    def test_no_repo_content_path_for_signer_material(self, workflow_text):
-        """No checked-in signers file may feed verification.
-
-        A tag push runs the workflow from the tag's own tree, so any
-        allowed-signers material read from the checkout is attacker-writable.
-        """
-        assert "allowed_signers" not in workflow_text
-        assert "allowedSignersFile" not in workflow_text
-        assert "secrets.RELEASE_ALLOWED_SIGNERS" not in workflow_text
-        for line in workflow_text.splitlines():
-            if "RELEASE_ALLOWED_SIGNERS" in line:
-                assert "vars.RELEASE_ALLOWED_SIGNERS" in line, (
-                    "RELEASE_ALLOWED_SIGNERS referenced outside the vars "
-                    f"context: {line.strip()!r}"
-                )
-
-
-class TestGateScript:
-    def test_gate_calls_the_script(self, jobs):
-        runs = [
-            str(step.get("run", "")).strip()
-            for step in jobs[GATE_JOB]["steps"]
-            if "run" in step
-        ]
-        assert GATE_SCRIPT_REL in runs
-
-    def test_script_exists_and_is_executable(self):
-        assert GATE_SCRIPT.is_file()
-        assert os.access(GATE_SCRIPT, os.X_OK)
-
-    def test_main_head_comes_from_the_github_api(self):
-        """The tag-at-main-head check must not trust a checked-out ref."""
-        script = GATE_SCRIPT.read_text()
-        assert "/commits/heads/main" in script
-        assert "GITHUB_API_URL" in script
-        assert "origin/main" not in script
-        assert "refs/heads/main" not in script
-
-    def test_workflow_never_compares_against_checked_out_main(self, workflow_text):
-        assert "origin/main" not in workflow_text
-        assert "refs/heads/main" not in workflow_text
-
-
-class TestGateCheckoutProvenance:
-    """The verification code must never come from the pushed tag's tree —
-    whoever can push a tag would then supply the code that verifies it."""
-
-    def _checkouts(self, jobs):
-        return [
-            step
-            for step in jobs[GATE_JOB]["steps"]
-            if str(step.get("uses", "")).split("@")[0] == "actions/checkout"
-        ]
-
-    def test_gate_checkout_is_pinned_to_main(self, jobs):
-        checkouts = self._checkouts(jobs)
-        assert checkouts, "gate job has no checkout step"
-        for step in checkouts:
-            assert step.get("with", {}).get("ref") == "main", (
-                "gate checkout must pin ref: main, never the pushed tag"
-            )
-
-    def test_gate_checkout_never_uses_github_ref(self, jobs):
-        for step in self._checkouts(jobs):
-            assert "github.ref" not in str(step.get("with", {}).get("ref", ""))
-
-    def test_gate_checkout_fetches_tags_for_verification(self, jobs):
-        """Pinning to main must not lose the tag object under test."""
-        for step in self._checkouts(jobs):
-            with_block = step.get("with", {})
-            assert with_block.get("fetch-tags") is True
-            assert with_block.get("fetch-depth") == 0
-
-
-class TestVersionReuseGate:
-    """skip-existing converges re-entry silently; the reuse gate makes reuse
-    an explicit, admin-authorized act (fail closed unless
-    vars.RELEASE_RESUME_VERSION names the version) and divergence RED
-    (foreign artifacts under the version fail before publish).
-
-    The gate's BEHAVIOR is tested where it lives — the script itself, in
-    tests/test_release_gate_version_reuse.py. What belongs here is the
-    wiring: that the workflow invokes that script, hands it its seams, and
-    fetches it from `main` rather than from the pushed tag."""
-
-    def _steps(self, jobs):
-        return jobs["publish-pypi"].get("steps", [])
-
-    def _gate_index(self, jobs):
-        for i, step in enumerate(self._steps(jobs)):
-            if "PYPI_PROJECT_URL" in (step.get("env") or {}):
-                return i
-        return None
-
-    def test_reuse_gate_exists_before_the_publish_step(self, jobs):
-        steps = self._steps(jobs)
-        gate_idx = self._gate_index(jobs)
-        assert gate_idx is not None, "publish-pypi has no version-reuse gate"
-        publish_idx = next(
-            i for i, step in enumerate(steps)
-            if str(step.get("uses", "")).startswith(f"{PUBLISH_ACTION}@")
+    def test_build_sets_source_date_epoch(self, jobs):
+        runs = "\n".join(
+            str(step.get("run", "")) for step in jobs["build"]["steps"]
         )
-        assert gate_idx < publish_idx
+        assert "SOURCE_DATE_EPOCH" in runs
 
-    def test_reuse_gate_url_is_the_production_project_url(self, jobs):
-        """The exact https://pypi.org/project/<name>/ shape is a transform
-        contract with Ctl/rehearsal/derive-workflow.py."""
-        step = self._steps(jobs)[self._gate_index(jobs)]
+    def test_build_runs_both_pre_publish_gates(self, jobs):
+        """Reaching publish-pypi red spends the version and the tag; these
+        two gates are what stop the run before that."""
+        runs = [str(step.get("run", "")) for step in jobs["build"]["steps"]]
+        for gate in ("ci/check_build_constraint.py", "ci/publisher_metadata_gate.py"):
+            assert any(gate in run for run in runs), f"{gate} is not run by build"
+            assert (REPO_ROOT / gate).is_file()
+
+    def test_gates_run_after_the_build_and_before_the_upload(self, jobs):
+        steps = jobs["build"]["steps"]
+        build_idx = next(
+            i for i, s in enumerate(steps) if str(s.get("run", "")).strip() == "uv build"
+        )
+        upload_idx = next(
+            i
+            for i, s in enumerate(steps)
+            if str(s.get("uses", "")).split("@")[0] == "actions/upload-artifact"
+        )
+        gate_idxs = [
+            i for i, s in enumerate(steps) if "ci/" in str(s.get("run", ""))
+        ]
+        assert gate_idxs
+        assert build_idx < min(gate_idxs)
+        assert max(gate_idxs) < upload_idx
+
+    def test_upload_fails_on_an_empty_dist(self, jobs):
+        upload = _step_using(jobs["build"], "actions/upload-artifact")
+        assert upload["with"]["if-no-files-found"] == "error"
+
+
+class TestPublishStep:
+    def test_attestations_are_stated_explicitly(self, jobs):
+        step = _step_using(jobs["publish-pypi"], PUBLISH_ACTION)
+        assert step["with"]["attestations"] is True
+
+    def test_skip_existing_is_absent(self, jobs):
+        """PyPI refusing an upload for a version it already holds IS the
+        version-reuse gate; swallowing that refusal is what the deleted
+        gate script existed to compensate for."""
+        step = _step_using(jobs["publish-pypi"], PUBLISH_ACTION)
+        assert "skip-existing" not in step["with"]
+
+    def test_publish_environment_is_the_reviewed_pypi_environment(self, jobs):
+        environment = jobs["publish-pypi"]["environment"]
+        assert environment["name"] == "pypi"
         assert re.fullmatch(
-            r"https://pypi\.org/project/[^/]+/",
-            step["env"]["PYPI_PROJECT_URL"],
+            r"https://pypi\.org/project/[^/]+/", environment["url"]
         )
 
-    def test_reuse_gate_runs_the_repo_script(self, jobs):
-        """The gate is a script file with env seams, not a heredoc: a
-        heredoc is unreachable by pytest, ruff and pre-commit, so its first
-        execution would be a real release's publish job."""
-        step = self._steps(jobs)[self._gate_index(jobs)]
-        assert REUSE_GATE_SCRIPT.name in step["run"]
-        assert ".github/scripts/" in step["run"]
-        assert REUSE_GATE_SCRIPT.is_file(), f"{REUSE_GATE_SCRIPT} is missing"
-        assert REUSE_GATE_SCRIPT.stat().st_mode & 0o111, (
-            "gate script is not executable"
-        )
 
-    def test_reuse_gate_takes_the_resume_switch_from_an_actions_variable(self, jobs):
-        """The one way to publish over an existing version is an
-        admin-controlled Actions variable — same trust model as
-        RELEASE_ALLOWED_SIGNERS: never repo content, never a secret."""
-        step = self._steps(jobs)[self._gate_index(jobs)]
-        value = step["env"]["RELEASE_RESUME_VERSION"]
-        assert re.fullmatch(r"\$\{\{\s*vars\.RELEASE_RESUME_VERSION\s*\}\}", value)
+class TestGithubReleaseJob:
+    def test_download_passes_token_and_run_id(self, jobs):
+        """Without these the download uses the attempt-sensitive internal
+        backend, which 404s when only this job is re-run after a successful
+        publish (actions/download-artifact#486)."""
+        step = _step_using(jobs["github-release"], "actions/download-artifact")
+        assert step["with"]["github-token"] == "${{ secrets.GITHUB_TOKEN }}"
+        assert step["with"]["run-id"] == "${{ github.run_id }}"
 
-    def test_publish_job_checks_out_main_before_downloading_dist(self, jobs):
-        """The publish job holds id-token: write, so its code must come from
-        `main`, never from the pushed tag (the verify job's rule). The
-        checkout also has to precede the artifact download — checkout cleans
-        the workspace it lands in, which would delete dist/."""
-        steps = self._steps(jobs)
-        checkouts = [
-            i for i, step in enumerate(steps)
-            if str(step.get("uses", "")).split("@")[0] == "actions/checkout"
-        ]
-        assert checkouts, "publish job has no checkout for the gate script"
-        for i in checkouts:
-            assert steps[i].get("with", {}).get("ref") == "main"
-        download = next(
-            i for i, step in enumerate(steps)
-            if str(step.get("uses", "")).split("@")[0] == "actions/download-artifact"
-        )
-        assert max(checkouts) < download
+    def test_release_uploads_the_built_distributions(self, jobs):
+        step = _step_using(jobs["github-release"], RELEASE_ACTION)
+        assert step["with"]["files"] == "dist/*"
+        assert step["with"]["fail_on_unmatched_files"] is True
 
 
-class TestPublishStepPinning:
-    def test_skip_existing_is_true(self, publish_step):
-        assert publish_step["with"].get("skip-existing") is True
+class TestActionPinning:
+    """Both third-party actions are SHA-pinned with a version comment; the
+    two move together, deliberately, in one edit."""
 
-    def test_action_is_sha_pinned(self, publish_step):
-        ref = publish_step["uses"].split("@", 1)[1]
-        assert ref != "release/v1", "publish action uses the mutable release/v1 alias"
-        assert not re.fullmatch(r"v\d+", ref), (
-            f"publish action pinned to mutable major alias '{ref}'"
-        )
-        assert re.fullmatch(r"[0-9a-f]{40}", ref), (
-            f"publish action ref {ref!r} is not a full commit SHA pin"
-        )
-
-    def test_pin_comment_meets_attestations_floor(self, workflow_text):
-        """SHA pin carries a '# vX.Y.Z' comment; that version is the intent."""
-        pin_lines = [
+    def _pin_line(self, workflow_text, action):
+        lines = [
             line
             for line in workflow_text.splitlines()
-            if f"{PUBLISH_ACTION}@" in line and not line.lstrip().startswith("#")
+            if f"{action}@" in line and not line.lstrip().startswith("#")
         ]
-        assert len(pin_lines) == 1
-        match = re.search(r"#\s*v(\d+)\.(\d+)\.(\d+)\s*$", pin_lines[0])
-        assert match, (
-            "publish action pin lacks the '# vX.Y.Z' version comment "
-            f"(convention: SHA pin + comment): {pin_lines[0].strip()!r}"
+        assert len(lines) == 1, f"expected one {action} pin, found {len(lines)}"
+        return lines[0]
+
+    @pytest.mark.parametrize("action", PINNED_ACTIONS)
+    def test_pinned_to_a_full_commit_sha(self, workflow_text, action):
+        ref = self._pin_line(workflow_text, action).split(f"{action}@", 1)[1].split()[0]
+        assert re.fullmatch(r"[0-9a-f]{40}", ref), (
+            f"{action} ref {ref!r} is not a full commit SHA pin"
         )
+
+    @pytest.mark.parametrize("action", PINNED_ACTIONS)
+    def test_pin_carries_a_version_comment(self, workflow_text, action):
+        line = self._pin_line(workflow_text, action)
+        assert re.search(r"#\s*v\d+\.\d+\.\d+\s*$", line), (
+            f"{action} pin lacks the '# vX.Y.Z' version comment: {line.strip()!r}"
+        )
+
+    def test_publish_action_pin_meets_the_metadata_floor(self, workflow_text):
+        line = self._pin_line(workflow_text, PUBLISH_ACTION)
+        match = re.search(r"#\s*v(\d+)\.(\d+)\.(\d+)\s*$", line)
         version = tuple(int(part) for part in match.groups())
-        assert version >= ATTESTATIONS_FLOOR, (
+        assert version >= PUBLISH_ACTION_FLOOR, (
             f"publish action pinned at v{'.'.join(match.groups())}, below the "
-            f"attestations-by-default floor v{'.'.join(map(str, ATTESTATIONS_FLOOR))}"
+            f"floor v{'.'.join(map(str, PUBLISH_ACTION_FLOOR))} whose twine "
+            "accepts Metadata-Version 2.5"
         )
+
+    def test_the_metadata_gate_reads_this_same_pin(self, workflow_text, gate):
+        """The gate derives the publisher's tooling from the workflow pin
+        rather than from a copy of the versions, so the two cannot drift."""
+        pinned = self._pin_line(workflow_text, PUBLISH_ACTION)
+        assert gate.publisher_sha() in pinned
+
+
+class TestBuildConstraint:
+    def test_pyproject_pins_the_build_backend(self):
+        """build-system.requires resolves outside uv.lock, so this pin is
+        the only thing fixing the backend that decides our metadata
+        version. ci/check_build_constraint.py asserts it actually bound."""
+        with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+            pyproject = tomllib.load(handle)
+        constraints = pyproject["tool"]["uv"]["build-constraint-dependencies"]
+        assert any(c.replace(" ", "").startswith("setuptools==") for c in constraints)
+
+
+class TestMetadataGateIdentity:
+    """The gate reads its identity from the repository it runs in, so no
+    second spelling of the project name can fall out of step with
+    `[project]` in pyproject.toml."""
+
+    def test_project_name_comes_from_pyproject(self, gate):
+        with (REPO_ROOT / "pyproject.toml").open("rb") as handle:
+            declared = tomllib.load(handle)["project"]["name"]
+        assert gate.project_name() == declared
+
+    def test_no_project_name_is_hard_coded(self, gate):
+        source = (REPO_ROOT / "ci" / "publisher_metadata_gate.py").read_text()
+        assert 'PROJECT = "' not in source
+
+    def test_distribution_match_normalises_separators(self, gate, tmp_path, monkeypatch):
+        """PEP 503/427: `a-b` builds `a_b-<version>-...`. A plain
+        `glob(f"{name}-*")` would find nothing for such a project."""
+        dist = tmp_path / "dist"
+        dist.mkdir()
+        for name in (
+            "my_pkg-0.0.0-py3-none-any.whl",
+            "my_pkg-0.0.0.tar.gz",
+            "something_else-1.0.tar.gz",
+        ):
+            (dist / name).write_bytes(b"")
+        monkeypatch.setattr(gate, "REPO", tmp_path)
+        monkeypatch.setattr(gate, "project_name", lambda: "my-pkg")
+        found = [Path(p).name for p in gate.built_distributions()]
+        assert found == [
+            "my_pkg-0.0.0-py3-none-any.whl",
+            "my_pkg-0.0.0.tar.gz",
+        ]
+
+    def test_missing_dist_directory_is_not_a_crash(self, gate, tmp_path, monkeypatch):
+        monkeypatch.setattr(gate, "REPO", tmp_path)
+        assert gate.built_distributions() == []
