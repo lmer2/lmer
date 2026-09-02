@@ -195,22 +195,37 @@ Mechanics:
   release-taskdef sessions. Tags are created with `git tag -s`. Sessions
   of any other taskdef never receive the key or the PAT — that negative
   guarantee is tested, not assumed.
-- The release workflow's **first job verifies the tag**, with the trust
-  anchors kept **out of repo content**. This matters because a workflow
-  run on a tag executes the workflow from the tag's own tree — anything
-  committed to the repo can be altered by whoever pushes a tag:
-  - The expected signer public key is pinned in an admin-controlled GitHub
-    Actions repository variable, `vars.RELEASE_ALLOWED_SIGNERS`, not in a
-    checked-in file.
-  - The verify job's **checkout is pinned to `main`**, so the verification
-    script itself never comes from the tag's tree either. The workflow
-    *definition* still rides the tag ref — that residual is bounded by the
-    tag ruleset and PAT custody below, and the pin trims the tag-borne
-    attack surface to the workflow text alone.
-  - The job asserts the tag commit **equals the head of GitHub `main`**,
-    fetched from the API rather than read from the tag's tree.
-  - Signature invalid or absent, or tag not at `main` head → the pipeline
-    fails → nothing publishes.
+- **CI does not verify the tag signature.** It did once; that job was
+  removed in 0.9.0 along with `vars.RELEASE_ALLOWED_SIGNERS`. The release
+  workflow's first job is `checks` — the repository's own CI run on the
+  tagged commit — and no job in it reads a tag signature or compares the
+  tag against `main`. Tags are still signed, and that signature is still
+  evidence for a human reading history; nothing in the publish path
+  depends on it.
+
+  The reason it went is that it never carried the weight it appeared to.
+  A workflow triggered by a tag runs the workflow *definition* from that
+  tag's own tree, so whoever can push a tag can rewrite the job that
+  checks it. Pinning the trust anchor to an Actions variable and the
+  script checkout to `main` narrowed that surface but could not close it,
+  and the same PAT that pushes a tag can push `main` and the workflows on
+  it. A check an attacker can edit is not a control; it is a control's
+  shape. What replaced it is enforced by GitHub rather than by repository
+  content:
+  - **Who may cut a release** is the mirror's `v*` **tag ruleset**. The
+    workflow fires on any `v*` tag push and publishes what that tag names,
+    so the ruleset — with a bypass entry for the bot — is the gate on
+    the trigger itself.
+  - **What may deploy** is the `pypi` environment's **deployment
+    tag-pattern policy**, narrowing deployments to `v*` refs.
+  - **A human authorizes the publish** through the **required reviewer on
+    the `pypi` environment**. `publish-pypi` deploys to that environment,
+    so the run pauses there until a human approves. This is the only
+    control in the design that survives compromise of the release PAT,
+    and it is why it is a gating setup receipt rather than hardening.
+
+  All three live in repository settings, where a tag-borne workflow
+  cannot reach them.
 - The **PyPI trusted publisher registration is pinned** to the repo, the
   workflow path, and the `pypi` environment.
 - The `pypi` environment carries a **deployment tag-pattern policy**
@@ -230,11 +245,11 @@ and tags together, defeating all in-repo and variable-based checks. With
 the deployment tag-pattern policy in place, the remaining exposure under
 PAT compromise is **accepted**. Mitigations are custody (release sessions
 only), minimal collaborators on the mirror, tag protection, and PAT
-expiry. One hardening option is deliberately deferred: a required-reviewer
-rule on the `pypi` environment would add a one-click human approval on
-GitHub per release and is the only control here that fully survives PAT
-compromise — it trades away the hands-off flow, and remains available if
-that trade ever changes.
+expiry. The one control that fully survives PAT compromise — a
+required-reviewer rule on the `pypi` environment — is **no longer
+deferred**: it is now a gating setup receipt. It costs the hands-off
+flow one one-click human approval on GitHub per release, and that trade
+was accepted in 0.9.0 when CI stopped verifying tag signatures.
 
 Out of scope, chartered as its own future project: self-hosted sigstore
 (Fulcio/Rekor) for keyless signing from the canonical GitLab instance — the
@@ -252,65 +267,82 @@ public Fulcio CA does not trust self-managed GitLab as an OIDC issuer.
 > credential custody paths, rotation runbooks, and provisioning specifics
 > live in the private work repo.
 
-## 5. PyPI publish semantics — `skip-existing` and re-run drift
+## 5. PyPI publish semantics — version reuse and re-run drift
 
-The PyPI publish step in the release workflow sets `skip-existing: true`
-so a re-run after a partial failure (uploaded to PyPI, died before the
-GitHub Release step) converges instead of failing on "file already
-exists".
+The PyPI publish step sets **no `skip-existing`**. An upload refused
+because the version already exists on the index is the signal, not
+something to swallow — so **PyPI's own refusal is the version-reuse
+gate**. There is no `.github/scripts/gate-version-reuse.py` (deleted in
+0.9.0), no index pre-flight query, and no `RELEASE_RESUME_VERSION`
+override: the index is the single authority on whether a version is
+spent, and it is consulted at the moment it matters rather than
+predicted beforehand.
 
-That convergence is never silent, and never automatic: a version-reuse
-gate (`.github/scripts/gate-version-reuse.py`) runs before the publish
-step, querying the index's JSON API for the tag's version.
+This is a deliberate simplification of what came before. The old gate
+queried the index and then had to decide whether an existing version was
+*this* run resuming or a republish of different code — which it could
+not do. Distribution filenames are a pure function of (project name,
+version), so both cases produce byte-for-byte identical file lists;
+digests cannot separate them either, because the build is not
+bit-reproducible; and PEP 740 provenance binds the artifact to its run
+inside the signing certificate, not in the JSON the index API serves.
+Unable to tell them apart, the gate refused and asked an admin to set a
+variable. Letting the upload attempt fail reaches the same answer without
+the variable, the script, or the ambiguity — and without a switch whose
+whole purpose was to publish over a version the index already held.
 
-- **Version not on the index** — first publish, proceed.
-- **Version present, holding an artifact this run did not build** — fail
-  before publish. Never publish over a diverged release.
-- **Version present with exactly this run's filenames** — fail, unless the
-  `RELEASE_RESUME_VERSION` Actions repository **variable** names that exact
-  version. Then the run proceeds with a warning, and `skip-existing`
-  no-ops the overlap.
+**Recovery is "Re-run failed jobs", never a full re-run.** The workflow's
+four jobs are `checks` → `build` → `publish-pypi` → `github-release`, and
+a full re-run after a successful publish **can no longer converge**: with
+no `skip-existing`, `publish-pypi` would attempt an upload the index
+refuses and fail. Re-running only the failed jobs — `gh run rerun
+<run-id> --failed`, which re-runs failed jobs and their dependents —
+leaves a succeeded `publish-pypi` alone and lets `github-release` finish.
+That job's artifact download therefore carries an explicit
+`github-token` and `run-id`, so it finds the `dist` artifact from the
+original attempt rather than the attempt-sensitive default.
 
-The reason the last case fails by default is that it is genuinely
-ambiguous. Distribution filenames are a pure function of (project name,
-version), so a resumed publish and a *republish of different code under
-the same version* produce byte-for-byte identical file lists. Digests
-cannot separate them either — the build is not bit-reproducible, so a
-legitimate re-run's artifacts differ from what the index holds — and PEP
-740 provenance binds the artifact to its run inside the signing
-certificate, not in the JSON the index API serves. Since the gate cannot
-tell the two apart, it refuses and asks a human: an admin sets
-`RELEASE_RESUME_VERSION` to the version being resumed, re-runs the
-workflow, and clears the variable afterwards. Same trust model as
-`RELEASE_ALLOWED_SIGNERS` — an admin-controlled Actions variable, never
-repo content, never a secret. The gate logs both sides' filenames,
-sha256 digests, upload times and provenance URLs, so the decision is made
-against evidence.
+**A version that published is spent.** If `publish-pypi` succeeded, that
+version is permanent even if yanked — PyPI filenames are never reissued.
+Repair is a yank where warranted plus a **new patch version through the
+same flow**. Tags are never deleted or re-pointed.
 
-The gate script itself is checked out from `main`, never from the pushed
-tag: the publish job holds `id-token: write`, so nothing running in it may
-come from the tree being published (the same rule the tag-verification job
-follows).
+Two gates run in the `build` job, before anything is authenticated,
+because reaching `publish-pypi` red spends both the version and the tag:
 
-That leaves the residual caveat: on an authorized resume the upload is
-skipped, so the **attestations from the re-run are not what PyPI
-serves**. For this reason, receipts record **which Actions run actually
-uploaded**, and the last green run URL is never over-trusted as the
-provenance of the published artifact.
+- `ci/check_build_constraint.py` asks the built wheel which setuptools
+  generated it and compares that against the `[tool.uv]
+  build-constraint-dependencies` pin, so a constraint that silently
+  failed to bind is caught rather than looking identical to no
+  constraint. It is stdlib-only and **also runs pre-tag** in the
+  canonical GitLab pipeline's `build-package` job.
+- `ci/publisher_metadata_gate.py` checks `./dist` with the publish
+  action's *own* twine, built from that action's `requirements/runtime.txt`
+  fetched at the exact commit `release.yml` pins — so the gate cannot
+  drift from the publisher, because it is not a copy of the publisher.
+  This is what would have caught ctl #44, where the backend emitted
+  `Metadata-Version: 2.5` and the pinned action's twine understood only
+  2.4, after trusted publishing had already authenticated. It needs `uv`
+  and network egress to GitHub, so it runs only in the tag build.
 
 ## 6. Error paths
 
-- **Tag/version mismatch:** the workflow's verify-version job requires tag
-  `vX.Y.Z` to equal `pyproject.toml` at the tag.
+- **Tag/version mismatch:** a step in the workflow's `build` job requires
+  tag `vX.Y.Z` to equal `pyproject.toml` at the tag, before anything is
+  built.
+- **Build-gate failure:** the `build` job's two pre-publish gates (§5) fail
+  the run before `publish-pypi` and before anything authenticates. The tag
+  is spent, the version is not.
 - **GitHub publish failure:** the run reports the Actions run URL and
-  fails. Re-running Leg 2 converges (idempotency + `skip-existing`) —
-  unless the version already published, where the reuse gate (§5) stops
-  the re-run until an admin authorizes it via `RELEASE_RESUME_VERSION`.
-  No silent success either way.
+  fails. Recovery is **"Re-run failed jobs"** (`gh run rerun <run-id>
+  --failed`), never a full re-run — after a successful publish a full
+  re-run cannot converge, because there is no `skip-existing` and the
+  index refuses the second upload (§5). No silent success either way.
 - **Burned version:** PyPI filenames are permanent — once an upload
   succeeds for a version, that version is spent even if yanked. Repair is
   a yank (if warranted) plus a new patch version through the same flow;
-  tags are never deleted or re-pointed.
+  tags are never deleted or re-pointed. There is no override that
+  republishes over a spent version, deliberately (§5).
 - **GitHub `main` divergence** (non-fast-forward push): hard stop.
   Remediation is a human decision recorded in the run — never an
   automatic force-push.
@@ -336,8 +368,11 @@ provenance of the published artifact.
   therefore takes a uniquified address (`…-v<X.Y.Z>-<stamp>`) rather than
   keeping the seed address; see RUN-STATE.md §7, where one-slug-names-one-run
   is the invariant that makes this safe.
-- **Re-run artifact drift:** the `skip-existing` caveat in §5 — receipts
-  identify the uploading run, not merely the latest green one.
+- **Re-run artifact drift:** receipts identify the run that actually
+  uploaded, not merely the latest green one. With no `skip-existing` a
+  re-run cannot silently upload over a published version, but a partial
+  recovery still means the green run you are looking at may not be the one
+  that published (§5).
 
 ## 7. First production release — deferred with handoff
 
@@ -360,8 +395,9 @@ All of the following must hold before launching the run:
   operator decision (2026-08-28); there is no longer a way to exercise
   tag → build → publish → release against TestPyPI before doing it for
   real. The first production release IS the first exercise of the
-  workflow. Read §5's burned-version remediation before starting, because
-  it is the recovery path if the run goes wrong.
+  workflow. Read §5 before starting — its recovery ladder ("Re-run failed
+  jobs", never a full re-run) and its burned-version remediation are the
+  path if the run goes wrong.
 - **Gating operator receipts complete** — the deployment works the *gating*
   section of [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) in a copy
   filed with that release run's records in the work repo — its own run

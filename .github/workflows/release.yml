@@ -58,10 +58,23 @@ jobs:
       - name: Build distributions
         run: uv build
 
-      # Last line of defence, and the reason it is here rather than only in
-      # the merge-request pipeline: reaching the publish job red spends the
-      # version and the tag, neither of which can be re-cut. Both gates are
-      # stdlib-only, so they need no project environment.
+      # Both gates run here, before publish-pypi and before anything
+      # authenticates, because reaching the publish job red spends the version
+      # AND the tag, neither of which this repo re-cuts.
+      #
+      # Only the first has a pre-tag copy. The canonical GitLab pipeline runs
+      # check_build_constraint.py in its build-package job (merge requests,
+      # default branch and tags), so backend drift is normally caught on the
+      # merge request and this run is the backstop. publisher_metadata_gate.py
+      # has no pre-tag copy deliberately: it fetches the publish action's
+      # requirements/runtime.txt from raw.githubusercontent.com at the pinned
+      # action SHA and builds a throwaway env with uv, so putting it in the MR
+      # pipeline would make every merge request depend on GitHub being
+      # reachable. Its subject — the publisher's own twine — also only matters
+      # against the distributions actually being published.
+      #
+      # check_build_constraint.py is stdlib-only; publisher_metadata_gate.py
+      # needs uv and network.
       - name: Check the build constraint bound
         run: python ci/check_build_constraint.py
 

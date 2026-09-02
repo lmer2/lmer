@@ -112,12 +112,23 @@ build-package:
   script:
     - uv build
     - ls -la dist/
+    # Pre-tag home for the build-constraint gate. The release workflow runs
+    # this same script in its own build job, but that is on the tag — by then
+    # the tag is cut, and this repo never re-points or re-cuts one, so a
+    # backend drift caught there costs a version and a release cycle. Here it
+    # is caught on the merge request instead. Stdlib-only, so it adds no
+    # dependency to this job; its sibling ci/publisher_metadata_gate.py is
+    # deliberately NOT here (it needs network egress to raw.githubusercontent.com
+    # to fetch the publish action's pinned requirements, which would make every
+    # MR pipeline depend on GitHub being reachable).
+    - python ci/check_build_constraint.py
   artifacts:
     paths:
       - dist/*.whl
       - dist/*.tar.gz
     expire_in: 1 week
   rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_TAG
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 

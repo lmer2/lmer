@@ -194,23 +194,24 @@ To cut a release:
    git push origin v0.1.1
    ```
 
-   The tag must be signed by a key listed in `RELEASE_ALLOWED_SIGNERS`, and its commit must be exactly the current GitHub `main` head — never tag from a side branch or a stale checkout.
+   Tag from an up-to-date `main`, never from a side branch or a stale checkout. Tags are signed so history carries evidence of who cut a release — but note that **CI does not verify the signature**: the workflow publishes what any pushed `v*` tag names, and what actually restricts that is the mirror's `v*` tag ruleset plus the required reviewer on the `pypi` environment (see below).
 
-5. Watch the `Release to PyPI` workflow in the Actions tab. It will:
-   - Verify the tag signature and that the tag sits at `main` head as reported by the GitHub API (`.github/scripts/verify-tag-signature.sh`) — an unsigned tag, an unlisted signer, or a tag off `main` head fails the pipeline before anything publishes.
-   - Verify the tag version matches `pyproject.toml`.
-   - Re-run `pre-commit` and `pytest`.
-   - Build the wheel and sdist with `uv build`.
-   - Publish to PyPI using Trusted Publishing (no stored secrets), with PEP 740 attestations. `skip-existing: true` makes a workflow re-run of an already-published version a no-op rather than a failure.
-   - Create a GitHub Release with the artifacts attached.
+5. Watch the `Release to PyPI` workflow in the Actions tab. Its four jobs run in order:
+   - **checks** — the repository's own CI workflow, on the tagged commit. A tag on a red commit fails here before anything is built.
+   - **build** — verifies the tag version matches `pyproject.toml`, builds the wheel and sdist with `uv build`, then runs two pre-publish gates: the build-backend constraint must have bound, and the distributions must pass the publish action's own twine. Everything up to here holds no token.
+   - **publish-pypi** — deploys to the `pypi` environment, so it **pauses for the required reviewer's approval**, then publishes with Trusted Publishing (no stored secrets) and PEP 740 attestations. There is no `skip-existing`: an upload refused because the version already exists is the version-reuse gate, so a re-run cannot publish over a released version.
+   - **github-release** — creates the GitHub Release with the artifacts attached, only after the upload was accepted.
+
+   If a job fails, recover with **"Re-run failed jobs"** (`gh run rerun <run-id> --failed`) — never a full re-run, which after a successful publish can no longer converge.
 
 ### Prerequisites (one-time)
 
 - A PyPI **Trusted Publisher** binding must exist for project `lmer` pointing at workflow `release.yml` on `lmer2/lmer`, environment `pypi`. Configure at https://pypi.org/manage/project/lmer/settings/publishing/.
 - A GitHub **environment** named `pypi` must exist on `lmer2/lmer` (Settings → Environments).
-- An admin-controlled `RELEASE_ALLOWED_SIGNERS` Actions repository **variable** must exist on `lmer2/lmer` (Settings → Secrets and variables → Actions → Variables) containing the allowed-signers lines for the release signing keys. It is a variable, not a secret, and deliberately not a file in the repo — a tag push runs the workflow from the tag's own tree, so in-repo trust anchors could be rewritten by whoever pushes a tag.
+- That `pypi` environment must carry a **deployment tag-pattern policy** (`v*` refs only) and a **required reviewer**. These are what authorize a release now that CI no longer verifies tag signatures, and they live in repository settings where a tag-borne workflow cannot rewrite them.
+- A **`v*` tag ruleset** on `lmer2/lmer`, with a bypass entry for the release bot. The workflow fires on any `v*` tag push, so this ruleset is the gate on who may trigger a release at all.
 
-All three are set up by the maintainer; they don't need to be touched per release.
+These are set up by the maintainer; they don't need to be touched per release.
 
 ## Documentation
 
