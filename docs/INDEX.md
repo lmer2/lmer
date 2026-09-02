@@ -270,10 +270,10 @@ Canonical explanation of how a public release ships, as a tracked lmer run with 
 - Topology: canonical GitLab instance, GitHub as a read-only mirror/publish target, tokenless PyPI upload via trusted publishing (OIDC)
 - The two-leg release run (Leg 1 prep, human release-MR merge gate, Leg 2 ship) and the push ordering (GitHub green before any GitLab publish)
 - Watch/resume semantics, single-flight locking, and per-step idempotency keyed on the recorded merge SHA
-- The signing model (SSH-signed `v*` tags, `RELEASE_ALLOWED_SIGNERS` verification) and its honest residual-risk statement
-- `skip-existing` re-run drift, the version-reuse gate and its `RELEASE_RESUME_VERSION` resume switch, error paths, and the deferred first production release with its prerequisites
+- The signing model (SSH-signed `v*` tags — signed for history, **not verified by CI**) and where authorization actually sits: the mirror's `v*` tag ruleset, the `pypi` environment's tag-pattern policy, and its required reviewer — plus an honest residual-risk statement
+- Version reuse (no `skip-existing`; PyPI's own refusal is the gate), the "Re-run failed jobs" recovery ladder, error paths, and the deferred first production release with its prerequisites
 
-**Best for**: Understanding the release flow end-to-end, cutting a release, and evaluating the signing/verification threat model.
+**Best for**: Understanding the release flow end-to-end, cutting a release, and evaluating the publish-authorization threat model.
 
 ---
 

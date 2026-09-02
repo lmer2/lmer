@@ -58,6 +58,17 @@ None of them are free; each one closes a specific hole.
       environment binding does not survive PAT compromise: an unprotected
       environment can be requested by any workflow in the repo — see
       [RELEASE-FLOW.md](./RELEASE-FLOW.md) §4).
+- [ ] `pypi` environment has a **required reviewer** — at least one human
+      on the environment `publish-pypi` deploys to. **Do not skip this
+      one.** CI does not verify tag signatures (that job was removed in
+      0.9.0), so this is the human gate on publishing, and it is the only
+      control in the design that survives compromise of the release PAT:
+      with it, a `v*` tag pushed by anyone still pauses for a human before
+      anything reaches the index. Its cost is deliberate — the release run
+      waits on GitHub for that approval. Together with the tag ruleset and
+      the tag-pattern policy above, these three settings carry the
+      authorization the workflow used to enforce itself; all three live in
+      repository settings, where a tag-borne workflow cannot reach them.
 - [ ] PR/issue policy set: mirror repos accept **no PRs**. Disable issues
       unless the repo deliberately hosts them.
 
@@ -91,20 +102,18 @@ None of them are free; each one closes a specific hole.
 - [ ] Release SSH signing key provisioned via lmer credential provisioning
       to **release-taskdef sessions only**; public half registered on the
       bot GitHub account.
-- [ ] `RELEASE_ALLOWED_SIGNERS` GitHub Actions repository **variable** set
-      to the signer public key (admin-controlled variable, deliberately
-      not a checked-in file — a tag-triggered workflow runs from the tag's
-      own tree, so in-repo trust anchors can be altered by whoever pushes
-      a tag).
 - [ ] **Negative guarantee** holds: sessions of any other taskdef do
       not receive the PAT or the signing key. The provisioning-scoping
       test asserts this; confirm it passes for the new entries.
-- [ ] `RELEASE_RESUME_VERSION` Actions repository **variable** left
-      **unset**. It is the only switch that lets the version-reuse gate
-      ([RELEASE-FLOW.md](./RELEASE-FLOW.md) §5) publish over a version the
-      index already holds: an admin sets it to that exact version for one
-      deliberate resume and clears it immediately after. Never provision
-      it as standing configuration.
+> **Retired — do not set these.** `RELEASE_ALLOWED_SIGNERS` and
+> `RELEASE_RESUME_VERSION` were Actions repository variables this list
+> used to require. Both are gone as of 0.9.0: the workflow's
+> tag-signature verification and its version-reuse gate script were
+> deleted, and nothing reads either variable. Setting them configures
+> nothing. What replaced them is in §2 above — the tag ruleset, the
+> environment tag-pattern policy and the required reviewer — plus PyPI's
+> own refusal to accept a version it already holds, which is now the
+> version-reuse gate ([RELEASE-FLOW.md](./RELEASE-FLOW.md) §5).
 
 ## 3. Rotation runbook (PAT + signing key)
 
@@ -126,15 +135,17 @@ Fine-grained PATs **expire** (≤ 1 year). Before expiry:
 
 ### Signing-key rotation
 
-New key → update the Actions variable + bot account → next release uses
-it. **No repo commit is involved** at any step.
+New key → bot account → next release uses it. **No repo commit is
+involved** at any step, and no Actions variable either: CI stopped
+verifying tag signatures in 0.9.0, so rotation no longer touches
+repository configuration at all.
 
 - [ ] Generate a new release SSH signing key; store it only in the lmer
       credential-provisioning entry.
-- [ ] Update the `RELEASE_ALLOWED_SIGNERS` Actions variable with the new
-      public key.
 - [ ] Register the new public key on the bot GitHub account; remove the
-      old one.
+      old one. This is **display/attribution only** — it makes signed tags
+      show as verified in the GitHub UI. The publish path does not depend
+      on it.
 - [ ] The next release signs with the new key — nothing else to do.
 
 ## 4. Burned-version runbook
@@ -151,10 +162,13 @@ release:
       it is, on both remotes. `gate-push` and the pre-push hook refuse ref
       deletions outright, so removing one is a deliberate human act with
       plain git — not something a session can do on its way past.
-- [ ] Do **not** reach for `RELEASE_RESUME_VERSION` here. It authorizes
-      re-entering a publish for a version this run built; it does not make
-      a spent version reusable, and `skip-existing` would keep the
-      artifacts PyPI already serves.
+- [ ] There is **no override**, deliberately. `RELEASE_RESUME_VERSION`
+      and `skip-existing` are both gone as of 0.9.0, so nothing can
+      republish over a spent version: PyPI refuses the upload, and that
+      refusal is the gate ([RELEASE-FLOW.md](./RELEASE-FLOW.md) §5). If a
+      run died *after* a successful publish, that is not a burned version
+      — recover it with **"Re-run failed jobs"** (`gh run rerun <run-id>
+      --failed`), never a full re-run.
 
 ## 5. GitHub `main` divergence remediation
 
