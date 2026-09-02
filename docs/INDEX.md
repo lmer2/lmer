@@ -4,6 +4,20 @@ This directory contains comprehensive documentation for the LMER (LLM Environmen
 
 ## Documentation Files
 
+### [HOW-LMER-WORKS.md](./HOW-LMER-WORKS.md)
+**How lmer works**
+
+A one-page, end-user tour of every component and how they interact, in
+small mermaid charts: the big picture, the life of one session, the work
+repo as memory, gates, the platform and its ways of reaching you, harnesses,
+service mode and fan-out, the release flow — plus a list of the design's
+strong points.
+
+**Best for**: Understanding what lmer is and how the pieces fit before
+reading any reference page.
+
+---
+
 ### [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md)
 **Platform Quickstart**
 
@@ -306,7 +320,7 @@ One-time, operator-performed production configuration receipts for the lmer rele
 
 ## Quick Navigation
 
-- **New to LMER?** Start with [LMER-CLI.md](./LMER-CLI.md) to learn how to use the tool
+- **New to LMER?** Read [HOW-LMER-WORKS.md](./HOW-LMER-WORKS.md) for the picture, then [LMER-CLI.md](./LMER-CLI.md) to learn how to use the tool
 - **Setting up containers?** See [CONTAINER.md](./CONTAINER.md) for Docker/Podman configuration
 - **Having auth issues?** Check [AUTHENTICATION.md](./AUTHENTICATION.md) for SSH and API setup
 - **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md) and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption and operator setup

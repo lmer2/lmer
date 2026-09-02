@@ -6,6 +6,8 @@ It clones a target repo into a sandbox container, mounts a known set of developm
 
 Claude Code is the default and most fully integrated harness. [Codex](https://github.com/openai/codex) and [pi](https://github.com/earendil-works/pi) are supported at a core tier — select one with `--harness <name>` or `LMER_HARNESS`; see [docs/HARNESSES.md](docs/HARNESSES.md) for the capability matrix and per-harness setup.
 
+For a one-page tour of how the pieces fit together — with diagrams — see [docs/HOW-LMER-WORKS.md](docs/HOW-LMER-WORKS.md).
+
 Only `chat` ships as a built-in task in [taskdef/](taskdef/). Additional tasks can be loaded from the work-repo or from directories listed in `LMER_TASKDEF_PATHS` — see [docs/TASKDEFS.md](docs/TASKDEFS.md).
 
 > **Note on GitLab vs GitHub support:** Up to this point the priority has been making lmer behave nicely against GitLab — the `gitlab-review` toolset does a lot of heavy lifting to smooth that integration. GitHub generally works, but with this GitHub release the next focus is bringing GitHub interaction up to the same level of polish. Expect rough edges on the GitHub side until that work lands.
