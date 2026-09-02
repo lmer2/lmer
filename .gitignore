@@ -57,6 +57,3 @@ third-party-docs/
 
 # Local-only holding area (untracked scratch, reference clones)
 /LOCAL/
-
-# Rehearsal rig parameters (may carry credentials; see Ctl/rehearsal/README.md)
-Ctl/rehearsal/rig.env

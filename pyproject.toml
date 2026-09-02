@@ -1,4 +1,8 @@
 [build-system]
+# Deliberately a floor, not a pin: this is what downstream sees when it builds
+# our sdist, and pinning a backend for other people's builds is not ours to do.
+# Our own builds are pinned by [tool.uv] build-constraint-dependencies below;
+# read that as the real backend version, not this line.
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
@@ -111,6 +115,15 @@ package = true
 # has been public for at least a week). Relative-duration syntax requires uv
 # from Dec 2025 or later.
 exclude-newer = "1 week"
+# Build requirements resolve outside uv.lock, so build-system.requires above is
+# the one place the lockfile cannot reach and this is the only thing holding the
+# backend still. It is not cosmetic: setuptools decides the Metadata-Version of
+# what we publish, and the publish action's twine rejects anything newer than it
+# understands — after trusted publishing has already authenticated, on a tag
+# that cannot be re-cut (ctl #44). Moving this pin means re-running
+# ci/publisher_metadata_gate.py: the publish action decides whether the new
+# metadata version is publishable, and it gets the last word.
+build-constraint-dependencies = ["setuptools==84.0.0"]
 
 [dependency-groups]
 dev = [

@@ -19,6 +19,9 @@
 - Draw simple marks on an image — an arrow, a box, freehand — before sending it in a chat
 - Attach files to a chat: drag, paste or pick one and the agent on the other end can read it
 - Configurable upload types and per-file size limit for chat attachments
+- gate-check surfaces the path a project's custom test runner took, from an optional `gate-check: test-mode=<label>` line it prints, on the result line and in the gate receipt's summary (#307)
+- Two pre-publish gates on the release build: the build backend constraint must have bound, and the distributions must pass the publish action's own twine (#337)
+- The production setup checklist now gates on the controls that carry release authorization: the mirror's `v*` tag ruleset, the `pypi` environment policy, and a required reviewer on it (#337)
 ### Fixed
 - Matrix bridge: every outbound message failed with `EncryptionError: No group session created` because the crypto store's database was created with only the crypto upgrade table, leaving `mx_room_state` and `mx_user_profile` — the tables member lookup reads — absent. Both upgrade tables now run on that database
 - Matrix bridge: the appservice was constructed without a state store, so mautrix defaulted to a file-backed one at a relative path, unwritable in the image's working directory. The appservice and the crypto machine now share one database-backed store
@@ -32,6 +35,15 @@
 - `lmer_platform.client` is now a public module: `Endpoint`, `Call` and `request()` moved out of `lmer-ctl`, which re-exports them. Any host-side client of the platform API can use it; `lmer-ctl`'s own behaviour is unchanged
 - `lmer-matrix-bridge` reaches the platform daemon through `LMER_PLATFORM_URL`/`LMER_PLATFORM_SECRET` when they are set, falling back to the daemon's local secret file. A containerised bridge cannot use the daemon's bind address, which is its own loopback from inside. Note the trade: the value supplied that way is the platform's *shared* secret, so the bridge's calls arrive as the operator rather than as an attributable caller, and it stays valid until the secret is rotated by hand — unlike the minted per-incarnation credential the assistant container gets
 - Platform assistant sessions now have the shared-work-repo agent-memory route switched off outright, keeping their memory host-local
+- Release flow opens a dependency-refresh MR against prep-release once a release has shipped, for adopters declaring a `dep_refresh` parameter
+- The GitHub release workflow is now four jobs — checks, build, publish-pypi, github-release — with no `.github/scripts/` and no repository variables (#337)
+- The PyPI publish action moves to v1.14.2, whose twine accepts Metadata-Version 2.5, and states `attestations: true` explicitly (#337)
+- Release recovery re-runs the FAILED jobs only (`gh run rerun <run-id> --failed`); a full re-run after a successful publish can no longer converge (#337)
+### Removed
+- `skip-existing` on the PyPI publish step: an upload refused for an existing version is now the version-reuse gate (#337)
+- The retired `RELEASE_ALLOWED_SIGNERS` and `RELEASE_RESUME_VERSION` receipts from the production setup checklist: nothing reads either variable (#337)
+- The release rehearsal rig (`Ctl/rehearsal/`), its runbook, evidence files and the `LMER_REHEARSAL_*` variables: there is no longer a pre-release dry run against TestPyPI (#340)
+- Tag-signature verification from CI, along with the `RELEASE_ALLOWED_SIGNERS` and `RELEASE_RESUME_VERSION` repository variables; tags are still signed, and who may cut a release is now a tag ruleset plus the reviewed `pypi` environment (#337)
 ### Security
 - Relocked every Python and web dependency onto the newest version its declared range allows, clearing five published advisories in shipped dependencies: aiohttp 3.14.1 → 3.14.3 (GHSA-cq5v-8q36-5273, GHSA-mfx4-hv73-q22v, GHSA-mq44-7p77-q5h7), dompurify 3.4.12 → 3.4.14 (GHSA-55q2-fjhq-7xh7) and nanoid 3.3.16 → 3.3.18 (GHSA-2v37-7h3g-55p8) (#316)
 

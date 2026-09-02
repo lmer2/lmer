@@ -1,5 +1,0 @@
-{
-  "_fixture": "Test fixture for tests/test_rehearsal_leg2.py \u2014 invented leg-2 re-entry state, NOT recorded rehearsal evidence. Refs current and the release run green: the re-entry must derive skip.",
-  "refs_current": true,
-  "run_conclusion": "success"
-}

@@ -10,7 +10,6 @@ import pytest
 
 from lmer_cli import cli, clone_cache
 from lmer_cli.cli import (
-    REHEARSAL_CREDENTIAL_ENVS,
     RELEASE_GITHUB_TOKEN_ENV,
     RELEASE_SIGNING_KEY_ENV,
     RELEASE_TASK_ID,
@@ -85,8 +84,7 @@ class TestCliEnvDictDeclaresNapkinTaskdef:
 class TestReleaseCredentialEnv:
     """The release credential scoping gate (_release_credential_env):
     production credentials (fine-grained GitHub PAT + release SSH signing
-    key) reach release-taskdef sessions ONLY; the rig-scoped rehearsal
-    credentials reach every session, env-borne only (spec §5, F5/F6)."""
+    key) reach release-taskdef sessions ONLY (spec §5)."""
 
     @pytest.fixture()
     def fake_home(self, tmp_path):
@@ -96,7 +94,7 @@ class TestReleaseCredentialEnv:
 
     @pytest.fixture(autouse=True)
     def _clean_release_env(self, monkeypatch):
-        for key in (RELEASE_GITHUB_TOKEN_ENV, RELEASE_SIGNING_KEY_ENV, *REHEARSAL_CREDENTIAL_ENVS):
+        for key in (RELEASE_GITHUB_TOKEN_ENV, RELEASE_SIGNING_KEY_ENV):
             monkeypatch.delenv(key, raising=False)
 
     # --- positive path: release-taskdef session ---
@@ -170,35 +168,12 @@ class TestReleaseCredentialEnv:
         assert RELEASE_GITHUB_TOKEN_ENV in entries
         assert RELEASE_SIGNING_KEY_ENV in entries
 
-    # --- rig-scoped rehearsal credentials (R3/F5/F6) ---
-
-    def test_non_release_session_receives_rig_vars(self, monkeypatch):
-        """POSITIVE: a non-release (masterplan/rehearsal) session DOES
-        receive the rig-scoped rehearsal variables."""
-        monkeypatch.setenv("LMER_REHEARSAL_GITHUB_TOKEN", "github_pat_rig")
-        monkeypatch.setenv("LMER_REHEARSAL_TESTPYPI_TOKEN", "pypi-rig-token")
-        monkeypatch.setenv("LMER_REHEARSAL_SIGNING_KEY", "/home/u/.ssh/rig_key")
-        entries, mounts, fatal = _release_credential_env("docker", "masterplan")
-        assert fatal is None
-        assert entries["LMER_REHEARSAL_GITHUB_TOKEN"] == "github_pat_rig"
-        assert entries["LMER_REHEARSAL_TESTPYPI_TOKEN"] == "pypi-rig-token"
-        assert entries["LMER_REHEARSAL_SIGNING_KEY"] == "/home/u/.ssh/rig_key"
-        # F5/F6: rig provisioning is env-vars ONLY — the rehearsal signing
-        # key is never delivered through the production key mount builder.
-        assert mounts == []
-
-    def test_release_session_also_receives_rig_vars(self, monkeypatch):
-        monkeypatch.setenv("LMER_REHEARSAL_GITHUB_TOKEN", "github_pat_rig")
-        entries, _, _ = _release_credential_env("docker", RELEASE_TASK_ID)
-        assert entries["LMER_REHEARSAL_GITHUB_TOKEN"] == "github_pat_rig"
-
 
 class TestCliEnvDictDeclaresReleaseCredentials:
     """Source-level guard (env-var convention §4, the
     test_cli_env_dict_declares_reasoning_effort pattern): main()'s env dict
     spreads the gate's entries so the production credentials are always
-    seeded (blocking the .env merge and preset seeding leak paths) and the
-    rehearsal variables are declared passthrough."""
+    seeded (blocking the .env merge and preset seeding leak paths)."""
 
     def test_release_entries_spread_into_env_dict(self):
         source = CLI_PY.read_text()
@@ -213,13 +188,6 @@ class TestCliEnvDictDeclaresReleaseCredentials:
         assert RELEASE_GITHUB_TOKEN_ENV == "LMER_RELEASE_GITHUB_TOKEN"
         assert RELEASE_SIGNING_KEY_ENV == "LMER_RELEASE_SIGNING_KEY"
 
-    def test_rehearsal_names_frozen(self):
-        """Names frozen in Ctl/rehearsal/README.md (credential isolation)."""
-        assert REHEARSAL_CREDENTIAL_ENVS == (
-            "LMER_REHEARSAL_GITHUB_TOKEN",
-            "LMER_REHEARSAL_TESTPYPI_TOKEN",
-            "LMER_REHEARSAL_SIGNING_KEY",
-        )
 
     def test_release_task_id_frozen(self):
         assert RELEASE_TASK_ID == "release"
