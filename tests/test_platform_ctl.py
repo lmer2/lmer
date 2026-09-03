@@ -435,6 +435,19 @@ ROUTE_TABLE = [
     (["runs", "resume", RUN_KEY, "--taskdef", "review", "--direction", "go on"],
      "POST", "/api/runs/resume", None,
      {**RUN_FIELDS, "taskdef": "review", "direction": "go on"}),
+    # --session has to arrive as the body's session_id: dropped, the resume
+    # continues whichever launch the run resolves to — the newest — so an
+    # operator naming an older one would be answered about a different record.
+    (["runs", "resume", RUN_KEY, "--session", "20260824-165230-2-31245"],
+     "POST", "/api/runs/resume", None,
+     {**RUN_FIELDS, "session_id": "20260824-165230-2-31245"}),
+    # The named spelling travels verbatim too, so the address a fleet row shows
+    # can be pasted straight back (lmer_platform.resume._require_session matches
+    # on both halves).
+    (["runs", "resume", RUN_KEY, "--session",
+      "20260824-165230-2-31245--auth-rate-limit"],
+     "POST", "/api/runs/resume", None,
+     {**RUN_FIELDS, "session_id": "20260824-165230-2-31245--auth-rate-limit"}),
     (["runs", "meta", "get", RUN_KEY], "GET", "/api/runs/meta",
      RUN_FIELDS, None),
     (["runs", "meta", "set", RUN_KEY, "--title", "auth fix"], "POST",

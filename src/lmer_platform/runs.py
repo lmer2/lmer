@@ -33,6 +33,36 @@ clone to get history, and it *infers* an answer the operator can simply state. A
 wrong inference here means either hiding your own work or showing someone else's,
 and both are worse than asking.
 
+What the session-unit record does NOT change (issue #353)
+---------------------------------------------------------
+In schema form a launch's record lives in its own session directory,
+``<project>/_runs/<slug>/<session-id>[--<name>]/``, and one slug groups every
+launch against one (taskdef, target) pair (D22). None of that reaches this
+index, deliberately:
+
+- **The key does not move.** :func:`run_key` stays ``host/project/slug``, which
+  is what ``runs.json``, :mod:`lmer_platform.meta`, :mod:`lmer_platform.relations`
+  and the check-in marks are all keyed by. The session id is part of the
+  ADDRESS, never the identity — the same distinction the container has drawn
+  since a named run's directory stopped being its slug (#87 D1).
+- **No session list is stored.** An entry already carries
+  ``last_session_id`` — the newest session this orchestrator ran for the run,
+  which in schema form is also the name of that session's directory, so it is
+  exactly the hint an operator needs to reach one of several sessions grouped
+  under a slug. A list of the others was considered and rejected: the durable
+  answer to "what launches exist for this run" is ``ls _runs/<slug>/`` in the
+  work repo, which stays right when a colleague launches a session this
+  orchestrator never saw, and a copy here would go stale the moment they did.
+  This index scopes the fleet (D25); it is not a second record.
+- **An address is never stored** — see :attr:`TrackedRun.key`. A session dir
+  makes that more true, not less: which of a slug's session dirs is the current
+  one is something only the mirror can answer, so a directory is *found*
+  (:func:`lmer_platform.workrepo.resolve_run_dir`) and only what found it names
+  one.
+
+:meth:`TrackedRun.from_dict` reads the keys it knows and ignores the rest, so an
+index written by a build that stores more than this one does still loads.
+
 Storage is one JSON snapshot (``runs.json``) rather than a file per run: the
 daemon is its only writer, entries are tiny, and the whole set is read on every
 state build — the conditions under which a single snapshot is simpler than a

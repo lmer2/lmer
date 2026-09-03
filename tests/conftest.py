@@ -12,6 +12,18 @@ import pytest
 
 from lmer_cli import gate_lock, precommit_cache, user_harnesses
 
+# The shared lmer-schema (plexus) fixture trees (issue #353) live in
+# tests/plexus_fixtures.py; re-exporting the fixtures here is what registers
+# them for every module. `pytest_plugins` is not an option in this conftest
+# (it is not the rootdir one), and the builder module deliberately imports
+# nothing from here, so this import cannot cycle. It is keyed on the sibling
+# file because TestLeakGuardEndToEnd (test_workrepo_isolation_guard.py) copies
+# this conftest verbatim into a pytester dir and needs it self-contained; in
+# the real tree a missing sibling still fails loud, as "fixture not found" in
+# every consumer.
+if Path(__file__).with_name("plexus_fixtures.py").is_file():
+    from tests.plexus_fixtures import legacy_plexus, schema_plexus  # noqa: F401
+
 _OUTDATED_TREE_MSG = (
     "tests/conftest.py needs the #233 write-attribution layer "
     "(work_repo.write_journal and gate_lock journal-only markers), but this "

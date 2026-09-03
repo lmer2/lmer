@@ -560,6 +560,7 @@ def parse_args(
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
+    parser.add_argument("--session", dest="session", help="Session id of the run record this launch continues, exported to the container as LMER_SESSION_ID. In a schema-form work repo that variable decides which record everything in the container writes in (<project>/_runs/<slug>/<session-id>[--<name>]/, spec D22), so a resume that names one lands IN the record the operator asked to continue instead of opening a fresh one beside it. This flag is the only supported source: an LMER_SESSION_ID in the host environment is deliberately NOT read (see the env dict), because every lmer container exports one.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
     parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
     parser.add_argument("--model", dest="model", help="Model the harness runs, exported to the container as LMER_LLM_NAME (env: LMER_LLM_NAME; the flag wins over it, and over a preset's env). Forwarded verbatim to the harness's own --model flag by the runner scripts — lmer never validates it, the harness rejects what it does not know. Also implies the harness when neither --harness nor LMER_HARNESS is set (e.g. --model gpt-5.5 selects codex).")
@@ -1284,6 +1285,51 @@ def _display_sources_config_cli() -> None:
     print("---")
 
 
+#: A session id names ONE directory inside a run's group, so it is a path
+#: SEGMENT: no separator, no empty/`.`/`..` segment, and no character
+#: ``Path.glob`` would expand rather than compare. Same rule as
+#: ``work_repo.run_state._usable_session_id`` and its container-side twin
+#: ``clone_and_exec._usable_session_id`` — deliberately, because a value those
+#: two refuse opens no record at all in the container, and the operator is
+#: HERE. No grammar beyond it: the ``--<name>`` half of a session dir is
+#: unconstrained (docs/SCHEMA.md), so a regex would refuse ids that are on
+#: disk right now. The agreement is pinned by tests/test_lmer_cli_args.py,
+#: this module having no work_repo import to share the rule through.
+_UNSAFE_SESSION_SEGMENTS = frozenset({"", ".", ".."})
+_SESSION_PATTERN_CHARS = "*?["
+
+
+def _session_id_refusal(session: str) -> str | None:
+    """Why *session* cannot name a session directory, or None when it can.
+
+    Whitespace is refused rather than stripped: the value becomes a directory
+    name, and silently rewriting an id sends the launch to a directory the
+    operator did not type. (The platform strips its own field before it
+    reaches this flag, so this refusal answers a hand-typed value.)
+    """
+    if not session.strip():
+        return "it is empty"
+    if session != session.strip():
+        return "it is padded with whitespace"
+    if "/" in session or "\\" in session:
+        return "it contains a path separator"
+    if session in _UNSAFE_SESSION_SEGMENTS:
+        return "it is not a name"
+    if session.startswith("."):
+        # Reserved, not merely unsafe — and the only shape here that opens a
+        # record instead of failing to. Every walk over a group skips
+        # dot-children (a dot-dir there is a `.new-*` seed mid-rename), so a
+        # `.hidden` id writes a complete record that `work sessions`, the
+        # fleet view and every later resume are blind to, while the session
+        # itself sees nothing wrong. Refused in all three copies of this rule
+        # rather than only here: `work session-start --session .hidden`
+        # reaches the same address by the kernel's own explicit route.
+        return "it starts with a dot, which names a seed directory"
+    if any(char in session for char in _SESSION_PATTERN_CHARS):
+        return "it contains a wildcard character"
+    return None
+
+
 def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
     """Validate mutually exclusive / dependent options on a parsed namespace.
 
@@ -1317,6 +1363,22 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
             "--service-group requires --checkout (path to local source checkout)"
         )
         return 2
+    if ns.session is not None:
+        # Refused here, where the operator can read it. The value becomes a
+        # directory name in the work repo (D22), and every layer below this
+        # one degrades quietly instead of refusing: the container-side guards
+        # treat an unusable id as NO launch id, so the session would start,
+        # open no record, and look normal until nothing could be resumed.
+        refusal = _session_id_refusal(ns.session)
+        if refusal is not None:
+            error(
+                f"--session {ns.session!r} is not a usable session id: {refusal}. "
+                "A session id names ONE launch inside the run's group "
+                "(<project>/_runs/<slug>/<session-id>), never a path or a "
+                "pattern — copy one from `work sessions` or from the fleet "
+                "view's row for the run."
+            )
+            return 2
     return None
 
 
@@ -2805,6 +2867,19 @@ def main(argv: list[str] | None = None) -> int:
         # question-stop. Applied in-container by `work session-start` before
         # the brief prints.
         "LMER_ANSWER": ns.answer if ns.answer else None,
+        # The record this launch continues (issue #353 D22). Sourced from
+        # --session ONLY — no os.environ fallback, and the reason is stronger
+        # here than for the two flag-only entries above. LMER_SESSION_ID is
+        # exported inside EVERY lmer container (libexec/harness-common.sh,
+        # libexec/claude-runner.sh), so an agent that runs `lmer` to spawn a
+        # child session always has one in its own environment; a fallback
+        # would route every such child into its PARENT's record, leaving two
+        # containers writing one state file — the collision the session-level
+        # record exists to prevent. Absent (None, not "") without the flag,
+        # because clone_and_exec.mint_session_id mints with setdefault: an
+        # empty string is a value it would NOT replace, and the launch would
+        # run with no usable id and open no record at all.
+        "LMER_SESSION_ID": ns.session if ns.session else None,
         "LMER_DISABLE_SUPERVISOR": "1" if ns.no_supervisor else None,
         # Forward the initial auto-/start delay so a host-set value reaches
         # the supervisor running inside the container.

@@ -109,10 +109,22 @@ if command -v claude >/dev/null 2>&1; then
     # Resolving to anything but the FIRST candidate means the canonical
     # location is absent: warn so operators fix the first candidate (with
     # the default list, that means moving the mirror into the taskdef repo).
+    #
+    # Default order: the taskdef repo is canonical. The work repo is a
+    # deprecated plugin source in EITHER of its spellings — the deprecation
+    # is about which repo, not the directory name — so both work-repo
+    # entries warn. The lmer schema (D18) renames the work repo's mirrors/
+    # to _agents/mirrors/; the schema form is preferred, and the legacy bare
+    # name stays LAST so the blind fallthrough lands where it always has.
+    # LMER_MASTERPLAN_MIRROR_CANDIDATES is operator-settable, so a candidate
+    # can be neither work-repo path: such a custom candidate is only reported
+    # as "not the canonical (first) candidate" — the work-repo arms match
+    # $LMER_WORK_REPO_PATH specifically, never a look-alike path elsewhere.
+    WORK_REPO="${LMER_WORK_REPO_PATH:-/work}"
     MIRROR=""
     FIRST=""
     LAST=""
-    IFS=':' read -ra CANDIDATES <<< "${LMER_MASTERPLAN_MIRROR_CANDIDATES:-/taskdef/mirrors/masterplan:/work/mirrors/masterplan}"
+    IFS=':' read -ra CANDIDATES <<< "${LMER_MASTERPLAN_MIRROR_CANDIDATES:-/taskdef/mirrors/masterplan:/work/_agents/mirrors/masterplan:/work/mirrors/masterplan}"
     for candidate in "${CANDIDATES[@]}"; do
         [ -n "$candidate" ] || continue
         [ -n "$FIRST" ] || FIRST="$candidate"
@@ -121,9 +133,29 @@ if command -v claude >/dev/null 2>&1; then
             MIRROR="$candidate"
         fi
     done
-    MIRROR="${MIRROR:-$LAST}"
+    DEPRECATION=" — the work-repo fallback is deprecated in either form; configure LMER_TASKDEF_REPO with a taskdef repo shipping mirrors/masterplan"
+    MIRROR_HINT=""
+    if [ -z "$MIRROR" ]; then
+        MIRROR="$LAST"
+        MIRROR_FORM="no candidate exists; attempting the last one blindly"
+        # Nothing exists anywhere, so the fix is the same whatever the list.
+        MIRROR_HINT="$DEPRECATION"
+    else
+        # Say WHICH fallback was hit: the schema-form path is the right place
+        # inside the work repo but still not the taskdef repo; the bare name
+        # is doubly stale (wrong repo AND pre-schema name), so nudge the
+        # rename too. A custom candidate is neither: the deprecation sentence
+        # is about the work repo, so it gets no claim it cannot earn.
+        case "$MIRROR" in
+            "$WORK_REPO"/_agents/mirrors/masterplan)
+                MIRROR_FORM="schema-form work-repo mirror"; MIRROR_HINT="$DEPRECATION" ;;
+            "$WORK_REPO"/mirrors/masterplan)
+                MIRROR_FORM="legacy bare-name work-repo mirror; the schema names it _agents/mirrors/"; MIRROR_HINT="$DEPRECATION" ;;
+            *) MIRROR_FORM="custom candidate" ;;
+        esac
+    fi
     if [ "$MIRROR" != "$FIRST" ]; then
-        echo "⚠️  masterplan: mirror resolved to $MIRROR, not the canonical (first) candidate ($FIRST) — that fallback is deprecated; configure LMER_TASKDEF_REPO with a taskdef repo shipping mirrors/masterplan" >&2
+        echo "⚠️  masterplan: mirror resolved to $MIRROR ($MIRROR_FORM), not the canonical (first) candidate ($FIRST)$MIRROR_HINT" >&2
     fi
     # >&2 on each: `claude plugin` success chatter goes to stdout, and this
     # script's stdout contract is the bare bundle root (the gated caller

@@ -146,7 +146,14 @@ from .spawn import (
 )
 from .store import utc_now_iso
 from .ui_build import dist_dir
-from .workrepo import mirror_status, pull, resolve_run_dir, run_dirs
+from .workrepo import (
+    fold_registry,
+    folded_identity,
+    mirror_status,
+    pull,
+    resolve_run_dir,
+    run_dirs,
+)
 
 logger = logging.getLogger("lmer_platform.api")
 
@@ -600,6 +607,16 @@ def _run_files_reply(
     A run absent from the mirror answers ``present: false`` with no files, which
     is a state and not an error: a freshly spawned run has pushed nothing yet.
 
+    Every path in the reply is ``ref.rel_path`` — the address the resolver
+    recorded — joined with a file name, and never a path composed from the
+    ``(host, project, slug)`` the request carried. Those three are the run's
+    IDENTITY and two of them are not where it lives: a named run sits in
+    ``runs/<slug>--<name>`` (T90), and in schema form the whole record is a
+    session dir under a project named by the registry rather than by its repo
+    (issue #353, D7/D22). Composing here would produce a link to a directory that
+    does not exist, which is the shape of the bug T90 fixed and the reason
+    :class:`lmer_platform.workrepo.RunDirRef` carries an address at all.
+
     The forge is resolved exactly as ``web_url_for`` resolves it — the operator's
     ``work_repo_forge`` when set, then the host, then GitLab. T66 shipped this call
     with no default on the reasoning that a guessed layout 404s, and that was the
@@ -741,8 +758,14 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     return payload
 
 
-#: What a root has to call the directory its taskdefs live in.
+#: What a root has to call the directory its taskdefs live in. Two names in the
+#: work repo: ``_taskdef`` is the schema-owned one (issue #353, D6/§2) and the
+#: bare name is grandfathered until a tree migrates, so both are read, in that
+#: order — the container's own order (:func:`lmer_cli.container.taskdefs.
+#: work_repo_taskdef_dirs`). The built-in root below keeps the bare name alone:
+#: it is a code checkout, not a plexus.
 _TASKDEF_DIRNAME = "taskdef"
+_WORK_TASKDEF_DIRNAMES = ("_taskdef", _TASKDEF_DIRNAME)
 
 
 def _package_taskdef_root() -> Path:
@@ -810,24 +833,120 @@ def _builtin_taskdef_root() -> Optional[Path]:
     return None
 
 
-def _mirror_project_dir(mirror: Path, host: str, project: str) -> Optional[Path]:
-    """``{mirror}/{host}/{project}``, or ``None`` when that is not inside the mirror.
+def _inside_mirror(root: Path, candidate: Path) -> Optional[Path]:
+    """*candidate* resolved, or ``None`` when it does not land inside *root*.
 
     The containment re-check is the one in :func:`_safe_asset`, for the same
-    reason: ``host``/``project`` come out of a repo URL a caller supplied, and
+    reason: the segments below come out of a repo URL a caller supplied, and
     ``_parse_repo_url`` hands back whatever path that URL had — ``..`` segments
     included. Without this, a crafted repo URL would aim the taskdef search at a
     directory outside the mirror and the menu would report what it found there.
+    Resolving first also refuses a project dir that is a *symlink* out of the
+    mirror. *root* is expected already resolved.
+    """
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
+
+
+def _mirror_project_dir(mirror: Path, host: str, project: str) -> Optional[Path]:
+    """``{mirror}/{host}/{project}``, or ``None`` when that is not inside the mirror.
+
+    The host bucket (issue #353, D9): where a repo nobody has named yet keeps its
+    work, and where every project in a tree with no manifest lives. Positional on
+    purpose — that path is derived from the remote, so it is the one place the
+    work repo still encodes identity — and it is a permanent holding form rather
+    than a transitional one, so this never retires. Which record areas the
+    project holds (``runs/``, ``_runs/``, both) is not part of the question.
     """
     if not (host and project):
         return None
     root = mirror.resolve()
+    return _inside_mirror(root, root / host / project)
+
+
+def _plexus_project_dir(mirror: Path, repo_url: Optional[str]) -> tuple:
+    """``(schema-form project dir, problem)`` for *repo_url* in the mirror (D20).
+
+    The second tree shape (issue #353): with a ``_plexus.yaml`` at the mirror
+    root the project dir is a flat top-level SHORT NAME (D7), and nothing in a
+    repo URL says which name that is — only the registry does (D8). So the URL is
+    looked up across every entry's ``repo:`` and ``remotes:`` through
+    :mod:`lmer_schema`, which is the one definition of both the normalization
+    (D21) and the registry rules; a second copy here would offer the operator a
+    menu the container disagrees with, the same trade the taskdef discovery
+    imports at the top of this module make.
+
+    Three answers, and the third is the one that matters:
+
+    - **no manifest** — the tree is legacy, ``(None, None)``, and the caller
+      falls through to the host bucket exactly as it always did;
+    - **no registry entry** — the repo is unnamed, also ``(None, None)``: names
+      are never derived (D9), so its work is in the bucket and stays there,
+      visibly unnamed, until a human names it;
+    - **a manifest that is present but unusable** — ``(None, <reason>)``, and the
+      caller drops BOTH project tiers. Fail-closed, matching
+      :func:`lmer_cli.container.taskdefs._plexus_project_dir`: a one-character
+      typo in a migrated tree must not silently point the search back at the
+      stale pre-migration ``{host}/{project}`` bucket, which is the demotion D20
+      exists to make impossible. The global tier is not a project claim and is
+      unaffected.
+
+    A failure to *import* the core is not a broken manifest — it is a checkout
+    with nothing schema-shaped in it — so it degrades to legacy and says
+    nothing, the split D20 draws for the work CLI's resolver.
+    """
     try:
-        candidate = (root / host / project).resolve()
-        candidate.relative_to(root)
-    except (OSError, RuntimeError, ValueError):
-        return None
-    return candidate
+        from lmer_schema import ManifestError, has_manifest, load_registry
+    except ImportError:  # pragma: no cover - the package ships with this one
+        return None, None
+    if not has_manifest(mirror):
+        return None, None
+    try:
+        registry = load_registry(mirror)
+    except ManifestError as exc:
+        return None, str(exc)
+    except OSError as exc:  # pragma: no cover - load_manifest wraps these
+        return None, f"unreadable: {exc}"
+    if registry is None or not repo_url:
+        return None, None
+    project = registry.lookup(repo_url)
+    if project is None:
+        return None, None
+    return _inside_mirror(mirror.resolve(), project.dir(mirror)), None
+
+
+def _mirror_project_dirs(
+    mirror: Path, host: str, project: str, repo_url: Optional[str]
+) -> list:
+    """Every project dir in the mirror this repo's work could be filed under.
+
+    Schema form first, then the host bucket — the container's order, and the
+    order the schema gives them: a migrated tree answers from its registry, and
+    the bucket is what holds a repo the registry does not name (D9). Both are
+    offered when both exist, because a tree migrates one project at a time and
+    the taskdefs may not have moved with the runs yet.
+
+    Empty on an unusable manifest, which drops the bucket too — see
+    :func:`_plexus_project_dir` for why that is not merely conservative.
+    """
+    schema_dir, problem = _plexus_project_dir(mirror, repo_url)
+    if problem is not None:
+        logger.warning(
+            "platform_mirror_manifest_unusable path=%s problem=%s — the project "
+            "taskdef tier is dropped rather than resolved against the "
+            "pre-migration path",
+            mirror / "_plexus.yaml", problem,
+        )
+        return []
+    roots = [schema_dir] if schema_dir is not None else []
+    bucket = _mirror_project_dir(mirror, host, project)
+    if bucket is not None:
+        roots.append(bucket)
+    return roots
 
 
 def _work_repo_taskdef_dirs(
@@ -838,13 +957,17 @@ def _work_repo_taskdef_dirs(
 ) -> list:
     """The work repo's taskdef tiers, read off this daemon's mirror (T73).
 
-    The container searches ``{work}/{host}/{project}/taskdef`` and then
-    ``{work}/taskdef`` before anything else
+    The container searches the project's own tiers and then the work repo's
+    global one before anything else
     (:func:`lmer_cli.container.taskdefs.work_repo_taskdef_dirs`), and the mirror
     (spec D24) is a full checkout of that same repo — so the tiers the operator
     keeps their own taskdefs in were never invisible from the host, only unwired.
     Returned in the container's order, existing directories only, so the search
-    below reads as the precedence it implements.
+    below reads as the precedence it implements. That order is now over two tree
+    shapes (issue #353): the registered project dir (:func:`_plexus_project_dir`)
+    and the ``{host}/{project}`` host bucket (:func:`_mirror_project_dir`),
+    each probed for ``_taskdef/`` and then the grandfathered ``taskdef/``, and
+    the mirror root itself last for the global tier.
 
     The project tier needs a project, which is why *target* and *repo_url* are
     here: they go through the same pair the spawn itself would
@@ -874,14 +997,23 @@ def _work_repo_taskdef_dirs(
             taskdef="", target=target or "", repo_url=repo_url or None
         )
         # The slug is discarded: a taskdef tier is a property of the repository,
-        # not of the run. This call is here for the host/project pair only.
-        host, project, _slug = derive_run_identity(request, _repo_urls(request)[1])
+        # not of the run. This call is here for the host/project pair only. The
+        # identity URL is kept because in schema form the project dir is resolved
+        # by registry lookup of that same URL, not by a path built from the pair.
+        #
+        # The config is passed for the same reason the spawn passes it: a launch
+        # URL that is a project's secondary remote derives the project's PRIMARY
+        # identity (D8), so the host bucket probed below is the one that project's
+        # pre-migration work sits in rather than a bucket named after a mirror.
+        identity_url = _repo_urls(request)[1]
+        host, project, _slug = derive_run_identity(request, identity_url, config)
 
         dirs = []
-        project_root = _mirror_project_dir(mirror, host or "", project or "")
-        if project_root is not None:
-            dirs.append(project_root / _TASKDEF_DIRNAME)
-        dirs.append(mirror / _TASKDEF_DIRNAME)
+        roots = _mirror_project_dirs(
+            mirror, host or "", project or "", identity_url
+        ) + [mirror]
+        for root in roots:
+            dirs.extend(root / name for name in _WORK_TASKDEF_DIRNAMES)
         return [path for path in dirs if path.is_dir()]
     # Deliberately everything, and scoped tighter than the caller's catch: a
     # mirror that is a broken symlink, or a repo URL nothing can be parsed out
@@ -1344,10 +1476,15 @@ def create_app(
             "                              fresh session carrying the answer\n"
             "  POST /api/runs/resume       continue a tracked run by starting its\n"
             "                              next session {host,project,slug,\n"
-            "                              taskdef?,repo_url?,direction?}. The\n"
-            "                              taskdef defaults to the run's recorded\n"
-            "                              one; naming another starts a sibling run\n"
-            "                              against the same target. A refusal here\n"
+            "                              taskdef?,repo_url?,direction?,\n"
+            "                              session_id?}. The taskdef defaults to\n"
+            "                              the run's recorded one; naming another\n"
+            "                              starts a sibling run against the same\n"
+            "                              target. session_id continues ONE launch\n"
+            "                              of a slug that groups several — the\n"
+            "                              newest by default — and an id that names\n"
+            "                              none of them is a 409 session_not_found\n"
+            "                              listing the ones there are. A refusal\n"
             "                              carries {code,message} — two of them ask\n"
             "                              for one more field rather than failing\n\n"
             "One session's terminal:\n"
@@ -2197,7 +2334,23 @@ def create_app(
         why it is a separate route with a name that says so. Tracked runs are
         flagged so the list is usable as a picker.
         """
-        tracked_keys = {(e.host, e.project, e.slug) for e in list_tracked()}
+        # Both sides of the membership test are folded to the project's
+        # primary remote (D8), for the reason `workrepo.folded_identity`
+        # gives: a row adopted by hand under the secondary spelling — the URL
+        # the operator actually cloned from — is keyed there, while the walk
+        # keys every directory on the primary. Comparing raw pairs read that
+        # disagreement as "untracked" and invited a second row for a
+        # directory that already had one, which is the defect the fold exists
+        # to close, reappearing one level up. A no-op in a legacy tree, and
+        # for every row whose key is already the primary.
+        # Read the registry ONCE for the whole listing: every row and every
+        # walked directory is folded, and re-parsing `_plexus.yaml` per fold
+        # meant twenty-odd reads of one unchanging file to answer one question.
+        registry = fold_registry(config)
+        tracked_keys = {
+            folded_identity(config, e.host, e.project, registry=registry) + (e.slug,)
+            for e in list_tracked()
+        }
         return {
             "candidates": [
                 {
@@ -2205,7 +2358,11 @@ def create_app(
                     "project": ref.project,
                     "slug": ref.slug,
                     "rel_path": ref.rel_path,
-                    "tracked": (ref.host, ref.project, ref.slug) in tracked_keys,
+                    "tracked": folded_identity(
+                        config, ref.host, ref.project, registry=registry
+                    )
+                    + (ref.slug,)
+                    in tracked_keys,
                 }
                 for ref in run_dirs(config)
             ],
@@ -2505,10 +2662,20 @@ def create_app(
         Keyed on the **run** and shaped like ``/api/runs/answer`` for the same
         reason: the session that stopped has exited (spec D15), so there is nothing
         to type into and continuing means spawning. The body is
-        ``/api/runs/adopt``'s plus the three things a caller may say about a resume
+        ``/api/runs/adopt``'s plus the four things a caller may say about a resume
         — ``taskdef`` (the override that starts a sibling run against the same
-        target), ``repo_url`` and ``direction``. All three are optional, and none is
-        coerced: a non-string keeps its own refusal instead of arriving as ``None``.
+        target), ``repo_url``, ``direction`` and ``session_id``. All four are
+        optional, and none is coerced: a non-string keeps its own refusal instead of
+        arriving as ``None``.
+
+        ``session_id`` names ONE launch of a slug that now groups several complete
+        records (spec D22), and it is the work repo's record dir rather than the
+        ``s-…`` session this route starts — two different namespaces, neither
+        derived from the other (:mod:`lmer_platform.resume`). Omitted means the
+        record the run resolves to, which is the newest launch and the one the
+        fleet view offers; an id naming none of them, or two, is refused as
+        ``session_not_found`` (409) carrying the list of launches there are, so a
+        client can turn it into a picker rather than into "cannot".
 
         **202, not 200**, exactly as the answer route is: when this returns a
         session has been started and nothing else has happened yet. The run claims
@@ -2536,6 +2703,10 @@ def create_app(
                 taskdef=body.get("taskdef"),
                 repo_url=body.get("repo_url"),
                 direction=body.get("direction"),
+                # Verbatim, like the three above: the resume path validates it as a
+                # path segment and imposes no grammar beyond that, because the
+                # ``--<name>`` half of a session dir has none (docs/SCHEMA.md).
+                session_id=body.get("session_id"),
             )
             result = resume_run(config, request)
         except ResumeError as exc:

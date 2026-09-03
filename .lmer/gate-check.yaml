@@ -41,10 +41,19 @@ tests:
     - tests/test_harness_runners.py
     - tests/test_import_provenance.py
     - tests/test_integration.py
+    # Reads docs/SCHEMA.md: TestTheCodeTableMatchesTheDocument asserts the
+    # registered check codes and the document's table match both ways, so a
+    # text-only edit to SCHEMA.md must run it.
+    - tests/test_lmer_schema_cli.py
+    - tests/test_lmer_schema_manifest.py
     - tests/test_masterplan_provisioning.py
     - tests/test_performance.py
     - tests/test_platform_ask.py
     - tests/test_platform_image.py
+    # Reaches docs/LMER-CLI.md through `Path(__file__).resolve().parents[1]`,
+    # an idiom the scanner does not model — found by hand-audit during #353,
+    # exactly the case the header above warns this list is a floor for.
+    - tests/test_platform_nudge.py
     - tests/test_platform_web_app.py
     - tests/test_platform_web_assistant.py
     - tests/test_platform_web_bundle.py
@@ -56,8 +65,8 @@ tests:
     - tests/test_rules_structure.py
     - tests/test_run_state_wiring.py
     - tests/test_security.py
-    - tests/test_signal_guard.py
     - tests/test_self_dev_pythonpath.py
+    - tests/test_signal_guard.py
     - tests/test_supervisor.py
     - tests/test_taskdef_render_matrix.py
     - tests/test_user_harnesses.py

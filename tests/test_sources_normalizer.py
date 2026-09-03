@@ -75,6 +75,8 @@ class TestNormalizeRepoUrl:
             "https://Git.Example.Com:443/agents/taskdefs",
             "git@git.example.com:agents/taskdefs.git",
             "git@git.example.com:agents/taskdefs",
+            "git.example.com:agents/taskdefs.git",
+            "git.example.com:agents/taskdefs",
             "ssh://git@git.example.com/agents/taskdefs.git",
             "ssh://git@git.example.com:22/agents/taskdefs",
         ]
@@ -84,6 +86,105 @@ class TestNormalizeRepoUrl:
     def test_pure_no_credential_injection(self):
         # A clean URL comes back clean — the normalizer never adds auth.
         assert "@" not in normalize_repo_url("https://git.example.com/a/b.git")
+
+
+class TestUserlessScpForm:
+    """Git's scp syntax is ``[<user>@]<host>:<path>`` — the user is optional.
+
+    Review finding (wave 1): the parser took its scp branch only when it
+    found userinfo, so the userless spelling fell through to the "all path"
+    reading and ``host:org/repo.git`` normalized to ``host:org/repo`` while
+    ``git@host:org/repo.git`` normalized to ``host/org/repo`` — two keys for
+    one repo, which is the D8 property the registry lookup rests on. The
+    userless form is not exotic: a checkout cloned through an ssh_config
+    ``Host`` alias reports it from ``git remote get-url`` for life.
+
+    The rule is git's own — no scheme and a ``:`` before any ``/`` — with
+    two scheme-less shapes deliberately kept OUT of the scp branch, both
+    pinned below: a bare-digit segment after the colon is a port (the
+    normalizer's own canonical spelling of a ported repo), and the
+    ambiguous ``a:b/c@d`` shape stays hostless (callers refuse it).
+    """
+
+    USERLESS = "git.example.com:agents/taskdefs.git"
+
+    def test_userless_scp_form_normalizes_like_https(self):
+        assert normalize_repo_url(self.USERLESS) == CANONICAL
+
+    def test_userless_and_user_qualified_scp_forms_are_one_repo(self):
+        # The exact reproduction from the review.
+        assert normalize_repo_url("git.example.com:acme/widgets.git") == \
+            normalize_repo_url("git@git.example.com:acme/widgets.git") == \
+            "git.example.com/acme/widgets"
+
+    def test_userless_scp_form_has_a_host(self):
+        # So the trust rule can compare it, rather than reporting host ''.
+        assert repo_url_host(self.USERLESS) == "git.example.com"
+        assert repo_url_host("Git.Example.COM:agents/taskdefs") == "git.example.com"
+
+    def test_userless_scp_form_carries_no_credential(self):
+        assert url_has_embedded_credential(self.USERLESS) is False
+
+    def test_absolute_path_after_the_colon(self):
+        # `host:/srv/git/x.git` is scp-form with an absolute path (git
+        # accepts it); the leading separator is dropped like a scheme URL's.
+        assert normalize_repo_url("git.example.com:/srv/git/x.git") == "git.example.com/srv/git/x"
+        assert repo_url_host("git.example.com:/srv/git/x.git") == "git.example.com"
+
+    def test_ported_canonical_form_is_a_port_not_an_scp_path(self):
+        # `host:2222/path` is what normalize_repo_url itself emits for a
+        # non-default port, so it must re-normalize to itself — under git's
+        # raw rule it would read as host `host`, path `2222/path`, and a
+        # manifest carrying the canonical ported key would silently miss.
+        ported = "git.example.com:2222/agents/taskdefs"
+        assert normalize_repo_url(ported) == ported
+        assert normalize_repo_url(ported) == \
+            normalize_repo_url("ssh://git@git.example.com:2222/agents/taskdefs")
+        # ...and stays the opaque reading a bare `host/path` gets: no host.
+        assert repo_url_host(ported) == ""
+
+    def test_bare_digits_to_the_end_are_a_port_too(self):
+        assert normalize_repo_url("git.example.com:2222") == "git.example.com:2222"
+        assert repo_url_host("git.example.com:2222") == ""
+
+    def test_ported_host_with_at_in_path_keeps_its_prior_reading(self):
+        # The shape _userinfo_boundary's digit guard already reads as a
+        # ported host; the scp rule agrees with it rather than re-deciding.
+        assert normalize_repo_url("host:8080/org/repo@v1.git") == "host:8080/org/repo@v1"
+
+    def test_user_qualified_form_is_the_way_to_spell_an_all_digit_segment(self):
+        # The residual ambiguity, documented on _parse_repo_url: a top-level
+        # path segment that really is all digits needs the user (or a
+        # scheme) to be read as a path.
+        assert normalize_repo_url("git@git.example.com:2024/reports") == \
+            "git.example.com/2024/reports"
+        assert normalize_repo_url("git.example.com:2024/reports") == \
+            "git.example.com:2024/reports"
+
+    def test_ambiguous_shape_stays_hostless(self):
+        # TestAmbiguousSchemeLessShape's guarantee, restated against the new
+        # branch: `a:b/c@d` has a `:` before any `/` but is NOT taken as
+        # userless scp — neither reading is reported as a host, and the
+        # string is left opaque exactly as before.
+        assert repo_url_host("git.example.com:org/re@po.git") == ""
+        assert normalize_repo_url("git.example.com:org/re@po.git") == "git.example.com:org/re@po"
+
+    def test_bare_paths_and_canonical_forms_are_untouched(self):
+        # (The leading separator has always been stripped with the trailing one.)
+        assert normalize_repo_url("/srv/git/repo.git") == "srv/git/repo"
+        assert normalize_repo_url(CANONICAL) == CANONICAL
+        assert repo_url_host(CANONICAL) == ""
+        # A `/` before the first `:` is not the scp shape.
+        assert normalize_repo_url("srv/git:repo") == "srv/git:repo"
+
+    def test_scheme_urls_are_unchanged_by_the_scp_rule(self):
+        # The scp branch is scheme-less only; these are the scheme-form
+        # readings pinned above, with a digit segment and a colon in the
+        # path for good measure.
+        assert normalize_repo_url("https://git.example.com/2222/x.git") == "git.example.com/2222/x"
+        assert normalize_repo_url("https://git.example.com/a:b/c") == "git.example.com/a:b/c"
+        assert normalize_repo_url("https://git.example.com:8443/agents/taskdefs") == \
+            "git.example.com:8443/agents/taskdefs"
 
 
 class TestRepoUrlHost:

@@ -1475,3 +1475,1006 @@ def test_a_slug_that_is_not_a_directory_name_is_never_globbed(config, slug):
     assert workrepo.resolve_run_dir(
         config, "gitlab.example.com", "agents/global", slug
     ) is None
+
+
+# --- the schema-form session record (issue #353, D7/D9/D22) -----------------
+#
+# In schema form the unit of record is the SESSION: one launch owns
+# ``<project>/_runs/<slug>/<session-id>[--<name>]/`` and ``_runs/<slug>/`` is a
+# grouping level nothing is ever written at (docs/SCHEMA.md, "Sessions and
+# runs"). ``<project>`` is the registered SHORT NAME — a flat top-level dir with
+# no host segment (D7) — or, for a repo nobody has named yet, the
+# ``{host}/{project}/`` host bucket at whatever depth its project-shaped dir
+# sits (D9). The legacy shared ``{host}/{project}/runs/<slug>/`` tree is read in
+# place and unchanged.
+
+#: Session ids in the schema-form grammar: timestamp-first, so they sort in
+#: start order (docs/SCHEMA.md). The second is the later launch.
+SESSION_ID = "20260824-165230-2-31245"
+LATER_SESSION_ID = "20260825-090000-2-31300"
+
+#: The remote every registered fixture project is bound to, and the identity
+#: derived from it. The port is deliberate: it belongs to the registry KEY and
+#: never to a host directory (!254 contract decision 2).
+FIXTURE_REPO = "ssh://git@gitlab.example.com:2222/acme/widgets.git"
+FIXTURE_IDENTITY = ("gitlab.example.com", "acme/widgets")
+
+
+def _plant_manifest(config, projects, *, name="example-plexus"):
+    """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
+    (config.mirror_path / "_plexus.yaml").write_text(
+        yaml.safe_dump({"schema": 1, "name": name, "projects": projects}),
+        encoding="utf-8",
+    )
+    return config.mirror_path / "_plexus.yaml"
+
+
+def _plant_session_run(config, project_dir, slug, session_id, *, state=True,
+                       recorded_slug=None, extra=None, area="_runs"):
+    """One schema-form session dir, ``<project_dir>/<area>/<slug>/<session-id>/``."""
+    path = config.mirror_path.joinpath(
+        *project_dir.split("/"), *area.split("/"), slug, session_id
+    )
+    path.mkdir(parents=True, exist_ok=True)
+    if state:
+        record = {
+            "schema": 1,
+            "slug": slug if recorded_slug is None else recorded_slug,
+            "status": "in-progress",
+        }
+        record.update(extra or {})
+        (path / "state.yaml").write_text(yaml.safe_dump(record), encoding="utf-8")
+    return path
+
+
+def _by_slug(config):
+    return {ref.slug: ref for ref in workrepo.run_dirs(config)}
+
+
+def test_run_dirs_find_a_flat_short_name_session_dir(config):
+    """D7's primary shape: a project dir with NO host segment at all."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    planted = _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    ref = _by_slug(config)["develop-2"]
+
+    assert ref.path == planted
+    assert ref.slug == "develop-2", "the session id is an address, never the key"
+    assert (ref.host, ref.project) == FIXTURE_IDENTITY
+
+
+def test_run_dirs_take_a_flat_project_identity_from_the_registry(config):
+    """The path is never the identity (D7/D8): ``widgets/`` says nothing about
+    which repo it holds, so the run key comes from the entry's ``repo:`` — and
+    the port that makes a distinct registry key never reaches a host name."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    ref = _by_slug(config)["develop-2"]
+
+    assert ref.host == "gitlab.example.com", "the host directory carries no port"
+    assert ref.project == "acme/widgets"
+    assert "widgets/" not in f"{ref.host}/{ref.project}", (
+        "the short name is the address, not the identity"
+    )
+
+
+def test_run_dirs_fall_back_to_the_identity_the_run_recorded(config):
+    """A flat dir with no registry entry is not automatically dark: the record
+    itself may say which repo it belongs to. The path still says nothing."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"other": {"repo": "git@gitlab.example.com:acme/other.git"}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID,
+                       extra={"repo": FIXTURE_REPO})
+
+    ref = _by_slug(config)["develop-2"]
+
+    assert (ref.host, ref.project) == FIXTURE_IDENTITY
+
+
+def test_run_dirs_skip_a_flat_project_with_no_recoverable_identity(config, caplog,
+                                                                   announcing):
+    """Nothing is derived from the directory name (D9). A candidate offered under
+    a key nothing can resolve is worse than one the operator is told about."""
+    workrepo.ensure_clone(config)
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    with caplog.at_level("INFO", logger="lmer_platform.workrepo"):
+        slugs = [ref.slug for ref in workrepo.run_dirs(config)]
+
+    assert slugs == ["develop-1"], "only the legacy fixture run"
+    said = [r.getMessage() for r in caplog.records
+            if "platform_run_dir_unidentified" in r.getMessage()]
+    assert len(said) == 1 and "widgets" in said[0]
+
+
+def test_run_dirs_survive_an_unusable_manifest(config):
+    """A broken ``_plexus.yaml`` is the validator's problem. This is a read path
+    the fleet view polls: it loses the runs whose identity that file held, and
+    nothing else."""
+    workrepo.ensure_clone(config)
+    (config.mirror_path / "_plexus.yaml").write_text("projects: [", encoding="utf-8")
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    assert [ref.slug for ref in workrepo.run_dirs(config)] == ["develop-1"], (
+        "the legacy tree still reads"
+    )
+
+
+def test_run_dirs_find_a_host_bucket_session_dir_at_any_depth(config):
+    """D9: an unnamed repo's work stays at ``{host}/{project}/``, and the bucket
+    descends to the first project-shaped dir at WHATEVER depth — no cap."""
+    workrepo.ensure_clone(config)
+    _plant_session_run(
+        config, "git.example.com/acme/team/sub/widgets", "review-mr-3", SESSION_ID
+    )
+
+    ref = _by_slug(config)["review-mr-3"]
+
+    assert (ref.host, ref.project) == ("git.example.com", "acme/team/sub/widgets")
+    assert ref.rel_path == (
+        f"git.example.com/acme/team/sub/widgets/_runs/review-mr-3/{SESSION_ID}"
+    )
+
+
+def test_run_dirs_read_all_three_shapes_from_one_mirror(config):
+    """Co-existence is the point (D16/D20): one mirror holds a migrated project,
+    an unnamed repo's bucket and the legacy shared tree at the same time."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    _plant_session_run(config, "git.example.com/acme/unnamed", "review-mr-3", SESSION_ID)
+
+    found = {ref.slug: (ref.host, ref.project) for ref in workrepo.run_dirs(config)}
+
+    assert found == {
+        "develop-2": FIXTURE_IDENTITY,
+        "review-mr-3": ("git.example.com", "acme/unnamed"),
+        "develop-1": ("gitlab.example.com", "agents/global"),
+    }
+
+
+def test_run_dirs_rel_path_is_the_session_dir_that_holds_the_record(config):
+    """The address is the directory an operator can open, in either shape."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    by_slug = _by_slug(config)
+
+    assert by_slug["develop-2"].rel_path == f"widgets/_runs/develop-2/{SESSION_ID}"
+    assert by_slug["develop-2"].rel_path.split("/") == list(
+        by_slug["develop-2"].path.relative_to(config.mirror_path).parts
+    ), "the address is the path that was found, not a composed one"
+
+
+def test_run_dirs_never_read_the_grouping_level_as_a_run(config):
+    """``_runs/<slug>/`` groups launches and holds nothing (D22). A state file
+    left there by hand is not a run — a dir under ``_runs/`` is one only through
+    its session children."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    group = config.mirror_path / "widgets" / "_runs" / "develop-2"
+    group.mkdir(parents=True)
+    (group / "state.yaml").write_text("schema: 1\n", encoding="utf-8")
+
+    assert [ref.slug for ref in workrepo.run_dirs(config)] == ["develop-1"]
+
+
+def test_run_dirs_require_a_state_file_in_the_session_dir(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID, state=False)
+
+    assert [ref.slug for ref in workrepo.run_dirs(config)] == ["develop-1"]
+
+
+def test_run_dirs_skip_the_seed_dir_of_a_session_being_written(config):
+    """``_runs/.new-<session-id>-*/`` is transient tooling state mid-rename."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    seed = config.mirror_path / "widgets" / "_runs" / f".new-{SESSION_ID}-a1b2"
+    seed.mkdir(parents=True)
+    (seed / "state.yaml").write_text("schema: 1\n", encoding="utf-8")
+
+    assert [ref.slug for ref in workrepo.run_dirs(config)] == ["develop-1"]
+
+
+def test_run_dirs_do_not_descend_into_a_session_dir(config):
+    """A session dir is a complete record, not a tree to hunt through — and a
+    masterplan bundle inside one is a foreign writer's (D12)."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    session = _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    nested = session / "masterplan" / "_runs" / "inner" / LATER_SESSION_ID
+    nested.mkdir(parents=True)
+    (nested / "state.yaml").write_text("schema: 1\nslug: inner\n", encoding="utf-8")
+
+    slugs = sorted(ref.slug for ref in workrepo.run_dirs(config))
+
+    assert slugs == ["develop-1", "develop-2"], "the bundle is opaque"
+
+
+def test_run_dirs_ignore_archived_sessions(config):
+    """One archive home (D13): ``<project>/_archive/_runs/<slug>/<session-dir>/``
+    is a retired record, exactly as legacy ``runs/archive/`` never listed."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "old-run", SESSION_ID, area="_archive/_runs")
+
+    assert [ref.slug for ref in workrepo.run_dirs(config)] == ["develop-1"]
+
+
+def test_run_dirs_ignore_a_top_level_schema_runs_dir(config):
+    """A bare ``_runs/`` at the root of the plexus belongs to no project."""
+    workrepo.ensure_clone(config)
+    _plant_session_run(config, ".", "orphan", SESSION_ID)
+
+    assert [ref.slug for ref in workrepo.run_dirs(config)] == ["develop-1"]
+
+
+def test_run_dirs_offer_one_candidate_per_slug_at_its_newest_session(config):
+    """Two launches on one target are two records and ONE run identity (D22).
+
+    The listing is the adoption picker and adoption keys on
+    ``host/project/slug``, so offering a slug once per session dir would offer
+    one key several times — the defect the legacy listing already refuses. The
+    address is the newest session dir, which session ids sort into last.
+    """
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    _plant_session_run(config, "widgets", "develop-2", LATER_SESSION_ID)
+
+    listed = [ref for ref in workrepo.run_dirs(config) if ref.slug == "develop-2"]
+
+    assert len(listed) == 1, "one run identity is one candidate"
+    assert listed[0].rel_path == f"widgets/_runs/develop-2/{LATER_SESSION_ID}"
+
+
+def test_run_dirs_keep_the_slug_when_a_session_dir_is_named(config):
+    """``work name`` renames the SESSION dir now, not ``runs/<slug>``. The
+    identity is untouched by it; only the address moves."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", f"{SESSION_ID}--the-name")
+
+    ref = _by_slug(config)["develop-2"]
+
+    assert ref.dir_name == f"{SESSION_ID}--the-name"
+    assert ref.rel_path == f"widgets/_runs/develop-2/{SESSION_ID}--the-name"
+
+
+def test_run_dirs_key_a_schema_form_run_by_the_slug_it_records(config):
+    """Identity is the recorded ``state.slug`` (issue #87 D1), with the grouping
+    dir as the fallback for a record that does not say."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "release-widgets", SESSION_ID,
+                       recorded_slug="release-widgets-v0.8.0")
+
+    slugs = sorted(ref.slug for ref in workrepo.run_dirs(config))
+
+    assert slugs == ["develop-1", "release-widgets-v0.8.0"]
+
+
+def test_run_dirs_fall_back_to_the_grouping_name_when_the_record_is_silent(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    path = _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    (path / "state.yaml").write_text("schema: 1\n", encoding="utf-8")
+
+    assert sorted(ref.slug for ref in workrepo.run_dirs(config)) == [
+        "develop-1", "develop-2"
+    ]
+
+
+def test_run_dirs_list_two_groups_claiming_one_slug_by_their_own_names(config,
+                                                                      caplog,
+                                                                      announcing):
+    """The ``masterplan`` case in schema form: a claim that names more than one
+    grouping dir is reported as found, never guessed at."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "one", SESSION_ID,
+                       recorded_slug="masterplan")
+    _plant_session_run(config, "widgets", "two", SESSION_ID,
+                       recorded_slug="masterplan")
+
+    with caplog.at_level("INFO", logger="lmer_platform.workrepo"):
+        slugs = sorted(ref.slug for ref in workrepo.run_dirs(config))
+
+    assert slugs == ["develop-1", "one", "two"]
+    said = [r.getMessage() for r in caplog.records
+            if "platform_run_dir_listed_by_name" in r.getMessage()]
+    assert len(said) == 2
+
+
+def test_run_dirs_skip_transient_and_archived_dirs_in_the_legacy_tree(config):
+    """The same two skips the schema-form half makes, in the shape that has had
+    them longest: a ``runs/.new-<session-id>-*`` seed is a directory mid-rename
+    (``work_repo.run_state.seed_run_dir``) and ``runs/archive/`` is where a
+    finished record is retired to. Neither is a candidate to adopt."""
+    workrepo.ensure_clone(config)
+    runs_dir = config.mirror_path / "gitlab.example.com" / "agents" / "global" / "runs"
+    for name in (f".new-{SESSION_ID}-a1b2", "archive"):
+        planted = runs_dir / name
+        planted.mkdir(parents=True, exist_ok=True)
+        (planted / "state.yaml").write_text("schema: 1\n", encoding="utf-8")
+
+    assert [ref.slug for ref in workrepo.run_dirs(config)] == ["develop-1"]
+
+
+# --- resolving a tracked run in schema form (issue #353, D7/D9/D22) ----------
+#
+# The other half of the shape above. ``resolve_run_dir`` is fed an IDENTITY the
+# local run index holds — ``(host, project, slug)`` — and has to find that run's
+# record wherever this tree keeps it: the legacy ``{host}/{project}/runs/<slug>/``
+# directory, the host bucket's ``{host}/{project}/_runs/<slug>/<session-id>/``
+# (whose path is still derived from the remote, D9), or a registered project's
+# flat ``<short-name>/_runs/<slug>/<session-id>/``, where the short name is only
+# discoverable by reading the registry backwards (D7/D8). Nothing is re-keyed:
+# the slug stays the identity in every shape and only the address moves.
+
+
+def _resolve(config, slug, identity=FIXTURE_IDENTITY):
+    return workrepo.resolve_run_dir(config, identity[0], identity[1], slug)
+
+
+def _mirror_contents(config):
+    """Every path under the mirror with its size and mtime, for a no-write check."""
+    return sorted(
+        (str(path.relative_to(config.mirror_path)), path.stat().st_size,
+         path.stat().st_mtime_ns)
+        for path in config.mirror_path.rglob("*")
+        if ".git/" not in f"{path.relative_to(config.mirror_path)}/"
+    )
+
+
+def test_resolve_run_dir_finds_a_flat_short_name_session_dir(config):
+    """D7's primary shape: the record is a session dir under a project dir whose
+    name is an address the identity cannot be composed from."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    planted = _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    ref = _resolve(config, "develop-2")
+
+    assert ref is not None, "a migrated project's run must not read as absent"
+    assert ref.path == planted
+    assert ref.slug == "develop-2", "no re-key: the slug is still the identity"
+    assert ref.dir_name == SESSION_ID
+    assert ref.rel_path == f"widgets/_runs/develop-2/{SESSION_ID}"
+
+
+def test_resolve_run_dir_finds_a_host_bucket_session_dir(config):
+    """D9: an unnamed repo's work keeps the path derived from its remote, so this
+    identity resolves with no registry at all — but the record is still a session
+    dir (D22)."""
+    workrepo.ensure_clone(config)
+    planted = _plant_session_run(
+        config, "git.example.com/acme/unnamed", "review-mr-3", SESSION_ID
+    )
+
+    ref = workrepo.resolve_run_dir(
+        config, "git.example.com", "acme/unnamed", "review-mr-3"
+    )
+
+    assert ref is not None
+    assert ref.path == planted
+    assert ref.rel_path == (
+        f"git.example.com/acme/unnamed/_runs/review-mr-3/{SESSION_ID}"
+    )
+
+
+def test_resolve_run_dir_finds_the_name_bearing_session_dir(config):
+    """``work name`` renames the SESSION dir in schema form, not ``runs/<slug>``,
+    so the container's one name-bearing rename lands one level deeper."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    planted = _plant_session_run(
+        config, "widgets", "develop-2", f"{SESSION_ID}--the-name"
+    )
+
+    ref = _resolve(config, "develop-2")
+
+    assert ref.path == planted
+    assert ref.slug == "develop-2"
+    assert ref.dir_name == f"{SESSION_ID}--the-name"
+    assert ref.rel_path == f"widgets/_runs/develop-2/{SESSION_ID}--the-name"
+
+
+def test_the_resolver_and_the_picker_quote_the_same_session(config):
+    """The failure the newest-session rule exists to prevent: if the two halves
+    disambiguated differently, the candidate list and the fleet row would quote
+    different directories of one run."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    newest = _plant_session_run(config, "widgets", "develop-2", LATER_SESSION_ID)
+
+    listed = [ref for ref in workrepo.run_dirs(config) if ref.slug == "develop-2"]
+    resolved = _resolve(config, "develop-2")
+
+    assert len(listed) == 1
+    assert resolved.path == listed[0].path == newest
+    assert resolved.rel_path == listed[0].rel_path
+
+
+def test_a_group_holding_several_sessions_says_which_one_it_chose_once(
+        config, caplog, announcing):
+    """Two launches on one target are two records of ONE identity (D22), so the
+    slug is not ambiguous the way two ``<slug>--<name>`` dirs are — but which
+    launch is being read is news, and a session id addresses a specific one."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    _plant_session_run(config, "widgets", "develop-2", LATER_SESSION_ID)
+
+    with caplog.at_level("INFO", logger="lmer_platform.workrepo"):
+        _resolve(config, "develop-2")
+        said = [r.getMessage() for r in caplog.records
+                if "platform_run_dir_sessions" in r.getMessage()]
+        caplog.clear()
+        _resolve(config, "develop-2")
+        again = [r.getMessage() for r in caplog.records
+                 if "platform_run_dir_sessions" in r.getMessage()]
+
+    assert len(said) == 1, "the choice between two records must not be silent"
+    assert LATER_SESSION_ID in said[0]
+    assert again == [], "a read path polled every few seconds says this once"
+
+
+def test_a_single_session_group_resolves_quietly(config, caplog, announcing):
+    """The ordinary schema-form run is not news: one launch, one record."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    with caplog.at_level("INFO", logger="lmer_platform.workrepo"):
+        assert _resolve(config, "develop-2") is not None
+
+    assert [r.getMessage() for r in caplog.records
+            if "platform_run_dir" in r.getMessage()] == []
+
+
+def test_resolve_run_dir_requires_a_state_file_in_the_session_dir(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID, state=False)
+
+    assert _resolve(config, "develop-2") is None
+
+
+def test_resolve_run_dir_never_reads_the_grouping_level_as_a_record(config):
+    """``_runs/<slug>/`` holds nothing (D22); a state file left there by hand is
+    not this run's record."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    group = config.mirror_path / "widgets" / "_runs" / "develop-2"
+    group.mkdir(parents=True)
+    (group / "state.yaml").write_text("schema: 1\nslug: develop-2\n",
+                                      encoding="utf-8")
+
+    assert _resolve(config, "develop-2") is None
+
+
+def test_resolve_run_dir_skips_the_seed_dir_of_a_session_being_written(config):
+    """``_runs/<slug>/.new-<session-id>-*/`` is a directory mid-rename."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    seed = (config.mirror_path / "widgets" / "_runs" / "develop-2"
+            / f".new-{SESSION_ID}-a1b2")
+    seed.mkdir(parents=True)
+    (seed / "state.yaml").write_text("schema: 1\n", encoding="utf-8")
+
+    assert _resolve(config, "develop-2") is None
+
+
+def test_resolve_run_dir_refuses_a_session_dir_symlinked_out_of_the_mirror(config):
+    """Resolving first, then re-checking containment: the segments are innocent
+    and the path still leaves the mirror."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    escaped = _plant_escape_target(config)
+    group = config.mirror_path / "widgets" / "_runs" / "develop-2"
+    group.mkdir(parents=True)
+    (group / SESSION_ID).symlink_to(escaped, target_is_directory=True)
+    assert (group / SESSION_ID / "state.yaml").is_file(), (
+        "the symlink has to reach the target for this to prove anything"
+    )
+
+    assert _resolve(config, "develop-2") is None
+
+
+@pytest.mark.parametrize("slug", [
+    "../../elsewhere/runs/secret", "..", "escape*", "**", "[", "a/b",
+])
+def test_a_schema_form_lookup_never_globs_or_leaves_the_mirror(config, slug):
+    """The identity is index-fed, so a hand-edited entry reaches this composition
+    without passing any request-path guard. The schema-form lookup joins the slug
+    as a path segment and re-checks containment; it never becomes a pattern, so
+    ``**`` cannot take the fleet view down with a ``ValueError`` either."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "escape", SESSION_ID)
+    escaped = _plant_escape_target(config)
+    assert (escaped / "state.yaml").is_file()
+
+    assert _resolve(config, slug) is None
+
+
+def test_resolve_run_dir_follows_a_schema_form_run_that_vacated_the_slug(config):
+    """A release changes slug after discovering the version; ``reslugged_from``
+    is the explicit history, and in schema form it is recorded in a session."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    planted = _plant_session_run(
+        config, "widgets", "release-widgets-v1.2.3", SESSION_ID,
+        extra={"reslugged_from": ["release-widgets"]},
+    )
+
+    ref = _resolve(config, "release-widgets")
+
+    assert ref is not None
+    assert ref.path == planted
+    assert ref.slug == "release-widgets", "the requested identity is kept"
+    assert ref.dir_name == SESSION_ID
+    assert ref.rel_path == f"widgets/_runs/release-widgets-v1.2.3/{SESSION_ID}"
+
+
+def test_a_terminal_schema_form_reslug_does_not_keep_the_seed_address(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(
+        config, "widgets", "release-widgets-v1.2.3", SESSION_ID,
+        extra={"reslugged_from": ["release-widgets"], "status": "complete"},
+    )
+
+    assert _resolve(config, "release-widgets") is None
+
+
+def test_the_registry_is_read_only_when_the_path_derived_shapes_miss(config,
+                                                                     monkeypatch):
+    """A legacy tree and a host bucket compose their own path (D9), so the common
+    case never pays for the manifest; a flat project has no other answer."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    _plant_session_run(config, "git.example.com/acme/unnamed", "review-mr-3",
+                       SESSION_ID)
+    loads = []
+    real_load = workrepo.load_registry
+    monkeypatch.setattr(
+        workrepo, "load_registry",
+        lambda root: (loads.append(root), real_load(root))[1],
+    )
+
+    assert workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", "develop-1"
+    ) is not None
+    assert workrepo.resolve_run_dir(
+        config, "git.example.com", "acme/unnamed", "review-mr-3"
+    ) is not None
+    assert loads == [], "the path says where these two live"
+
+    assert _resolve(config, "develop-2") is not None
+    assert loads, "a flat short name is only discoverable through the registry"
+
+
+# --- multi-remote projects (D8: the registry's UNION) ------------------------
+#
+# ``remotes:`` exists for the project that is reachable at more than one URL,
+# and every WRITER resolves across the union — ``work_repo.utils._schema_layout``
+# through ``resolve_project_dir`` and ``api._plexus_project_dir`` through
+# ``Registry.lookup``. A launch through a secondary remote therefore writes its
+# record under the SAME short name, and a resolver that inverted ``repo:`` alone
+# reported that run absent. The WALK keys what it lists on ``repo:`` and so does
+# the spawn: ``spawn.derive_run_identity`` folds the launch URL to the project's
+# primary remote (tests/test_platform_spawn.py), so one directory has one
+# identity key. The union stays on this side for the identities that fold does
+# not produce — see ``_RegistryIdentities.names_for``.
+
+#: The same project as :data:`FIXTURE_REPO`, reached through its mirror.
+FIXTURE_MIRROR_REPO = "https://github.com/acme/widgets.git"
+FIXTURE_MIRROR_IDENTITY = ("github.com", "acme/widgets")
+
+
+def test_resolve_run_dir_finds_a_project_reached_through_a_secondary_remote(
+        config):
+    """The reviewer's case (!257 discussion 6): the record lands under the short
+    name whichever remote the launch used, so the identity the tracked row
+    carries is the mirror's — and that used to resolve to nothing."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {
+        "widgets": {"repo": FIXTURE_REPO, "remotes": [FIXTURE_MIRROR_REPO]},
+    })
+    planted = _plant_session_run(config, "widgets", "review-mr-1", SESSION_ID)
+
+    ref = _resolve(config, "review-mr-1", FIXTURE_MIRROR_IDENTITY)
+
+    assert ref is not None, "a run launched through the mirror must not read absent"
+    assert ref.path == planted
+    assert ref.rel_path == f"widgets/_runs/review-mr-1/{SESSION_ID}"
+
+
+def test_the_primary_remote_still_resolves_the_same_project(config):
+    """The union is an addition, not a move: the ``repo:`` identity answers
+    exactly as it did before ``remotes:`` was consulted at all."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {
+        "widgets": {"repo": FIXTURE_REPO, "remotes": [FIXTURE_MIRROR_REPO]},
+    })
+    planted = _plant_session_run(config, "widgets", "review-mr-1", SESSION_ID)
+
+    ref = _resolve(config, "review-mr-1")
+
+    assert ref is not None and ref.path == planted
+
+
+def test_a_run_reached_through_a_mirror_is_still_listed_under_the_primary(config):
+    """Both directions of one project's identity, pinned together: the walk keys
+    what it LISTS on ``repo:`` (``_project_identity``), which is now also the
+    identity a launch through either remote is tracked under — the launch URL is
+    folded to the primary where the identity is derived
+    (``spawn.derive_run_identity``), so one directory answers to one key. The
+    union stays on the RESOLVE side for the identities that fold does not
+    produce: a row tracked by a build that predates it, or a run adopted by hand
+    under a secondary's spelling. That is the second assertion here."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {
+        "widgets": {"repo": FIXTURE_REPO, "remotes": [FIXTURE_MIRROR_REPO]},
+    })
+    planted = _plant_session_run(config, "widgets", "review-mr-1", SESSION_ID)
+
+    listed = _by_slug(config)["review-mr-1"]
+
+    assert (listed.host, listed.project) == FIXTURE_IDENTITY, (
+        "the walk's keying is unchanged by this fix"
+    )
+    assert _resolve(config, "review-mr-1", FIXTURE_MIRROR_IDENTITY).path == planted
+
+
+def test_a_repoless_entry_answers_to_no_remote_at_all(config):
+    """D19: a repoless project contributes no keys to the union. It is addressed
+    by name, so no identity lookup may ever land in its tree — including the one
+    a reader might compose from the short name."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {
+        "notes": {"description": "no repo of its own"},
+        "widgets": {"repo": FIXTURE_REPO, "remotes": [FIXTURE_MIRROR_REPO]},
+    })
+    _plant_session_run(config, "notes", "develop-9", SESSION_ID)
+
+    assert _resolve(config, "develop-9", ("gitlab.example.com", "acme/notes")) is None
+    assert _resolve(config, "develop-9", FIXTURE_MIRROR_IDENTITY) is None
+    assert _resolve(config, "develop-9") is None
+
+
+def test_an_unregistered_identity_still_falls_through_to_its_host_bucket(config):
+    """D9: a repo nobody has named is not in the union under any remote, so the
+    union-aware lookup leaves it exactly where it was — the ``{host}/{project}``
+    bucket its own remote derives."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {
+        "widgets": {"repo": FIXTURE_REPO, "remotes": [FIXTURE_MIRROR_REPO]},
+    })
+    planted = _plant_session_run(
+        config, "git.example.com/acme/unnamed", "review-mr-3", SESSION_ID
+    )
+
+    ref = workrepo.resolve_run_dir(
+        config, "git.example.com", "acme/unnamed", "review-mr-3"
+    )
+
+    assert ref is not None and ref.path == planted
+    assert ref.rel_path == (
+        f"git.example.com/acme/unnamed/_runs/review-mr-3/{SESSION_ID}"
+    )
+
+
+def test_a_schema_form_resolve_survives_an_unusable_manifest(config, caplog,
+                                                             announcing):
+    """A broken ``_plexus.yaml`` is the validator's problem. This read path loses
+    the runs whose identity that file held, says so once, and nothing else."""
+    workrepo.ensure_clone(config)
+    (config.mirror_path / "_plexus.yaml").write_text("projects: [", encoding="utf-8")
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    with caplog.at_level("WARNING", logger="lmer_platform.workrepo"):
+        assert _resolve(config, "develop-2") is None
+        assert workrepo.resolve_run_dir(
+            config, "gitlab.example.com", "agents/global", "develop-1"
+        ) is not None, "the legacy tree still resolves"
+
+    said = [r.getMessage() for r in caplog.records
+            if "platform_mirror_manifest_unusable" in r.getMessage()]
+    assert len(said) == 1
+
+
+def test_resolving_never_writes_into_the_mirror(config):
+    """The mirror is a read-only checkout: a state file this daemon cannot parse
+    must not be moved aside for post-mortem (``run_state.load_state`` does that,
+    which is why nothing here goes through it) — the next ``reset --hard`` would
+    trip over the backup.
+
+    The slug asked for is absent on purpose, so every fallback runs and every
+    state file in the project is read.
+    """
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    session = _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    (session / "state.yaml").write_text("slug: [unclosed\n", encoding="utf-8")
+    before = _mirror_contents(config)
+
+    assert _resolve(config, "no-such-run") is None
+
+    assert _mirror_contents(config) == before
+    assert not list(config.mirror_path.rglob("*.bad-*"))
+
+
+def test_every_schema_form_run_listed_resolves_under_the_key_it_is_listed_with(
+        config):
+    """The picker and the resolver are one contract in schema form too: adopting
+    a candidate tracks it under the key shown, and every verb afterwards resolves
+    that key."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    _plant_session_run(config, "widgets", "develop-2", LATER_SESSION_ID)
+    _plant_session_run(config, "widgets", "review-mr-9", f"{SESSION_ID}--the-name")
+    _plant_session_run(config, "git.example.com/acme/unnamed", "review-mr-3",
+                       SESSION_ID)
+
+    listed = workrepo.run_dirs(config)
+
+    assert {ref.slug for ref in listed} == {
+        "develop-1", "develop-2", "review-mr-9", "review-mr-3"
+    }
+    for ref in listed:
+        found = workrepo.resolve_run_dir(config, ref.host, ref.project, ref.slug)
+        assert found is not None and found.path == ref.path, (
+            f"{ref.slug} is offered but does not resolve back to {ref.rel_path}"
+        )
+        assert found.rel_path == ref.rel_path
+
+
+def test_a_legacy_run_resolves_exactly_as_before_beside_a_schema_project(config):
+    """Co-existence (D16/D20): teaching the resolver the second shape must not
+    move the legacy tree's answer by a byte."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    _plant_run_dir(config, f"{SLUG}--the-name")
+
+    bare = workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", "develop-1"
+    )
+    named = workrepo.resolve_run_dir(
+        config, "gitlab.example.com", "agents/global", SLUG
+    )
+
+    assert bare.dir_name is None
+    assert bare.rel_path == "gitlab.example.com/agents/global/runs/develop-1"
+    assert named.dir_name == f"{SLUG}--the-name"
+    assert named.rel_path == (
+        f"gitlab.example.com/agents/global/runs/{SLUG}--the-name"
+    )
+# --- which session addresses the group (!256, discussion 3) -----------------
+#
+# "Newest session by directory NAME" is only start order while every
+# state-bearing directory in the group is named in the ``LMER_SESSION_ID`` form
+# — and nothing enforces that: this same schema registers the non-conforming
+# case as a WARNING (``record.session-id-malformed``), so the fleet view meets
+# it rather than assuming it away. A hand-made copy sorts after ``2026…``
+# (``b`` > ``2``), so it used to win the group; the single ref then addressed
+# the copy and the fleet row read ``complete`` for a run that was live.
+
+#: The reviewer's tree: an old finished launch, the live one, and a copy taken
+#: by hand whose name is in no form at all.
+EARLY_SESSION_ID = "20260101-000000-1-1"
+LIVE_SESSION_ID = "20260825-060108-2-19758"
+OUT_OF_FORM_DIR = "backup-before-i-broke-it"
+
+
+def _plant_reviewers_tree(config):
+    """``widgets/_runs/develop-1/`` with two launches and one hand-made copy."""
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-1", EARLY_SESSION_ID,
+                       extra={"status": "complete"})
+    live = _plant_session_run(config, "widgets", "develop-1", LIVE_SESSION_ID,
+                              extra={"status": "in-progress"})
+    _plant_session_run(config, "widgets", "develop-1", OUT_OF_FORM_DIR,
+                       extra={"status": "complete"})
+    return live
+
+
+def _schema_form_refs(config):
+    """The refs from the flat project dir — the legacy fixture also has a
+    ``develop-1``, and it is a different run under a different identity."""
+    return [ref for ref in workrepo.run_dirs(config) if ref.project == "acme/widgets"]
+
+
+def _mirror_snapshot(config):
+    """Every path under the mirror with its kind, size and mtime (not ``.git``)."""
+    snapshot = {}
+    for path in sorted(config.mirror_path.rglob("*")):
+        rel = path.relative_to(config.mirror_path)
+        if ".git" in rel.parts:
+            continue
+        info = path.lstat()
+        snapshot[str(rel)] = (path.is_dir(), info.st_size, info.st_mtime_ns)
+    return snapshot
+
+
+def test_run_dirs_pick_the_newest_session_id_and_ignore_a_dir_that_is_not_one(
+        config, caplog, announcing):
+    """The reviewer's tree: the live launch wins, the copy is ignored.
+
+    Ordering by name is only meaningful among names the schema gives an order —
+    the id form. A directory in no form has no place in that comparison, so it
+    is passed over rather than crowned, and said once: a run reported
+    ``complete`` while it is running is exactly the disappearance this listing
+    must not cause.
+    """
+    workrepo.ensure_clone(config)
+    live = _plant_reviewers_tree(config)
+
+    with caplog.at_level("INFO", logger="lmer_platform.workrepo"):
+        listed = _schema_form_refs(config)
+
+    assert len(listed) == 1, "one run identity is one candidate"
+    assert listed[0].path == live
+    assert listed[0].rel_path == f"widgets/_runs/develop-1/{LIVE_SESSION_ID}"
+    assert yaml.safe_load(
+        (listed[0].path / "state.yaml").read_text(encoding="utf-8")
+    )["status"] == "in-progress", "the addressed record is the live one"
+    said = [r.getMessage() for r in caplog.records
+            if "platform_session_dir_not_in_form" in r.getMessage()]
+    assert len(said) == 1 and OUT_OF_FORM_DIR in said[0]
+
+
+def test_run_dirs_keep_a_group_whose_sessions_are_all_out_of_form(config, caplog,
+                                                                  announcing):
+    """Losing the run from the fleet view would be worse than the defect fixed.
+
+    With no id-form child there is no schema-given order, so the group falls
+    back to the newest directory MTIME — a stat, never a read, so the walk keeps
+    costing what it did — and says so, because that ordering is this module's
+    own choice and not something the tree promised.
+    """
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    # Name order would pick ``restored-copy``; mtime picks the other one.
+    older = _plant_session_run(config, "widgets", "develop-2", "restored-copy")
+    newer = _plant_session_run(config, "widgets", "develop-2", OUT_OF_FORM_DIR)
+    os.utime(older, (1_000_000, 1_000_000))
+    os.utime(newer, (2_000_000, 2_000_000))
+
+    with caplog.at_level("INFO", logger="lmer_platform.workrepo"):
+        listed = _schema_form_refs(config)
+
+    assert [ref.path for ref in listed] == [newer], "the run is still offered"
+    said = [r.getMessage() for r in caplog.records
+            if "platform_session_dir_undated" in r.getMessage()]
+    assert len(said) == 1 and "develop-2" in said[0]
+
+
+def test_run_dirs_prefer_any_session_id_to_the_newest_thing_on_disk(config):
+    """The fallback is for a group with NO id-form child, and only that: a copy
+    made after the launch it copied is still not the record."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    session = _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+    copy = _plant_session_run(config, "widgets", "develop-2", OUT_OF_FORM_DIR)
+    os.utime(session, (1_000_000, 1_000_000))
+    os.utime(copy, (2_000_000, 2_000_000))
+
+    assert [ref.path for ref in _schema_form_refs(config)] == [session]
+
+
+def test_run_dirs_never_write_into_the_mirror(config):
+    """The mirror is a read-only checkout (:func:`workrepo._recorded_slug`): a
+    listing that stamped anything would be a local modification for the next
+    ``reset --hard`` to trip over. Ordering by mtime reads it, never sets it."""
+    workrepo.ensure_clone(config)
+    _plant_reviewers_tree(config)
+    _plant_session_run(config, "widgets", "develop-2", "restored-copy")
+
+    before = _mirror_snapshot(config)
+    workrepo.run_dirs(config)
+
+    assert _mirror_snapshot(config) == before
+
+
+# --- the session id a record is addressed by (issue #353, D22) ---------------
+#
+# ``LMER_SESSION_ID`` is the one thing that decides which record a launch writes
+# in: the container mints one at startup only when the host injected none
+# (``clone_and_exec.main`` -> ``mint_session_id``). So the verbs that continue a
+# particular record (``lmer_platform.resume``, ``lmer_platform.answer``) have to
+# be able to ask "which session is this ref addressed by" — and the two rules
+# that answer it, what counts as a session record and what the ``--<name>``
+# rename does to a dir name, already live here rather than in either verb.
+
+
+def test_record_session_id_names_the_launch_of_a_schema_form_record(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", SESSION_ID)
+
+    assert workrepo.record_session_id(_resolve(config, "develop-2")) == SESSION_ID
+
+
+def test_record_session_id_is_the_id_half_of_a_named_session_dir(config):
+    """``<sid>`` and ``<sid>--<name>`` are the same session and the id is
+    ``<sid>``. Answering with the directory name would work today by accident and
+    compose ``<sid>--<name>--<name>`` the moment anything built the record's
+    address back out of it."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", f"{SESSION_ID}--the-name")
+
+    ref = _resolve(config, "develop-2")
+
+    assert ref.dir_name == f"{SESSION_ID}--the-name"
+    assert workrepo.record_session_id(ref) == SESSION_ID
+
+
+def test_record_session_id_is_none_for_a_legacy_run_dir(config):
+    """One shared record per target, read in place and never restructured: no
+    launch addresses it, so there is nothing to hand a resume."""
+    workrepo.ensure_clone(config)
+    _plant_run_dir(config, SLUG)
+
+    ref = workrepo.resolve_run_dir(config, "gitlab.example.com", "agents/global", SLUG)
+
+    assert ref is not None, "the legacy shape must still resolve"
+    assert workrepo.record_session_id(ref) is None
+
+
+def test_record_session_id_is_none_for_an_unmigrated_group_level_record(config):
+    """A tree adopted before its runs were migrated holds
+    ``_runs/<slug>/state.yaml`` — the record is the grouping dir itself
+    (``work_repo.run_state._creation_address``), addressed by the slug rather
+    than by a launch.
+
+    The ref is built by hand because this shape is not one the walk lists at all
+    (a group with no session child yields nothing), and the helper still has to
+    answer for it: the alternative answer is a run's SLUG travelling as a session
+    id."""
+    workrepo.ensure_clone(config)
+    group = config.mirror_path / "widgets" / "_runs" / "develop-2"
+    group.mkdir(parents=True)
+    (group / "state.yaml").write_text(
+        "schema: 1\nslug: develop-2\nstatus: in-progress\n", encoding="utf-8"
+    )
+
+    ref = workrepo.RunDirRef(
+        host=FIXTURE_IDENTITY[0],
+        project=FIXTURE_IDENTITY[1],
+        slug="develop-2",
+        path=group,
+        address="widgets/_runs/develop-2",
+    )
+
+    assert workrepo.record_session_id(ref) is None
+
+
+def test_record_session_id_answers_a_dir_name_that_is_not_in_the_form(
+        config, caplog, announcing):
+    """``_newest_session`` addresses a group whose children are in no form at all
+    rather than dropping the run from the fleet view, so a resolved record CAN sit
+    at a name the session-id grammar does not describe. That name is still what
+    addresses it, and refusing to name it would leave the operator unable to
+    continue the record the view is showing them."""
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}})
+    _plant_session_run(config, "widgets", "develop-2", OUT_OF_FORM_DIR)
+
+    ref = _resolve(config, "develop-2")
+
+    assert ref.dir_name == OUT_OF_FORM_DIR
+    assert workrepo.record_session_id(ref) == OUT_OF_FORM_DIR

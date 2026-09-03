@@ -104,7 +104,7 @@ from .spawn import (
     spawn_session,
 )
 from .store import StoreError, append_event
-from .workrepo import RunDirRef, resolve_run_dir
+from .workrepo import RunDirRef, record_session_id, resolve_run_dir
 
 logger = logging.getLogger("lmer_platform.answer")
 
@@ -571,6 +571,24 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
             # field is where a validated answer goes, and the flag is refused in
             # the caller-supplied argv beside it.
             answer=request.answer,
+            # The record that ASKED, so the answer is applied in it rather than
+            # in a fresh record the container would otherwise mint beside it
+            # (spec D22: the session is the unit of record, and LMER_SESSION_ID
+            # picks which one a launch writes in). An empty record holding an
+            # answer, with the question still standing in the real one, is the
+            # shape this closes.
+            #
+            # Unconditional, unlike the same injection in
+            # :mod:`lmer_platform.resume`: ``_require_same_run`` above has already
+            # refused every respawn that would derive another run, so there is no
+            # sibling group for this id to be wrong in. ``None`` for a legacy tree
+            # and nothing changes there.
+            #
+            # This is now the direct route. ``work_repo.cli._session_that_asked``
+            # stays as the fallback it describes itself as — it reroutes a launch
+            # carrying ``LMER_ANSWER`` to the record that asked, which is what
+            # covers launchers that carry only the answer and nothing else.
+            session_id=record_session_id(ref),
         ),
     )
 

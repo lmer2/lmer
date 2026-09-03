@@ -459,6 +459,14 @@ def _validated(session_id: str) -> str:
     the check is borrowed from the registry rather than written again here: two
     different notions of a legal session id is how ``..`` eventually gets past
     one of them.
+
+    The same id also names a DIRECTORY in a schema-form work repo —
+    ``_runs/<slug>/<session-id>[--<name>]/`` is one launch's whole record
+    (``docs/SCHEMA.md``, "Sessions and runs") — so the borrowed rule has to
+    admit every name that tree can carry: the ``LMER_SESSION_ID`` form and the
+    kebab-case ``--<name>`` the freeze rename appends both sit inside the
+    registry's charset, and nothing here was widened to let them in
+    (``tests/test_platform_session_io.py`` pins both directions).
     """
     try:
         registry.session_path(session_id)
