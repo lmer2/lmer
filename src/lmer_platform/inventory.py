@@ -309,6 +309,14 @@ class RunView:
     status: Optional[str] = None
     stop_reason: Optional[str] = None
     updated: Optional[str] = None
+    #: Where the run's record was FOUND, work-repo-relative, or ``None`` when no
+    #: directory was found for it at all — a freshly spawned run that has pushed
+    #: nothing is a state, not an error, and a client renders a path only when
+    #: there is one. Never composed here: the address is whatever found the
+    #: directory (:attr:`lmer_platform.workrepo.RunDirRef.rel_path`), which is
+    #: `{host}/{project}/runs/<dir>` in a legacy tree and the session dir
+    #: `<project>/_runs/<slug>/<session-id>` in schema form (D22) — two shapes
+    #: one composition here could only get wrong for one of them.
     rel_path: Optional[str] = None
     attention: Optional[Attention] = None
     session: Optional[dict] = None

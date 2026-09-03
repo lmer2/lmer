@@ -57,6 +57,13 @@ identity up front and tracks the run before the container has committed anything
 Without that, a session's first minutes — precisely when someone is watching —
 would show a row with no identity.
 
+One step sits between the URL and the parse, for the project that is reachable at
+more than one remote (D8): the launch URL is folded to that project's PRIMARY
+remote first (:func:`derive_repo_identity`), because that is what the record's
+directory is listed under. Without the fold a launch through a mirror was tracked
+under one identity and listed under another — one directory, two keys, and an
+adoption picker offering back a run this orchestrator had just started.
+
 Which repo URL, though, is a question with four answers, and the last two are why
 ``lmer develop <MR-url>`` needs no repo flag on the command line: **the target
 usually contains the repository**. So a spawn that was handed no URL and has no
@@ -151,7 +158,7 @@ from lmer_cli.service import ServiceError
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
-from . import ask, memory, meta, registry, runs, slots, uploads
+from . import ask, memory, meta, registry, runs, slots, uploads, workrepo
 from .config import ENV_REPO_URL, PlatformConfig, configured_repo_url
 from .store import StoreError, append_event, logs_dir, utc_now_iso
 from . import store
@@ -161,10 +168,11 @@ logger = logging.getLogger("lmer_platform.spawn")
 __all__ = [
     "SpawnError", "CapacityError", "RunAlreadyLive", "SlotOccupied",
     "live_session_for_run",
-    "SpawnRequest", "SpawnResult", "ANSWER_FLAG",
+    "SpawnRequest", "SpawnResult", "ANSWER_FLAG", "SESSION_FLAG",
     "wait_for_exit_recorded",
     "PRESET_FLAG", "AGENTS_FLAG", "MODEL_FLAG", "NO_REPO_ENV",
-    "resolve_lmer_bin", "derive_run_identity", "spawn_session", "log_path_for",
+    "resolve_lmer_bin", "derive_run_identity", "derive_repo_identity",
+    "spawn_session", "log_path_for",
     "token_file_for", "read_control_token", "transcript_dir_for", "ask_dir_for",
     "upload_dir_for",
     "container_log_dir_for", "container_log_path_for",
@@ -192,6 +200,19 @@ _PORT_PICK_ATTEMPTS = 8
 #: :mod:`lmer_platform.answer` because this module both emits it and refuses it in
 #: ``extra_args``; that module re-exports it.
 ANSWER_FLAG = "--answer"
+
+#: The flag ``lmer`` takes the session's own record from, spelled by
+#: :func:`_build_command` from :attr:`SpawnRequest.session_id`. Host-side it
+#: becomes the container's ``LMER_SESSION_ID``, which is the single thing that
+#: decides which ``<project>/_runs/<slug>/<session-id>[--<name>]/`` the launch
+#: writes its record in (spec D22): the container mints one at startup only when
+#: the host injected none, so injecting is how a resume or an answer continues
+#: the record it just read instead of opening a fresh one beside it.
+#:
+#: Reserved in ``extra_args`` for the reason :data:`ANSWER_FLAG` is — it belongs
+#: to verbs that check before they spawn — and emitted from a typed field for
+#: the same reason: which record a session lands in is not caller text.
+SESSION_FLAG = "--session"
 
 #: The flag ``lmer`` selects a named startup preset with, spelled by
 #: :func:`_build_command` from :attr:`SpawnRequest.preset`. The name is resolved
@@ -243,8 +264,8 @@ NO_REPO_ENV = "LMER_NO_REPO"
 #: rather than a caller mistake, hence a refusal rather than a note in the docs.
 #: The first four would move, weaken or delete the control plane the session's
 #: registry entry advertises, leaving an entry that promises a session nobody can
-#: drive; the fifth belongs to a verb that validates before it spawns; the last
-#: three are flags this module emits itself, from typed fields, and records.
+#: drive; the next two belong to verbs that validate before they spawn; the last
+#: four are flags this module emits itself, from typed fields, and records.
 _RESERVED_ARGS = (
     # Would replace the token minted here and written 0600, so the entry's
     # token_ref would stop opening anything.
@@ -269,6 +290,18 @@ _RESERVED_ARGS = (
     # through here: it sets SpawnRequest.answer, which is a typed field rather
     # than caller-shaped argv.
     ANSWER_FLAG,
+    # Which record the session writes in (spec D22): the container takes this as
+    # its LMER_SESSION_ID, and the record is the whole of what a run *is* in
+    # schema form. The platform emits it from a typed field, but the reason it is
+    # reserved is the answer flag's rather than the recording one below — argv is
+    # last-wins, so a second spelling in extra_args beats the platform's and
+    # points the session at a record it never checked. That is exactly what
+    # lmer_platform.resume and lmer_platform.answer refuse before they spawn: a
+    # session that lands in another run's record applies its answer where no
+    # question was asked, or claims a launch a live container is already writing.
+    # A raw POST /api/sessions must not be able to do from argv what those verbs
+    # will not do from a request body.
+    SESSION_FLAG,
     # The last four are reserved for a different reason from the rest, and it
     # is not that they are dangerous to a session: the platform *emits* all
     # four, from typed fields, and writes what it emitted into the registry
@@ -399,13 +432,79 @@ def _reject_option_value(name: str, value: str) -> None:
     *hijack* — this one cannot succeed rather than succeeding as something else —
     but the same reachability: ``POST /api/sessions`` takes every one of those
     fields verbatim from the request body.
+
+    :attr:`SpawnRequest.session_id` comes here too although :func:`_build_command`
+    spells it as one ``--session=<id>`` token, which argparse *does* read as a
+    value. That is the reason to check rather than a reason not to: the ``=``
+    spelling means nothing would stop ``--session=-x`` on the way through, and a
+    record directory named after a flag is not one this platform will point a
+    session at. Every field the platform emits gets the same answer, so which one
+    is refused does not depend on how it happened to be spelled.
     """
     if value.startswith("-"):
         raise SpawnError(
             f"{name} may not begin with a dash ({value!r}): it is passed to "
             "`lmer` as the argument of a flag, and argparse reads a dash-leading "
-            "value as the next option instead — the child would exit 2 with "
-            '"expected one argument" rather than starting a session'
+            "value as the next option instead — a two-token flag exits 2 with "
+            '"expected one argument" rather than starting a session, and the '
+            "one-token `=` spelling that survives that is no reason to let a "
+            "value shaped like a flag through"
+        )
+
+
+def _reject_unsafe_session_id(session_id: str) -> None:
+    """Refuse a session id that is not one directory name.
+
+    :attr:`SpawnRequest.session_id` becomes the container's ``LMER_SESSION_ID``,
+    and the container joins that under the run's grouping dir to make the record
+    it writes: ``<project>/_runs/<slug>/<session-id>/``
+    (``work_repo.run_state._creation_address``, spec D22). So the whole value has
+    to be usable as a single path segment — a ``/`` would put the record in
+    another run's group or outside the run area entirely, ``..`` would walk out
+    of the work repo, ``.`` would make the grouping level itself the record (the
+    one level D22 keeps empty), and a NUL is not a name any filesystem takes.
+
+    Refused rather than sanitised, and refused here rather than left to the
+    container: the value decides where a whole run record lands, and a spawn that
+    quietly wrote in a neighbouring record is the failure the resume and answer
+    verbs check against before they get this far. This is the floor under both,
+    the way :func:`_reject_unsafe_taskdef` is for the run dir's own name.
+
+    A glob character and surrounding whitespace are refused for a second reason,
+    and it is the one that makes this reachable. The value is emitted as
+    ``lmer --session``, and the host CLI refuses exactly those
+    (``lmer_cli.cli._session_id_refusal``: whitespace is not stripped, because
+    rewriting an id sends the launch to a directory nobody named). Without them
+    here the platform would emit a value its own child rejects — and by then the
+    port is drawn, the token minted, the entry registered and the run tracked, so
+    the operator sees an accepted spawn that exits 2, which is precisely what the
+    validation loop below exists to prevent. Nor is it hypothetical: session dirs
+    are named by whatever created them, :func:`lmer_platform.workrepo.
+    record_session_id` deliberately answers with an out-of-form name so the
+    operator can continue a record the fleet view is showing them, and nothing
+    stops a directory called ``2026*``.
+
+    A dot-leading id cannot arrive from :func:`lmer_platform.workrepo.
+    record_session_id` at all — it names a directory taken out of
+    :func:`_sessions_in`, which excludes dot-children — so this clause is the
+    floor holding rather than a case being caught. It is here because the floor
+    has to stay at least as strict as the host's: a rule that admits what
+    ``lmer --session`` refuses is a spawn that registers and then dies as the
+    child's exit 2.
+    """
+    if (
+        session_id in (".", "..")
+        or session_id != session_id.strip()
+        or session_id.startswith(".")
+        or any(bad in session_id for bad in ("/", "\\", "\x00"))
+        or any(char in session_id for char in "*?[")
+    ):
+        raise SpawnError(
+            f"session_id is not a usable directory name ({session_id!r}): it "
+            "names one launch inside the run's group, never a path or a "
+            "pattern — the container joins it under _runs/<slug>/ to make the "
+            "record this session writes in, and `lmer --session` refuses the "
+            "same shapes at the other end"
         )
 
 
@@ -439,6 +538,16 @@ class SpawnRequest:
     question to answer first. That is why ``--answer`` is refused in
     ``extra_args`` (see :data:`_RESERVED_ARGS`) while this field is not — the
     difference between the two is the validation, not the argv.
+
+    ``session_id`` is typed for the same reason as ``answer`` rather than the one
+    below: it says which ``<project>/_runs/<slug>/<session-id>/`` record the
+    session writes in (spec D22), so it decides where a whole run record lands.
+    :mod:`lmer_platform.resume` and :mod:`lmer_platform.answer` fill it with the
+    record they resolved and checked; ``--session`` is refused in ``extra_args``
+    because caller text there would win by being later in argv and point a
+    session at a record nothing checked. ``None`` is the ordinary spawn, which
+    founds a launch rather than continuing one — the container mints its own id
+    and that is exactly right.
 
     ``preset``, ``agents`` and ``model`` are typed for a related but distinct
     reason. All three *are* filled from the HTTP body, so the difference is not
@@ -494,6 +603,12 @@ class SpawnRequest:
     ports: int = 0
     extra_args: tuple = ()
     answer: Optional[str] = None
+    #: The work repo record this session must write in (:data:`SESSION_FLAG`) —
+    #: the launch's ``LMER_SESSION_ID``, e.g. ``20260824-165230-2-31245``, and
+    #: never the ``s-…`` id this platform files the *container* session under.
+    #: The two namespaces both get called a session and neither is derived from
+    #: the other (:mod:`lmer_platform.resume`'s module docstring).
+    session_id: Optional[str] = None
     identity_repo_url: Optional[str] = None
     no_repo: bool = False
     #: What this orchestrator files the run under, one line
@@ -531,6 +646,16 @@ class SpawnRequest:
             not isinstance(self.answer, str) or not self.answer.strip()
         ):
             raise SpawnError(f"answer must be non-empty text, got {self.answer!r}")
+        # A record's address, so it is checked as one: a blank or a repr would be
+        # spelled behind the ``=`` like any other text, and the container would
+        # take it as the directory to write this run's whole record in.
+        if self.session_id is not None:
+            if not isinstance(self.session_id, str) or not self.session_id.strip():
+                raise SpawnError(
+                    f"session_id must be non-empty text, got {self.session_id!r}"
+                )
+            _reject_option_value("session_id", self.session_id)
+            _reject_unsafe_session_id(self.session_id)
         # The flag *arguments* the platform emits. Absent is the normal case
         # and says nothing; present and unusable is refused here rather than
         # discovered by the child, which can only report it by exiting 2 — after
@@ -647,22 +772,60 @@ def resolve_lmer_bin(config: PlatformConfig) -> str:
 
 
 def derive_run_identity(
-    request: SpawnRequest, repo_url: Optional[str]
+    request: SpawnRequest,
+    repo_url: Optional[str],
+    config: Optional[PlatformConfig] = None,
 ) -> tuple:
     """Predict ``(host, project, slug)`` for the run this spawn will create.
 
     Mirrors what the container itself will compute: the slug from
-    ``run_state.derive_slug`` and the host/project from the repo URL. Returns
-    ``None`` components when the repo URL is absent or unparseable — the session
-    still runs, it just cannot be joined to a run dir until its state is pushed.
+    ``run_state.derive_slug`` and the host/project from the repo URL
+    (:func:`derive_repo_identity`, which is also where the multi-remote fold
+    lives). Returns ``None`` components when the repo URL is absent or
+    unparseable — the session still runs, it just cannot be joined to a run dir
+    until its state is pushed.
 
     The URL is a parameter rather than ``request.repo_url`` because deriving an
     identity from one and recording one as the run's repo are separable; see
     :func:`_repo_urls` for which is which.
     """
     slug = run_state.derive_slug(request.taskdef, request.target)
-    host, project = _parse_repo_url(repo_url or "")
+    host, project = derive_repo_identity(repo_url, config)
     return host, project, slug
+
+
+def derive_repo_identity(
+    repo_url: Optional[str], config: Optional[PlatformConfig] = None
+) -> tuple:
+    """``(host, project)`` the run of a launch at *repo_url* is filed under.
+
+    The URL's own parse, unless the work repo's registry says that URL is a
+    remote of a project it knows — then that project's PRIMARY remote, because
+    the project dir the record lands in is placed across the registry's union
+    (D8) and LISTED under the primary. Deriving from the launch URL verbatim gave
+    one directory two identity keys, one tracked and one listed, which is the
+    defect :func:`lmer_platform.workrepo.primary_remote_identity` sets out in
+    full: the adoption picker offering an already-tracked run, adopting it
+    doubling that run's index row, and :func:`_refuse_if_run_is_live` not seeing
+    two launches through two remotes as one run.
+
+    ``(None, None)`` when neither can answer, which is the case
+    :func:`_untracked_run_warning` speaks to — and it stays that case, since the
+    fold is best-effort by construction and never a refusal.
+
+    *config* is how the manifest reaches identity, and it is the smallest thing
+    that could: it names the daemon's own mirror of the work repo (spec D24),
+    which is where the registry already is and which both callers of this pair
+    already hold (:func:`spawn_session`,
+    :func:`lmer_platform.api._work_repo_taskdef_dirs`, which reads the same
+    registry one call later through ``_plexus_project_dir``). No second manifest
+    reader, no new field on :class:`SpawnRequest` for callers to fill in
+    differently, and no ambient lookup a test cannot see. Omitted — a caller
+    deriving an identity with no orchestrator around it — the answer is the URL's
+    own parse, exactly as it was before this existed.
+    """
+    folded = workrepo.primary_remote_identity(config, repo_url)
+    return folded if folded is not None else _parse_repo_url(repo_url or "")
 
 
 def _identity_url_from_target(target: str) -> Optional[str]:
@@ -1918,6 +2081,11 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
     ``extra_args``, which may end in a bare ``--`` handing the rest to the
     container's own command line.
 
+    ``--session=<id>`` takes the same one-token spelling, so that neither the
+    spelling nor :func:`_reject_option_value` is load-bearing on its own: a record
+    name shaped like a flag is refused before it is built, and could not be read
+    as one if it got here.
+
     ``--preset``, ``--agents``, ``--model`` and ``--harness`` stay two tokens
     rather than following that pattern, because they carry *names* rather than
     prose: a preset, agent, model or harness name that begins with a dash is not
@@ -1939,6 +2107,8 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
         cmd += [MODEL_FLAG, request.model]
     if request.ports:
         cmd += ["--ports", str(request.ports)]
+    if request.session_id:
+        cmd += [f"{SESSION_FLAG}={request.session_id}"]
     if request.answer:
         cmd += [f"{ANSWER_FLAG}={request.answer}"]
     cmd += [str(arg) for arg in request.extra_args]
@@ -2462,7 +2632,7 @@ def spawn_session(
     # Two URLs, because "what this run's repo is" and "what its identity is
     # derived from" are separable claims — only the first is recorded anywhere.
     repo_url, identity_url = _repo_urls(request)
-    host, project, slug = derive_run_identity(request, identity_url)
+    host, project, slug = derive_run_identity(request, identity_url, config)
     # As early as the identity allows, and before the command is built: a spawn
     # refused for a run that is already running leaves nothing behind — no argv, no
     # port drawn, no directory made.
@@ -2662,6 +2832,15 @@ def spawn_session(
                 # every poll (issue #312).
                 "slot_service_group": slot_group,
                 "slot_services": slot_services,
+                # No key for ``request.session_id``, and that is a decision
+                # rather than an omission: unlike the flags above, the record a
+                # session writes in accounts for itself. The session appends its
+                # harness id to that record's own lineage (``sessions:``,
+                # ``run_state.session_lineage``, D22), which is written by what
+                # happened rather than by what was asked for, and is where a
+                # post-mortem reads it. A key here would also put a second
+                # namespace's "session" on an entry whose own key is the ``s-…``
+                # container session — the two this file already keeps apart.
             },
             run={"host": host, "project": project, "slug": slug},
             # The *only* record that the slot is taken — nothing writes an occupancy

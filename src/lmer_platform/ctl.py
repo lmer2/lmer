@@ -398,7 +398,7 @@ def _call_runs_resume(args) -> Call:
         "POST", "/api/runs/resume",
         body={
             **_run_fields(args.key),
-            **_given(args, ("taskdef", "repo_url", "direction")),
+            **_given(args, ("taskdef", "repo_url", "direction", "session_id")),
         },
     )
 
@@ -787,6 +787,13 @@ def _add_runs(sub) -> None:
     )
     resume.add_argument("--repo-url", dest="repo_url", help="If the run needs one.")
     resume.add_argument("--direction", help="What the next session should do.")
+    resume.add_argument(
+        "--session", dest="session_id",
+        help="One launch of the run's group: a session dir's <session-id> or its "
+             "full <session-id>--<name>. Defaults to the newest launch; an id "
+             "that names none of them is refused with the list rather than "
+             "resolved to a neighbouring record.",
+    )
     resume.set_defaults(call=_call_runs_resume)
 
     meta = runs_sub.add_parser(

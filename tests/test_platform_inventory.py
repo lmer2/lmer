@@ -2111,3 +2111,113 @@ def test_detail_without_the_marker_is_not_a_refusal(tmp_path):
         )),
     )
     assert run.attention is None
+
+
+# --- the address a row carries, in either tree shape (issue #353) -----------
+#
+# The row's ``rel_path`` is whatever FOUND the run's directory
+# (:attr:`lmer_platform.workrepo.RunDirRef.rel_path`), never a path composed
+# here — which is what makes it truthful for a schema-form run, whose record
+# lives in a session dir ``<project>/_runs/<slug>/<session-id>/`` (D22) with no
+# host segment in front of it at all (D7).
+
+SESSION_ID = "20260824-165230-2-31245"
+
+
+def plant_session_run(tmp_path, slug, *, project_dir="widgets",
+                      session_id=SESSION_ID, host="gitlab.example.com",
+                      project="acme/widgets", state_yaml=None):
+    """A schema-form session dir on disk, and the ref a walk would build for it.
+
+    The identity is the repo the registry binds the project dir to, so it is
+    passed in exactly as the walk recovers it — never read off the path.
+    """
+    path = tmp_path / project_dir / "_runs" / slug / session_id
+    path.mkdir(parents=True, exist_ok=True)
+    if state_yaml is not None:
+        (path / "state.yaml").write_text(state_yaml, encoding="utf-8")
+    return RunDirRef(
+        host=host, project=project, slug=slug, path=path,
+        dir_name=session_id,
+        address=f"{project_dir}/_runs/{slug}/{session_id}",
+    )
+
+
+def test_a_schema_form_row_carries_its_session_dir_as_its_rel_path(tmp_path):
+    """The address is the directory an operator can open, and for a session-unit
+    record that is the session dir — not a composed ``runs/<slug>``."""
+    ref = plant_session_run(
+        tmp_path, "develop-issue-353",
+        state_yaml=state_yaml(status="in-progress", phase="execution"),
+    )
+
+    run = inventory.build_inventory([ref], []).runs[0]
+
+    assert run.rel_path == f"widgets/_runs/develop-issue-353/{SESSION_ID}"
+    assert run.to_dict()["rel_path"] == run.rel_path
+    assert run.phase == "execution", "the record is read from the session dir"
+
+
+def test_a_schema_form_row_keeps_the_identity_the_walk_recovered(tmp_path):
+    """The short name in the address is not the project: identity comes from the
+    registry (D7/D8) and the row must carry that, or nothing keyed on
+    ``host/project/slug`` finds the run again."""
+    ref = plant_session_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+
+    run = inventory.build_inventory([ref], []).runs[0]
+
+    assert (run.host, run.project) == ("gitlab.example.com", "acme/widgets")
+    assert run.rel_path.startswith("widgets/_runs/")
+
+
+def test_legacy_and_schema_form_rows_coexist_each_with_its_own_rel_path(
+        tmp_path):
+    """Co-existence is real, not promised (D16): one fleet, two tree shapes."""
+    legacy = plant_run(tmp_path, "legacy-run",
+                       state_yaml=state_yaml(status="in-progress"))
+    schema = plant_session_run(tmp_path, "schema-run",
+                               state_yaml=state_yaml(status="in-progress"))
+
+    rows = {r.slug: r.rel_path for r in inventory.build_inventory(
+        [legacy, schema], []).runs}
+
+    assert rows == {
+        "legacy-run": "gitlab.example.com/agents/global/runs/legacy-run",
+        "schema-run": f"widgets/_runs/schema-run/{SESSION_ID}",
+    }
+
+
+def test_an_unreadable_schema_form_state_is_logged_at_a_path_that_exists(
+        tmp_path, caplog):
+    """The log line is for a human who has to go and look at the file, so it
+    quotes the found address — the one place the state actually is."""
+    ref = plant_session_run(tmp_path, "bad", state_yaml="}{ not yaml [")
+
+    with caplog.at_level("WARNING", logger="lmer_platform.inventory"):
+        run = inventory.build_inventory([ref], []).runs[0]
+
+    assert run.attention.reason == "unreadable"
+    said = [r.getMessage() for r in caplog.records
+            if "platform_run_state_unreadable" in r.getMessage()]
+    assert len(said) == 1
+    quoted = said[0].split("run=")[1].split(" ")[0]
+    assert quoted == ref.rel_path
+    assert (tmp_path / quoted).is_dir(), (
+        "the operator must be able to open what the log names"
+    )
+
+
+def test_a_tracked_schema_form_run_with_no_dir_still_has_no_rel_path(tmp_path):
+    """A freshly spawned run that has pushed nothing is a state, not an error —
+    and the one row that cannot say where the run lives says nothing, in either
+    shape. A session dir makes that more true, not less: the index knows the
+    slug, and which of the slug's sessions is the run's newest dir is something
+    only the mirror can answer."""
+    inv = inventory.build_inventory(
+        [], [], tracked=[_Tracked("not-pushed", project="acme/widgets")]
+    )
+    run = inv.runs[0]
+
+    assert run.state == "dormant"
+    assert run.rel_path is None
+    assert run.to_dict()["rel_path"] is None

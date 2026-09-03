@@ -6,19 +6,27 @@ from pathlib import Path
 import pytest
 
 from work_repo.utils import (
+    LEGACY_FORM,
+    instance_memory_dir,
+    project_area,
     project_info_dir,
     project_memory_dir,
     sanitize_task_target,
     task_info_dir,
     task_target_dir,
+    work_repo_layout,
 )
 
 # Env vars the info-dir helpers read; cleared before each helper test so the
 # host environment can't leak real LMER_* values into assertions.
+# LMER_REPO_URL joined the list with dual-read (issue #353): it is the lookup
+# key in a schema-form tree, so a leaked one could resolve a base these
+# legacy-tree assertions do not expect.
 _INFO_DIR_ENV_VARS = (
     "LMER_WORK_REPO_PATH",
     "LMER_REPO_HOST",
     "LMER_REPO_PROJECT",
+    "LMER_REPO_URL",
     "LMER_TASK",
     "LMER_TASK_TARGET",
 )
@@ -262,3 +270,53 @@ class TestInfoDirHelpers:
         assert task_target_dir() == Path(
             "/wr/git.example.com/group/proj/review/mr-756"
         )
+
+
+class TestLegacyFormHelpers:
+    """The dual-read accessors (issue #353 D20) answering for a tree with no
+    `_plexus.yaml` — the only form these env-only tests build. Schema form
+    and the failure modes live in tests/test_work_repo_schema_base.py."""
+
+    def test_layout_is_legacy_and_names_no_manifest(self, clean_info_env, tmp_path):
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", str(tmp_path))
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        layout = work_repo_layout()
+        assert layout.form == LEGACY_FORM
+        assert layout.is_schema is False
+        assert layout.root == tmp_path
+        assert layout.base == tmp_path / "git.example.com" / "group/proj"
+        assert layout.project is None
+        assert layout.manifest is None
+        assert layout.problem is None
+
+    def test_layout_without_run_context(self, clean_info_env, tmp_path):
+        """No host/project is no base — the form is still answered."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", str(tmp_path))
+        layout = work_repo_layout()
+        assert layout.form == LEGACY_FORM
+        assert layout.base is None
+
+    def test_project_area_uses_the_legacy_name(self, clean_info_env):
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+        clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        assert project_area("runs", "_runs") == Path(
+            "/wr/git.example.com/group/proj/runs"
+        )
+        assert project_area("specs", "_specs") == Path(
+            "/wr/git.example.com/group/proj/specs"
+        )
+
+    def test_project_area_without_run_context(self, clean_info_env):
+        assert project_area("runs", "_runs") is None
+
+    @pytest.mark.parametrize("with_context", [True, False])
+    def test_no_instance_memory_scope(self, clean_info_env, with_context):
+        """D17's instance scope exists only in schema form; a legacy tree
+        keeps every memory type in `{project}/memory/`."""
+        clean_info_env.setenv("LMER_WORK_REPO_PATH", "/wr")
+        if with_context:
+            clean_info_env.setenv("LMER_REPO_HOST", "git.example.com")
+            clean_info_env.setenv("LMER_REPO_PROJECT", "group/proj")
+        assert instance_memory_dir() is None

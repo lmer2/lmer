@@ -30,7 +30,7 @@ from lmer_cli import gate_lock
 
 from .run_state import append_event, run_dir, run_rel_path_candidates
 from .specs_index import specs_rel_path
-from .utils import sanitize_task_target
+from .utils import no_run_context_error, task_target_dir, work_repo_layout
 
 PUSH_RETRIES = 3
 
@@ -688,12 +688,68 @@ def claim_push_once(repo_path: Path, label: str = "work repo") -> tuple[str, str
     return CLAIM_PUSH_ERROR, output
 
 
+def _rel_to_root(path: Optional[Path], root: Path) -> Optional[str]:
+    """*path* spelled relative to the work-repo root, or None.
+
+    None for a path outside the root (and for no path at all), which stages
+    nothing rather than a string a commit would take literally — the rule
+    :func:`run_state.run_rel_for_dir_name` and :func:`specs_index.specs_rel_path`
+    already follow for the areas they own.
+    """
+    if path is None:
+        return None
+    try:
+        return Path(path).relative_to(root).as_posix()
+    except ValueError:
+        return None
+
+
+def _memory_rel_paths() -> list[str]:
+    """Both memory scopes, from the module that owns them.
+
+    Imported at call time, not at module import: ``work_repo.memory`` imports
+    this module, so a top-level import here would close the cycle (the same
+    local-import convention ``specs_index`` uses for ``run_state``).
+    """
+    from .memory import memory_write_rel_paths  # local: memory imports this module
+
+    return memory_write_rel_paths()
+
+
 def commit_work_changes(commit_message: Optional[str] = None) -> int:
     """
-    Commit and push the current task-target directory in the work repo.
+    Commit and push everything this session writes into the work repo.
 
-    Builds the path ``{host}/{project}/{task_type}/{task_target}`` from the
-    environment and delegates to :func:`commit_work_path`.
+    The batching commit behind ``work commit``. Every path is asked of the
+    helper that OWNS it rather than composed from the ``{host}/{project}``
+    env trio, so the list follows the FORM of the tree (issue #353 D20) and
+    can never name a directory the writers do not use.
+
+    Both forms stage the run record (:func:`run_state.run_rel_path_candidates`
+    — the resolved dir plus the address a rename vacated) and the specs index
+    (:func:`specs_index.specs_rel_path`). The two ends differ:
+
+    * a LEGACY tree also stages ``{host}/{project}/{task}/{target}``, where
+      log and report output predating the run-dir unification (issue #87 D4)
+      may still sit. Schema form has no such directory — the record is a
+      session dir under ``_runs/<slug>/`` (D22) and nothing writes a
+      task-target path — so staging one there would name a directory that
+      does not exist.
+    * a SCHEMA tree also stages both memory scopes
+      (:func:`memory.memory_write_rel_paths`). D17 splits memory in two and
+      the instance scope lives at the plexus ROOT, outside every project
+      dir, so no other path in this list can reach it. That scope is shared,
+      so this can carry another launch's freshly persisted memory along —
+      the same many-concurrent-writers property the run area already has,
+      and pushing it beats losing it when an ephemeral container exits. A
+      legacy tree has ONE scope and keeps staging exactly what it staged
+      before: memory there is ``work memory persist``'s own push.
+
+    Refuses (1) when nothing resolves a project dir — an unset launch context
+    in a legacy tree, an unreadable manifest in a schema one — naming the
+    reason it actually has (:func:`~work_repo.utils.no_run_context_error`). A broken registry
+    is NOT that case: it resolves the host bucket (D9) and the commit
+    proceeds there.
 
     Args:
         commit_message: Optional commit message (defaults to auto-generated)
@@ -701,26 +757,28 @@ def commit_work_changes(commit_message: Optional[str] = None) -> int:
     Returns:
         Exit code (0 for success, non-zero for failure)
     """
-    repo_host = os.environ.get("LMER_REPO_HOST")
-    repo_project = os.environ.get("LMER_REPO_PROJECT")
-    task_type = os.environ.get("LMER_TASK", "default")
-    task_target = os.environ.get("LMER_TASK_TARGET", "default")
-
-    if not repo_host or not repo_project:
-        print("❌ LMER_REPO_HOST and LMER_REPO_PROJECT must be set", file=sys.stderr)
+    layout = work_repo_layout()
+    if layout.base is None:
+        print(no_run_context_error(), file=sys.stderr)
         return 1
 
-    # Sanitize task_target to match directory structure
-    safe_task_target = sanitize_task_target(task_target) if task_target else "default"
+    paths: list[str] = []
 
     # Legacy task-target dir: log/report output predating the run-dir
-    # unification (issue #87 D4) may still sit here — keep staging it.
-    target_path = f"{repo_host}/{repo_project}/{task_type}/{safe_task_target}"
+    # unification (issue #87 D4) may still sit here — keep staging it, in the
+    # form that has it. `task_target_dir` applies the same LMER_TASK /
+    # LMER_TASK_TARGET defaults and the same `sanitize_task_target` this used
+    # to apply inline, so the legacy string is unchanged.
+    if not layout.is_schema:
+        legacy_target = _rel_to_root(task_target_dir(), layout.root)
+        if legacy_target is not None:
+            paths.append(legacy_target)
 
     # The run dir itself: the resolved (possibly renamed) dir plus the
     # bare-slug dir, so a rename whose own push failed still gets its old
-    # path's deletions staged (commit_work_path skips clean paths).
-    paths = [target_path]
+    # path's deletions staged (commit_work_path skips clean paths). In schema
+    # form the bare address is the `_runs/<slug>/` group, which holds every
+    # session of the run.
     for rel in run_rel_path_candidates():
         if rel not in paths:
             paths.append(rel)
@@ -732,6 +790,12 @@ def commit_work_changes(commit_message: Optional[str] = None) -> int:
     if specs_rel and specs_rel not in paths:
         paths.append(specs_rel)
 
+    # Both memory scopes (D17), schema form only — see the docstring.
+    if layout.is_schema:
+        for rel in _memory_rel_paths():
+            if rel not in paths:
+                paths.append(rel)
+
     return commit_work_path(paths, commit_message)
 
 
@@ -741,8 +805,9 @@ def commit_napkin_if_subdir(commit_message: Optional[str] = None) -> int:
 
     The inverse of :func:`push_napkin_if_separate`: in subdir mode
     ``LMER_NAPKIN_PATH`` resolves under ``LMER_WORK_REPO_PATH``, but the
-    work-repo commit (:func:`commit_work_changes`) stages only the task-target
-    and run-dir paths — napkin sits at the work-repo root, so without this
+    work-repo commit stages only the paths this session's own work lands in
+    (:func:`commit_work_changes`) — napkin is not one of them in either form,
+    and it sits at the work-repo root, so without this
     step notes written there are never committed and are silently lost when
     an ephemeral container exits. Stages and pushes just the napkin subdir
     via :func:`commit_work_path`.
@@ -773,8 +838,8 @@ def commit_napkin_if_subdir(commit_message: Optional[str] = None) -> int:
 def report_uncommitted_work_items() -> int:
     """Flag items left uncommitted in the work repo after a ``work commit``.
 
-    ``work commit`` stages only the run dir and legacy task-target dir (see
-    :func:`commit_work_changes`), so a file added elsewhere — e.g. a new
+    ``work commit`` stages only the paths :func:`commit_work_changes` composes
+    for this session's form, so a file added elsewhere — e.g. a new
     ``{host}/{project}/info/*.md`` — is silently left behind (issue #85). This
     runs a repo-wide ``git status --porcelain --untracked-files=all`` and prints
     one ⚠️ block naming the untracked/unstaged entries so the user notices them.

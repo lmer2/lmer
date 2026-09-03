@@ -59,7 +59,14 @@ from .ui_build import (
     NODE_VERSION, UIBuildError, installed_ui_dir, is_built, node_dir, platform_key,
     setup_ui,
 )
-from .workrepo import mirror_status, pull, resolve_run_dir, run_dirs
+from .workrepo import (
+    fold_registry,
+    folded_identity,
+    mirror_status,
+    pull,
+    resolve_run_dir,
+    run_dirs,
+)
 
 logger = logging.getLogger("lmer_platform.daemon")
 
@@ -165,6 +172,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--prompt", dest="direction",
         help="What the next session should do — the run's seed direction. Required "
              "to reopen a run that is already complete or archived",
+    )
+    # The API field is `session_id` and the flag is spelled --session because that
+    # is what the host CLI takes (`lmer --session`), which is where the value ends
+    # up. Without it a terminal resume gets whichever launch the picker resolves —
+    # the newest — so an operator continuing an older one had no way to say so.
+    resume_cmd.add_argument(
+        "--session", dest="session_id",
+        help="Which launch of the run's group to continue: a session dir's "
+             "<session-id>, or its full <session-id>--<name>. Omit it to continue "
+             "the newest launch, which is the ordinary one-tap case; an id that "
+             "names none of them is refused with the list of the ones there are, "
+             "never resolved to a neighbouring record",
     )
 
     return parser
@@ -383,7 +402,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_runs(args: argparse.Namespace) -> int:
     config = load_config()
     if args.candidates:
-        tracked_keys = {(e.host, e.project, e.slug) for e in list_tracked()}
+        # The CLI twin of `GET /api/runs/candidates`, and it has to make the
+        # SAME comparison: both sides folded to the project's primary remote
+        # (D8), from one registry read. Comparing raw pairs here while the HTTP
+        # route folded them let the two surfaces disagree about the same
+        # directory — the route saying `tracked`, this listing offering it for
+        # adoption — and adopting from this listing wrote the second row for a
+        # run the platform had already spawned, which is the defect the fold
+        # exists to close. A no-op in a legacy tree and for any row already
+        # keyed on the primary.
+        registry = fold_registry(config)
+        tracked_keys = {
+            folded_identity(config, e.host, e.project, registry=registry) + (e.slug,)
+            for e in list_tracked()
+        }
         found = run_dirs(config)
         if not found:
             print("no runs found in the work-repo mirror "
@@ -392,7 +424,10 @@ def _cmd_runs(args: argparse.Namespace) -> int:
         print(f"{len(found)} run(s) in the shared work repo "
               "— these are everyone's, not the fleet view:")
         for ref in found:
-            mark = "tracked" if (ref.host, ref.project, ref.slug) in tracked_keys else "-"
+            key = folded_identity(
+                config, ref.host, ref.project, registry=registry
+            ) + (ref.slug,)
+            mark = "tracked" if key in tracked_keys else "-"
             print(f"  [{mark:>7}] {ref.rel_path}")
         return 0
 
@@ -520,6 +555,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         taskdef=args.taskdef,
         repo_url=args.repo_url,
         direction=args.direction,
+        session_id=args.session_id,
     )
     try:
         result = resume_run(config, request)

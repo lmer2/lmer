@@ -31,6 +31,21 @@ the entrypoint still runs stdlib-only when no ``sources.yaml`` exists;
 when one IS present and the import fails, startup is refused
 (``_refuse_start_if_sources_unreadable``) — a present config that cannot
 be read must never be silently ignored.
+
+The second guarded seam is the lmer-schema core (issue #353): a work repo
+in the schema form places this launch's record by REGISTRY LOOKUP over
+normalized remotes (D8/D21), which has exactly one definition —
+``lmer_schema.registry``/``lmer_cli.container.sources.normalize_repo_url``.
+Mirroring that here would be a second implementation of identity, so
+``_resolve_work_repo_placement`` imports the core lazily and guarded,
+exactly as ``_import_yaml`` does, and answers "legacy" without importing
+anything when the tree carries no ``_plexus.yaml`` (a single stat — the
+same presence test the core itself uses). A tree that DOES carry one and a
+build that cannot import the core is a refusal to place anything, never a
+fall back to the legacy names: that fallback would write a schema-form
+tree's record at ``{host}/{project}/runs/`` and split the tree in two
+(D20). This is the one exception to the stdlib-only rule above and it is
+a degrade-to-legacy exception, not a dependency.
 """
 from __future__ import annotations
 
@@ -81,6 +96,45 @@ KNOWN_HARNESS_RUNNERS = {
 # work-repo root (single source of truth for the refusal check and the
 # resolution step — see the section banner further down).
 SOURCES_CONFIG_NAME = "sources.yaml"
+
+# The plexus manifest (spec §4, issue #353). Spelled here for ONE purpose:
+# a stdlib presence probe answering "is anything schema-shaped here at all",
+# which is the question that decides whether the lmer-schema core matters to
+# this launch — see _resolve_work_repo_placement. Nothing here opens or parses
+# it; the core owns the name for every read (lmer_schema.manifest), and the
+# probe is deliberately the same test the core's own detection uses
+# (is_symlink() first, so a dangling manifest symlink still reads as present).
+PLEXUS_MANIFEST_NAME = "_plexus.yaml"
+
+# The two project-scope area names container start creates in a schema-form
+# tree: the run area (D22 — a launch's session dir hangs under
+# `_runs/<slug>/`) and the project info dir, the schema spelling of the
+# legacy chain's `{host}/{project}/info/`. Standalone copies of the work
+# CLI's `project_area("runs", "_runs")` / `project_area("info", "_info")`
+# mapping, pinned against it by tests/test_clone_and_exec_session_dir.py
+# (the dir created here must be the dir `work` later resolves).
+SCHEMA_RUNS_DIR = "_runs"
+SCHEMA_INFO_DIR = "_info"
+
+# A session id names ONE directory inside a run's group in schema form, so a
+# value carrying a path separator, an empty/`.`/`..` segment or a glob
+# character is not one. Mirrors work_repo.run_state._usable_session_id (and
+# through it lmer_platform.answer._reject_traversal); the parity is a test,
+# because this module cannot import either.
+_UNSAFE_SESSION_SEGMENTS = frozenset({"", ".", ".."})
+_SESSION_PATTERN_CHARS = "*?["
+
+# What makes a child of a group a RECORD rather than an address: it holds a
+# state file. Same names, in the same order, as work_repo.run_state's
+# STATE_FILE/LEGACY_STATE_FILE and lmer_platform.workrepo._STATE_FILENAMES —
+# the two resolvers that read this tree — pinned against them by
+# tests/test_clone_and_exec_session_dir.py, since this module can import
+# neither. Used by _session_record_exists, never written here.
+_STATE_FILENAMES = ("state.yaml", "state.yml")
+
+# A bare full SHA-1 task target; run slugs use its 12-char short form
+# (work_repo.run_state.derive_slug, issue #87 D4).
+_FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 
 # Env var carrying the taskdef ref override. Participates in the per-field
 # resolution matrix for the taskdef source only — there is no napkin ref
@@ -1670,12 +1724,280 @@ def clone_secondary_mr(
             print(f"   Repository cloned at HEAD in {target_dir}. You may need to manually checkout the source branch.", file=sys.stderr)
 
 
+@dataclass(frozen=True)
+class WorkRepoPlacement:
+    """Where this launch's work goes in the work repo, and in which form.
+
+    ``schema`` is True for a tree carrying a ``_plexus.yaml`` (spec D20);
+    ``base`` is the project dir the launch records under — the env trio's
+    ``{host}/{project}`` in a legacy tree, the registry-resolved short name
+    (or, for a repo nobody has named yet, its ``{host}/{project}`` host
+    bucket — D9) in a schema-form one. ``base`` is None when there is nothing
+    to resolve, or nothing safe to resolve: a PRESENT manifest this build
+    cannot read never degrades to the legacy names. ``problem`` carries the
+    reason whenever the manifest or its registry could not be used.
+    """
+
+    schema: bool
+    base: Path | None
+    problem: str | None
+
+
+def _resolve_work_repo_placement(
+    work_repo_path: Path, host: str | None, project: str | None
+) -> WorkRepoPlacement:
+    """Resolve the work repo's form and this launch's project dir (D20).
+
+    The entrypoint's copy of the question ``work_repo.utils.work_repo_layout``
+    answers for the work CLI — it cannot call that resolver (this module runs
+    before the package is guaranteed importable) but it must reach the SAME
+    directory, or container start prepares a dir no ``work`` verb writes in.
+    So the parts that decide identity are not mirrored: the manifest, the
+    registry lookup and the remote normalization all come from the core
+    (D8/D21 pin those to one definition), imported lazily and guarded exactly
+    as ``_import_yaml`` is. ``tests/test_clone_and_exec_session_dir.py`` pins
+    the composed answer against the work CLI's for the same tree and env.
+
+    A tree with NO manifest is answered before any of that, from one stat:
+    that is the path every unmigrated tree takes and it stays stdlib-only.
+    A tree WITH one and a build that cannot read it resolves nothing and says
+    why — never a fall back to the legacy names, which would write a schema
+    tree's record at ``{host}/{project}/runs/`` and split it in two (D20). A
+    manifest that parses but whose REGISTRY breaks a rule is different in
+    kind: only identity is unusable, so the work parks in the host bucket
+    (the same fallback the work CLI and the validator make) rather than being
+    refused.
+    """
+    root = Path(work_repo_path)
+    legacy_base = root / host / project if host and project else None
+    manifest = root / PLEXUS_MANIFEST_NAME
+    if not (manifest.is_symlink() or manifest.exists()):
+        return WorkRepoPlacement(schema=False, base=legacy_base, problem=None)
+
+    try:
+        # Guarded and lazy, like PyYAML above: reached only once a manifest is
+        # known to be present, so a legacy tree never imports the core, and an
+        # lmer built without it degrades instead of dying at container start.
+        from lmer_schema.form import Form, detect_form
+        from lmer_schema.manifest import ManifestError
+        from lmer_schema.registry import (
+            RegistryError,
+            load_registry,
+            resolve_project_dir,
+        )
+    except ImportError as exc:
+        return WorkRepoPlacement(
+            schema=True,
+            base=None,
+            problem=(
+                f"{manifest}: present, but the lmer-schema core API is not "
+                f"importable in this container ({exc})"
+            ),
+        )
+
+    # The core is the authority on the form once it can be asked; the stat
+    # above only decided whether it had to be.
+    if detect_form(root) is not Form.SCHEMA:
+        return WorkRepoPlacement(schema=False, base=legacy_base, problem=None)
+
+    registry, problem = None, None
+    try:
+        registry = load_registry(root)
+    except RegistryError as exc:
+        problem = str(exc)
+    except ManifestError as exc:
+        return WorkRepoPlacement(schema=True, base=None, problem=str(exc))
+    except Exception as exc:  # pragma: no cover - defensive
+        # Whatever went wrong reading a PRESENT manifest, the one thing that
+        # must not happen is falling back to the legacy names.
+        return WorkRepoPlacement(
+            schema=True, base=None, problem=f"{manifest}: unusable manifest: {exc}"
+        )
+
+    url = os.environ.get("LMER_REPO_URL")
+    if not url and host and project:
+        url = f"https://{host}/{project}"
+
+    base = legacy_base
+    if url:
+        resolution = resolve_project_dir(root, url, registry=registry)
+        if resolution.path is not None:
+            base = resolution.path
+        elif resolution.bucket_path is not None:
+            # A miss with no bucket dir yet: the first launch for an unnamed
+            # repo creates it. Never a derived short name (D9).
+            base = resolution.bucket_path
+    return WorkRepoPlacement(schema=True, base=base, problem=problem)
+
+
+def _usable_session_id(session: str | None) -> bool:
+    """Whether *session* can name ONE session dir inside a run's group.
+
+    Standalone mirror of ``work_repo.run_state._usable_session_id``: the value
+    is a path SEGMENT (no separator, no empty/``.``/``..`` segment) and it is
+    compared, never expanded (no glob character). A value that fails this is
+    treated as no launch id at all — the work CLI degrades the same way,
+    because ``LMER_SESSION_ID`` reaches every hook-facing invocation and a
+    refusal there would take a session down over a variable it did not set.
+    A dot-leading id is refused too, and for the reason the work CLI's copy
+    states at length: dot-children of a group are `.new-*` seeds to every walk
+    over it, so such an id opens a record that is written and then invisible
+    to every resolver — a worse outcome than opening none.
+    Parity with the work CLI's copy is pinned by
+    ``tests/test_clone_and_exec_session_dir.py``.
+    """
+    if not isinstance(session, str) or not session:
+        return False
+    segments = session.replace("\\", "/").split("/")
+    if len(segments) > 1 or session in _UNSAFE_SESSION_SEGMENTS:
+        return False
+    if session.startswith("."):
+        return False
+    return not any(char in session for char in _SESSION_PATTERN_CHARS)
+
+
+def _launch_session_id() -> str | None:
+    """This launch's ``LMER_SESSION_ID`` when it can be a directory name.
+
+    ``main()`` mints one (:func:`mint_session_id`) before it places anything,
+    so in a container start this is always set; a host-injected value is
+    preserved as-is and therefore checked.
+    """
+    session = os.environ.get("LMER_SESSION_ID")
+    return session if _usable_session_id(session) else None
+
+
+def _derive_run_slug(task_type: str | None, task_target: str | None) -> str:
+    """The run slug for (taskdef, target) — the ``_runs/<slug>/`` group.
+
+    Standalone mirror of ``work_repo.run_state.derive_slug`` (same reason as
+    the ``sanitize_task_target`` copy above: this module runs without the
+    package). The two must agree exactly or container start prepares a
+    different group than the one ``work seed`` writes into — pinned by
+    ``tests/test_clone_and_exec_session_dir.py``.
+    """
+    taskdef = task_type or "default"
+    if task_target and _FULL_SHA_RE.fullmatch(task_target):
+        return f"{taskdef}-{task_target[:12].lower()}"
+    safe = sanitize_task_target(task_target) if task_target else "default"
+    if safe == "default":
+        return taskdef
+    return f"{taskdef}-{safe}"
+
+
+def _session_record_exists(group: Path, session: str) -> bool:
+    """Whether *group* already holds this launch's record, under either name.
+
+    Standalone mirror of the two questions ``work_repo.run_state.
+    _named_session`` asks of a group (and of the rule
+    ``lmer_platform.workrepo._sessions_in`` shares with it), because a
+    resumed launch's record may carry either name and only the work CLI can
+    normally tell:
+
+    - a RECORD is a child holding a state file — a dot-dir is a seed
+      mid-rename and a bare directory is an address, never a record;
+    - it answers to *session* by its own name, or by the ``<session>--<name>``
+      the freeze rename produced when the launch was named.
+
+    Pinned against ``run_state._named_session`` by
+    ``tests/test_clone_and_exec_session_dir.py``, this module being unable to
+    import it. Any fs error is "no record": the answer only ever decides
+    whether an empty directory is created, and container start must not fail
+    on an unreadable group.
+    """
+    try:
+        # Listed inside the try: ``iterdir()`` is a generator and raises on
+        # the FIRST iteration, so a group that does not exist yet — the
+        # common case, a run's first launch — escapes an except around the
+        # call alone.
+        children = sorted(group.iterdir())
+    except OSError:
+        return False
+    for child in children:
+        try:
+            if child.name.startswith(".") or not child.is_dir():
+                continue
+            if child.name != session and not child.name.startswith(f"{session}--"):
+                continue
+            if any((child / name).is_file() for name in _STATE_FILENAMES):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _ensure_session_dir(
+    placement: WorkRepoPlacement, task_type: str | None, task_target: str | None
+) -> None:
+    """Create this launch's session dir in a schema-form work repo (D22).
+
+    One launch owns one complete record at ``<project>/_runs/<slug>/
+    <session-id>/``; ``_runs/<slug>/`` only groups (taskdef, target) and
+    nothing is written at that level. The dir is created EMPTY — ``work
+    seed`` still seeds through its tmp-dir-then-rename lifecycle, whose
+    rename replaces an empty dir at the destination — so this prepares the
+    address without ever being a half-written record.
+
+    Only when the group does not already hold this launch's record, though
+    (:func:`_session_record_exists`). A RESUME arrives with the resumed
+    record's id in ``LMER_SESSION_ID`` (the host CLI's ``--session``), and
+    that record may be a NAMED one, living at ``<session-id>--<name>/``:
+    creating the bare address unconditionally then leaves an empty
+    ``<session-id>/`` beside the very record the launch is about to write in.
+    Nothing mis-routes — both resolvers count only children carrying a state
+    file — but it is litter at the one level D22 keeps clean, the validator
+    warns on it, and an operator reading the group finds two directories for
+    one launch and no way to tell which is the run.
+
+    Two refusals. With no base there is nothing to create and the reason is
+    printed (a present manifest this build cannot read). With no usable
+    ``LMER_SESSION_ID`` the project dir is prepared and no record is opened:
+    an invocation with no launch id has no launch identity to invent, and a
+    dir named for a guess is a record nobody can resume.
+    """
+    if placement.base is None:
+        if placement.problem:
+            print(
+                f"⚠️  {placement.problem}\n"
+                f"   Not creating any work-repo directory for this launch: a "
+                f"present {PLEXUS_MANIFEST_NAME} is never read as a legacy "
+                f"tree (spec D20). Fix or remove the manifest.",
+                file=sys.stderr,
+            )
+        return
+    if placement.problem:
+        print(f"⚠️  {placement.problem}", file=sys.stderr)
+
+    base = placement.base
+    base.mkdir(parents=True, exist_ok=True)
+    (base / SCHEMA_INFO_DIR).mkdir(parents=True, exist_ok=True)
+
+    session = _launch_session_id()
+    if not session:
+        return
+    slug = _derive_run_slug(task_type, task_target)
+    group = base / SCHEMA_RUNS_DIR / slug
+    if _session_record_exists(group, session):
+        # The record this launch continues is already on disk; its address is
+        # its own name, whatever that name is. Nothing to prepare.
+        return
+    group.mkdir(parents=True, exist_ok=True)
+    (group / session).mkdir(exist_ok=True)
+
+
 def ensure_work_repo_directory(work_repo_path: Path, host: str | None, project: str | None, task_type: str | None, task_target: str | None) -> None:
     """
-    Ensure directory structure exists in work repo: {host}/{project}/{task_type}/{task_target}
-    Also creates info directories at:
+    Ensure this launch's directories exist in the work repo, by FORM.
+
+    Legacy tree (no ``_plexus.yaml``) — unchanged, byte for byte:
+    {host}/{project}/{task_type}/{task_target}, plus info directories at
     - {host}/{project}/info/ (global project info)
     - {host}/{project}/{task_type}/info/ (project+task specific info)
+
+    Schema-form tree (issue #353) — the resolved project dir, its ``_info/``,
+    and this launch's session dir ``_runs/<slug>/<session-id>/`` (D22); see
+    :func:`_resolve_work_repo_placement` for how the form and the project dir
+    are resolved and :func:`_ensure_session_dir` for what is created.
 
     Args:
         work_repo_path: Path to the work repository
@@ -1689,6 +2011,11 @@ def ensure_work_repo_directory(work_repo_path: Path, host: str | None, project: 
     """
     if not host or not project:
         # Skip directory creation if we can't parse the repo URL
+        return
+
+    placement = _resolve_work_repo_placement(work_repo_path, host, project)
+    if placement.schema:
+        _ensure_session_dir(placement, task_type, task_target)
         return
 
     # Build project directory path: {host}/{project}
@@ -1767,6 +2094,25 @@ def _is_self_dev_workspace(workspace: Path) -> bool:
     return name in ("lmer", "lmer-cli")
 
 
+def _work_repo_doc_dir(placement: WorkRepoPlacement) -> "Path | None":
+    """The work repo's project INFO area for *placement*, or None.
+
+    One mapping, taken from the placement the entrypoint already resolved:
+    a schema-form tree's ``<project>/_info/`` (:data:`SCHEMA_INFO_DIR`, the
+    dir :func:`_ensure_session_dir` creates for this same launch) and a
+    legacy tree's ``{host}/{project}/info/`` — the path
+    :func:`ensure_work_repo_directory` creates in its legacy chain.
+
+    None whenever the placement resolved no base: no run context, or a
+    PRESENT manifest this build cannot read. The second is why this takes a
+    placement rather than the env pair — the legacy names must not be
+    composed for a tree that is not legacy (D20).
+    """
+    if placement.base is None:
+        return None
+    return placement.base / (SCHEMA_INFO_DIR if placement.schema else "info")
+
+
 def provision_documentation(
     workspace: Path,
     work_repo_path: Path,
@@ -1777,8 +2123,28 @@ def provision_documentation(
 
     For each documentation file, the hierarchy is (least to most important):
     1. lmer global defaults (global_path, e.g. /Agents/global/)
-    2. Work repo project info ({host}/{project}/info/)
+    2. Work repo project info (the project's info area, BY FORM — see below)
     3. Project repo's own files (already in workspace) — highest priority, skipped
+
+    The work-repo tier is addressed through the SAME resolution container
+    start uses to place this launch's record (:func:`_resolve_work_repo_placement`
+    → :func:`_work_repo_doc_dir`), not composed from ``LMER_REPO_HOST``/
+    ``LMER_REPO_PROJECT`` here: in a schema-form tree the project dir is
+    whatever the registry resolved and its info area is ``_info/``, so the
+    hard-composed ``{host}/{project}/info/`` matched nothing and a migrated
+    project's own conventions silently stopped reaching the agent (issue
+    #353). A legacy tree resolves to exactly the path this used to compose.
+
+    A work repo this build cannot read never raises here — provisioning runs
+    on container start's always-succeed path, where the cost of a failure is
+    a session with no AGENTS.md at all. It degrades on the same split
+    :func:`_resolve_work_repo_placement` makes: NO manifest is a legacy tree
+    and reads the legacy names; a PRESENT but unreadable one resolves no
+    base, so this skips the work-repo tier entirely, prints the reason and
+    falls through to the lmer defaults. That arm — defaults rather than the
+    legacy names — is the D20 refusal: the legacy path of a schema-form tree
+    is at best a stale pre-migration copy, and handing an agent someone's
+    superseded conventions is worse than handing it the documented defaults.
 
     Provisioned files are added to .git/info/exclude so they don't appear as
     untracked changes, and a .lmer-provisioned-docs marker file is written
@@ -1808,6 +2174,19 @@ def provision_documentation(
     repo_host = os.environ.get("LMER_REPO_HOST")
     repo_project = os.environ.get("LMER_REPO_PROJECT")
 
+    # Where this launch's project info lives, by form — resolved ONCE, before
+    # the per-file loop, so the tier is one answer for the whole pass.
+    placement = _resolve_work_repo_placement(work_repo_path, repo_host, repo_project)
+    work_info_dir = _work_repo_doc_dir(placement)
+    if work_info_dir is None and placement.problem:
+        print(
+            f"⚠️  {placement.problem}\n"
+            f"   Not reading any work-repo documentation for this launch: a "
+            f"present {PLEXUS_MANIFEST_NAME} is never read as a legacy tree "
+            f"(spec D20). Falling back to the lmer defaults.",
+            file=sys.stderr,
+        )
+
     # Discover which rule files lmer provides
     doc_files = ["AGENTS.md"]
     global_rules_dir = global_path / "rules"
@@ -1825,8 +2204,8 @@ def provision_documentation(
 
         # Try work repo first (middle priority)
         source = None
-        if repo_host and repo_project:
-            work_source = work_repo_path / repo_host / repo_project / "info" / doc_file
+        if work_info_dir is not None:
+            work_source = work_info_dir / doc_file
             if work_source.exists():
                 source = work_source
                 sources[doc_file] = "work-repo"
@@ -2325,7 +2704,10 @@ def main(argv: list[str] | None = None) -> int:
     1. Read repository URL from LMER_REPO_URL environment variable
     2. Clone repository into /workspace with specified branch/ref
     3. Clone work repository into /work
-    4. Create directory structure in work repo: {host}/{project}/{task_type}/{task_target}
+    4. Create this launch's directories in the work repo, by form:
+       {host}/{project}/{task_type}/{task_target} in a legacy tree, the
+       resolved project dir's _runs/<slug>/<session-id>/ in a schema-form
+       one (ensure_work_repo_directory)
     5. Execute either claude-runner or custom command via bash
 
     Args:
@@ -2341,6 +2723,14 @@ def main(argv: list[str] | None = None) -> int:
         cmd_tokens = argv[idx + 1 :]
     else:
         cmd_tokens = ["claude-runner"]
+
+    # Mint the session id FIRST (it was minted at dispatch, a few hundred
+    # lines below). In a schema-form work repo this value names this launch's
+    # session dir (issue #353 D22), and ensure_work_repo_directory creates
+    # that dir well before dispatch — a dir cannot be named by a variable that
+    # does not exist yet. setdefault, so dispatch_runner's own call stays the
+    # no-op it becomes and a host-injected id is still preserved.
+    mint_session_id()
 
     service_mode = os.environ.get("LMER_SERVICE_MODE") == "1"
     # Repo-less session (e.g. Slack-only chat): the host CLI sets LMER_NO_REPO

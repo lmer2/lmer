@@ -21,14 +21,24 @@ from unittest.mock import patch
 import pytest
 
 from work_repo import cli as work_cli
-from work_repo import release_run, run_state
+from work_repo import release_run, run_state, utils
 from work_repo.git_ops import CLAIM_PUSH_WON
 from tests.conftest import strip_lmer_env
+from tests.plexus_fixtures import PRIMARY_REPO, PROJECT, build_schema_plexus
 
 SHA_BUMP = "a" * 40
 SHA_MERGE = "b" * 40
 # The seed address every release of this fixture's repository derives.
 BASE = "release-repo"
+# The same address in the schema-form tree below, whose registered project is
+# reached by short name and whose target is a branch rather than a URL.
+SCHEMA_BASE = "release-main"
+# Three launches of that release: the one that goes terminal, the one that
+# claims after it, and a launch of a DIFFERENT release run that already owns
+# the version-bearing address.
+SID_FIRST = "20260824-101500-1-11111"
+SID_NEXT = "20260825-090000-3-33333"
+SID_OTHER = "20260824-113000-1-22222"
 
 
 @pytest.fixture(autouse=True)
@@ -486,3 +496,163 @@ class TestRollOverIsOneCommit:
             assert _main(["release", "claim"]) == 0
 
         assert commit.call_args.args[1] is None
+
+
+def _resume_as(rdir, session_id, monkeypatch):
+    """The resume handshake, as `work` performs it: the harness id arrives in
+    the environment and chains into the record's `sessions:` lineage, which is
+    what routes this launch's later invocations back to that dir (D22). Without
+    it a fresh `LMER_SESSION_ID` opens a NEW session of the same group and
+    never meets the terminal record at all."""
+    monkeypatch.setenv("LMER_SESSION_ID", session_id)
+    run_state.attach_session(rdir, run_state.load_state(rdir), session_id)
+
+
+@pytest.fixture
+def schema_runs(monkeypatch, tmp_path):
+    """The same release lifecycle in a SCHEMA-FORM tree (issue #353 D22).
+
+    Everything above runs in a legacy tree, where a record is `runs/<slug>/`
+    and `rdir.parent` IS the run area — the two facts the release call sites
+    were written against. Here the record is `<project>/_runs/<slug>/<sid>/`,
+    so `rdir.parent` is the GROUP and a run-area-relative name is two
+    segments; a call site that composes either one the old way addresses a
+    directory that does not exist, and only a schema tree can show it.
+    """
+    tree = build_schema_plexus(tmp_path / "plexus")
+    host, path = PRIMARY_REPO.split("/", 1)
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tree.root))
+    monkeypatch.setenv("LMER_REPO_HOST", host)
+    monkeypatch.setenv("LMER_REPO_PROJECT", path)
+    monkeypatch.setenv("LMER_TASK", "release")
+    monkeypatch.setenv("LMER_TASK_TARGET", "main")
+    monkeypatch.setenv("LMER_SESSION_ID", SID_FIRST)
+    utils._ANNOUNCED_MANIFEST_PROBLEMS.clear()
+    return tree
+
+
+class TestTheRollOverComposesInSchemaForm:
+    """The claim-side roll-over, against the layout it will actually meet once
+    a tree adopts `_plexus.yaml` (MR !259 review).
+
+    Two levels have to be right and neither is `rdir.parent` any more: the
+    address the aside slug is tested for occupancy at is the RUN AREA (the
+    group is one level too deep, and a candidate that is free there can be
+    taken at the level `reslug_run` asks about), and the path staged for the
+    dir the run moved TO is run-area-relative (`<slug>/<sid>`, which is what
+    `freeze_run_dir`/`reslug_run` hand back for the vacated half).
+    """
+
+    def test_the_dir_the_run_moved_to_is_staged_at_the_path_it_moved_to(
+            self, schema_runs, capsys, monkeypatch):
+        """`moved.name` is a bare session id here, so the staging path built
+        from it is `_runs/<sid>` — a path nothing wrote. `commit_work_path`
+        skips a path that neither exists nor holds tracked files, so the CAS
+        commit would record the vacated dir's deletion and nothing at the new
+        address, against a call site whose whole reason to exist is that no
+        resolver can name that dir once the successor owns the address."""
+        area = run_state.runs_base()
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        parked = _close_out(stop_reason="aborted")
+        assert parked == area / SCHEMA_BASE / SID_FIRST
+        capsys.readouterr()
+        _resume_as(parked, SID_NEXT, monkeypatch)
+
+        with ExitStack() as stack:
+            commit = _claim_seams(stack)
+            assert _main(["release", "claim"]) == 0
+
+        aside = [d for d in area.iterdir() if d.name.startswith(f"{SCHEMA_BASE}-")]
+        assert len(aside) == 1
+        moved = aside[0] / SID_FIRST
+        assert run_state.load_state(moved)["stop_reason"] == "aborted"
+
+        staged = commit.call_args.args[1] or []
+        vacated = f"{PROJECT}/_runs/{SCHEMA_BASE}/{SID_FIRST}"
+        destination = f"{PROJECT}/_runs/{aside[0].name}/{SID_FIRST}"
+        assert vacated in staged, f"the vacated path was left out: {staged}"
+        assert destination in staged, (
+            "the dir the run moved TO was left out of the claim commit — the "
+            f"previous release run lands as a pure deletion: {staged}")
+        # Every extra path the roll-over asks for addresses a real directory:
+        # the vacated one is gone (the successor's group holds only the new
+        # launch), and the destination is where the record now is.
+        assert (schema_runs.root / destination).is_dir()
+        assert f"{PROJECT}/_runs/{SID_FIRST}" not in staged
+        assert not (area / SID_FIRST).exists()
+
+    def test_the_aside_address_is_asked_of_the_run_area_not_the_group(
+            self, schema_runs, capsys, monkeypatch):
+        """`unique_release_slug` given the group tests occupancy at
+        `_runs/<old-slug>/<candidate>` instead of `_runs/<candidate>`, so it
+        hands back the canonical address while another launch holds it —
+        exactly the address `slug_available` refuses. `reslug_run` then asks
+        the right level, declines the move, and the claim fails closed: safe,
+        but it is the version-in-slug wedge back on any adopted repo."""
+        area = run_state.runs_base()
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        # Another release run already owns the canonical version-bearing
+        # address — the re-used version of RELEASE-FLOW.md §6, one group up.
+        taken = f"{SCHEMA_BASE}-v0.6.0"
+        other = area / taken / SID_OTHER
+        other.mkdir(parents=True)
+        run_state.write_state(other, run_state.seed_state(taken, "release", "main"))
+        # ...and this run recorded 0.6.0 but never moved (a read-only fs at
+        # record time), so it goes terminal on the seed address.
+        with patch.object(run_state.Path, "rename",
+                          side_effect=OSError("read-only fs")):
+            assert _record(["version", "0.6.0"]) == 0
+        parked = _close_out()
+        assert parked == area / SCHEMA_BASE / SID_FIRST
+        capsys.readouterr()
+        _resume_as(parked, SID_NEXT, monkeypatch)
+
+        with ExitStack() as stack:
+            assert _claim(stack) == 0, "the seed address could not be freed"
+
+        fresh = run_state.run_dir()
+        assert fresh == area / SCHEMA_BASE / SID_NEXT
+        assert run_state.load_state(fresh)["status"] == "in-progress"
+        assert release_run.load_release(fresh) is None
+        # The parked run took an address of its own rather than the one the
+        # other launch holds, and that launch's record is untouched.
+        assert [d.name for d in (area / taken).iterdir()] == [SID_OTHER]
+        assert run_state.load_state(other)["slug"] == taken
+        assert run_state.find_run_dir(taken) == other
+        # It landed on a VARIANT of the taken address (the group holding the
+        # RECORD is the one to look for: the aside has to be computed as free
+        # rather than assumed, and the record verb's own attempt at a variant
+        # is unwound rather than left standing on its address).
+        moved = [d for d in area.iterdir()
+                 if d.name.startswith(f"{taken}-") and (d / SID_FIRST).is_dir()]
+        assert len(moved) == 1
+        assert run_state.load_state(moved[0] / SID_FIRST)["status"] == "complete"
+
+    def test_the_record_verbs_re_slug_asks_the_same_level(
+            self, schema_runs, capsys):
+        """The third call site of the same question, one verb earlier
+        (`_ensure_release_slug`): asked of the group it hands `reslug_run` the
+        canonical address another launch holds, the move is refused, and leg 1
+        carries on with the run still parked on the seed address every next
+        release derives."""
+        area = run_state.runs_base()
+        with ExitStack() as stack:
+            assert _claim(stack) == 0
+        taken = f"{SCHEMA_BASE}-v0.6.0"
+        other = area / taken / SID_OTHER
+        other.mkdir(parents=True)
+        run_state.write_state(other, run_state.seed_state(taken, "release", "main"))
+        capsys.readouterr()
+
+        assert _record(["version", "0.6.0"]) == 0
+
+        assert "re-slug skipped" not in capsys.readouterr().err
+        moved = run_state.run_dir()
+        assert moved.name == SID_FIRST  # the launch is the same launch
+        assert moved.parent.name.startswith(f"{taken}-")
+        assert not (area / SCHEMA_BASE).exists(), "the seed address was not freed"
+        # The other launch's group is untouched, and one slug names one run.
+        assert [d.name for d in (area / taken).iterdir()] == [SID_OTHER]
+        assert run_state.find_run_dir(taken) == other

@@ -282,12 +282,22 @@ dated entry per spec pointing back at where it landed:
 specs/2026-07-15-gate-receipts--spec.md -> ../runs/develop-issue-88--gate-receipts/spec.md
 ```
 
-- **Entry name**: `YYYY-MM-DD-<run>--<basename>` — the registration date,
-  the run's name (slug when unnamed), then the spec's own filename after a
-  reserved `--` separator. The run-name component never contains `--`
-  (runs of hyphens collapse to one), so the first `--` after the date
-  always splits name from filename and distinct (run, spec) pairs never
-  collide.
+- **Entry name**: `YYYY-MM-DD-<label>--<basename>` — the registration date,
+  the record's label, then the spec's own filename after a reserved `--`
+  separator. The label component never contains `--` (runs of hyphens
+  collapse to one), so the first `--` after the date always splits label
+  from filename.
+
+  In a legacy tree the label is the run's name, slug when unnamed, and one
+  target has one run directory — so distinct (run, spec) pairs never
+  collide and entry names are exactly what they have always been. In a
+  **schema-form** tree (`_plexus.yaml`; see `docs/SCHEMA.md`) the session is
+  the unit of record, one `_runs/<slug>/` group holds several independent
+  launches, and the label carries the launch's session id as well:
+  `2026-07-15-gate-receipts-20260715-101500-1-11111--spec.md`. That suffix
+  is what makes the key unique — without it two launches of one run share a
+  label, and the second one's registration silently unlinks the first
+  launch's entry while its spec sits untouched on disk.
 - **Entry form**: a relative symlink to the spec's one canonical location —
   never a copy (specs are never written in two places), and for masterplan
   bundle specs the target is the bundle file itself, never the run-root
@@ -302,9 +312,10 @@ specs/2026-07-15-gate-receipts--spec.md -> ../runs/develop-issue-88--gate-receip
 Maintenance is automatic: `work artifact` upserts an entry when it registers
 a spec-class artifact, and the masterplan artifact sync (`work artifact
 --sync`, also run by `work commit`/session end) indexes bundle specs. Upserts
-are idempotent — re-registering the same spec re-points the same day's link,
-and a later-day re-registration replaces the older entry, so a spec never
-accumulates duplicate entries. All index maintenance is fail-soft: an index
+are idempotent per (label, spec) — re-registering the same spec re-points the
+same day's link, and a later-day re-registration replaces the older entry, so
+a spec never accumulates duplicate entries. That the label names one RECORD
+and not one run is what keeps a sibling launch's entry out of the replacement. All index maintenance is fail-soft: an index
 problem warns and never fails the registration that triggered it.
 
 For specs that predate the index, rebuild it from `runs/`:

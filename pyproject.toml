@@ -101,6 +101,7 @@ lmer-signal = "ask_channel.signal_cli:main"
 lmer-end-session = "lmer_cli.session_end:main"
 github-review = "github_reviewer.cli:main"
 work = "work_repo.cli:main"
+lmer-schema = "lmer_schema.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/lmer2/lmer"

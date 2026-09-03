@@ -1,12 +1,21 @@
-"""Central specs index (issue #101).
+"""Central specs index (issue #101), form-routed (issue #353).
 
-Specs land deep inside per-run dirs — `runs/<slug>/spec.md`, masterplan
+Specs land deep inside per-record dirs — `runs/<slug>/spec.md`, masterplan
 bundle files at `runs/<slug>/masterplan/<mp>/spec.md` — so finding "that
 spec from last week" means archaeology. The specs index is a flat
-`{host}/{project}/specs/` directory (sibling of `info/` and `runs/`) of
-dated RELATIVE symlinks pointing at each spec's canonical location: a
-plain directory listing IS the index, so no README/index file is
-maintained beside the links (v1 is symlinks-only by design).
+directory (sibling of the info and runs areas) of dated RELATIVE symlinks
+pointing at each spec's canonical location: a plain directory listing IS
+the index, so no README/index file is maintained beside the links (v1 is
+symlinks-only by design).
+
+The area is form-routed (D20): `{host}/{project}/specs/` in a legacy tree,
+`<project>/_specs/` under the registry-resolved project dir in a
+schema-form one. This module never re-derives that mapping —
+:func:`specs_dir` asks `utils.project_area`, the one module that knows the
+second set of names, and :func:`specs_rel_path` makes THAT dir relative to
+the work-repo root, so the path staged for commit is always the path
+written (it used to be a hand-built `{host}/{project}/specs` f-string,
+which in schema form names a directory nothing writes).
 
 Entry shape: `YYYY-MM-DD-<run>--<basename>` — the registration date, the
 run's name (state.name, slug fallback) to disambiguate, then the spec's
@@ -16,10 +25,18 @@ distinct (run, spec) pairs distinct — with a single `-`, (`a`,
 first post-date `--` unambiguous the run-label component itself never
 contains one: runs of hyphens in a label are collapsed to a single `-`
 (dir-name fallback labels can be `slug--name` shaped).
-Entry form: relative symlink (`../runs/<dir>/…`) to the
-one canonical file — never a copy (the charter's "never write the same
-file in two places" rule, #103) and, for masterplan bundle specs, never
-the run-root convenience symlink (the bundle file is the single target).
+Entry form: relative symlink to the one canonical file — never a copy
+(the charter's "never write the same file in two places" rule, #103) and,
+for masterplan bundle specs, never the run-root convenience symlink (the
+bundle file is the single target). The target reaches into the RECORD dir,
+which in schema form is one level deeper than in a legacy tree because the
+session is the unit of record (D22): `../_runs/<slug>/<session-id>/…`,
+including the `--<name>` suffix a freeze leaves on the session dir, rather
+than `../runs/<dir>/…`. Relative, resolving and inside the plexus root are
+ERROR-tier shape rules in every form (`index.link-not-relative`,
+`index.link-escapes`, `index.dangling-link` in docs/SCHEMA.md), so both
+ends of every target this module writes are resolved paths under the
+project dir and the link between them is `os.path.relpath`'s answer.
 One entry per (run, spec file): re-registering the same spec re-points
 the same day's link, and a later-day re-registration replaces the older
 dated entry rather than accumulating duplicates.
@@ -31,9 +48,12 @@ exactly `spec`, starts with `spec` + separator, or ends with separator +
 `spec.py` (not Markdown), `specifics.md`, `inspect.md` do not.
 
 Every write path here is fail-soft by contract: the index is a
-convenience view over runs/, and no index problem may ever fail the
+convenience view over the run area, and no index problem may ever fail the
 artifact registration (or sync) that triggered it. `rebuild()` is the
-backfill path for runs that predate the index.
+backfill path for runs that predate the index; it asks the run-state
+kernel's shared record walk (`run_state.iter_record_dirs`) which
+directories are records, so the index and the resolvers can never meet
+different sets.
 """
 
 from __future__ import annotations
@@ -44,15 +64,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from .utils import _work_repo_base
+from .utils import _work_repo_base, project_area, work_repo_root
 
 __all__ = [
-    "SPECS_DIR", "is_spec_artifact", "specs_dir", "specs_rel_path",
-    "run_label", "upsert_spec_link", "list_entries", "rebuild",
-    "repoint_run_dir_entries",
+    "SPECS_DIR", "SCHEMA_SPECS_DIR", "is_spec_artifact", "specs_dir",
+    "specs_rel_path", "run_label", "upsert_spec_link", "list_entries",
+    "rebuild", "repoint_run_dir_entries",
 ]
 
+#: The area's two names, passed to `utils.project_area` (which owns the
+#: legacy→schema mapping) and never joined onto a base by hand here.
 SPECS_DIR = "specs"
+SCHEMA_SPECS_DIR = "_specs"
 
 # Spec-class filename stems (see module docstring for the rationale).
 _SPEC_STEM_RE = re.compile(r"^spec$|^spec[-_.]|[-_.]spec$", re.IGNORECASE)
@@ -73,34 +96,120 @@ def is_spec_artifact(name: str) -> bool:
 
 
 def specs_dir() -> Optional[Path]:
-    """`{work}/{host}/{project}/specs/` — sibling of info/ and runs/."""
-    base = _work_repo_base()
-    if base is None:
-        return None
-    return base / SPECS_DIR
+    """The specs index area of this session's project dir: `<project>/specs`
+    in a legacy tree, `<project>/_specs` in a schema-form one (D20).
+
+    Routed through `utils.project_area`, which owns the legacy→schema name
+    mapping and the project dir it hangs off — in schema form that dir is
+    whatever the registry resolved (a short name, or a host bucket for a repo
+    nobody has named yet), not a `{host}/{project}` path. None when nothing
+    resolves, including the fail-closed case of a present-but-unusable
+    manifest: an index written at the legacy names inside a schema tree is
+    the split tree the validator flags.
+    """
+    return project_area(SPECS_DIR, SCHEMA_SPECS_DIR)
 
 
 def specs_rel_path() -> Optional[str]:
-    """The specs dir relative to the work-repo root, for commit staging."""
-    host = os.environ.get("LMER_REPO_HOST")
-    project = os.environ.get("LMER_REPO_PROJECT")
-    if not host or not project:
+    """The specs dir relative to the work-repo root, for commit staging.
+
+    Derived from the RESOLVED area rather than re-composed from the env trio
+    (issue #353): this used to be a hand-built `{host}/{project}/specs`
+    f-string, the same bypass the run area's staging path shed, and in schema
+    form it names a directory nothing writes — so `work commit` staged an
+    empty path while the entries it had just created sat untracked. The two
+    must address one directory, and only the resolver can reach a registry
+    short name or a host bucket.
+
+    None when no area resolves, and also when the resolved area lies outside
+    the work repo — staging nothing rather than a path a commit would take
+    literally (the rule :func:`run_state.run_rel_for_dir_name` follows).
+    """
+    sdir = specs_dir()
+    if sdir is None:
         return None
-    return f"{host}/{project}/{SPECS_DIR}"
+    try:
+        return sdir.relative_to(work_repo_root()).as_posix()
+    except ValueError:
+        return None
 
 
 def run_label(rdir: Path, state: Optional[dict] = None) -> str:
-    """The run identity baked into an entry name: state.name, slug fallback,
-    then the directory name (already `slug` or `slug--name` shaped) when no
-    state is readable — an unreadable sibling must never break indexing."""
+    """The label an entry is named under: the RECORD's identity, not the
+    run's (issue #353).
+
+    The run identity comes first — state.name, slug fallback, then the
+    directory name when no state is readable, since an unreadable sibling
+    must never break indexing — and in schema form the session id is
+    appended to it.
+
+    That suffix is the whole point. In schema form the SESSION is the unit
+    of record (D22): one `_runs/<slug>/` group holds several complete,
+    independent records, and two of its launches share `slug` exactly and
+    `name` whenever nobody named them differently. Keyed on the run alone,
+    the second launch's :func:`upsert_spec_link` re-pointed the first
+    launch's entry (same day) or unlinked it as stale (any other day), and
+    that record's spec left the index with nothing raised and nothing
+    logged. The session id is the one component nobody chooses, so it is
+    what makes the key unique by construction rather than by luck.
+
+    The question asked is the RECORD's shape (`run_state._is_session_record`)
+    and deliberately not the TREE's form (`run_state.is_session_form`): a
+    record sitting directly in the run area — a legacy tree, or a schema one
+    adopted before its runs were migrated — is its target's only record and
+    its directory name carries no session id, so the form question would
+    have composed a useless `slug-slug` for it. A legacy tree's entry names
+    are therefore byte-identical to what they always were.
+
+    The dir-name fallback is returned unadorned: `<sid>` / `<sid>--<name>`
+    already names one record.
+
+    The cost, deliberate: entry names get long —
+    `2026-08-25-develop-issue-101-20260824-101500-1-11111--spec.md` where the
+    old name was `2026-08-25-develop-issue-101--spec.md`. A long name that
+    names one record beats a short one that hides another.
+    """
+    from . import run_state  # local: run_state imports this module
     if state is None:
-        from . import run_state  # local: run_state imports this module
         state = run_state._read_sibling_state(rdir)
+    label = None
     if isinstance(state, dict):
-        label = state.get("name") or state.get("slug")
-        if label:
-            return str(label)
-    return rdir.name
+        recorded = state.get("name") or state.get("slug")
+        if recorded:
+            label = str(recorded)
+    if label is None:
+        return rdir.name
+    if not run_state._is_session_record(rdir):
+        return label
+    return _record_label(label, run_state.session_id_of(rdir.name))
+
+
+def _record_label(label: str, session_id: str) -> str:
+    """One spelling of `<run label>-<session id>`, shared by the code that
+    CREATES an entry name and the code that RECOGNISES one.
+
+    Two spellings of this would be two rules that drift, and the re-point
+    below only finds an entry by rebuilding the label it was created under —
+    so a mismatch there does not fail loudly, it silently re-registers the
+    spec under a mangled basename.
+    """
+    return f"{label}-{session_id}" if session_id else label
+
+
+def _record_session_id(area_rel_name: str) -> Optional[str]:
+    """The session id carried by a RUN-AREA-RELATIVE record name, or None.
+
+    `<slug>/<session-id>` in schema form, a bare `<dir>` in a legacy tree
+    (which has no session level, hence None). Derived from the NAME rather
+    than from the directory because the re-point's whole problem is that the
+    old directory is gone by the time it runs — the name is all that is left
+    to spell it with.
+    """
+    from . import run_state  # local: run_state imports this module
+    parts = [part for part in str(area_rel_name).split("/") if part]
+    if len(parts) < 2:
+        return None
+    return run_state.session_id_of(parts[-1])
 
 
 def _safe_label(label: str) -> str:
@@ -138,7 +247,16 @@ def upsert_spec_link(
     in place, and stale entries for the same pair under other dates —
     including ones in the legacy `<date>-<label>-<basename>` format that
     predates the reserved `--` separator — are removed, so
-    re-registration never accumulates duplicates.
+    re-registration never accumulates duplicates. The label is the RECORD's
+    (:func:`run_label`), so in schema form that pair is one launch's spec
+    and never a sibling launch's.
+
+    An entry written under the OLD run-keyed label is left alone rather than
+    swept. Re-deriving every name in one pass is `--rebuild`'s job; a freeze
+    or re-slug rewrites such an entry in passing (the bare run label is still
+    one of the labels the re-point recognises); and no work repo in the field
+    has schema-form entries under the old key, so there is nothing to sweep
+    in practice — only a cost to pay if this function started guessing.
 
     Returns the entry path, or None when nothing was indexed.
     """
@@ -148,12 +266,17 @@ def upsert_spec_link(
         if base is None or not is_spec_artifact(basename):
             return None
         spec_path = spec_path if spec_path.is_absolute() else spec_path.absolute()
+        # Inside the project dir in either form, which is what makes the
+        # relative target below resolve and stay inside the plexus root: both
+        # ends are under `base`, so `relpath` can only walk up as far as it.
         if not spec_path.is_file() or not spec_path.is_relative_to(base):
             return None
-        sdir = base / SPECS_DIR
+        sdir = specs_dir()
+        if sdir is None:
+            return None
         sdir.mkdir(parents=True, exist_ok=True)
         entry = _entry_name(label, basename, when)
-        # One entry per (run, spec file): drop same-pair entries under
+        # One entry per (record, spec file): drop same-pair entries under
         # other dates before (re-)pointing today's. Same-pair entries in
         # the legacy pre-`--` name format are cleaned up too — but only
         # when the legacy label is itself `--`-free, since a `--`-bearing
@@ -188,41 +311,59 @@ def upsert_spec_link(
 
 
 def repoint_run_dir_entries(
-    old_dirname: str, new_dirname: str, new_label: str
+    old_name: str, new_name: str, new_label: str
 ) -> None:
-    """Re-point index entries after a run-dir rename (the freeze's
-    `runs/<slug>/` → `runs/<slug>--<name>/`). Fail-soft.
+    """Re-point index entries after a record dir moved (the freeze's
+    `<slug>/` → `<slug>--<name>/`, the re-slug's move to a new address).
+    Fail-soft.
 
-    Without this, every entry registered before the freeze dangles — its
-    relative target still says `../runs/<slug>/…` — and because the rename
-    changes `run_label` (slug → name), upsert's stale-cleanup (keyed on
+    Without this, every entry registered before the move dangles — its
+    relative target still names the old dir — and because a freeze changes
+    `run_label` (slug → name), upsert's stale-cleanup (keyed on
     label+basename) never removes the old-label entry either, so the
     dangling link is permanent. Each affected entry is dropped and
-    re-upserted against the renamed path under the run's new label, keeping
+    re-upserted against the moved path under the run's new label, keeping
     the original registration date.
+
+    The interface stays NAME-keyed and the name carries the group. Both
+    movers hand RUN-AREA-relative names (`run_state._area_rel_name`): a bare
+    dir name in a legacy tree, `<slug>/<session-id>` in schema form, where
+    the record is one level below the run area (D22) and a freeze renames the
+    session while a re-slug moves it to another group. A path-keyed interface
+    would work equally well for the target but not for the SOURCE — the old
+    dir no longer exists by the time this runs — so the name is what both
+    ends can still spell, and the one prefix rewrite below covers both forms
+    because the run area itself is resolved rather than spelled.
     """
     try:
-        base = _work_repo_base()
-        if base is None or old_dirname == new_dirname:
+        from . import run_state  # local: run_state imports this module
+        sdir = specs_dir()
+        runs = run_state.runs_base()
+        if sdir is None or runs is None or old_name == new_name:
             return
-        sdir = base / SPECS_DIR
         if not sdir.is_dir():
             return
-        old_prefix = f"../runs/{old_dirname}/"
+        # `../runs/` legacy, `../_runs/` schema — asked of the two resolved
+        # areas rather than spelled, so the prefix written by upsert (which
+        # is `relpath` between the same two dirs) and the prefix matched here
+        # cannot drift apart.
+        area_prefix = os.path.relpath(runs, sdir).replace(os.sep, "/")
+        old_prefix = f"{area_prefix}/{old_name}/"
         for entry in list(sdir.iterdir()):
             if not entry.is_symlink():
                 continue
             target = os.readlink(entry).replace(os.sep, "/")
             if not target.startswith(old_prefix):
                 continue
-            new_target = base / "runs" / new_dirname / target[len(old_prefix):]
+            new_target = runs / new_name / target[len(old_prefix):]
             # Keep the entry's registration date and its basename. The
             # basename may be an alias (a masterplan run-root link name like
             # `mp-a-spec.md`) rather than the target's own filename, so it
             # is parsed out of the entry name (`YYYY-MM-DD-<label>--<base>`;
             # pre-`--` entries used a single dash) by stripping the label
-            # the entry was created under — the pre-rename dir name (slug),
-            # or the run's name when it was set before the freeze.
+            # the entry was created under — a component of the pre-move name
+            # (the slug, or the session dir), or the run's name when it was
+            # set before the freeze.
             # Fallback: the target's filename.
             m = re.match(r"^(\d{4}-\d{2}-\d{2})-(.+)$", entry.name)
             if not m:
@@ -239,8 +380,32 @@ def repoint_run_dir_entries(
             # single-dash stripping — a candidate that is a dash-prefix of
             # the created label (or a legacy basename containing `--`) must
             # not mis-split the name.
+            # The COMPONENTS of the old name, not the whole string: an entry
+            # is created under the run's label, which in schema form is the
+            # group's slug or the session dir's own name — never the
+            # `<slug>/<session-id>` pair. In a legacy tree the name has one
+            # component, so this is the same list it always was.
+            # BOTH spellings per component, the record label first. An
+            # entry created under `<slug>-<sid>` is not recognised by the
+            # bare `<slug>`: the `--` split below would reject it, the
+            # legacy single-dash strip would then match `<slug>` and shear
+            # the name mid-session-id, and the spec would be re-registered
+            # under a basename like `20260824-101500-1-11111--spec.md`. The
+            # bare spelling stays because a pre-#353 entry, an unmigrated
+            # record and the dir-name fallback all carry it. `new_label`
+            # arrives from `run_label` already record-keyed, so it is never
+            # composed twice. In a legacy tree `record_id` is None and this
+            # list is byte-identical to what it always was.
+            components = [c for c in old_name.split("/") if c]
+            record_id = _record_session_id(old_name)
+            candidates: list[str] = []
+            for component in components:
+                if record_id and component != components[-1]:
+                    candidates.append(_record_label(component, record_id))
+                candidates.append(component)
+            candidates.append(new_label)
             safe_candidates = [
-                _safe_label(str(c)) for c in (old_dirname, new_label) if str(c)
+                _safe_label(str(c)) for c in candidates if str(c)
             ]
             if "--" in rest:
                 label_part, _, base_part = rest.partition("--")
@@ -296,18 +461,33 @@ def _registration_when(rdir: Path, name: str, canonical: Path) -> Optional[datet
 
 
 def rebuild() -> list[Path]:
-    """Rebuild the whole index from runs/ (backfill path, `work specs-index
-    --rebuild`): drop every existing symlink entry, then re-index each
-    run's spec-class artifacts — names registered in state.artifacts plus
-    spec-class files/symlinks at the run-dir root (which covers masterplan
+    """Rebuild the whole index from the run area (backfill path, `work
+    specs-index --rebuild`): drop every existing symlink entry, then re-index
+    each record's spec-class artifacts — names registered in state.artifacts
+    plus spec-class files/symlinks at the record root (which covers masterplan
     run-root links; those resolve to their canonical bundle file). Entry
-    dates come from the run's `artifact_written` events when recorded,
-    else the file's mtime. Fail-soft per run and per entry."""
+    dates come from the record's `artifact_written` events when recorded,
+    else the file's mtime. Fail-soft per record and per entry.
+
+    WHICH dirs are records is the run-state kernel's question, not this
+    module's: `run_state.iter_record_dirs()` is the shared walk the resolvers
+    and the session listing already use, and asking it is what makes the
+    index reach one level deeper in schema form — each `_runs/<slug>/`
+    grouping dir's session children, with the grouping level itself skipped,
+    since nothing is ever written there (D22). It also carries the `.new-*`
+    and `archive/` skips, so those stay unindexed as before.
+
+    One consequence, deliberate: the walk reads "no state file" as "not a
+    record", so a directory sitting directly under a legacy `runs/` with a
+    spec and no state.yaml is no longer indexed (it was, under its own dir
+    name). That rule is forced in schema form — such a directory IS the
+    grouping level — and a second, form-dependent rule here is exactly the
+    drift the shared walk exists to prevent.
+    """
     from . import run_state  # local: run_state imports this module
-    base = _work_repo_base()
-    if base is None:
+    sdir = specs_dir()
+    if sdir is None:
         return []
-    sdir = base / SPECS_DIR
     if sdir.is_dir():
         for entry in list_entries():
             try:
@@ -315,14 +495,7 @@ def rebuild() -> list[Path]:
             except OSError as exc:
                 print(f"⚠️  specs index: could not remove {entry.name}: {exc}")
     created: list[Path] = []
-    runs = base / "runs"
-    try:
-        run_dirs = sorted(p for p in runs.iterdir() if p.is_dir()) if runs.is_dir() else []
-    except OSError:
-        run_dirs = []
-    for rdir in run_dirs:
-        if rdir.name.startswith(".") or rdir.name == run_state.ARCHIVE_DIR:
-            continue  # `.new-*` orphans and archived runs stay unindexed
+    for rdir in run_state.iter_record_dirs():
         try:
             state = run_state._read_sibling_state(rdir)
             label = run_label(rdir, state)
@@ -345,5 +518,8 @@ def rebuild() -> list[Path]:
                 if link is not None:
                     created.append(link)
         except Exception as exc:
-            print(f"⚠️  specs index: skipped {rdir.name}: {exc}")
+            # Named the way the movers name a record — run-area relative, so
+            # a warning about one session dir says which run it belongs to.
+            label = run_state.run_area_rel_name(rdir) or rdir.name
+            print(f"⚠️  specs index: skipped {label}: {exc}")
     return created

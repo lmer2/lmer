@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.plexus_fixtures import PRIMARY_REPO, build_schema_plexus
 from work_repo.info_reader import read_project_info
 
 
@@ -303,3 +304,65 @@ class TestReadProjectInfo:
                 assert "Task Related Report Files" in result
                 assert "report.md" in result
                 assert ".hidden.md" not in result
+
+
+class TestReadProjectInfoSchemaForm:
+    """The info reader follows the tree's form (issue #353 D20): it goes
+    through `work_repo.utils.project_info_dir()`, so a schema-form plexus
+    reads `<project>/_info/` and nothing here respells the name."""
+
+    def _env(self, tree):
+        host, path = PRIMARY_REPO.split("/", 1)
+        return {
+            "LMER_WORK_REPO_PATH": str(tree.root),
+            "LMER_REPO_HOST": host,
+            "LMER_REPO_PROJECT": path,
+            "LMER_REPO_URL": f"https://{PRIMARY_REPO}",
+            "LMER_TASK": "develop",
+            "LMER_TASK_TARGET": "issue-353",
+        }
+
+    def test_reads_the_registry_resolved_info_dir(self, tmp_path):
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        (tree.info_dir / "extra.md").write_text("# Extra\n\nSchema-form info.")
+
+        with patch.dict(os.environ, self._env(tree)):
+            result = read_project_info()
+
+        assert "extra.md" in result
+        assert "Schema-form info" in result
+        # The fixture's own project info page, read from `_info/`.
+        assert "important.md" in result
+
+    def test_does_not_read_the_legacy_info_dir(self, tmp_path):
+        """A stale `{host}/{project}/info/` inside a migrated tree is the
+        split tree the validator flags — never a source of context."""
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        host, path = PRIMARY_REPO.split("/", 1)
+        stale = tree.root / host / path / "info"
+        stale.mkdir(parents=True)
+        (stale / "stale.md").write_text("# Stale\n\nPre-migration info.")
+
+        with patch.dict(os.environ, self._env(tree)):
+            result = read_project_info()
+
+        assert "stale.md" not in result
+        assert "Pre-migration info" not in result
+
+    def test_broken_manifest_reports_and_reads_nothing(self, tmp_path, capsys):
+        """Fail-closed (D20): an unusable manifest resolves no info dir, so a
+        read-only verb reports and carries on instead of silently serving the
+        legacy tree's context."""
+        tree = build_schema_plexus(tmp_path / "plexus-schema")
+        host, path = PRIMARY_REPO.split("/", 1)
+        stale = tree.root / host / path / "info"
+        stale.mkdir(parents=True)
+        (stale / "stale.md").write_text("# Stale\n\nPre-migration info.")
+        tree.manifest.write_text("schema: 1\nprojects: [oops\n", encoding="utf-8")
+
+        with patch.dict(os.environ, self._env(tree)):
+            result = read_project_info()
+
+        assert "stale.md" not in result
+        assert "Error" in result
+        assert str(tree.manifest) in capsys.readouterr().err

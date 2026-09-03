@@ -287,15 +287,24 @@ The goal is stored temporarily and persists across CLI invocations but is not pe
 #### Persist Agent Memory
 
 When `LMER_PERSIST_AGENT_MEMORY` is enabled, your agent memory is persisted to
-the work repo on a **per-project** basis (stored under
-`{host}/{project}/memory/`) so it survives across sessions.
+the work repo so it survives across sessions. **Where it lands depends on the
+memory's own `metadata.type`** (schema form, spec D17): a `project` memory goes
+to that project's own scope, and `user`, `feedback` and `reference` memories go
+to the instance-wide scope shared by every project in the work repo — so a fact
+about you, or about how you should work, is recalled in every project rather
+than only the one you happened to learn it in. Recall reads both scopes, with
+the project scope taking precedence on a name collision. In a legacy work repo
+(no `_plexus.yaml`) there is only one scope and everything lands in
+`{host}/{project}/memory/` as before.
 
 - **Restore is automatic.** At session start, any previously-saved memory for
   this project is copied back into your memory directory before you begin — you
   do not need to do anything to load it.
 - **Persisting is your responsibility.** Memory you write during a session lives
-  only in the ephemeral container until you save it. Before you finish a task,
-  run:
+  only in the ephemeral container until you save it. Persist **merges** into the
+  work repo — it deletes only memories that were restored to you and that you
+  then removed, so a memory another session wrote is never lost because you did
+  not have it. Before you finish a task, run:
 
   ```bash
   work memory persist

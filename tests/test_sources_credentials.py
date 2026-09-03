@@ -72,6 +72,17 @@ class TestSshBranch:
         assert mode == DERIVED_SSH
         assert url == "git@git.example.com:agents/taskdefs.git"
 
+    def test_userless_scp_declared_is_read_as_scp_not_as_a_path(self):
+        # `host:path` is git's scp syntax with the optional user omitted
+        # (what an ssh_config alias checkout reports). Before the parser took
+        # the scp branch on git's rule this came back all-path and was
+        # rebuilt as `git@host:host:agents/taskdefs.git`.
+        url, mode = derive_clone_url(
+            "git.example.com:agents/taskdefs.git", WORK_SCP
+        )
+        assert mode == DERIVED_SSH
+        assert url == "git@git.example.com:agents/taskdefs.git"
+
 
 class TestPortMismatchWithholdsTheCredential:
     """Iteration-5 review finding: the trust key is hostname-only, so "same

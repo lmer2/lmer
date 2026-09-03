@@ -47,6 +47,23 @@ external cleaner contract) — the archive subtree lives INSIDE `runs/`,
 sharing its namespace: the resolver skips it and `archive` is a reserved
 run name.
 
+### Schema form: the run dir is the session dir
+
+In a work repo migrated to the lmer schema (a *plexus*, marked by a
+`_plexus.yaml` manifest) the unit of record is the **session**, and what
+this document calls "the run dir" IS the session dir. The schema changes
+their location only: the file shapes documented here are unchanged
+(`state.yaml`, `events.jsonl`, `ledger.yaml`, `release.yaml`, `log.yaml`,
+`goals.md`, `plan.md`, `plan.index.json`, `reports/`), but they live at
+`<project>/_runs/<slug>/<session-id>[--<name>]/` instead of
+`{host}/{project}/runs/<slug>[--<name>]/`. Several independent sessions on
+the same target may sit under one `_runs/<slug>/`, and nothing is written at
+the slug level. Legacy `runs/<slug>/` trees are read in place. The layout
+itself — where files live, the session-id form, the archive home — is
+specified in [SCHEMA.md](./SCHEMA.md) ("Sessions and runs"); this document
+stays the reference for what is *in* those files and how the `work` CLI
+maintains them.
+
 ### Run-dir lifecycle
 
 The `work` CLI owns the directory's whole lifecycle (issue #87):
@@ -109,12 +126,20 @@ commit. The work repo's own README documents the full repository layout.
 
 ### Masterplan artifact links
 
-Masterplan bundles nest at `runs/<slug>/masterplan/<mp-slug>/`, which would
-leave their key artifacts hard to find from the run dir. The work layer
-therefore syncs **relative symlinks** at the run-dir root pointing into the
-bundle (e.g. `spec.md -> masterplan/develop-run-naming/spec.md`) — both ends
-live in the same work-repo checkout, so relative links survive git
-round-trips and can never drift the way copies do.
+A masterplan bundle's key artifacts would otherwise be hard to find from the
+record's root, so the work layer syncs **relative symlinks** at that root
+pointing into the bundle — both ends live in the same work-repo checkout, so
+relative links survive git round-trips and can never drift the way copies do.
+
+**Where the bundle sits depends on the form** (spec D12/D22):
+
+- **Schema form** — one flat bundle per session dir, at
+  `<project>/_runs/<slug>/<session-id>/masterplan/`, because the session dir
+  IS the fragment. There is no `<mp-slug>` level to iterate, so the links use
+  the plain artifact names (`spec.md -> masterplan/spec.md`). Nothing is ever
+  written at the `_runs/<slug>/` grouping level.
+- **Legacy form** — bundles nest at `runs/<slug>/masterplan/<mp-slug>/`, and
+  the links behave exactly as they always have (see **Naming** below).
 
 - **What syncs:** the well-known bundle artifacts, when present: `spec.md`,
   `goals.md`, `plan.md`, `plan.html`, `retro.md`. Each linked artifact is
@@ -123,9 +148,10 @@ round-trips and can never drift the way copies do.
 - **When:** during `work commit` and `work session-end` (before staging), so
   every push self-maintains the links; `work artifact --sync` invokes the
   same sync manually.
-- **Naming:** with a single bundle under `masterplan/`, links use the plain
-  artifact names; with several bundles, links are prefixed
-  `<mp-slug>-<name>` (e.g. `develop-run-naming-plan.md`). A pre-existing
+- **Naming (legacy form):** with a single bundle under `masterplan/`, links
+  use the plain artifact names; with several bundles, links are prefixed
+  `<mp-slug>-<name>` (e.g. `develop-run-naming-plan.md`). In schema form a
+  session dir holds at most one bundle, so the prefixing case cannot arise. A pre-existing
   regular file at a link name (e.g. a manually copied spec.md) is replaced
   by the symlink — the bundle copy is canonical.
 - **Fail-soft:** like the rest of the state layer, sync errors are reported
@@ -155,6 +181,9 @@ owner: null                  # {session_id, claimed_at} while a session is live
 claim: null                  # {session_id, claimed_at} — single-flight release claim (§7); release runs only
 frozen: null                 # UTC stamp of the pre-execution freeze gate (§1); null until it fires
 reslugged_from: []           # addresses this run has vacated (§7); absent on runs that never re-slugged
+sessions:                    # schema form only: the launches that wrote HERE (§1); absent in legacy trees
+  - 20260824-101500-1-11111  # the dir's own session id, always first
+  - 20260825-093012-2-31245  # each resume that continued this record, appended in order
 created: 2026-07-03T14:02:11Z
 updated: 2026-07-03T15:40:03Z
 ```
@@ -188,7 +217,15 @@ paths, one mechanism: `work answer "<text>"` in-container, or
 are one-shot data, not standing configuration) so `work session-start`
 applies it automatically before printing the brief
 (only when the loaded state is actually stopped on a recorded question;
-fail-soft — a problem applying it degrades to the plain brief). Both go
+fail-soft — a problem applying it degrades to the plain brief). In schema
+form the answer has to be applied in the record that ASKED and not in the
+relaunch's own: `POST /api/runs/answer` injects that record's id as the
+container's `LMER_SESSION_ID` (§5), and a launcher that carries only the
+answer is covered by `work session-start` rerouting itself to the newest
+launch of this run that is stopped on a question (§4). Either way the
+`question_answered` event lands in the record holding the question — filed
+in a fresh empty record it would leave that question standing, and
+`work sessions` showing a stopped run nobody answered. Both go
 through `run_state.answer_question`: append a `question_answered` event
 carrying `{question, answer}` (both secret-redacted), clear
 `open_question`, clear `stop_reason`, write through the single writer.
@@ -218,9 +255,23 @@ the `state_changed` event's data as
 events by the tool process, fail-soft to null when events can't be read —
 so estimate vs. actual is comparable per run with no extra state field.
 
-`name`, `frozen`, `open_question`, `estimate`, and `claim` are additive —
-**schema stays 1**, no migration: older readers ignore unknown keys (an old
-state.yaml without the key reads as null), and the schema guard only
+**`sessions` — the lineage chain (schema form).** In schema form a launch owns
+its own session directory (§1), so a record's `state.yaml` names the launches
+that have written to it. The field is an **optional list of strings, append-only
+and deduplicated**; its **first entry is the directory's own session id**, and
+each later entry is a harness session that resumed into this record. It is
+**absent in legacy trees**, where several launches interleave in one shared run
+dir and their history stays in `events.jsonl` instead.
+
+The chain is not bookkeeping — it is the routing. A resume performs the
+handshake once (`ensure_run(session=<id>)`), and every later `work` process in
+that container finds the right directory because the record says this harness
+id writes there. That is why resuming a session needs no new environment
+variable: the record carries the answer.
+
+`name`, `frozen`, `open_question`, `estimate`, `claim`, and `sessions` are
+additive — **schema stays 1**, no migration: older readers ignore unknown keys
+(an old state.yaml without the key reads as null), and the schema guard only
 refuses *newer* schema numbers. Extending `stop_reason` with `aborted` is
 additive on the same terms — `status` stays the closed three-value enum.
 
@@ -616,7 +667,7 @@ engagement seeds a fresh run.
 | `work answer "<text>"` | Record the human's answer to the run's recorded open question (§2): appends `question_answered` (`{question, answer}`, both secret-redacted), clears `open_question` and `stop_reason` (`status` untouched — a completed run stays complete), pushes the run dir. Errors (exit 1) without run context or when no open question is recorded; never auto-seeds. The same logic is applied automatically by `work session-start` when `LMER_ANSWER` is set (the host CLI's `--answer` flag). |
 | `work event <type> [--note "…"] [--data <json>]` | Append one event line. Auto-seeds the run if it doesn't exist yet. |
 | `work verify <name> -- <command …>` | Run the command (stderr merged into stdout), stream its output through, mirror its exit code, and append a `verify` receipt event (§2): `{name, argv, exit_code, duration_s, summary_line, output_tail_sha256}`. The `--` separator is required (a forgotten name must not silently become the command). A signal-killed command mirrors the shell convention `128+N` (receipt and observed exit code agree); a command that cannot start exits 127. Mutating-verb rules: without run context this errors *before* running the command. A receipt-append failure after the command ran is reported loudly on stderr but the exit code still mirrors the command. |
-| `work resume [--json]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, an `Estimate: ~3 sessions / 4h — used: 2 sessions` line when an estimate is recorded (§2), a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. For release runs the brief additionally carries a `Release:` block — derived leg + next step, recorded SHAs/tag, receipt set, and the claim verdict (§7) — so a relaunched session resumes at exactly one next action; non-release briefs are byte-identical to before. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
+| `work resume [--json] [--session <id>]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, an `Estimate: ~3 sessions / 4h — used: 2 sessions` line when an estimate is recorded (§2), a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. For release runs the brief additionally carries a `Release:` block — derived leg + next step, recorded SHAs/tag, receipt set, and the claim verdict (§7) — so a relaunched session resumes at exactly one next action; non-release briefs are byte-identical to before. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
 | `work ledger` | Print the execution ledger table (read-only): the summary line plus one row per task. With no ledger prints `No ledger`, exit 0. |
 | `work ledger set <task-id> --status <s> [--title …] [--commit <sha>] [--receipt <name>] [--note …]` | The only mutation path for `ledger.yaml` (§2): upserts the row (omitted fields preserved), stamps `updated`, appends a `task` event, pushes the run dir. `--status` is one of `pending\|in-progress\|done\|deferred\|dropped`; `done` with no `--commit` warns loudly but succeeds. |
 | `work plan check` | Read-only lint of the run's `plan.index.json` (§2). Errors (exit 1): invalid/newer schema, structural problems (non-string/duplicate ids, missing description), unknown `deps` ids, dependency cycles, file overlap between dependency-independent tasks not declared in `shared_files`, missing/invalid `session_scope`, `multi` without `scope_rationale`. Warnings (exit 0): plan.md checkbox count drifting from the index task count, empty `verify_commands`, `goals` refs that don't parse from goals.md (`## G<n>:` headings; skipped when goals.md is absent), active goals with no covering task (a `goals` ref, or a plan.md mention as fallback), stale/malformed `shared_files` entries. Findings print to stdout so the report can be pasted into the plan-approval request. No run context or no `plan.index.json` prints a message and exits 0 (chat/review taskdefs have no index); writes nothing — no event, no push. |
@@ -628,7 +679,8 @@ engagement seeds a fresh run.
 | `work artifact <name> --file <path>` | Copy the file into the run dir (secret-redacted), register it in `state.artifacts` (through the single writer, keyed by the artifact's filename stem), append `artifact_written`. `<name>` must be a plain filename (no path components, no leading dot). |
 | `work seed <taskdef> <target> [--goal …] [--name …]` | Out-of-session run creation: derives the slug from its args and creates a run for it through the same create-tmp → write-state → rename lifecycle, recording CLI-shaped events (`run_seeded`, then `goal_set` / `run_named` as given). Does **not** claim `owner` (seeding is not owning) and does **not** push — batch with `work commit`. An existing run for the slug (or a name conflict) is an error. |
 | `work release claim` / `claim-status` / `unclaim` / `record …` / `status` / `abort` | The release-run verbs (§7): the single-flight release claim (claim-by-push CAS — never the rebase-retry push path), the write-once release record (`release.yaml`), the derived-leg status view, and the terminal abort. Verb-by-verb tables, exit codes, and semantics live in §7. |
-| `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), apply a pushed `LMER_ANSWER` when the run is stopped on a recorded question (§2, fail-soft), decide the resume brief *before* claiming, append `session_start`, claim `owner`, print the brief (leading with the answered question+answer pair when one was just applied). Always exits 0. |
+| `work sessions [--running] [--json]` | Read-only listing of the run's launches (schema form: one row per session dir; legacy: one row per run dir, id `-`, since several launches interleave in one directory). Columns: session id, address (run-area-relative), status, phase, `updated`, and `orphaned` — an in-progress record with no live claim, or a claim stale past the threshold. `--running` filters to `status == in-progress` and not orphaned; an orphan stays listed and marked rather than hidden (hiding it is how a crashed session reads as a finished one). `--json` emits `{form, count, sessions[…]}`; a record whose state cannot be read — or cannot be represented in JSON — is listed with its address fields and null state, never dropped. Always exits 0. |
+| `work session-start` | Hook-facing. Seed the run if absent (via the tmp-then-rename lifecycle), apply a pushed `LMER_ANSWER` when the run is stopped on a recorded question (§2, fail-soft), decide the resume brief *before* claiming, append `session_start`, claim `owner`, print the brief (leading with the answered question+answer pair when one was just applied). `--session <id>` continues an existing launch instead of opening a new one (schema form): the id is chained into that record's `sessions:` lineage (§2), so every later `work` invocation of this launch finds the directory through the record and no *second* variable has to be minted and kept in step with it. It is one of two ways a launch says which record it writes in, and the container's ordinary one is the other — with no flag the kernel resolves to the record that answers to this launch's `LMER_SESSION_ID` (§5, then the lineage, then the launch's creation address), so a launch the host already addressed (`lmer --session`) needs no flag at all and `hooks/start.py` passes none. With neither — a relaunch carrying only `LMER_ANSWER`, which has opened no record of its own — the verb reroutes itself to the launch that asked the question, because an answer filed in a fresh record leaves the question standing in the record that asked it. The id names one launch inside the run's group; a value that is a path or a pattern is refused. Always exits 0. |
 | `work session-end` | Hook-facing. Append `session_end`, clear `owner` if it's ours, push the run-state path via `work commit`. Always exits 0. |
 
 `work state set` field choices: `--stop-reason` is one of
@@ -672,10 +724,19 @@ event's data — a goal without them behaves byte-for-byte as before.
 
 ## 5. Session lifecycle
 
-- **Session id:** minted once per container session by `claude-runner.sh`
-  (UTC timestamp + pid + random, preserved if already set), exported as
-  `LMER_SESSION_ID`, used in `owner` claims and every event's `session`
-  field. Defaults to `"unknown"` if unset.
+- **Session id:** minted once per container session (UTC timestamp + pid +
+  random), exported as `LMER_SESSION_ID`, used in `owner` claims and every
+  event's `session` field. Minted by `clone_and_exec.main` *before* anything
+  is placed, because in schema form this value names the session dir the
+  launch writes its record in — a directory cannot be named by a variable
+  that does not exist yet — and `claude-runner.sh` and the harness dispatch
+  preserve an existing value rather than minting a second one. The mint is a
+  `setdefault`, so a **host-injected** id survives and points the whole
+  launch at a record that already exists: that is `lmer --session <id>`,
+  which the platform's resume and answer routes fill in with the record they
+  resolved and checked, and it is what makes a resume land in the record it
+  continued instead of opening a fresh one beside it. Defaults to
+  `"unknown"` if unset.
 - **Start:** the `/start` render pipeline calls `work session-start`, which
   seeds the run if absent (`run_seeded`), appends `session_start`, claims
   `owner`, and returns a resume brief that gets injected into the rendered

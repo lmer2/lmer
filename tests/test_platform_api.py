@@ -10,12 +10,20 @@ import asyncio
 import base64
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 
 from lmer_platform import api
 from lmer_platform import config as cfg
 from lmer_platform import registry, store
 from tests.conftest import strip_lmer_env
+
+# The taskdef-tier fixtures, imported rather than copied — the same trade
+# ``tests.test_platform_run_files`` makes with the panel parser. Planting a
+# taskdef and blinding the host's own candidates are the arrangement T73's tests
+# established, and a second copy would drift from the one the search is
+# described by.
+from tests.test_platform_addrun import blind_the_host, plant_taskdefs
 
 SECRET = "test-secret-value"
 
@@ -420,6 +428,164 @@ def test_candidates_flag_a_tracked_named_run_as_tracked(client, platform_root, c
     assert by_slug["mine"]["rel_path"].endswith("runs/mine--nice-name"), (
         "the address is still the directory an operator can open"
     )
+
+
+# --- one directory, one identity key (issue #353, D8) ------------------------
+#
+# A project with ``remotes:`` is reachable at more than one URL and the CONTAINER
+# places its record across the registry's UNION, so a launch through the
+# secondary writes under the same short name as one through the primary. The
+# picker compares the mirror WALK's key — which is the project's ``repo:`` — with
+# the tracked index's, so an identity taken from the launch URL verbatim gave one
+# directory two keys and the picker offered a run this orchestrator had spawned
+# itself. Adopting it, which is what the picker invites, wrote a SECOND index
+# entry for that one directory: two rows, two titles, two check-in marks.
+#
+# ``spawn.derive_run_identity`` folds the launch URL to the project's primary
+# remote, so the two halves agree by construction. Both surfaces are tested from
+# the identity the platform itself derives rather than a hand-written pair — the
+# ``lmer platform runs --candidates`` twin in ``lmer_platform.daemon`` reads the
+# same walk and the same index, so it is fixed by the same fold.
+
+REGISTERED_PRIMARY = "gitlab.example.com/acme/widgets"
+REGISTERED_SECONDARY = "github.com/acme/widgets"
+SECONDARY_URL = "https://github.com/acme/widgets.git"
+WIDGETS_TARGET = "https://gitlab.example.com/acme/widgets/-/work_items/42"
+WIDGETS_SESSION_ID = "20260824-165230-2-31245"
+
+
+def _register_widgets(config):
+    """A mirror whose manifest knows ``widgets`` at both of its remotes (D8)."""
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        yaml.safe_dump({
+            "schema": 1,
+            "name": "example-plexus",
+            "projects": {"widgets": {
+                "repo": REGISTERED_PRIMARY, "remotes": [REGISTERED_SECONDARY],
+            }},
+        }),
+        encoding="utf-8",
+    )
+
+
+def _plant_registered_run(config, slug):
+    """One schema-form session record under the project's SHORT NAME (D7/D22) —
+    where the container puts it whichever remote the launch used."""
+    path = config.mirror_path / "widgets" / "_runs" / slug / WIDGETS_SESSION_ID
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "state.yaml").write_text(
+        f"schema: 1\nslug: {slug}\nstatus: in-progress\n", encoding="utf-8"
+    )
+    return path
+
+
+def _identity_of_a_launch_through_the_mirror(config):
+    """The ``(host, project)`` a spawn through the SECONDARY remote tracks under.
+
+    Read out of the platform's own prediction rather than spelled out here: a
+    hand-written pair would let the picker agree with a key no spawn derives.
+    """
+    from lmer_platform import spawn
+
+    request = spawn.SpawnRequest(
+        taskdef="review", target=WIDGETS_TARGET, repo_url=SECONDARY_URL
+    )
+    host, project, _slug = spawn.derive_run_identity(request, SECONDARY_URL, config)
+    return host, project
+
+
+def test_a_run_spawned_through_a_secondary_remote_is_not_offered_for_adoption(
+    client, platform_root, config
+):
+    """The picker lists what is NOT tracked, so a run this orchestrator started
+    itself appearing there is an invitation to adopt a run it already has."""
+    from lmer_platform import runs as run_index
+
+    _register_widgets(config)
+    _plant_registered_run(config, "review-mr-1")
+    host, project = _identity_of_a_launch_through_the_mirror(config)
+    run_index.track(host, project, "review-mr-1")
+
+    payload = client.get("/api/runs/candidates", headers=bearer_header()).json()
+    by_slug = {c["slug"]: c for c in payload["candidates"]}
+
+    assert set(by_slug) == {"review-mr-1"}, "one directory, one candidate"
+    assert by_slug["review-mr-1"]["tracked"] is True
+
+
+def test_a_run_adopted_under_a_secondary_spelling_is_not_offered_again(
+    client, platform_root, config
+):
+    """The row the fold cannot reach, and used to be re-offered forever
+    (!269 review).
+
+    `POST /api/runs/adopt` takes host and project verbatim with no registry
+    validation, and the secondary is the URL an operator actually cloned from
+    — so it is the spelling they would type. The walk keys every directory on
+    the PRIMARY, so comparing raw pairs read that as "untracked" and invited a
+    second row for a directory that already had one: the defect item 15 exists
+    to close, reappearing one level up.
+    """
+    from lmer_platform import runs as run_index
+
+    _register_widgets(config)
+    _plant_registered_run(config, "review-mr-1")
+    secondary_host, secondary_project = REGISTERED_SECONDARY.split("/", 1)
+    run_index.track(secondary_host, secondary_project, "review-mr-1",
+                    source="adopted")
+
+    payload = client.get("/api/runs/candidates", headers=bearer_header()).json()
+    by_slug = {c["slug"]: c for c in payload["candidates"]}
+
+    assert by_slug["review-mr-1"]["tracked"] is True, (
+        "a directory already tracked under one of its own remotes was offered "
+        "for adoption again"
+    )
+
+
+def test_a_genuinely_untracked_run_is_still_offered(
+    client, platform_root, config
+):
+    """The converse, so folding both sides of the membership test is not a
+    widening: a directory nothing tracks is still a candidate."""
+    _register_widgets(config)
+    _plant_registered_run(config, "review-mr-2")
+
+    payload = client.get("/api/runs/candidates", headers=bearer_header()).json()
+    by_slug = {c["slug"]: c for c in payload["candidates"]}
+
+    assert by_slug["review-mr-2"]["tracked"] is False
+
+
+def test_adopting_a_candidate_cannot_double_a_run_the_platform_spawned(
+    client, platform_root, config
+):
+    """The damage the picker's offer leads to: one directory, two index entries,
+    each with its own title and check-in marks and neither aware of the other."""
+    from lmer_platform import runs as run_index
+
+    _register_widgets(config)
+    _plant_registered_run(config, "review-mr-1")
+    host, project = _identity_of_a_launch_through_the_mirror(config)
+    run_index.track(host, project, "review-mr-1")
+
+    payload = client.get("/api/runs/candidates", headers=bearer_header()).json()
+    offered = payload["candidates"][0]
+    client.post("/api/runs/adopt", headers=bearer_header(), json={
+        "host": offered["host"], "project": offered["project"],
+        "slug": offered["slug"],
+    })
+
+    tracked = run_index.list_tracked()
+    assert len(tracked) == 1, (
+        "one run directory became two rows in the fleet view: "
+        f"{[t.key for t in tracked]}"
+    )
+    # Re-tracking preserves the first sighting (``runs.track``), so the surviving
+    # row is still the spawn's — adopting a run one already has is a no-op, which
+    # is what makes the picker's offer harmless even when it is made.
+    assert tracked[0].source == "spawned"
 
 
 def test_adopt_then_forget_over_the_api(config, platform_root):
@@ -1224,3 +1390,218 @@ def test_a_fleet_poll_records_no_check_in(platform_root):
     api.build_state(cfg.load())
     api.build_state(cfg.load())
     assert checkin.read_marks() == {}, "build_state wrote check-in state"
+
+
+# --- the work repo's taskdef tiers, in both tree shapes (issue #353) ---------
+#
+# The daemon reads the operator's own taskdefs off its mirror (T73) by resolving
+# the project dir and joining the taskdef tier onto it. The work repo holds two
+# shapes at once (D16/D20), so "the project dir" has two answers: the registered
+# SHORT NAME the ``_plexus.yaml`` registry binds this repo to (D7/D8), and — for
+# a repo nobody has named yet, or a tree with no manifest at all — the
+# ``{host}/{project}`` host bucket that has always held it (D9). Both are
+# offered, schema name first, exactly as the container's own resolver
+# (``lmer_cli.container.taskdefs.work_repo_taskdef_dirs``) searches them: a menu
+# that named a tier the container will not read is a spawn that fails.
+#
+# The properties that must survive the second shape, in the order they matter:
+# the containment re-check that stops a crafted repo URL aiming the search
+# outside the mirror; no pull on a request path; a present-but-broken manifest
+# failing CLOSED (D20) rather than quietly demoting the search to the
+# pre-migration bucket; and nothing ever derived from a repo name (D9).
+
+REPO_URL = "https://gitlab.example.com/acme/widgets.git"
+#: What that URL parses to, which is the host bucket an unnamed repo's work
+#: lives in — and the short name the fixture registry binds it to.
+BUCKET = ("gitlab.example.com", "acme/widgets")
+SHORT_NAME = "widgets"
+
+
+@pytest.fixture
+def mirror(platform_root):
+    """This daemon's work-repo mirror, planted rather than cloned.
+
+    Resolved through :attr:`PlatformConfig.mirror_path` so it keeps pointing at
+    the directory the daemon actually reads; ``platform_root`` is what keeps it
+    inside tmp_path.
+    """
+    root = cfg.load().mirror_path
+    root.mkdir(parents=True)
+    return root
+
+
+def _plant_manifest(mirror, projects, *, name="example-plexus"):
+    """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
+    (mirror / "_plexus.yaml").write_text(
+        yaml.safe_dump({"schema": 1, "name": name, "projects": projects}),
+        encoding="utf-8",
+    )
+
+
+def _tiers(config, **kwargs):
+    return [str(path) for path in api._work_repo_taskdef_dirs(config, **kwargs)]
+
+
+def test_the_project_taskdef_tier_is_found_by_registry_lookup(config, mirror):
+    """Schema form: the project dir is the registered short name, and nothing
+    about the repo URL says which name that is — only the registry does (D7/D8)."""
+    _plant_manifest(mirror, {SHORT_NAME: {"repo": REPO_URL}})
+    plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "develop")
+
+    assert _tiers(config, repo_url=REPO_URL) == [str(mirror / SHORT_NAME / "_taskdef")]
+
+
+def test_the_schema_tier_is_offered_before_the_bucket_it_migrates_from(config, mirror):
+    """A tree mid-migration holds both, and co-existence is real rather than
+    promised (D16): both tiers are searched, the schema-owned name first."""
+    _plant_manifest(mirror, {SHORT_NAME: {"repo": REPO_URL}})
+    plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "develop")
+    plant_taskdefs(mirror.joinpath(*BUCKET) / "taskdef", "older")
+
+    assert _tiers(config, repo_url=REPO_URL) == [
+        str(mirror / SHORT_NAME / "_taskdef"),
+        str(mirror.joinpath(*BUCKET) / "taskdef"),
+    ]
+
+
+def test_a_project_that_holds_the_session_area_still_resolves_positionally(
+    config, mirror
+):
+    """The host bucket is not a transitional shape — it is the permanent holding
+    form for a repo nobody has named yet (D9) — and its project may already be
+    writing session records. The dir is still found by ``{host}/{project}``, and
+    its taskdef tier is read under both names."""
+    project = mirror.joinpath(*BUCKET)
+    (project / "_runs" / "develop-1" / "20260824-165230-2-31245").mkdir(parents=True)
+    plant_taskdefs(project / "_taskdef", "develop")
+
+    assert _tiers(config, repo_url=REPO_URL) == [str(project / "_taskdef")]
+
+
+def test_a_project_holding_both_record_areas_resolves_the_same(config, mirror):
+    """With a legacy ``runs/`` beside the new ``_runs/`` as well: which record
+    areas a project holds is not how its taskdef tier is found."""
+    project = mirror.joinpath(*BUCKET)
+    (project / "runs" / "develop-1").mkdir(parents=True)
+    (project / "_runs" / "develop-1" / "20260824-165230-2-31245").mkdir(parents=True)
+    plant_taskdefs(project / "taskdef", "develop")
+
+    assert _tiers(config, repo_url=REPO_URL) == [str(project / "taskdef")]
+
+
+def test_a_crafted_repo_url_cannot_aim_the_taskdef_search_outside_the_mirror(
+    config, mirror
+):
+    """``host``/``project`` come out of a repo URL a caller supplied, and the
+    parser hands back whatever path that URL had — ``..`` segments included.
+    Without the re-check, such a URL would aim the taskdef search at a directory
+    outside the mirror and the menu would report what it found there."""
+    outside = plant_taskdefs(mirror.parent / "outside" / "taskdef", "not-yours")
+    escaping = "https://gitlab.example.com/../../outside"
+
+    assert api._mirror_project_dir(mirror, BUCKET[0], "../../outside") is None
+    assert _tiers(config, repo_url=escaping) == []
+    assert outside.is_dir(), "the directory the URL aimed at is really there"
+
+
+def test_a_symlinked_project_dir_is_refused_by_the_same_re_check(config, mirror):
+    """The check is after resolution, so a project dir that is a symlink out of
+    the mirror is refused as well as one spelled with ``..``."""
+    outside = plant_taskdefs(mirror.parent / "elsewhere" / "taskdef", "not-yours")
+    link = mirror.joinpath(*BUCKET)
+    link.parent.mkdir(parents=True)
+    link.symlink_to(outside.parent, target_is_directory=True)
+
+    assert api._mirror_project_dir(mirror, *BUCKET) is None
+    assert _tiers(config, repo_url=REPO_URL) == []
+
+
+def test_an_unusable_manifest_drops_the_project_tiers_not_the_global_one(
+    config, mirror
+):
+    """Fail CLOSED on a manifest that is present but broken (D20): a
+    one-character typo must never quietly point the search back at the
+    pre-migration bucket, which is the silent demotion the second form exists to
+    make impossible. The global tier is not a project claim, so it stays."""
+    (mirror / "_plexus.yaml").write_text("projects: [", encoding="utf-8")
+    plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "schema-tier")
+    plant_taskdefs(mirror.joinpath(*BUCKET) / "taskdef", "bucket-tier")
+    plant_taskdefs(mirror / "_taskdef", "global-tier")
+
+    assert _tiers(config, repo_url=REPO_URL) == [str(mirror / "_taskdef")]
+
+
+def test_an_unregistered_repo_gets_no_invented_short_name(config, mirror):
+    """Names are never derived (D9). A directory named after the repo is not the
+    project's dir until a human says so in the manifest — until then the work
+    lives in the bucket, visibly unnamed."""
+    _plant_manifest(
+        mirror, {"other": {"repo": "https://gitlab.example.com/acme/other"}}
+    )
+    plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "derived")
+    plant_taskdefs(mirror.joinpath(*BUCKET) / "taskdef", "the-bucket")
+
+    assert _tiers(config, repo_url=REPO_URL) == [
+        str(mirror.joinpath(*BUCKET) / "taskdef")
+    ]
+
+
+def test_the_global_tier_reads_the_schema_name_before_the_bare_one(config, mirror):
+    """``_taskdef/`` is the schema-owned name (D6/§2); the bare one is
+    grandfathered until the tree migrates, so both are read, in that order."""
+    plant_taskdefs(mirror / "_taskdef", "schema")
+    plant_taskdefs(mirror / "taskdef", "legacy")
+
+    assert _tiers(config) == [str(mirror / "_taskdef"), str(mirror / "taskdef")]
+
+
+def test_the_tiers_agree_with_the_container_in_schema_form(config, mirror, monkeypatch):
+    """Not a second opinion about the work repo's layout: the tiers and their
+    order are asserted against the container's own resolver, which is the code
+    that settles every id this menu offers — in the second shape too."""
+    from lmer_cli.container import taskdefs as container_taskdefs
+
+    _plant_manifest(mirror, {SHORT_NAME: {"repo": REPO_URL}})
+    plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "develop")
+    plant_taskdefs(mirror.joinpath(*BUCKET) / "taskdef", "older")
+    plant_taskdefs(mirror / "_taskdef", "global")
+    monkeypatch.setenv("LMER_WORK_REPO_PATH", str(mirror))
+    monkeypatch.setenv("LMER_REPO_URL", REPO_URL)
+    monkeypatch.setenv("LMER_REPO_HOST", BUCKET[0])
+    monkeypatch.setenv("LMER_REPO_PROJECT", BUCKET[1])
+
+    ours = api._work_repo_taskdef_dirs(config, repo_url=REPO_URL)
+
+    assert [path.resolve() for path in ours] == [
+        path.resolve() for path in container_taskdefs.work_repo_taskdef_dirs()
+    ]
+
+
+def test_the_schema_form_tier_reaches_the_spawn_form(config, mirror, tmp_path,
+                                                     monkeypatch):
+    """End to end: what the operator is offered on the run form is what the
+    registry resolved, and the route stays advisory."""
+    _plant_manifest(mirror, {SHORT_NAME: {"repo": REPO_URL}})
+    plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "develop")
+    blind_the_host(monkeypatch, tmp_path)
+
+    options = api.discover_spawn_options(config, repo_url=REPO_URL)
+
+    assert options["taskdefs"] == ["develop"]
+    assert options["advisory"] is True
+
+
+def test_reading_the_taskdef_tiers_never_pulls_the_mirror(config, mirror, tmp_path,
+                                                          monkeypatch):
+    """The mirror is read exactly as it stands: a form's select is no reason to
+    put a ``git fetch`` on a request path, in either shape."""
+    pulls = []
+    monkeypatch.setattr(api, "pull", lambda *a, **k: pulls.append(a))
+    _plant_manifest(mirror, {SHORT_NAME: {"repo": REPO_URL}})
+    plant_taskdefs(mirror / SHORT_NAME / "_taskdef", "develop")
+    blind_the_host(monkeypatch, tmp_path)
+
+    assert api.discover_spawn_options(config, repo_url=REPO_URL)["taskdefs"] == [
+        "develop"
+    ]
+    assert pulls == []

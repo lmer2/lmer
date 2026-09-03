@@ -66,6 +66,22 @@ and blocks the stop until it lands. No sentinel is burned and no counter is
 consumed while suppressed, so a session does not spend its nudges on stops it
 was never told about.
 
+Trigger 2 has to find the run dir under BOTH work-repo layouts (issue #353,
+spec D7/D20/D22). In a legacy tree it is ``{host}/{project}/runs/{slug}``.
+In a schema-form tree — one with a ``_plexus.yaml`` manifest at the work-repo
+root — the project is a flat short-name dir named by the manifest's
+``projects:`` registry, and the run dir is ``{shortname}/_runs/{slug}``. The
+short name is found by normalizing the launch's repo URL (``LMER_REPO_URL``,
+else ``https://{host}/{project}``) and looking it up across every entry's
+``repo:`` and ``remotes:``; no match means the repo is unnamed and its work
+sits in the ``{host}/{project}`` host bucket, which is the legacy path (D9).
+The registry lookup and the URL normalization
+(``lmer_cli.container.sources.normalize_repo_url``, D21) are replicated
+inline here for the same reason as everything else in this file: hooks import
+no project code. A manifest that is present but unreadable is NOT demoted to
+legacy form (D20 — that would point the guard at a split tree); the hook
+simply resolves no run dir and blocks nothing.
+
 The hook fails open everywhere: unreadable payload, git errors, ``work``
 failures, JSON parse errors, sentinel/counter I/O errors → exit 0, no
 output. Blocking is signalled only via ``{"decision": "block", "reason": …}``
@@ -77,9 +93,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+
+# PyYAML is the one non-stdlib dependency (hooks/start.py takes the same
+# one); guarded so a bare interpreter still runs the legacy path — see
+# read_plexus_registry for what an absent parser means in schema form.
+try:
+    import yaml
+except ImportError:  # pragma: no cover - exercised only on a bare interpreter
+    yaml = None
 
 # Fallback workspace root when the hook payload carries no usable ``cwd``.
 DEFAULT_WORKSPACE = "/workspace"
@@ -117,6 +142,25 @@ LEDGER_SENTINEL_TEMPLATE = "/tmp/lmer_run_state_guard_ledger.{session}"
 # standalone-stdlib and import no project code.
 _TRUTHY = {"1", "yes", "true"}
 _FALSY = {"0", "no", "false"}
+
+# Schema-form work repo (spec §4): the manifest at the work-repo root whose
+# ``projects:`` registry names the flat project dirs, and the per-project
+# runs dir beneath a short name (D22). Legacy trees have neither.
+PLEXUS_MANIFEST = "_plexus.yaml"
+SCHEMA_RUNS_DIR = "_runs"
+LEGACY_RUNS_DIR = "runs"
+
+# normalize_repo_url (src/lmer_cli/container/sources.py), replicated inline
+# — the same rules, so a registry value and the launch URL compare apples to
+# apples (D21). Default ports fold away; any other port stays in the key.
+_DEFAULT_PORTS = ("443", "22")
+_SCHEME_RE = re.compile(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*)://")
+
+# Spec §1 short-name charset. A registry key becomes a path segment under
+# the work root, and the work repo is agent-writable — anything outside this
+# set is skipped, never joined (the same check taskdefs._plexus_project_dir
+# applies; ``os.path.join`` would reset on an absolute key).
+_SHORT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 
 # ---------------------------------------------------------------------------
@@ -228,21 +272,143 @@ def run_dir_noncompliance(
     return dirty, unpushed
 
 
+def _userinfo_boundary(text: str, scp_form: bool = False) -> int:
+    """Index of the ``@`` separating userinfo from host, or ``-1`` if none.
+
+    Replica of sources.py's helper: the boundary is the last ``@`` before the
+    first path separator, with the one extension that a later ``@`` preceded
+    by ``user:secret`` shape (a non-numeric right-hand side) is taken instead,
+    so a credential carrying ``/`` is still seen. For scp-form the text after
+    the boundary must itself carry a ``:`` (``[user@]host:path``), which keeps
+    a bare ``host:org/re@po.git`` from reading as userinfo.
+    """
+    slash = text.find("/")
+    at = text.rfind("@", 0, slash if slash != -1 else len(text))
+    if at == -1 and "@" in text:
+        candidate = text.rpartition("@")[0]
+        _, colon, secret = candidate.partition("/")[0].partition(":")
+        if colon and not secret.isdigit():
+            if not scp_form or ":" in text[len(candidate) + 1:]:
+                at = len(candidate)
+    return at
+
+
+def _parse_repo_url(url: str | None) -> tuple[str, str, str, str, str]:
+    """Split a git URL into ``(scheme, userinfo, host, port, path)``.
+
+    Replica of sources.py's parser: scheme URLs and scp-form both handled,
+    never raises. scp-form is git's ``[user@]host:path`` — no scheme and a
+    ``:`` before any ``/``, the user optional — minus the two shapes the
+    canonical parser keeps out of it: bare digits after the colon are a
+    port (``host:2222/path`` is the normalizer's own ported spelling and
+    stays opaque), and the ambiguous ``a:b/c@d`` shape stays opaque too.
+    Anything else scheme-less comes back entirely in ``path``.
+    """
+    url = (url or "").strip()
+    m = _SCHEME_RE.match(url)
+    if m:
+        rest = url[m.end():]
+        at = _userinfo_boundary(rest)
+        userinfo, rest = (rest[:at], rest[at + 1:]) if at != -1 else ("", rest)
+        netloc, _, path = rest.partition("/")
+        host, _, port = netloc.partition(":")
+        return m.group("scheme").lower(), userinfo, host, port, path
+    at = _userinfo_boundary(url, scp_form=True)
+    if at != -1:
+        host, _, path = url[at + 1:].partition(":")
+        return "", url[:at], host, "", path
+    host, colon, path = url.partition(":")
+    if (
+        colon
+        and host
+        and "/" not in host
+        and not path.partition("/")[0].isdigit()
+        and _userinfo_boundary(url) == -1
+    ):
+        return "", "", host, "", path
+    return "", "", "", "", url
+
+
+def normalize_repo_url(url: str | None) -> str:
+    """Canonical comparison form of a git repo URL: ``host/path``.
+
+    Replica of ``lmer_cli.container.sources.normalize_repo_url`` (D21):
+    lowercase the host, drop scheme and userinfo, drop the default ports
+    443/22 but keep any other as ``host:port``, fold scp (user optional) and
+    ``ssh://`` forms into ``host/path``, strip a trailing ``.git`` and
+    trailing ``/``. Path
+    case is preserved here and compared case-insensitively by the lookup.
+    Pinned against the original by tests/test_run_state_guard_second_name.py.
+    """
+    _, _, host, port, path = _parse_repo_url(url)
+    host = host.lower()
+    if port and port not in _DEFAULT_PORTS:
+        host = f"{host}:{port}"
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    path = path.rstrip("/")
+    if host and path:
+        return f"{host}/{path}"
+    return host or path
+
+
+def registry_lookup(registry: dict | None, repo_url: str | None) -> str | None:
+    """Short name of the registry entry whose ``repo:`` or any ``remotes:``
+    value names ``repo_url`` (spec §4 resolution, D8); None when nothing does.
+
+    Both sides pass through ``normalize_repo_url`` and compare
+    case-insensitively on the path. Keys that are not §1 short names
+    (``_SHORT_NAME_RE``), entries that are not mappings, repoless entries
+    (D19), and non-string remote values are simply skipped — the validator
+    owns shape complaints, the hook only needs an answer it can safely join
+    into a path.
+    """
+    if not isinstance(registry, dict):
+        return None
+    wanted = normalize_repo_url(repo_url).lower()
+    if not wanted:
+        return None
+    for name, entry in registry.items():
+        if not isinstance(name, str) or not _SHORT_NAME_RE.fullmatch(name):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        candidates = [entry.get("repo")]
+        remotes = entry.get("remotes")
+        if isinstance(remotes, list):
+            candidates.extend(remotes)
+        for value in candidates:
+            if isinstance(value, str) and normalize_repo_url(value).lower() == wanted:
+                return name
+    return None
+
+
 def derive_run_dir(
     decision: dict | None,
     host: str | None,
     project: str | None,
     work_repo_path: str | None = None,
+    repo_url: str | None = None,
 ) -> str | None:
     """
     Resolve the run-dir path trigger 2 inspects.
 
     Preference order: an explicit path exposed by the resume JSON (future-
     proofing — the decision does not carry one today); the conventional
-    ``{work}/{host}/{project}/runs/{slug}`` when the decision names a slug;
-    otherwise the project's whole ``runs/`` dir, so unpushed run artifacts
-    are still caught even when the slug is unknown. Returns ``None`` without
-    run context.
+    runs dir for the work repo's form plus ``/{slug}`` when the decision
+    names a slug; otherwise the project's whole runs dir, so unpushed run
+    artifacts are still caught even when the slug is unknown. Returns
+    ``None`` without run context.
+
+    The conventional dir is ``{work}/{host}/{project}/runs`` in a legacy
+    tree and ``{work}/{shortname}/_runs`` in a schema-form one (D20/D22),
+    where the short name comes from looking ``repo_url`` (``LMER_REPO_URL``,
+    else ``https://{host}/{project}``) up in the manifest's registry. No
+    registry match is the host bucket — the legacy path (D9). The one
+    filesystem touch here is that manifest read, via ``read_plexus_registry``:
+    a manifest that is present but unusable resolves to ``None`` rather than
+    to the legacy path (D20), and so blocks nothing.
     """
     if isinstance(decision, dict):
         exposed = decision.get("run_dir")
@@ -250,7 +416,18 @@ def derive_run_dir(
             return exposed
     if not host or not project:
         return None
-    base = os.path.join(work_repo_path or DEFAULT_WORK_REPO_PATH, host, project, "runs")
+    work = work_repo_path or DEFAULT_WORK_REPO_PATH
+    try:
+        registry = read_plexus_registry(work)
+    except Exception:
+        return None  # present-but-unusable manifest: no base to resolve
+    base = os.path.join(work, host, project, LEGACY_RUNS_DIR)
+    if registry is not None:
+        lookup_url = repo_url.strip() if isinstance(repo_url, str) and repo_url.strip() \
+            else f"https://{host}/{project}"
+        short_name = registry_lookup(registry, lookup_url)
+        if short_name:
+            base = os.path.join(work, short_name, SCHEMA_RUNS_DIR)
     slug = decision.get("slug") if isinstance(decision, dict) else None
     if isinstance(slug, str) and slug.strip():
         return os.path.join(base, slug)
@@ -538,6 +715,37 @@ def read_run_events(run_dir: str) -> list | None:
     return events
 
 
+def read_plexus_registry(work_repo_path: str) -> dict | None:
+    """
+    The ``projects:`` registry of the work repo's ``_plexus.yaml``.
+
+    ``None`` when there is no manifest (legacy tree); a dict — possibly empty,
+    when the manifest declares no projects — when there is one. A manifest
+    that is present but cannot be used (unreadable, not YAML, not a mapping,
+    a ``projects:`` that is not a mapping, or no YAML parser on this
+    interpreter) raises ``ValueError``: the caller must NOT read that as a
+    legacy tree (D20), and the guard's answer is to resolve nothing.
+    """
+    path = os.path.join(work_repo_path, PLEXUS_MANIFEST)
+    if not os.path.exists(path):
+        return None
+    if yaml is None:
+        raise ValueError("PyYAML unavailable; cannot read the plexus manifest")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh.read())
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"unreadable plexus manifest: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("plexus manifest is not a mapping")
+    registry = data.get("projects")
+    if registry is None:
+        return {}
+    if not isinstance(registry, dict):
+        raise ValueError("plexus manifest 'projects' is not a mapping")
+    return registry
+
+
 def _run_work_resume() -> dict | None:
     """``work resume --json`` (read-only), parsed; None on any failure."""
     try:
@@ -634,7 +842,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Trigger 2 inputs.
     work_repo_path = os.environ.get("LMER_WORK_REPO_PATH", "").strip() or DEFAULT_WORK_REPO_PATH
-    run_dir = derive_run_dir(decision, host, project, work_repo_path)
+    repo_url = os.environ.get("LMER_REPO_URL", "").strip() or None
+    run_dir = derive_run_dir(decision, host, project, work_repo_path, repo_url)
     run_dir_url = derive_run_dir_url(decision)
     dirty, unpushed = (False, False)
     if run_dir and not gate_in_flight:

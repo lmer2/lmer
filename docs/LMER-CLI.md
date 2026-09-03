@@ -15,6 +15,8 @@ Python-first CLI for running LMER with a repository target, cloning inside the c
 - [Building the Container Image](#building-the-container-image)
 - [Command-Line Options](#command-line-options)
   - [Startup presets (`--preset` / `LMER_<TASK>_PRESET` / `LMER_PRESET`)](#startup-presets---preset--lmer_preset)
+- [Validating a plexus (`lmer-schema validate`)](#validating-a-plexus-lmer-schema-validate)
+- [Sessions and resume (`work sessions`)](#sessions-and-resume-work-sessions)
 - [Troubleshooting](#troubleshooting)
 
 ### Prerequisites
@@ -179,7 +181,7 @@ The following environment variables control LMER behavior:
 
 - **`LMER_STATUSLINE`** - Comma-separated, ordered list of the segments the in-container Claude Code status line renders (issue #121). Unset or blank keeps the default `repo,branch,task,ctx` — exactly the pre-existing `group/project @ feature/x | develop | ctx 42%` line. Available segment names (case-insensitive, surrounding whitespace ignored): `repo`, `branch`, `task`, `ctx`, `model` (model display name, e.g. `Fable`), `cost` (session cost, `$1.23`), `5h` / `7d` (subscription usage-limit windows, e.g. `5h 24%` — only rendered when the payload carries `rate_limits`, i.e. on Claude subscription sessions), `effort` (reasoning effort, `eff high`), `duration` (session wall-clock time, `1h03m`), and `lines` (lines added/removed, `+156/-23`). Order in the list is render order; `repo` immediately followed by `branch` joins as `repo @ branch`, all other segments join with ` | `. Unknown names are ignored, a list selecting nothing falls back to the default, and a segment whose data is unavailable is simply omitted — the renderer never errors. The 📦/⚡ indicators are always appended and are not part of the list. Read in-container by `hooks/statusline.py` (via the provisioned `statusLine` command); forwarded into the container by the host CLI, so it can be set host-side or in `.env` files. Claude-harness only — codex/pi have no custom-statusline hook today.
 
-- **`LMER_PERSIST_AGENT_MEMORY`** - When set to a truthy value (`1`, `true`, `yes`, case-insensitive), the session's agent memory is persisted to the work repo on a **per-project** basis, stored under `{host}/{project}/memory/` (shared across all task types, targets, and harnesses for that project). Restore is automatic: at session start the harness runner (`libexec/claude-runner.sh`, or `harness_restore_memory` for codex/pi) runs `work memory restore`, which copies any saved memory from the work repo into the shared memory directory (`~/.claude/projects/-workspace/memory/` — a harness-neutral store despite the path) before the agent reads it. Persisting back is the agent's responsibility — the agent runs `work memory persist` (which copies the memory directory into the work repo and commits and pushes it). Claude Code reads the directory natively; codex/pi sessions get the read/write/persist contract injected into their global context file (the `prompts/agent-memory.md` fragment — see [HARNESSES.md](./HARNESSES.md)). Falsy values (`0`, `false`, `no`) and unset both disable the feature, in which case both `work memory` subcommands are no-ops. Parsed via `get_bool_env` and forwarded into the container by the host CLI. The memory directory path can be overridden for non-standard layouts/tests with `LMER_AGENT_MEMORY_DIR`. **Platform assistant sessions are the one exception:** the platform blanks this variable for the sessions it spawns with `kind="assistant"`, because the assistant's memory is host-local operational state that must not reach the shared work repo — it persists instead through a host mount of `~/.lmer/platform/assistant-memory/` (see [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md#uber-lmers-memory)). Worker sessions are unaffected.
+- **`LMER_PERSIST_AGENT_MEMORY`** - When set to a truthy value (`1`, `true`, `yes`, case-insensitive), the session's agent memory is persisted to the work repo, shared across all task types, targets, and harnesses. **Where a memory lands depends on its `metadata.type`** (schema form, spec D17): `project` memories go to the project's own scope (`<project>/_agents/memory/`), while `user`, `feedback` and `reference` memories go to the instance-wide scope (`_agents/memory/` at the plexus root) shared by every project in that work repo. In a legacy work repo (no `_plexus.yaml`) there is one scope and everything lands under `{host}/{project}/memory/`, byte-identically to before. Restore is automatic: at session start the harness runner (`libexec/claude-runner.sh`, or `harness_restore_memory` for codex/pi) runs `work memory restore`, which copies any saved memory from the work repo into the shared memory directory (`~/.claude/projects/-workspace/memory/` — a harness-neutral store despite the path) before the agent reads it. Persisting back is the agent's responsibility — the agent runs `work memory persist`, which routes each memory to its scope by type, **merges** it into that scope, updates the scope's own `MEMORY.md` index, and commits and pushes. **Persist merges rather than mirrors:** restore records what it handed this session, and persist only deletes — or overwrites — a file when this session has something to say about it. A file it was given and then removed is deleted; a file it was given, still holds unchanged, and that has since changed in the work repo is left alone in both directions. A memory another session wrote — one this session never saw — is never deleted, and the index is merged line-wise on the same rule, so a session can neither drop an entry it never had nor resurrect one another session retired. With no restore manifest (an older container, or a restore that did not run) persist deletes nothing at all. Two further safeguards: a scope this session routed nothing to is left untouched rather than emptied, and restore merges both scopes back into one directory, project over instance. In legacy form it is the single-directory copy it has always been. Claude Code reads the directory natively; codex/pi sessions get the read/write/persist contract injected into their global context file (the `prompts/agent-memory.md` fragment — see [HARNESSES.md](./HARNESSES.md)). Falsy values (`0`, `false`, `no`) and unset both disable the feature, in which case both `work memory` subcommands are no-ops. Parsed via `get_bool_env` and forwarded into the container by the host CLI. The memory directory path can be overridden for non-standard layouts/tests with `LMER_AGENT_MEMORY_DIR`. **Platform assistant sessions are the one exception:** the platform blanks this variable for the sessions it spawns with `kind="assistant"`, because the assistant's memory is host-local operational state that must not reach the shared work repo — it persists instead through a host mount of `~/.lmer/platform/assistant-memory/` (see [PLATFORM-QUICKSTART.md](./PLATFORM-QUICKSTART.md#uber-lmers-memory)). Worker sessions are unaffected.
 
 - **`LMER_RUN_STATE_GUARD`** - Kill switch for the **run-state compliance Stop hook** (`hooks/run_state_guard.py`), which blocks a stop while the run state is missing its phase, goal, or name — or the run dir carries uncommitted/unpushed changes, or the session has landed gate-commits without recording any execution-ledger row (`work ledger set`) — and replies with the exact `work` commands to fix it. Parsed via `get_bool_env`: unset or truthy (`1`, `true`, `yes`, case-insensitive) leaves the guard **enabled** (the default); set `LMER_RUN_STATE_GUARD=0` (or `false`/`no`) to disable it entirely. The guard is fail-open — any error in its own checks lets the stop proceed — so the kill switch exists to opt out of the nudges, not to work around hook failures. Forwarded into the container by the host CLI.
 
@@ -197,17 +199,19 @@ The following environment variables control LMER behavior:
 
 - **`LMER_PRECOMMIT_CACHE_DIR`** - Directory holding the separate, short-lived full-`--all-files` pre-commit pass cache (default `/tmp/lmer-precommit-cache`). It follows the same owner-only file/directory rules and is forwarded into the container, where the gate runs. Reuse remains off unless the work repo's project info opts the repository in. See [GATE-FASTPATH.md](./GATE-FASTPATH.md).
 
-- **`LMER_MASTERPLAN`** - When set to a truthy value (`1`, `true`, `yes`, case-insensitive; parsed via `get_bool_env`), the session runs the **masterplan** workflow (brainstorm → plan → execute → finish, on top of superpowers). Setting `LMER_TASK=masterplan` implies it, and a taskdef can declare the need itself via `masterplan: true` in a per-task `task.yaml` (see docs/TASKDEFS.md) — so this toggle is mainly for one-off enabling of masterplan on top of a task whose taskdef does not declare it. When active, `libexec/claude-runner.sh` at session start runs `libexec/masterplan-enable.sh --gated`, which installs the masterplan plugin from the first existing mirror in `LMER_MASTERPLAN_MIRROR_CANDIDATES` (see below; default order: taskdef repo, then the deprecated work-repo mirror) via `claude plugin marketplace add <mirror>` → `plugin install masterplan@rasatpetabit-masterplan` → `plugin enable masterplan`, and exports `MASTERPLAN_RUNS_DIR` (see below). The same script without `--gated` is the mid-session on-demand path: it forces enablement in a running session, persisting the environment via `~/.bashrc.d/masterplan-env.sh` (the parent claude process cannot be re-enved), after which one `/reload-plugins` from the user activates the plugin. Every step is idempotent and non-fatal — provisioning failures warn and continue rather than aborting the session. superpowers is baked into the image but left disabled (the image bake removes `~/.claude/settings.json` so no `enabledPlugins` entry survives, keeping the runtime global-settings symlink intact) and is re-enabled automatically as masterplan's declared dependency when the plugin installs, so plain sessions pay no runtime cost. Because the runtime `settings.json` starts as a read-only symlink, the provisioning step materializes it into a writable regular file before the `claude plugin` calls; the path is overridable for non-standard layouts/tests with `LMER_SETTINGS_FILE`. Falsy values (`0`, `false`, `no`) and unset both disable the toggle itself — they do not veto `LMER_TASK=masterplan` or a taskdef's own `task.yaml` declaration. Forwarded into the container by the host CLI.
+- **`LMER_MASTERPLAN`** - When set to a truthy value (`1`, `true`, `yes`, case-insensitive; parsed via `get_bool_env`), the session runs the **masterplan** workflow (brainstorm → plan → execute → finish, on top of superpowers). Setting `LMER_TASK=masterplan` implies it, and a taskdef can declare the need itself via `masterplan: true` in a per-task `task.yaml` (see docs/TASKDEFS.md) — so this toggle is mainly for one-off enabling of masterplan on top of a task whose taskdef does not declare it. When active, `libexec/claude-runner.sh` at session start runs `libexec/masterplan-enable.sh --gated`, which installs the masterplan plugin from the first existing mirror in `LMER_MASTERPLAN_MIRROR_CANDIDATES` (see below; default order: taskdef repo, then the deprecated work-repo mirror in its schema-form `_agents/mirrors/` spelling, then in its legacy bare `mirrors/` spelling) via `claude plugin marketplace add <mirror>` → `plugin install masterplan@rasatpetabit-masterplan` → `plugin enable masterplan`, and exports `MASTERPLAN_RUNS_DIR` (see below). The same script without `--gated` is the mid-session on-demand path: it forces enablement in a running session, persisting the environment via `~/.bashrc.d/masterplan-env.sh` (the parent claude process cannot be re-enved), after which one `/reload-plugins` from the user activates the plugin. Every step is idempotent and non-fatal — provisioning failures warn and continue rather than aborting the session. superpowers is baked into the image but left disabled (the image bake removes `~/.claude/settings.json` so no `enabledPlugins` entry survives, keeping the runtime global-settings symlink intact) and is re-enabled automatically as masterplan's declared dependency when the plugin installs, so plain sessions pay no runtime cost. Because the runtime `settings.json` starts as a read-only symlink, the provisioning step materializes it into a writable regular file before the `claude plugin` calls; the path is overridable for non-standard layouts/tests with `LMER_SETTINGS_FILE`. Falsy values (`0`, `false`, `no`) and unset both disable the toggle itself — they do not veto `LMER_TASK=masterplan` or a taskdef's own `task.yaml` declaration. Forwarded into the container by the host CLI.
 
-- **`MASTERPLAN_RUNS_DIR`** - Set **by lmer inside the container** for masterplan sessions (not a host input): the bundle root masterplan writes to, computed as `<current-run-dir>/masterplan` where the run dir comes from the run-state kernel (`work_repo.run_state.run_dir()`). This nests masterplan's bundles (`<mp-slug>/` each with its own `state.yml`/`events.jsonl`) inside the lmer run directory alongside the run's own `state.yaml`, so masterplan artifacts are captured with the rest of the run. It is not LMER-prefixed because it is masterplan's own configuration variable (honored by masterplan's `lib/paths.mjs`); lmer only computes and exports it. Only set when the run dir is resolvable (`LMER_REPO_HOST`/`LMER_REPO_PROJECT` present); otherwise provisioning is skipped. Mid-session enablement (`masterplan-enable.sh` without `--gated`) persists it via `~/.bashrc.d/masterplan-env.sh` instead of the process environment, and its `--repo-host`/`--repo-project` flags can supply a repo target for a session launched without one.
+- **`MASTERPLAN_RUNS_DIR`** - Set **by lmer inside the container** for masterplan sessions (not a host input): the bundle root masterplan writes to, computed as `<current-run-dir>/masterplan` where the run dir comes from the run-state kernel (`work_repo.run_state.run_dir()`). That puts masterplan's bundle inside the lmer run directory alongside the run's own `state.yaml`, so masterplan artifacts are captured with the rest of the run. In schema form the run dir IS this launch's session dir, so the bundle is **flat**: one bundle per session directory, at `<session-dir>/masterplan/`, with no `<mp-slug>/` level under it and nothing ever written at the `_runs/<slug>/` grouping level (docs/SCHEMA.md, [Sessions and runs](./SCHEMA.md#sessions-and-runs)). Its internals stay opaque to lmer — a foreign writer's tree, named rather than inspected — and the well-known artifacts (`spec.md`, `goals.md`, `plan.md`, `plan.html`, `retro.md`) are surfaced as relative symlinks at the session-dir root. A legacy tree keeps `runs/<slug>/masterplan/`. It is not LMER-prefixed because it is masterplan's own configuration variable (honored by masterplan's `lib/paths.mjs`); lmer only computes and exports it. Only set when the run dir is resolvable — the repo target must be known (`LMER_REPO_HOST`/`LMER_REPO_PROJECT`), and in a schema-form work repo the manifest and its registry must be readable; otherwise provisioning is skipped. Mid-session enablement (`masterplan-enable.sh` without `--gated`) persists it via `~/.bashrc.d/masterplan-env.sh` instead of the process environment, and its `--repo-host`/`--repo-project` flags can supply a repo target for a session launched without one.
 
-- **`LMER_MASTERPLAN_MIRROR_CANDIDATES`** - Colon-separated list of masterplan plugin-mirror directories consulted by `libexec/masterplan-enable.sh` (default `/taskdef/mirrors/masterplan:/work/mirrors/masterplan`): the first *existing* candidate is used for `claude plugin marketplace add`; when none exist the last candidate is attempted anyway (its failure warns and continues, preserving the historical fail-soft behavior for the work-repo mirror). The taskdef repo is the mirror's canonical home — resolving to anything but the first candidate emits a deprecation warning telling the operator to configure `LMER_TASKDEF_REPO` with a repo shipping `mirrors/masterplan`; the work-repo location keeps working but is deprecated. Forwarded into the container by the host CLI.
+- **`LMER_MASTERPLAN_MIRROR_CANDIDATES`** - Colon-separated list of masterplan plugin-mirror directories consulted by `libexec/masterplan-enable.sh` (default `/taskdef/mirrors/masterplan:/work/_agents/mirrors/masterplan:/work/mirrors/masterplan`): the first *existing* candidate is used for `claude plugin marketplace add`; when none exist the last candidate is attempted anyway (its failure warns and continues, preserving the historical fail-soft behavior for the work-repo mirror). The taskdef repo is the mirror's canonical home, so resolving to anything but the first candidate warns, and the warning names the form that was hit: the two work-repo entries — the schema-form `_agents/mirrors/masterplan` (lmer schema, D18) and the legacy bare `mirrors/masterplan`, kept last so the blind fallthrough lands where it always has — carry the deprecation warning telling the operator to configure `LMER_TASKDEF_REPO` with a repo shipping `mirrors/masterplan` (the legacy spelling additionally points at the `_agents/mirrors/` rename); both keep working. A custom candidate that is neither work-repo path (the work repo being `LMER_WORK_REPO_PATH`, default `/work`) is only reported as not being the canonical (first) candidate. Forwarded into the container by the host CLI.
 
 - **`LMER_SETTINGS_LOCAL_FILE`** - Path to the personal `settings.local.json` whose `permissions.allow`/`deny` `libexec/claude-runner.sh` merges into the effective settings file (`LMER_SETTINGS_FILE`, default `/home/developer/.claude/settings.json`); default `/home/developer/.claude/settings.local.json`, an override for non-standard layouts/tests, and a path that does not exist simply means no merge. Like `LMER_SETTINGS_FILE` and `LMER_AGENT_MEMORY_DIR`, this is an **in-container seam** read only by the runner script — the host CLI does not forward it, so a host `export` never reaches it; it crosses only when a `.env` file (or a preset's `env`) carries it.
 
 - **`LMER_MCP_FILE`** - Path to the base `.mcp.json` that `libexec/claude-runner.sh` merges personal MCP servers into, rewriting it in place (default `/home/developer/.mcp.json`); an override for non-standard layouts/tests, and an in-container seam like `LMER_SETTINGS_FILE` — a host `export` does not reach it, only a `.env` (or preset `env`) entry does.
 
 - **`LMER_MCP_LOCAL_FILE`** - Path to the personal `.mcp.local.json` whose `mcpServers` are merged into the file above (default `/home/developer/.mcp.local.json`); an override for non-standard layouts/tests, a path that does not exist simply means no merge, and — like the two above — an in-container seam a host `export` does not reach.
+
+- **`LMER_WORK_AGENT_FILES_ROOT`** - Root of the work repo's agent-files tree, read by `libexec/harness-common.sh` (codex/pi config provisioning via `harness_provision_config`, Pi prompt-template rendering) and by `libexec/claude-runner.sh` (the work-repo skills, commands, agents and output-styles Claude links, and the work `settings.json` it merges). Taken as-is: the value is used verbatim as the root, and when the path does not exist the work agent-files tree is simply blank — there is no fallthrough to `_agents/` or `agent-files/`, so an override pointing nowhere yields no work-repo agent files at all rather than the default tree (this is what isolates the runner tests from `/work`). Empty behaves like unset. When unset, the tree is resolved per harness leaf (`claude`, `codex`, `pi`, …) under `LMER_WORK_REPO_PATH` (default `/work`): `_agents/<leaf>` when it exists (lmer schema, D18), else the legacy `agent-files/<leaf>`, else blank; when both exist the schema form is read and a one-line notice names the ignored legacy copy. An override for non-standard layouts and tests; like `LMER_SETTINGS_LOCAL_FILE`, this is an **in-container seam** read only by the runner scripts — the host CLI does not forward it, so a host `export` never reaches it; it crosses only when a `.env` file (or a preset's `env`) carries it.
 
 - **`LMER_MOUNT_FILES`** - Comma-separated list of explicit per-file mounts, each entry using the `--mount-file` grammar `host:container[:mode]` (comma is the entry separator so it does not collide with the `:` field separator, cf. `LMER_TASKDEF_PATHS` choosing its own separator for the same reason). `host` gets `~`/`$VAR` expansion and must resolve to an **existing file**; `container` must be an **absolute** path; `mode` is `ro` (default) or `rw`. Env entries are applied **before** `--mount-file` flags, so a persistent `.env` sets a baseline an ad-hoc flag can override; when two entries target the same container destination, last wins and a warning is emitted. Any invalid entry **aborts the run** — fail-fast is deliberate and stricter than the skip-and-warn mount builders (external taskdefs, uv cache), because these entries are typically credentials (e.g. a kubeconfig) and silently launching without one only surfaces as confusing downstream auth failures. Files are bind-mounted as-is, never copied; SELinux labeling is applied automatically when enforcing. This is a **host-side** variable read by the launching CLI; it does not need to reach inside the container.
 
@@ -256,6 +260,8 @@ The following environment variables control LMER behavior:
 - **`LMER_SUBMIT_ENTER_DELAY`** - Seconds the supervisor waits between typing a submitted message and pressing Enter on it (`POST /input` with `append_newline`, which is every message the platform chat pane, `lmer pipe`, `lmer platform ctl input` and the Slack path send). It is the margin *on top of* waiting for the harness to read the text — see the `POST /input` contract below — covering a harness that may still be coalescing input in its own event loop after the read. Accepts a float from `0` to `1.0`; `0` is honored, and anything else — non-numeric, negative, non-finite (`nan`, `inf`, `1e400`), or above the ceiling — warns on stderr and falls back to the default `0.2`. The ceiling is not a preference: the wait runs while the PTY write lock is held, so a large value freezes the session's terminal I/O for its duration, and the obvious slip here is milliseconds-for-seconds (`LMER_SUBMIT_ENTER_DELAY=200` is rejected, not honored). Raise it if long messages still land typed-but-unsubmitted, but note two limits it does not lift: a message with **many embedded newlines** does not submit under any delivery variant tried (issue #230), and on a **heavily loaded host** a send can still land unsent, where raising the delay to `1.0` was measured *not* to help (issue #231). Read at each send by `lmer-supervisor` but sourced from the container's environment, which is fixed when the session is created — so **changing it on the host affects sessions started afterwards, not the one you are looking at**; restart the session to retune it. Forwarded into the container by the host CLI.
 
 - **`LMER_ANSWER`** - Answer to the run's recorded open question (the durable `open_question` field a previous session stored via `work state set --stop-reason=question --question "<text>"`). **Flag-only**: sourced exclusively from the `--answer` CLI flag (which populates this var, same deliberate pattern as `LMER_START_PROMPT`); a host-exported or `.env`-set `LMER_ANSWER` is never forwarded. An answer is one-shot data while `.env` is standing configuration — an env fallback would let a stale value silently auto-answer every future question-stop on the project. (A future Track-B remote-delivery leg may add a consume-once delivery channel.) At session start, `work session-start` applies it automatically when the resolved run is actually stopped on a recorded question: it appends a `question_answered` event carrying both texts (secret-redacted), clears the question stop, and prints a resume brief that leads with the question+answer pair — so a fresh session resumes with clean context instead of reviving the session that asked. When the run has no open question the value is ignored (fail-soft). See docs/RUN-STATE.md §2.
+
+- **`LMER_SESSION_ID`** - Which work-repo record this launch writes in: in a schema-form work repo every launch owns `<project>/_runs/<slug>/<session-id>[--<name>]/`, and this variable is what picks one ([RUN-STATE.md §5](./RUN-STATE.md), [SCHEMA.md](./SCHEMA.md)). It is normally **minted inside the container** at startup — `clone_and_exec.main`, before anything is placed, as UTC timestamp + pid + random — and inherited unchanged by the runner, the hooks and every `work` invocation, so an ordinary launch opens a record of its own. As a *host* input it is **flag-only**: sourced exclusively from `lmer --session <id>`, never from a host-exported or `.env` `LMER_SESSION_ID`. That refusal is stricter in kind than `LMER_ANSWER`'s, not merely the same habit: **every** lmer container exports this variable, so an agent that runs `lmer` to spawn a child session always has one in its own environment — an env fallback would send the child into its parent's record and leave two live containers writing one `state.yaml`, which is the collision the per-launch record exists to prevent. Injecting it is how a resume continues the record it resolved instead of opening a fresh one beside it (see `--session` below). It also names the session in `owner` claims and in every recorded event, and is `unknown` when unset.
 
 - **`SLACK_BOT_TOKEN`** - Slack Bot User OAuth Token (`xoxb-...`) used by the Slack-thread chat integration. **Required** whenever a Slack thread permalink is passed as a target to `lmer chat` — lmer fails fast at startup if it is missing. Typically set in your `.env` file. Forwarded into the container, where the `lmer-slack` CLI uses it (Bearer auth) for all Slack Web API calls. See [Slack Thread Chat](#slack-thread-chat) for how to create the Slack app and obtain the token.
 
@@ -766,6 +772,7 @@ lmer build --local /path/to/agents/global
 - `--manual-start` - Do not auto-inject `/start` into Claude on launch. By default the supervisor sends `/start` shortly after Claude is ready so the configured task begins immediately
 - `--prompt <text>` - Follow-up prompt injected immediately after the auto-`/start`, so an automated run can hand Claude an extra instruction without manual typing (e.g. `lmer chat <issue-url> --prompt="research X online first"`). Claude queues input typed while it is still working on `/start`, so the prompt becomes the next conversation turn. Forwarded to the container as `LMER_START_PROMPT`. Ignored under `--manual-start` (nothing is auto-injected then)
 - `--answer <text>` - Answer to the run's recorded open question. Forwarded to the container as `LMER_ANSWER` (this flag is the ONLY source — a host-exported or `.env` `LMER_ANSWER` is never forwarded); `work session-start` applies it before printing the resume brief (records a `question_answered` event, clears the question stop) so the fresh session resumes seeded with the question+answer pair. Ignored when the run isn't stopped on a recorded question. See `LMER_ANSWER` above and docs/RUN-STATE.md §2
+- `--session <id>` - Session id of the run record this launch continues, forwarded to the container as `LMER_SESSION_ID` (this flag is the ONLY source — a host-exported or `.env` `LMER_SESSION_ID` is never forwarded, because every lmer container exports one and a child would inherit its parent's record). The id names **one launch inside the run's group** — a session directory's `<session-id>`, or its full `<session-id>--<name>`, as `work sessions` lists them — so the session writes in that record rather than minting a new one beside it; without it a relaunch of a run opens a fresh empty record and the launch you meant to continue is left as it was. A value that could not be a directory name (a path separator, `.`, `..`, empty, a glob character, or one padded with spaces) is refused here, before the container starts (exit 2), because nothing below refuses it: the container-side guards read an unusable id as *no* id at all, so the session would start, quietly file itself under a synthesized id or in the group's newest launch, and look completely normal until the launch you named turned out to be untouched. Whitespace is refused rather than trimmed — silently rewriting an id would send the launch to a directory you did not type. A legacy work repo has no session directories to name, so nothing there is addressed by the id — it is still this session's id in `owner` claims and events, exactly as an unnamed launch's would be. See `LMER_SESSION_ID` above and [Resuming a specific session by id](#resuming-a-specific-session-by-id)
 - `--fastapi` - Expose a FastAPI endpoint inside the container that lets a controlling process drive Claude's stdin/stdout (`POST /input`, `GET /output`). The chosen port is published to `127.0.0.1` on the host. See [Supervisor and FastAPI Endpoint](#supervisor-and-fastapi-endpoint)
 - `--fastapi-port-range LOW-HIGH` - Port range to pick a free FastAPI port from (default `8700-8799`). The host CLI picks one free port from this range before container start and publishes only that port
 - `--fastapi-host <host>` - Inside-container bind host for the FastAPI endpoint (default `0.0.0.0` when `--fastapi` is set so the published port works)
@@ -1040,6 +1047,234 @@ How it works:
 - If the pool doesn't have enough free ports to satisfy the request, startup aborts with a clear error rather than starting with fewer ports than asked for.
 
 The default pool (`8800-8899`) is deliberately distinct from the FastAPI range (`8700-8799`), so `--ports` and `--fastapi` can be combined in one session without colliding.
+
+### Validating a plexus (`lmer-schema validate`)
+
+[SCHEMA.md](./SCHEMA.md) is the normative layout of a work repo migrated to the lmer schema (a *plexus*, marked by a `_plexus.yaml` manifest at its root). `lmer-schema validate` is that document's executable form: it reads a tree, reports everything that does not conform, and never writes, moves, or repairs anything.
+
+```bash
+# The spelling that always works, from a checkout.
+PYTHONPATH=src python -m lmer_schema.cli validate /work
+
+# The same command via the console entry, once the package is installed.
+lmer-schema validate /work
+```
+
+`lmer-schema = lmer_schema.cli:main` is a declared console script, but a console script only reaches `PATH` after the package is (re)installed — so `python -m lmer_schema.cli` is the spelling used throughout this section.
+
+`PATH` is the plexus **root** itself: the directory holding `_plexus.yaml` in schema form. Nothing climbs to a parent. A tree with no manifest is not an error — it is **legacy form**, recognised and read in place, and checked at the lenient tier described below.
+
+#### Exit codes
+
+| exit code | meaning |
+|---|---|
+| `0` | Conformant: no ERROR findings. Warnings and informational findings are allowed and **never block**. |
+| `1` | Not conformant: one or more ERROR findings. |
+| `2` | Unusable input: there is no tree to judge. `PATH` is not a directory, or a `_plexus.yaml` is present but cannot be parsed — a broken manifest never silently demotes a tree to legacy form. |
+
+A **usage error is exit `2` as well**: an unknown flag, a missing command, a non-integer `--stale-after`, `--list-checks` given alongside a command. It is the same statement as unusable input — what the command was given cannot be validated. The message goes to **stderr, and nothing at all is written to stdout**, so a consumer piping stdout into a JSON parser sees either one valid document or nothing.
+
+These are the validator's own codes, deliberately not the `0`/`2`/`64` codes of the `sources` CLI (see [`bin/doctor`](#bindoctor)).
+
+#### Flags
+
+| flag | effect |
+|---|---|
+| `--json` | Emit one JSON document on stdout instead of text. Accepted before or after the command (`--json validate PATH` and `validate PATH --json` are the same invocation). |
+| `--plexus-repo-url URL` | The remote this plexus repo itself was cloned from, for the manifest's same-host `sources:` guard. See below. |
+| `--stale-after DAYS` | How long an `in-progress` session may go untouched before `record.session-stale` reports it, in days (default `14`). Informational only — it can never change the exit code. |
+| `--list-checks` | Print the registered check codes with their severities and tiers, then exit `0`. Takes no command. |
+| `-h`, `--help` | Usage, on stdout, exit `0`. |
+
+#### Text output: an ordered fix-list
+
+The text output is not a log and not a summary. It is a numbered list, most severe first, each entry naming the severity, the stable machine code and the repo-relative path, then the message and any detail — work down it and the blocking findings are done first. One verdict line closes it.
+
+```
+$ python -m lmer_schema.cli validate .
+lmer-schema validate: . — schema form
+
+fix list — 1 finding(s), most severe first:
+  1. ERROR  index.dangling-link  lmer/_specs/2026-08-25-develop-issue-353-20260824-165230-2-31245--spec.md
+     index symlink target does not exist
+     detail: target: ../_runs/develop-issue-353/20260824-165230-2-31245/spec.md
+
+not conformant: 1 error(s), 0 warning(s), 0 informational. Fix the errors above, in order.
+```
+
+In a **legacy** tree the verdict says out loud what the exit code cannot: the list is a migration aid, not a gate.
+
+```
+$ python -m lmer_schema.cli validate .
+lmer-schema validate: . — legacy form
+
+fix list — 2 finding(s), most severe first:
+  1. INFO   manifest.absent  .
+     no _plexus.yaml: this is a legacy tree, recognised and read in place; the validator's findings are the list to fix before adopting the schema
+  2. INFO   tree.legacy-project-home  example.com/group/lmer
+     legacy `{host}/{project}` project home `example.com/group/lmer`, read in place; it becomes a short-name project by gaining a registry entry (Appendix A).
+
+conformant: 0 error(s), 0 warning(s), 2 informational — a legacy tree, checked at the lenient tier: the list above is a migration aid, not a gate.
+```
+
+#### How the strictness tiers become findings
+
+SCHEMA.md's [Inventory](./SCHEMA.md#inventory) assigns every schema path a strictness tier, and the validator implements those rows. Each registered check code carries the tier of the surface it checks, which is what `--list-checks` prints in its third column:
+
+| tier | what the validator reports |
+|---|---|
+| `machine` | Machine-owned surfaces — `_*` directories, state files, indexes, the manifest. A shape violation is an ERROR; an unknown file inside is a WARN. Most codes live here. |
+| `free-form` | Napkin bodies, knowledge pages, info prose, plan bodies: content is never read. The directory *name* is still schema-owned, so a code here could only ever be about the name of a thing — no code is registered against this tier today. |
+| `opaque` | A foreign writer's tree (`_agents/mirrors/`, an orchestration bundle): checked no further than its existence. |
+| `legacy` | A pre-schema name — `runs/`, `specs/`, `agent-files/`, a `{host}/{project}` project home. Recognised, read in place, reported INFO, never required to move. |
+| `not-schema` | The documented holding form of [host buckets](./SCHEMA.md#host-buckets): INFO, and never affecting conformance. The one exception is `tree.bucket-collision`, an ERROR — a registered remote whose `{host}/{project}/` path is still a real directory is a split tree, and work would land in two places. |
+
+**The legacy tier is a downgrade table, not a second set of checks.** In a tree with no manifest, integrity findings that are ERROR in schema form are softened, while shape findings are not: a corrupt `state.yaml` is broken in any form. `--list-checks` marks every tier-sensitive code with the severity it carries in a legacy tree — today `index.dangling-link`, `index.entry-without-file` and `agents.memory-entry-without-file` drop ERROR to WARN, `agents.memory-scope-mismatch` drops WARN to INFO, and `manifest.sources-legacy-file` drops WARN to INFO. The same downgrades apply to the *contents* of a host bucket inside a schema-form tree, because a bucket is a repo the plexus has not adopted yet.
+
+Unusable input suppresses everything below it rather than reporting a short, misleadingly clean tree: the run adds one `runner.checks-skipped` INFO naming what did not run.
+
+#### `--json`: the document the machine reads
+
+`--json` prints exactly one JSON document on stdout and nothing else. Its keys are a consumed contract:
+
+```json
+{
+  "schema": 1,
+  "tool": "lmer-schema",
+  "form": "schema",
+  "exit_code": 1,
+  "unusable": null,
+  "counts": { "error": 1, "warn": 0, "info": 0 },
+  "findings": [
+    {
+      "code": "index.dangling-link",
+      "severity": "ERROR",
+      "path": "lmer/_specs/2026-08-25-develop-issue-353-20260824-165230-2-31245--spec.md",
+      "message": "index symlink target does not exist",
+      "detail": "target: ../_runs/develop-issue-353/20260824-165230-2-31245/spec.md"
+    }
+  ]
+}
+```
+
+- **`schema`** — version of *this document*, not the plexus's `schema:`. Bumped when the shape changes in a way a reader must notice.
+- **`tool`** — always `"lmer-schema"`, so a document found on its own says what wrote it.
+- **`form`** — `"schema"` or `"legacy"`: the two answers of form detection, and therefore which severity table the findings were resolved against.
+- **`exit_code`** — the same integer the process exits with, so a stored document carries its own verdict.
+- **`unusable`** — `null`, or the reason the input could not be judged. When it is non-null, `exit_code` is `2`.
+- **`counts`** — `{"error": N, "warn": N, "info": N}` over the findings below.
+- **`findings`** — the fix-list in report order, most severe first. Every entry has exactly five keys:
+  - **`code`** — the stable `<namespace>.<name>` machine code (`manifest.*`, `registry.*`, `tree.*`, `agents.*`, `record.*`, `index.*`, `runner.*`). Renaming one is a breaking change of this output.
+  - **`severity`** — `"ERROR"`, `"WARN"` or `"INFO"`.
+  - **`path`** — repo-relative POSIX, `"."` for the plexus root. Never absolute.
+  - **`message`** — the one-line human text.
+  - **`detail`** — supporting text (a symlink target, an offending value), or `null`.
+
+The envelope deliberately does **not** carry the path that was validated. Every finding path is repo-relative and this document gets copied around, so one absolute path in it would leak the machine layout of whoever ran the validator. The text output does print the target, because that output goes to the terminal of the person who typed the command.
+
+#### `--list-checks`: the check inventory
+
+`--list-checks` prints one row per registered code, in code order, and exits `0`:
+
+```
+<code>  <SEVERITY>  <tier>  [flags] <summary>
+```
+
+The severity is the second field so the table stays greppable and `awk`-able. Two flags can appear before the summary:
+
+- **`[legacy <SEVERITY>]`** — the code is tier-sensitive: this is the severity it carries in a legacy tree.
+- **`[unreachable at schema 1]`** — the code is registered but cannot fire at this lmer's schema support.
+
+```
+index.dangling-link           ERROR  machine  [legacy WARN] a `_specs/`/`_plans/` index symlink or a `<session-dir>/<artifact>.md` bundle link whose target does not exist
+manifest.schema-older         WARN   machine  [unreachable at schema 1] `schema:` is older than the newest this lmer knows; a newer schema is available
+tree.host-bucket              INFO   not-schema  a host bucket: an unnamed repo's work, awaiting adoption (D9)
+```
+
+Exactly one code carries the unreachable flag today, and it is worth knowing why rather than looking for the warning it advertises. `manifest.schema-older` needs a *supported* schema older than the newest this lmer knows; at schema 1 the supported set is `(1,)`, so an older `schema:` integer is unsupported input — exit `2`, like a newer one — and never that WARN. The flag is computed from the schema constants rather than hard-coded per release, so it disappears by itself the day schema 2 ships. The full reason is the `unreachable` value in the JSON inventory.
+
+`--list-checks --json` prints `{schema, tool, checks}`, where each check is `{code, severity, legacy, tier, summary, unreachable}` — `legacy` is the tier-sensitive severity (equal to `severity` when the code is not tier-sensitive) and `unreachable` is `null` or the reason.
+
+`--list-checks` takes no command: `lmer-schema validate PATH --list-checks` is a usage error (exit `2`).
+
+#### `--plexus-repo-url` and the same-host `sources:` guard
+
+The manifest's `sources:` entries are declared remotes the container clones with the work-repo credential, so `manifest.sources-cross-host` refuses a `sources.<name>.repo` sitting on a different host than the plexus repo itself (the same rule as [Same-host trust](#same-host-trust-rule)). Nothing inside the tree says what the plexus repo's own remote is. `--plexus-repo-url URL` is how you tell it, and **without it that one comparison is simply skipped** — every other check runs unchanged.
+
+There is exactly one case where the environment answers instead. When `PATH` resolves to `$LMER_WORK_REPO_PATH`, the tree being validated *is* this session's work repo, so `$LMER_WORK_REPO` (then the older `$LMER_REPO_URL`) really is its remote, and it is used as the default. The two paths are compared **resolved**, so a symlinked, relative or trailing-slash spelling of one directory still matches; an unset, empty or non-matching `LMER_WORK_REPO_PATH` is never an error, it just leaves the guard disarmed.
+
+For **any other** `PATH` the flag is the whole answer, and the guard stays disarmed without it. A conformance verdict must never depend on an ambient variable: a work-repo URL that merely happens to be exported is no evidence about the tree named on the command line, and judging the same bytes two ways depending on who ran the command would be a false positive and a false negative in one — in ERROR findings that land in the stored JSON document.
+
+### Sessions and resume (`work sessions`)
+
+In a work repo migrated to the lmer schema the unit of record is the **session**: one launch writes one record, at `<project>/_runs/<slug>/<session-id>[--<name>]/`. Several launches against the same target share the `<slug>/` group — two people on one issue are two records — so "which run is this?" becomes "which *session* of this run?". `work sessions` answers it, and `--session <id>` is how a launch continues an existing record instead of opening a new one.
+
+Both surfaces work in a legacy tree too. There one shared run dir per target holds every session's writes, so no session id describes it, and the rows say so rather than presenting a directory name as a launch. The file shapes are unchanged in either form — see [RUN-STATE.md](./RUN-STATE.md) for what is *in* a record, and [SCHEMA.md](./SCHEMA.md#sessions-and-runs) for where it lives.
+
+#### `work sessions` — what is recorded, and what is live
+
+`work sessions` lists this project's run records, one row per launch, **grouped by slug and in start order within a slug** (the walk is group order; only the timestamp-first session ids inside one group make that start order, so `created` is not monotonic across the whole listing). It is **read-only and always exits `0`**: no run context (a `chat` session with no repo target, or a work repo whose manifest cannot be read) is a normal state and is reported with the cause it actually has, never as a failure.
+
+```
+$ work sessions
+Sessions: 3 (1 running, 1 orphaned)
+  issue-353      20260825-120000-1-1  in-progress name=schema-docs phase=execute created=2026-08-25T12:00:00Z updated=2026-08-25T12:30:00Z ⚠️  orphaned (no live owner)
+  issue-353      20260825-124000-2-7  in-progress name=schema-docs phase=execute created=2026-08-25T12:40:00Z updated=2026-08-25T12:50:00Z
+  release-0-8-0  20260824-090000-3-2  complete    name=prep-080 phase=release created=2026-08-24T09:00:00Z updated=2026-08-24T18:40:00Z
+```
+
+The header counts the whole listing: `Sessions: <total> (<running> running, <orphaned> orphaned)`. Then, per row:
+
+- **slug** — the run's slug, derived from the taskdef and target ([RUN-STATE.md §3](./RUN-STATE.md#3-slug-derivation)). Two rows sharing a slug are two launches against the same target. `?` when the record's state file could not be read.
+- **session id** — the launch's `LMER_SESSION_ID`, which is also its directory name (a `--<name>` suffix added by the naming freeze is not part of the id: `<sid>` and `<sid>--<name>` are the same session). `-` in a legacy tree, where several sessions interleave in one run dir and none of them names it.
+- **status** — the run status from `state.yaml` (`in-progress`, `complete`, …), or `?` when it could not be read.
+- **`key=value` tails** — `name`, `phase`, `created`, `updated`, printed only when set, the way `work ledger` prints a row.
+- **a trailing marker** — `⚠️  orphaned (no live owner)` for an `in-progress` record with no owner claim or a stale one, or `⚠️  state unreadable` for a record whose state file could not be parsed.
+
+An empty listing prints `No sessions recorded`; with no run context, `No run context: <reason>`.
+
+**`--running`** narrows the listing to records that are `in-progress` **and** not orphaned — something is live in them right now. An orphaned record is deliberately *not* running, and just as deliberately still listed without the flag: it is the resumable one, and hiding it is how a crashed session gets mistaken for a finished one. A record whose state cannot be read has no verdict at all, so it is never `--running` and always listed. The header is `Running sessions: <n>` rather than the full `Sessions: <total> (<running> running, <orphaned> orphaned)` count, since the other two numbers are what the flag filtered out. The empty case prints `No sessions running`.
+
+Orphaned is a question about *this moment* — it reads the owner claim a session takes at start and clears at end. It is not the validator's `record.session-stale`, which asks on a much longer window whether a record has been abandoned altogether (see `--stale-after` above). Neither ever ends a run: an orphan is listable, resumable, and never auto-ended.
+
+**`--json`** emits `{"form": …, "count": N, "sessions": [...]}` on one line — `form` is `"schema"` or `"legacy"`, and with no run context the document carries `"detail"` with the reason and an empty list. Each session entry carries `id`, `dir_name`, `path` (absolute, in-container), `address` (`<slug>/<session-id>`, the run-area-relative name), `slug`, `name`, `status`, `phase`, `created`, `updated`, `owner` and `orphaned`.
+
+```
+$ work sessions --json
+{"form": "schema", "count": 3, "sessions": [{"id": "20260825-120000-1-1", "dir_name": "20260825-120000-1-1", "path": "/work/lmer/_runs/issue-353/20260825-120000-1-1", "slug": "issue-353", "name": "schema-docs", "status": "in-progress", "phase": "execute", "created": "2026-08-25T12:00:00Z", "updated": "2026-08-25T12:30:00Z", "owner": null, "orphaned": true, "address": "issue-353/20260825-120000-1-1"}, …]}
+```
+
+A record JSON cannot represent — a hand-edited `state.yaml` whose unquoted timestamp YAML resolved to a native date, say — is listed with its address fields kept and everything read out of the state file nulled. It is never dropped, and the verb still exits `0`: an unreadable record disappearing from the listing is exactly the failure this listing exists to prevent.
+
+#### Resuming a specific session by id
+
+Two things can say which record a launch continues, and each covers a launcher the other cannot reach.
+
+**`LMER_SESSION_ID` itself** is the container's own answer, and the one the platform uses. It is minted at container startup only when the host injected none, and `lmer --session <id>` injects it — which is what `POST /api/runs/resume` and `POST /api/runs/answer` do with the record they resolved and checked. Because everything in the container already reads that variable, nothing has to be threaded through the hooks: `hooks/start.py` runs `work session-start` with no `--session` at all, and the launch still lands in the named record.
+
+**`work session-start --session <id>`** is the other, for a launcher that can call `work` but does not own the container's environment. It happens **exactly once per launch**: the named record is the one this session continues, and the call chains this harness's `LMER_SESSION_ID` into that record's `sessions:` lineage — so every *later* `work` invocation in the container, each a separate process knowing only its own session id, finds the same directory through the record itself. That is why there is no second environment variable to forward and keep in step with the directory.
+
+```bash
+# Continue the record listed above rather than opening a new one.
+work session-start --session 20260825-120000-1-1
+```
+
+`work resume --session <id>` briefs one record without joining it — the read-only half of the same addressing.
+
+```bash
+work resume --session 20260825-120000-1-1
+```
+
+What an id may name, and what happens when it does not:
+
+- An id names **one launch inside this run's group** — the `<slug>/` the session derives — never a path and never a pattern. A value that could not be a directory name (`.`, `..`, an absolute path, a glob character) is refused by the run-state kernel with a message saying so; the read-only verbs report it and still exit `0`, and `session-start` is hook-facing and does the same. **Schema form only** — see the legacy note below.
+- An id nothing occupies resolves to where that record *would* be written, which is what lets `session-start` seed it; `work resume` on it simply briefs a fresh run.
+- `--session ""` is a request for a session that cannot exist, not a request for the launch's own record, and is refused as such (**schema form only**, as above).
+- With no `--session`, routing is unchanged: this launch's own directory, then the record whose lineage already carries this harness id, then the launch's creation address. In a legacy tree there is one run dir per target and nothing is chained — **and `--session` is ignored there entirely**: a legacy tree has no session directories to name, so the flag is neither used nor validated, and neither of the refusals above fires. Passing it against a legacy work repo is a silent no-op, not an error.
+
+One related case is automatic. When a stopped run is relaunched with a pushed answer (`lmer --answer "…"`), the relaunch is a new container, and left to itself it would mint a new session id and file the answer in a fresh empty record beside the one that asked — with the question still standing in the real record. The platform's answer route closes that directly: it injects the asking record's id as `LMER_SESSION_ID` (`lmer --session`), so the launch writes there from its first `work` call. For a launcher that carries only the answer, `work session-start` falls back to routing itself to the newest session of this run that is stopped on a question — the record the answer is actually about — and only when the relaunch has written no record of its own. Naming the session, by either route, is the direct one.
+
+The condition the fallback yields on is that the launch **already has a record**, not that an id was injected, and the difference is worth stating because only one of them is guaranteed. The platform injects an id it resolved off disk, so its record always exists and the fallback always stands down: the two mechanisms cannot pick different records because only one of them ever answers. A hand-typed `lmer --session <id>` naming a record that does *not* exist yet, carried together with `--answer`, is the case where both are aimed — and there the fallback wins, the answer is applied where the question is (the useful outcome), and the id names an address the launch then does not use.
 
 ### Troubleshooting
 

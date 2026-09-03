@@ -107,6 +107,17 @@ def masterplan_runs_dir() -> Optional[Path]:
     authority on where a run's directory lives). Returns ``None`` when the run
     dir cannot be resolved (host/project unset), so the caller can skip
     provisioning without failing the session.
+
+    That single composition is also what carries the bundle into a schema-form
+    tree (issue #353): there the run dir IS this launch's session dir,
+    ``<project>/_runs/<slug>/<session-id>[--<name>]/`` (D22), so the bundle
+    root is ``<session-dir>/masterplan`` — flat, at most one per session dir,
+    and never at the ``_runs/<slug>/`` grouping level nothing may write to
+    (D12; docs/SCHEMA.md, "Sessions and runs"). A legacy tree keeps
+    ``runs/<slug>/masterplan``. Nothing is re-derived here to achieve that and
+    nothing looks inside the bundle — it is a foreign writer's tree, named
+    rather than inspected — which is what
+    ``tests/test_masterplan_runs_dir_session.py`` pins.
     """
     # Deferred deliberately: keep the import inside this function so that
     # ``masterplan_enabled()`` (a pure ``get_bool_env`` check) and the module as
