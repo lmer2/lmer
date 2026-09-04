@@ -304,7 +304,167 @@ def test_dead_session_without_run_dir_is_crashed(tmp_path):
     inv = inventory.build_inventory([], [session("never-committed", live=False)])
     run = inv.runs[0]
     assert run.state == "crashed"
-    assert "no run state was ever committed" in run.attention.note
+    assert "its run state is not in the mirror" in run.attention.note
+
+
+def test_the_note_says_where_it_looked_rather_than_what_was_never_done(tmp_path):
+    """#324: the mirror is git-eventual, so an absent run dir is not proof that
+    nothing was ever pushed."""
+    inv = inventory.build_inventory([], [session("pushed-then-exited", live=False)])
+    assert "ever committed" not in inv.runs[0].attention.note
+
+
+def test_a_wound_down_session_is_not_a_crash(tmp_path):
+    """#324: a wind-down leaves no reaper to clear the entry, so the dead entry
+    that is evidence of a crash everywhere else is here evidence of the request
+    being carried out."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    entry = session("r1", live=False, lifecycle={
+        "verb": "wind_down",
+        "requested_at": "2026-08-20T16:19:33Z",
+        "backstop_at": "2026-08-20T16:49:33Z",
+    })
+    run = inventory.build_inventory([ref], [entry]).runs[0]
+
+    assert run.state == "dormant"
+    assert run.attention is None
+
+
+def test_a_wound_down_session_with_no_run_dir_is_not_a_crash_either(tmp_path):
+    """The same rule on the row built from the entry alone — the row #324 saw."""
+    entry = session("wound-down", live=False, lifecycle={
+        "verb": "wind_down", "requested_at": "2026-08-20T16:19:33Z",
+    })
+    run = inventory.build_inventory([], [entry]).runs[0]
+
+    assert run.state == "dormant"
+    assert run.attention is None
+
+
+def test_a_wound_down_session_a_watcher_saw_die_is_still_a_crash(tmp_path):
+    """The bound on the mark: ``spawn._watch`` keeps the entry of a session that
+    exits non-zero, so a watched dead entry is a recorded death. The mark alone
+    would retire it — wound down at 09:00, OOM-killed at 09:04."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    entry = session("r1", live=False,
+                    lifecycle={"verb": "wind_down",
+                               "requested_at": "2026-08-20T16:19:33Z"},
+                    exited={"code": 137, "clean": False,
+                            "at": "2026-08-20T16:23:00Z"})
+    run = inventory.build_inventory([ref], [entry]).runs[0]
+
+    assert run.state == "crashed"
+    assert run.attention.reason == "crashed"
+
+
+def test_a_wound_down_session_a_watcher_saw_die_is_a_crash_with_no_run_dir_too(
+    tmp_path,
+):
+    ref_less = session("gone", live=False,
+                       lifecycle={"verb": "wind_down"},
+                       exited={"code": 1, "clean": False})
+    run = inventory.build_inventory([], [ref_less]).runs[0]
+
+    assert run.state == "crashed"
+    assert run.attention.reason == "crashed"
+
+
+@pytest.mark.parametrize("exited", [
+    None, {"clean": True}, {"code": 0, "clean": True},
+], ids=["nothing recorded", "a clean ending", "a clean ending with its code"])
+def test_the_wind_down_mark_stands_when_no_bad_exit_was_recorded(tmp_path, exited):
+    """Nothing recorded is the case the mark is genuinely the best evidence for:
+    an unwatched session's entry survives a clean exit too."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    extra = {} if exited is None else {"exited": exited}
+    entry = session("r1", live=False, lifecycle={"verb": "wind_down"}, **extra)
+
+    assert inventory.build_inventory([ref], [entry]).runs[0].state == "dormant"
+
+
+@pytest.mark.parametrize("exited", ["exit 137", {}, [], 0, None], ids=[
+    "not a mapping", "an empty record", "an empty list", "a bare code",
+    "a present null"])
+def test_an_unreadable_exit_record_fails_towards_the_crash(tmp_path, exited):
+    """The one place this module does not read a wrong-typed field as a missing
+    one, because the directions are not symmetric: read as "nothing was seen", a
+    corrupt record retires a death nobody is then told about."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    entry = session("r1", live=False, lifecycle={"verb": "wind_down"},
+                    exited=exited)
+
+    assert inventory.build_inventory([ref], [entry]).runs[0].state == "crashed"
+
+
+def test_a_present_null_exit_is_not_the_same_as_no_exit_key(tmp_path):
+    """`.get("exited")` cannot tell them apart, and they must not be: an entry
+    that kept the key and lost its content is a record that was written, and
+    reading it as absent lets the sweep delete the death's only evidence."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    wound = {"verb": "wind_down"}
+
+    absent = session("r1", live=False, lifecycle=wound)
+    present_null = session("r1", live=False, lifecycle=wound, exited=None)
+
+    assert inventory.build_inventory([ref], [absent]).runs[0].state == "dormant"
+    assert inventory.build_inventory([ref], [present_null]).runs[0].state == "crashed"
+
+
+def test_a_recorded_bad_exit_alone_changes_nothing(tmp_path):
+    """Without a wind-down mark the entry was already a crash; the new field must
+    not become a second way of deciding that."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    entry = session("r1", live=False, exited={"code": 137, "clean": False})
+
+    assert inventory.build_inventory([ref], [entry]).runs[0].state == "crashed"
+
+
+def test_a_crashed_row_says_the_same_thing_whether_or_not_its_run_dir_is_there(
+    tmp_path,
+):
+    """What `detect.Detector._confirmed` rests on, pinned where it is decided.
+
+    The forced pull moves a run from `_view_from_session` to `_derive`, and the
+    confirmation keeps a signal only when its key — `(ref, kind, since)` —
+    survives that switch. The detector's own tests cannot see this: they hand the
+    same synthetic payload to both reads.
+    """
+    entry = session("r1", live=False)
+    without = inventory.build_inventory([], [entry]).runs[0]
+    plain = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    with_dir = inventory.build_inventory([plain], [entry]).runs[0]
+
+    def key(run):
+        return (
+            f"{run.host}/{run.project}/{run.slug}",
+            run.attention.reason,
+            run.attention.since or "",
+        )
+
+    assert key(without) == key(with_dir), (
+        "the crashed signal's identity depends on which builder made the row, so "
+        "a run dir arriving mid-confirmation would withdraw a genuine crash"
+    )
+    assert key(without)[1] == "crashed"
+
+
+def test_a_lifecycle_record_of_something_else_is_still_a_crash(tmp_path):
+    """Only the recorded wind-down verb excuses a dead entry; anything else on
+    that key is a fact about a different operation."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    for lifecycle in ({"verb": "exit"}, {"requested_at": "2026-08-20T16:19:33Z"}, "wind_down"):
+        entry = session("r1", live=False, lifecycle=lifecycle)
+        run = inventory.build_inventory([ref], [entry]).runs[0]
+        assert run.state == "crashed", lifecycle
+        assert run.attention.reason == "crashed", lifecycle
+
+
+def test_a_live_wound_down_session_is_still_running(tmp_path):
+    """Being asked to wrap up is not being finished: it holds its slot until it
+    actually goes."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    entry = session("r1", live=True, lifecycle={"verb": "wind_down"})
+    assert inventory.build_inventory([ref], [entry]).runs[0].state == "running"
 
 
 def test_session_with_no_run_block_still_appears(tmp_path):
@@ -689,6 +849,8 @@ SESSION_FIELD_READERS = {
     "started_at": "RunDetail.vue: 'started <n> ago'",
     "log_path": "RunDetail.vue: where the PTY log is on the host",
     "lifecycle": "RunDetail.vue: the recorded wind-down request",
+    "exited": "RunDetail.vue: the ending a watcher saw, under the crash alert — "
+              "the record that decides crashed-vs-dormant beside a wind-down mark",
     "activity": "RunCard.vue: 'idle 22m' beside the run's age (idle_seconds), "
                 "with last_output_at as its tooltip",
 }
@@ -788,6 +950,33 @@ def test_the_detail_view_still_gets_every_field_it_reads(tmp_path, platform_root
     assert block["started_at"] == entry["started_at"]
     assert block["log_path"] == "/home/dev/.lmer/platform/logs/s-full.log"
     assert block["lifecycle"]["verb"] == "wind_down"
+
+
+@pytest.mark.parametrize("exited, served", [
+    (None, {}), ("exit 137", {}), (0, {}), (False, {}), ([], {}),
+    ({"code": 137, "clean": False}, {"code": 137, "clean": False}),
+], ids=["a present null", "a string", "a zero", "a false", "a list", "a record"])
+def test_a_present_but_unreadable_exit_reaches_the_client_as_an_empty_record(
+    tmp_path, exited, served
+):
+    """`session.get(key)` cannot tell a present `null` from an absent key while
+    `_observed_bad_exit` makes presence the fact, so the browser would render
+    nothing for a row it was just told is crashed."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    entry = session("r1", live=False, exited=exited)
+
+    block = inventory.build_inventory([ref], [entry]).runs[0].to_dict()["session"]
+    assert block["exited"] == served
+
+
+def test_an_absent_exit_still_reaches_the_client_as_null(tmp_path):
+    """The other side: nobody watched, and the row must not claim somebody did."""
+    ref = plant_run(tmp_path, "r1", state_yaml=state_yaml(status="in-progress"))
+    block = inventory.build_inventory(
+        [ref], [session("r1", live=False)]
+    ).runs[0].to_dict()["session"]
+
+    assert block["exited"] is None
 
 
 def test_every_allowlisted_field_names_the_code_that_reads_it():

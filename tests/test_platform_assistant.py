@@ -37,6 +37,7 @@ from dotenv import dotenv_values
 
 from lmer_cli import cli, resolve
 from lmer_cli.harness import HARNESSES
+from lmer_cli.mounts import MOUNT_LINK_MARKER
 from lmer_platform import assistant
 from lmer_platform import config as cfg
 from lmer_platform import memory, registry, runs, spawn, store
@@ -2542,7 +2543,95 @@ def test_the_status_body_carries_the_store(platform_root):
     """``to_dict`` is what ``GET /api/assistant`` answers with."""
     body = assistant.status().to_dict()
     assert body["memory"]["path"] == str(memory.memory_dir())
-    assert set(body["memory"]) == {"path", "files", "bytes", "truncated", "large"}
+    assert set(body["memory"]) == {
+        "path", "files", "bytes", "truncated", "large", "link",
+    }
+
+
+def test_a_store_with_no_recorded_link_says_so_rather_than_guessing(platform_root):
+    """``None`` is the honest answer when no incarnation has left the fact."""
+    assert assistant.status().memory["link"] is None
+
+
+def test_the_status_carries_what_the_container_recorded_about_the_link(
+    platform_root,
+):
+    """The fact a host measurement cannot reach: whether the declared memory
+    path was actually put onto this store."""
+    directory = memory.prepare_memory_dir()
+    (directory / MOUNT_LINK_MARKER).write_text(
+        "schema=1\ndeclared=/home/developer/.claude/x\n"
+        f"staged={memory.CONTAINER_STAGED_DIR}\nlinked=no\n"
+        "detail=cannot create the parent directory\nat=2026-09-03T12:00:00Z\n",
+        encoding="utf-8",
+    )
+
+    reported = assistant.status().memory
+    assert reported["files"] == 0, "the marker is not one of the store's files"
+    assert reported["link"]["linked"] is False
+    assert "parent directory" in reported["link"]["detail"]
+
+
+def write_link_marker(directory, *, at="2026-09-03T12:00:00Z", linked="yes"):
+    (directory / MOUNT_LINK_MARKER).write_text(
+        "schema=1\ndeclared=/home/developer/.claude/x\n"
+        f"staged={memory.CONTAINER_STAGED_DIR}\nlinked={linked}\n"
+        f"detail=linked\nat={at}\n",
+        encoding="utf-8",
+    )
+
+
+def test_a_link_record_older_than_the_running_session_is_flagged_stale(
+    config, long_lived,
+):
+    """Only a session that ran the linker rewrites the marker, so one whose image
+    predates it leaves the previous incarnation's answer sitting there."""
+    write_link_marker(memory.prepare_memory_dir(), at="2020-01-01T00:00:00Z")
+    assistant.start(config)
+
+    assert assistant.status().memory["link"]["stale"] is True
+
+
+def test_a_link_record_this_session_wrote_is_not_stale(config, long_lived):
+    write_link_marker(memory.prepare_memory_dir(), at="2099-01-01T00:00:00Z")
+    assistant.start(config)
+
+    assert assistant.status().memory["link"]["stale"] is False
+
+
+@pytest.mark.parametrize("at, started", [
+    ("not-a-timestamp", "2026-09-03T17:00:00Z"),
+    ("2026-09-03T17:00:00Z", "nope"),
+    ("2026-09-03T17:00:00.500Z", "2026-09-03T17:00:00Z"),
+    ("2026-09-03T17:00:01+00:00", "2026-09-03T17:00:00Z"),
+    ("", "2026-09-03T17:00:00Z"),
+], ids=["marker unreadable", "session unreadable", "marker has millis",
+        "marker has an offset", "marker empty"])
+def test_a_timestamp_it_cannot_read_is_unanswerable_rather_than_current(at, started):
+    """A lexicographic compare answers confidently for input it cannot judge —
+    `"not-a-timestamp" < started` is a definite "current". The differently-shaped
+    stamps are the drift case between the container's `date` and `TS_FORMAT`."""
+    snapshot = {"link": {"linked": True, "at": at}}
+
+    out = assistant._with_link_age(snapshot, {"started_at": started})
+
+    assert out["link"]["stale"] is None
+
+
+def test_with_no_record_there_is_no_stale_key_to_read(platform_root):
+    """With no record the snapshot comes back untouched: `link` is null and
+    `stale` is not a key at all."""
+    out = assistant._with_link_age({"link": None}, {"started_at": "x"})
+
+    assert out["link"] is None
+
+
+def test_with_nothing_running_the_records_age_is_unanswerable(platform_root):
+    """`None` rather than `False`: "we cannot tell" and "it is current" are the
+    two answers this feature exists to stop conflating."""
+    write_link_marker(memory.prepare_memory_dir())
+
+    assert assistant.status().memory["link"]["stale"] is None
 
 
 def test_a_large_store_says_so_in_the_status(platform_root):

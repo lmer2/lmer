@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from lmer_cli.harness import HARNESSES
-from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR
+from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINK_MARKER
 from lmer_platform import memory, store
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
@@ -229,3 +229,100 @@ def test_a_store_the_assistant_is_curating_is_not_worth_an_event(platform_root):
         event for event in store.read_events()
         if event.get("type") == "assistant_memory_large"
     ]
+
+
+# ── Liveness: what the container's linker recorded (#383 item 2) ─────────────
+
+
+def write_marker(directory, *, linked=True, detail="linked"):
+    """The marker exactly as Ctl/container/setup-mount-links.sh writes it."""
+    (directory / MOUNT_LINK_MARKER).write_text(
+        "\n".join([
+            "schema=1",
+            f"declared={HARNESSES['claude'].memory_dir}",
+            f"staged={memory.CONTAINER_STAGED_DIR}",
+            f"linked={'yes' if linked else 'no'}",
+            f"detail={detail}",
+            "at=2026-09-03T12:00:00Z",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_an_empty_store_with_no_marker_reports_no_link_fact(platform_root):
+    """``None`` is "nobody told us" — a pre-marker session image and a store no
+    session has been given leave the same absence."""
+    directory = memory.prepare_memory_dir()
+    assert memory.link_state(directory) is None
+
+
+def test_the_recorded_link_is_read_back(platform_root):
+    directory = memory.prepare_memory_dir()
+    write_marker(directory)
+
+    record = memory.link_state(directory)
+    assert record["linked"] is True
+    assert record["staged"] == memory.CONTAINER_STAGED_DIR
+
+
+def test_a_recorded_failure_is_read_back_as_one(platform_root):
+    """An empty store plus a failed link is a different state from an empty store
+    plus a live one, and only the marker separates them."""
+    directory = memory.prepare_memory_dir()
+    write_marker(directory, linked=False, detail="the declared path is a non-empty directory")
+
+    record = memory.link_state(directory)
+    assert record["linked"] is False
+    assert "non-empty directory" in record["detail"]
+
+
+def test_the_marker_is_not_counted_as_a_memory_file(platform_root):
+    """A linked store that has saved nothing must still measure as empty."""
+    directory = memory.prepare_memory_dir()
+    write_marker(directory)
+
+    measurement = memory.measure(directory)
+    assert measurement.files == 0
+    assert measurement.bytes == 0
+
+
+def test_the_marker_does_not_hide_the_files_beside_it(platform_root):
+    directory = memory.prepare_memory_dir()
+    write_marker(directory)
+    (directory / "MEMORY.md").write_text("- a fact\n", encoding="utf-8")
+
+    assert memory.measure(directory).files == 1
+
+
+def test_a_marker_named_the_same_in_a_subdirectory_is_an_ordinary_file(platform_root):
+    """Only the store root carries the linker's record; the harness owns the rest
+    of the tree."""
+    directory = memory.prepare_memory_dir()
+    nested = directory / "notes"
+    nested.mkdir()
+    (nested / MOUNT_LINK_MARKER).write_text("x", encoding="utf-8")
+
+    assert memory.measure(directory).files == 1
+
+
+@pytest.mark.parametrize("text", [
+    "",
+    "schema=1\n",
+    "declared=/a\nstaged=/b\n",
+    "declared=/a\nstaged=/b\nlinked=maybe\ndetail=d\nat=t\n",
+    "not a marker at all\n",
+    # A file truncated after the verdict validates without `detail` or `at`, and
+    # a verdict with no reason and no age is not the fact this feature serves.
+    "declared=/a\nstaged=/b\nlinked=yes\n",
+    "declared=/a\nstaged=/b\nlinked=no\nat=t\n",
+    "declared=/a\nstaged=/b\nlinked=no\ndetail=d\n",
+], ids=["empty", "schema only", "no linked field", "an uninterpretable verdict",
+        "not key=value", "truncated after the verdict", "no detail", "no at"])
+def test_an_uninterpretable_marker_is_the_same_absence_as_no_marker(
+    platform_root, text
+):
+    """A half-written or foreign file must not become a confident answer."""
+    directory = memory.prepare_memory_dir()
+    (directory / MOUNT_LINK_MARKER).write_text(text, encoding="utf-8")
+
+    assert memory.link_state(directory) is None

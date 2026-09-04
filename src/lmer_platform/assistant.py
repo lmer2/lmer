@@ -370,6 +370,7 @@ import signal
 import threading
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -397,6 +398,7 @@ from .config import (
 from .transcripts import _scrub, _scrub_decoded
 from .store import (
     StoreError,
+    TS_FORMAT,
     age_seconds,
     append_event,
     ensure_state_dir,
@@ -1012,7 +1014,9 @@ def status() -> AssistantStatus:
                 pending=len(state.pending),
                 handoff=state.handoff,
                 nudged_at=state.nudged_at,
-                memory=memory_snapshot,
+                # No live session to date the record against, so `stale` is
+                # `None` rather than `False` — see :func:`_with_link_age`.
+                memory=_with_link_age(memory_snapshot, None),
             )
         session_id = live.get("id")
         pid = live.get("pid")
@@ -1032,7 +1036,7 @@ def status() -> AssistantStatus:
             nudged_at=state.nudged_at,
             log_path=_opt_str(live.get("log_path")),
             settings=_launched_settings(live),
-            memory=memory_snapshot,
+            memory=_with_link_age(memory_snapshot, live),
         )
     # Outside the lock, as ``_memory_snapshot()`` above it is: a read of a file
     # a container writes must not hold up a start or a stop.
@@ -1047,9 +1051,50 @@ def _memory_snapshot() -> dict:
     A filesystem measurement, so the answer is the same whether an assistant is
     running, has never run, or runs a harness with no memory feature. Bounded
     (``MEASURE_ENTRY_CAP``) because a UI polls this route.
+
+    ``link`` is the exception: not a measurement but what the container's
+    linker recorded (:func:`lmer_platform.memory.link_state`), joined on because
+    a ``files`` of zero means opposite things with and without it.
     """
     directory = memory.memory_dir()
-    return {"path": str(directory), **memory.measure(directory).to_dict()}
+    return {
+        "path": str(directory),
+        **memory.measure(directory).to_dict(),
+        "link": memory.link_state(directory),
+    }
+
+
+def _with_link_age(snapshot: dict, live: Optional[dict]) -> dict:
+    """Mark the link record ``stale`` when it predates the running incarnation.
+
+    Only a session that ran the linker rewrites the marker, so one whose image
+    predates it leaves the previous incarnation's answer in place. ``stale`` is
+    ``None`` whenever the question cannot be asked, because "we cannot tell" and
+    "it is current" are the two answers this feature exists to stop conflating;
+    with no record at all the snapshot is returned untouched. Both stamps are
+    parsed rather than string-compared for the same reason: a lexicographic
+    compare answers confidently for input it cannot judge. See
+    docs/PLATFORM-QUICKSTART.md, "uber lmer's memory".
+    """
+    record = snapshot.get("link")
+    if not isinstance(record, dict):
+        return snapshot
+    stale = None
+    written = _parsed_stamp(record.get("at"))
+    started = _parsed_stamp((live or {}).get("started_at"))
+    if written is not None and started is not None:
+        stale = written < started
+    return {**snapshot, "link": {**record, "stale": stale}}
+
+
+def _parsed_stamp(value) -> Optional[datetime]:
+    """One platform timestamp, or ``None`` for anything that is not one."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.strptime(value, TS_FORMAT)
+    except ValueError:
+        return None
 
 
 def _launched_settings(live: dict) -> dict:

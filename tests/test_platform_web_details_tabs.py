@@ -934,8 +934,10 @@ def test_the_run_row_falls_back_to_the_runs_key_and_never_composes_a_path():
     )
 
     key = _binding("runKey")
-    for part in ("run.host", "run.project", "run.slug"):
-        assert part in key, f"the key is not the run's identity: {part} is missing"
+    assert "composeRunKey(props.run)" in key, (
+        "the key is not the run's identity through the one grammar — see "
+        "web/src/runref.js and tests/test_runref_grammar.py (#383 item 3)"
+    )
 
     code = _without_comments(_read(RUN_DETAIL))
     assert not re.search(r"runs/\$?\{", code), (

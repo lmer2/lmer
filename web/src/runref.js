@@ -28,6 +28,17 @@ const PREFIX = 'lmer://run/'
 // itself whether a reference is live.
 let resolver = null
 
+// runKey(run) -> 'host/project/slug'
+//
+// The same spelling `lmer_cli.runref.compose` writes on the Python side. The
+// shell decides which run is open by this string, so a view that spells it
+// differently is a navigator that never marks where you are — silently,
+// because every row still opens fine (#383 item 3).
+export function runKey(run) {
+  if (!run) return null
+  return `${run.host}/${run.project}/${run.slug}`
+}
+
 // parseRunRef(href) -> {host, project, slug, key} | null
 //
 // Total: anything that is not exactly a reference is `null`, which every caller
@@ -41,7 +52,7 @@ export function parseRunRef(href) {
   const host = parts[0]
   const slug = parts[parts.length - 1]
   const project = parts.slice(1, -1).join('/')
-  return { host, project, slug, key: `${host}/${project}/${slug}` }
+  return { host, project, slug, key: runKey({ host, project, slug }) }
 }
 
 // onRunRef(fn) -> stop()

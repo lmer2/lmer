@@ -9,6 +9,7 @@ import {
   mdiPlayCircleOutline, mdiPowerSleep, mdiRepeatOff, mdiSkullOutline,
 } from '@mdi/js'
 import { ago, attentionLabel, stateMeta, toneColor } from '../format.js'
+import { runKey } from '../runref.js'
 
 // The fleet view's list, shrunk to what fits beside a run: a name, one line of
 // news, and the signal. The signal is the part that must not be what gets cut —
@@ -96,12 +97,7 @@ const props = defineProps({
 
 defineEmits(['open'])
 
-// Must stay in step with App.vue's keyOf: the shell decides which run is open by
-// this string, and a row that spells it differently is a navigator that never
-// marks where you are — silently, because every row still opens fine.
-function keyOf(run) {
-  return `${run.host}/${run.project}/${run.slug}`
-}
+const keyOf = runKey
 
 // The fleet view's order, kept: runs needing a human first, always. Compact took
 // the cards' size away, not their priority.

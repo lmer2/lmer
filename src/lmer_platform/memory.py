@@ -14,6 +14,11 @@ Two properties are load-bearing and easy to undo from here:
   process runs (the #293/#290 EACCES). :func:`memory_links` hands the entrypoint
   the pair it symlinks as ``developer`` instead.
 * Nothing here deletes or trims a memory file. :func:`observe` reports.
+
+Two questions, not one: :func:`measure` is accumulation and :func:`link_state`
+is liveness, the latter read from the marker only the container can write
+(#383 item 2). Conflating them is what made a store measuring zero files
+ambiguous between "linked, nothing saved yet" and "never linked".
 """
 
 from __future__ import annotations
@@ -25,7 +30,9 @@ from pathlib import Path
 from typing import Optional
 
 from lmer_cli.harness import HARNESSES
-from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR
+from lmer_cli.mounts import (
+    CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINK_MARKER, read_link_marker,
+)
 # The variable this feature closes off must be the one work_repo.memory gates on,
 # or "platform-local only" is a comment rather than a guarantee.
 from work_repo.memory import PERSIST_ENV_VAR
@@ -39,7 +46,7 @@ __all__ = [
     "PERSIST_ENV_VAR", "CONTAINER_STAGED_DIR", "DIR_MODE",
     "WARN_BYTES", "WARN_FILES", "MEASURE_ENTRY_CAP",
     "Measurement", "memory_dir", "prepare_memory_dir", "harness_memory_dirs",
-    "memory_links", "mount_flags", "measure", "observe",
+    "memory_links", "mount_flags", "measure", "observe", "link_state",
 ]
 
 #: One store per host, shared by every incarnation — the point of the feature.
@@ -172,12 +179,15 @@ def measure(directory: Optional[Path] = None) -> Measurement:
 
     Accumulation, not liveness: a store that already holds files keeps reporting
     them whether or not anything still reads the container-side path. An absent
-    or unreadable store measures as empty.
+    or unreadable store measures as empty. The linker's marker is excluded so
+    the two answers stay separable — a count of one that is only the marker
+    would be neither.
 
     Symlinks are never followed — the store is rw-mounted into a container an
     agent drives, so a link out of it is something that side can plant.
     """
     root = memory_dir() if directory is None else directory
+    marker = Path(root) / MOUNT_LINK_MARKER
     files = 0
     total = 0
     looked_at = 0
@@ -196,6 +206,10 @@ def measure(directory: Optional[Path] = None) -> Measurement:
             try:
                 if entry.is_dir(follow_symlinks=False):
                     pending.append(Path(entry.path))
+                    continue
+                if Path(entry.path) == marker:
+                    # Counting the linker's own record would make every linked
+                    # store report one file.
                     continue
                 if not entry.is_file(follow_symlinks=False):
                     continue
@@ -226,3 +240,15 @@ def observe(directory: Optional[Path] = None) -> Measurement:
             data=measurement.to_dict(),
         )
     return measurement
+
+
+def link_state(directory: Optional[Path] = None) -> Optional[dict]:
+    """What the container's linker last recorded about the store, or ``None``.
+
+    ``None`` means the fact is not available rather than that no link was made —
+    a session image predating the marker leaves none, and so does a store no
+    session has been given yet. It is the last incarnation's answer, not a live
+    probe. See docs/PLATFORM-QUICKSTART.md, "uber lmer's memory".
+    """
+    root = memory_dir() if directory is None else directory
+    return read_link_marker(root)

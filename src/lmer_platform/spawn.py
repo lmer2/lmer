@@ -133,7 +133,7 @@ import threading
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 from urllib.parse import urlparse
 
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
@@ -1752,6 +1752,123 @@ def _container_log_mount_flags(directory: Path) -> list:
     return ["--mount-dir", f"{directory}:{CONTAINER_SESSION_LOG_DIR}:rw"]
 
 
+class SessionChannels(NamedTuple):
+    """What a session's side channels come to, once they are prepared.
+
+    The caller never sees an individual directory, so it cannot grow a rule
+    about one; :attr:`upload_dir` is out only because the registry entry wants
+    it again.
+    """
+
+    #: ``lmer`` flags binding the prepared directories in, in insertion order.
+    host_flags: list
+    #: ``declared:staged`` pairs for the entrypoint's linker (#293).
+    link_pairs: list
+    #: Environment the child needs to know which channels it actually got.
+    env: dict
+    #: The chat-upload store, or ``None`` — read again by the registry entry.
+    upload_dir: Optional[Path]
+
+
+def _prepare_session_channels(session_id: str, kind: str) -> SessionChannels:
+    """Create this session's side-channel directories and say what follows.
+
+    One decision made once per channel: each is prepared, may fail to be, and
+    has to be reflected in three places at once — a mount flag, possibly a link
+    pair, and an environment variable saying whether the agent has the thing.
+
+    A channel that could not be prepared is announced by **blanking** its
+    variable rather than deleting it: the child is ``lmer``, which seeds its own
+    environment from ``.env`` files first-wins, so a merely absent key is one a
+    file may re-supply.
+
+    :attr:`SessionChannels.host_flags` is in insertion order and the caller
+    inserts it **once** — ``_with_host_flags`` puts flags straight after
+    ``--fastapi``, so two calls would interleave them in reverse.
+    """
+    # One subdirectory per harness, so the file the chat view reads outlives the
+    # container (`lmer` runs it --rm). Only for sessions the platform spawns:
+    # persisting every lmer invocation's transcript is a separate decision.
+    transcript_dir = _prepare_transcript_dir(session_id)
+    transcript_mounts = (
+        _prepare_transcript_subdirs(transcript_dir)
+        if transcript_dir is not None
+        else []
+    )
+    # The session's ask channel (T23).
+    ask_dir = _prepare_ask_dir(session_id)
+    # The directory is the offer; the file inside it is the session's answer, and
+    # an image too old to write one (#150) reads as exactly that.
+    container_log_dir = _prepare_container_log_dir(session_id)
+    # One store per *host* (#325). Gated on the kind, not offered as a request
+    # field — a worker's memory has its own route, the work repo.
+    memory_dir = (
+        memory.prepare_memory_dir() if kind == registry.ASSISTANT_KIND else None
+    )
+    if memory_dir is not None:
+        memory.observe(memory_dir)
+    # Where files attached to this session's chat land (#246). Every session gets
+    # one; the kind decides only which store that is.
+    upload_dir = _prepare_upload_dir(session_id, kind)
+    # Where the session publishes what its own status line shows (#248). Every
+    # session gets one: which harness the child resolves to is decided inside it,
+    # and an unused directory is cheaper than a missing strip.
+    status_dir = _prepare_status_dir(session_id)
+
+    host_flags: list = []
+    if transcript_mounts:
+        host_flags += _transcript_mount_flags(transcript_mounts)
+    if ask_dir is not None:
+        host_flags += _ask_mount_flags(ask_dir)
+    if container_log_dir is not None:
+        host_flags += _container_log_mount_flags(container_log_dir)
+    if memory_dir is not None:
+        host_flags += memory.mount_flags(memory_dir)
+    if upload_dir is not None:
+        host_flags += _upload_mount_flags(upload_dir)
+    if status_dir is not None:
+        host_flags += _status_mount_flags(status_dir)
+
+    # Filtered to mounts actually prepared: a link pair for a directory nothing
+    # bound would have the entrypoint linking a path onto nothing.
+    mounted_destinations = {container_dir for _, container_dir in transcript_mounts}
+    link_pairs = [
+        (declared, staged)
+        for declared, staged in _harness_session_links()
+        if staged in mounted_destinations
+    ]
+    if memory_dir is not None:
+        # Staged like a user harness's session dir, and for the same ownership
+        # reason (#293) — see lmer_platform.memory.
+        link_pairs += memory.memory_links()
+
+    env = {
+        # Gates the prompt fragment telling an agent to read files out of a
+        # directory this session may not have got.
+        uploads.UPLOADS_DIR_ENV: (
+            uploads.CONTAINER_UPLOADS_DIR if upload_dir is not None else ""
+        ),
+        # The flag an agent tests to know it was orchestrated at all.
+        ask.ASK_DIR_ENV: ask.CONTAINER_ASK_DIR if ask_dir is not None else "",
+        # A value without the mount would point the harness's writes at a
+        # container-private directory nothing reads (#248).
+        statusline.STATUS_DIR_ENV: (
+            statusline.CONTAINER_STATUS_DIR if status_dir is not None else ""
+        ),
+    }
+    if kind == registry.ASSISTANT_KIND:
+        # Platform-local only (#325), on the kind and not on the memory mount, so
+        # a store that could not be prepared does not reopen the route it
+        # replaces.
+        env[memory.PERSIST_ENV_VAR] = ""
+    return SessionChannels(
+        host_flags=host_flags,
+        link_pairs=link_pairs,
+        env=env,
+        upload_dir=upload_dir,
+    )
+
+
 def _with_host_flags(command: list, flags: list) -> list:
     """Insert platform-added ``lmer`` flags ahead of the caller's ``extra_args``.
 
@@ -2470,7 +2587,9 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
 
     The registry entry is removed only on a clean exit: an entry surviving with a
     dead PID is the crash signal the inventory reads, so leaving it there is the
-    point, not an oversight.
+    point, not an oversight. The kept entry also *records* the bad exit, so a
+    reader can tell an ending this watched from one it never saw
+    (:func:`lmer_platform.inventory._observed_bad_exit`).
 
     Two pieces of cleanup run on *both* paths, last, because recording how a
     session ended is the job that must not be lost. The transcript scrub happens
@@ -2509,6 +2628,20 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
             pass
         logger.info("platform_session_exited id=%s code=%s", session_id, code)
     else:
+        # On the entry, not only in the event above: the fleet view reads the
+        # entry, and survival alone cannot say *why* it survived — without this a
+        # wind-down mark would outrank an exit a watcher saw fail. Fail-soft in
+        # the safe direction: losing it costs the label, never the signal.
+        try:
+            registry.update(
+                session_id, exited={"code": code, "clean": False, "at": utc_now_iso()}
+            )
+        except StoreError as exc:
+            logger.warning(
+                "platform_session_exit_unrecorded id=%s error=%s — the entry "
+                "survives as the crash signal, but a wind-down mark on it can no "
+                "longer be told apart from this death", session_id, exc,
+            )
         logger.warning(
             "platform_session_died id=%s code=%s — registry entry kept as the "
             "crash signal", session_id, code,
@@ -2697,60 +2830,9 @@ def spawn_session(
     except OSError as exc:
         raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
 
-    # The transcript's host home, with one subdirectory per harness mounted in
-    # where that harness writes its session JSONL, so the file the chat view reads
-    # outlives the container (`lmer` runs it --rm) whichever harness ran. Only for
-    # sessions the platform spawns: persisting every lmer invocation's transcript
-    # is a separate decision, and this is not the place to take it.
-    transcript_dir = _prepare_transcript_dir(session_id)
-    transcript_mounts = (
-        _prepare_transcript_subdirs(transcript_dir)
-        if transcript_dir is not None
-        else []
-    )
-    # The session's ask channel (T23): where it posts questions for the operator
-    # and reads the answers back.
-    ask_dir = _prepare_ask_dir(session_id)
-    # Where the session writes its own log, if its image knows how to (#150). The
-    # directory is the offer; the file inside it is the session's answer, and the
-    # read path takes "no file" for exactly the answer it is.
-    container_log_dir = _prepare_container_log_dir(session_id)
-    # The assistant's memory store (#325): one directory per *host*, so what one
-    # incarnation learned is on disk for the next. Gated on the kind, not offered
-    # as a request field — a worker's memory has its own route (the work repo).
-    memory_dir = (
-        memory.prepare_memory_dir() if kind == registry.ASSISTANT_KIND else None
-    )
-    if memory_dir is not None:
-        memory.observe(memory_dir)
-    # Where the files the operator attaches to this session's chat land (#246).
-    # Every session gets one, worker and assistant alike — a screenshot is most
-    # useful to the run that just built the thing in it — and the *kind* decides
-    # only which store that is.
-    upload_dir = _prepare_upload_dir(session_id, kind)
-    # Where the session publishes what its own status line shows (#248). Every
-    # session gets one: which harness the child resolves to is decided inside
-    # it, and an unused directory is cheaper than a missing strip.
-    status_dir = _prepare_status_dir(session_id)
-
-    # One insertion, not one per mount: _with_host_flags inserts right after
-    # --fastapi, so calling it twice would interleave the mounts in reverse and
-    # make the command's shape depend on the order of these lines.
-    host_flags: list = []
-    if transcript_mounts:
-        host_flags += _transcript_mount_flags(transcript_mounts)
-    if ask_dir is not None:
-        host_flags += _ask_mount_flags(ask_dir)
-    if container_log_dir is not None:
-        host_flags += _container_log_mount_flags(container_log_dir)
-    if memory_dir is not None:
-        host_flags += memory.mount_flags(memory_dir)
-    if upload_dir is not None:
-        host_flags += _upload_mount_flags(upload_dir)
-    if status_dir is not None:
-        host_flags += _status_mount_flags(status_dir)
-    if host_flags:
-        command = _with_host_flags(command, host_flags)
+    channels = _prepare_session_channels(session_id, kind)
+    if channels.host_flags:
+        command = _with_host_flags(command, channels.host_flags)
 
     control_token, token_file = _mint_control_token(session_id)
 
@@ -2767,48 +2849,8 @@ def spawn_session(
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
     }
-    if upload_dir is not None:
-        child_env[uploads.UPLOADS_DIR_ENV] = uploads.CONTAINER_UPLOADS_DIR
-    else:
-        # Blanked rather than deleted, for ASK_DIR_ENV's reason below: the child
-        # is `lmer`, which seeds its own environment from .env files first-wins,
-        # so a merely absent key is one a file may re-supply — and this variable
-        # is what gates the prompt fragment that tells an agent to read files out
-        # of a directory this session has not got.
-        child_env[uploads.UPLOADS_DIR_ENV] = ""
-    if status_dir is not None:
-        child_env[statusline.STATUS_DIR_ENV] = statusline.CONTAINER_STATUS_DIR
-    else:
-        # Blanked, on the same rule as the two variables around it: a value
-        # without the mount points the writes at a container-private directory.
-        child_env[statusline.STATUS_DIR_ENV] = ""
-    if ask_dir is not None:
-        child_env[ask.ASK_DIR_ENV] = ask.CONTAINER_ASK_DIR
-    else:
-        # Never inherited: the daemon's own environment carrying this variable
-        # (a daemon started from inside a session, say) would otherwise tell an
-        # agent it has a channel that was never mounted. Blank rather than
-        # absent, because the child is `lmer` and it seeds its own environment
-        # from .env files first-wins — a key that is merely absent is a key a
-        # file may re-supply. Blank already reads as unset on every consumer
-        # (resolve_channel_dir strips it; the runners render the ask fragment
-        # only on a non-blank value).
-        child_env[ask.ASK_DIR_ENV] = ""
-    # The declared→staged link pairs for the entrypoint (#293), filtered to
-    # mounts actually prepared. Seeded fresh, never inherited (a daemon's own
-    # environment would carry another session's pairs), and blank rather than
-    # absent for the reason the two variables below give.
-    mounted_destinations = {container_dir for _, container_dir in transcript_mounts}
-    link_pairs = [
-        (declared, staged)
-        for declared, staged in _harness_session_links()
-        if staged in mounted_destinations
-    ]
-    if memory_dir is not None:
-        # Staged like a user harness's session dir, and for the same ownership
-        # reason (#293) — see lmer_platform.memory.
-        link_pairs += memory.memory_links()
-    child_env[MOUNT_LINKS_ENV] = format_mount_links("", link_pairs)
+    child_env.update(channels.env)
+    child_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
     if request.no_repo:
         # Spec D17, structurally: `lmer` skips repo resolution on this and the
         # container skips the workspace clone, so the session has nothing to edit
@@ -2824,13 +2866,6 @@ def spawn_session(
         # back. Blank is falsy to get_bool_env on the host and never equals "1"
         # in the container, so it reads as unset the whole way down.
         child_env[NO_REPO_ENV] = ""
-    if kind == registry.ASSISTANT_KIND:
-        # Platform-local only (#325): the shared-work-repo mirror is closed here
-        # rather than left to fail for want of a repo identity. On the kind and
-        # not on the mount above, so a store that could not be prepared does not
-        # reopen the route it replaces; blank rather than deleted for the
-        # LMER_NO_REPO reason.
-        child_env[memory.PERSIST_ENV_VAR] = ""
 
     master_fd, slave_fd = pty.openpty()
     try:
@@ -2916,7 +2951,7 @@ def spawn_session(
             # spawn has made it (uber lmer's is per host), so its presence says
             # nothing about the container that is running now — see
             # lmer_platform.uploads.registry_pointer.
-            uploads=uploads.registry_pointer(upload_dir),
+            uploads=uploads.registry_pointer(channels.upload_dir),
             started_at=utc_now_iso(),
         )
 

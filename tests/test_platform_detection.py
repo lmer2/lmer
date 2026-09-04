@@ -162,11 +162,20 @@ def reading(*payloads):
 
     Raises whatever it is handed instead of a payload, which is how a tick that
     fails mid-sequence is expressed without a second seam.
+
+    The sequence is one of *ticks*, so a ``force_pull`` re-read inside one tick
+    answers what that tick already saw rather than advancing. A test that wants
+    the two reads to disagree brings a reader of its own.
     """
     remaining = list(payloads)
+    served = []
 
     def read(config, **kwargs):
-        current = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        if kwargs.get("force_pull") and served:
+            current = served[-1]
+        else:
+            current = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+            served.append(current)
         if isinstance(current, BaseException):
             raise current
         return current
@@ -531,6 +540,131 @@ def test_the_tick_reads_the_fleet_view_without_forcing_a_pull(config, monkeypatc
     detect.Detector(config, notifier=Spool()).tick_once()
 
     assert calls == [{}], "the throttled path takes no arguments; forcing takes one"
+
+
+def test_a_fresh_crash_is_confirmed_against_a_caught_up_mirror(config, monkeypatch):
+    """#324: the tick asserts an absence, so it pays for one pull to be sure.
+
+    A run that pushed its final state inside the throttle window is otherwise
+    indistinguishable from one that never pushed at all.
+    """
+    crashed = fleet(row("develop-141", reason="crashed", state="crashed",
+                        note="session process is gone", since="2026-08-20T16:19:00Z"))
+    calls = []
+    unforced = [fleet(), crashed]
+
+    def spy(config, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("force_pull"):
+            return fleet()
+        return unforced.pop(0) if len(unforced) > 1 else unforced[0]
+
+    monkeypatch.setattr(detect, "build_state", spy)
+    spool = Spool()
+    tick = detect.Detector(config, notifier=spool)
+
+    tick.tick_once()                       # baseline: nothing is crashed
+    fresh = tick.tick_once()               # the crash appears, and dissolves
+
+    assert calls == [{}, {}, {"force_pull": True}], (
+        "exactly one forced read, and only once a crash was fresh in the diff"
+    )
+    assert fresh == [], "an absence the caught-up mirror does not support"
+    assert spool.calls == [], "and nothing reached the assistant"
+    assert tick.unconfirmed == 1
+
+
+def test_a_crash_the_forced_pull_still_shows_is_delivered(config, monkeypatch):
+    """The confirmation is a check, not a suppression: a real crash still lands."""
+    crashed = fleet(row("develop-141", reason="crashed", state="crashed",
+                        since="2026-08-20T16:19:00Z"))
+    unforced = [fleet(), crashed]
+
+    def spy(config, **kwargs):
+        if kwargs.get("force_pull"):
+            return crashed
+        return unforced.pop(0) if len(unforced) > 1 else unforced[0]
+
+    monkeypatch.setattr(detect, "build_state", spy)
+    spool = Spool()
+    tick = detect.Detector(config, notifier=spool)
+
+    tick.tick_once()                       # baseline: nothing is crashed
+    fresh = tick.tick_once()               # the crash appears, and survives
+
+    assert [signal.kind for signal in fresh] == ["crashed"]
+    assert len(spool.calls) == 1
+    assert tick.unconfirmed == 0
+
+
+def test_a_withdrawn_crash_is_not_recorded_as_already_announced(config, monkeypatch):
+    """Leaving the key in the baseline would mark a condition nobody was ever
+    told about as one they had been."""
+    crashed = fleet(row("develop-141", reason="crashed", state="crashed",
+                        since="2026-08-20T16:19:00Z"))
+    forced = [fleet(), crashed]
+    unforced = [fleet(), crashed]
+
+    def spy(config, **kwargs):
+        if kwargs.get("force_pull"):
+            return forced.pop(0) if len(forced) > 1 else forced[0]
+        return unforced.pop(0) if len(unforced) > 1 else unforced[0]
+
+    monkeypatch.setattr(detect, "build_state", spy)
+    spool = Spool()
+    tick = detect.Detector(config, notifier=spool)
+
+    tick.tick_once()                       # baseline
+    assert tick.tick_once() == [], "withdrawn on the first forced read"
+    second = tick.tick_once()              # the same condition, now confirmed
+
+    assert [signal.kind for signal in second] == ["crashed"], (
+        "a withdrawn signal was never announced, so it is still fresh"
+    )
+    assert len(spool.calls) == 1
+
+
+def test_a_tick_with_no_fresh_crash_never_forces_a_pull(config, monkeypatch):
+    """The throttle keeps its meaning for everything the confirmation is not for."""
+    calls = []
+
+    def spy(config, **kwargs):
+        calls.append(kwargs)
+        return fleet(row("develop-141", reason="question", note=QUESTION,
+                         state="waiting_on_you", since="2026-07-28T10:00:00Z"))
+
+    monkeypatch.setattr(detect, "build_state", spy)
+    tick = detect.Detector(config, notifier=Spool())
+
+    tick.tick_once()
+    tick.tick_once()
+    tick.tick_once()
+
+    assert calls == [{}, {}, {}], "a question is not an assertion about the mirror"
+
+
+def test_a_failed_confirmation_delivers_the_crash_anyway(config, monkeypatch, detected):
+    """A mirror that will not answer is the worst moment to go quiet about a death."""
+    crashed = fleet(row("develop-141", reason="crashed", state="crashed",
+                        since="2026-08-20T16:19:00Z"))
+
+    unforced = [fleet(), crashed]
+
+    def spy(config, **kwargs):
+        if kwargs.get("force_pull"):
+            raise RuntimeError("mirror is a smoking hole")
+        return unforced.pop(0) if len(unforced) > 1 else unforced[0]
+
+    monkeypatch.setattr(detect, "build_state", spy)
+    spool = Spool()
+    tick = detect.Detector(config, notifier=spool)
+
+    tick.tick_once()
+    fresh = tick.tick_once()
+
+    assert [signal.kind for signal in fresh] == ["crashed"]
+    assert len(spool.calls) == 1
+    assert tick.failures == 1, "and the failure is counted rather than swallowed"
 
 
 # --- (4) a detection failure must never take the daemon down ------------------
@@ -2251,3 +2385,72 @@ def test_the_answered_digest_is_not_a_reason_for_the_operator_to_act():
     assert detect.QUESTION_ANSWERED_KIND not in inventory.ATTENTION_REASONS
     assert detect.QUESTION_ANSWERED_KIND not in detect.MATERIAL_STATES
     assert set(detect.QUESTION_KINDS) <= set(inventory.ATTENTION_REASONS)
+
+
+# ── The sweep reaches the rows the wind-down relabel creates (!284 review) ────
+
+
+def wound_down_entry(slug="develop-141", *, session_id="s-wound", exited=None):
+    """A dead entry the operator asked to end, as `lifecycle.wind_down` leaves it."""
+    stale_entry(slug, session_id=session_id)
+    fields = {"lifecycle": {"verb": "wind_down",
+                            "requested_at": "2026-08-20T16:19:33Z"}}
+    if exited is not None:
+        fields["exited"] = exited
+    registry.update(session_id, **fields)
+    return session_id
+
+
+def test_a_wound_down_entry_is_reconciled_without_a_terminal_status(config):
+    """Otherwise nothing clears it: the only affordance is the UI card that
+    renders on a `crashed` row, which this no longer is."""
+    session_id = wound_down_entry()
+    plant_committed_run(config, status="in-progress")
+
+    assert detect.sweep_finished_sessions(config) == [session_id]
+    assert registry.read_session(session_id) is None
+
+
+def test_a_wound_down_entry_a_watcher_saw_die_is_left_alone(config):
+    """The sweep reads the same two facts as the label, so it can never clear
+    what the fleet still calls crashed."""
+    session_id = wound_down_entry(exited={"code": 137, "clean": False})
+    plant_committed_run(config, status="in-progress")
+
+    assert detect.sweep_finished_sessions(config) == []
+    assert registry.read_session(session_id) is not None
+
+
+def test_an_ordinary_crash_is_still_left_alone(config):
+    """The pre-existing rule, unchanged: no wind-down, no terminal status."""
+    session_id = stale_entry()
+    plant_committed_run(config, status="in-progress")
+
+    assert detect.sweep_finished_sessions(config) == []
+    assert registry.read_session(session_id) is not None
+
+
+def test_a_confirm_failure_does_not_log_that_the_tick_was_skipped(
+    config, monkeypatch, detected
+):
+    """Every other stage's failure costs its work; this one delivers anyway, so
+    "this tick is skipped" would mislead whoever is reconciling a mirror
+    outage."""
+    crashed = fleet(row("develop-141", reason="crashed", state="crashed",
+                        since="2026-08-20T16:19:00Z"))
+    unforced = [fleet(), crashed]
+
+    def spy(config, **kwargs):
+        if kwargs.get("force_pull"):
+            raise RuntimeError("mirror is a smoking hole")
+        return unforced.pop(0) if len(unforced) > 1 else unforced[0]
+
+    monkeypatch.setattr(detect, "build_state", spy)
+    tick = detect.Detector(config, notifier=Spool())
+    tick.tick_once()
+    tick.tick_once()
+
+    said = [r.message for r in detected.records if "stage=confirm" in r.message]
+    assert said, "the confirm failure was not logged at all"
+    assert not any("this tick is skipped" in message for message in said), said
+    assert any("delivered unconfirmed" in message for message in said), said

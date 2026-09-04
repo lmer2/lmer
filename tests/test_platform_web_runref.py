@@ -91,7 +91,7 @@ def test_the_reference_carries_no_action():
         if line.strip().startswith("return { host")
     ]
     assert lines == [
-        "return { host, project, slug, key: `${host}/${project}/${slug}` }"
+        "return { host, project, slug, key: runKey({ host, project, slug }) }"
     ], lines
 
 

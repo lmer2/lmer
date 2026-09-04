@@ -110,6 +110,8 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 import yaml
+from lmer_cli import runref
+
 from work_repo import run_state
 
 # Private helpers reused deliberately rather than reimplemented: credential
@@ -1684,7 +1686,7 @@ def _renamed_run_dir(
         return None
     if len(found) > 1:
         _announce_once(
-            f"ambiguous:{host}/{project}/{slug}",
+            f"ambiguous:{runref.compose(host, project, slug)}",
             logging.WARNING,
             "platform_run_dir_ambiguous run=%s/%s/runs/%s candidates=%s — this "
             "slug names more than one run (a taskdef run with no target is slugged "
@@ -1695,7 +1697,7 @@ def _renamed_run_dir(
         return None
     ref = found[0]
     _announce_once(
-        f"settled:{host}/{project}/{slug}->{ref.dir_name}",
+        f"settled:{runref.compose(host, project, slug)}->{ref.dir_name}",
         logging.INFO,
         "platform_run_dir_settled run=%s/%s/runs/%s dir=%s — the run was named, "
         "so the container renamed its directory (runs/%s -> runs/%s); the "
@@ -1746,7 +1748,7 @@ def _session_run_dir(
             continue
         if len(sessions) > 1:
             _announce_once(
-                f"sessions:{host}/{project}/{slug}",
+                f"sessions:{runref.compose(host, project, slug)}",
                 logging.INFO,
                 "platform_run_dir_sessions run=%s/%s/%s sessions=%d dir=%s — this "
                 "slug groups more than one launch, which in schema form is more "
@@ -1859,7 +1861,7 @@ def _reslugged_run_dir(
     if ref is None:
         return None
     _announce_once(
-        f"reslugged:{host}/{project}/{slug}->{address}",
+        f"reslugged:{runref.compose(host, project, slug)}->{address}",
         logging.INFO,
         "platform_run_dir_reslugged run=%s/%s/%s dir=%s — the live run "
         "records the requested slug in reslugged_from, so the platform follows "
