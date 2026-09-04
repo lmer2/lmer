@@ -376,7 +376,7 @@ from typing import Optional
 from lmer_cli.cli import _get_taskdef_paths, _resolve_taskdef_dir
 from lmer_cli.runtime import repo_root_path
 
-from . import memory, registry, spawn
+from . import memory, registry, spawn, statusline
 from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
@@ -799,6 +799,11 @@ class AssistantStatus:
     #: Served with no assistant running too — the store outlives all of them.
     #: Accumulation only, never liveness; see :mod:`lmer_platform.memory`.
     memory: Optional[dict] = None
+    #: What the running incarnation last published about its own status line
+    #: (issue #248, :mod:`lmer_platform.statusline`). ``None`` with nothing
+    #: running, and for a running one that publishes nothing. Served here
+    #: because this is the route the chat pane already polls.
+    statusline: Optional[dict] = None
 
     @property
     def age_seconds(self) -> Optional[float]:
@@ -821,6 +826,7 @@ class AssistantStatus:
             "log_path": self.log_path,
             "settings": self.settings,
             "memory": self.memory,
+            "statusline": self.statusline,
             "taskdef": TASKDEF,
             "target": TARGET,
         }
@@ -1010,7 +1016,7 @@ def status() -> AssistantStatus:
             )
         session_id = live.get("id")
         pid = live.get("pid")
-        return AssistantStatus(
+        answer = AssistantStatus(
             running=True,
             session_id=session_id if isinstance(session_id, str) else None,
             pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
@@ -1028,6 +1034,11 @@ def status() -> AssistantStatus:
             settings=_launched_settings(live),
             memory=memory_snapshot,
         )
+    # Outside the lock, as ``_memory_snapshot()`` above it is: a read of a file
+    # a container writes must not hold up a start or a stop.
+    if answer.session_id is None:
+        return answer
+    return replace(answer, statusline=statusline.for_session(answer.session_id))
 
 
 def _memory_snapshot() -> dict:

@@ -162,6 +162,23 @@ any change to lmer itself.
 
 ---
 
+### [SESSION-STATUS.md](./SESSION-STATUS.md)
+**The session status document (schema 1)**
+
+The contract a session publishes its own status-line numbers through, so the
+platform can show them:
+- Where the document goes (`$LMER_STATUS_DIR/status.json`) and the atomic-write
+  and permission rules
+- Every field, what absence means, and which parts are the harness's vocabulary
+  rather than the platform's
+- What the platform serves it on, and the bounds it enforces reading it
+- How a drop-in harness publishes the same document
+
+**Best for**: Showing a harness's context and usage numbers in the fleet view,
+or teaching a drop-in to report them.
+
+---
+
 ### [PROMPT-FRAGMENTS.md](./PROMPT-FRAGMENTS.md)
 **Prompt Fragments**
 

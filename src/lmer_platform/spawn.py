@@ -158,7 +158,9 @@ from lmer_cli.service import ServiceError
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
-from . import ask, memory, meta, registry, runs, slots, uploads, workrepo
+from . import (
+    ask, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
+)
 from .config import ENV_REPO_URL, PlatformConfig, configured_repo_url
 from .store import StoreError, append_event, logs_dir, utc_now_iso
 from . import store
@@ -174,6 +176,7 @@ __all__ = [
     "resolve_lmer_bin", "derive_run_identity", "derive_repo_identity",
     "spawn_session", "log_path_for",
     "token_file_for", "read_control_token", "transcript_dir_for", "ask_dir_for",
+    "status_dir_for",
     "upload_dir_for",
     "container_log_dir_for", "container_log_path_for",
 ]
@@ -1344,6 +1347,8 @@ def _reserved_session_destinations() -> dict:
         _container_dir_key(ask.CONTAINER_ASK_DIR): "the session's ask channel",
         _container_dir_key(uploads.CONTAINER_UPLOADS_DIR):
             "the session's chat upload store",
+        _container_dir_key(statusline.CONTAINER_STATUS_DIR):
+            "the session's status document",
         _container_dir_key(CONTAINER_SESSION_LOG_DIR): "the session's own log",
         _container_dir_key(CONTAINER_HARNESSES_DIR): "the user-harness drop-ins",
         _container_dir_key(CONTAINER_MOUNT_STAGING_DIR):
@@ -1639,6 +1644,36 @@ def _ask_mount_flags(directory: Path) -> list:
     drift apart.
     """
     return ["--mount-dir", f"{directory}:{ask.CONTAINER_ASK_DIR}:rw"]
+
+
+def status_dir_for(session_id: str) -> Path:
+    """Host directory a session publishes its status document into (#248).
+
+    Pass-through to :func:`lmer_platform.statusline.session_status_dir`, kept
+    here so the spawn side has one name for every per-session directory it
+    mounts.
+    """
+    return statusline.session_status_dir(session_id)
+
+
+def _prepare_status_dir(session_id: str) -> Optional[Path]:
+    """Create the session's status directory 0700. ``None`` if that failed.
+
+    Fail-soft with an honest far end, as the ask channel is: with no directory
+    the variable is blank too, so the harness publishes nothing rather than
+    writing where nothing reads.
+    """
+    return statusline.prepare_status_dir(session_id)
+
+
+def _status_mount_flags(directory: Path) -> list:
+    """``lmer`` flags that mount *directory* in for the session's status document.
+
+    ``rw`` because the harness rewrites the document on every render. The
+    destination is the same constant the environment variable points at, so the
+    mount and what the writer is told cannot drift apart.
+    """
+    return ["--mount-dir", f"{directory}:{statusline.CONTAINER_STATUS_DIR}:rw"]
 
 
 def upload_dir_for(session_id: str, kind: str) -> Path:
@@ -1980,6 +2015,12 @@ def _protected_mount_destinations() -> dict:
             "session's chat there, so redirecting it would hand a caller's "
             "directory whatever the operator uploads next — and leave the agent "
             "reading files nobody sent it"
+        ),
+        statusline.CONTAINER_STATUS_DIR: (
+            "the session publishes its status line's numbers there and the "
+            "platform reads them off the host side of that mount, so "
+            "redirecting it would leave every strip in the fleet view blank "
+            "for this session while the harness went on publishing"
         ),
     })
     return protected
@@ -2431,14 +2472,14 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
     dead PID is the crash signal the inventory reads, so leaving it there is the
     point, not an oversight.
 
-    The transcript scrub is the one piece of cleanup that runs on *both* paths.
-    It happens here rather than in :func:`_drain` because it must not start while
-    anything is still appending to the file, and ``Popen.wait`` returning is the
-    signal that the session's own process is gone — see
-    :func:`_scrub_transcripts` for the case that signal does not cover. It is also
-    the *last* thing this function does: recording how a session ended is the job
-    that must not be lost, and cleanup that walks a file the container wrote is
-    the more surprising of the two.
+    Two pieces of cleanup run on *both* paths, last, because recording how a
+    session ended is the job that must not be lost. The transcript scrub happens
+    here rather than in :func:`_drain` because it must not start while anything
+    is still appending, and ``Popen.wait`` returning is the signal that the
+    session's process is gone — see :func:`_scrub_transcripts` for the case that
+    signal does not cover. The status document goes with it: it describes a
+    session that is *rendering*, so even a kept entry gives it no reader, unlike
+    the ports file (:func:`absorb_ports` still folds those facts in).
     """
     try:
         code = process.wait()
@@ -2458,8 +2499,10 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
         # entry is the crash signal, and an entry whose token_ref resolved to
         # nothing would advertise a session as controllable and then deny it.
         registry.remove(session_id)
-        # The ports file has no readers once the session is gone; both *logs* do
-        # (they are the scrollback source), so only the former is cleaned up.
+        # The ports file has no readers once the session has exited cleanly;
+        # both *logs* do (they are the scrollback source), so only the former is
+        # cleaned up. On the crash path it stays: the entry is kept, and
+        # ``absorb_ports`` still reads this file for one.
         try:
             ports_file_for(session_id).unlink()
         except OSError:
@@ -2474,6 +2517,8 @@ def _watch(process: subprocess.Popen, session_id: str) -> None:
     # Outside the branch, because it belongs to both endings: a crashed session's
     # entry is kept deliberately, its raw credentials are not.
     _scrub_transcripts(session_id)
+    # Both endings, for the reason in the docstring.
+    statusline.discard_status_dir(session_id)
 
     # Last, and in a `finally`-like position by construction: everything above is
     # what "the ending has been recorded" means, so signalling earlier would hand
@@ -2683,6 +2728,10 @@ def spawn_session(
     # useful to the run that just built the thing in it — and the *kind* decides
     # only which store that is.
     upload_dir = _prepare_upload_dir(session_id, kind)
+    # Where the session publishes what its own status line shows (#248). Every
+    # session gets one: which harness the child resolves to is decided inside
+    # it, and an unused directory is cheaper than a missing strip.
+    status_dir = _prepare_status_dir(session_id)
 
     # One insertion, not one per mount: _with_host_flags inserts right after
     # --fastapi, so calling it twice would interleave the mounts in reverse and
@@ -2698,6 +2747,8 @@ def spawn_session(
         host_flags += memory.mount_flags(memory_dir)
     if upload_dir is not None:
         host_flags += _upload_mount_flags(upload_dir)
+    if status_dir is not None:
+        host_flags += _status_mount_flags(status_dir)
     if host_flags:
         command = _with_host_flags(command, host_flags)
 
@@ -2725,6 +2776,12 @@ def spawn_session(
         # is what gates the prompt fragment that tells an agent to read files out
         # of a directory this session has not got.
         child_env[uploads.UPLOADS_DIR_ENV] = ""
+    if status_dir is not None:
+        child_env[statusline.STATUS_DIR_ENV] = statusline.CONTAINER_STATUS_DIR
+    else:
+        # Blanked, on the same rule as the two variables around it: a value
+        # without the mount points the writes at a container-private directory.
+        child_env[statusline.STATUS_DIR_ENV] = ""
     if ask_dir is not None:
         child_env[ask.ASK_DIR_ENV] = ask.CONTAINER_ASK_DIR
     else:

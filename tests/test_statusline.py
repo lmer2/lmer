@@ -11,17 +11,27 @@ import pytest
 from hooks.statusline import (
     DEFAULT_SEGMENTS,
     DEFAULT_WORKSPACE,
+    STATUS_FILENAME,
+    STATUS_LIMIT_CAP,
+    STATUS_SCHEMA,
     build_line,
     context_percent,
     cost_text,
     ctx_text,
     duration_text,
+    effort_level,
     effort_text,
+    limit_keys,
+    limit_percent,
+    limit_resets_at,
     lines_text,
     model_name,
     parse_segments,
     payload_cwd,
+    publish_if_mounted,
+    publish_status,
     rate_limit_text,
+    status_document,
 )
 
 REPO_ROOT = Path(__file__).parent.parent
@@ -478,6 +488,330 @@ class TestMainSubprocess:
 
 # ---- provisioning ---------------------------------------------------------------
 
+# ---- the status document (issue #248) -------------------------------------
+
+def _status_payload():
+    """A payload carrying all three published facts."""
+    return {
+        "context_window": {"used_percentage": 9},
+        "rate_limits": {
+            "five_hour": {"used_percentage": 23.5, "resets_at": 1738425600},
+            "seven_day": {"used_percentage": 41.2, "resets_at": 1738857600},
+        },
+        "effort": {"level": "high"},
+    }
+
+
+class TestLimitFields:
+    """The structured seams the document is built from, beside the rendered
+    segment that used to be the only reader of ``rate_limits``."""
+
+    def test_percent_is_clamped_like_the_segment(self):
+        payload = {"rate_limits": {"five_hour": {"used_percentage": 250}}}
+        assert limit_percent(payload, "five_hour") == 100
+        assert rate_limit_text(payload, "five_hour", "5h") == "5h 100%"
+
+    def test_resets_at_is_epoch_seconds(self):
+        payload = {"rate_limits": {"seven_day": {"resets_at": 1738857600}}}
+        assert limit_resets_at(payload, "seven_day") == 1738857600
+
+    @pytest.mark.parametrize("value", [0, -1, "1738857600", None, True, float("inf")])
+    def test_unusable_reset_is_absent_not_zero(self, value):
+        """An epoch of 0 would render as 1970 — a window that reset long ago,
+        which is the opposite of what "not reported" means."""
+        payload = {"rate_limits": {"seven_day": {"resets_at": value}}}
+        assert limit_resets_at(payload, "seven_day") is None
+
+    def test_a_window_may_report_percent_without_a_reset(self):
+        payload = {"rate_limits": {"five_hour": {"used_percentage": 12}}}
+        assert limit_percent(payload, "five_hour") == 12
+        assert limit_resets_at(payload, "five_hour") is None
+
+    def test_effort_level_is_the_bare_word(self):
+        assert effort_level({"effort": {"level": " xhigh "}}) == "xhigh"
+        assert effort_text({"effort": {"level": " xhigh "}}) == "eff xhigh"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [{}, {"effort": "x"}, {"effort": {}}, {"effort": {"level": ""}},
+         {"effort": {"level": 3}}],
+    )
+    def test_effort_absent(self, payload):
+        assert effort_level(payload) is None
+
+
+class TestLimitKeys:
+    """Which windows get published. A label table, not an allowlist: the keys of
+    ``rate_limits`` are Claude Code's to name, so a renamed or newly-added window
+    must not be dropped silently — a strip showing fewer numbers is
+    indistinguishable from a session reporting none."""
+
+    def test_labelled_windows_first_in_reading_order(self):
+        payload = {"rate_limits": {"seven_day": {}, "five_hour": {}}}
+        assert limit_keys(payload) == ["five_hour", "seven_day"]
+
+    def test_a_window_this_renderer_never_heard_of_is_still_published(self):
+        payload = {"rate_limits": {
+            "five_hour": {"used_percentage": 23},
+            "monthly_model_quota": {"used_percentage": 7},
+        }}
+        assert limit_keys(payload) == ["five_hour", "monthly_model_quota"]
+        document = status_document(payload, updated="u")
+        assert document["limits"] == [
+            {"key": "five_hour", "percent": 23, "label": "5h"},
+            # No label: this renderer has no short name for it, and the platform
+            # falls back to the key rather than inventing one.
+            {"key": "monthly_model_quota", "percent": 7},
+        ]
+
+    def test_unknown_windows_keep_the_payloads_own_order(self):
+        payload = {"rate_limits": {"b_quota": {}, "a_quota": {}}}
+        assert limit_keys(payload) == ["b_quota", "a_quota"]
+
+    def test_the_number_published_is_capped(self):
+        """The payload is somebody else's data structure, and the platform
+        refuses a document for its size."""
+        payload = {"rate_limits": {f"w{index}": {"used_percentage": 1}
+                                   for index in range(STATUS_LIMIT_CAP + 5)}}
+        assert len(limit_keys(payload)) == STATUS_LIMIT_CAP
+
+    @pytest.mark.parametrize(
+        "payload", [{}, {"rate_limits": {}}, {"rate_limits": "x"}, "junk", None],
+    )
+    def test_nothing_to_publish(self, payload):
+        assert limit_keys(payload) == []
+
+
+class TestStatusDocument:
+    def test_all_three_facts(self):
+        document = status_document(_status_payload(), updated="2026-09-03T14:31:07Z")
+        assert document == {
+            "schema": STATUS_SCHEMA,
+            "harness": "claude",
+            "updated": "2026-09-03T14:31:07Z",
+            "context": {"percent": 9},
+            "limits": [
+                {"key": "five_hour", "label": "5h", "percent": 24,
+                 "resets_at": 1738425600},
+                {"key": "seven_day", "label": "7d", "percent": 41,
+                 "resets_at": 1738857600},
+            ],
+            "effort": {"level": "high"},
+        }
+
+    def test_the_identifying_fields_are_always_there(self):
+        """A session that has learned nothing yet still says who it is: the
+        platform tells "publishes status, nothing to report" from "publishes
+        nothing" by the file's existence."""
+        document = status_document({}, updated="2026-09-03T14:31:07Z")
+        assert document == {
+            "schema": STATUS_SCHEMA,
+            "harness": "claude",
+            "updated": "2026-09-03T14:31:07Z",
+        }
+
+    def test_windows_are_published_in_reading_order(self):
+        """5h before 7d, and the order survives a payload that lists them the
+        other way round — the document is read left to right on a strip."""
+        payload = {"rate_limits": {
+            "seven_day": {"used_percentage": 41},
+            "five_hour": {"used_percentage": 23},
+        }}
+        document = status_document(payload, updated="u")
+        assert [entry["key"] for entry in document["limits"]] == [
+            "five_hour", "seven_day",
+        ]
+
+    def test_one_window_alone(self):
+        payload = {"rate_limits": {"seven_day": {"used_percentage": 41}}}
+        document = status_document(payload, updated="u")
+        assert document["limits"] == [
+            {"key": "seven_day", "label": "7d", "percent": 41},
+        ]
+
+    def test_a_window_with_no_percent_is_dropped(self):
+        payload = {"rate_limits": {"five_hour": {"resets_at": 1738425600}}}
+        assert "limits" not in status_document(payload, updated="u")
+
+    @pytest.mark.parametrize(
+        "payload", [{}, {"rate_limits": {}}, {"rate_limits": "x"}],
+    )
+    def test_no_windows_publishes_no_limits_key(self, payload):
+        """Absence is "not reported", never an empty list a client would have
+        to tell from a zeroed one."""
+        assert "limits" not in status_document(payload, updated="u")
+
+    def test_the_document_ignores_the_segment_configuration(self):
+        """LMER_STATUSLINE selects what the terminal *line* renders; the
+        platform strip is composed platform-side (operator decision on #248),
+        so a trimmed line must not blank it."""
+        document = status_document(_status_payload(), updated="u")
+        assert set(document) >= {"context", "limits", "effort"}
+
+    def test_it_is_json_serialisable(self):
+        """It crosses a mount as JSON, so nothing in it may be a Python
+        object a client cannot read."""
+        json.loads(json.dumps(status_document(_status_payload(), updated="u")))
+
+
+class TestPublishStatus:
+    def test_writes_the_document(self, tmp_path):
+        assert publish_status({"schema": 1}, str(tmp_path)) is True
+        assert json.loads((tmp_path / STATUS_FILENAME).read_text()) == {"schema": 1}
+
+    def test_leaves_no_temporary_behind(self, tmp_path):
+        """The reader has no lock and the file is rewritten on every render, so
+        the write is a rename — and a rename that left its temporary would fill
+        a mounted directory one render at a time."""
+        publish_status({"schema": 1}, str(tmp_path))
+        publish_status({"schema": 1}, str(tmp_path))
+        assert [p.name for p in tmp_path.iterdir()] == [STATUS_FILENAME]
+
+    def test_replaces_an_earlier_document(self, tmp_path):
+        publish_status({"schema": 1, "context": {"percent": 9}}, str(tmp_path))
+        publish_status({"schema": 1, "context": {"percent": 11}}, str(tmp_path))
+        document = json.loads((tmp_path / STATUS_FILENAME).read_text())
+        assert document["context"] == {"percent": 11}
+
+    def test_mode_is_0600(self, tmp_path):
+        publish_status({"schema": 1}, str(tmp_path))
+        mode = (tmp_path / STATUS_FILENAME).stat().st_mode & 0o777
+        assert mode == 0o600
+
+    def test_a_missing_directory_is_false_not_an_exception(self, tmp_path):
+        assert publish_status({"schema": 1}, str(tmp_path / "nope")) is False
+
+    def test_an_unserialisable_document_is_false(self, tmp_path):
+        assert publish_status({"bad": {1, 2}}, str(tmp_path)) is False
+        assert not (tmp_path / STATUS_FILENAME).exists()
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestPublishIfMounted:
+    def test_publishes_when_the_platform_mounted_a_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("LMER_STATUS_DIR", str(tmp_path))
+        assert publish_if_mounted(_status_payload()) is True
+        document = json.loads((tmp_path / STATUS_FILENAME).read_text())
+        assert document["context"] == {"percent": 9}
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+                            document["updated"])
+
+    @pytest.mark.parametrize("value", ["", "   "])
+    def test_a_blank_variable_publishes_nothing(self, value, monkeypatch):
+        monkeypatch.setenv("LMER_STATUS_DIR", value)
+        assert publish_if_mounted(_status_payload()) is False
+
+    def test_an_unset_variable_publishes_nothing(self, monkeypatch):
+        monkeypatch.delenv("LMER_STATUS_DIR", raising=False)
+        assert publish_if_mounted(_status_payload()) is False
+
+    def test_the_directory_is_never_created(self, tmp_path, monkeypatch):
+        """It is one half of a mount the platform made: a directory created
+        here would hold a document nobody can read, and the platform's "is
+        there a directory" probe is what tells a mounted session from an image
+        too old to have one."""
+        target = tmp_path / "not-mounted"
+        monkeypatch.setenv("LMER_STATUS_DIR", str(target))
+        assert publish_if_mounted(_status_payload()) is False
+        assert not target.exists()
+
+    def test_a_file_where_the_directory_should_be_publishes_nothing(
+        self, tmp_path, monkeypatch,
+    ):
+        target = tmp_path / "file"
+        target.write_text("x")
+        monkeypatch.setenv("LMER_STATUS_DIR", str(target))
+        assert publish_if_mounted(_status_payload()) is False
+
+
+class TestPublishedByMain:
+    """End to end: what a real render leaves in the mounted directory."""
+
+    def test_the_line_and_the_document(self, tmp_path):
+        result = _run_script(
+            {**_status_payload(), "model": {"display_name": "Opus 5"}},
+            env_extra={"LMER_STATUS_DIR": str(tmp_path),
+                       "LMER_STATUSLINE": "ctx", "LMER_REPO_PROJECT": "group/project"},
+        )
+        assert result.returncode == 0
+        assert result.stdout.rstrip("\n") == "ctx 9%"
+        document = json.loads((tmp_path / STATUS_FILENAME).read_text())
+        assert document["limits"][0]["label"] == "5h"
+        assert document["effort"] == {"level": "high"}
+
+    def test_a_session_with_no_mount_still_renders(self, tmp_path):
+        result = _run_script(_status_payload(), env_extra={"LMER_STATUSLINE": "ctx"})
+        assert result.returncode == 0
+        assert result.stdout.rstrip("\n") == "ctx 9%"
+
+    def test_a_document_that_cannot_be_written_costs_the_line_nothing(self, tmp_path):
+        """A mount the publish cannot land in costs the document, not the line.
+
+        Staged as a directory in the document's place rather than as a mode bit:
+        this runs the real script in a subprocess and root (what CI's pytest job
+        runs as) ignores a 0o500 directory, while the kernel enforces this case
+        for every uid.
+        """
+        target = tmp_path / "mounted"
+        target.mkdir()
+        (target / STATUS_FILENAME).mkdir()
+        result = _run_script(
+            _status_payload(),
+            env_extra={"LMER_STATUS_DIR": str(target), "LMER_STATUSLINE": "ctx"},
+        )
+        assert result.returncode == 0
+        assert result.stdout.rstrip("\n") == "ctx 9%"
+        assert (target / STATUS_FILENAME).is_dir(), "nothing replaced it"
+        # And no temporary left beside it: a publish that fails cleans up.
+        assert [path.name for path in target.iterdir()] == [STATUS_FILENAME]
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0, reason="root ignores the mode bit this test relies on"
+    )
+    def test_a_read_only_mount_costs_the_document_not_the_line(self, tmp_path):
+        """The same property with the mode bit doing the enforcing — the shape a
+        uid mismatch across the bind mount actually takes."""
+        target = tmp_path / "mounted"
+        target.mkdir(mode=0o500)
+        try:
+            result = _run_script(
+                _status_payload(),
+                env_extra={"LMER_STATUS_DIR": str(target), "LMER_STATUSLINE": "ctx"},
+            )
+            assert result.returncode == 0
+            assert result.stdout.rstrip("\n") == "ctx 9%"
+            assert not (target / STATUS_FILENAME).exists()
+        finally:
+            target.chmod(0o700)
+
+    def test_torn_stdin_publishes_the_identifying_fields(self, tmp_path):
+        """Unparseable input degrades to an empty payload, and the document
+        that describes it still says who it is."""
+        result = _run_script(
+            None, env_extra={"LMER_STATUS_DIR": str(tmp_path)}, raw_stdin="{not json",
+        )
+        assert result.returncode == 0
+        document = json.loads((tmp_path / STATUS_FILENAME).read_text())
+        assert document["schema"] == STATUS_SCHEMA
+        assert document["harness"] == "claude"
+        assert "context" not in document
+
+    def test_the_platform_reads_what_the_hook_wrote(self, tmp_path):
+        """The round trip, which is the whole contract: the two halves cannot
+        share an import (this renderer is stdlib-only by constraint), so the
+        format is bound by a test that writes with one and reads with the
+        other."""
+        from lmer_platform import statusline as reader
+
+        _run_script(_status_payload(), env_extra={"LMER_STATUS_DIR": str(tmp_path)})
+        served = reader.read_document(tmp_path / STATUS_FILENAME)
+        assert served["harness"] == "claude"
+        assert served["context"] == {"percent": 9}
+        assert served["effort"] == {"level": "high"}
+        assert [entry["label"] for entry in served["limits"]] == ["5h", "7d"]
+        assert served["limits"][0]["resets_at"] == "2025-02-01T16:00:00Z"
+
+
 class TestStatuslineProvisioning:
     """Every lmer session must get the status line without user setup:
     settings.json points statusLine at claude-status (on PATH via
@@ -511,6 +845,27 @@ class TestStatuslineProvisioning:
         )
         assert pattern.search(source), \
             "LMER_STATUSLINE entry missing from cli.py container env dict"
+
+    def test_cli_env_dict_declares_the_status_dir(self):
+        """Guard: LMER_STATUS_DIR must be in cli.py's container env dict.
+
+        The platform sets it on the child ``lmer``; without this entry it stops
+        there and every strip is blank while both halves of the mount still look
+        correctly wired.
+        """
+        source = (REPO_ROOT / "src" / "lmer_cli" / "cli.py").read_text()
+        pattern = re.compile(
+            r"""["']LMER_STATUS_DIR["']\s*:\s*os\.environ\.get\(\s*["']LMER_STATUS_DIR["']\s*\)"""
+        )
+        assert pattern.search(source), \
+            "LMER_STATUS_DIR entry missing from cli.py container env dict"
+
+    def test_the_status_dir_variable_is_documented(self):
+        """Every LMER_ variable controlling user-visible behaviour carries a
+        bullet in docs/LMER-CLI.md (the project's env-var convention)."""
+        doc = (REPO_ROOT / "docs" / "LMER-CLI.md").read_text()
+        assert "**`LMER_STATUS_DIR`**" in doc
+        assert "SESSION-STATUS.md" in doc
 
     def test_wrapper_end_to_end(self, tmp_path):
         """bin/claude-status → hooks/statusline.py with a real payload."""

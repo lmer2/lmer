@@ -14,6 +14,7 @@ import AskHistory from './AskHistory.vue'
 import Chat from './Chat.vue'
 import RelatedRuns from './RelatedRuns.vue'
 import RunMeta from './RunMeta.vue'
+import StatusStrip from './StatusStrip.vue'
 import { forgetRun, resumeRun } from '../api.js'
 import {
   ago, attentionLabel, duration, ledgerSummary, portUrl, shortTarget, stateMeta,
@@ -819,6 +820,16 @@ async function forget() {
                 <dt v-if="session.log_path">log</dt>
                 <dd v-if="session.log_path"><code class="scroll-x">{{ session.log_path }}</code></dd>
               </dl>
+
+              <!-- This session's own status line (issue 248). Outside the
+                   key/value list above because most of it is proportions, and a
+                   meter answers "how much is left" at a glance where a
+                   percentage in a definition list has to be read. -->
+              <StatusStrip
+                :status="run.statusline"
+                :now="now"
+                class="mt-3"
+              />
 
               <!-- How long the harness has been quiet (T95), in the fleet row's
                    idiom: dimmed, subordinate, no chip and no colour. The state

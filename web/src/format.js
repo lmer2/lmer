@@ -330,3 +330,81 @@ export function targetRef(target) {
 export function driverLabel(run) {
   return [run.harness, run.model].filter(Boolean).join(' · ') || null
 }
+
+// The harness's own status line, as segments to draw (issue 248). One
+// vocabulary for all three surfaces, because a `ctx 9%` that reads differently
+// in the list and in the detail beside it is two facts to an operator.
+//
+// Order is the document's, and the document's order is the harness's: only it
+// knows which of its usage windows matters most. `percent` is present only on
+// the segments that are a proportion, and its absence is how a caller knows
+// there is no meter to draw.
+export function statusSegments(status) {
+  if (!status) return []
+  const segments = []
+  const context = proportion(status.context?.percent)
+  if (context !== null) segments.push(segment('ctx', 'ctx', context))
+  for (const window of status.limits || []) {
+    const percent = proportion(window?.percent)
+    if (percent === null) continue
+    segments.push({
+      ...segment(`limit:${window.key}`, window.label || window.key, percent),
+      resets_at: window.resets_at || null,
+    })
+  }
+  // Not a proportion and deliberately last: it is what the session is *set* to,
+  // where everything before it is being spent.
+  const level = status.effort?.level
+  if (level) {
+    segments.push({ key: 'effort', label: 'eff', value: level,
+      text: `eff ${level}` })
+  }
+  return segments
+}
+
+function segment(key, label, percent) {
+  return { key, label, percent, value: `${percent}%`,
+    text: `${label} ${percent}%` }
+}
+
+// A percentage, or null for anything that is not one. Typed rather than
+// coerced: `Number(null)` and `Number(false)` are both 0, and absence means
+// "not reported" everywhere in this document — a fabricated `ctx 0%` is the one
+// answer its shape exists to avoid.
+function proportion(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+// Under a minute is "now" for a status line: claude re-renders on every change,
+// so a fresher reading is one keystroke away and dating it would be noise.
+const STATUS_FRESH_SECONDS = 60
+
+// How long ago the reading was taken, and only once that is worth saying; null
+// while fresh, so a caller renders nothing. The age is the daemon's
+// `age_seconds` and not this browser's clock — see docs/SESSION-STATUS.md ("How
+// the UI renders it") for that trade and for why a missing age still captions.
+// On a failed poll App.vue keeps the last payload, so this caption freezes with
+// the rest of it and the error banner is what says so.
+export function statusAge(status) {
+  if (!status) return null
+  const seconds = status.age_seconds
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) {
+    return 'age unknown'
+  }
+  if (seconds < STATUS_FRESH_SECONDS) return null
+  return `as of ${duration(seconds)} ago`
+}
+
+// When a usage window comes back, phrased forwards. `duration()`'s thresholds,
+// so this and every age beside it agree about when minutes become hours. Null
+// for an absent, unparseable or already-passed reset: "resets in 0s" would be a
+// countdown to something that already happened.
+export function resetsLabel(iso, now = Date.now()) {
+  if (!iso) return null
+  const when = Date.parse(iso)
+  if (Number.isNaN(when)) return null
+  const seconds = (when - now) / 1000
+  if (seconds <= 0) return null
+  const span = duration(seconds)
+  return span ? `resets in ${span}` : null
+}

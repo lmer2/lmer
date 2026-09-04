@@ -95,6 +95,7 @@ from . import meta
 from . import reattach
 from . import relations
 from . import session_io
+from . import statusline
 from . import transcripts
 from . import uploads
 from .answer import AnswerError, AnswerRequest, answer_run
@@ -722,6 +723,10 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     # these is waiting on me" is the question it exists to answer.
     inventory = build_inventory(
         refs, sessions, tracked=tracked, questions=ask.pending_by_session(sessions),
+        # What each live session last published about itself (#248), read here
+        # for the same reason its questions are: the run list and the run view
+        # both want it, and neither should cost a request per row.
+        statusline=statusline.by_session(sessions),
         # Resolved here, where config is in hand: defaulting deeper would leave
         # a host's config.json with no effect (#243).
         stall=StallPolicy(
@@ -1413,7 +1418,10 @@ def create_app(
             "  GET  /api/state             fleet view: runs THIS orchestrator\n"
             "                              tracks. A run's session block is\n"
             "                              narrowed to the fields a client reads,\n"
-            "                              not the whole registry entry\n"
+            "                              not the whole registry entry;\n"
+            "                              `statusline` carries what its live\n"
+            "                              session published about its own status\n"
+            "                              line (context, usage windows, effort)\n"
             "  POST /api/sessions          spawn {taskdef,target,repo_url,\n"
             "                              preset,agents,harness,ports,\n"
             "                              title?,description?,...} — title names\n"
@@ -1532,8 +1540,9 @@ def create_app(
             "itself, and the thing the operator chats with:\n"
             "  GET  /api/assistant          whether one is running, which session,\n"
             "                               how old, how many digests are spooled\n"
-            "                               for it, and the handover note it starts\n"
-            "                               from. A read: it starts nothing. The\n"
+            "                               for it, its own status line, and the\n"
+            "                               handover note it starts from. A read:\n"
+            "                               it starts nothing. The\n"
             "                               pending count here is the only\n"
             "                               non-consuming signal that something is\n"
             "                               waiting — watch it, do not drain to ask\n"

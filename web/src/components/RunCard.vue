@@ -10,6 +10,7 @@ import {
   ago, attentionLabel, checkinLabel, driverLabel, duration, ledgerSummary,
   portUrl, shortTarget, stateMeta, targetLink, targetRef, toneColor,
 } from '../format.js'
+import StatusStrip from './StatusStrip.vue'
 
 // Which kind of thing the run is against. The word in the chip says it too, and
 // that is the point: main.js names colour-carrying-a-signal-alone as this UI's
@@ -334,6 +335,10 @@ const forgettable = computed(
             : 'nothing has read this run yet'"
         >{{ checkin }}</span>
         <span :title="run.updated || ''">{{ ago(run.updated, now) }}</span>
+        <!-- The live session's own status line (issue 248). In this line rather
+             than a chip group of its own for `idle`'s reason: a fact the state
+             chip does not contain, not a competing verdict. -->
+        <StatusStrip :status="run.statusline" :now="now" compact />
       </div>
 
       <!-- Why a row is at the top of the fleet, and therefore never cut away: the

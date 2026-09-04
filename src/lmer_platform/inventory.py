@@ -335,6 +335,12 @@ class RunView:
     #: for, and the history a crashed run can show would vanish the moment the
     #: crash was acknowledged.
     last_session_id: Optional[str] = None
+    #: What the run's *live* session last published about itself
+    #: (:mod:`lmer_platform.statusline`). On the row for the reason the
+    #: questions are: both the run list and the run view read this field, and a
+    #: request per row is the wrong trade for a view polled from a phone.
+    #: ``None`` for every dormant run and every harness that does not report.
+    statusline: Optional[dict] = None
 
     @property
     def live(self) -> bool:
@@ -532,6 +538,9 @@ class RunView:
             "events": self.events,
             "ports": self.ports,
             "questions": self.questions,
+            # Beside the session block rather than inside it: SESSION_FIELDS
+            # narrows a *registry entry*, and this is not one (#248).
+            "statusline": self.statusline,
             # How the session was launched. Flat fields, read out of the entry's
             # ``task`` block here rather than left for a client to dig out of:
             # that block does not cross at all (SESSION_FIELDS), and a UI reading
@@ -1033,6 +1042,7 @@ def _view_from_run_dir(
     questions: Optional[list] = None,
     title: Optional[str] = None,
     stall: Optional[StallPolicy] = None,
+    statusline: Optional[dict] = None,
 ) -> RunView:
     state, error = _load_state_tolerantly(ref)
     run_state_state, attention = _derive(
@@ -1041,6 +1051,7 @@ def _view_from_run_dir(
     state = state or {}
     return RunView(
         questions=list(questions or []),
+        statusline=statusline,
         last_session_id=last_session_id,
         host=ref.host,
         project=ref.project,
@@ -1068,6 +1079,7 @@ def _view_from_session(
     questions: Optional[list] = None,
     *,
     title: Optional[str] = None,
+    statusline: Optional[dict] = None,
 ) -> RunView:
     """A session whose run dir has not reached the mirror yet.
 
@@ -1113,6 +1125,7 @@ def _view_from_session(
         attention=attention,
         session=entry,
         questions=list(questions or []),
+        statusline=statusline,
     )
 
 
@@ -1157,6 +1170,7 @@ def build_inventory(
     titles: Optional[Mapping] = None,
     activity: Optional[Mapping] = None,
     stall: Optional[StallPolicy] = None,
+    statusline: Optional[Mapping] = None,
 ) -> Inventory:
     """Join run dirs against session entries into the fleet view.
 
@@ -1195,8 +1209,14 @@ def build_inventory(
     *stall* is the halt-detection policy (#243). ``None`` means the shipped
     defaults with the real reader; ``StallPolicy(idle_after=0, backstop_after=0)``
     asks for no stall opinion at all.
+
+    *statusline* maps a session id to what that session published about itself
+    (:func:`lmer_platform.statusline.by_session`). On the *questions* convention
+    rather than the titles': ``None`` means "no statuses", not "go and read
+    them".
     """
     by_session_questions = dict(questions or {})
+    by_session_statusline = dict(statusline or {})
     by_title = _titles() if titles is None else dict(titles)
     by_activity = None if activity is None else dict(activity)
     by_key: dict[tuple, dict] = {}
@@ -1243,6 +1263,10 @@ def build_inventory(
         session_id = (entry or {}).get("id")
         return list(by_session_questions.get(session_id) or [])
 
+    def statusline_for(entry: Optional[dict]) -> Optional[dict]:
+        session_id = (entry or {}).get("id")
+        return by_session_statusline.get(session_id)
+
     def title_for(entry: dict) -> Optional[str]:
         run = entry.get("run") or {}
         return _title_for(
@@ -1262,6 +1286,7 @@ def build_inventory(
                 questions=questions_for(entry),
                 title=_title_for(by_title, ref.host, ref.project, ref.slug),
                 stall=stall,
+                statusline=statusline_for(entry),
             )
         )
 
@@ -1282,13 +1307,15 @@ def build_inventory(
             continue
         runs.append(
             _view_from_session(
-                entry, questions_for(entry), title=title_for(entry)
+                entry, questions_for(entry), title=title_for(entry),
+                statusline=statusline_for(entry),
             )
         )
     for entry in unmatched:
         runs.append(
             _view_from_session(
-                entry, questions_for(entry), title=title_for(entry)
+                entry, questions_for(entry), title=title_for(entry),
+                statusline=statusline_for(entry),
             )
         )
 

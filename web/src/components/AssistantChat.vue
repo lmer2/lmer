@@ -103,6 +103,7 @@ import {
   stopAssistant,
 } from '../api.js'
 import { ago } from '../format.js'
+import StatusStrip from './StatusStrip.vue'
 
 const props = defineProps({
   now: { type: Number, default: () => Date.now() },
@@ -499,6 +500,11 @@ onBeforeUnmount(() => {
             started {{ ago(status.started_at, now) }}
           </span>
         </div>
+
+        <!-- uber lmer's own status line (issue 248), at the run drawer's
+             density: what is left of this incarnation's context is what decides
+             whether to keep talking or restart. -->
+        <StatusStrip :status="status.statusline" :now="now" class="mb-3" />
 
         <!-- A lifecycle call in flight, said where the incarnation it is about is
              described: the cluster's spinner says something is happening and this
