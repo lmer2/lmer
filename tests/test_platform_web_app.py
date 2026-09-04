@@ -680,8 +680,10 @@ def test_the_list_can_be_searched_over_what_the_row_shows():
     #: Row facts a substring search cannot help with, and why. Times are rendered
     #: relative ("3m ago"), so a query never means one; the ledger is a count; and
     #: the session block and the liveness flag are read by the row to *derive* what
-    #: it shows — the state word is what carries them into the search.
-    unsearchable = {"updated", "session", "ledger", "live"}
+    #: it shows — the state word is what carries them into the search. The status
+    #: line is percentages that change on every render, so a query over it is
+    #: never a way to find a run (issue 248).
+    unsearchable = {"updated", "session", "ledger", "live", "statusline"}
     card = re.sub(r"<!--.*?-->", "", RUN_CARD.read_text(encoding="utf-8"), flags=re.S)
     card = re.sub(r"^\s*//.*$", "", card, flags=re.M)
     shown = {match for match in re.findall(r"\brun\.(\w+)", card)} - unsearchable

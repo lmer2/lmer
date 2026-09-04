@@ -2944,6 +2944,9 @@ def main(argv: list[str] | None = None) -> int:
         # without the matching mount is an agent told to read files out of an
         # empty directory. No flag, for the same reason.
         "LMER_UPLOADS_DIR": os.environ.get("LMER_UPLOADS_DIR"),
+        # Container-side path of this session's status document (issue #248),
+        # forwarded for the same reasons as the two above. No flag either.
+        "LMER_STATUS_DIR": os.environ.get("LMER_STATUS_DIR"),
         # Env contributed by special target types (Slack tokens + parsed
         # thread context today). Keys of types with no matching target are
         # seeded with None so the .env merge below cannot forward them.

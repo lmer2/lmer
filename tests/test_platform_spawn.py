@@ -33,8 +33,8 @@ from lmer_cli.mounts import CONTAINER_MOUNT_STAGING_DIR, MOUNT_LINKS_ENV
 from lmer_cli.user_harnesses import HARNESSES_DIR_ENV, clear_user_harness_cache
 from lmer_platform import config as cfg
 from lmer_platform import (
-    ask, memory, registry, runs, session_io, spawn, store, transcripts,
-    uploads, workrepo,
+    ask, memory, registry, runs, session_io, spawn, statusline, store,
+    transcripts, uploads, workrepo,
 )
 from tests.conftest import strip_lmer_env
 from work_repo import run_state
@@ -2305,6 +2305,7 @@ PLATFORM_MOUNT_DESTINATIONS = {
     ask.CONTAINER_ASK_DIR,
     uploads.CONTAINER_UPLOADS_DIR,
     supervisor.CONTAINER_SESSION_LOG_DIR,
+    statusline.CONTAINER_STATUS_DIR,
 }
 
 
@@ -3426,11 +3427,19 @@ def test_the_child_sees_both_halves_of_the_upload_store(config):
     assert marker.read_text(encoding="utf-8") == uploads.CONTAINER_UPLOADS_DIR
 
 
-def test_the_registry_entry_records_that_this_session_can_be_handed_a_file(config):
+def test_the_registry_entry_records_that_this_session_can_be_handed_a_file(
+    config, monkeypatch,
+):
     """The route reads this rather than looking for the directory: uber lmer's
     store is per host, so its existence says nothing about the container that is
-    running now."""
-    result = spawn.spawn_session(config, request_for(extra_args=("--sleep",)))
+    running now.
+
+    Kept alive through the assertion with ``FAKE_LMER_SLEEP``: a clean exit reaps
+    the entry, so reading it after a stub that exits immediately is a race. The
+    ``--sleep`` this used to pass is not a flag the stub or ``lmer`` has.
+    """
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "5")
+    result = spawn.spawn_session(config, request_for())
     entry = registry.read_session(result.session_id) or {}
     assert entry.get("uploads", {}).get("container_path") == (
         uploads.CONTAINER_UPLOADS_DIR
@@ -3475,7 +3484,9 @@ def test_a_session_whose_upload_store_cannot_be_created_still_starts(
         return real_popen(command, **kwargs)
 
     monkeypatch.setattr(spawn.subprocess, "Popen", spy)
-    result = spawn.spawn_session(config, request_for(extra_args=("--sleep",)))
+    # Alive through the read, for the reason the test above gives.
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "5")
+    result = spawn.spawn_session(config, request_for())
     assert result.session_id
     assert uploads.CONTAINER_UPLOADS_DIR not in [
         spec.split(":")[1] for spec in mount_specs_in(captured["command"])
