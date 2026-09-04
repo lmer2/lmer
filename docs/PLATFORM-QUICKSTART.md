@@ -127,6 +127,21 @@ conversation window is lost.
   replying to a *live* one is delivered into the waiting session.
 - **Wind down vs exit** — wind down asks the agent to wrap up and end itself;
   exit ends it now. Both under the run's detail view.
+- **Wound down, not crashed** — a dead session's leftover registry entry is
+  normally the only evidence that something died, so the fleet reads it as a
+  crash. The exception is an ending the operator asked for: a wind-down leaves a
+  record on the entry and then ends exactly as asked, with no reaper to clear it,
+  and such a row reads `dormant` with no attention badge (#324). Two facts decide
+  it, not one — the recorded request, *and* the absence of a bad exit a watcher
+  saw. A session wound down at 09:00 and OOM-killed at 09:04 is still a crash,
+  and the detail view names the status that watcher saw. Where nobody watched (a
+  re-attached session, or one `lmer platform spawn` started) there is no such
+  record either way, which is the case the wind-down mark is allowed to speak
+  for. A corrupt or truncated `exited` record counts as a bad exit rather than as
+  none: mislabelling a wound-down run costs a badge an operator can dismiss,
+  while the other direction retires a death nobody is ever told about. The
+  daemon's sweep clears these entries, since the UI's "clear crashed sessions"
+  card only renders on a crashed row.
 - **uber lmer** — the supervising assistant. It hears attention changes and
   session milestones (`lmer-signal`), can spawn/answer/wind-down runs on
   request, and keeps operator-taught standing orders across restarts. Teach it
@@ -153,6 +168,12 @@ conversation window is lost.
     substitution, not a markdown parse: it does not know what a code span is, so
     a reference written *as an example* is reduced too. An escaped `\[` is left
     alone, as is a label containing brackets.
+  - **One grammar, two languages.** The key and the reference are spelled by
+    `src/lmer_cli/runref.py` and `web/src/runref.js`, with one corpus run
+    through both by `tests/test_runref_grammar.py`. Splitting a key is
+    deliberately permissive (an argument the daemon should refuse by name),
+    matching a reference deliberately anchored (it decides whether a link is
+    live).
   - Web-only: it reaches you after a bundle build and a UI image roll.
 - **A narrower app** — the toggle in the app bar holds the whole app — the bar, the
   run list, the content and uber lmer's drawer — in a 1620px band in the middle of
@@ -329,6 +350,32 @@ outage that stops it recording a nudge also stops uber lmer draining the spool �
 without that memory, an unwritable `assistant.json` turned the interval into the
 30-second tick.
 
+### Confirming a crash
+
+A `crashed` digest claims two things: that a session died, and that its run
+committed nothing. The second half is read off the work-repo mirror, and a
+detection tick deliberately does *not* pull it — so a run that pushed its final
+state and exited inside the throttle window looks exactly like one that never
+pushed at all, and was announced as a death with its work declared lost (#324).
+
+The claim is therefore re-read against a mirror forced to catch up, and only
+when such a signal is fresh in that tick's diff — never on a tick that found a
+crash standing, and never on one that found none. `work_repo_pull_interval`
+keeps its meaning for all the traffic the confirmation is not for.
+
+What the forced read costs, because it is what the next reader will budget
+against: a second whole `build_state`. That is the fetch in `list_tracked()`, a
+`resolve_run_dir` per tracked run, the titles, the ask channel and the check-in
+fold — plus, since no `activity` mapping is handed in, one control-plane HTTP
+read per *live* session at `ACTIVITY_TIMEOUT_SECONDS` each. On a busy fleet with
+a few unreachable containers that roughly doubles the tick and can push it past
+the detection interval. It is the right trade on an event this rare, and worth
+knowing before a second such read is added.
+
+A confirmation that fails delivers the crash anyway: the absence may be real,
+and a mirror that will not answer is the worst moment to go quiet about a
+session that died.
+
 ### Configuration
 
 | variable | default | what it sets |
@@ -380,9 +427,25 @@ every incarnation instead.
   across many incarnations is worth investigating. It is *not* a liveness check —
   a store that already holds files keeps reporting them even if the harness stops
   reading the path (that path is the harness's own encoding of its working
-  directory, which nothing promises). The authoritative answer is in the session's
-  own log, where the container entrypoint prints either `🔗 Linked <path> → …` or a
-  `⚠️` line naming why it could not.
+  directory, which nothing promises).
+- **Liveness is a separate field, and it comes from the container.** The entrypoint
+  linker leaves a `.lmer-mount-link` record in the staged store saying whether it
+  made the symlink and, if not, why; `GET /api/assistant` serves it as the `link`
+  block beside the counts. That is what makes `files: 0` diagnosable: with
+  `link.linked` true it means "linked, nothing saved yet", with it false the
+  `detail` names the obstruction, and `link: null` means no incarnation has left
+  the fact — a session image older than the marker, or a store nothing has used.
+  The session's own log still prints `🔗 Linked <path> → …` or a `⚠️` line, and the
+  record is that line made durable and machine-readable. The marker is not counted
+  among the store's files.
+- **`link.stale` says whether the record is *this* incarnation's.** Only a session
+  that ran the linker rewrites it, so one whose image predates the marker — or
+  whose memory directory could not be prepared — leaves the previous
+  incarnation's answer in place. `true` means the record predates the running
+  session and describes a link it did not make; `null` means the question cannot
+  be asked (no record, or nothing running). Several harnesses can declare a
+  memory path and share one store, and a success is never downgraded by a later
+  pair, so `linked: true` means *something* linked it, not that everything did.
 - **How it gets in, and why not more simply.** The host directory is bound at a
   staging path (`~/.lmer-mounts/assistant/memory`) and the container entrypoint
   symlinks the harness's own memory path to it. It is not bound at that path

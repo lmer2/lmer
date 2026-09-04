@@ -57,6 +57,16 @@ CONTAINER_MOUNT_STAGING_DIR = "/home/developer/.lmer-mounts"
 # :func:`format_mount_links` for the grammar.
 MOUNT_LINKS_ENV = "LMER_MOUNT_LINKS"
 
+# Written by Ctl/container/setup-mount-links.sh, read by
+# :func:`read_link_marker`; tests/test_mount_links_script.py pins the two
+# spellings together, because they are one name in two languages (#383 item 2).
+MOUNT_LINK_MARKER = ".lmer-mount-link"
+
+# `detail` and `at` are required, not optional: docs/PLATFORM-QUICKSTART.md
+# promises a false verdict names its obstruction and dates itself, and a
+# truncated file would otherwise satisfy the reader without either.
+_MARKER_REQUIRED = ("declared", "staged", "linked", "detail", "at")
+
 # Fixed path inside the container where the release SSH signing key is
 # mounted (release-taskdef sessions only; spec §4/§5 of the release-flow
 # bundle). The release session gate in cli.py forwards this path via
@@ -403,6 +413,34 @@ def format_mount_links(inherited: str, pairs: Iterable[Tuple[str, str]]) -> str:
     entries = [entry for entry in inherited.split(",") if entry.strip()]
     entries += [f"{declared}:{staged}" for declared, staged in pairs]
     return ",".join(entries)
+
+
+def read_link_marker(directory) -> Optional[dict]:
+    """What the container's linker recorded about *directory*, or ``None``.
+
+    ``None`` for every way of not having the fact — no marker, an unreadable
+    one, a `linked` field that is not the yes/no the writer emits — because an
+    uninterpretable marker is the same absence as none, not a weaker fact.
+    Unknown keys are tolerated so the writer can grow a field without this
+    becoming a two-image change. See docs/PLATFORM-QUICKSTART.md, "uber lmer's
+    memory", for what the record is for.
+    """
+    path = Path(directory) / MOUNT_LINK_MARKER
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    record: dict = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip():
+            record.setdefault(key.strip(), value.strip())
+    if not all(record.get(field) for field in _MARKER_REQUIRED):
+        return None
+    if record["linked"] not in ("yes", "no"):
+        return None
+    record["linked"] = record["linked"] == "yes"
+    return record
 
 
 def build_user_mounts(

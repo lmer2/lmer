@@ -118,6 +118,8 @@ import os
 import sys
 from typing import Any, Optional, Sequence
 
+from lmer_cli import runref
+
 from lmer_platform.client import (
     Call,
     Endpoint,
@@ -277,13 +279,14 @@ def _run_fields(key: str) -> dict:
     emptiness or existence, so a key naming no run reaches the daemon and comes
     back as its refusal, which names the field it disliked.
     """
-    parts = key.split("/")
-    if len(parts) < 3:
+    parts = runref.split(key)
+    if parts is None:
         raise CtlError(
             f"{key!r} is not a run key — a run is named host/project/slug, as "
             "the fleet view names it (gitlab.example.com/group/project/develop-141)"
         )
-    return {"host": parts[0], "project": "/".join(parts[1:-1]), "slug": parts[-1]}
+    host, project, slug = parts
+    return {"host": host, "project": project, "slug": slug}
 
 
 # --- the verbs: one route each ----------------------------------------------

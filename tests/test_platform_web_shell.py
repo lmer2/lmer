@@ -28,8 +28,9 @@ So each test pins one decision whose loss has no visible symptom:
 - the drawer is permanent beside the content on a desktop and an overlay on a
   phone, decided by Vuetify's breakpoint rather than a media query of ours
 - the run being shown is marked as the one being shown, and the shell and the
-  navigator agree on what identifies a run — they compute that string separately
-  and a divergence highlights nothing while every row still opens fine
+  navigator identify a run through the *one* definition in ``runref.js`` — they
+  used to compute that string separately, and a divergence highlights nothing
+  while every row still opens fine
 - the navigator did not drag xterm into the first load
 
 How any of it looks, and whether two icon buttons crowd a phone's app bar, are
@@ -553,17 +554,22 @@ def test_the_navigator_shows_where_you_are():
 
 
 def test_the_navigator_and_the_shell_agree_on_what_identifies_a_run():
-    """They compute that string separately, and a divergence is silent.
+    """They used to compute that string separately, and a divergence was silent.
 
-    The shell decides which run is open by this key; the navigator decides which
-    row to mark by rebuilding it. Change one — add a branch, drop the host — and
-    the drawer marks nothing while every row still opens perfectly, which is the
-    kind of bug that gets lived with rather than reported.
+    Change one — add a branch, drop the host — and the drawer marks nothing while
+    every row still opens perfectly, which is the kind of bug that gets lived with
+    rather than reported. Both now take the one definition (#383 item 3), so this
+    asserts the import rather than a matching literal: the divergence is not
+    caught, it is unavailable.
     """
-    shape = "`${run.host}/${run.project}/${run.slug}`"
     for source in (APP, RUN_NAV):
-        body = _function_body(_read(source), "function keyOf(run)")
-        assert shape in body, f"{source.name} identifies a run differently"
+        text = _read(source)
+        assert "runKey" in text and "runref.js" in text, (
+            f"{source.name} no longer takes the run key from runref.js"
+        )
+        assert "const keyOf = runKey" in text, (
+            f"{source.name} wraps or rebuilds the key instead of using it"
+        )
 
 
 def test_an_empty_fleet_leaves_the_navigator_saying_so():

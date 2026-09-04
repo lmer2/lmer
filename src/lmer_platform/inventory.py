@@ -29,6 +29,14 @@ This is why the inventory must run **before** :func:`registry.prune_dead`: the
 stale entry *is* the crash signal, and pruning it is how an operator
 acknowledges the crash and clears it from the list.
 
+One dead entry is **not** that evidence: a session the operator asked to wind
+down leaves a ``lifecycle`` record and then ends exactly as asked, with no reaper
+to clear it (#324). Two facts decide it — :func:`_was_wound_down` for what was
+asked, :func:`_observed_bad_exit` for what a watcher saw — because the request
+alone carries no exit code and nothing that clears it. Wound down and then dead
+under a watcher is still a crash; wound down with nothing else recorded reads
+``dormant``. See docs/PLATFORM-QUICKSTART.md, "Wound down, not crashed".
+
 **Sessions can exist before their run dir does.** A freshly spawned session does
 not appear in the mirror until it runs its first ``work commit`` — seconds or
 minutes later. Iterating run dirs alone would make a just-spawned session
@@ -122,6 +130,7 @@ from work_repo import run_state
 
 from . import assistant, meta, transcripts
 from .config import DEFAULT_STALL_BACKSTOP_SECONDS, DEFAULT_STALL_IDLE_SECONDS
+from .lifecycle import VERB_WIND_DOWN
 from .reattach import OUTPUT_CONTROL_PLANE, OUTPUT_SESSION_LOG, detached_record
 from .registry import is_live
 from .runs import RunIndexError, run_key
@@ -225,6 +234,10 @@ _TERMINAL_STATUSES = ("complete", "archived")
 #: the tests, which pin each field to the code that reads it, so widening this is
 #: a deliberate act rather than the side effect of writing a new key onto an entry.
 #:
+#: ``exited`` and ``lifecycle`` only mean something together: a row showing
+#: ``wind_down`` beside state ``crashed`` needs the record that decided between
+#: them, so the deciding evidence travels with the verdict.
+#:
 #: ``activity`` is the one member that is not on the registry entry as written: it
 #: is folded onto a copy of it while the row is built (see the module docstring on
 #: why it can only come from the container, and what bounds the read). It crosses
@@ -233,7 +246,9 @@ _TERMINAL_STATUSES = ("complete", "archived")
 #: the live session and nothing else: it is unknowable for a run with no session,
 #: it dies with the entry, and a row-level ``idle`` would invite a client to read
 #: it on a dormant run and get a null it could not explain.
-SESSION_FIELDS = ("id", "pid", "started_at", "log_path", "lifecycle", "activity")
+SESSION_FIELDS = (
+    "id", "pid", "started_at", "log_path", "lifecycle", "exited", "activity",
+)
 
 #: Taskdefs whose sessions are quiet *by design*, so silence means nothing about
 #: them. A denylist rather than an allowlist of "real" taskdefs: taskdefs are
@@ -474,10 +489,18 @@ class RunView:
         A field the entry does not carry is present as ``None`` rather than
         omitted, so the keys a client sees do not depend on how much the daemon
         had learned by the last time it wrote the entry.
+
+        ``exited`` is the exception: :func:`_observed_bad_exit` makes the
+        *presence* of that key the fact, and a present ``null`` serialises
+        identically to an absent one — so it is normalised to ``{}``, which is
+        what an unreadable record means and what the caption renders.
         """
         if not self.session:
             return None
-        return {key: self.session.get(key) for key in SESSION_FIELDS}
+        block = {key: self.session.get(key) for key in SESSION_FIELDS}
+        if "exited" in self.session and not isinstance(block["exited"], dict):
+            block["exited"] = {}
+        return block
 
     @property
     def session_id_for_history(self) -> Optional[str]:
@@ -931,6 +954,48 @@ class StallPolicy:
             return None
 
 
+def _was_wound_down(session: Optional[dict]) -> bool:
+    """Did the platform record *asking* this session to end?
+
+    The platform reading back its own action rather than inferring one from how
+    a session died. It says nothing about how the session went, which is why
+    nothing acts on it alone — see :func:`_observed_bad_exit`.
+    """
+    lifecycle = (session or {}).get("lifecycle")
+    if not isinstance(lifecycle, dict):
+        return False
+    return lifecycle.get("verb") == VERB_WIND_DOWN
+
+
+def _observed_bad_exit(session: Optional[dict]) -> bool:
+    """Did a watcher see this session's process exit badly?
+
+    The bound on the wind-down mark. ``False`` when nothing is recorded, which is
+    the case that mark is genuinely the best evidence for: a re-attached session
+    or one ``lmer platform spawn`` started has no watcher, so its entry survives
+    a clean exit too and says nothing either way.
+
+    The **presence of the key** is the fact — tested with ``in``, so a truncated
+    ``exited: null`` still counts — and only an explicit ``clean`` takes it back.
+    That inverts this module's usual read-a-wrong-type-as-missing tolerance,
+    because the two directions are not symmetric: read as "nothing was seen", a
+    corrupt record retires a death nobody is told about and lets
+    :func:`lmer_platform.detect._ended_as_asked` delete its only evidence. Read
+    the other way it costs a wound-down run a label an operator can dismiss.
+
+    ``clean: True`` has no writer today — :func:`lmer_platform.spawn._watch`
+    removes the entry outright on a clean exit — and is honoured anyway because
+    this reads a hand-editable file.
+    """
+    session = session or {}
+    if "exited" not in session:
+        return False
+    exited = session["exited"]
+    if isinstance(exited, dict) and exited.get("clean") is True:
+        return False
+    return True
+
+
 def _derive(
     state: Optional[dict],
     session: Optional[dict],
@@ -1022,6 +1087,9 @@ def _derive(
         )
 
     if stale_entry:
+        if _was_wound_down(session) and not _observed_bad_exit(session):
+            # The one dead entry that is not evidence of a death (#324).
+            return "dormant", None
         # Evidence, not inference: a clean exit removes its registry entry, so a
         # leftover entry with a dead PID means something actually died.
         return "crashed", Attention(
@@ -1087,25 +1155,35 @@ def _view_from_session(
     run state to read. The row exists so a just-spawned session is visible
     immediately rather than after its first ``work commit``.
 
+    Which bounds what a dead one of these rows may claim: the mirror is
+    git-eventual (spec D24), so an absent run dir is not proof that nothing was
+    pushed, and the note says where it looked rather than what was never done
+    (#324).
+
     A question asked in those first minutes is the *likeliest* one — "which repo
     did you mean?" comes before the first ``work commit``, not after — so this row
     carries the ask channel too rather than being the one place it goes missing.
+    A dead session has none that matter: whatever it was asking, nothing is there
+    to answer.
     """
     run = entry.get("run") or {}
     task = entry.get("task") or {}
     live = bool(entry.get("live"))
+    wound_down = (
+        not live and _was_wound_down(entry) and not _observed_bad_exit(entry)
+    )
     if not live:
-        state = "crashed"
+        state = "dormant" if wound_down else "crashed"
     else:
         state = "detached" if _is_blind(entry) else "running"
     attention = None
-    if not live:
+    if not live and not wound_down:
         attention = Attention(
             reason="crashed",
-            note="session process is gone and no run state was ever committed",
+            note="session process is gone and its run state is not in the mirror",
             since=entry.get("started_at"),
         )
-    elif questions:
+    elif live and questions:
         attention = Attention(
             reason="live_question",
             note=_live_question_note(questions),

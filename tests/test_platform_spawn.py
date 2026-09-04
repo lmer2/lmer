@@ -1261,6 +1261,33 @@ def test_crash_leaves_the_entry_as_the_crash_signal(config, monkeypatch):
     assert registry.is_live(entry) is False
 
 
+def test_a_bad_exit_is_recorded_on_the_entry_and_not_only_in_history(
+    config, monkeypatch
+):
+    """Survival says a watcher kept the entry; it cannot say *why* it kept it.
+
+    Without the record a wound-down session's mark outranks a death a watcher
+    actually saw (`inventory._observed_bad_exit`).
+    """
+    monkeypatch.setenv("FAKE_LMER_EXIT", "137")
+    result = spawn.spawn_session(config, request_for())
+
+    assert wait_for(
+        lambda: (registry.read_session(result.session_id) or {}).get("exited")
+    )
+    exited = registry.read_session(result.session_id)["exited"]
+    assert exited["code"] == 137
+    assert exited["clean"] is False
+    assert exited["at"].endswith("Z")
+
+
+def test_a_clean_exit_records_nothing_because_the_entry_is_gone(config):
+    """Why an absent record means "nobody saw it end badly" rather than "it ended
+    badly and we lost the note"."""
+    result = spawn.spawn_session(config, request_for())
+    assert wait_for(lambda: registry.read_session(result.session_id) is None)
+
+
 def test_exit_is_recorded_in_platform_history(config):
     result = spawn.spawn_session(config, request_for())
     assert wait_for(lambda: registry.read_session(result.session_id) is None)
@@ -2919,7 +2946,12 @@ def test_an_older_image_writes_no_log_and_is_served_the_host_tee(config):
     assert (path, source) == (
         spawn.log_path_for(result.session_id), session_io.LOG_SOURCE_HOST,
     )
-    assert b"fake lmer started" in session_io.read_log(result.session_id).data
+    # `_watch` and `_drain` are separate threads for separate events, so the tee
+    # can still be catching up when the exit is already recorded — nothing
+    # promises otherwise, and reading the file straight raced it in CI.
+    assert wait_for(
+        lambda: b"fake lmer started" in session_io.read_log(result.session_id).data
+    ), session_io.read_log(result.session_id).data
 
 
 def test_a_newer_image_writes_its_own_log_and_that_is_what_is_served(
@@ -3438,7 +3470,7 @@ def test_the_registry_entry_records_that_this_session_can_be_handed_a_file(
     the entry, so reading it after a stub that exits immediately is a race. The
     ``--sleep`` this used to pass is not a flag the stub or ``lmer`` has.
     """
-    monkeypatch.setenv("FAKE_LMER_SLEEP", "5")
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
     result = spawn.spawn_session(config, request_for())
     entry = registry.read_session(result.session_id) or {}
     assert entry.get("uploads", {}).get("container_path") == (
@@ -3485,7 +3517,7 @@ def test_a_session_whose_upload_store_cannot_be_created_still_starts(
 
     monkeypatch.setattr(spawn.subprocess, "Popen", spy)
     # Alive through the read, for the reason the test above gives.
-    monkeypatch.setenv("FAKE_LMER_SLEEP", "5")
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
     result = spawn.spawn_session(config, request_for())
     assert result.session_id
     assert uploads.CONTAINER_UPLOADS_DIR not in [
@@ -4244,3 +4276,74 @@ def test_a_store_that_could_not_be_prepared_leaves_the_route_closed(
         spec for spec in mount_specs_in(result.command)
         if spec.split(":")[1:2] == [memory.CONTAINER_STAGED_DIR]
     ]
+
+
+# ── The side channels as one answer (#383 item 1) ────────────────────────────
+# The extraction's proof is the tests above passing unchanged; these add the seam
+# itself, so the next channel can be tested without driving a whole spawn.
+
+
+def test_the_channels_of_a_worker_are_mounts_links_and_the_env_that_names_them(
+    config, _no_user_harnesses, platform_root
+):
+    channels = spawn._prepare_session_channels("s-worker", registry.WORKER_KIND)
+
+    assert channels.host_flags, "a worker gets its ask channel and log directory"
+    assert channels.env[ask.ASK_DIR_ENV] == ask.CONTAINER_ASK_DIR
+    assert channels.env[uploads.UPLOADS_DIR_ENV] == uploads.CONTAINER_UPLOADS_DIR
+    assert memory.PERSIST_ENV_VAR not in channels.env, (
+        "a worker's memory route is the work repo, and this closes it"
+    )
+    assert memory.CONTAINER_STAGED_DIR not in [
+        staged for _, staged in channels.link_pairs
+    ]
+
+
+def test_an_assistant_also_gets_the_host_memory_store(
+    config, _no_user_harnesses, platform_root
+):
+    channels = spawn._prepare_session_channels("s-assistant", registry.ASSISTANT_KIND)
+
+    assert channels.env[memory.PERSIST_ENV_VAR] == "", (
+        "platform-local only: the shared-work-repo route is closed on the kind"
+    )
+    assert memory.CONTAINER_STAGED_DIR in [
+        staged for _, staged in channels.link_pairs
+    ]
+    assert "--mount-dir" in channels.host_flags
+
+
+def test_a_channel_that_could_not_be_prepared_is_announced_as_blank(
+    config, _no_user_harnesses, platform_root, monkeypatch
+):
+    """The child seeds its own environment from .env files first-wins, so a
+    deleted key is one a file may hand back — and then an agent claims a channel
+    it never got."""
+    monkeypatch.setattr(spawn, "_prepare_ask_dir", lambda session_id: None)
+    monkeypatch.setattr(spawn, "_prepare_upload_dir", lambda session_id, kind: None)
+
+    channels = spawn._prepare_session_channels("s-worker", registry.WORKER_KIND)
+
+    assert channels.env[ask.ASK_DIR_ENV] == ""
+    assert channels.env[uploads.UPLOADS_DIR_ENV] == ""
+    assert channels.upload_dir is None
+
+
+def test_the_link_pairs_never_name_a_destination_nothing_bound(
+    config, _no_user_harnesses, platform_root, monkeypatch
+):
+    """A pair for an unmounted staged path leaves a dangling symlink where the
+    harness looks for its own state."""
+    monkeypatch.setattr(spawn, "_prepare_transcript_dir", lambda session_id: None)
+
+    # The assistant kind, so a pair survives the transcript mounts going away; a
+    # worker would leave the assertion below holding vacuously.
+    channels = spawn._prepare_session_channels("s-a", registry.ASSISTANT_KIND)
+    assert channels.link_pairs
+
+    mounted = {
+        spec.split(":")[1]
+        for flag, spec in zip(channels.host_flags, channels.host_flags[1:])
+        if flag == "--mount-dir"
+    }
+    assert all(staged in mounted for _, staged in channels.link_pairs)

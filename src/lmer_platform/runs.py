@@ -77,6 +77,8 @@ import logging
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
+from lmer_cli import runref
+
 from . import registry
 from .store import (
     StoreError, mutating, read_json, snapshot_path, utc_now_iso, write_json,
@@ -187,11 +189,15 @@ class TrackedRun:
 
 
 def run_key(host: str, project: str, slug: str) -> str:
-    """Stable identity for a run across the platform's state files."""
+    """Stable identity for a run across the platform's state files.
+
+    The validation is this index's — an empty part is a refusal rather than a row
+    nothing can address; the spelling is :mod:`lmer_cli.runref`'s.
+    """
     for name, value in (("host", host), ("project", project), ("slug", slug)):
         if not isinstance(value, str) or not value.strip():
             raise RunIndexError(f"{name} must be a non-empty string, got {value!r}")
-    return f"{host.strip()}/{project.strip()}/{slug.strip()}"
+    return runref.compose(host.strip(), project.strip(), slug.strip())
 
 
 def _index_path():

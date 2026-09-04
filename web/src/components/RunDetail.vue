@@ -21,6 +21,7 @@ import {
   targetLink, targetRef, toneColor,
 } from '../format.js'
 import { rememberChoice, storedChoice } from '../preferences.js'
+import { runKey as composeRunKey } from '../runref.js'
 
 // The emulator is over half the JS in the bundle and only this view opens one, so
 // it arrives as its own chunk. It is now deferred twice over: a tab panel renders
@@ -191,9 +192,7 @@ const session = computed(() => props.run.session || null)
 // for a directory it actually found (workrepo.resolve_run_dir confirms it by
 // content), and a row with no directory yet — tracked but unpushed, or a session
 // whose first commit has not landed — has this instead.
-const runKey = computed(
-  () => `${props.run.host}/${props.run.project}/${props.run.slug}`,
-)
+const runKey = computed(() => composeRunKey(props.run))
 
 // What the run last recorded about itself, joined here rather than in the
 // template. Two things follow from that, and both are the fleet row's `committed`
@@ -312,6 +311,25 @@ const windDownAsked = computed(
 const windDownAt = computed(
   () => windDownSent.value?.requested_at || lifecycle.value?.requested_at || null,
 )
+
+// What a watcher recorded about this session's ending, when one did. Absent for
+// every session nobody watched — a re-attached one, or a `platform spawn` —
+// which is the case the wind-down mark is allowed to speak for.
+const observedExit = computed(() => {
+  const exited = session.value?.exited
+  // `null` really is "nobody recorded anything": the daemon normalises a
+  // present-but-unreadable record to `{}` so this side need not reconstruct a
+  // distinction JSON cannot carry.
+  if (!exited || typeof exited !== 'object') return null
+  if (exited.clean === true) return null
+  const code = exited.code
+  // Only a primitive is a status; interpolating an object prints
+  // "[object Object]" at the operator.
+  const readable = ['string', 'number', 'boolean'].includes(typeof code)
+  return readable
+    ? `A watcher saw this session exit with status ${code}.`
+    : 'A watcher saw this session exit, but could not read its status.'
+})
 
 // The backstop the daemon recorded (spec R18). Nothing escalates when it passes —
 // D22 forbids that — so this is the surfacing instead: past the deadline the card
@@ -684,6 +702,12 @@ async function forget() {
         :text="run.attention.note"
         inline
       /></template>
+      <!-- Beside a crash this is the whole reason the row is one: with the
+           record it reads `crashed`, without it `dormant`. It renders under any
+           attention reason, so a yielded run whose session died shows it too. -->
+      <div v-if="observedExit" class="text-caption mt-1">
+        {{ observedExit }}
+      </div>
     </v-alert>
 
     <!-- Answering stays above the tabs for the same reason, and it is the stronger

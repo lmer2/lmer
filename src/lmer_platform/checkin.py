@@ -38,6 +38,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from lmer_cli import runref
+
 from .assistant import MAX_NOTE_CHARS
 from .store import (
     StoreError,
@@ -104,7 +106,7 @@ class StaleRun:
 
     @property
     def ref(self) -> str:
-        return f"{self.host}/{self.project}/{self.slug}"
+        return runref.compose(self.host, self.project, self.slug)
 
     @property
     def key(self) -> tuple:
@@ -129,7 +131,7 @@ def marks_path() -> Path:
 
 
 def _run_key(host: str, project: str, slug: str) -> str:
-    return f"{host}/{project}/{slug}"
+    return runref.compose(host, project, slug)
 
 
 def read_marks() -> dict:

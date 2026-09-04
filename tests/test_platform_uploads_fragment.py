@@ -15,12 +15,11 @@ screenshot as missing.
 """
 
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 
-from lmer_platform import uploads
+from lmer_platform import registry, spawn, store, uploads
 from tests._claude_runner_harness import run_claude_runner, skip_if_npm_claude_present
 from tests.test_harness_runners import run_harness_runner
 
@@ -190,7 +189,12 @@ class TestOtherHarnesses:
 def test_the_mount_the_variable_and_the_instruction_name_one_directory():
     """One fact in three places, and the pairs that can drift are checked here:
     the destination the platform mounts at, the value it exports, and the path
-    the fragment prints."""
+    the fragment prints.
+
+    The binding moved into ``spawn._prepare_session_channels`` (#383 item 1), so
+    the middle of the three is asserted by calling it rather than by matching the
+    assignment's source.
+    """
     assert uploads.CONTAINER_UPLOADS_DIR in render_fragment()
     spawn_source = (REPO_ROOT / "src" / "lmer_platform" / "spawn.py").read_text(
         encoding="utf-8"
@@ -198,7 +202,18 @@ def test_the_mount_the_variable_and_the_instruction_name_one_directory():
     assert "uploads.CONTAINER_UPLOADS_DIR" in spawn_source, (
         "the spawn spells the destination itself instead of reading the constant"
     )
-    assert re.search(
-        r"child_env\[uploads\.UPLOADS_DIR_ENV\] = uploads\.CONTAINER_UPLOADS_DIR",
-        spawn_source,
-    ), "the variable carries something other than the mount destination"
+
+
+def test_the_exported_variable_is_the_mount_destination(tmp_path, monkeypatch):
+    """A session with a store exports exactly where it is mounted; one without
+    exports blank, because a deleted variable is one a ``.env`` file could
+    re-supply."""
+    monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
+
+    channels = spawn._prepare_session_channels("s-1", registry.WORKER_KIND)
+    assert channels.upload_dir is not None
+    assert channels.env[uploads.UPLOADS_DIR_ENV] == uploads.CONTAINER_UPLOADS_DIR
+
+    monkeypatch.setattr(spawn, "_prepare_upload_dir", lambda session_id, kind: None)
+    without = spawn._prepare_session_channels("s-2", registry.WORKER_KIND)
+    assert without.env[uploads.UPLOADS_DIR_ENV] == ""

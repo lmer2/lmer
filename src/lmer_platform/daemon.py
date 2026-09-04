@@ -44,6 +44,8 @@ import logging
 import sys
 from typing import Optional
 
+from lmer_cli import runref
+
 from .api import build_state, create_app
 from .assistant import Supervisor, register_supervisor
 from .config import (
@@ -192,17 +194,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _split_run_ref(raw: str) -> tuple:
     """Parse ``<host>/<project>/<slug>`` where *project* may contain slashes.
 
-    Project paths are not a fixed number of segments (``group/project`` versus
-    ``group/subgroup/project``), so the split is first-segment host,
-    last-segment slug, everything between is the project.
+    The split is :func:`lmer_cli.runref.split`; what stays here is this command
+    line's own tolerance for what a human pastes at a shell. That normalisation
+    is deliberately not in the shared function: a splitter that repaired keys
+    would make two spellings resolve to one run everywhere rather than only
+    where somebody typed it.
     """
-    parts = [p for p in (raw or "").strip().strip("/").split("/") if p]
-    if len(parts) < 3:
+    parts = runref.split("/".join(
+        p for p in (raw or "").strip().strip("/").split("/") if p
+    ))
+    if parts is None:
         raise ConfigError(
             f"expected <host>/<project>/<slug>, got {raw!r} — the project may "
             "contain slashes, but host and slug are one segment each"
         )
-    return parts[0], "/".join(parts[1:-1]), parts[-1]
+    return parts
 
 
 def _overrides(args: argparse.Namespace) -> dict:

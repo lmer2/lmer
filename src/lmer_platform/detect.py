@@ -142,6 +142,11 @@ path, and forcing here would turn every tick into a ``git fetch`` and make the
 ``work_repo_pull_interval`` throttle mean nothing. Detection is therefore never
 more expensive than the browser sitting on the same page.
 
+There is one exception: a signal whose content is an assertion about the mirror
+(:data:`ABSENCE_KINDS`) is re-read against a caught-up one before it is
+delivered. See :meth:`Detector._confirmed`, and docs/PLATFORM-QUICKSTART.md,
+"Confirming a crash", for what that costs.
+
 :data:`DETECT_INTERVAL_SECONDS` matches :data:`lmer_platform.config
 .DEFAULT_PULL_INTERVAL_SECONDS`, so on a default host a tick lands roughly in
 step with the fastest the mirror can move. It is a constant rather than a read of
@@ -182,10 +187,17 @@ read in two places that behave differently:
   run key to its live replacement and turns into a second row and a permanent badge
   for a session that finished normally.
 
-The sweep removes such an entry in exactly the case where the run's own record says
-the work finished, so neither of those outlives the run, and :func:`_derive`'s rule
-is not touched. An entry whose run state is *not* terminal stays exactly where it
+The sweep removes such an entry when the run's own record says the work
+finished, so neither of those outlives the run and :func:`_derive`'s rule is not
+touched. It removes one more: an entry the operator asked to wind down that no
+watcher saw fail (:func:`_ended_as_asked`), which the fleet now calls ``dormant``
+rather than ``crashed`` and which the UI's clear-crashed card therefore no longer
+offers to remove. Both conditions read the same facts as the label, so the sweep
+can never clear a row the fleet still calls crashed. Anything else stays where it
 is: that shape is a real crash and the entry is its only evidence.
+
+Only the first of the two takes the transcript scrub with it — see
+:func:`_reconcile`.
 
 It also finishes the cleanup ``_watch`` would have done on the way out, which for
 these sessions has never happened at all: the control token goes with the entry
@@ -302,12 +314,14 @@ from typing import Optional
 from ask_channel import protocol as ask_protocol
 from work_repo import run_state
 
+from lmer_cli import runref
+
 from . import ask, assistant, checkin, nudge, registry, transcripts
 from .api import build_state
 from . import config as config_module
 from .config import PlatformConfig, checkin_settings, nudge_settings
 from .session_io import SessionIOError, send_input, session_output_state
-from .inventory import _TERMINAL_STATUSES
+from .inventory import _TERMINAL_STATUSES, _observed_bad_exit, _was_wound_down
 from .spawn import ports_file_for
 from .store import (
     StoreError,
@@ -359,9 +373,13 @@ _UNIDENTIFIED = "—"
 #: every existing consumer of ``session_exited`` exactly as correct as it was: this
 #: is not one of those events, and it does not arrive as one.
 #:
-#: What its ``data`` says instead: the session, the run key, the committed status
-#: that authorised the removal, and ``exit_code: null`` — explicitly unknown, since
-#: the ending itself is evidence-based rather than observed.
+#: What its ``data`` says instead: the session, the run key, the run's committed
+#: status *at the time of the sweep*, and ``exit_code: null`` — explicitly unknown,
+#: since the ending itself is evidence-based rather than observed.
+#:
+#: ``run_status`` is a reading and not an authorisation: :func:`_ended_as_asked`
+#: fires precisely when the status is *not* terminal, and what authorised the
+#: removal is then on the entry instead.
 SESSION_ENDED_UNWATCHED = "session_ended_unwatched"
 
 #: Event type for a milestone a session signalled (T122). The platform's own
@@ -431,6 +449,16 @@ ASSISTANT_NUDGED = "assistant_nudged"
 #: duplicate the ``critical_error`` attention reason that already covers it.
 MATERIAL_STATES = ("complete",)
 
+#: Signal kinds whose claim is an **absence** in the work-repo mirror, and which
+#: are therefore re-read against a caught-up mirror before they are delivered.
+#: See :meth:`Detector._confirmed`.
+ABSENCE_KINDS = ("crashed",)
+
+#: What an absorbed failure cost, for the stages that simply do not run. Named
+#: because one stage's failure costs something else — see
+#: :meth:`Detector._absorb`.
+_TICK_SKIPPED = "this tick is skipped and detection keeps going"
+
 
 def _text(value: object) -> Optional[str]:
     """A non-empty string, or ``None`` for anything else.
@@ -484,7 +512,7 @@ class Signal:
     @property
     def ref(self) -> str:
         """``<host>/<project>/<slug>`` — the identity every run route takes."""
-        return f"{self.host}/{self.project}/{self.slug}"
+        return runref.compose(self.host, self.project, self.slug)
 
     @property
     def key(self) -> tuple:
@@ -709,7 +737,9 @@ def _committed_status(config: PlatformConfig, identity: tuple) -> Optional[str]:
     return status if isinstance(status, str) else None
 
 
-def _reconcile(session_id: str, identity: tuple, status: str) -> bool:
+def _reconcile(
+    session_id: str, identity: tuple, status: Optional[str], *, scrub: bool
+) -> bool:
     """Remove one stale entry and record the ending. ``True`` when it went.
 
     The removal comes first and the event only follows a removal that happened:
@@ -736,6 +766,11 @@ def _reconcile(session_id: str, identity: tuple, status: str) -> bool:
     (:func:`lmer_platform.transcripts.scrub_transcript`). The hazard it documents —
     a lingering grandchild appending into the replaced inode — is the same hazard
     in both places and no larger in this one.
+
+    Which is why *scrub* is the caller's decision: an entry admitted only by the
+    wind-down mark is the population that ground excludes — a re-attached session
+    whose registry pid died with the host PTY may still be writing its transcript,
+    and scrubbing there would truncate a live file.
     """
     if not registry.remove(session_id, force=True):
         logger.debug(
@@ -763,6 +798,15 @@ def _reconcile(session_id: str, identity: tuple, status: str) -> bool:
         ports_file_for(session_id).unlink()
     except OSError:
         pass
+    if not scrub:
+        logger.info(
+            "platform_sweep_reconciled id=%s run=%s/%s/%s status=%s — the operator "
+            "asked this session to end and no watcher saw it fail; its entry is "
+            "cleared. The transcript is left alone: this run recorded no terminal "
+            "status, so nothing here says the harness has stopped writing",
+            session_id, host, project, slug, status,
+        )
+        return True
     try:
         transcripts.scrub_session_transcripts(session_id)
     except OSError as exc:
@@ -785,10 +829,12 @@ def sweep_finished_sessions(config: PlatformConfig) -> list:
 
     Returns the ids reconciled. The condition, all four parts of it, is the whole
     function: an entry that is **there**, a pid that is **dead**, a run identity on
-    the entry, and a **terminal committed status** for that run
-    (:data:`lmer_platform.inventory._TERMINAL_STATUSES`). Anything else is left
-    alone — most of all a dead entry whose run state is not terminal, which is a
-    crash, and whose entry is the only record that it happened.
+    the entry, and either a **terminal committed status** for that run
+    (:data:`lmer_platform.inventory._TERMINAL_STATUSES`) or an ending the operator
+    asked for and no watcher saw fail (:func:`_ended_as_asked`). Anything else is
+    left alone — most of all a dead entry whose run state is not terminal and
+    whose ending nobody asked for, which is a crash, and whose entry is the only
+    record that it happened.
 
     The terminal statuses are imported rather than restated, and that matters in
     both directions: a list here that lacked one would leave those runs reading
@@ -812,11 +858,24 @@ def sweep_finished_sessions(config: PlatformConfig) -> list:
         if identity is None:
             continue
         status = _committed_status(config, identity)
-        if status not in _TERMINAL_STATUSES:
+        finished = status in _TERMINAL_STATUSES
+        if not finished and not _ended_as_asked(entry):
             continue
-        if _reconcile(session_id, identity, status):
+        if _reconcile(session_id, identity, status, scrub=finished):
             reconciled.append(session_id)
     return reconciled
+
+
+def _ended_as_asked(entry: dict) -> bool:
+    """Did this dead entry end the way the operator asked it to?
+
+    The second reconciliation condition, and the sweep is the only clearing path
+    these entries have: the UI's "clear crashed sessions" card renders on a
+    ``crashed`` row, which they no longer are
+    (:func:`lmer_platform.inventory._derive`). Deliberately the same pair of
+    facts the label is made of, so the two can never disagree.
+    """
+    return _was_wound_down(entry) and not _observed_bad_exit(entry)
 
 
 # --- milestones a session signalled -------------------------------------------
@@ -858,7 +917,7 @@ class SessionSignal:
         """
         if not (self.host and self.project and self.slug):
             return None
-        return f"{self.host}/{self.project}/{self.slug}"
+        return runref.compose(self.host, self.project, self.slug)
 
     @property
     def digest(self) -> str:
@@ -1126,6 +1185,10 @@ class Detector:
         #: Nudges typed into the assistant's session (issue #317). Counted
         #: apart because it is the only stage that writes *into* a session.
         self.nudged = 0
+        #: Absence claims a forced pull withdrew before anyone was told (#324).
+        #: A climbing number is a tuning fact — the mirror throttle and the rate
+        #: runs finish are out of step — rather than a fault.
+        self.unconfirmed = 0
         self._stop = threading.Event()
         self._sleep = sleep or self._stop.wait
         self._read_state = state_reader or build_state
@@ -1329,6 +1392,7 @@ class Detector:
             return []
 
         fresh = [signal for key, signal in current.items() if key not in baseline]
+        fresh = self._confirmed(fresh)
         for signal in fresh:
             self._deliver(signal)
         # After the fresh ones, so a run whose question cleared *into* another
@@ -1344,6 +1408,52 @@ class Detector:
         # Last on purpose, so it counts what this tick spooled.
         self._nudge_stage()
         return fresh
+
+    def _confirmed(self, fresh: list) -> list:
+        """*fresh* minus the absence claims a caught-up mirror does not support.
+
+        A ``crashed`` row says a session died having committed nothing, and the
+        second half of that is read off a mirror this tick deliberately did not
+        pull — so a run that pushed its final state inside the throttle window is
+        indistinguishable from one that never pushed, and is announced as a death
+        with its work declared lost (#324). The claim is checked before it is
+        made, and only when such a signal is fresh in this tick's diff. What the
+        forced read costs is in docs/PLATFORM-QUICKSTART.md, "Confirming a
+        crash".
+
+        A dropped signal leaves :attr:`_seen` too, so it stays a condition nobody
+        was told about. A read that fails delivers anyway: the absence may be
+        real, and a mirror that will not answer is the worst moment to go quiet
+        about a session that died.
+        """
+        if not any(signal.kind in ABSENCE_KINDS for signal in fresh):
+            return fresh
+        try:
+            payload = self._read_state(self.config, force_pull=True)
+        except Exception as exc:  # noqa: BLE001 - the delivery below is not its dependant
+            self._absorb(
+                "confirm", exc,
+                "the crash it was checking is delivered unconfirmed, because a "
+                "mirror that will not answer is the worst moment to go quiet "
+                "about a session that died",
+            )
+            return fresh
+        self._clear("confirm")
+        confirmed = _signals(payload)
+        kept = []
+        for signal in fresh:
+            if signal.kind not in ABSENCE_KINDS or signal.key in confirmed:
+                kept.append(signal)
+                continue
+            self.unconfirmed += 1
+            if self._seen is not None:
+                self._seen.pop(signal.key, None)
+            logger.info(
+                "platform_detection_absence_withdrawn run=%s kind=%s — the mirror "
+                "was a pull behind; its run state is there and nothing was "
+                "announced", signal.ref, signal.kind,
+            )
+        return kept
 
     def _nudge_stage(self) -> None:
         """:meth:`nudge_once` with its failures absorbed, as a tick stage.
@@ -1718,12 +1828,19 @@ class Detector:
         self.notified += 1
         return True, bool(live)
 
-    def _absorb(self, stage: str, exc: BaseException) -> None:
+    def _absorb(
+        self, stage: str, exc: BaseException, outcome: str = _TICK_SKIPPED
+    ) -> None:
         """Log a failure once per cause per stage, then demote its repeats.
 
         Per *stage* rather than one shared cause, so a permanently unwritable
         spool cannot make an unrelated first mirror failure look like a repeat and
         hide it at ``DEBUG``.
+
+        *outcome* is a parameter because :meth:`_confirmed` delivers the crash it
+        could not confirm: the shared "this tick is skipped" would tell whoever is
+        reconciling a mirror outage that nothing was announced, while they are
+        looking at the digest that was.
         """
         self.failures += 1
         cause = f"{type(exc).__name__}: {exc}"
@@ -1737,9 +1854,9 @@ class Detector:
             return
         self._failed[stage] = (cause, 1)
         logger.error(
-            "platform_detection_failed stage=%s error=%s — this tick is skipped "
-            "and detection keeps going; identical repeats are logged at debug, "
-            "and the fleet view does not depend on any of it", stage, cause,
+            "platform_detection_failed stage=%s error=%s — %s; identical repeats "
+            "are logged at debug, and the fleet view does not depend on any of it",
+            stage, cause, outcome,
         )
 
     def _clear(self, stage: str) -> None:

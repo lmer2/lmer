@@ -363,6 +363,13 @@ def remove(session_id: str, *, force: bool = False) -> bool:
 
     ``force`` skips the ownership check entirely; :func:`prune_dead` uses it.
 
+    Held under the entry's lock, the same one :func:`update` takes: otherwise
+    ``update`` reads, is overtaken by the unlink, and writes the entry it read
+    straight back — a resurrected entry the fleet view shows as crashed forever.
+    The two racers are real: ``assistant.stop`` removes the entry of a session it
+    signalled, and that unclean exit is what ``spawn._watch`` is recording at the
+    same moment.
+
     The session's control token (:func:`token_path`) goes with the entry, and
     only when the entry actually went: a removal this process declined, or an
     entry already moved aside as corrupt, leaves the token alone. Without this,
@@ -371,24 +378,27 @@ def remove(session_id: str, *, force: bool = False) -> bool:
     exactly what just got deleted.
     """
     path = session_path(session_id)
-    entry = read_session(session_id)
-    if entry is not None and not force:
-        owner = entry.get("owner_pid")
-        if isinstance(owner, int) and owner != os.getpid() and _pid_alive(owner):
-            logger.debug(
-                "platform_session_remove_skipped id=%s owner_pid=%s (not ours)",
-                session_id, owner,
+    with mutating(path):
+        entry = read_session(session_id)
+        if entry is not None and not force:
+            owner = entry.get("owner_pid")
+            if isinstance(owner, int) and owner != os.getpid() and _pid_alive(owner):
+                logger.debug(
+                    "platform_session_remove_skipped id=%s owner_pid=%s (not ours)",
+                    session_id, owner,
+                )
+                return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            logger.warning(
+                "platform_session_remove_failed id=%s error=%s", session_id, exc
             )
             return False
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return False
-    except OSError as exc:
-        logger.warning(
-            "platform_session_remove_failed id=%s error=%s", session_id, exc
-        )
-        return False
+    # Outside the lock: the token has a path of its own that nothing
+    # read-modify-writes.
     try:
         token_path(session_id).unlink()
     except FileNotFoundError:

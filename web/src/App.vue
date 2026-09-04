@@ -28,7 +28,7 @@ import {
 import {
   rememberChoice, rememberFlag, storedChoice, storedFlag,
 } from './preferences.js'
-import { onRunRef } from './runref.js'
+import { onRunRef, runKey } from './runref.js'
 
 const POLL_MS = 10000
 
@@ -180,9 +180,7 @@ watch(uberOpen, (open) => {
 let poll = null
 let tick = null
 
-function keyOf(run) {
-  return `${run.host}/${run.project}/${run.slug}`
-}
+const keyOf = runKey
 
 const attention = computed(() => state.value?.attention || [])
 const runs = computed(() => state.value?.runs || [])
