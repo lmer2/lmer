@@ -1,0 +1,64 @@
+#!/bin/bash
+# Launch a captivus chrome-agent browser and record it as THIS session's, so
+# the SessionEnd sweep can stop it without touching anybody else's (issue #410).
+#
+# Use this instead of a bare `chrome-agent launch`. Everything else — every CDP
+# call, `status`, `stop` — is plain `chrome-agent`; this wrapper exists only for
+# the one operation that creates something needing cleanup. `chrome-agent`
+# itself still means captivus, unwrapped.
+#
+# Arguments are passed through untouched:
+#   chrome-agent-launch --headless
+#   chrome-agent-launch --headless -- --window-size=1920,1080
+#
+# A bare `chrome-agent launch` still works and is not an error — it simply is
+# not recorded, so the sweep will leave its browser alone. That is the intended
+# direction of failure: a leaked browser is visible and bounded, a browser
+# stopped out from under another session is neither.
+
+set -u
+
+# shellcheck source=../libexec/chrome-agent-session.sh
+. "$(dirname "$(readlink -f "$0")")/../libexec/chrome-agent-session.sh"
+
+out="$(chrome-agent launch "$@")"
+status=$?
+printf '%s\n' "$out"
+[ "$status" -eq 0 ] || exit "$status"
+
+name="$(printf '%s' "$out" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+# Only a plain instance name gets recorded; the sweep passes these to a command.
+case "$name" in
+    "" | *[!A-Za-z0-9._-]* )
+        echo "⚠️  chrome-agent-launch: could not record the instance name;" >&2
+        echo "   SessionEnd will not sweep it. Stop it yourself when done." >&2
+        exit 0
+        ;;
+esac
+
+ledger="$(chrome_agent_ledger_path)"
+if [ -z "$ledger" ]; then
+    echo "⚠️  chrome-agent-launch: no session to attribute this browser to;" >&2
+    echo "   SessionEnd will not sweep it. Stop it yourself when done." >&2
+    exit 0
+fi
+
+# Record an IDENTITY, not just a name. captivus hands out the lowest free
+# `<dir>-NN` and `stop` frees it again, so a name this session recorded can
+# later belong to a different session's browser — and stopping by name alone
+# would then kill theirs. That is not a rare race: the skill tells the agent to
+# stop promptly, which is precisely what frees the name. A pid paired with its
+# start time pins one process for the life of the machine, and the sweep
+# re-checks both before it stops anything.
+registry="${LMER_CHROME_AGENT_REGISTRY:-/tmp/chrome-agent/registry.json}"
+pid="$(chrome_agent_instance_pid "$registry" "$name")"
+start="$(chrome_agent_pid_starttime "$pid")"
+if [ -z "$pid" ] || [ -z "$start" ]; then
+    echo "⚠️  chrome-agent-launch: could not pin $name to a process;" >&2
+    echo "   SessionEnd will not sweep it. Stop it yourself when done." >&2
+    exit 0
+fi
+
+mkdir -p "$(dirname "$ledger")" 2>/dev/null || exit 0
+printf '%s %s %s\n' "$name" "$pid" "$start" >> "$ledger" 2>/dev/null || true
+exit 0

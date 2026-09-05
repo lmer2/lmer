@@ -286,9 +286,9 @@ Named, operator-defined startup configurations (`LMER_PRESETS_FILE`) that a sess
 ### [MCP-CONFIGURATION.md](./MCP-CONFIGURATION.md)
 **MCP Server Configuration**
 
-How `.mcp.json` is loaded and how MCP servers are exposed to Claude inside the lmer container.
+How `.mcp.json` is loaded and how MCP servers are exposed to Claude inside the lmer container. lmer wires none by default; browser automation is the `chrome-agent` skill rather than an MCP.
 
-**Best for**: Adding or troubleshooting Model Context Protocol servers (e.g. Playwright).
+**Best for**: Adding or troubleshooting Model Context Protocol servers, and deciding whether a capability wants an MCP or a CLI.
 
 ---
 
