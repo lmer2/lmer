@@ -71,6 +71,7 @@ gracefully and are listed explicitly:
 | Supervisor auto-start + FastAPI endpoint     | ✅     | ✅    | ✅  |
 | Slash commands (`agent-files` commands)      | ✅     | ✅⁷   | ✅⁷ |
 | Skills (`agent-files` skills)                | ✅     | ❌    | ❌  |
+| Browser automation (`chrome-agent`)          | ✅¹¹   | ⚠️¹¹  | ⚠️¹¹ |
 | Output styles (`agent-files` output-styles)  | ✅⁹    | ❌    | ❌  |
 | Lifecycle hook guards                        | ✅¹⁰   | ⚠️¹⁰  | ❌¹⁰ |
 | Agent memory persistence (`work memory`)     | ✅     | ✅⁸   | ✅⁸ |
@@ -158,6 +159,18 @@ gracefully and are listed explicitly:
     harnesses still surfaces only through the orchestrator's stalled-run
     digest. The same holds for the run-state, SessionEnd, and Slack reply
     guards. Pi fires no lifecycle hook guards.
+
+11. The captivus `chrome-agent` CLI and the `/usr/bin/chromium` shim are baked
+    into the image, so **any** harness can launch a browser. What is claude-only
+    is everything that makes that safe: the skill teaching the escalation ladder
+    and the memory budget, the `Bash(chrome-agent:*)` grant, and the `SessionEnd`
+    sweep — all of them live under `agent-files/claude/`. (The sweep only ever
+    stops browsers started through `bin/chrome-agent-launch`, so a non-claude
+    session's browsers are left alone rather than swept by somebody else's
+    SessionEnd — but nothing sweeps them either.) A codex or pi session
+    can therefore start a Chrome that nothing sweeps and no document has told it
+    to stop. Until skills reach those harnesses, brief them through the AGENTS.md
+    path if they are going to drive a browser (issue #410).
 
 ## Authentication
 

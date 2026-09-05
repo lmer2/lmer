@@ -18,6 +18,8 @@
       "Bash(bin/gate-push:*)",
       "Bash(cat:*)",
       "Bash(chmod:*)",
+      "Bash(chrome-agent:*)",
+      "Bash(chrome-agent-launch:*)",
       "Bash(cp:*)",
       "Bash(cut:*)",
       "Bash(date:*)",
@@ -121,6 +123,7 @@
       "Bash(work report:*)",
       "Bash(work report --file:*)",
       "Bash(xargs:*)",
+      "Bash(Xvfb:*)",
       "Bash(./claude-container:*)",
       "Bash(./lmer:*)",
       "Bash(./setup-container-home.sh:*)",
@@ -162,12 +165,12 @@
       "Write(/workspace/**)",
       "Write(review.json)",
       "Write(report.md)",
-      "mcp__playwright__*",
       "Skill(start)",
       "Skill(followup)",
       "Skill(rgr)",
       "Skill(test)",
-      "Skill(doctor)"
+      "Skill(doctor)",
+      "Skill(chrome-agent)"
     ],
     "deny": [
       "Bash(git commit:*)",
@@ -199,6 +202,15 @@
           {
             "type": "command",
             "command": "command -v work >/dev/null 2>&1 && work session-end || true"
+          }
+        ]
+      },
+      {
+        "matcher": "logout|prompt_input_exit|other",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Agents/global/hooks/chrome_agent_sweep.sh || true"
           }
         ]
       }

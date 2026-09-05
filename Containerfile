@@ -52,7 +52,13 @@ RUN microdnf -y install docker-ce-cli && \
 RUN mkdir -p /opt/tools/bin && \
     curl -fsSL https://mise.run | MISE_INSTALL_PATH=/opt/tools/bin/mise sh
 
-# Playwright system dependencies (separate layer — large, rarely changes)
+# Playwright system dependencies (separate layer — large, rarely changes).
+# The xorg-x11-server-* / libXfont2 / libXdmcp / xdotool entries are the X
+# server that makes HEADED chromium possible for the chrome-agent skill
+# (#410): this layer already carries the whole chromium GUI/graphics stack, so
+# headed costs ~1.3 MB more rather than a new stack. They live here, above the
+# harness cache-bust ARGs, so `lmer build --update-harness <name>` does not
+# re-run a dnf install. Headless stays the default.
 RUN microdnf -y install \
         alsa-lib \
         at-spi2-atk \
@@ -70,7 +76,13 @@ RUN microdnf -y install \
         mesa-libgbm \
         nss \
         pango \
-        xdg-utils && \
+        xdg-utils \
+        libXdmcp \
+        libXfont2 \
+        xdotool \
+        xorg-x11-server-Xvfb \
+        xorg-x11-server-common \
+        xorg-x11-xauth && \
     microdnf clean all
 
 # === ROOT: user creation + directory setup ===
@@ -213,15 +225,70 @@ RUN mise exec -- npm install -g @openai/codex
 ARG PI_CACHE_BUST=0
 RUN mise exec -- npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 
-# Install Playwright MCP and Browsers
+# Install Playwright and Browsers
+# The @playwright/mcp server package is gone with the MCP wiring it served
+# (issue #410) — nothing referenced it any more. Playwright itself stays: it
+# manages the chromium the chrome-agent skill drives, and it is still how
+# browser tests are authored.
 # We install globally to make the package available, and install browsers to user cache
 # Use mise exec for both commands so node/npm are on PATH for reshimming and playwright
-RUN mise exec -- bash -c "npm install -g @playwright/mcp playwright && playwright install chromium"
+RUN mise exec -- bash -c "npm install -g playwright && playwright install chromium"
 
-# Configure Playwright MCP server for Claude Code
+# === ROOT: browser-automation substrate for the chrome-agent skill ===
+#
+# captivus chrome-agent finds Chrome by testing five hardcoded absolute paths
+# (/usr/bin/google-chrome, …-stable, /usr/bin/chromium-browser, /usr/bin/chromium,
+# /snap/bin/chromium) — no PATH search, no env var, no flag. At run time we are uid
+# 1000 and every one of those is unwritable (/usr/bin is root-owned; /snap cannot be
+# created), so the shim has to be baked in here. os.path.isfile follows symlinks, so
+# one symlink is enough.
+#
+# RETIREMENT TRIGGER: an upstream captivus PR adding a PATH search / CHROME_PATH /
+# --chrome-path escape hatch to the launcher is in flight (carried by its own develop
+# run, tracked separately from #410). Once that ships and the pin below moves to a
+# release carrying it, pass CHROME_PATH instead and DELETE this symlink layer.
+#
+# The Playwright build directory is resolved, never hardcoded: a browser bump changes
+# chromium-<build>, and a stale symlink would fail at launch time inside somebody's
+# session rather than here. Zero or several matches fail the build loudly.
+USER root
+RUN set -eu; \
+    matches="$(find /home/developer/.cache/ms-playwright \
+                    -mindepth 3 -maxdepth 3 \
+                    -path '*/chromium-*/chrome-linux64/chrome' -type f | sort)"; \
+    count="$(printf '%s' "$matches" | grep -c '^' || true)"; \
+    if [ "$count" -ne 1 ]; then \
+        echo "FATAL: expected exactly 1 Playwright chromium, found $count:" >&2; \
+        printf '%s\n' "$matches" >&2; \
+        echo "Adjust the chrome-agent chromium shim in the Containerfile." >&2; \
+        exit 1; \
+    fi; \
+    ln -sfn "$matches" /usr/bin/chromium; \
+    test -x /usr/bin/chromium
+
+USER developer
+
+# captivus chrome-agent (PyPI `chrome-agent`) — the browser-automation substrate,
+# driven through the chrome-agent skill rather than an MCP server. Pinned: 0.x,
+# one maintainer, and the CDP verbs the skill teaches are what moves between minors.
+# There is no cache-bust ARG: `lmer build` only emits them for registered
+# harnesses (src/lmer_cli/build.py), so one here would be dead config. Moving
+# the pin is what rebuilds this layer.
+#
+# NAME: captivus owns the `chrome-agent` verb here. sderosiaux/chrome-agent — a
+# different project — installs an executable of the same name, so if a second CDP
+# tool is ever added it gets a distinct name or a wrapper; the two must never
+# coexist under one verb. See agent-files/claude/skills/chrome-agent/SKILL.md.
+RUN uv tool install --python /usr/bin/python3.12 chrome-agent==0.5.8 && \
+    chrome-agent --version
+
+
+# Copy MCP configuration from repo. lmer ships no MCP server of its own (#410).
+# This copy is the base the .mcp.local.json merge rewrites at container start —
+# note it is NOT project scope for a session working in /workspace, which is
+# where a project .mcp.json is read from. docs/MCP-CONFIGURATION.md has the
+# whole scope story.
 RUN mkdir -p /home/developer/.claude
-
-# Copy MCP configuration from repo (.mcp.json contains MCP server definitions)
 COPY --chown=developer:developer .mcp.json /home/developer/.mcp.json
 
 # === DEVELOPER: shell + git config (cached) ===

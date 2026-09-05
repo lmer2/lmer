@@ -29,6 +29,10 @@
 tests:
   text_diff_subset:
     - tests/test_agent_defs.py
+    # Reads agent-files/claude/skills/chrome-agent/SKILL.md: the skill's
+    # hazard and ladder assertions live there, so a prose-only edit to it
+    # must run them.
+    - tests/test_browser_automation_wiring.py
     - tests/test_consistency.py
     - tests/test_containerfile.py
     - tests/test_doctor_sources.py
