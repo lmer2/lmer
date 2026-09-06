@@ -880,6 +880,7 @@ def run_child(
             proc = subprocess.Popen(
                 argv,
                 env=child_env,
+                stdin=subprocess.DEVNULL,
                 stdout=stdout if stdout else subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 start_new_session=True,

@@ -421,6 +421,7 @@ def _make_stub(
     self_kill=None,
     stderr_text=None,
     stdout_text=None,
+    stdin_target_file=None,
 ):
     """Drop a stub harness binary recording argv/env, return its record files.
 
@@ -439,6 +440,10 @@ def _make_stub(
         f'printf "%s\\n" "$@" > "{argv_file}"',
         f'env > "{env_file}"',
     ]
+    if stdin_target_file:
+        lines.append(
+            f"readlink /proc/self/fd/0 > {shlex.quote(str(stdin_target_file))}"
+        )
     if answer:
         lines.append(f'printf "%s" {shlex.quote(answer)}')
     if stderr_text:
@@ -526,6 +531,51 @@ class TestMainEndToEnd:
         # The notice reaches a cross-harness child too — it rides the prompt,
         # which every harness passes through identically.
         assert NONINTERACTIVE_NOTICE.splitlines()[0] in argv
+
+    def test_child_stdin_is_devnull(self, tmp_path, monkeypatch):
+        real_popen = spawn_harness.subprocess.Popen
+        popen_kwargs = {}
+
+        def record_popen(*args, **kwargs):
+            popen_kwargs.update(kwargs)
+            return real_popen(*args, **kwargs)
+
+        monkeypatch.setattr(spawn_harness.subprocess, "Popen", record_popen)
+        code, _, _ = _run_main(
+            tmp_path, ["sol-review", "--prompt", "p"], stub="codex"
+        )
+
+        assert code == 0
+        assert "stdin" in popen_kwargs
+        assert popen_kwargs["stdin"] == subprocess.DEVNULL
+
+    def test_child_fd_zero_is_devnull_when_parent_stdin_is_an_open_pipe(
+        self, tmp_path
+    ):
+        stdin_target_file = tmp_path / "child-stdin-target.txt"
+        original_stdin = os.dup(0)
+        read_fd, write_fd = os.pipe()
+        try:
+            os.dup2(read_fd, 0)
+            os.close(read_fd)
+            read_fd = None
+            assert os.readlink("/proc/self/fd/0").startswith("pipe:[")
+
+            code, _, _ = _run_main(
+                tmp_path,
+                ["sol-review", "--prompt", "p"],
+                stub="codex",
+                stdin_target_file=stdin_target_file,
+            )
+        finally:
+            os.dup2(original_stdin, 0)
+            os.close(original_stdin)
+            os.close(write_fd)
+            if read_fd is not None:
+                os.close(read_fd)
+
+        assert code == 0
+        assert stdin_target_file.read_text().strip() == "/dev/null"
 
     def test_env_flag_overrides_preset_env(self, tmp_path):
         code, _, env_file = _run_main(

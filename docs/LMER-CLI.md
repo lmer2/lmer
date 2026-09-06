@@ -795,6 +795,25 @@ lmer build --local /path/to/agents/global
 
 **Note**: `--workspace-volume` and `--workspace-bind` options are currently not functional. The workspace uses the `/workspace` directory from the container image instead.
 
+### Fan-out launch safety and timeout triage
+
+Launch each `spawn-harness` invocation in its own Bash call. Never combine it
+with a heredoc; if a combined call is unavoidable, append `</dev/null` to the
+`spawn-harness` command. Current images detach the child's standard input, but
+the explicit launch shape also protects sessions on older images and other
+stdin-reading commands in the same call. Use the shell tool's managed
+background facility instead of `nohup spawn-harness ... &`, so it tracks the
+child through completion and captures its final output. See
+[Fan-out agents](./PRESETS.md#fan-out-agents---agents--lmer_agents) for the
+in-container workflow.
+
+For Codex children, `Reading additional input from stdin...` appears on every
+non-TTY run and is not the fault signal by itself. When a child times out,
+inspect the beginning of `spawn-harness`'s stderr passthrough: if there is no
+`OpenAI Codex v...` banner, the child stalled before startup. A failure footer
+exists only with `--output` and retains the last 40 stderr lines, so it usually
+does not contain the startup banner and cannot answer that question.
+
 ### Startup presets (`--preset` / `LMER_PRESET`)
 
 Named startup presets — a local checkout to mount, a service container to target, extra environment variables, extra CLI flags — are defined once by the operator in the JSON file named by `LMER_PRESETS_FILE`; the same file serves Slack-selected and CLI-selected presets, and the format, validation rules, and trust model are documented in [docs/PRESETS.md](./PRESETS.md). A CLI invocation applies one by name:
