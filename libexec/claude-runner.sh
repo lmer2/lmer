@@ -18,11 +18,19 @@ else
 fi
 
 # Check for .claude.json
-if [ -f "$HOME/.claude.json" ]; then
+CLAUDE_CONFIG_FILE="${LMER_CLAUDE_CONFIG_FILE:-$HOME/.claude.json}"
+if [ -f "$CLAUDE_CONFIG_FILE" ]; then
     echo "✅ Claude config found at ~/.claude.json"
 else
     echo "⚠️  No .claude.json found"
 fi
+
+# Pre-trust the workspace so claude's folder-trust dialog (and, for a config
+# we have to seed, its first-run onboarding) never blocks the session (#415).
+# claude inherits this script's cwd, so that is the path it will key trust on.
+# shellcheck source=./claude-trust.sh
+source "$(dirname "$0")/claude-trust.sh"
+claude_pretrust_workspace "$CLAUDE_CONFIG_FILE" "$(pwd -P)"
 
 # Check statsig directory
 if [ -d "$HOME/.claude/statsig" ]; then
