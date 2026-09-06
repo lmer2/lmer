@@ -1,0 +1,2 @@
+fixed:
+- "Fan-out children no longer stall before startup when spawn-harness inherits an open standard-input socket"
