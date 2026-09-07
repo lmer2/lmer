@@ -27,6 +27,7 @@ its registry entry reaped by the watcher thread, so any assertion about a
 import contextlib
 import json
 import os
+import re
 import signal
 import threading
 import stat
@@ -1967,6 +1968,18 @@ def orchestrate_prose():
     return " ".join(orchestrate_instructions().split())
 
 
+def orchestrate_section_of(phrase):
+    """The `##` section of the instructions holding *phrase*, whitespace-joined.
+
+    Rendering proves a paragraph is in the text; it cannot prove the text around
+    it does not tell the session to skip it. Section membership can.
+    """
+    sections = re.split(r"^## ", orchestrate_instructions(), flags=re.M)
+    holding = [s for s in sections if phrase in " ".join(s.split())]
+    assert len(holding) == 1, f"{phrase!r} is in {len(holding)} sections, expected 1"
+    return " ".join(holding[0].split())
+
+
 def test_the_taskdef_documents_the_api_behind_the_cli(platform_root):
     """A URL and a key are no use without knowing what to ask for.
 
@@ -2187,6 +2200,13 @@ def test_the_taskdef_only_advertises_an_api_it_was_actually_given(
         "the CLI reads the same two variables, so a session that was given "
         "neither has no more use for it than for the routes"
     )
+    # Issue #423, the other direction: what the session *has* is not conditional
+    # on the API, and the unreachable incarnation is the one with nothing else.
+    for fact in ("the same tokens every normal run gets", "fully functional clone"):
+        assert fact in " ".join(rendered.split()), (
+            f"{fact!r} reaches only one kind of session; a host with no API has "
+            "nothing but `/work` and a forge token to answer from"
+        )
 
 
 def render_unreachable_taskdef(monkeypatch, reason):
@@ -2662,6 +2682,81 @@ def test_the_taskdef_tells_the_assistant_where_its_memory_lives(platform_root):
         "the store is permanent now and re-read every incarnation, and the "
         "no-secrets rule the agent sees elsewhere is scoped to the work-repo "
         "route it does not have"
+    )
+
+
+def test_the_taskdef_states_the_credentials_and_the_writable_work_clone(
+    platform_root,
+):
+    """Issue #423. Both facts had to be repeated to live incarnations, which is
+    what missing from the starting context looks like: the file named only the
+    platform secret, so a session inferred a reader's forge credentials, and the
+    only thing it said about the work repo was which `work` verbs fail, so
+    `/work` read as a snapshot. The writer half is asserted with them — it is
+    the true half of the sentence the correction replaced.
+    """
+    text = orchestrate_prose()
+    assert "the same tokens every normal run gets" in text, (
+        "nothing says the assistant's forge credentials are an ordinary run's, "
+        "so it infers a reader's from the platform secret being the only one named"
+    )
+    assert "fully functional clone" in text and "not a frozen read view" in text, (
+        "`/work` reads as a view of the work repo unless it is called a clone"
+    )
+    assert "pulls and pushes with plain `git`" in text, (
+        "an assistant that is not told the clone is pushable routes an artifact "
+        "through a worker session instead of pushing it"
+    )
+    assert "Pull before you read anything time-sensitive" in text, (
+        "a clone from session start answers questions about runs that have moved"
+    )
+    # #423's own wording was "tell the owning run to pull before its next
+    # `work commit`"; that couples the notice to a commit that integrates the
+    # push by itself (commit_work_path is commit-FIRST). What the run cannot do
+    # by itself is *see* the file — its clone is a different clone.
+    assert "tell the owning run that the file is there" in text, (
+        "a push into a run's dir that the run is never told about is a file only "
+        "the next incarnation of that run might stumble on"
+    )
+    assert "its own clone needs a pull to see it" in text, (
+        "the run's clone is not this one, so the artifact is invisible there "
+        "until it pulls"
+    )
+    for verb in ("work log", "work commit", "work report"):
+        assert f"`{verb}`" in text, (
+            f"`{verb}` is a writer that genuinely fails, and the clone correction "
+            "must not read as making every `work` write available"
+        )
+    # Measured on a repo-less invocation: the writers exit 1, and `work state`,
+    # `ledger`, `goals`, `resume` and `sessions` print `No run context` and exit 0
+    # — a silent no-op that reads like an empty run, which is the worse failure.
+    assert "The readers are worse" in text and "exit **0**" in text, (
+        "an assistant told only the writers are gone runs `work state` to answer "
+        "'what is that run doing', gets a clean exit, and reports the run empty"
+    )
+    assert "no flag points one at another run" in text, (
+        "there is no --run/--slug/--host/--project on any `work` subparser, so "
+        "'no run context' is not something a flag can supply"
+    )
+    # The push is the half that fails silently often: every writer in the repo
+    # goes commit-first -> pull --rebase -> push (git_ops._push_with_rebase_retries),
+    # because a pull-first sequence refuses outright on a dirty tree.
+    assert "commit first, then `pull --rebase`, then push" in text, (
+        "a bare push into this repo is rejected non-fast-forward whenever any "
+        "other session has pushed since the clone, which on a live fleet is the "
+        "common case"
+    )
+    # Issue #423 asked for these facts next to the platform-API section. Inside
+    # it, the unreachable branch's closing "skip the rest of this section" covers
+    # them — on precisely the host that has nothing but `/work` and a token.
+    section = orchestrate_section_of("Your credentials are an ordinary run's")
+    assert "skip the rest of this section" not in section, (
+        "these two facts share a section with an instruction to skip the rest of "
+        "it; they need their own heading (or a place above that section)"
+    )
+    assert "fully functional clone" in section, (
+        "the two facts belong to one section — splitting them lets a future "
+        "edit move one back under the skip instruction"
     )
 
 
