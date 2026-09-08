@@ -76,7 +76,7 @@ import subprocess
 import threading
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
 
 # One definition of the credential scrub, imported rather than reimplemented —
@@ -510,6 +510,13 @@ class PlatformConfig:
     #:
     #: No environment override, unlike every scalar above it: a JSON list in an
     #: env var is a footgun, and declaring slots is once-per-host file work.
+    #:
+    #: **This is the boot-time snapshot and decides nothing** (issue #256). The
+    #: daemon writes this field itself now, so every reader that must see the
+    #: current list goes through :func:`with_stored_slots` — which is also what
+    #: lets the editor resolve a *candidate* list through the same resolver. A
+    #: new ``slot_rows(config)`` on a long-lived config gets a stale answer with
+    #: nothing to warn it.
     slots: tuple = ()
     #: How long a run may go unchecked before the daemon spools a digest naming
     #: it (issue #244), in seconds. ``0`` disables check-in digests; see
@@ -1375,6 +1382,61 @@ def upload_types() -> tuple:
     return DEFAULT_UPLOAD_TYPES
 
 
+def stored_slots() -> tuple:
+    """The service-slot entries ``config.json`` holds **now** (issue #256).
+
+    :attr:`PlatformConfig.slots` is the value read at *load* time, and the
+    daemon holds one resolved config for its whole life — so a slot written to
+    the file under a running platform stayed invisible until it restarted. This
+    is the whole resolution chain for the field rather than a shortcut through
+    it: ``slots`` deliberately has no environment layer, so the file is the only
+    layer there is, and reading it fresh cannot bake an export into anything.
+
+    :func:`upload_types`' posture, and the same house rules as at load time —
+    an unreadable file resolves to no slots with a log line, never an exception,
+    because this is called from the fleet payload and from the spawn gate. Use
+    :func:`stored_slots_or_problem` where the caller can *report* the failure:
+    ``()`` is a claim about the host, and a read that did not happen must not
+    be shown as a host that declares nothing.
+    """
+    entries, _problem = stored_slots_or_problem()
+    return entries
+
+
+def stored_slots_or_problem() -> tuple:
+    """:func:`stored_slots`, plus why it is empty when a read failed.
+
+    ``(entries, problem)``, where *problem* is ``None`` unless ``config.json``
+    exists and could not be read. Before #256 the boot-time value carried the
+    rows across a transient read failure; re-reading per request moves that
+    failure onto every poll, which is the trade hot slots buy — but it must not
+    be silent, or a file saved mid-edit renders as a host with no slots at all
+    while the spawn gate refuses by the wrong name.
+    """
+    try:
+        stored = read_json(config_path())
+    except StoreError as exc:
+        logger.error(
+            "platform_config_unreadable error=%s — no service slots are "
+            "declared", exc,
+        )
+        return (), str(exc)
+    if not isinstance(stored, dict):
+        return (), None
+    return _slots_value(stored.get("slots")), None
+
+
+def with_stored_slots(config: PlatformConfig) -> PlatformConfig:
+    """*config* with its slots re-read from the file (issue #256).
+
+    The seam between "resolved once at boot" and "resolved now", and it is a
+    call the reader has to make deliberately: :mod:`lmer_platform.slots` keeps
+    answering for the config it is handed, so the editor can resolve a
+    *candidate* list through the identical code by passing a config carrying it.
+    """
+    return replace(config, slots=stored_slots())
+
+
 def _int_group_settings(keys: dict, *, group: str) -> dict:
     """One integer setting group, resolved layer by layer.
 
@@ -1451,47 +1513,56 @@ def _layer_int(raw: object, *, layer: str, field: str) -> Optional[int]:
 _STORED_LOCK = threading.Lock()
 
 
-def update_stored(changes: dict) -> dict:
-    """Persist *changes* into ``config.json`` — the stored layer and only it.
+def mutate_stored(compute: Callable[[dict], dict]) -> dict:
+    """Edit ``config.json``'s stored layer — the stored layer and only it.
 
-    Not :func:`save`, deliberately: ``save`` writes a whole resolved
-    :class:`PlatformConfig`, and a resolved config has the environment baked
-    into it — persisting one from a daemon whose operator has
-    ``LMER_PLATFORM_ASSISTANT_MODEL`` exported would copy the export into the
-    file, where it would outlive the export and read as a choice nobody made.
-    This edits the stored mapping itself: unknown keys in the file survive
-    untouched (the same tolerance :func:`load` has for a file written by a
-    newer build), a value of ``None`` removes the key so the layer below shows
-    through, and everything else is stored as given.
+    *compute* is handed the stored mapping as it is on disk **now** and answers
+    the changes to apply to it, all inside the write lock. An edit that has to
+    read the current value to decide the next one — every service-slot edit does
+    (issue #256) — cannot read outside the lock and write inside it: two such
+    writes interleaving drop one of them silently.
 
-    The merged file is validated as a whole before it is written — built into a
+    The stored mapping itself is edited, never a resolved config: unknown keys
+    in the file survive untouched (the same tolerance :func:`load` has for a
+    file written by a newer build), a value of ``None`` removes its key so the
+    layer below shows through, and everything else is stored as given. The
+    merged file is validated as a whole before it is written — built into a
     :class:`PlatformConfig` exactly as :func:`load` would build it — so a write
     that would make the next boot refuse the file is refused here instead, with
     the caller still attached to hear it.
 
-    Returns the stored mapping as written.
+    *compute* may raise to abandon the write; nothing is written and the
+    exception reaches the caller unchanged, which is how a precondition that can
+    only be checked against the current file (a slot changed under an edit)
+    refuses without a second read.
+
+    Raises :class:`lmer_platform.store.StoreError` when ``config.json`` exists
+    and cannot be read. A caller with a human attached should say so rather than
+    write: see the comment on the read below.
     """
-    known = _known_fields()
-    unknown = set(changes) - known
-    if unknown:
-        raise ConfigError(
-            f"unknown config field(s): {', '.join(sorted(unknown))}"
-        )
     with _STORED_LOCK:
-        try:
-            stored = read_json(config_path())
-        except StoreError as exc:
-            logger.error(
-                "platform_config_unreadable error=%s — the update starts from "
-                "an empty stored config", exc,
-            )
-            stored = None
+        # Deliberately NOT :func:`load`'s warn-and-continue: starting from an
+        # empty mapping is right at boot — a daemon that will not start cannot be
+        # fixed through its own UI — and wrong for a write, where it would
+        # *publish* that empty mapping over a file it could not read. The
+        # newer-schema refusal is the case that makes it destructive rather than
+        # merely lossy: ``read_json`` leaves those bytes deliberately untouched
+        # (nothing is moved aside), so overwriting them destroys the only copy.
+        # ``None`` — no file yet — is the one absence that really is empty.
+        stored = read_json(config_path())
         current = dict(stored) if isinstance(stored, dict) else {}
         # The store's own bookkeeping, not configuration: ``write_json`` stamps
         # both on every write, so carrying the old pair forward would only
         # persist a stale ``updated``.
         current.pop("schema", None)
         current.pop("updated", None)
+        changes = compute(dict(current))
+        known = _known_fields()
+        unknown = set(changes) - known
+        if unknown:
+            raise ConfigError(
+                f"unknown config field(s): {', '.join(sorted(unknown))}"
+            )
         for field, value in changes.items():
             if value is None:
                 current.pop(field, None)
@@ -1502,6 +1573,22 @@ def update_stored(changes: dict) -> dict:
         }))
         write_json(config_path(), current)
     return current
+
+
+def update_stored(changes: dict) -> dict:
+    """Persist a fixed set of *changes* — :func:`mutate_stored` with no reading.
+
+    Not :func:`save`, deliberately: ``save`` writes a whole resolved
+    :class:`PlatformConfig`, and a resolved config has the environment baked
+    into it — persisting one from a daemon whose operator has
+    ``LMER_PLATFORM_ASSISTANT_MODEL`` exported would copy the export into the
+    file, where it would outlive the export and read as a choice nobody made.
+
+    Use this when the values to store are already decided. When they depend on
+    what the file currently holds, use :func:`mutate_stored` directly — the
+    reading has to happen under the same lock as the write.
+    """
+    return mutate_stored(lambda _current: changes)
 
 
 def configured_repo_url() -> Optional[str]:

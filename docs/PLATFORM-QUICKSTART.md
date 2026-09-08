@@ -211,10 +211,12 @@ conversation window is lost.
   be forgotten from their card (undo window; nothing on disk is touched).
 - **Service slots** — named single-occupancy bindings from a runner to a dev
   service on this host, declared under `slots` in `config.json` and shown as a
-  row each under the runs list. The spawn dialog's picker offers the free ones;
-  `lmer-ctl spawn … --slot <name>` takes one from a shell. Occupancy is derived
-  from live sessions, so a slot frees when its session's process ends and a
-  crash cannot strand one. Full reference:
+  row each under the runs list. Declare, edit and remove them from that section;
+  the spawn dialog's picker offers the free ones, and
+  `lmer-ctl spawn … --slot <name>` takes one from a shell. Changes apply on the
+  next poll — nothing is restarted. Occupancy is derived from live sessions, so
+  a slot frees when its session's process ends and a crash cannot strand one.
+  Full reference:
   [SERVICE-MODE.md](SERVICE-MODE.md#service-slots-several-agents-one-dev-stack).
 - **"stopped responding"** — a run whose session is up but whose agent stopped
   producing anything, with no stop recorded by the run itself. That is what a

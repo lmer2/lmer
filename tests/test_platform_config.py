@@ -10,6 +10,8 @@ import inspect
 import json
 import os
 import stat
+import time
+from dataclasses import replace
 
 import pytest
 
@@ -1153,6 +1155,124 @@ def test_update_stored_writes_slots_without_baking_in_the_environment(
 
     assert stored["slots"] == entries
     assert "bind_address" not in stored
+
+
+def test_stored_slots_reads_the_file_as_it_is_now(platform_root):
+    """Issue #256's first obstacle: the daemon holds one config for its life."""
+    config = cfg.load()
+    assert config.slots == ()
+
+    cfg.update_stored({"slots": [{"name": "webapp", "preset": "webapp_dev"}]})
+
+    assert config.slots == (), "the resolved config is still the boot-time one"
+    assert cfg.stored_slots() == ({"name": "webapp", "preset": "webapp_dev"},)
+    assert cfg.with_stored_slots(config).slots == cfg.stored_slots()
+
+
+def test_with_stored_slots_changes_nothing_else(platform_root, monkeypatch):
+    """It is the slots seam, not a reload — an export must not be re-resolved."""
+    monkeypatch.setenv(cfg.ENV_BIND_ADDRESS, "10.0.0.1")
+    config = cfg.load()
+    monkeypatch.setenv(cfg.ENV_BIND_ADDRESS, "10.0.0.2")
+
+    refreshed = cfg.with_stored_slots(config)
+
+    assert refreshed.bind_address == "10.0.0.1"
+    assert refreshed == replace(config, slots=cfg.stored_slots())
+
+
+def test_stored_slots_survives_an_unreadable_file(platform_root, caplog):
+    """Read on the fleet poll and at the spawn gate: it may not raise."""
+    path = cfg.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    with caplog.at_level("ERROR", logger="lmer_platform.config"):
+        assert cfg.stored_slots() == ()
+
+    assert "platform_config_unreadable" in caplog.text
+
+
+def test_stored_slots_applies_the_house_rule_to_a_non_list(platform_root, caplog):
+    store.write_json(cfg.config_path(), {"slots": {"webapp": "webapp_dev"}})
+
+    with caplog.at_level("WARNING", logger="lmer_platform.config"):
+        assert cfg.stored_slots() == ()
+
+    assert "field=slots" in caplog.text
+
+
+# --- the locked read-modify-write (mutate_stored, issue #256) ----------------
+
+def test_mutate_stored_computes_its_changes_from_the_current_file(platform_root):
+    cfg.update_stored({"slots": [{"name": "one", "preset": "p"}]})
+    seen = []
+
+    def compute(current):
+        seen.append(current)
+        return {"slots": list(current["slots"]) + [{"name": "two", "preset": "p"}]}
+
+    stored = cfg.mutate_stored(compute)
+
+    assert seen == [{"slots": [{"name": "one", "preset": "p"}]}]
+    assert [entry["name"] for entry in stored["slots"]] == ["one", "two"]
+
+
+def test_mutate_stored_writes_nothing_when_the_callback_raises(platform_root):
+    """How a precondition that can only be checked under the lock refuses."""
+    cfg.update_stored({"slots": [{"name": "one", "preset": "p"}]})
+
+    class Refused(RuntimeError):
+        pass
+
+    def compute(_current):
+        raise Refused("not on my watch")
+
+    with pytest.raises(Refused):
+        cfg.mutate_stored(compute)
+
+    assert cfg.load().slots == ({"name": "one", "preset": "p"},)
+
+
+def test_mutate_stored_serialises_two_writers(platform_root):
+    """Two threads each appending: the lock is what keeps both changes.
+
+    Without it the merge happens outside the lock and the later write is
+    computed from a list that no longer exists — one operator's change silently
+    gone.
+    """
+    import threading
+
+    cfg.update_stored({"slots": []})
+    start = threading.Barrier(2)
+
+    def append(name):
+        start.wait()
+
+        def compute(current):
+            entries = list(current.get("slots") or [])
+            # Widen the window the lock has to cover.
+            time.sleep(0.01)
+            return {"slots": entries + [{"name": name, "preset": "p"}]}
+
+        cfg.mutate_stored(compute)
+
+    threads = [
+        threading.Thread(target=append, args=(name,)) for name in ("a", "b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(
+        entry["name"] for entry in cfg.load().slots
+    ) == ["a", "b"]
+
+
+def test_mutate_stored_refuses_an_unknown_field(platform_root):
+    with pytest.raises(cfg.ConfigError, match="assistant_effort"):
+        cfg.mutate_stored(lambda _current: {"assistant_effort": "high"})
 
 
 def test_no_environment_variable_declares_slots(platform_root, monkeypatch):

@@ -1172,6 +1172,9 @@ def test_build_state_carries_a_row_per_declared_slot(platform_root, slot_host):
     assert [row["name"] for row in payload["slots"]] == ["webapp", "plain"]
     assert payload["slots"][0] == {
         "name": "webapp", "preset": "webapp_dev", "description": "Web app dev",
+        # The version an editor sends back as If-Match (#256); pinned in
+        # tests/test_platform_slots_api.py rather than spelled out here.
+        "etag": payload["slots"][0]["etag"],
         "service": "webapp-web", "service_group": None, "members": [],
         "state": "free", "reason": None,
         "occupant": None, "occupants": [], "service_occupants": [],

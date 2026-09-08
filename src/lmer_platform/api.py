@@ -57,7 +57,7 @@ import json
 import logging
 import os
 import secrets as secrets_mod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -110,13 +110,17 @@ from .config import (
     active_assistant_credential,
     assistant_settings,
     checkin_settings,
+    _slots_value,
     configured_repo_url,
+    mutate_stored,
     nudge_settings,
     upload_settings,
     upload_types,
     update_stored,
     validate_assistant_override,
     validate_int_setting,
+    stored_slots_or_problem,
+    with_stored_slots,
 )
 from .inventory import StallPolicy, build_inventory
 from .lifecycle import LifecycleError
@@ -133,7 +137,18 @@ from .session_io import ControlPlaneError, SessionIOError
 # that pair (T73). Private and reused deliberately, the same trade this module
 # already makes with ``lmer_cli.cli``'s discovery helpers: a second reading of a
 # repo URL here would offer the operator a tier the container never searches.
-from .slots import slot_rows
+# Both reason helpers are private and imported deliberately, the trade this
+# module already makes with ``_discover_all_tasks``: the form's refusal and the
+# row's reason for the same fault must be one sentence, and a second copy of it
+# is a copy that will be improved once.
+from .slots import (
+    _KNOWN_KEYS,
+    _no_presets_reason,
+    _unknown_preset_reason,
+    parse_slots,
+    slot_rows,
+    slot_status,
+)
 from .spawn import (
     CapacityError,
     RunAlreadyLive,
@@ -145,7 +160,7 @@ from .spawn import (
     derive_run_identity,
     spawn_session,
 )
-from .store import utc_now_iso
+from .store import StoreError, utc_now_iso
 from .ui_build import dist_dir
 from .workrepo import (
     fold_registry,
@@ -735,6 +750,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
         ),
     )
 
+    slot_entries, slots_problem = stored_slots_or_problem()
     payload = {
         "schema": SCHEMA_VERSION,
         "generated_at": utc_now_iso(),
@@ -749,7 +765,22 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
         # The sessions read above are passed in to save a registry read;
         # ``slot_rows`` filters them for liveness itself, which matters because
         # this list deliberately includes dead entries.
-        "slots": [row.to_dict() for row in slot_rows(config, sessions=sessions)],
+        #
+        # Slots are re-read from ``config.json`` here rather than taken off the
+        # boot-time config (#256): this daemon is what writes that file now, and
+        # a row that could not show the operator's own edit until a restart is
+        # the failure the editor exists to remove.
+        "slots": [
+            row.to_dict()
+            for row in slot_rows(
+                replace(config, slots=slot_entries), sessions=sessions,
+            )
+        ],
+        # ``None`` unless ``config.json`` exists and could not be read. Empty
+        # slots is otherwise a claim about the host — "this one declares none" —
+        # and a file saved mid-edit would make that claim while the spawn gate
+        # refused by the wrong name.
+        "slots_problem": slots_problem,
     }
     payload.update(inventory.to_dict())
     _fold_checkins(payload)
@@ -1168,6 +1199,255 @@ def discover_spawn_options(
     }
 
 
+# --- editing service slots (issue #256) --------------------------------------
+
+#: What a slot write may name, taken from the file's own vocabulary rather than
+#: copied from it: :mod:`lmer_platform.slots` is built to tolerate a key a newer
+#: build wrote, so a hand copy here would silently start refusing what the
+#: loader accepts.
+SLOT_BODY_KEYS = tuple(sorted(_KNOWN_KEYS))
+
+#: The subset an *edit* may change. The name is not among them: it is what a
+#: running session recorded and what the row is addressed by, so moving it is
+#: remove-then-declare rather than an edit.
+SLOT_EDIT_KEYS = tuple(key for key in SLOT_BODY_KEYS if key != "name")
+
+
+class SlotWriteRefused(Exception):
+    """A slot write that must not happen, and the answer the route gives.
+
+    Carried rather than raised as an ``HTTPException`` because these checks run
+    inside :func:`lmer_platform.config.mutate_stored`'s callback — under the
+    write lock, where FastAPI is not in scope — and because the refusals are the
+    feature: each one is a sentence an operator reads on the form.
+    """
+
+    def __init__(self, status: int, message: str, *, code: Optional[str] = None):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.code = code
+
+
+def _unreadable_config_reason(problem: str) -> str:
+    """What every slot route says when ``config.json`` cannot be read.
+
+    One sentence for the write and for the preview, because the editor shows
+    both in the same box: a form that answered "this host declares no such
+    slot" to a preview and "nothing was written" to the save would be two
+    accounts of one file nobody could read. The same rule
+    :func:`lmer_platform.slots._unknown_preset_reason` exists for.
+    """
+    return f"{problem}; nothing was changed — resolve the file on the host first"
+
+
+def _slot_entries(stored: Optional[dict] = None) -> list:
+    """The raw ``slots`` entries, from *stored* or from the file as it is now.
+
+    Reading from the file **refuses** rather than answering ``()`` when the file
+    exists and cannot be read: every caller here is deciding something on the
+    operator's behalf, and an empty list would let a preview report "this host
+    declares no service slot" about a file nothing could read — the claim
+    ``slots_problem`` exists to stop the fleet view making. The swallowing form
+    is :func:`lmer_platform.config.stored_slots`, for the spawn gate, which has
+    nowhere to report to.
+    """
+    if stored is None:
+        entries, problem = stored_slots_or_problem()
+        if problem:
+            raise SlotWriteRefused(
+                409, _unreadable_config_reason(problem), code="config_unreadable",
+            )
+        return list(entries)
+    return list(_slots_value(stored.get("slots")))
+
+
+def _entry_name(entry: object) -> Optional[str]:
+    """A raw entry's name as :func:`lmer_platform.slots.parse_slots` reads it."""
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    return name.strip() if isinstance(name, str) else None
+
+
+def _slot_at(entries: list, name: str) -> tuple:
+    """``(index, definition)`` for the entry *name* resolves to, or ``(None, None)``.
+
+    Through :func:`lmer_platform.slots.parse_slots`, so the etag an ``If-Match``
+    is compared against is the one the row published — same parser, same digest.
+
+    Index and definition come out of the *same* answer, and that is the point:
+    ``parse_slots`` skips a malformed entry, so a file carrying
+    ``[{"name": "x"}, {"name": "x", "preset": "p"}]`` has a first entry with the
+    name and a second one the daemon actually reads under it. An edit that
+    landed on the first would change something nothing reads and leave the live
+    definition untouched.
+
+    The index matters because the one-service-one-slot rule is decided in
+    declaration order, so an edit puts the entry back where it was.
+    """
+    for definition in parse_slots(entries):
+        if definition.name != name:
+            continue
+        for index, entry in enumerate(entries):
+            if entry == definition.entry:
+                return index, definition
+        # Unreachable: the definition was built from one of these entries.
+        raise SlotWriteRefused(
+            500, f"service slot {name!r} could not be located in the file",
+        )
+    return None, None
+
+
+def _slot_text(body: dict, key: str) -> Optional[str]:
+    """One text field out of a request body, or ``None`` when it is cleared.
+
+    A browser sends an emptied field as ``""``; that is a request to clear it,
+    the same reading ``POST /api/assistant/config`` gives.
+    """
+    value = body.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise SlotWriteRefused(400, f"{key} must be text, not {type(value).__name__}")
+    return value.strip() or None
+
+
+#: Slot names the ``PUT``/``DELETE`` routes cannot address, because they carry
+#: the name as one path segment. Measured against the real routes rather than
+#: reasoned about: a percent-encoded ``/`` is resolved before routing and never
+#: matches (404), and ``.``/``..`` are normalised away by the path (405).
+#: Everything else round-trips — spaces, ``?``, ``#``, ``%``, ``:`` and
+#: non-ASCII all resolve, so none of them is refused.
+_UNADDRESSABLE_NAMES = frozenset({".", ".."})
+
+
+def _addressable(name: str) -> str:
+    """*name*, if the edit and remove routes will be able to find it again.
+
+    Checked where a name is *created* rather than at load: a slot declared with
+    a ``/`` in it renders a row whose pencil 404s on its own preview, so the
+    editor would create something only a text editor can then change — the one
+    operation this feature exists to remove. A name already in a file keeps
+    working for spawning; it stays file-only work, like a malformed entry.
+    """
+    if "/" in name or name in _UNADDRESSABLE_NAMES:
+        raise SlotWriteRefused(
+            400,
+            f"slot name {name!r} cannot be addressed by the edit and remove "
+            "routes, which carry the name in the URL path — use a name without "
+            "'/' that is not '.' or '..'",
+            code="unaddressable_name",
+        )
+    return name
+
+
+def _checked_preset(name: str) -> str:
+    """*name*, if this host has a preset called that.
+
+    The issue's rule, and the reason it is a refusal rather than a warning: a
+    slot's preset is what puts the session into service mode, so a name nothing
+    resolves declares a slot that can never be used. When *nothing* loads, the
+    refusal is :func:`lmer_platform.slots._no_presets_reason`'s sentence — the
+    same words the row uses — because "no such preset" would send the operator
+    to fix a file that is fine.
+    """
+    presets = load_presets()
+    if name in presets:
+        return name
+    if not presets:
+        raise SlotWriteRefused(400, _no_presets_reason(name), code="no_presets")
+    # The row's own sentence, not a second spelling of it: this refusal and a
+    # `misconfigured` row for the same fault can be in one viewport at once (the
+    # presets file is hot). The list of what the host *does* have is already in
+    # the editor's select, so it is not repeated here.
+    raise SlotWriteRefused(
+        400, _unknown_preset_reason(name), code="unknown_preset",
+    )
+
+
+def _slot_row(config: PlatformConfig, entries: list, name: str) -> dict:
+    """The row *name* would have if ``config.json`` held *entries*.
+
+    The whole point of the editor's preview, and the reason it resolves a
+    candidate list through :func:`lmer_platform.slots.slot_rows` rather than
+    checking anything itself: the sentence the form shows is then the sentence
+    the row shows, by construction, and the rules it reports — unknown preset, a
+    preset that sets no service, a service another slot already bound — have
+    exactly one implementation.
+    """
+    rows = slot_rows(replace(config, slots=tuple(entries)))
+    for row in rows:
+        if row.definition.name == name:
+            return row.to_dict()
+    # Only reachable if ``parse_slots`` dropped the entry this route just built,
+    # which would mean the shape rules and these checks disagree.
+    raise SlotWriteRefused(
+        400, f"slot {name!r} is not a usable slot entry", code="unusable_entry",
+    )
+
+
+def _refuse_if_occupied(config: PlatformConfig, name: str, what: str) -> None:
+    """Refuse *what* while a live session holds slot *name* (409).
+
+    Measured from the running sessions, and therefore deliberately **outside**
+    the config write lock: that lock protects the file, and whether an agent is
+    running against the dev service right now is not a fact about the file. The
+    read-then-act window this leaves is the one every slot decision has
+    (:func:`lmer_platform.spawn._claim_slot` states it), and the cost of losing
+    the race here is a row that says what happened, not a corrupted write.
+
+    Only holders of this slot's own *name* count. A session holding the same
+    service under a **different** slot is not something editing this one can
+    disturb — that row already says so, and refusing here would make a slot
+    unfixable for the reason it needs fixing.
+    """
+    status = slot_status(with_stored_slots(config), name)
+    if status is None or not status.occupants:
+        return
+    who = ", ".join(
+        str(held.get("session_id")) for held in status.occupants
+    )
+    raise SlotWriteRefused(
+        409,
+        f"service slot {name!r} is held by {who} — {what} under a running "
+        "session changes what that session is bound to; pass confirm=true to "
+        "do it anyway",
+        code="slot_occupied",
+    )
+
+
+def _matched_etag(entries: list, name: str, etag: Optional[str]):
+    """The definition *etag* was taken from, or a refusal saying why not.
+
+    The concurrency check, and it is a **measurement** rather than a hope: the
+    entry is re-parsed from the file as it is at write time and its digest
+    recomputed, so an edit made in an editor between the form's read and its
+    submit is detected instead of overwritten.
+    """
+    _index, definition = _slot_at(entries, name)
+    if definition is None:
+        raise SlotWriteRefused(
+            404, f"this host declares no service slot called {name!r}",
+            code="no_such_slot",
+        )
+    if not etag:
+        raise SlotWriteRefused(
+            428,
+            "send the slot's etag as If-Match — it is on the row, and it is "
+            "what keeps this edit from overwriting one made in the file",
+            code="etag_required",
+        )
+    if etag.strip('"') != definition.etag:
+        raise SlotWriteRefused(
+            412,
+            f"service slot {name!r} changed since it was read — reload the "
+            "fleet view and make the edit again",
+            code="slot_changed",
+        )
+    return definition
+
+
 def _index_file():
     """The built SPA entry point, or ``None`` when the UI has not been built."""
     dist = dist_dir()
@@ -1303,7 +1583,7 @@ def create_app(
     import anyio
     from fastapi import Depends, FastAPI, Header, HTTPException, Query
     from fastapi.responses import (
-        FileResponse, PlainTextResponse, StreamingResponse,
+        FileResponse, JSONResponse, PlainTextResponse, StreamingResponse,
     )
     from starlette.websockets import WebSocketDisconnect
 
@@ -1384,6 +1664,24 @@ def create_app(
         )
 
     guard = [Depends(require_secret)]
+
+    def _unreadable_config(exc: StoreError) -> HTTPException:
+        """``config.json`` exists and could not be read, so nothing was written.
+
+        409 rather than 500: the daemon is fine and the request was well formed
+        — the file on disk is in a state only a person can resolve, and the
+        store's own sentence is the one that says which state (a schema a newer
+        build wrote, a file that could not be opened). Answering 200 over a
+        write that did not happen, or writing anyway, are the two things this
+        must not do.
+        """
+        return HTTPException(
+            status_code=409,
+            detail={
+                "code": "config_unreadable",
+                "message": _unreadable_config_reason(str(exc)),
+            },
+        )
 
     @app.get("/", dependencies=guard)
     def root():
@@ -3113,7 +3411,257 @@ def create_app(
             update_stored(changes)
         except ConfigError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise _unreadable_config(exc) from exc
         return _assistant_config_reply({"changed": sorted(body)})
+
+    def _slot_refusal(exc: SlotWriteRefused) -> HTTPException:
+        """One refusal, in the shape ``web/src/api.js`` already unpacks.
+
+        A structured detail rather than a bare sentence because two of these are
+        things the view acts on rather than prints: a changed slot means reload
+        and re-edit, and an occupied one means offer the confirm. The prose is
+        still what gets shown.
+        """
+        return HTTPException(
+            status_code=exc.status,
+            detail=(
+                {"code": exc.code, "message": exc.message}
+                if exc.code else exc.message
+            ),
+        )
+
+    def _store_slots(mutate: Callable[[list], list]) -> list:
+        """Apply *mutate* to the slot list under the config write lock.
+
+        *mutate* is handed the entries as the file has them **now** and answers
+        the list to store; every precondition that compares against the current
+        file is checked in there, so a concurrent write — this daemon's or an
+        operator's editor — cannot slip between the check and the write
+        (:func:`lmer_platform.config.mutate_stored`).
+
+        Returns the entries as written.
+        """
+        try:
+            stored = mutate_stored(
+                lambda current: {"slots": mutate(_slot_entries(current))}
+            )
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise _unreadable_config(exc) from exc
+        return _slot_entries(stored)
+
+    def _write_slot(name: str, mutate: Callable[[list], list]) -> dict:
+        """:func:`_store_slots`, answering with the row *name* ended up with."""
+        try:
+            return _slot_row(config, _store_slots(mutate), name)
+        except SlotWriteRefused as exc:  # pragma: no cover - see _slot_row
+            raise _slot_refusal(exc) from exc
+
+    def _slot_preview(name: str, mutate: Callable[[list], list]) -> dict:
+        """The row *mutate* would produce, without writing (``dry_run``).
+
+        Every check the write runs, and nothing written — which is what makes
+        the form's verdict the row's verdict rather than a second opinion that
+        agrees today. That includes the reads: a preview against a
+        ``config.json`` nobody can read refuses in the same words the save
+        would, rather than describing a host it never saw.
+        """
+        try:
+            return _slot_row(config, mutate(_slot_entries()), name)
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+
+    @app.post("/api/slots", dependencies=guard)
+    def create_slot(body: dict, dry_run: bool = Query(default=False)):
+        """Declare a service slot (issue #256).
+
+        ``{"name": …, "preset": …, "description": …}``. The preset must be one
+        this host has: a slot is only a slot because its preset puts the session
+        into service mode, so a name nothing resolves declares something that
+        can never be used, and the row would say so after the save instead of
+        the form saying so before it.
+
+        ``?dry_run=true`` runs every check and writes nothing, answering with
+        the row the slot *would* have — the editor's live preview. The write
+        takes effect on the next fleet poll: ``slots`` is re-read per request
+        now, so nothing has to be restarted.
+        """
+        unknown = sorted(set(body) - set(SLOT_BODY_KEYS))
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown slot field(s): {', '.join(unknown)} — a slot is "
+                    f"{', '.join(SLOT_BODY_KEYS)}"
+                ),
+            )
+        try:
+            name = _slot_text(body, "name")
+            preset = _slot_text(body, "preset")
+            if not name:
+                raise SlotWriteRefused(400, "a slot needs a name")
+            _addressable(name)
+            if not preset:
+                raise SlotWriteRefused(400, "a slot needs a preset")
+            entry = {"name": name, "preset": _checked_preset(preset)}
+            description = _slot_text(body, "description")
+            if description:
+                entry["description"] = description
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+
+        def mutate(entries: list) -> list:
+            if _slot_at(entries, name)[1] is not None:
+                raise SlotWriteRefused(
+                    409,
+                    f"this host already declares a service slot called "
+                    f"{name!r}",
+                    code="name_taken",
+                )
+            return entries + [entry]
+
+        if dry_run:
+            return _slot_preview(name, mutate)
+        # 201 for the write and 200 for the preview, which is why the code is set
+        # here rather than on the decorator: a dry run creates nothing.
+        return JSONResponse(_write_slot(name, mutate), status_code=201)
+
+    @app.put("/api/slots/{name}", dependencies=guard)
+    def update_slot(
+        name: str,
+        body: dict,
+        dry_run: bool = Query(default=False),
+        confirm: bool = Query(default=False),
+        if_match: Optional[str] = Header(default=None, alias="If-Match"),
+    ) -> dict:
+        """Change a slot's preset or description (issue #256).
+
+        A patch of what the body names, applied **onto the stored entry** rather
+        than replacing it: keys a newer build wrote survive, and so does the
+        entry's position, which decides who wins the one-service-one-slot rule.
+
+        ``If-Match`` carries the etag the row published. It is required, and a
+        mismatch is a 412 rather than a merge: the other writer is an operator
+        in an editor, and quietly winning the race is the failure this route
+        exists to avoid.
+
+        Changing the ``preset`` of a slot a live session holds re-binds what
+        that session is running against, so it is refused unless
+        ``?confirm=true``. An edit that leaves the binding where it is — a
+        description, or a preset re-sent unchanged — is not gated.
+        """
+        unknown = sorted(set(body) - set(SLOT_EDIT_KEYS))
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown slot field(s): {', '.join(unknown)} — an edit may "
+                    f"change {', '.join(SLOT_EDIT_KEYS)}"
+                ),
+            )
+        if not body:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"name at least one of {', '.join(SLOT_EDIT_KEYS)} to change"
+                ),
+            )
+        try:
+            preset = None
+            if "preset" in body:
+                preset = _slot_text(body, "preset")
+                if not preset:
+                    raise SlotWriteRefused(400, "a slot needs a preset")
+                preset = _checked_preset(preset)
+            # Only an actual change of binding is gated. A body that re-sends
+            # the preset it already has is what the editor's live preview does
+            # on every keystroke, and refusing that would make an occupied slot
+            # impossible to even look at.
+            #
+            # A dry run is never gated: it writes nothing, so there is nothing
+            # to refuse — and refusing it hid the very verdict the operator
+            # needs in order to decide whether to confirm.
+            _index, current = _slot_at(_slot_entries(), name)
+            rebinding = (
+                preset is not None
+                and current is not None
+                and current.preset != preset
+            )
+            if rebinding and not confirm and not dry_run:
+                _refuse_if_occupied(config, name, "changing its preset")
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+
+        def mutate(entries: list) -> list:
+            _matched_etag(entries, name, if_match)
+            index, _definition = _slot_at(entries, name)
+            edited = dict(entries[index])
+            if preset is not None:
+                edited["preset"] = preset
+            if "description" in body:
+                description = _slot_text(body, "description")
+                if description:
+                    edited["description"] = description
+                else:
+                    edited.pop("description", None)
+            return entries[:index] + [edited] + entries[index + 1:]
+
+        if dry_run:
+            return _slot_preview(name, mutate)
+        return _write_slot(name, mutate)
+
+    @app.delete("/api/slots/{name}", dependencies=guard)
+    def delete_slot(
+        name: str,
+        confirm: bool = Query(default=False),
+        if_match: Optional[str] = Header(default=None, alias="If-Match"),
+    ) -> dict:
+        """Remove a slot (issue #256).
+
+        Refused while a live session holds it unless ``?confirm=true``: the
+        session keeps running either way — occupancy is derived from the
+        registry, not from this file — but the guarantee it was spawned under
+        stops being declared anywhere, and the next spawn against that dev
+        service has nothing to refuse it.
+
+        ``If-Match`` as on the edit, and for the same reason.
+
+        **Every** entry carrying the name goes, not just the one the row is.
+        ``parse_slots`` keeps the first usable entry for a name and skips the
+        rest, so a file with two ``web`` entries shows one row sitting on a
+        shadow — removing only the resolved index leaves the row on screen
+        backed by the next entry, and the button reads as broken. An *edit*
+        still lands on the resolved index alone (commit fe843af9): changing the
+        slot means changing the definition in effect, while removing it means
+        the name is gone.
+        """
+        removed: list = []
+
+        def mutate(entries: list) -> list:
+            _matched_etag(entries, name, if_match)
+            kept = []
+            for entry in entries:
+                if _entry_name(entry) == name:
+                    removed.append(entry)
+                else:
+                    kept.append(entry)
+            return kept
+
+        try:
+            if not confirm:
+                _refuse_if_occupied(config, name, "removing it")
+        except SlotWriteRefused as exc:
+            raise _slot_refusal(exc) from exc
+        remaining = _store_slots(mutate)
+        return {
+            # The list, so a caller can see that a duplicate went with it.
+            "removed": removed,
+            "slots": len(remaining),
+        }
 
     @app.post("/api/prune", dependencies=guard)
     def prune() -> dict:

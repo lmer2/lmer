@@ -30,11 +30,13 @@ no opinion about the container runtime — it passes one to
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # The real parser, so "do these args rebind the slot?" is answered by the thing
@@ -113,6 +115,30 @@ class SlotDefinition:
     name: str
     preset: str
     description: Optional[str] = None
+    #: The ``config.json`` entry this was built from, when it came from a file.
+    #: Out of equality and out of ``repr`` because it is not part of what a slot
+    #: *is* — it is what :attr:`etag` digests, and a definition built by hand
+    #: has to compare equal to the same definition read off disk.
+    entry: Optional[dict] = field(default=None, compare=False, repr=False)
+
+    @property
+    def etag(self) -> str:
+        """A digest of the entry, for detecting an edit made behind this one.
+
+        Over the **raw entry** rather than over the three fields above: an entry
+        may carry keys this build does not know (:func:`_build_slot` warns and
+        keeps the slot), and comparing field by field would either call an
+        untouched entry changed or quietly drop what it could not see. A
+        definition with no entry — one built in code — digests its own fields,
+        so the property is total.
+        """
+        source = self.entry if isinstance(self.entry, dict) else {
+            "name": self.name,
+            "preset": self.preset,
+            "description": self.description,
+        }
+        canonical = json.dumps(source, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -259,6 +285,10 @@ class SlotStatus:
             "name": self.definition.name,
             "preset": self.definition.preset,
             "description": self.definition.description,
+            # What an editor sends back as ``If-Match`` (issue #256): the row is
+            # the only place a client ever sees the entry, so this is where the
+            # version it edited against comes from.
+            "etag": self.definition.etag,
             "service": self.service,
             "service_group": self.service_group,
             "members": list(self.members),
@@ -346,7 +376,9 @@ def _build_slot(
         )
         description = None
 
-    return SlotDefinition(name=name, preset=preset, description=description)
+    return SlotDefinition(
+        name=name, preset=preset, description=description, entry=dict(entry)
+    )
 
 
 def slot_definitions(config: PlatformConfig) -> list[SlotDefinition]:
@@ -778,6 +810,17 @@ def _no_presets_reason(preset_name: str) -> str:
     )
 
 
+def _unknown_preset_reason(preset_name: str) -> str:
+    """Why a named preset this host has heard nothing of makes a slot unusable.
+
+    A function for :func:`_no_presets_reason`'s reason: the editor refuses the
+    same fault before a save (:mod:`lmer_platform.api`), and two spellings of
+    one verdict in one viewport is the drift the issue's "same sentence" rule
+    exists to prevent.
+    """
+    return f"preset {preset_name!r} is not defined on this host"
+
+
 def _resolve_definition(
     definition: SlotDefinition, presets: dict, claimed: dict, groups: dict
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -796,9 +839,7 @@ def _resolve_definition(
             # A different fault from a name that is merely absent: blaming the
             # wrong one sends the operator to check the thing that is right.
             return None, None, _no_presets_reason(definition.preset)
-        return None, None, (
-            f"preset {definition.preset!r} is not defined on this host"
-        )
+        return None, None, _unknown_preset_reason(definition.preset)
 
     rebinding = _rebinding_arg(preset)
     if rebinding == ARGS_UNPARSEABLE:

@@ -3650,12 +3650,18 @@ def test_the_event_table_cannot_grow_without_bound(config):
 
 
 def slot_config(fake_lmer, entries=None):
-    return cfg.load({
-        "lmer_bin": str(fake_lmer),
+    """A config declaring *entries*, written to the file the gate reads.
+
+    Not a ``load`` override: since #256 the spawn gate re-reads ``slots`` from
+    ``config.json`` at claim time, so a slot that exists only in a resolved
+    config is a slot the daemon does not have.
+    """
+    cfg.update_stored({
         "slots": entries if entries is not None else [
             {"name": "webapp", "preset": "webapp_dev", "description": "Web app dev"},
         ],
     })
+    return cfg.load({"lmer_bin": str(fake_lmer)})
 
 
 def test_a_slot_spawn_emits_the_slots_preset(platform_root, fake_lmer, slot_host):
@@ -3827,10 +3833,10 @@ def test_the_slot_gate_and_the_cap_refuse_independently(
     A free slot on a capped host still refuses, and an occupied slot on an idle
     host still refuses — each naming which gate closed.
     """
+    cfg.update_stored({"slots": [{"name": "webapp", "preset": "webapp_dev"}]})
     capped = cfg.load({
         "lmer_bin": str(fake_lmer),
         "max_concurrent_sessions": 1,
-        "slots": [{"name": "webapp", "preset": "webapp_dev"}],
     })
     # A live worker that holds no slot: the host is full, the slot is free.
     registry.register("s-worker", pid=os.getpid())
@@ -3842,7 +3848,6 @@ def test_the_slot_gate_and_the_cap_refuse_independently(
     roomy = cfg.load({
         "lmer_bin": str(fake_lmer),
         "max_concurrent_sessions": 10,
-        "slots": [{"name": "webapp", "preset": "webapp_dev"}],
     })
     registry.register("s-holder", pid=os.getpid(), slot="webapp")
 
@@ -3855,10 +3860,13 @@ def test_a_refused_slot_spawn_leaves_nothing_behind(
 ):
     """The gate runs before the port is drawn and the directories are made."""
     registry.register("s-holder", pid=os.getpid(), slot="webapp")
+    # Built before the snapshot: declaring the slot writes config.json, which is
+    # not a trace of the refused spawn.
+    config = slot_config(fake_lmer)
     before = sorted(p.name for p in platform_root.rglob("*") if p.is_file())
 
     with pytest.raises(spawn.SlotOccupied):
-        spawn.spawn_session(slot_config(fake_lmer), request_for(slot="webapp"))
+        spawn.spawn_session(config, request_for(slot="webapp"))
 
     assert sorted(p.name for p in platform_root.rglob("*") if p.is_file()) == before
 
@@ -3901,10 +3909,10 @@ def test_a_spawn_is_refused_when_its_service_is_held_under_another_slot(
         "p_a": {"checkout": "/srv/w", "service": "web"},
     }), encoding="utf-8")
     monkeypatch.setenv("LMER_PRESETS_FILE", str(presets))
-    config = cfg.load({
-        "lmer_bin": str(fake_lmer),
-        "slots": [{"name": "a", "preset": "p_a"}, {"name": "b", "preset": "clean"}],
-    })
+    config = slot_config(
+        fake_lmer,
+        [{"name": "a", "preset": "p_a"}, {"name": "b", "preset": "clean"}],
+    )
     registry.register(
         "s-b", pid=os.getpid(), slot="b",
         task={"preset": "clean", "slot_service": "web"},
