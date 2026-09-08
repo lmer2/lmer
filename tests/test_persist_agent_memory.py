@@ -24,6 +24,12 @@ from tests._claude_runner_harness import run_claude_runner, skip_if_npm_claude_p
 CLI_PY = Path(__file__).parent.parent / "src" / "lmer_cli" / "cli.py"
 
 
+@pytest.fixture(autouse=True)
+def memory_git_preflight(monkeypatch):
+    """Copy/merge tests stub Git; push_safety exercises the real preflight."""
+    monkeypatch.setattr(memory, "check_commit_ready", lambda *args: 0)
+
+
 # ── Layer 1: cli.py env-dict guard ──────────────────────────────────────────
 
 
@@ -257,7 +263,9 @@ def test_persist_noop_when_disabled(memory_env):
 def test_persist_no_memory_to_save(memory_env, monkeypatch):
     monkeypatch.setenv("LMER_PERSIST_AGENT_MEMORY", "1")
     # No agent memory dir / files at all.
-    assert memory.persist_memory() == 0
+    with patch("work_repo.memory.commit_work_path", return_value=0) as commit:
+        assert memory.persist_memory() == 0
+    assert commit.call_args.args[0] == []
 
 
 def test_persist_copies_and_commits(memory_env, monkeypatch):

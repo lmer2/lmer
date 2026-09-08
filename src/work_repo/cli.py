@@ -3435,7 +3435,7 @@ def cmd_release_record(args) -> int:
               f"new path — the old one is free for the next release)")
     # Durability: the record is the crash-recovery contract (spec §3 —
     # resume is the contract) — push now, not at session end. An idempotent
-    # no-op stages nothing and commit_work_path skips the empty commit. The
+    # no-op creates no commit but still verifies remote publication. The
     # pre-rename path rides along so a re-slug's deletion lands too.
     _push_run_dir(state, f"release record {noun}", old_dir_name,
                   saved="release record")

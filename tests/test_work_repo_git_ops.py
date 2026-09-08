@@ -39,10 +39,22 @@ from tests.plexus_fixtures import (
     build_legacy_plexus,
     build_schema_plexus,
 )
-from work_repo import memory, run_state, specs_index, utils
+from work_repo import git_ops, memory, run_state, specs_index, utils
 from work_repo.run_state import run_rel_path_candidates
 from work_repo.specs_index import specs_rel_path
 from work_repo.utils import sanitize_task_target
+
+PUSH_UPSTREAM = ["push", "origin", "HEAD:refs/heads/main"]
+REBASE_UPSTREAM = ["pull", "--rebase", "--autostash", "origin", "refs/heads/main"]
+
+
+@pytest.fixture(autouse=True)
+def publication_checks(monkeypatch):
+    """Isolate these staging/routing tests; real Git safety lives in push_safety."""
+    monkeypatch.setattr(git_ops, "check_commit_ready", lambda *args: 0)
+    monkeypatch.setattr(git_ops, "_verify_published", lambda *args: 0)
+    monkeypatch.setattr(git_ops, "_publication_destination", lambda *args: ("origin", "refs/heads/main"))
+    monkeypatch.setattr(git_ops, "_index_snapshot", lambda repo: (repo / ".test-index", None))
 
 
 class TestRunGitCommand:
@@ -85,8 +97,8 @@ class TestCommitWorkChanges:
             result = commit_work_changes()
             assert result == 1
 
-    def test_commit_work_changes_no_changes(self):
-        """Test commit when there are no changes"""
+    def test_commit_work_changes_unborn_repository_cannot_confirm_publication(self):
+        """An empty repository has no commit or upstream to verify."""
         with tempfile.TemporaryDirectory() as tmpdir:
             # Initialize git repo
             subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
@@ -107,8 +119,7 @@ class TestCommitWorkChanges:
 
             with patch.dict(os.environ, env_vars):
                 result = commit_work_changes()
-                # Should return 0 (no changes to commit)
-                assert result == 0
+                assert result != 0
 
     def test_commit_work_changes_with_changes(self):
         """Test commit when there are changes"""
@@ -150,7 +161,7 @@ class TestCommitWorkChanges:
                             return (0, "M  github.com/owner/repo/review/pr-123/log.yaml\n")
                         elif cmd == ["commit", "-m", "Update work repo: github.com/owner/repo/review/pr-123"]:
                             return (0, "")
-                        elif cmd == ["push"]:
+                        elif cmd == PUSH_UPSTREAM:
                             return (0, "")
                         return (0, "")
 
@@ -184,13 +195,8 @@ class TestCommitWorkChanges:
                     ]
                     assert len(add_calls) == 1
 
-    def test_commit_work_path_no_change_in_target_ignores_other_dirty_files(self):
-        """Unchanged target + an unrelated dirty file → return 0, no commit.
-
-        Regression test: the no-change check must be scoped to target_path so a
-        dirty per-session log.yaml elsewhere can't trigger a spurious empty
-        commit (which would fail and return non-zero).
-        """
+    def test_commit_work_path_no_upstream_does_not_commit_other_dirty_files(self):
+        """Missing upstream fails without turning unrelated dirt into a commit."""
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             subprocess.run(["git", "init"], cwd=tmpdir, check=True, capture_output=True)
@@ -211,7 +217,7 @@ class TestCommitWorkChanges:
 
             with patch.dict(os.environ, {"LMER_WORK_REPO_PATH": tmpdir}):
                 result = commit_work_path("git.example.com/grp/proj/memory")
-            assert result == 0
+            assert result != 0  # no upstream can confirm publication
             # No new commit should have been created.
             rc, out = run_git_command(["log", "--oneline"], tmp, check=False)
             assert out.strip().count("\n") == 0  # exactly one commit (init)
@@ -272,9 +278,9 @@ class TestCommitWorkPathResilience:
             calls.append(cmd)
             if cmd[0] == "status":
                 return (0, f"M  {rel}/state.yaml\n")
-            if cmd == ["push"]:
+            if cmd == PUSH_UPSTREAM:
                 # First push rejected (non-FF), second succeeds.
-                pushes = [c for c in calls if c == ["push"]]
+                pushes = [c for c in calls if c == PUSH_UPSTREAM]
                 if len(pushes) == 1:
                     return (1, "! [rejected] main -> main (fetch first)")
                 return (0, "")
@@ -285,14 +291,14 @@ class TestCommitWorkPathResilience:
                 assert commit_work_path(rel) == 0
 
         commit_i = calls.index(["commit", "-m", f"Update work repo: {rel}"])
-        first_pull_i = next(i for i, c in enumerate(calls) if c == ["pull", "--rebase"])
-        first_push_i = calls.index(["push"])
+        first_pull_i = next(i for i, c in enumerate(calls) if c == REBASE_UPSTREAM)
+        first_push_i = calls.index(PUSH_UPSTREAM)
         assert commit_i < first_pull_i < first_push_i, calls
         # A rebase happens between the rejected and the retried push.
-        push_indices = [i for i, c in enumerate(calls) if c == ["push"]]
+        push_indices = [i for i, c in enumerate(calls) if c == PUSH_UPSTREAM]
         assert len(push_indices) == 2
         rebases_between = [
-            c for c in calls[push_indices[0] + 1:push_indices[1]] if c == ["pull", "--rebase"]
+            c for c in calls[push_indices[0] + 1:push_indices[1]] if c == REBASE_UPSTREAM
         ]
         assert rebases_between, "must rebase between push attempts"
 
@@ -303,7 +309,7 @@ class TestCommitWorkPathResilience:
         def side_effect(cmd, cwd, check=False):
             if cmd[0] == "status":
                 return (0, f"M  {rel}/fact.md\n")
-            if cmd == ["push"]:
+            if cmd == PUSH_UPSTREAM:
                 return (1, "! [rejected]")
             return (0, "")
 
@@ -311,7 +317,7 @@ class TestCommitWorkPathResilience:
             with patch("work_repo.git_ops.run_git_command", side_effect=side_effect) as mock_git:
                 assert commit_work_path(rel) == 1
                 assert [c for c in (call[0][0] for call in mock_git.call_args_list)
-                        if c == ["push"]].count(["push"]) == 3
+                        if c == PUSH_UPSTREAM].count(PUSH_UPSTREAM) == 3
 
     def test_multi_path_staging_skips_missing(self, tmp_path):
         existing = "git.example.com/grp/proj/develop/issue-1"
@@ -382,7 +388,7 @@ class TestCommitWorkPathResilience:
                 # Missing paths get a read-only tracked-files probe (they may
                 # hold pending deletions) — but nothing is staged or committed.
                 assert all(
-                    call.args[0][0] == "ls-files"
+                    call.args[0][0] in {"ls-files", "rev-list"}
                     for call in mock_git.call_args_list
                 )
 
@@ -797,7 +803,7 @@ class TestCommitNapkinIfSubdir:
         calls = [c.args[0] for c in mock_git.call_args_list]
         assert ["add", "-A", "--", "napkin"] in calls
         assert ["commit", "-m", "msg"] in calls
-        assert ["push"] in calls
+        assert PUSH_UPSTREAM in calls
         # Everything runs against the work repo, not the napkin path.
         assert all(c.args[1] == Path(str(work)) for c in mock_git.call_args_list)
 
@@ -910,9 +916,9 @@ class TestPushNapkinIfSeparate:
             calls.append(cmd)
             if cmd[0] == "status":
                 return (0, " M note.md")
-            if cmd == ["push"]:
+            if cmd == PUSH_UPSTREAM:
                 # First push rejected (non-FF), second succeeds.
-                if [c for c in calls if c == ["push"]] == [["push"]]:
+                if [c for c in calls if c == PUSH_UPSTREAM] == [PUSH_UPSTREAM]:
                     return (1, "! [rejected] main -> main (fetch first)")
                 return (0, "")
             return (0, "")
@@ -922,15 +928,15 @@ class TestPushNapkinIfSeparate:
                 assert push_napkin_if_separate("msg") == 0
 
         commit_i = calls.index(["commit", "-m", "msg"])
-        first_rebase_i = next(i for i, c in enumerate(calls) if c == ["pull", "--rebase"])
+        first_rebase_i = next(i for i, c in enumerate(calls) if c == REBASE_UPSTREAM)
         assert commit_i < first_rebase_i, calls
         # No plain (non-rebase) pull anywhere — it would refuse on dirty trees.
         assert ["pull"] not in calls
-        push_indices = [i for i, c in enumerate(calls) if c == ["push"]]
+        push_indices = [i for i, c in enumerate(calls) if c == PUSH_UPSTREAM]
         assert len(push_indices) == 2
         rebases_between = [
             c for c in calls[push_indices[0] + 1:push_indices[1]]
-            if c == ["pull", "--rebase"]
+            if c == REBASE_UPSTREAM
         ]
         assert rebases_between, "must rebase between push attempts"
 
