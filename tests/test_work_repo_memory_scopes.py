@@ -46,6 +46,7 @@ from work_repo import memory, utils
 def _clean_lmer_env(monkeypatch):
     """No ambient run context, and no announcement carried between tests."""
     strip_lmer_env(monkeypatch)
+    monkeypatch.setattr(memory, "check_commit_ready", lambda *args: 0)
     utils._ANNOUNCED_MANIFEST_PROBLEMS.clear()
 
 
@@ -752,7 +753,7 @@ class TestPersistRefusals:
         rc, staged = _persist()
 
         assert rc == 0
-        assert staged is None
+        assert staged == []  # check pending commits without staging any files
         assert (tree.instance_memory_dir / USER_MEMORY_FILE).read_text() == before
 
 

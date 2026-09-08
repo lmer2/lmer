@@ -226,6 +226,15 @@ Durable per-run state in the work repo — `state.yaml`/`events.jsonl`, resume b
 
 ---
 
+### [WORK-REPO-SAFETY.md](./WORK-REPO-SAFETY.md)
+
+Git state guards, staged-marker validation, verified publication, and recovery
+for memory, work logs, and napkin repositories.
+
+**Best for**: Recovering failed work publication and understanding clean retries.
+
+---
+
 ### [SCHEMA.md](./SCHEMA.md)
 **The lmer schema (version 1)**
 

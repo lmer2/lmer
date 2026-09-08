@@ -28,6 +28,12 @@ RUN_REL = f"{HOST}/{PROJECT}/runs/{SLUG}"
 @pytest.fixture
 def work_repo(tmp_path, monkeypatch):
     """A work repo with a run dir holding one committed, then dirtied, file."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    templates = tmp_path / "templates"
+    templates.mkdir()
+    monkeypatch.setenv("GIT_TEMPLATE_DIR", str(templates))
     repo = tmp_path / "work"
     repo.mkdir()
     for cmd in (
@@ -44,6 +50,18 @@ def work_repo(tmp_path, monkeypatch):
     subprocess.run(
         ["git", "commit", "-m", "seed"], cwd=repo, check=True, capture_output=True
     )
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(origin)], check=True, capture_output=True, timeout=15
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(origin)], cwd=repo,
+        check=True, capture_output=True, timeout=15,
+    )
+    subprocess.run(
+        ["git", "push", "-u", "origin", "HEAD"], cwd=repo,
+        check=True, capture_output=True, timeout=15,
+    )
     # The dirt a real run carries when a gate is running: an appended receipt.
     (run_dir / "events.jsonl").write_text(
         json.dumps({"type": "gate", "note": "gate-check: pass"}) + "\n",
@@ -57,8 +75,6 @@ def work_repo(tmp_path, monkeypatch):
     monkeypatch.setenv("LMER_TASK_TARGET", "https://git.example.com/group/project/-/issues/201")
     monkeypatch.setenv(gate_lock.LOCK_DIR_ENV, str(tmp_path / "locks"))
     monkeypatch.delenv(gate_lock.GUARD_ENV, raising=False)
-    # No remote: the push half warns and fails, which is irrelevant here — every
-    # assertion below is about whether a COMMIT was created.
     return repo
 
 
@@ -181,6 +197,43 @@ class TestDeferral:
         before = len(_commits(work_repo))
         commit_work_path(RUN_REL, "run-state: session end", allow_during_gate=True)
         assert len(_commits(work_repo)) == before + 1
+
+    @pytest.mark.parametrize("paths", [RUN_REL, []])
+    def test_existing_unpushed_commit_is_explicitly_deferred(
+        self, work_repo, monkeypatch, capsys, paths
+    ):
+        for args in (["add", "--", RUN_REL], ["commit", "-m", "local only"]):
+            subprocess.run(
+                ["git", *args], cwd=work_repo, check=True, capture_output=True, timeout=15
+            )
+        assert _porcelain(work_repo) == []
+        pending = subprocess.run(
+            ["git", "rev-list", "--count", "@{upstream}..HEAD"], cwd=work_repo,
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        assert pending.stdout.strip() == "1"
+        _hold_other_process_marker(monkeypatch)
+
+        def unexpected_push(*args):
+            pytest.fail("a gate must defer publication of existing commits too")
+
+        monkeypatch.setattr(git_ops, "_push_with_rebase_retries", unexpected_push)
+        assert commit_work_path(paths, "retry") == 0
+        output = capsys.readouterr().out
+        assert "deferred" in output.lower()
+        if not paths:
+            assert "Existing local commits" in output
+            assert "Left on disk, uncommitted:" not in output
+        assert (gate_lock.lock_dir() / git_ops.DEFERRAL_QUEUE_NAME).exists()
+
+    def test_empty_paths_do_not_defer_unrelated_dirt(self, work_repo, monkeypatch, capsys):
+        _hold_other_process_marker(monkeypatch)
+        before = _porcelain(work_repo)
+        assert before
+        assert commit_work_path([], "nothing to stage") == 0
+        assert _porcelain(work_repo) == before
+        assert "deferred" not in capsys.readouterr().out.lower()
+        assert not (gate_lock.lock_dir() / git_ops.DEFERRAL_QUEUE_NAME).exists()
 
     def test_kill_switch_restores_the_old_behavior(self, work_repo, monkeypatch):
         _hold_other_process_marker(monkeypatch)

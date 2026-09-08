@@ -40,6 +40,7 @@ in a manifest-less tree and is untouched by this task.
 """
 
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -351,7 +352,9 @@ class TestTheValidatorAcceptsEveryLinkThisSyncWrites:
         assert _entries(schema_plexus.specs_dir)
         report = Report(Form.SCHEMA)
         check_index_links(schema_plexus.root, report)
-        check_record(schema_plexus.root, report)
+        check_record(
+            schema_plexus.root, report, now=datetime(2026, 8, 25, tzinfo=timezone.utc)
+        )
         assert [(f.code, f.path) for f in report.findings] == []
 
 

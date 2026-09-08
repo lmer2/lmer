@@ -134,7 +134,7 @@ import yaml
 
 from lmer_cli.util import get_bool_env
 
-from .git_ops import commit_work_path
+from .git_ops import check_commit_ready, commit_work_path
 from .utils import (
     instance_memory_dir,
     project_memory_dir,
@@ -950,17 +950,16 @@ def persist_memory(commit_message: str | None = None) -> int:
 
     source = agent_memory_dir()
     if not _has_files(source):
-        # An empty memory dir is "nothing to persist" only when this session
-        # was handed nothing either. A session that restored memories and has
-        # since deleted every one of them is retiring all of them, and
-        # returning here discards that: the files stay upstream and the next
-        # restore hands them all back. Same shape as the per-scope skip in
-        # :func:`_persist_scopes`, and the manifest is again what tells a
-        # retirement from a session that never had anything.
+        # The #369 manifest distinguishes retiring restored memories from a
+        # session handed none. A completed retirement may still need pushing.
         restored = read_restore_manifest()
         if not any(_manifest_files(restored, scope) for scope in scopes):
             print("🧠 No agent memory to persist")
-            return 0
+            return commit_work_path([], commit_message)
+
+    rc = check_commit_ready(work_repo_root())
+    if rc != 0:
+        return rc
 
     try:
         copied, rel_paths = _persist_scopes(source, scopes)
@@ -970,7 +969,7 @@ def persist_memory(commit_message: str | None = None) -> int:
 
     if not rel_paths:
         print("🧠 No agent memory to persist")
-        return 0
+        return commit_work_path([], commit_message)
 
     print(f"🧠 Merged {copied} agent memory file(s) into work repo")
 

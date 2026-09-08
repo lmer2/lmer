@@ -62,7 +62,7 @@ sweep by comparing two empty snapshots, and says so in its own docstring.
 
 Nothing here addresses the operational work repo: every tree is built under
 `tmp_path` (the builder refuses any root under it), and every git sink these
-commands reach is stubbed — the `commit_work_path` writes, and the three
+commands reach is stubbed — the `commit_work_path` writes, and the three advisory
 read-side probes (`web_url_for` under `log`/`state set`/`artifact`,
 `report_uncommitted_work_items` under `commit`, `run_dir_push_status` under a
 phase change) that shell out with `cwd` inside the tree, where git walks UP
@@ -70,7 +70,8 @@ and, with a `TMPDIR` inside a checkout, would read that checkout rather than
 the fixture. No probe is asserted on and all are fail-soft, so the stubs
 return the answers they already gave here; what runs above them — argv
 parsing, form detection, resolution, path composition, file I/O and the
-staging composition — is the shipped code.
+staging composition — is the shipped code. Memory's repository-state preflight
+is also stubbed; the real-repository safety suite covers that guard.
 `TestTheCommandSetNeverReachesGit` holds that claim to account instead of
 leaving it to this paragraph: it drives the whole command set in both forms
 with `run_git_command` replaced by a recorder, which has to stay empty. The
@@ -179,7 +180,8 @@ def _no_push():
     against a tmp tree and, worse, would silently miss the paths one of the
     verbs staged.
 
-    Three READ sinks are stubbed for a different reason. `work log`, `work
+    Memory's repository-state preflight is stubbed alongside publication.
+    Three advisory READ sinks are stubbed for a different reason. `work log`, `work
     state set` and `work artifact` call `web_url_for` to decorate the path
     they print; `work commit` calls `report_uncommitted_work_items` to flag
     strays; and `work state set` calls `run_dir_push_status` at a phase
@@ -210,6 +212,7 @@ def _no_push():
     with patch("work_repo.cli.commit_work_path", side_effect=record), \
             patch("work_repo.git_ops.commit_work_path", side_effect=record), \
             patch("work_repo.memory.commit_work_path", side_effect=record), \
+            patch("work_repo.memory.check_commit_ready", return_value=0), \
             patch("work_repo.cli.web_url_for", return_value=None), \
             patch("work_repo.cli.report_uncommitted_work_items", return_value=0), \
             patch("work_repo.cli.run_dir_push_status", return_value=(False, False)):
