@@ -161,7 +161,12 @@ from work_repo import run_state
 from . import (
     ask, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
 )
-from .config import ENV_REPO_URL, PlatformConfig, configured_repo_url
+from .config import (
+    ENV_REPO_URL,
+    PlatformConfig,
+    configured_repo_url,
+    with_stored_slots,
+)
 from .store import StoreError, append_event, logs_dir, utc_now_iso
 from . import store
 
@@ -2699,6 +2704,10 @@ def _claim_slot(
     if request.slot is None:
         return request, None, None, None
 
+    # The file, not the boot-time config (#256): a slot created through the UI
+    # has to be spawnable into without a restart, and both reads below have to
+    # see the same list.
+    config = with_stored_slots(config)
     status = slots.slot_status(config, request.slot, cached=False)
     if status is None:
         declared = [d.name for d in slots.slot_definitions(config)]

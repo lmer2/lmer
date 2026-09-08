@@ -505,10 +505,13 @@ def test_to_dict_is_the_row_the_payload_carries(
 ):
     _store_slots([{"name": "webapp", "preset": "webapp_dev", "description": "Web app"}])
 
-    assert slots.slot_rows(cfg.load())[0].to_dict() == {
+    row = slots.slot_rows(cfg.load())[0]
+
+    assert row.to_dict() == {
         "name": "webapp",
         "preset": "webapp_dev",
         "description": "Web app",
+        "etag": row.definition.etag,
         "service": "webapp-web",
         "service_group": None,
         "members": [],
@@ -518,6 +521,38 @@ def test_to_dict_is_the_row_the_payload_carries(
         "occupants": [],
         "service_occupants": [],
     }
+
+
+def test_the_etag_covers_keys_this_build_does_not_know(
+    platform_root, presets_file, service_up, caplog
+):
+    """Why it digests the raw entry rather than the three parsed fields.
+
+    An entry may carry a key a newer build wrote; the slot loads anyway. If the
+    version an editor compares against ignored that key, an edit made in the
+    file would read as no change and be overwritten.
+    """
+    _store_slots([{"name": "webapp", "preset": "webapp_dev", "from_the_future": 1}])
+    with caplog.at_level("WARNING", logger="lmer_platform.slots"):
+        before = slots.slot_definitions(cfg.load())[0].etag
+
+    _store_slots([{"name": "webapp", "preset": "webapp_dev", "from_the_future": 2}])
+    with caplog.at_level("WARNING", logger="lmer_platform.slots"):
+        after = slots.slot_definitions(cfg.load())[0].etag
+
+    assert before != after
+
+
+def test_a_definition_built_in_code_still_has_an_etag(platform_root):
+    """Total, so nothing has to ask whether an entry came off disk."""
+    assert slots.SlotDefinition(name="a", preset="b").etag
+
+
+def test_the_raw_entry_is_out_of_a_definitions_equality(platform_root):
+    """A definition is its name, preset and description — the entry is provenance."""
+    assert slots.SlotDefinition(name="a", preset="b") == slots.SlotDefinition(
+        name="a", preset="b", entry={"name": "a", "preset": "b", "extra": 1},
+    )
 
 
 # --- the resource is the service, not the name --------------------------------

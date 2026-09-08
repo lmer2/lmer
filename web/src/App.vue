@@ -20,6 +20,7 @@ import AssistantChat from './components/AssistantChat.vue'
 import RunCard from './components/RunCard.vue'
 import RunDetail from './components/RunDetail.vue'
 import RunNav from './components/RunNav.vue'
+import SlotEditor from './components/SlotEditor.vue'
 import SlotRow from './components/SlotRow.vue'
 import { fetchState, forgetRun, prune, rescan } from './api.js'
 import {
@@ -192,9 +193,31 @@ const mirror = computed(() => state.value?.mirror || null)
 // renders nothing on the hosts that have not got it yet is one the operator
 // cannot ask the assistant to set up, because they never learn it is there.
 const slots = computed(() => state.value?.slots || [])
+// Why the list is empty, when it is empty for a reason. Empty slots otherwise
+// reads as "this host declares none", and a `config.json` saved mid-edit would
+// make that claim on every poll (#256).
+const slotsProblem = computed(() => state.value?.slots_problem || null)
 // Filtered here rather than in the dialog, so the row's wording and the
 // dialog's list come from one predicate.
 const freeSlots = computed(() => slots.value.filter(slotIsFree))
+
+// The slot editor (#256). `editingSlot` is null for "declare a new one".
+//
+// It stays a computed over the payload deliberately — the dialog has to be able
+// to see that the row moved under it — but the editor snapshots what it needs at
+// open and saves against that snapshot. Handing it a live prop to save from is
+// what would give the etag check away: the poll would refresh the version every
+// ten seconds, so a concurrent hand edit would be accepted rather than refused.
+const slotEditorOpen = ref(false)
+const editingSlotName = ref(null)
+const editingSlot = computed(
+  () => slots.value.find((row) => row.name === editingSlotName.value) || null,
+)
+
+function editSlot(row) {
+  editingSlotName.value = row?.name || null
+  slotEditorOpen.value = true
+}
 
 // Staleness must be visible rather than silently wrong (spec R20): a fleet view
 // confidently showing week-old phases is worse than one admitting it can't tell.
@@ -796,13 +819,26 @@ onUnmounted(() => {
                above, because a fleet tracking nothing is the state you are most
                likely to be about to spawn into a slot from. -->
           <template v-if="!loading">
-            <div class="section-title">service slots</div>
+            <div class="d-flex align-center ga-2">
+              <div class="section-title">service slots</div>
+              <v-spacer />
+              <!-- Beside the title rather than under the list: on a host that
+                   declares none the list is one muted line, and a button below
+                   it reads as belonging to that line. -->
+              <v-btn
+                :prepend-icon="mdiPlus"
+                size="small"
+                variant="text"
+                @click="editSlot(null)"
+              >add slot</v-btn>
+            </div>
             <SlotRow
               v-for="slot in slots"
               :key="slot.name"
               :row="slot"
               :runs="runs"
               @open="open"
+              @edit="editSlot"
             />
             <!-- A host that declares none says so (#254), quietly: the title and
                  one muted line are what tell an operator the feature exists, and
@@ -815,10 +851,30 @@ onUnmounted(() => {
                  directly under the error alert. A *later* failed refresh keeps
                  the previous payload, and saying so from stale-but-real data is
                  how the rest of this page treats a refresh that did not land. -->
+            <!-- Before the empty-state line, and instead of it: the line is a
+                 claim about the host's configuration, and this is the case where
+                 nothing is known about it. -->
+            <v-alert
+              v-if="slotsProblem"
+              type="warning"
+              :icon="mdiAlertOutline"
+              density="compact"
+              class="mb-2"
+            >{{ slotsProblem }}</v-alert>
             <p
-              v-if="!slots.length && state"
+              v-else-if="!slots.length && state"
               class="text-body-small text-medium-emphasis"
             >No service slots configured.</p>
+
+            <!-- Keyed on the slot being edited so switching rows starts the
+                 dialog over rather than reusing one still holding the previous
+                 slot's fields and its refusal. -->
+            <SlotEditor
+              v-model="slotEditorOpen"
+              :key="editingSlotName || 'new'"
+              :row="editingSlot"
+              @changed="load"
+            />
           </template>
         </template>
       </v-container>

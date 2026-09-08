@@ -10,6 +10,7 @@ import {
   mdiAlertOutline,
   mdiCheckboxBlankCircleOutline,
   mdiCircleSlice8,
+  mdiPencil,
 } from '@mdi/js'
 
 import { slotMeta, toneColor } from '../format.js'
@@ -21,7 +22,7 @@ const props = defineProps({
   runs: { type: Array, default: () => [] },
 })
 
-const emit = defineEmits(['open'])
+const emit = defineEmits(['open', 'edit'])
 
 // Names, not the icon objects, so the mapping stays in format.js where it can
 // be read under plain Node — @mdi/js is not importable there.
@@ -90,6 +91,20 @@ const holders = computed(() => [
         <v-chip v-else-if="row.service" size="small" variant="outlined">
           {{ row.service }}
         </v-chip>
+
+        <v-spacer />
+
+        <!-- Edit and remove are one affordance (#256): removal lives inside the
+             editor, behind the daemon's refusal, rather than as a second button
+             a thumb can reach by accident on a phone. -->
+        <v-btn
+          :icon="mdiPencil"
+          density="comfortable"
+          size="small"
+          variant="text"
+          title="edit this slot"
+          @click="emit('edit', row)"
+        />
       </div>
 
       <div

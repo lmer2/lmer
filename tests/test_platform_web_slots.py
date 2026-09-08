@@ -37,12 +37,19 @@ What each guard keeps, and why losing it is silent:
   and a second payload of its own is how the row and the picker start
   disagreeing about which slots exist;
 - slot and preset are exclusive in the dialog, because they are exclusive in the
-  daemon — a 400 must not be the first the operator hears of it.
+  daemon — a 400 must not be the first the operator hears of it;
+- and the editor (#256) reports the daemon's own verdict rather than its own,
+  sends the version it read the row at, and makes removing an occupied slot a
+  second deliberate press. Each of those is a way the editor could look like it
+  works while quietly overwriting somebody — the form agreeing with itself, a
+  save winning a race against a text editor, a removal landing under a running
+  agent.
 
 How any of it looks on a 390px row is verified by building the bundle and by a
 live look at a real fleet.
 """
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -51,6 +58,8 @@ from tests.conftest import node_binary, require_node_toolchain
 
 WEB = Path(__file__).resolve().parent.parent / "web"
 SLOT_ROW = WEB / "src" / "components" / "SlotRow.vue"
+SLOT_EDITOR = WEB / "src" / "components" / "SlotEditor.vue"
+API = WEB / "src" / "api.js"
 APP = WEB / "src" / "App.vue"
 ADD_RUN = WEB / "src" / "components" / "AddRun.vue"
 FORMAT = WEB / "src" / "format.js"
@@ -151,7 +160,10 @@ def test_a_host_with_no_slots_says_so():
     tag = text[text.rindex("<p", 0, hint):hint]
     # Conditional on the emptiness, not on the section: a line saying there are
     # none, printed above rows, is worse than the silence it replaced.
-    assert 'v-if="!slots.length && state"' in tag, (
+    # `v-if` or `v-else-if` — #256 put the unreadable-config alert ahead of it
+    # in the same chain, and which arm the hint sits on is not what this guard
+    # is about.
+    assert re.search(r'v-(?:else-)?if="!slots\.length && state"', tag), (
         "the hint renders beside real slot rows"
     )
     # Quiet, in the tone this app's other empty states use. A slot-less host is
@@ -176,7 +188,7 @@ def test_the_hint_needs_a_payload_before_it_claims_anything():
     hint = text.index("No service slots configured.")
     tag = text[text.rindex("<p", 0, hint):hint]
 
-    condition = re.search(r'v-if="([^"]*)"', tag)
+    condition = re.search(r'v-(?:else-)?if="([^"]*)"', tag)
     assert condition, "the hint is unconditional"
     assert re.search(r"\bstate\b", condition.group(1)), (
         "the hint's condition does not require a payload, so a fleet read that "
@@ -320,9 +332,394 @@ def test_the_row_carries_no_attention_stripe_or_forget():
     assert "emit('forget'" not in text and '@forget' not in text, (
         "the row offers a forget"
     )
-    assert re.findall(r"defineEmits\(\[([^\]]*)\]\)", text) == ["'open'"], (
-        "the row emits something other than the one navigation it is allowed"
+    # `edit` joined `open` with #256. It is not a marking of the kind this guard
+    # bans — it opens the editor for a fixture of the host, and it is still the
+    # operator asking rather than the row asking for an operator.
+    assert re.findall(r"defineEmits\(\[([^\]]*)\]\)", text) == [
+        "'open', 'edit'"
+    ], "the row emits something other than the navigation and the edit"
+
+
+# --- the editor (issue #256) -------------------------------------------------
+
+def test_the_editor_component_exists_and_is_mounted_by_the_shell():
+    app = APP.read_text(encoding="utf-8")
+
+    assert SLOT_EDITOR.is_file()
+    assert "import SlotEditor from './components/SlotEditor.vue'" in app
+    assert re.search(r"<SlotEditor\b", app), "the shell mounts no editor"
+
+
+def test_every_row_can_be_edited_and_a_new_slot_declared():
+    row = SLOT_ROW.read_text(encoding="utf-8")
+    app = APP.read_text(encoding="utf-8")
+
+    assert "emit('edit', row)" in row, "the row offers no edit"
+    assert '@edit="editSlot"' in app, "the shell does not listen for it"
+    assert 'editSlot(null)' in app, "there is no way to declare a new slot"
+
+
+def test_the_editor_avoids_vues_reserved_slot_vocabulary():
+    """SlotRow.vue's rule, for the same reason — see the row's own guard."""
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+    app = APP.read_text(encoding="utf-8")
+
+    assert re.search(r"^\s*row: \{ type: Object", text, re.M)
+    assert "slot: { type: Object" not in text
+    assert ':row="editingSlot"' in app
+
+
+def test_the_editor_previews_through_the_daemons_dry_run():
+    """The issue's "same sentence" rule, at the only place it can be lost.
+
+    A form that decided for itself whether a slot was usable would be a second
+    implementation of ``_resolve_definition``; the dry run is what makes the
+    verdict shown before a save the row's own.
+    """
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+
+    assert "dryRun: true" in text, "the editor previews nothing"
+    assert "slotMeta(preview.value?.state)" in text, (
+        "the preview paints its verdict with something other than the row's map"
     )
+    assert "preview?.reason" in text, "the preview drops the daemon's reason"
+
+
+def test_the_editor_paints_its_verdict_through_the_shared_tone_map():
+    """The row's rule (see the chip guard above): the ramp alone is not a signal."""
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+
+    assert "toneColor(meta.tone)" in text
+
+
+def test_a_save_carries_the_version_it_was_read_at():
+    """Without the etag the daemon cannot tell an edit from an overwrite.
+
+    Read at *open*, not at the last poll — see the mounted probe below, which is
+    the guard that actually binds it. This one only keeps the header in place.
+    """
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+    client = API.read_text(encoding="utf-8")
+
+    assert "etag: opened.value.etag" in text, "the editor sends no version"
+    # The prop may be *compared* against the snapshot — that is how the dialog
+    # notices it moved — but never sent.
+    assert "etag: props.row.etag" not in text, (
+        "a save sends the etag off the polled prop, which moves under it"
+    )
+    assert "'If-Match': etag" in client, "the client does not send it as If-Match"
+
+
+def test_the_confirm_reaches_both_verbs():
+    """The 409 for a re-point names `confirm=true`; the client has to be able to
+    send it, or the refusal is a dead end and the docs promise a press that does
+    not exist."""
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+    client = API.read_text(encoding="utf-8")
+
+    assert re.search(r"export function updateSlot\([^)]*confirm", client, re.S), (
+        "updateSlot cannot send a confirm"
+    )
+    assert "confirm: confirmingRebind.value" in text
+    assert "'save anyway'" in text
+
+
+def test_a_slot_that_changed_underneath_reloads_rather_than_retrying():
+    """The fields were composed against a version that is gone."""
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+
+    assert "exc.code === 'slot_changed'" in text
+    assert text.count("emit('changed')") >= 3, (
+        "a refused save leaves the view holding the version it was refused for"
+    )
+
+
+def test_removing_an_occupied_slot_takes_a_second_deliberate_press():
+    """The daemon refuses first; the confirm exists only after that refusal.
+
+    An up-front checkbox is one people learn to tick — the refusal has to be
+    read before it can be answered.
+    """
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+
+    assert "confirm: confirmingRemoval.value" in text
+    assert re.search(
+        r"confirmingRemoval = ref\(false\)", text,
+    ), "the confirm does not start off"
+    assert "exc.code === 'slot_occupied'" in text, (
+        "nothing turns the daemon's refusal into the confirm"
+    )
+    assert "'remove anyway'" in text
+
+
+def test_the_preset_field_is_a_menu_rather_than_free_text():
+    """Unlike the spawn dialog's: there the list is a suggestion, here it is the
+    rule — the write refuses a preset this host does not have, so free text
+    would be offering a 400."""
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+
+    at = text.index('v-model="preset"')
+    tag = text[text.rindex("<", 0, at) + 1:text.index(">", at)]
+    assert tag.startswith("v-select"), f"the preset field is a {tag.split()[0]}"
+    assert ':items="presets"' in tag
+
+
+def test_the_editor_debounces_its_preview():
+    """One resolution per keystroke would probe a dev container per character."""
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+
+    assert "PREVIEW_DELAY_MS" in text
+    assert "clearTimeout(previewTimer)" in text
+
+
+def test_a_stale_preview_cannot_land_on_a_newer_one():
+    text = SLOT_EDITOR.read_text(encoding="utf-8")
+
+    assert "function stale(mine)" in text
+    assert "if (stale(mine)) return" in text
+
+
+# --- the editor, mounted (issue #256) ----------------------------------------
+#
+# Every guard above reads source, and no amount of reading source can observe a
+# lifecycle: the dialog comes into existence with `modelValue` already true (the
+# shell sets the name and the flag in one tick, and the `:key` remounts it), so a
+# watcher that is not `immediate` has no transition to see and the form opens
+# with no verdict and no preset list — looking exactly like a host that has
+# neither. tests/test_platform_web_sketch.py records the same defect shipping
+# green past source-level guards; this is its rig, narrowed to this component.
+
+_MOUNT_PROBE = """
+import { readFileSync } from 'node:fs'
+import { createSSRApp, h } from 'vue'
+import { renderToString } from 'vue/server-renderer'
+import { parse, compileScript } from '@vue/compiler-sfc'
+
+const path = 'src/components/SlotEditor.vue'
+const { descriptor } = parse(readFileSync(path, 'utf8'), { filename: path })
+const compiled = compileScript(descriptor, { id: 'probe', inlineTemplate: true })
+
+// The daemon, recorded rather than faked away: reaching it is the assertion.
+const calls = []
+globalThis.fetch = async (url) => {
+  calls.push(String(url).split('?')[0])
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({ presets: ['webapp_dev'], name: 'webapp', state: 'free' }),
+  }
+}
+
+const source = compiled.content
+  .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
+  .replace(/from ['"]@mdi\\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
+  .replace(/from ['"]\\.\\.\\/(api|format)\\.js['"]/g,
+    (_m, name) => `from '${import.meta.resolve(`./src/${name}.js`)}'`)
+const component = (await import(
+  `data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`
+)).default
+
+// Mounted the way App.vue mounts it: open from the first frame.
+const app = createSSRApp({
+  render: () => h(component, {
+    modelValue: true,
+    row: %s,
+  }),
+})
+app.config.compilerOptions.isCustomElement = (tag) => tag.startsWith('v-')
+app.config.warnHandler = () => {}
+try {
+  await renderToString(app)
+} catch (error) {
+  calls.push(`render-error:${error.message}`)
+}
+console.log(JSON.stringify({ calls }))
+"""
+
+EXISTING_ROW = (
+    "{ name: 'webapp', preset: 'webapp_dev', description: '', etag: 'abc123' }"
+)
+
+
+def _mounted(row="null"):
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", _MOUNT_PROBE % row],
+        capture_output=True, text=True, timeout=180, cwd=str(WEB),
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    return json.loads(result.stdout)["calls"]
+
+
+def test_mounting_the_editor_open_asks_the_host_for_its_presets():
+    """A select whose list never loads is a select with nothing in it."""
+    assert "api/spawn-options" in _mounted(EXISTING_ROW)
+
+
+def test_mounting_the_editor_on_a_row_previews_it_straight_away():
+    """Without this the dialog opens with no verdict until something is typed —
+    and an operator opening a `misconfigured` slot to fix it sees nothing at all
+    about what is wrong with it."""
+    calls = _mounted(EXISTING_ROW)
+
+    assert "api/slots/webapp" in calls, f"no preview at mount: {calls}"
+    assert not [call for call in calls if call.startswith("render-error:")], calls
+
+
+def test_mounting_the_editor_for_a_new_slot_previews_nothing_yet():
+    """Empty fields are not a slot to have an opinion about."""
+    calls = _mounted("null")
+
+    assert "api/slots" not in calls
+    assert not [call for call in calls if call.startswith("render-error:")], calls
+
+# --- the etag the save actually carries (issue #256, review iteration 1) -----
+#
+# The source guards above can see that *an* etag is sent. They cannot see *which*
+# one, and that is the whole property: `props.row` is a computed over the polled
+# payload, so a dialog left open for ten seconds is handed a fresh etag for a
+# change the operator has not seen. Sending it makes `If-Match` match the very
+# edit it exists to refuse — and because the form still holds the old preset, the
+# save then reverts it.
+#
+# So this drives the component: one instance, mounted with etag E0, then given a
+# new row object the way a poll does, then saved. The rig is heavier than the
+# mount probe above (a custom renderer, so the instance survives a prop change
+# and `save()` can be called on it) because a re-mounting rig cannot observe this
+# at all — a fresh instance snapshots the new row and looks correct either way.
+
+_SAVE_PROBE = """
+import { readFileSync } from 'node:fs'
+import { createRenderer, ref, h, nextTick } from 'vue'
+import { parse, compileScript } from '@vue/compiler-sfc'
+
+const path = 'src/components/SlotEditor.vue'
+const { descriptor } = parse(readFileSync(path, 'utf8'), { filename: path })
+// Not `inlineTemplate`: that closes the setup bindings over the render function
+// and `save()` becomes unreachable. The template is not what is under test here.
+const compiled = compileScript(descriptor, { id: 'probe' })
+
+const sent = []
+globalThis.fetch = async (url, options = {}) => {
+  sent.push({
+    url: String(url),
+    method: options.method || 'GET',
+    ifMatch: (options.headers || {})['If-Match'] || null,
+    body: options.body ? JSON.parse(options.body) : null,
+  })
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({ presets: ['webapp_dev', 'api_dev'], state: 'free' }),
+  }
+}
+
+const source = compiled.content
+  .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
+  .replace(/from ['"]@mdi\\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
+  .replace(/from ['"]\\.\\.\\/(api|format)\\.js['"]/g,
+    (_m, name) => `from '${import.meta.resolve(`./src/${name}.js`)}'`)
+const component = (await import(
+  `data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`
+)).default
+component.render = () => null
+
+const noop = () => {}
+const nodeOps = {
+  createElement: (t) => ({ tag: t }), createText: (t) => ({ text: t }),
+  createComment: (t) => ({ comment: t }), setText: noop, setElementText: noop,
+  insert: noop, remove: noop, parentNode: () => null, nextSibling: () => null,
+  patchProp: noop, querySelector: () => null, setScopeId: noop,
+  cloneNode: (n) => n,
+}
+const { createApp } = createRenderer(nodeOps)
+
+const child = ref(null)
+const row = ref({
+  name: 'webapp', preset: 'webapp_dev', description: '', etag: 'E0',
+})
+const app = createApp({
+  render: () => h(component, { modelValue: true, row: row.value, ref: child }),
+})
+app.config.warnHandler = noop
+app.mount(nodeOps.createElement('root'))
+await nextTick()
+
+// `<script setup>` bindings are deliberately private on the public proxy, so the
+// internal instance is how a probe reaches them. Test-only reach-in: exposing
+// them for this would be production surface bought with a test.
+const state = child.value.$.setupState
+const moved = [state.movedUnderneath]
+
+// The operator types something.
+state.description = 'typed by the operator'
+await nextTick()
+
+// Ten seconds of polling: a new object, a preset nobody in this dialog picked,
+// and the etag that change earned.
+row.value = { name: 'webapp', preset: 'api_dev', description: '', etag: 'E1' }
+await nextTick()
+moved.push(state.movedUnderneath)
+
+sent.length = 0
+await state.save()
+
+console.log(JSON.stringify({ sent, movedUnderneath: moved }))
+"""
+
+
+def _save_probe():
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", _SAVE_PROBE],
+        capture_output=True, text=True, timeout=180, cwd=str(WEB),
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    return json.loads(result.stdout)
+
+
+def test_a_save_carries_the_etag_the_dialog_opened_at_not_the_polls():
+    """The critical finding of review iteration 1.
+
+    Concretely: the row is at E0 when the pencil is pressed; a colleague edits
+    `config.json` and the entry becomes E1; the poll delivers E1 to the open
+    dialog. The save must still carry E0 — that is what makes the daemon's 412
+    fire, and the colleague's edit survive.
+    """
+    sent = _save_probe()["sent"]
+
+    writes = [call for call in sent if call["method"] == "PUT"]
+    assert writes, f"the save sent nothing: {sent}"
+    assert writes[0]["ifMatch"] == "E0", (
+        f"the save carried {writes[0]['ifMatch']!r} — the poll's version, not "
+        "the one the fields were composed against"
+    )
+
+
+def test_a_save_does_not_revert_a_change_it_never_saw():
+    """The same defect's second half, and the one that does the damage.
+
+    `changes()` diffs the form against its snapshot. Diffed against the *polled*
+    prop instead, the preset the operator never touched reads as changed — so
+    the save actively writes the old value back over the colleague's.
+    """
+    writes = [call for call in _save_probe()["sent"] if call["method"] == "PUT"]
+
+    assert "preset" not in writes[0]["body"], (
+        "the save asserts a preset nobody in this dialog changed: "
+        f"{writes[0]['body']}"
+    )
+    assert writes[0]["body"]["description"] == "typed by the operator"
+
+
+def test_the_dialog_notices_the_row_moved_under_it():
+    """Said before the save rather than after its refusal: the fields on screen
+    were composed against a version that no longer exists."""
+    assert _save_probe()["movedUnderneath"] == [False, True]
 
 
 # --- the picker --------------------------------------------------------------

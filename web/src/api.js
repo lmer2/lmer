@@ -227,6 +227,53 @@ export function spawnSession(payload) {
   })
 }
 
+// --- service slots (issue #256) ----------------------------------------------
+
+// A patch of one slot, never a POST of the whole list: the daemon merges it into
+// `config.json` as the file is at write time, so a slot added in an editor since
+// this page loaded is not lost to a save here.
+//
+// `dryRun` runs every check and writes nothing, answering with the row the slot
+// *would* have — the same route the save takes, which is what stops the form
+// growing a second opinion about what makes a slot valid. `etag` travels as
+// `If-Match`: the daemon recomputes it under its write lock and refuses (412,
+// `slot_changed`) rather than overwriting an edit made behind this one.
+export function createSlot(slot, { dryRun = false } = {}) {
+  return request(`api/slots${dryRun ? '?dry_run=true' : ''}`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(slot),
+  })
+}
+
+// `confirm` on either verb is the operator saying yes to a change the daemon
+// refused because a live session is in the slot — a removal, or a re-point that
+// moves what that session is bound to. Absent by default, so the refusal is what
+// an unthinking press gets.
+export function updateSlot(
+  name, changes, { etag, dryRun = false, confirm = false } = {},
+) {
+  const query = new URLSearchParams()
+  if (dryRun) query.set('dry_run', 'true')
+  if (confirm) query.set('confirm', 'true')
+  const suffix = query.toString()
+  return request(
+    `api/slots/${encodeURIComponent(name)}${suffix ? `?${suffix}` : ''}`,
+    {
+      method: 'PUT',
+      headers: { ...jsonHeaders, 'If-Match': etag || '' },
+      body: JSON.stringify(changes),
+    },
+  )
+}
+
+export function removeSlot(name, { etag, confirm = false } = {}) {
+  return request(
+    `api/slots/${encodeURIComponent(name)}${confirm ? '?confirm=true' : ''}`,
+    { method: 'DELETE', headers: { 'If-Match': etag || '' } },
+  )
+}
+
 // --- one session's terminal --------------------------------------------------
 
 // A negative offset reads the last |offset| bytes, so a terminal can attach to
