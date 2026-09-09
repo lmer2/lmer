@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import html
 import logging
 import os
 import re
@@ -52,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ConnectorConfig", "SlackConnector", "render_outbound", "option_for",
-    "post_replay_notice", "replay_stamp",
+    "post_replay_notice", "replay_stamp", "attachment_notice",
     "DEFAULT_POLL_SECONDS", "POLL_SECONDS_ENV", "SUBSCRIBER", "CHANNEL", "main",
     "ATTACH_ACK", "DETACH_NOTE", "ATTACH_ACK_ENV", "ATTACH_FROM_NOW_ENV",
     "ATTACH_SINCE_ENV",
@@ -95,6 +96,22 @@ ATTACH_SINCE_ENV = "LMER_CHAT_ATTACH_SINCE"
 #: these rather than writing its own, so the two transports cannot drift.
 ATTACH_ACK = "🔗 lmer is listening in this thread."
 DETACH_NOTE = "🔌 lmer has stopped listening in this thread."
+
+
+def attachment_notice(launch_settings: Optional[dict], *, slack_markup: bool = True) -> str:
+    """Format launch labels for Slack markup or a Matrix plain-text body."""
+    if launch_settings is None:
+        return ATTACH_ACK
+
+    def label(key, unset):
+        value = launch_settings.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return unset
+        text = " ".join(value.split())[:160]
+        return html.escape(text, quote=False) if slack_markup else text
+
+    return ATTACH_ACK + f" Preset: {label('preset', 'none')}; model: {label('model', 'harness default')}."
+
 
 #: The supervisor caps a long-poll at 30 s.
 BUS_POLL_SECONDS = 25.0
@@ -255,7 +272,7 @@ def render_outbound(
         body = f"⌨️ [{_who(source)}] {text}"
     elif kind == "message":
         label = _who(source)
-        if meta.get("fidelity") == "reconstructed":
+        if meta.get("fidelity") in ("reconstructed", "confirmed"):
             label += " · typed"
         body = text if agent else f"💬 [{label}] {text}"
         # Where it went, when it went somewhere else (issue #414): the record is
@@ -396,6 +413,7 @@ class SlackConnector:
         self._bot_user_id: Optional[str] = None
         self._cursor_ts: Optional[str] = None
         self._bus_cursor = 0
+        self._launch_settings: Optional[dict] = None
         #: questions whose one free-text chance has been used (`_first_since`)
         self._answered_freely: set = set()
         #: Whether the thread has been told this connector is listening — and so
@@ -514,6 +532,8 @@ class SlackConnector:
         except bus.BusError as exc:
             logger.warning("slack_connector_seed_failed error=%s", exc)
             return
+        launch = health.get("launch")
+        self._launch_settings = launch if isinstance(launch, dict) else None
         acked = (health.get("subscribers") or {}).get(self.subscriber)
         if isinstance(acked, int) and not isinstance(acked, bool):
             self._bus_cursor = acked
@@ -536,9 +556,10 @@ class SlackConnector:
         """
         if not self.config.attach_ack or self._announced:
             return
+        notice = attachment_notice(self._launch_settings)
         try:
             self._mirrored(
-                self.slack.post_message(self.config.channel, self.config.thread_ts, ATTACH_ACK,
+                self.slack.post_message(self.config.channel, self.config.thread_ts, notice,
                                         connection_notice=True)
             )
         except SlackError as exc:

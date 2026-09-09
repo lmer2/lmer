@@ -208,12 +208,16 @@ def _matrix_client(account):
 # ---------------------------------------------------------------------------
 
 
-def slack_rooted(ref: ThreadRef, client, *, refuse_refusals: bool = False) -> ThreadRef:
+def slack_rooted(ref: ThreadRef, client, *, refuse_refusals: bool = False,
+                 require_resolution: bool = False) -> ThreadRef:
     """*ref* keyed by the thread root Slack reports for it."""
-    return slack_thread(ref, client, refuse_refusals=refuse_refusals)[0]
+    return slack_thread(
+        ref, client, refuse_refusals=refuse_refusals, require_resolution=require_resolution,
+    )[0]
 
 
-def slack_thread(ref: ThreadRef, client, *, refuse_refusals: bool = False) -> tuple:
+def slack_thread(ref: ThreadRef, client, *, refuse_refusals: bool = False,
+                 require_resolution: bool = False) -> tuple:
     """``(ref keyed by its root, the thread's messages)``.
 
     A link to a message *inside* a thread parses as its own root, and
@@ -239,19 +243,32 @@ def slack_thread(ref: ThreadRef, client, *, refuse_refusals: bool = False) -> tu
     lookup must not be what decides a thread's identity, and so does a code that
     only says this call would not be *served* (:data:`_SLACK_UNSEEABLE` names
     the one exclusion and why). Off by default: a *recorded* target
-    (``adopt_launch_targets``) and a one-shot read or post are not decisions, and
-    a launch must not fail on one.
+    (``adopt_launch_targets``) and a one-shot read or post do not decide whether
+    a thread is free to attach.
+
+    A held-thread refusal check uses *require_resolution*: an unavailable or
+    empty answer cannot establish that another spelling is not already held.
+    That deciding path refuses every lookup failure; ordinary reads and
+    adoption keep the best-effort default.
     """
     channel, ts = ref.key["channel"], ref.key["thread_ts"]
     try:
         messages = client.get_replies(channel, ts)
     except Exception as exc:
-        if refuse_refusals and getattr(exc, "code", None) in _SLACK_UNSEEABLE:
+        if require_resolution or (refuse_refusals and getattr(exc, "code", None) in _SLACK_UNSEEABLE):
             raise _slack_failure(exc, channel) from None
         logger.warning("thread_root_unresolved channel=%s ts=%s error=%s", channel, ts, exc)
         return ref, None
     first = messages[0] if messages else {}
+    if not isinstance(first, dict):
+        first = {}
     root = first.get("thread_ts") or first.get("ts")
+    if require_resolution and (not isinstance(root, str) or not root.strip()):
+        raise ThreadError(
+            f"Slack did not identify the thread root for {channel}/{ts} — "
+            "retry once it can be verified, or launch without that thread",
+            status=502,
+        )
     if not isinstance(root, str) or not root or root == ts:
         return ref, messages
     logger.info("thread_root_resolved channel=%s from=%s to=%s", channel, ts, root)

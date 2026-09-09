@@ -135,6 +135,7 @@ class ThreadConnectors:
         self._next_attempt: dict = {}
         self._exits: dict = {}
         self._detail: dict = {}
+        self._disconnected: set = set()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._load()
@@ -185,6 +186,7 @@ class ThreadConnectors:
                 self._save()
         for record in records:
             self._stop_process((session_id, record["id"]))
+            self._notify_disconnected(session_id, record)
             self._forget((session_id, record["id"]))
         return len(records)
 
@@ -234,11 +236,32 @@ class ThreadConnectors:
                     f"this run has no connection {thread_id!r}", status=404,
                 )
         self._stop_process((session_id, record["id"]))
+        self._notify_disconnected(session_id, record)
         self._forget((session_id, record["id"]))
         logger.info(
             "platform_thread_disconnected session=%s thread=%s", session_id, record["id"],
         )
         return record
+
+    def _notify_disconnected(self, session_id: str, record: dict) -> None:
+        """Tell the affected session once per loss, outside the connector lock."""
+        from . import comms
+
+        key = (session_id, record["id"])
+        with self._lock:
+            if key in self._disconnected:
+                return
+            self._disconnected.add(key)
+        try:
+            comms.ensure_hub().post(
+                session_id, kind="message", channel="platform",
+                text=f"thread disconnected: {record['label']}",
+            )
+        except (comms.CommsError, session_io.SessionIOError) as exc:
+            logger.warning(
+                "platform_thread_disconnect_notice_failed session=%s thread=%s error=%s",
+                session_id, record["id"], exc,
+            )
 
     def require_room(self, session_id: str):
         """A control plane, and room for one more connection. Returns the endpoint.
@@ -306,11 +329,12 @@ class ThreadConnectors:
         """
         for target in targets or ():
             try:
-                ref = self.prepare(target, checks=False)
+                ref = parse_thread(target)
             except ThreadError:
                 # Not this check's to refuse: an unusable target is dropped with
                 # a warning by adopt_launch_targets, not made fatal to a launch.
                 continue
+            ref = self._resolved(ref, require_resolution=True)
             with self._lock:
                 holder = self._live_holder(ref, besides=besides)
             if holder is not None:
@@ -353,30 +377,15 @@ class ThreadConnectors:
         client = self._matrix_client(self._require_matrix_credentials())
         return thread_access.matrix_resolved(ref, client)
 
-    def _resolved(self, ref: ThreadRef) -> ThreadRef:
-        """*ref* keyed by the thread its transport says it is, not by the link.
+    def _resolved(self, ref: ThreadRef, *, require_resolution: bool = False) -> ThreadRef:
+        """Resolve transport identity; launch refusals require a verified result.
 
-        Every guard here is a dict lookup on :attr:`ThreadRef.id` — the duplicate
-        409, the one-live-session-per-thread 409, the reconcile's process table —
-        so two spellings of one thread producing two ids means two connectors on
-        it, and every reply twice. Both transports have such a pair, and each is
-        settled by asking the transport rather than by another rule about link
-        shapes:
-
-        - **matrix**, a room given as an **alias** rather than an id: the
-          homeserver's directory answers. A room id needs no call at all, which
-          is what most permalinks carry.
-        - **Slack**, a link to a message *inside* a thread with no ``thread_ts``
-          on it: it parses as its own root. ``conversations.replies`` takes "a
-          message in the thread" and every threaded message carries ``thread_ts``,
-          the parent's — so Slack names the root and the link does not have to.
-
-        Best-effort in both directions: a transport that cannot be asked leaves
-        the ref as the link spelled it, because a directory lookup must not be
-        what makes a spawn fail.
+        Adoption remains best-effort. See docs/COMMS.md for transport semantics.
         """
         if ref.channel == CHANNEL_SLACK:
-            return self._slack_rooted(ref)
+            if require_resolution:
+                self._require_slack_credentials()
+            return self._slack_rooted(ref, require_resolution=require_resolution)
         if not ref.key["room"].startswith("#"):
             return ref
         try:
@@ -384,10 +393,21 @@ class ThreadConnectors:
                 ref.key["room"]
             )
         except Exception as exc:
+            if require_resolution:
+                raise ThreadError(
+                    f"cannot verify the matrix room {ref.key['room']}: {exc} — "
+                    "retry once it can be resolved, or launch without that thread",
+                    status=getattr(exc, "status", 502),
+                ) from None
             logger.warning(
                 "platform_thread_alias_unresolved room=%s error=%s", ref.key["room"], exc,
             )
             return ref
+        if require_resolution and (not isinstance(room_id, str) or not room_id.startswith("!")):
+            raise ThreadError(
+                f"the homeserver did not identify the matrix room {ref.key['room']} — "
+                "retry once it can be resolved, or launch without that thread", status=502,
+            )
         return ThreadRef(
             channel=ref.channel,
             key={"room": room_id, "event": ref.key["event"]},
@@ -395,20 +415,28 @@ class ThreadConnectors:
             label=ref.label,
         )
 
-    def _slack_rooted(self, ref: ThreadRef, *, refuse_refusals: bool = False) -> ThreadRef:
+    def _slack_rooted(self, ref: ThreadRef, *, refuse_refusals: bool = False,
+                      require_resolution: bool = False) -> ThreadRef:
         """*ref* keyed by the thread root Slack reports for it.
 
         *refuse_refusals* is :func:`lmer_cli.thread_access.slack_thread`'s, and
-        reaches only :meth:`prepare`'s deciding path — a client that cannot even
-        be built stays best-effort here whichever way it is set, because that is
-        this host's own failure and not Slack's answer.
+        reaches :meth:`prepare`'s deciding path. The stronger
+        *require_resolution* also refuses a client that cannot be built, because
+        the held-thread check needs a verified identity before it can pass.
         """
         try:
             client = self._slack_client((self._environ.get("SLACK_BOT_TOKEN") or "").strip())
         except Exception as exc:
+            if require_resolution:
+                raise ThreadError(
+                    f"cannot verify the Slack thread: {exc} — retry once Slack is available, "
+                    "or launch without that thread", status=502,
+                ) from None
             logger.warning("platform_thread_root_unresolved error=%s", exc)
             return ref
-        return thread_access.slack_rooted(ref, client, refuse_refusals=refuse_refusals)
+        return thread_access.slack_rooted(
+            ref, client, refuse_refusals=refuse_refusals, require_resolution=require_resolution,
+        )
 
     def drop_run(self, identity: tuple) -> int:
         """Forget the connections of every session belonging to *identity*.
@@ -592,7 +620,7 @@ class ThreadConnectors:
                 records = list(self._sessions.get(session_id, ()))
             if not records:
                 continue
-            health = session_io._quiet_health(session_id)
+            health = session_io.quiet_health(session_id)
             comms = (health or {}).get("comms")
             subscribers = comms.get("subscribers") if isinstance(comms, dict) else None
             if not isinstance(subscribers, dict):
@@ -667,9 +695,12 @@ class ThreadConnectors:
             # second connector for one connection. The spawn is a fork, and every
             # slow step (the stop's wait, the whole of a connector's life) is
             # outside.
-            self._start(key, record, endpoint=endpoint)
+            held = self._start(key, record, endpoint=endpoint)
+        if held:
+            self._notify_disconnected(key[0], record)
 
-    def _start(self, key: tuple, record: dict, *, endpoint=None) -> None:
+    def _start(self, key: tuple, record: dict, *, endpoint=None) -> Optional[str]:
+        """Start the connector, returning the reason if another holder blocks it."""
         session_id, thread_id = key
         if endpoint is None:
             try:
@@ -681,7 +712,7 @@ class ThreadConnectors:
         held = self._reclaim(ref, key)
         if held is not None:
             self._fail(key, held)
-            return
+            return held
         try:
             argv = self._argv(record, session_id)
             popen = self._runner(
@@ -694,6 +725,7 @@ class ThreadConnectors:
             return
         with self._lock:
             self._procs[key] = _Process(popen=popen, ref=ref, since=utc_now_iso())
+            self._disconnected.discard(key)
             self._detail.pop(key, None)
             self._attempts.pop(key, None)
             self._next_attempt.pop(key, None)
@@ -773,6 +805,7 @@ class ThreadConnectors:
         """
         with self._lock:
             self._exits.pop(key, None)
+            self._disconnected.discard(key)
             self._detail.pop(key, None)
             self._attempts.pop(key, None)
             self._next_attempt.pop(key, None)

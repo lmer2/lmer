@@ -31,6 +31,7 @@ from .util import get_bool_env
 
 __all__ = [
     "SCHEMA_VERSION", "COMMS_LOG_NAME", "COMMS_LOG_ENV", "TERMINAL_MIRROR_ENV",
+    "TERMINAL_CONFIRM_ENV", "DEFAULT_TERMINAL_CONFIRM_SECONDS",
     "DRAIN_GRACE_ENV", "DEFAULT_DRAIN_GRACE", "drain_grace",
     "KIND_MESSAGE", "KIND_NOTE", "KIND_MILESTONE", "KIND_QUESTION",
     "KIND_ANSWER", "KIND_CLOSE", "KIND_COMMAND", "KNOWN_KINDS", "AGENT_KINDS",
@@ -69,6 +70,8 @@ COMMS_LOG_ENV = "LMER_COMMS_LOG"
 
 #: Kill switch for the terminal line reconstruction (§3.4 of the spec).
 TERMINAL_MIRROR_ENV = "LMER_COMMS_TERMINAL_MIRROR"
+TERMINAL_CONFIRM_ENV = "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"
+DEFAULT_TERMINAL_CONFIRM_SECONDS = 30
 
 #: How long the supervisor keeps its control plane up after the harness
 #: exits, so a subscriber can fetch and ack the last records over HTTP. The
@@ -264,6 +267,7 @@ class Message:
     attachments: tuple = ()
     meta: Mapping = field(default_factory=dict)
     schema: int = SCHEMA_VERSION
+    local_only: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -279,6 +283,7 @@ class Message:
             "options": list(self.options),
             "attachments": [dict(item) for item in self.attachments],
             "meta": dict(self.meta),
+            **({"local_only": True} if self.local_only else {}),
         }
 
     @classmethod
@@ -318,6 +323,7 @@ class Message:
             attachments=tuple(dict(item) for item in attachments if isinstance(item, Mapping))
             if isinstance(attachments, (list, tuple)) else (),
             meta=dict(meta) if isinstance(meta, Mapping) else {},
+            local_only=raw.get("local_only") is True,
             schema=schema if isinstance(schema, int) else SCHEMA_VERSION,
         )
 
@@ -628,6 +634,7 @@ class MessageLog:
         attachments: object = (),
         meta: object = None,
         session_caller: bool = False,
+        local_only: bool = False,
     ) -> tuple[Message, str]:
         """Validate, arbitrate, persist and publish one record.
 
@@ -647,6 +654,8 @@ class MessageLog:
         """
         if not isinstance(kind, str) or not kind:
             raise CommsError("kind is required")
+        if local_only and (source.channel != CHANNEL_TERMINAL or kind != KIND_MESSAGE):
+            raise CommsError("only reconstructed terminal messages may be local-only")
         if source.channel == CHANNEL_AGENT and kind not in AGENT_KINDS:
             raise CommsError(f"the agent may post {sorted(AGENT_KINDS)}, not {kind!r}")
         if kind == KIND_COMMAND and source.channel not in COMMAND_CHANNELS:
@@ -741,6 +750,7 @@ class MessageLog:
                 options=choices,
                 attachments=files,
                 meta=extra,
+                local_only=local_only,
             )
             self._write(message)
             self._index(message)
@@ -828,6 +838,7 @@ class MessageLog:
         timeout: float = 0.0,
         kinds: Optional[Iterable[str]] = None,
         waiter: Optional[str] = None,
+        include_local: bool = True,
     ) -> tuple[list[Message], int]:
         """Records past *since*, blocking up to *timeout* for the next one.
 
@@ -849,6 +860,8 @@ class MessageLog:
             try:
                 while True:
                     fresh = self._messages[since:] if since < len(self._messages) else []
+                    if not include_local:
+                        fresh = [m for m in fresh if not m.local_only]
                     if wanted is not None:
                         fresh = [m for m in fresh if m.kind in wanted]
                     if fresh or deadline is None:

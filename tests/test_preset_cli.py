@@ -1084,3 +1084,38 @@ class TestListPresets:
         assert "preset (demo)" in out, (
             f"--show-env must label preset-sourced vars; got: {out!r}"
         )
+
+
+@pytest.mark.parametrize("selector", ["flag", "env"])
+def test_resolved_preset_and_model_metadata_reach_the_container(presets_file, tmp_path, selector):
+    captured = {}
+    env = {"LMER_PRESETS_FILE": str(presets_file), "LMER_SESSION_PRESET": "stale"}
+    argv = ["--model", "requested-model", *_EXEC_ARGS]
+    if selector == "flag":
+        argv = ["--preset", "demo", *argv]
+        env["LMER_PRESET"] = "other"
+    else:
+        env["LMER_PRESET"] = "demo"
+    assert _run_main(argv, env_in=env, captured_env=captured, home=tmp_path) == 0
+    assert captured["LMER_SESSION_PRESET"] == "demo"
+    assert captured["LMER_LLM_NAME"] == "requested-model"
+
+
+def test_no_selected_preset_does_not_forward_an_inherited_label(tmp_path):
+    captured = {}
+    assert _run_main(_EXEC_ARGS, env_in={"LMER_SESSION_PRESET": "stale"},
+                     captured_env=captured, home=tmp_path) == 0
+    assert captured.get("LMER_SESSION_PRESET") is None
+
+
+def test_resolved_preset_is_reported_by_show_env(presets_file, tmp_path, capsys):
+    assert _run_main(["--show-env", "--preset", "demo"],
+                     env_in={"LMER_PRESETS_FILE": str(presets_file)}, home=tmp_path) == 0
+    output = capsys.readouterr().out
+    assert "LMER_SESSION_PRESET" in output and "demo" in output
+
+
+def test_resolved_preset_has_an_explicit_container_passthrough():
+    from pathlib import Path
+    source = (Path(__file__).resolve().parents[1] / "src/lmer_cli/cli.py").read_text()
+    assert '"LMER_SESSION_PRESET": os.environ.get("LMER_SESSION_PRESET")' in source

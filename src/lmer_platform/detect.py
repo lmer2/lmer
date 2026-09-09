@@ -1846,9 +1846,12 @@ class Detector:
             append_event(
                 SESSION_SIGNALLED, note=signal.session, data=signal.event_data()
             )
-            delivered, live = self._spool(
-                signal.digest, SIGNAL_DIGEST_KIND, signal.data()
-            )
+            delivered, live = False, False
+            entry = registry.read_session(signal.session) or {}
+            if entry.get("kind") != assistant.KIND:
+                delivered, live = self._spool(
+                    signal.digest, SIGNAL_DIGEST_KIND, signal.data()
+                )
             logger.info(
                 "platform_signal_ingested session=%s signal=%s run=%s "
                 "notified=%s assistant_live=%s",

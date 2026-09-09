@@ -1349,7 +1349,7 @@ def _reported_model(session_id: object) -> Optional[str]:
     return model.strip() if isinstance(model, str) and model.strip() else None
 
 
-def _refuse(error: AssistantError, reason: str) -> AssistantError:
+def _refuse(error: AssistantError, reason: str, *, operation: str = "start") -> AssistantError:
     """Record a refusal in platform history and return it to raise.
 
     Spec §8.2 requires cap refusals to reach ``events.jsonl`` — "a cap that is
@@ -1358,11 +1358,11 @@ def _refuse(error: AssistantError, reason: str) -> AssistantError:
     did not get it, which is invisible in a UI that only shows what is running.
     """
     append_event(
-        "assistant_start_refused",
+        f"assistant_{operation}_refused",
         note=reason,
         data={"reason": reason, "detail": str(error)},
     )
-    logger.warning("platform_assistant_start_refused reason=%s: %s", reason, error)
+    logger.warning("platform_assistant_%s_refused reason=%s: %s", operation, reason, error)
     return error
 
 
@@ -1966,7 +1966,7 @@ def rotate(
                 launch, launch_sources, besides=(live or {}).get("id"),
             )
         except AssistantThreadHeld as exc:
-            raise _refuse(exc, "thread_held")
+            raise _refuse(exc, "thread_held", operation="rotate")
         stop(reason="rotation", handoff=handoff)
         return start(config, settings=settings, refuse_held_threads=False)
 

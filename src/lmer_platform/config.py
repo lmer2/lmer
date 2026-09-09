@@ -88,6 +88,7 @@ from lmer_cli.runtime import RuntimeErrorDetect, detect_runtime
 # to agree with what :func:`lmer_cli.tokens._gitlab_token_issuing_host` reads.
 from lmer_cli.tokens import _host_from_git_url
 from lmer_cli.util import get_bool_env
+from lmer_cli.comms import DEFAULT_TERMINAL_CONFIRM_SECONDS, TERMINAL_CONFIRM_ENV
 
 # Module level, deliberately: this used to be a function-local import explained as
 # laziness for importability, which defended a cycle that does not exist —
@@ -115,6 +116,7 @@ _CHANNEL_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 
 __all__ = [
+    "TERMINAL_SETTING_KEYS", "terminal_settings",
     "ConfigError", "PlatformConfig", "CONFIG_FILENAME", "SECRET_FILENAME",
     "DEFAULT_BIND_ADDRESS", "DEFAULT_BIND_PORT", "ENV_REPO_URL",
     "ENV_WORK_REPO_FORGE", "WORK_REPO_FORGE_NONE", "WORK_REPO_FORGE_VALUES",
@@ -313,6 +315,10 @@ NUDGE_SETTING_KEYS = {
     ),
 }
 
+TERMINAL_SETTING_KEYS = {
+    "confirm_seconds": ("terminal_confirm_seconds", TERMINAL_CONFIRM_ENV),
+}
+
 
 @dataclass(frozen=True)
 class _IntSettingRule:
@@ -354,6 +360,14 @@ class _IntSettingRule:
 #: which raises: a daemon bound where nobody expects it beats one that will not
 #: start.
 INT_SETTINGS = {
+    "terminal_confirm_seconds": _IntSettingRule(
+        default=DEFAULT_TERMINAL_CONFIRM_SECONDS,
+        minimum=1,
+        floor_reason="confirmation needs a positive window — disable the terminal tracker separately",
+        log_key="platform_terminal_confirm_invalid",
+        unit="seconds",
+        singular_unit="second",
+    ),
     "chat_keep_last": _IntSettingRule(
         default=0,
         minimum=0,
@@ -550,6 +564,7 @@ class PlatformConfig:
     #: digests. See :data:`NUDGE_SETTING_KEYS` and :data:`INT_SETTINGS`.
     nudge_after_seconds: int = DEFAULT_NUDGE_AFTER_SECONDS
     nudge_pending_threshold: int = DEFAULT_NUDGE_PENDING_THRESHOLD
+    terminal_confirm_seconds: int = DEFAULT_TERMINAL_CONFIRM_SECONDS
     #: What a file attached to a chat may weigh, and which types are accepted
     #: (issue #246). The type list is names, normalised and filtered against
     #: :data:`lmer_platform.uploads.KNOWN_TYPES` by :func:`_upload_types_value`;
@@ -1179,6 +1194,7 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
             field: _layer_int(_env_str(env_var), layer="env", field=field)
             for field, env_var in (
                 *CHECKIN_SETTING_KEYS.values(), *NUDGE_SETTING_KEYS.values(),
+                *TERMINAL_SETTING_KEYS.values(),
             )
         },
         **{
@@ -1394,6 +1410,11 @@ def upload_settings() -> dict:
     upload to be measured against it rather than the next daemon start.
     """
     return _int_group_settings(UPLOAD_SETTING_KEYS, group="upload")
+
+
+def terminal_settings() -> dict:
+    """The terminal confirmation window, resolved fresh for live supervisors."""
+    return _int_group_settings(TERMINAL_SETTING_KEYS, group="terminal")
 
 
 def upload_types() -> tuple:

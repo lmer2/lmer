@@ -488,18 +488,15 @@ def _subscribe_to_comms() -> CommsHub:
 
 
 def _assistant_consumer(hub: CommsHub):
-    """Feed the assistant from the fleet journal.
-
-    A milestone keeps the immediate digest and platform event it has always had
-    (the detector's own path, skipped for these sessions); every other record is
-    queued and flushed as one ``session_comms`` digest per session — the
-    assistant receives everything, batched.
-    """
+    """Record milestones and spool worker and human records to the assistant."""
     from . import assistant, detect
     from .store import append_event
 
     def consume(event) -> None:
         message = event.message
+        source = message.get("source") or {}
+        meta = message.get("meta") or {}
+        own = source.get("channel") == "uber-lmer" or meta.get("session_origin") is True
         if message.get("kind") == "milestone":
             run = event.run or {}
             identity = None
@@ -517,16 +514,16 @@ def _assistant_consumer(hub: CommsHub):
                 slug=identity[2] if identity else None,
             )
             append_event(detect.SESSION_SIGNALLED, note=event.session, data=signal.event_data())
-            assistant.notify(signal.digest, kind=detect.SIGNAL_DIGEST_KIND, data=signal.data())
+            if not own:
+                assistant.notify(signal.digest, kind=detect.SIGNAL_DIGEST_KIND, data=signal.data())
             try:
-                # Shared with the ask-directory reader, so recovery does not
-                # re-spool what the hub delivered. The mark counts directory
-                # entries and never seqs — docs/COMMS.md §10 (#421).
+                # Share the ask-directory mark to avoid duplicate history on recovery.
                 detect.record_ingested_signals([signal])
             except Exception as exc:
                 logger.warning("platform_comms_mark_failed session=%s error=%s", event.session, exc)
             return
-        hub.queue_digest(event)
+        if not own:
+            hub.queue_digest(event)
 
     return consume
 

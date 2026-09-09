@@ -64,7 +64,7 @@ def bearer(token):
 class BusPlane:
     """One session's supervisor, with a bus, on a real loopback port."""
 
-    def __init__(self, tmp_path, session="s-bus-1", *, startup_pending=False):
+    def __init__(self, tmp_path, session="s-bus-1", *, startup_pending=False, terminal_window=None):
         self.log = bus.MessageLog(session, str(tmp_path / f"{session}.messages.jsonl"))
         self.sink: list[bytes] = []
         buf = supervisor.OutputBuffer(limit=4096)
@@ -77,8 +77,15 @@ class BusPlane:
             self.log, lambda text: supervisor._submit_payload(write_input, text),
             "claude", startup_pending=True,
         ) if startup_pending else None
-        app = supervisor._build_fastapi_app(buf, write_input, BUS_TOKEN, comms=self.log,
-                                           inbound_relay=self.relay)
+        from lmer_cli.terminal_mirror import TerminalMirror, TranscriptReader
+        self.mirror = (
+            TerminalMirror(self.log, TranscriptReader(None, "unknown"), window=terminal_window)
+            if terminal_window is not None else None
+        )
+        app = supervisor._build_fastapi_app(
+            buf, write_input, BUS_TOKEN, comms=self.log,
+            inbound_relay=self.relay, terminal_mirror=self.mirror,
+        )
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             self.port = probe.getsockname()[1]
@@ -533,6 +540,40 @@ class TestRoutes:
 
 
 class TestHub:
+    def test_terminal_window_updates_a_running_supervisor_through_the_real_transport(
+        self, platform_root, tmp_path, monkeypatch, client,
+    ):
+        monkeypatch.setattr(comms, "POLL_SECONDS", 0.05)
+        plane = BusPlane(tmp_path, terminal_window=11)
+        hub = comms.CommsHub()
+        session = live_session(plane)
+
+        def reaches(value):
+            deadline = time.monotonic() + 5
+            while plane.mirror.window != value and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert plane.mirror.window == value
+
+        try:
+            hub.subscribe(session)
+            reaches(30)
+            reply = client.post("/api/assistant/config",
+                                json={"terminal_confirm_seconds": 75}, headers=auth())
+            assert reply.status_code == 200
+            assert reply.json()["terminal"]["confirm_seconds"]["source"] == "config.json"
+            reaches(75)
+            monkeypatch.setenv(bus.TERMINAL_CONFIRM_ENV, "90")
+            reaches(90)
+            effective = client.get("/api/assistant/config", headers=auth()).json()
+            assert effective["terminal"]["confirm_seconds"]["source"] == "env"
+            monkeypatch.setenv(bus.TERMINAL_CONFIRM_ENV, "invalid")
+            reaches(75)
+            assert client.post("/api/assistant/config", json={"terminal_confirm_seconds": 0},
+                               headers=auth()).status_code == 400
+        finally:
+            hub.stop()
+            plane.stop()
+
     def test_subscriber_ingests_over_http_acks_and_feeds_consumers(self, platform_root, plane):
         session = live_session(plane)
         hub = comms.CommsHub()
@@ -1028,3 +1069,134 @@ def _until(condition, timeout: float = 15.0) -> None:
             return
         time.sleep(0.02)
     raise AssertionError("condition never held")
+
+
+@pytest.mark.parametrize("kind", ["message", "note", "question", "milestone"])
+@pytest.mark.parametrize("source, meta", [("uber-lmer", {}), ("agent", {"session_origin": True})])
+@pytest.mark.parametrize("session", ["s-assistant", "s-worker"])
+def test_assistant_origin_records_remain_in_journal_without_spooling(
+    platform_root, monkeypatch, kind, source, meta, session,
+):
+    from lmer_platform import assistant, daemon, detect
+    spooled = []
+    monkeypatch.setattr(assistant, "notify", lambda *args, **kwargs: spooled.append((args, kwargs)))
+    hub = comms.CommsHub()
+    hub.add_consumer(daemon._assistant_consumer(hub))
+    message = {"id": session + "/000001", "seq": 1, "kind": kind, "text": "own words",
+               "source": {"channel": source}, "meta": meta}
+    hub._ingest(session, message)
+    assert hub.flush_digests() == 0
+    assert spooled == []
+    assert hub.journal.read_since(0)[0][0].message == message
+    events = [event for event in store.read_events() if event["type"] == detect.SESSION_SIGNALLED]
+    assert len(events) == int(kind == "milestone")
+
+
+@pytest.mark.parametrize("kind", ["message", "milestone"])
+@pytest.mark.parametrize("source", ["agent", "slack", "platform"])
+def test_worker_and_human_records_still_reach_the_assistant_spool(
+    platform_root, monkeypatch, kind, source,
+):
+    from lmer_platform import assistant, daemon
+    spooled = []
+    monkeypatch.setattr(assistant, "notify", lambda *args, **kwargs: spooled.append((args, kwargs)))
+    hub = comms.CommsHub()
+    hub.add_consumer(daemon._assistant_consumer(hub))
+    hub._ingest("s-worker", {
+        "id": "s-worker/000001", "seq": 1, "kind": kind, "text": "news",
+        "source": {"channel": source}, "meta": {"session_origin": False},
+    })
+    hub.flush_digests()
+    assert len(spooled) == 1
+    assert spooled[0][1]["kind"] == ("session_signal" if kind == "milestone" else "session_comms")
+
+
+@pytest.mark.parametrize("source, meta", [("uber-lmer", {}), ("agent", {"session_origin": True})])
+def test_assistant_milestone_is_recorded_and_marked_from_the_real_bus(
+    platform_root, plane, monkeypatch, source, meta,
+):
+    from lmer_platform import assistant, daemon, detect
+    session = live_session(plane, kind=assistant.KIND)
+    spooled = []
+    monkeypatch.setattr(assistant, "notify", lambda *args, **kw: spooled.append(args))
+    hub = comms.CommsHub()
+    hub.add_consumer(daemon._assistant_consumer(hub))
+    hub.subscribe(session)
+    try:
+        plane.log.agent_channel = "uber-lmer"
+        message, _ = plane.log.append(
+            kind="milestone", text="own milestone",
+            source=bus.Source(source, ref="ask-dir:000001.signal.json"),
+            session_caller=bool(meta),
+        )
+        assert message.source.channel == "uber-lmer"
+        assert bool(message.meta.get("session_origin")) == bool(meta)
+        _until(lambda: hub.journal.read_since(0)[0])
+        _until(lambda: detect._signal_marks().get(session) == 1, timeout=2)
+        events = [event for event in store.read_events() if event["type"] == detect.SESSION_SIGNALLED]
+        assert len(events) == 1
+        assert hub.flush_digests() == 0
+        assert spooled == []
+    finally:
+        hub.stop()
+
+
+def test_assistant_milestone_projection_does_not_echo_when_the_hub_is_absent(
+    platform_root, plane, monkeypatch,
+):
+    from lmer_platform import assistant, detect, ask as ask_channel
+    from ask_channel import protocol as ask_protocol
+    session = live_session(plane, kind=assistant.KIND)
+    monkeypatch.setattr(comms, "_HUB", None)
+    directory = ask_channel.session_ask_dir(session)
+    directory.mkdir(parents=True, exist_ok=True)
+    ask_protocol.write_record(directory, "000001" + ask_protocol.SIGNAL_SUFFIX, {
+        "schema": ask_protocol.SCHEMA_VERSION, "id": "000001",
+        "kind": ask_protocol.KIND_SIGNAL, "text": "own milestone",
+        "at": "2026-09-04T00:00:00Z",
+    })
+    assert [signal.text for signal in detect.new_signals()] == ["own milestone"]
+    spooled = []
+    detector = detect.Detector(cfg.load(), notifier=lambda *args, **kw: spooled.append(args))
+    assert [signal.text for signal in detector._ingest_signals()] == ["own milestone"]
+    assert spooled == []
+    assert detect._signal_marks()[session] == 1
+    assert detect.new_signals() == []
+    events = [event for event in store.read_events() if event["type"] == detect.SESSION_SIGNALLED]
+    assert len(events) == 1
+    registry.update(session, kind="worker")
+    ask_protocol.post_signal(directory, "worker milestone")
+    assert [signal.text for signal in detector._ingest_signals()] == ["worker milestone"]
+    assert len(spooled) == 1
+
+
+def test_each_thread_loss_reaches_the_real_bus_after_reconnect(plane, platform_root, tmp_path, monkeypatch):
+    from tests.test_platform_thread_connectors import SLACK_LINK, component
+    from slack_chat import registry as thread_registry
+
+    monkeypatch.setattr(thread_registry, "REGISTRY_DIR", str(tmp_path / "threads"))
+    session = live_session(plane)
+    hub = comms.CommsHub()
+    monkeypatch.setattr(comms, "ensure_hub", lambda: hub)
+    now = [0.0]
+    threads = component(platform_root, clock=lambda: now[0])
+    try:
+        for count in (1, 2):
+            connected = threads.connect(session, SLACK_LINK, by="operator")
+            threads.disconnect(session, connected["id"])
+            messages = plane.log.read_since(0)[0]
+            assert len(messages) == count
+            assert b"".join(plane.sink).count(b"thread disconnected:") == count
+        live_session(plane, session_id="holder")
+        threads.connect("holder", SLACK_LINK, by="operator")
+        threads.adopt_launch_targets(session, [SLACK_LINK], by="operator")
+        for _ in range(2):
+            now[0] += 100
+            threads.reconcile()
+        messages = plane.log.read_since(0)[0]
+        assert len(messages) == 3
+        assert len({message.id for message in messages}) == 3
+        assert all(message.source.channel == "platform" for message in messages)
+        assert b"".join(plane.sink).count(b"thread disconnected:") == 3
+    finally:
+        threads.stop()

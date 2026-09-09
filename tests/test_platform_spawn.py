@@ -4074,6 +4074,15 @@ def env_of_spawn(monkeypatch, config, **kwargs):
     return captured
 
 
+@pytest.mark.parametrize("override, expected", [(None, "75"), ("90", "90"), ("invalid", "75")])
+def test_terminal_confirmation_window_reaches_the_spawned_process(config, monkeypatch, override, expected):
+    cfg.update_stored({"terminal_confirm_seconds": 75})
+    if override is not None:
+        monkeypatch.setenv("LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS", override)
+    captured = env_of_spawn(monkeypatch, config)
+    assert captured["LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"] == expected
+
+
 def test_the_assistant_gets_a_memory_mount(config):
     """Mounted where the entrypoint links the harness's declared path from, and
     ``rw`` because the harness writes its memory files there."""

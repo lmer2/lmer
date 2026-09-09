@@ -881,7 +881,7 @@ def test_session_output_state_separates_the_two_nones(monkeypatch):
     from lmer_platform import session_io
 
     def health(payload):
-        monkeypatch.setattr(session_io, "_quiet_health", lambda session_id: payload)
+        monkeypatch.setattr(session_io, "quiet_health", lambda session_id: payload)
         return session_io.session_output_state("s-1")
 
     assert health(None) is None, "no answer stays no answer"
