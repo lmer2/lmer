@@ -218,6 +218,14 @@ def _meta():
     return meta
 
 
+def _references():
+    """The :mod:`lmer_platform.references` module, imported on demand — the same
+    cycle and the same seam as :func:`_meta`."""
+    from . import references
+
+    return references
+
+
 def load_index() -> dict:
     """Raw ``{key: entry}`` mapping. Empty when nothing is tracked yet."""
     try:
@@ -410,6 +418,12 @@ def forget(host: str, project: str, slug: str) -> bool:
         _meta().drop(host, project, slug)
     except StoreError as exc:
         logger.warning("platform_run_meta_orphaned key=%s error=%s", key, exc)
+    # And the threads it was pointed at, for the same reason and on the same
+    # terms (:mod:`lmer_platform.references`).
+    try:
+        _references().drop(host, project, slug)
+    except StoreError as exc:
+        logger.warning("platform_run_references_orphaned key=%s error=%s", key, exc)
     logger.info("platform_run_forgotten key=%s", key)
     return True
 

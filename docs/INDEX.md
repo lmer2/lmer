@@ -258,6 +258,24 @@ How `--service` and `--checkout` let lmer run against an already-running contain
 
 ---
 
+### [COMMS.md](./COMMS.md)
+**The unified communications channel**
+
+One channel per session, both directions, with the supervisor as the single
+port: the agent's one command (`lmer-signal`), the message model and the bus
+routes, how the platform, Slack, matrix and the terminal connect, the
+first-answer-wins question flow, source tags, loop rules, and the one-release
+compatibility shims.
+- The message record (schema 1), its kinds and the question fold
+- Supervisor routes (`/messages`) and daemon routes (`/api/comms/*`)
+- Slack and matrix threads as session targets, the connectors and listeners
+- Where the log lives, the drain grace, every `LMER_*` variable involved
+
+**Best for**: Writing or operating anything that talks to a session, and
+understanding what `lmer-signal` does with what you post.
+
+---
+
 ### [MATRIX-CHAT.md](./MATRIX-CHAT.md)
 **Matrix Chat Bridge**
 
@@ -366,7 +384,8 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - **Setting up containers?** See [CONTAINER.md](./CONTAINER.md) for Docker/Podman configuration
 - **Having auth issues?** Check [AUTHENTICATION.md](./AUTHENTICATION.md) for SSH and API setup
 - **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md) and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption and operator setup
-- **Answering runs from your phone?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
+- **Talking to a session from Slack, matrix or the chat pane?** See [COMMS.md](./COMMS.md)
+- **Announcing runs that want a human into a Matrix room?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
 - **Migrating a work repo to the schema?** See [SCHEMA.md](./SCHEMA.md) for the normative layout, then check the tree with `lmer-schema validate`
 - **Need to troubleshoot?** All documents include troubleshooting sections
 

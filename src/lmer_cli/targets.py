@@ -23,8 +23,10 @@ needs no new branches.
 """
 
 import os
+import sys
 from typing import ClassVar
 
+from matrix_chat.permalink import is_matrix_thread_url, parse_matrix_permalink
 from slack_chat.permalink import is_slack_thread_url, parse_slack_permalink
 from slack_chat.registry import deregister, register
 
@@ -42,8 +44,31 @@ class TargetHandler:
     #: so .env files cannot forward them without a matching target.
     container_env_keys: ClassVar[tuple[str, ...]] = ()
 
+    #: Whether this target type runs a connector against the session's bus
+    #: (issue #407). The CLI then turns the supervisor control plane on for the
+    #: session, mints its token host-side when the environment did not supply
+    #: one, and hands both to :meth:`attach_control_plane` before
+    #: :meth:`on_session_start`.
+    needs_control_plane: ClassVar[bool] = False
+
     def __init__(self) -> None:
         self.targets: list[str] = []
+        self.control_plane: tuple[str, str] | None = None
+        self.uploads: tuple[str, str] | None = None
+        #: Whether this process runs the connectors for its threads and claims
+        #: them in the host registry. ``False`` under ``--no-thread-connectors``,
+        #: where the platform daemon owns both (issue #412) and all this handler
+        #: contributes is the container's chat context.
+        self.hosts_connectors: bool = True
+        self._additional_handlers: list[TargetHandler] = []
+
+    def attach_control_plane(self, url: str, token: str) -> None:
+        """Where the session's bus will answer, from the host side."""
+        self.control_plane = (url, token)
+
+    def attach_uploads(self, host_dir: str, container_dir: str) -> None:
+        """The session's upload store: its host directory and its container path."""
+        self.uploads = (host_dir, container_dir)
 
     @classmethod
     def matches(cls, target: str) -> bool:
@@ -53,6 +78,32 @@ class TargetHandler:
     def add(self, target: str) -> None:
         """Record a target this handler claimed via :meth:`matches`."""
         self.targets.append(target)
+
+    @staticmethod
+    def thread_key(target: str) -> tuple[str, str]:
+        """The conversation and root event this permalink connects to."""
+        raise NotImplementedError
+
+    def _start_additional_targets(self) -> None:
+        """Each additional thread owns its connector, cursor and registration."""
+        seen = {self.thread_key(target) for target in self.targets[:1]}
+        for target in self.targets[1:]:
+            key = self.thread_key(target)
+            if key in seen:
+                continue
+            seen.add(key)
+            handler = type(self)()
+            handler.add(target)
+            handler.control_plane = self.control_plane
+            handler.uploads = self.uploads
+            handler.hosts_connectors = self.hosts_connectors
+            self._additional_handlers.append(handler)
+            handler.on_session_start()
+
+    def _stop_additional_targets(self) -> None:
+        for handler in self._additional_handlers:
+            handler.on_session_end()
+        self._additional_handlers.clear()
 
     def validate_environment(self) -> str | None:
         """Return an error message when required credentials are missing."""
@@ -101,17 +152,27 @@ class TargetHandler:
         """Teardown counterpart to :meth:`on_session_start`. Default no-op."""
 
 
+def _warn(message: str) -> None:
+    """What a connector says when it gives up. The connectors log it too, but
+    the host `lmer` process configures no logging, so this is the copy a human
+    sees."""
+    print(f"⚠️  {message}", file=sys.stderr)
+
+
 class SlackThreadTargets(TargetHandler):
     """Slack thread permalinks passed as ``lmer`` targets (issue #54).
 
     Only the first Slack target drives the container's chat context
     (``LMER_SLACK_CHANNEL`` / ``LMER_SLACK_THREAD_TS`` /
-    ``LMER_SLACK_PERMALINK``); additional Slack targets are retained but
-    currently unused. ``SLACK_BOT_TOKEN`` is required whenever a Slack
-    target is present; ``SLACK_APP_TOKEN`` is optional and forwarded
-    when set. Repo-less sessions are allowed for the ``chat`` task only
-    — it is the only taskdef adapted for repo-less mode; every other
-    task assumes code in /workspace.
+    ``LMER_SLACK_PERMALINK`` / ``LMER_CHAT_CHANNEL``); additional Slack targets
+    each get their own connector. ``SLACK_BOT_TOKEN`` is required on the
+    **host** whenever a Slack target is present — since issue #407 the thread is
+    served by a connector running in this process
+    (:mod:`slack_chat.connector`), so the token never enters the container: both
+    Slack tokens are seeded ``None`` in the container env, which is what keeps a
+    ``.env`` file from forwarding them. Repo-less sessions are allowed for the
+    ``chat`` task only — it is the only taskdef adapted for repo-less mode; every
+    other task assumes code in /workspace.
     """
 
     repoless_task_ids = frozenset({"chat"})
@@ -121,17 +182,24 @@ class SlackThreadTargets(TargetHandler):
         "LMER_SLACK_CHANNEL",
         "LMER_SLACK_THREAD_TS",
         "LMER_SLACK_PERMALINK",
+        "LMER_CHAT_CHANNEL",
     )
+    needs_control_plane = True
 
     def __init__(self) -> None:
         super().__init__()
         self.channel: str | None = None
         self.thread_ts: str | None = None
         self.permalink: str | None = None
+        self.connector = None
 
     @classmethod
     def matches(cls, target: str) -> bool:
         return is_slack_thread_url(target)
+
+    @staticmethod
+    def thread_key(target: str) -> tuple[str, str]:
+        return parse_slack_permalink(target)
 
     def add(self, target: str) -> None:
         super().add(target)
@@ -159,32 +227,184 @@ class SlackThreadTargets(TargetHandler):
 
     def container_env(self) -> dict[str, str | None]:
         return {
-            "SLACK_BOT_TOKEN": os.environ.get("SLACK_BOT_TOKEN"),
-            "SLACK_APP_TOKEN": os.environ.get("SLACK_APP_TOKEN"),
+            # Blocked, not forwarded: the connector on the host holds them.
+            "SLACK_BOT_TOKEN": None,
+            "SLACK_APP_TOKEN": None,
             "LMER_SLACK_CHANNEL": self.channel,
             "LMER_SLACK_THREAD_TS": self.thread_ts,
             "LMER_SLACK_PERMALINK": self.permalink,
+            "LMER_CHAT_CHANNEL": "slack",
         }
 
     def on_session_start(self) -> None:
-        """Record this Slack-thread attachment in the host-side registry.
+        """Record the attachment in the host-side registry and start the connector.
 
-        Lets the Slack listener detect that an lmer is already connected to the
-        thread — including a session it didn't spawn, e.g. a manual
-        ``lmer chat <permalink>`` from a shell — and decline to connect a second
-        one (issue #74). The registry call is best-effort and keyed on the
-        parsed ``channel`` / ``thread_ts``; with no Slack target parsed it is a
-        no-op.
+        The registry lets the Slack listener detect that an lmer is already
+        connected to the thread — including a session it didn't spawn, e.g. a
+        manual ``lmer chat <permalink>`` from a shell — and decline to connect a
+        second one (issue #74). The connector is what carries the conversation
+        (issue #407): it needs the control plane the CLI attached; without one
+        the session runs and the thread stays silent, and that is said out loud.
         """
+        if not self.hosts_connectors:
+            return
+        self._start_additional_targets()
         register(self.channel, self.thread_ts, permalink=self.permalink)
+        if self.control_plane is None or not self.channel or not self.thread_ts:
+            print(
+                "⚠️  Slack thread target without a supervisor control plane — the "
+                "connector cannot run, so the thread will not hear this session",
+                file=sys.stderr,
+            )
+            return
+        try:
+            from slack_chat.connector import ConnectorConfig, SlackConnector
+
+            url, token = self.control_plane
+            host_dir, container_dir = self.uploads or (None, None)
+            config = ConnectorConfig.from_env(
+                channel=self.channel, thread_ts=self.thread_ts,
+                supervisor_url=url, supervisor_token=token,
+                uploads_dir=host_dir, container_uploads_dir=container_dir,
+            )
+            self.connector = SlackConnector(config, notify=_warn)
+            self.connector.start()
+        except Exception as exc:  # a dead connector must not stop the session
+            print(f"⚠️  Slack connector did not start: {exc}", file=sys.stderr)
+            self.connector = None
 
     def on_session_end(self) -> None:
-        """Clear the registry entry recorded by :meth:`on_session_start`."""
+        """Stop the connector and clear the registry entry."""
+        if not self.hosts_connectors:
+            return
+        self._stop_additional_targets()
+        if self.connector is not None:
+            self.connector.stop()
+            self.connector = None
         deregister(self.channel, self.thread_ts)
 
 
+class MatrixThreadTargets(TargetHandler):
+    """Matrix thread permalinks passed as ``lmer`` targets (issue #407, §5.5).
+
+    The mirror of :class:`SlackThreadTargets`: the first matrix target drives the
+    container's chat context (``LMER_MATRIX_ROOM_ID`` / ``LMER_MATRIX_THREAD_EVENT``
+    / ``LMER_MATRIX_PERMALINK`` / ``LMER_CHAT_CHANNEL``), the bot account's
+    credentials are required on the **host** and never enter the container, and
+    the connector runs in this process (:mod:`matrix_chat.connector`).
+    """
+
+    repoless_task_ids = frozenset({"chat"})
+    container_env_keys = (
+        "LMER_MATRIX_HOMESERVER",
+        "LMER_MATRIX_USER_ID",
+        "LMER_MATRIX_ACCESS_TOKEN",
+        "LMER_MATRIX_ROOM_ID",
+        "LMER_MATRIX_THREAD_EVENT",
+        "LMER_MATRIX_PERMALINK",
+        "LMER_CHAT_CHANNEL",
+    )
+    needs_control_plane = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.room: str | None = None
+        self.thread_event: str | None = None
+        self.permalink: str | None = None
+        self.connector = None
+
+    @classmethod
+    def matches(cls, target: str) -> bool:
+        return is_matrix_thread_url(target)
+
+    @staticmethod
+    def thread_key(target: str) -> tuple[str, str]:
+        parsed = parse_matrix_permalink(target)
+        if parsed is None:
+            raise ValueError("invalid matrix thread permalink")
+        return parsed.room, parsed.event_id
+
+    def add(self, target: str) -> None:
+        super().add(target)
+        if self.permalink is None:
+            parsed = parse_matrix_permalink(target)
+            if parsed is not None:
+                self.permalink = target
+                self.room, self.thread_event = parsed.room, parsed.event_id
+
+    def validate_environment(self) -> str | None:
+        missing = [
+            name for name in ("LMER_MATRIX_HOMESERVER", "LMER_MATRIX_USER_ID", "LMER_MATRIX_ACCESS_TOKEN")
+            if not os.environ.get(name)
+        ]
+        if missing:
+            return (
+                f"{', '.join(missing)} required when a matrix thread URL is given — the bot "
+                "account the connector acts as. Set them in your .env file."
+            )
+        return None
+
+    def repoless_start_message(self) -> str:
+        return "💬 matrix thread is the only target — starting a session without a repository"
+
+    def repoless_unsupported_reason(self, task_id: str | None) -> str:
+        return (
+            "A matrix thread as the only target is supported for the 'chat' task "
+            f"only; the '{task_id}' task needs a repository target (or run it from "
+            "inside a git checkout)."
+        )
+
+    def container_env(self) -> dict[str, str | None]:
+        return {
+            "LMER_MATRIX_HOMESERVER": None,
+            "LMER_MATRIX_USER_ID": None,
+            "LMER_MATRIX_ACCESS_TOKEN": None,
+            "LMER_MATRIX_ROOM_ID": self.room,
+            "LMER_MATRIX_THREAD_EVENT": self.thread_event,
+            "LMER_MATRIX_PERMALINK": self.permalink,
+            "LMER_CHAT_CHANNEL": "matrix",
+        }
+
+    def on_session_start(self) -> None:
+        if not self.hosts_connectors:
+            return
+        self._start_additional_targets()
+        register(self.room, self.thread_event, permalink=self.permalink, kind="matrix")
+        if self.control_plane is None or not self.room or not self.thread_event:
+            print(
+                "⚠️  matrix thread target without a supervisor control plane — the "
+                "connector cannot run, so the thread will not hear this session",
+                file=sys.stderr,
+            )
+            return
+        try:
+            from matrix_chat.connector import ConnectorConfig, MatrixConnector
+
+            url, token = self.control_plane
+            host_dir, container_dir = self.uploads or (None, None)
+            config = ConnectorConfig.from_env(
+                room=self.room, thread_event=self.thread_event,
+                supervisor_url=url, supervisor_token=token,
+                uploads_dir=host_dir, container_uploads_dir=container_dir,
+            )
+            self.connector = MatrixConnector(config, notify=_warn)
+            self.connector.start()
+        except Exception as exc:  # a dead connector must not stop the session
+            print(f"⚠️  matrix connector did not start: {exc}", file=sys.stderr)
+            self.connector = None
+
+    def on_session_end(self) -> None:
+        if not self.hosts_connectors:
+            return
+        self._stop_additional_targets()
+        if self.connector is not None:
+            self.connector.stop()
+            self.connector = None
+        deregister(self.room, self.thread_event, kind="matrix")
+
+
 #: Registry of special target types, in match-priority order.
-TARGET_HANDLER_TYPES: tuple[type[TargetHandler], ...] = (SlackThreadTargets,)
+TARGET_HANDLER_TYPES: tuple[type[TargetHandler], ...] = (SlackThreadTargets, MatrixThreadTargets)
 
 
 def partition_targets(

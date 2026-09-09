@@ -1737,7 +1737,7 @@ def test_the_row_asks_for_the_forget_and_never_does_it():
     with no window at all.
     """
     text = _read(RUN_CARD)
-    assert "defineEmits(['open', 'forget', 'open-chat'])" in text, (
+    assert "defineEmits(['open', 'forget', 'open-chat', 'threads-changed'])" in text, (
         "the row does not declare the verbs it emits"
     )
     assert "$emit('forget', run)" in _template(), "nothing asks for the forget"

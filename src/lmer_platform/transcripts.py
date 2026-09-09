@@ -262,12 +262,13 @@ mid-turn message.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
@@ -288,7 +289,7 @@ __all__ = [
     "TRANSCRIPT_FILE_MODE",
     "DEFAULT_MESSAGE_LIMIT", "MAX_MESSAGE_LIMIT", "TEXT_LIMIT", "DETAIL_LIMIT",
     "MAX_MESSAGES_PER_SOURCE", "MAX_SOURCES", "TOOL_STATUSES", "MESSAGE_KINDS",
-    "ASK_CHANNEL_VIA", "MONITOR_VIA", "MONITOR_ROLE", "PLATFORM_ROLE",
+    "ASK_CHANNEL_VIA", "COMMS_VIA", "MONITOR_VIA", "MONITOR_ROLE", "PLATFORM_ROLE",
     "ToolCall", "Message", "Source", "MessagePage",
     "transcript_root", "session_transcript_dir", "locate_sources",
     "sessions_for_run", "normalise_records", "read_source", "read_messages",
@@ -418,6 +419,12 @@ MESSAGE_KINDS = ("said", "injected", "notice")
 #: not something the harness wrote down, and a turn that claimed to be transcript
 #: content while being assembled here is the one thing this merge must not do.
 ASK_CHANNEL_VIA = "ask"
+
+#: ``via`` for a turn merged in from the session's communications bus (issue
+#: #407): the agent's notes, milestones and questions, and everything any
+#: channel said to it, read from the daemon's fleet journal — never from the
+#: transcript, which records only the tagged relay of the inbound half.
+COMMS_VIA = "comms"
 
 #: What ``Message.via`` says when a turn is the harness's background monitor
 #: reporting a condition the session asked to be woken for. The same statement
@@ -776,6 +783,7 @@ class ToolCall:
     detail: Optional[str] = None
     status: str = "pending"
     error: Optional[str] = None
+    command: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -783,6 +791,7 @@ class ToolCall:
             "detail": self.detail,
             "status": self.status,
             "error": self.error,
+            "command": self.command,
         }
 
 
@@ -808,6 +817,13 @@ class Message:
     text: str
     at: Optional[str] = None
     origin: Optional[str] = None
+    #: Stable across reads, which ``seq`` is not — ``seq`` is a position in the
+    #: merged conversation and every read renumbers, so a late transcript row
+    #: shifts every turn after it and a client paging by position redraws one it
+    #: already holds. A bus turn takes the record's id; a transcript turn is
+    #: numbered within its own append-only file. ``None`` only outside
+    #: :func:`read_messages`.
+    id: Optional[str] = None
     truncated: bool = False
     tools: list = field(default_factory=list)
     seq: int = 0
@@ -822,6 +838,22 @@ class Message:
     #: status. ``None`` when the refusal carried neither, or when there is none.
     api_error: Optional[str] = None
     api_error_status: Optional[int] = None
+    #: For a :data:`COMMS_VIA` turn: the bus record's ``source`` (channel, author,
+    #: ref) and the label the view shows beside the speaker — the record's kind
+    #: (``note``, ``milestone``, ``question``, ``answer``, ``late answer``), or
+    #: ``None`` for a plain message.
+    source: Optional[dict] = None
+    comms_kind: Optional[str] = None
+    #: ``"reconstructed"`` on a terminal line the supervisor rebuilt from
+    #: keystrokes rather than read (spec §3.4). It is a prediction, and the
+    #: condition for shipping it was that the humans reading the mirror can see
+    #: which lines are one.
+    fidelity: Optional[str] = None
+    #: The thread a `lmer-signal post --thread` went into (issue #414). The words
+    #: are on this session's own conversation because the run said them, but they
+    #: were addressed to a thread this session is not connected to — without this
+    #: the pane shows them as a message to whoever is reading it.
+    thread: Optional[str] = None
 
     @property
     def empty(self) -> bool:
@@ -831,6 +863,7 @@ class Message:
     def to_dict(self) -> dict:
         return {
             "seq": self.seq,
+            "id": self.id,
             "role": self.role,
             "kind": self.kind,
             "at": self.at,
@@ -842,6 +875,10 @@ class Message:
             "api_refusal": self.api_refusal,
             "api_error": self.api_error,
             "api_error_status": self.api_error_status,
+            "source": self.source,
+            "comms_kind": self.comms_kind,
+            "fidelity": self.fidelity,
+            "thread": self.thread,
         }
 
 
@@ -1249,6 +1286,18 @@ def _tool_detail(payload) -> Optional[str]:
     return None
 
 
+def _tool_command(payload) -> Optional[str]:
+    """Complete scrubbed command, or no match evidence when it exceeds the cap."""
+    if not isinstance(payload, dict):
+        return None
+    for key in ("command", "cmd"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            command, truncated = _present(value, TEXT_LIMIT)
+            return None if truncated else command
+    return None
+
+
 def _strip_wrappers(text: str) -> str:
     """Remove the tags Claude Code wraps injected user content in."""
     return _WRAPPER_RE.sub("", text).strip()
@@ -1461,6 +1510,7 @@ def _claude_message(record: dict, pending: dict) -> Optional[Message]:
                 call = ToolCall(
                     name=str(block.get("name") or "tool"),
                     detail=_tool_detail(block.get("input")),
+                    command=_tool_command(block.get("input")),
                 )
                 tools.append(call)
                 use_id = block.get("id")
@@ -1577,6 +1627,7 @@ def _pi_message(record: dict, pending: dict) -> Optional[Message]:
                 # bash tool, ``path`` for the file ones — so the same generic
                 # pick reads them.
                 detail=_tool_detail(block.get("arguments")),
+                command=_tool_command(block.get("arguments")),
             )
             tools.append(call)
             call_id = block.get("id")
@@ -1600,7 +1651,7 @@ def _pi_message(record: dict, pending: dict) -> Optional[Message]:
 def _codex_arguments(raw) -> Optional[dict]:
     """A codex function call's arguments, which arrive as a JSON *string*.
 
-    Parsed defensively, and only ever for the one-line hint: an argument blob
+    Parsed defensively for the tool hint and command: an argument blob
     that is not JSON, or is JSON but not a mapping, or was truncated by the model
     reads as "no detail" rather than as a failure — a tool chip with a name and
     no hint still says what ran.
@@ -1726,9 +1777,11 @@ def _codex_message(record: dict, pending: dict) -> Optional[Message]:
     kind_of_payload = payload.get("type")
 
     if kind_of_payload == "function_call":
+        arguments = _codex_arguments(payload.get("arguments"))
         call = ToolCall(
             name=str(payload.get("name") or "tool"),
-            detail=_tool_detail(_codex_arguments(payload.get("arguments"))),
+            detail=_tool_detail(arguments),
+            command=_tool_command(arguments),
         )
         call_id = payload.get("call_id")
         if isinstance(call_id, str) and call_id:
@@ -1767,9 +1820,11 @@ def _codex_message(record: dict, pending: dict) -> Optional[Message]:
         arguments = payload.get("arguments")
         if arguments is None:
             arguments = payload.get("input")
+        arguments = _codex_arguments(arguments)
         call = ToolCall(
             name=name if isinstance(name, str) and name else kind_of_payload,
-            detail=_tool_detail(_codex_arguments(arguments)),
+            detail=_tool_detail(arguments),
+            command=_tool_command(arguments),
         )
         call_id = payload.get("call_id")
         if isinstance(call_id, str) and call_id:
@@ -2579,6 +2634,317 @@ def _interleave(transcript: list, channel: list) -> list:
     return [item[3] for item in ordered]
 
 
+def _comms_messages(session_id: str) -> tuple:
+    """One session's bus records as turns, and the harness's copies to hide.
+
+    Returns ``(turns, copies)``. *copies* holds ``(role, text)`` for every
+    harness turn that is the same communication as a record already in *turns*,
+    which the harness wrote down for its own two reasons:
+
+    - inbound, the exact line the supervisor typed in (``[slack · vegu] …``),
+      recorded as a ``user`` turn;
+    - outbound, the reply the agent wrote as prose before posting it, recorded
+      as an ``assistant`` turn.
+
+    Showing either beside the record it came from shows one message twice.
+    Read from the daemon's journal, never from the container's log (spec
+    decision 17).
+
+    Best-effort like every other read here: a hub that cannot answer costs the
+    bus turns and nothing else.
+    """
+    try:
+        from lmer_cli import comms as bus
+
+        from . import comms as hub_module
+
+        events, _cursor = hub_module.ensure_hub().feed(
+            0, session=session_id, limit=hub_module.PANE_LIMIT,
+        )
+    except Exception as exc:  # pragma: no cover - defensive, see docstring
+        logger.warning(
+            "platform_transcript_comms_unreadable session=%s error=%s — the "
+            "conversation is served without the bus's turns", session_id, exc,
+        )
+        return [], []
+    if not events:
+        return [], []
+
+    questions: dict = {}
+    turns: list = []
+    copies: list = []
+    for event in events:
+        record = event.message
+        kind = record.get("kind")
+        source = record.get("source") if isinstance(record.get("source"), dict) else {}
+        channel = source.get("channel")
+        meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+        if kind == "question":
+            questions[record.get("id")] = record
+        inbound = channel not in (None, "agent") and not meta.get("session_origin")
+        if kind == "command":
+            role = PLATFORM_ROLE
+        elif inbound:
+            role = "user"
+        else:
+            role = "assistant"
+        label = None if kind == "message" and inbound else kind
+        if kind == "answer" and meta.get("late"):
+            label = "late answer"
+        spoken, truncated = _present(str(record.get("text") or ""), TEXT_LIMIT, keep="tail")
+        text = spoken
+        if kind == "close" and not text:
+            text = "stopped waiting for an answer"
+        if text:
+            identifier = record.get("id")
+            if not isinstance(identifier, str) or not identifier:
+                # A record the journal holds without a usable id still has to be
+                # nameable, or the pane cannot tell it from a turn it already
+                # holds. The journal's own cursor is stable across reads.
+                identifier = f"{session_id}:comms#{event.cursor}"
+            turns.append(Message(
+                role=role, kind="said", text=text, at=record.get("at") or None,
+                truncated=truncated, via=COMMS_VIA,
+                id=identifier,
+                source=dict(source) if source else None, comms_kind=label,
+                fidelity=meta.get("fidelity") if isinstance(meta.get("fidelity"), str) else None,
+                thread=_thread_link(meta.get("thread")),
+            ))
+        if role == "assistant" and spoken:
+            # The record's own words, not the rendered ``text``: a ``close``
+            # renders words it does not carry, and the harness never wrote those.
+            copies.append(("assistant", _collapsed(spoken), record.get("at")))
+        if inbound and kind in ("message", "answer"):
+            message = bus.Message.from_dict(record)
+            if message is None:
+                continue
+            asked = questions.get(record.get("in_reply_to"))
+            line, tagged = bus.relay_payload(
+                message, bus.Message.from_dict(asked) if asked else None
+            )
+            if tagged:
+                copies.append(("user", _collapsed(line), None))
+    return turns, copies
+
+
+def _thread_link(value: object) -> Optional[str]:
+    """``meta.thread``, but only when it is a thread permalink.
+
+    Everything else on a record is text the pane renders as text; this one field
+    becomes an ``href``, and the whole path to it — ``POST /messages`` takes an
+    unschema'd ``meta`` on the session's own token, the bus stringifies keys and
+    passes values through, the journal keeps the record verbatim — is careful
+    about *attribution* and says nothing about this. So a session that never
+    posts into a thread could still choose where a link in the operator's browser
+    points, under a caption claiming the platform put it there.
+
+    The honest path always passes: ``lmer-signal post --thread`` sets this from
+    ``ThreadRef.canonical``. Anything that does not parse is dropped, and the
+    pane then renders the turn without the marker rather than with a link
+    nobody vouched for.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    from lmer_cli.threads import ThreadError, parse_thread
+
+    try:
+        parse_thread(value)
+    except ThreadError:
+        logger.info("platform_transcript_thread_link_refused")
+        return None
+    return value
+
+
+def _collapsed(text: str) -> str:
+    return " ".join(str(text or "").split())
+
+
+#: How much of a truncated turn's tail has to match a copy for the two to be the
+#: same message. Long enough that two different messages do not collide, short
+#: enough to survive any truncation. Load-bearing for the inbound direction only,
+#: where the relay line is built whole from the record while the harness's copy is
+#: kept by its tail; an outbound copy and its turn are truncated by the same rule,
+#: so they compare equal.
+_COPY_TAIL = 200
+
+
+def _without_bus_copies(transcript: list, copies: list) -> list:
+    """Drop the harness's own copy of a record the bus already carries.
+
+    The bus record is the one kept: it is what every other channel saw, and it
+    alone carries the source and kind the pane labels the turn with. Matched on
+    role and whitespace-collapsed text, once per copy.
+
+    A turn that also made tool calls keeps its place with the words removed: the
+    harness writes the reply and the `lmer-signal post` that sends it as one turn,
+    and the calls under it are recorded nowhere else.
+
+    A copy is spent only inside its record's own time window — the last turn at or
+    before the record, and never one after it. Bare agent prose repeats ("done",
+    "on it", "pushed" are ordinary `note` and `milestone` text), so an unbounded
+    match deleted a separate statement: earlier, when matching ran oldest-first,
+    and later, when a copy with no legitimate match survived to consume the next
+    turn that happened to say the same words. A record posted from a heredoc has
+    no prose copy at all, so copies that match nothing are ordinary.
+
+    The undated case is the documented fallback and nothing more: a record whose
+    `at` cannot be read takes the earliest turn still free — dated turns first, so
+    an undated *turn* is only taken when no dated one is eligible, which is what
+    :data:`_UNDATED` is ordered for on both branches. The inbound half passes no time and is deliberately
+    unchanged — its copy is a tagged relay line, near-unique by construction, and
+    the record always precedes the harness's copy of it.
+    """
+    if not copies:
+        return transcript
+    claimed = _claims(transcript, copies)
+    if not claimed:
+        return transcript
+    kept: list = []
+    for index, message in enumerate(transcript):
+        if index in claimed:
+            if not message.tools:
+                continue
+            message = replace(message, text="", truncated=False)
+        kept.append(message)
+    return kept
+
+
+#: Sort key for a turn with no readable time. Ordered below every real timestamp
+#: so an undated turn is claimed only when no dated one is eligible.
+_UNDATED = (0, "")
+
+
+def _sortable(at) -> tuple:
+    when = _timestamp_key(at) if at else None
+    return _UNDATED if when is None else (1, when)
+
+
+def _claims(transcript: list, copies: list) -> set:
+    """Which turn each copy is spent on, as the set of claimed indices.
+
+    Resolved copy-first and per group of identical words: the turns of a group in
+    time order and its copies in record order are walked together, each copy taking
+    the latest eligible turn not already taken. Matching turn-first meant
+    re-scanning the group for a better claimant on every turn, which is quadratic
+    in turns that say the same words — the shape a session posting "done" all day
+    actually has. Measured on 5000 turns against 2000 copies: all identical words,
+    2.97s turn-first against 0.03s here; 5000 truncated turns against 2000 copies
+    matching nothing — the shape that reaches :func:`_spend_by_tail` rather than
+    this one — 2.71s unindexed against 0.07s. Two numbers because one of them was
+    quoted for a path the input never took (!288 review).
+    """
+    groups: dict = {}
+    for index, message in enumerate(transcript):
+        if message.kind == "said" and message.text:
+            key = (message.role, _collapsed(message.text))
+            groups.setdefault(key, []).append((_sortable(message.at), index))
+    for entries in groups.values():
+        entries.sort()
+
+    wanted: dict = {}
+    for position, (role, words, at) in enumerate(copies):
+        when = _timestamp_key(at) if at else None
+        wanted.setdefault((role, words), []).append((when, position))
+
+    claimed: set = set()
+    spent: set = set()
+    for key, asking in wanted.items():
+        entries = groups.get(key)
+        if entries:
+            _spend(entries, asking, claimed, spent)
+    _spend_by_tail(transcript, copies, wanted, claimed, spent)
+    return claimed
+
+
+def _spend(entries: list, asking: list, claimed: set, spent: set) -> None:
+    """Walk one group's turns and its copies together, latest eligible first.
+
+    *entries* is ``(sort key, index)`` in time order; *asking* is ``(when,
+    position)``. A dated copy takes the latest turn at or before its record; an
+    undated one takes the earliest turn still free, which is the documented
+    oldest-first fallback.
+    """
+    dated = sorted((when, position) for when, position in asking if when is not None)
+    eligible: list = []
+    cursor = 0
+    for when, position in dated:
+        while cursor < len(entries) and entries[cursor][0] <= (1, when):
+            eligible.append(entries[cursor][1])
+            cursor += 1
+        if eligible:
+            claimed.add(eligible.pop())
+            spent.add(position)
+    # Dated turns first and each class by position: sorted-key order put undated
+    # turns at the front, so the fallback took one while dated turns were free —
+    # the inverse of what _UNDATED is for, on the branch that governs every
+    # inbound copy.
+    free = [
+        index for _key, index in sorted(entries, key=lambda e: (e[0] == _UNDATED, e[1]))
+        if index not in claimed
+    ]
+    for when, position in asking:
+        if when is not None or not free:
+            continue
+        claimed.add(free.pop(0))
+        spent.add(position)
+
+
+def _spend_by_tail(transcript, copies, wanted, claimed, spent) -> None:
+    """The inbound direction's fallback, for copies nothing said exactly.
+
+    A long inbound message is kept by its tail in the transcript and whole in the
+    relay line, so equality never holds and the pane showed the record and the
+    harness's copy of it.
+
+    **Undated copies only, which is the inbound half by construction** — every
+    relay line is passed with no time. That is what keeps this pass inside the
+    rule the module docstring states: an outbound copy is bounded by its record's
+    window, and it never needs this path, because a record's text and the harness
+    turn that says it are truncated by the same call and compare equal.
+
+    Indexed on the tail rather than scanned: ``spoken.endswith(tail)`` is a
+    suffix comparison for every unspent copy on every truncated turn, which is
+    quadratic on an input this module calls ordinary (copies that match nothing).
+    """
+    outstanding: dict = {}
+    for asking in wanted.values():
+        for when, position in asking:
+            if when is None and position not in spent:
+                outstanding.setdefault(
+                    (copies[position][0], copies[position][1][-_COPY_TAIL:]), []
+                ).append(position)
+    if not outstanding:
+        return
+    for index, message in enumerate(transcript):
+        if index in claimed or message.kind != "said" or not message.truncated:
+            continue
+        words = _collapsed(message.text)
+        if len(words) <= _COPY_TAIL:
+            continue
+        waiting = outstanding.get((message.role, words[-_COPY_TAIL:]))
+        while waiting:
+            position = waiting.pop(0)
+            if position in spent:
+                continue
+            claimed.add(index)
+            spent.add(position)
+            break
+
+
+def _merged_channel(session_id: str) -> tuple:
+    """The turns to merge into one session's transcript, and the copies to hide.
+
+    The bus wins when it has anything: the ask directory is a projection of the
+    same records for one release (spec §8.2), so reading both would show every
+    question twice. A session with no bus turns — an older image — keeps the ask
+    channel's exchange exactly as before.
+    """
+    turns, copies = _comms_messages(session_id)
+    if turns:
+        return turns, copies
+    return _channel_messages(session_id), []
+
+
 def _channel_messages(session_id: str) -> list:
     """One session's ask-channel exchanges as normalised turns, oldest first.
 
@@ -2612,6 +2978,7 @@ def _channel_messages(session_id: str) -> list:
             built.append(Message(
                 role="assistant", kind="said", text=text, at=entry.at or None,
                 truncated=truncated, via=ASK_CHANNEL_VIA,
+                id=f"{session_id}:ask:{entry.id}:question",
             ))
         answer = entry.answer
         if answer is None:
@@ -2622,6 +2989,7 @@ def _channel_messages(session_id: str) -> list:
                 role="user", kind="said", text=text,
                 at=answer.answered_at or None, truncated=truncated,
                 via=ASK_CHANNEL_VIA,
+                id=f"{session_id}:ask:{entry.id}:answer",
             ))
     return built
 
@@ -2661,6 +3029,27 @@ def _collect_sources(session_id: str) -> list:
     return grouped
 
 
+def _source_name(session_id: str, path: Path) -> str:
+    """A transcript file's name within its session: stable, and unique per file.
+
+    Not the stem. Discovery is recursive and normatively so — a harness keeps one
+    subdirectory per workspace — so ``a/session-7.jsonl`` and ``b/session-7.jsonl``
+    share a stem, and two turns would answer to one name (!288 review). Not the
+    absolute path either: that is host filesystem layout, which
+    :meth:`Source.to_dict` deliberately keeps away from a browser. What is left is
+    the path below the session's own directory — or below the harness transcript
+    root, since a recorded pointer is the *preferred* resolution and lies outside
+    the derived directory — and for a file below neither, a digest of the path,
+    which leaks nothing and will not collide across a session's handful of files.
+    """
+    for root in (session_transcript_dir(session_id), transcript_root()):
+        try:
+            return path.relative_to(root).as_posix()
+        except ValueError:
+            continue
+    return hashlib.blake2b(str(path).encode("utf-8"), digest_size=8).hexdigest()
+
+
 def read_messages(
     session_id: str,
     *,
@@ -2693,14 +3082,20 @@ def read_messages(
         for source in sources:
             from_file, described = read_source(source)
             read.append(described)
-            loaded.append((from_file, described.vocabulary))
+            loaded.append((from_file, described.vocabulary, source))
         selected = _prefer_adapter_tier(member, loaded, vocabulary_index=1)
-        found = [
-            message
-            for from_file, _vocabulary in selected
-            for message in from_file
-        ]
-        messages.extend(_interleave(found, _channel_messages(member)))
+        found: list = []
+        for from_file, _vocabulary, source in selected:
+            # Numbered per file rather than across the run: a transcript is
+            # append-only, so a row's place in its own file is fixed once
+            # written, while its place in the merged conversation is not.
+            name = _source_name(member, source.path)
+            for index, message in enumerate(from_file):
+                if message.id is None:
+                    message.id = f"{member}:{name}#{index}"
+                found.append(message)
+        channel, copies = _merged_channel(member)
+        messages.extend(_interleave(_without_bus_copies(found, copies), channel))
 
     for index, message in enumerate(messages):
         message.seq = index

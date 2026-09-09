@@ -932,3 +932,59 @@ def test_the_drawer_takes_its_colour_from_the_theme():
         "the drawer has no accent, so it reads as the same panel as the run "
         "navigator on the other edge"
     )
+
+
+def test_thread_settings_form_round_trips_lists_and_clears_them():
+    import json
+    import subprocess
+    from tests.test_platform_web_bundle import node_binary, require_node_toolchain
+
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    script = r"""
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { createRenderer } from 'vue'
+import { parse, compileScript } from '@vue/compiler-sfc'
+const path = 'src/components/AssistantSettings.vue'
+const { descriptor } = parse(readFileSync(path, 'utf8'), { filename: path })
+assert.match(descriptor.template.content, /<v-textarea[\s\S]*?v-model="fields.threads"/)
+const compiled = compileScript(descriptor, { id: 'threads-probe' })
+globalThis.savedCalls = []
+const source = compiled.content
+  .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
+  .replace(/from ['"]@mdi\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
+  .replace(/import .* from ['"]\.\.\/api.js['"]/, `
+    const fetchAssistantConfig = async () => ({ settings: {} });
+    const setAssistantConfig = async (body) => {
+      globalThis.savedCalls.push(body);
+      return { settings: { threads: { stored: body.threads, value: body.threads } }, changed: ['threads'] };
+    };`)
+const component = (await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)).default
+component.render = () => null
+const renderer = createRenderer({ createComment: () => ({}), insert() {}, remove() {}, parentNode() {}, nextSibling() {} })
+const app = renderer.createApp(component, { running: true, runningSettings: { threads: ['https://matrix.to/#/!room:example.org/$root'] } })
+const instance = app.mount({})
+const state = instance.$.setupState
+const links = ['https://team.slack.com/archives/C1/p1700000000000001', 'https://matrix.to/#/!room:example.org/$root']
+const config = { settings: { threads: { stored: links, value: links } } }
+state.reply = config
+state.prefill(config)
+assert.equal(state.fields.threads, links.join('\n'))
+assert.deepEqual(state.changes(), {})
+assert.equal(state.runningDiffers('threads'), true)
+state.fields.threads = links[1]
+await state.save()
+assert.deepEqual(globalThis.savedCalls[0], { threads: [links[1]] })
+assert.equal(state.runningDiffers('threads'), false)
+state.fields.threads = ''
+await state.save()
+assert.deepEqual(globalThis.savedCalls[1], { threads: [] })
+app.unmount()
+console.log(JSON.stringify({ passed: true }))
+"""
+    result = subprocess.run([node, "--input-type=module", "-e", script], cwd=WEB,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {"passed": True}

@@ -103,6 +103,8 @@ import logging
 from pathlib import Path
 from typing import Iterable, Optional
 
+from lmer_cli.comms import option_conflict
+
 from ask_channel import protocol
 from ask_channel.protocol import (
     ANSWER_SUFFIX,
@@ -464,12 +466,61 @@ def _require_question(directory: Path, question_id: str) -> Entry:
     return entry
 
 
+def question_on_channel(session_id: str, question_id: str) -> Optional[Entry]:
+    """The question this session's ask directory holds under *question_id*, if any.
+
+    A pure read that never raises: it decides which of two answer paths a reply
+    takes (issue #421), so an unreadable channel has to mean "not here" rather
+    than an error in front of an operator who has an answer to give.
+
+    The entry rather than a yes/no, because the caller has to tell this question
+    from a bus record that merely carries the same number.
+
+    Answered and closed are attached rather than acted on: the caller decides
+    which of them belongs to which path, and :func:`answer_question` owns the
+    refusals themselves.
+    """
+    if not protocol.valid_entry_id(question_id):
+        return None
+    try:
+        directory = session_ask_dir(session_id)
+        if not directory.is_dir():
+            return None
+        entry = protocol.read_entry(directory, question_id)
+    except (AskChannelError, AskError, OSError):
+        return None
+    return entry if entry is not None and entry.kind == protocol.KIND_QUESTION else None
+
+
+def entry_is_the_bus_projection(session_id: str, question_id: str) -> bool:
+    """Whether the record filed under *question_id* was written by the
+    supervisor's bus projection rather than by the session's own CLI.
+
+    The two share the directory during the compatibility window and can file
+    entries with the same id and the same words (issue #421), so this is read
+    off the record's own writer mark. Never raises, for
+    :func:`question_on_channel`'s reason.
+    """
+    try:
+        directory = session_ask_dir(session_id)
+        record = protocol._read_json(
+            directory / f"{question_id}{protocol.QUESTION_SUFFIX}"
+        )
+    except (AskChannelError, AskError, OSError):
+        return False
+    return (
+        isinstance(record, dict)
+        and record.get(protocol.WRITER_KEY) == protocol.BUS_WRITER
+    )
+
+
 def answer_question(
     session_id: str,
     question_id: str,
     text: str,
     *,
     source: str = "operator",
+    option: Optional[int] = None,
 ) -> dict:
     """Record the operator's reply to one live session's question.
 
@@ -490,6 +541,17 @@ def answer_question(
             "started without one, so it cannot be waiting for an answer"
         )
     question = _require_question(directory, question_id)
+    if option is not None:
+        # Before the three refusals below: a request whose option index names
+        # nothing cannot be acted on whatever state the question is in. Resolved
+        # here as well as on the bus because this leg's reader is a pre-bus
+        # session polling the file itself (issue #421) — it has no resolver, and
+        # it is the same predicate so the route cannot mean two things depending
+        # on the session's vintage.
+        conflict = option_conflict(text, option, question.options)
+        if conflict is not None:
+            raise AskChannelError(f"{conflict} (question {question_id})")
+        text = question.options[option - 1]
     if question.answer is not None:
         raise AlreadyAnswered(
             f"question {question_id} was already answered at "
@@ -521,7 +583,9 @@ def answer_question(
         # anything.
         raise SessionGone(_no_reader_message(session_id, question_id, reader))
     try:
-        answer = protocol.write_answer(directory, question, text, source=source)
+        answer = protocol.write_answer(
+            directory, question, text, source=source, option=option
+        )
     except FileExistsError as exc:
         # Lost the race with another answer between the read above and the link.
         raise AlreadyAnswered(

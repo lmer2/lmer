@@ -115,6 +115,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from typing import Any, Optional, Sequence
 
@@ -313,25 +314,73 @@ def _call_spawn(args) -> Call:
     body = {"taskdef": args.taskdef, "target": args.target}
     body.update(_given(args, (
         "repo_url", "preset", "agents", "harness", "model", "ports", "slot",
-        "title", "description",
+        "title", "description", "targets",
     )))
+    if args.references:
+        body["references"] = [_reference_of(spec) for spec in args.references]
     return Call("POST", "/api/sessions", body=body)
 
 
+def _reference_of(spec: str) -> dict:
+    """``<permalink>[|<title>]`` — the one flag spelling that carries both.
+
+    A pipe because a permalink cannot contain one and a title can contain
+    anything else; split at the first, so a title with a pipe in it survives.
+    """
+    permalink, _, title = spec.partition("|")
+    reference = {"permalink": permalink.strip()}
+    if title.strip():
+        reference["title"] = title.strip()
+    return reference
+
+
 def _call_send(args) -> Call:
+    """A message to the session, on its bus (issue #407).
+
+    The bus stamps the source from this caller's credential — ``uber lmer`` for
+    the assistant — and relays the text into the harness tagged, so the agent
+    sees who spoke and every other channel sees the message too. ``--no-newline``
+    keeps the pre-bus keystroke path: a fragment left in the prompt box is not a
+    message anyone else should see.
+    """
+    text = _text(args.text)
+    if args.no_newline:
+        return Call(
+            "POST",
+            f"/api/sessions/{args.session}/input",
+            body={"data": text, "append_newline": False},
+        )
+    if re.fullmatch(r"/[A-Za-z][\w-]*", text):
+        raise CtlError(
+            f"{text!r} looks like a harness command. To run it: "
+            f"lmer-ctl command {args.session} {text!r}. "
+            "To discuss it as prose, use lmer-ctl send with a sentence around it."
+        )
     return Call(
         "POST",
-        f"/api/sessions/{args.session}/input",
-        body={
-            "data": _text(args.text),
-            "append_newline": not args.no_newline,
-            # This command steers another session with prose. The supervisor
-            # must not execute a sentence beginning with a harness escape, but
-            # slash commands are deliberate on this orchestration path.
-            "sanitize": True,
-            "preserve_slash_commands": True,
-        },
+        f"/api/sessions/{args.session}/comms",
+        body={"kind": "message", "text": text},
     )
+
+
+def _call_command(args) -> Call:
+    return Call(
+        "POST",
+        f"/api/sessions/{args.session}/comms",
+        body={"kind": "command", "text": _text(args.text)},
+    )
+
+
+def _call_comms(args) -> Call:
+    return Call(
+        "GET",
+        f"/api/sessions/{args.session}/comms",
+        params=_given(args, ("since", "timeout")),
+    )
+
+
+def _call_feed(args) -> Call:
+    return Call("GET", "/api/comms/feed", params=_given(args, ("since", "timeout", "session")))
 
 
 def _call_log(args) -> Call:
@@ -355,11 +404,83 @@ def _call_questions(args) -> Call:
 
 
 def _call_answer(args) -> Call:
+    if args.option is None and args.text is None:
+        raise CtlError(
+            "an answer needs the option's text or --option N, and this has neither"
+        )
+    if args.option is not None and args.text is not None:
+        # The bus refuses the pair too. Caught here so the words are still in
+        # front of the operator rather than in a 400 that does not quote them.
+        raise CtlError(
+            "an answer names its option by index or in its text, not both — "
+            f"drop one of --option {args.option} and {args.text!r}"
+        )
+    body: dict = {}
+    if args.text is not None:
+        body["answer"] = _text(args.text)
+    if args.option is not None:
+        body["option"] = args.option
     return Call(
         "POST",
         f"/api/sessions/{args.session}/ask/{args.question}/answer",
-        body={"answer": _text(args.text)},
+        body=body,
     )
+
+
+def _call_thread_read(args) -> Call:
+    return Call(
+        "GET",
+        "/api/comms/thread",
+        params={"permalink": _text(args.permalink), **_given(args, ("limit",))},
+    )
+
+
+def _call_thread_post(args) -> Call:
+    return Call(
+        "POST",
+        "/api/comms/thread",
+        body={"permalink": _text(args.permalink), "text": _text(args.text)},
+    )
+
+
+def _call_threads_list(args) -> Call:
+    return Call("GET", f"/api/sessions/{args.session}/threads")
+
+
+def _call_threads_connect(args) -> Call:
+    return Call(
+        "POST",
+        f"/api/sessions/{args.session}/threads",
+        body={"permalink": _text(args.permalink)},
+    )
+
+
+def _call_threads_open(args) -> Call:
+    return Call(
+        "POST",
+        f"/api/sessions/{args.session}/threads",
+        body={"channel": _text(args.channel), **_given(args, ("title",))},
+    )
+
+
+def _call_threads_references(args) -> Call:
+    return Call("GET", f"/api/sessions/{args.session}/references")
+
+
+def _call_threads_reference(args) -> Call:
+    return Call(
+        "POST",
+        f"/api/sessions/{args.session}/references",
+        body={"permalink": _text(args.permalink), **_given(args, ("title",))},
+    )
+
+
+def _call_threads_unreference(args) -> Call:
+    return Call("DELETE", f"/api/sessions/{args.session}/references/{args.reference}")
+
+
+def _call_threads_disconnect(args) -> Call:
+    return Call("DELETE", f"/api/sessions/{args.session}/threads/{args.thread}")
 
 
 def _call_wind_down(args) -> Call:
@@ -474,9 +595,12 @@ def _add_run_key(parser: argparse.ArgumentParser, name: str = "key") -> None:
     )
 
 
-def _add_text(parser: argparse.ArgumentParser, label: str) -> None:
+def _add_text(
+    parser: argparse.ArgumentParser, label: str, *, optional: bool = False
+) -> None:
     parser.add_argument(
         "text",
+        nargs="?" if optional else None,
         help=(
             f"{label} '-' reads it from stdin, which is what to use for anything "
             "multi-line or containing backticks, $ or quotes."
@@ -543,6 +667,18 @@ def create_parser() -> argparse.ArgumentParser:
     spawn.add_argument(
         "--repo-url", dest="repo_url", help="Overrides the host default."
     )
+    spawn.add_argument(
+        "--target-thread", dest="targets", action="append",
+        help="Slack or matrix thread permalink to connect (repeatable).",
+    )
+    spawn.add_argument(
+        "--reference-thread", dest="references", action="append", metavar="PERMALINK[|TITLE]",
+        help=(
+            "A thread the run should know about without being connected to it "
+            "(repeatable). It is told once and reads or posts it with "
+            "`lmer-signal read` / `post --thread`."
+        ),
+    )
     spawn.add_argument("--preset", help="A preset name from spawn-options.")
     spawn.add_argument("--agents", help="Fan-out spec for --agents.")
     spawn.add_argument("--harness", help="claude, codex, pi — whatever the host has.")
@@ -565,18 +701,51 @@ def create_parser() -> argparse.ArgumentParser:
     send = sub.add_parser(
         "send",
         help=(
-            "Type into a live session — this is how a /followup is delivered "
-            "(POST /api/sessions/{id}/input)."
+            "Send a message to a live session on its bus; the agent sees it "
+            "tagged [uber lmer] and so does every connected channel "
+            "(POST /api/sessions/{id}/comms)."
         ),
     )
     send.add_argument("session", help="Session id.")
-    _add_text(send, "What to type.")
+    _add_text(send, "What to say.")
     send.add_argument(
         "--no-newline",
         action="store_true",
-        help="Do not submit: leave the text in the prompt without a newline.",
+        help=(
+            "Type without submitting, as raw keystrokes (POST /api/sessions/{id}/input) "
+            "— not a message, nothing else sees it."
+        ),
     )
     send.set_defaults(call=_call_send)
+
+    command = sub.add_parser(
+        "command",
+        help=(
+            "Run a harness slash command in a live session, e.g. /followup "
+            "(POST /api/sessions/{id}/comms with kind=command)."
+        ),
+    )
+    command.add_argument("session", help="Session id.")
+    _add_text(command, "The command, starting with /.")
+    command.set_defaults(call=_call_command)
+
+    comms = sub.add_parser(
+        "comms",
+        help="One session's conversation on its bus (GET /api/sessions/{id}/comms).",
+    )
+    comms.add_argument("session", help="Session id.")
+    comms.add_argument("--since", type=int, help="Only records after this sequence number.")
+    comms.add_argument("--timeout", type=float, help="Long-poll this many seconds for the next record (max 30).")
+    comms.set_defaults(call=_call_comms)
+
+    feed = sub.add_parser(
+        "feed",
+        help="The fleet-wide comms feed (GET /api/comms/feed).",
+    )
+    feed.add_argument("--since", type=int, help="Only events after this cursor.")
+    feed.add_argument("--timeout", type=float, help="Long-poll this many seconds (max 30).")
+    feed.add_argument("--session", help="Only this session's records.")
+    feed.set_defaults(call=_call_feed)
 
     log = sub.add_parser(
         "log",
@@ -633,7 +802,17 @@ def create_parser() -> argparse.ArgumentParser:
     )
     answer.add_argument("session", help="Session id.")
     answer.add_argument("question", help="Question id, from `questions`.")
-    _add_text(answer, "The answer.")
+    _add_text(answer, "The answer, unless --option names it.", optional=True)
+    answer.add_argument(
+        "--option", type=int, metavar="N",
+        help=(
+            "Answer by picking one of the question's options: N is 1-based into "
+            "the `options` array `questions` prints, in the order it prints "
+            "them. The session is handed the option's text. Not combinable with "
+            "the text argument. A number typed as the answer text is never read "
+            "as an option."
+        ),
+    )
     answer.set_defaults(call=_call_answer)
 
     wind_down = sub.add_parser(
@@ -646,6 +825,109 @@ def create_parser() -> argparse.ArgumentParser:
     wind_down.add_argument("session", help="Session id.")
     wind_down.add_argument("--note", help="One clause riding on the end of the prompt.")
     wind_down.set_defaults(call=_call_wind_down)
+
+    thread = sub.add_parser(
+        "thread",
+        help=(
+            "Read or post one Slack or matrix thread by permalink, connecting "
+            "nothing to it (/api/comms/thread)."
+        ),
+    )
+    thread_sub = thread.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
+    thread_read = thread_sub.add_parser(
+        "read", help="Print a thread's most recent messages.",
+    )
+    thread_read.add_argument("permalink", help="Thread permalink.")
+    thread_read.add_argument(
+        "--limit", type=int, help="How many of the most recent messages (default 20).",
+    )
+    thread_read.set_defaults(call=_call_thread_read)
+    thread_post = thread_sub.add_parser(
+        "post",
+        help=(
+            "Post once into a thread. The post is attributed to this credential "
+            "— `uber lmer` or `operator` — not to anything in the text."
+        ),
+    )
+    thread_post.add_argument("permalink", help="Thread permalink.")
+    thread_post.add_argument("text", help="What to post; `-` reads it from stdin.")
+    thread_post.set_defaults(call=_call_thread_post)
+
+    threads = sub.add_parser(
+        "threads",
+        help=(
+            "The chat threads a running session is mirrored into: open one, "
+            "connect one, disconnect one, or list them "
+            "(/api/sessions/{id}/threads)."
+        ),
+    )
+    threads_sub = threads.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
+    threads_list = threads_sub.add_parser(
+        "list", help="What this session is connected to, and whether each connector is running.",
+    )
+    threads_list.add_argument("session", help="Session id.")
+    threads_list.set_defaults(call=_call_threads_list)
+    threads_connect = threads_sub.add_parser(
+        "connect",
+        help=(
+            "Connect this session to a Slack or matrix thread. The transport "
+            "comes from the link; the daemon runs the connector."
+        ),
+    )
+    threads_connect.add_argument("session", help="Session id.")
+    threads_connect.add_argument("permalink", help="Thread permalink.")
+    threads_connect.set_defaults(call=_call_threads_connect)
+    threads_open = threads_sub.add_parser(
+        "open",
+        help=(
+            "Open a new thread in a channel and connect this session to it. The "
+            "bot must already be in the channel."
+        ),
+    )
+    threads_open.add_argument("session", help="Session id.")
+    threads_open.add_argument(
+        "channel",
+        help="Slack channel id or #name, or matrix room id or alias.",
+    )
+    threads_open.add_argument(
+        "--title",
+        help="First line of the root message, in place of the run's own title.",
+    )
+    threads_open.set_defaults(call=_call_threads_open)
+    threads_disconnect = threads_sub.add_parser(
+        "disconnect", help="Stop mirroring one thread. The thread is told.",
+    )
+    threads_disconnect.add_argument("session", help="Session id.")
+    # The id and not the permalink: a permalink is a URL, and a URL cannot be one
+    # path segment — %2F is normalised back to a separator before the route is
+    # matched, so it would 404. `threads list` is where the id comes from.
+    threads_disconnect.add_argument("thread", help="Thread id, as `threads list` reports it.")
+    threads_disconnect.set_defaults(call=_call_threads_disconnect)
+    threads_references = threads_sub.add_parser(
+        "references",
+        help="The threads this run has been pointed at, connected to none of them.",
+    )
+    threads_references.add_argument("session", help="Session id.")
+    threads_references.set_defaults(call=_call_threads_references)
+    threads_reference = threads_sub.add_parser(
+        "reference",
+        help=(
+            "Point this run at a thread: it is told once, and reads or posts it "
+            "with `lmer-signal read` / `post --thread`. Nothing is connected."
+        ),
+    )
+    threads_reference.add_argument("session", help="Session id.")
+    threads_reference.add_argument("permalink", help="Thread permalink.")
+    threads_reference.add_argument("--title", help="What this thread is, in one line.")
+    threads_reference.set_defaults(call=_call_threads_reference)
+    threads_unreference = threads_sub.add_parser(
+        "unreference", help="Drop one reference. The run is not told.",
+    )
+    threads_unreference.add_argument("session", help="Session id.")
+    threads_unreference.add_argument(
+        "reference", help="Reference id, as `threads references` reports it.",
+    )
+    threads_unreference.set_defaults(call=_call_threads_unreference)
 
     exit_p = sub.add_parser(
         "exit",

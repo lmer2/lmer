@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from slack_chat import listener
+from slack_chat import sessions
 from slack_chat.sessions import CHAT_TASK_ID, SessionManager, listener_default_preset
 from lmer_cli.presets import Preset, load_presets, select_preset_name
 
@@ -1133,7 +1134,7 @@ class TestForwardedEnvFileDefaultInAck:
         )
         forward("LMER_CHAT_PRESET=house\n")
 
-        clause, warning = listener._preset_ack_parts(None)
+        clause, warning = sessions.preset_ack_parts(None, listener.session_manager)
 
         assert "listener default preset `house`" in clause
         assert "`LMER_CHAT_PRESET`" in clause
@@ -1155,7 +1156,7 @@ class TestForwardedEnvFileDefaultInAck:
         manager = forward(f"LMER_CHAT_PRESET=house\nLMER_PRESETS_FILE={presets}\n")
         monkeypatch.setattr(listener, "PRESETS", {})
 
-        clause, warning = listener._preset_ack_parts(None)
+        clause, warning = sessions.preset_ack_parts(None, listener.session_manager)
 
         assert "listener default preset `house`" in clause
         assert warning == "", (
@@ -1180,7 +1181,7 @@ class TestForwardedEnvFileDefaultInAck:
             listener, "PRESETS", {"house": Preset(name="house", checkout="/co")}
         )
 
-        clause, warning = listener._preset_ack_parts(None)
+        clause, warning = sessions.preset_ack_parts(None, listener.session_manager)
 
         assert clause == ""
         assert "`house`" in warning and "is not defined" in warning
@@ -1204,7 +1205,7 @@ class TestForwardedEnvFileDefaultInAck:
             f"LMER_PRESETS_FILE={tmp_path / 'gone.json'}\n"
         )
 
-        clause, warning = listener._preset_ack_parts(None)
+        clause, warning = sessions.preset_ack_parts(None, listener.session_manager)
 
         assert clause == ""
         assert "is not defined" in warning
@@ -1223,7 +1224,7 @@ class TestForwardedEnvFileDefaultInAck:
             {"listener_only": Preset(name="listener_only", checkout="/co")},
         )
 
-        _clause, warning = listener._preset_ack_parts(None)
+        _clause, warning = sessions.preset_ack_parts(None, listener.session_manager)
 
         assert "child_only" in warning
         assert "listener_only" not in warning

@@ -350,11 +350,15 @@ class TestTargetHandlerContract:
                 assert env[key] is None
 
     def test_special_target_env_fills_slack_context(self):
-        """An active Slack handler contributes token + parsed thread context."""
+        """An active Slack handler contributes the parsed thread context and
+        the chat-channel marker — and since #407 keeps the token out: the
+        connector on the host holds it, and a None seed is what blocks a .env
+        file from forwarding it."""
         with patch.dict(os.environ, {"SLACK_BOT_TOKEN": "xoxb-test"}):
             _, handlers = partition_targets([SLACK_URL])
             env = special_target_env(handlers)
-        assert env["SLACK_BOT_TOKEN"] == "xoxb-test"
+        assert env["SLACK_BOT_TOKEN"] is None
+        assert env["LMER_CHAT_CHANNEL"] == "slack"
         assert env["LMER_SLACK_CHANNEL"] == "C0123ABCDEF"
         assert env["LMER_SLACK_THREAD_TS"] == "1700000000.123456"
         assert env["LMER_SLACK_PERMALINK"] == SLACK_URL
@@ -611,10 +615,15 @@ class TestSlackCredentialFastFail:
 
 
 class TestSlackTokenContainerEnv:
-    """Case (b): SLACK_BOT_TOKEN flows into container env dict."""
+    """Case (b), inverted by #407: the Slack tokens stay on the host.
 
-    def test_bot_token_in_container_env(self):
-        """SLACK_BOT_TOKEN from host env must appear in the container env dict."""
+    The connector that carries the thread runs in the host ``lmer`` process
+    (:mod:`slack_chat.connector`), so the container needs no Slack credential;
+    both tokens are seeded ``None`` so a ``.env`` file cannot forward them
+    either. The thread context and the chat-channel marker still travel.
+    """
+
+    def test_bot_token_stays_out_of_the_container_env(self):
         env_in = {**_BASE_ENV, "SLACK_BOT_TOKEN": "xoxb-test-bot-token"}
         captured = {}
         with patch.dict(os.environ, env_in, clear=True):
@@ -623,15 +632,21 @@ class TestSlackTokenContainerEnv:
 
                 main(["--no-task", "--exec", "true", _SLACK_URL])
 
-        assert "SLACK_BOT_TOKEN" in captured, (
-            "SLACK_BOT_TOKEN must be forwarded into the container env dict "
-            f"when set; container env keys: {sorted(captured.keys())}"
+        assert captured.get("SLACK_BOT_TOKEN") is None, (
+            "the Slack bot token reached the container env — the connector on "
+            "the host is its only holder since #407"
         )
-        assert captured["SLACK_BOT_TOKEN"] == "xoxb-test-bot-token"
+        assert captured["LMER_CHAT_CHANNEL"] == "slack"
+        assert captured["LMER_SLACK_CHANNEL"]
+        # A chat-thread target implies the control plane, with a host-minted
+        # token. Only its digest crosses: the harness can read the container's
+        # initial environment, and the control credential is what stamps a
+        # record's channel (#407 §3.2).
+        assert captured["LMER_FASTAPI"] == "1"
+        assert captured.get("LMER_FASTAPI_TOKEN") is None
+        assert len(captured["LMER_FASTAPI_TOKEN_SHA256"]) == 64
 
-    def test_app_token_in_container_env_when_set(self):
-        """SLACK_APP_TOKEN from host env must appear in the container env dict
-        when it is set."""
+    def test_app_token_stays_out_of_the_container_env_too(self):
         env_in = {
             **_BASE_ENV,
             "SLACK_BOT_TOKEN": "xoxb-test-bot-token",
@@ -644,11 +659,7 @@ class TestSlackTokenContainerEnv:
 
                 main(["--no-task", "--exec", "true", _SLACK_URL])
 
-        assert "SLACK_APP_TOKEN" in captured, (
-            "SLACK_APP_TOKEN must be forwarded into container env when set; "
-            f"container env keys: {sorted(captured.keys())}"
-        )
-        assert captured["SLACK_APP_TOKEN"] == "xapp-test-app-token"
+        assert captured.get("SLACK_APP_TOKEN") is None
 
     def test_absence_of_app_token_is_not_fatal(self, capsys):
         """main() must succeed (rc == 0) when SLACK_BOT_TOKEN is set but
@@ -1084,3 +1095,108 @@ class TestSlackSessionRegistration:
         assert rc == 0
         reg.assert_not_called()
         dereg.assert_not_called()
+
+
+@pytest.mark.parametrize("channel", ["slack", "matrix"])
+@pytest.mark.parametrize("supplied_control", [False, True])
+@pytest.mark.parametrize("session_kind", ["worker", "assistant"])
+def test_chat_launch_starts_connector_with_digest_only_container(
+    tmp_path, monkeypatch, channel, supplied_control, session_kind,
+):
+    """Real CLI → target → connector → HTTP bus, starting the bus at launch."""
+    import threading
+    import time
+    from lmer_cli import cli, supervisor
+    from slack_chat import connector as slack_connector
+    from matrix_chat import connector as matrix_connector
+    from tests.test_slack_connector import FakeSlack
+    from tests.test_matrix_chat import FakeMatrix, ROOM, ROOT, BOT
+
+    received = threading.Event()
+    transport = FakeSlack() if channel == "slack" else FakeMatrix()
+    if channel == "slack":
+        original = transport.post_message
+        def post(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if "outbound seam" in args[2]:
+                received.set()
+            return result
+        transport.post_message = post
+        monkeypatch.setattr(slack_connector, "SlackClient", lambda *a, **kw: transport)
+        target = SLACK_URL
+    else:
+        original = transport.send_thread_text
+        def post(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if "outbound seam" in args[2]:
+                received.set()
+            return result
+        transport.send_thread_text = post
+        original_sync = transport.sync
+        def sync(**kwargs):
+            time.sleep(0.01)
+            return original_sync(**kwargs)
+        transport.sync = sync
+        monkeypatch.setattr(matrix_connector, "MatrixClient", lambda *a, **kw: transport)
+        target = f"https://matrix.to/#/{ROOM}/{ROOT}"
+    monkeypatch.setattr(slack_connector, "BUS_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(matrix_connector, "BUS_POLL_SECONDS", 0.05)
+    monkeypatch.setattr(cli, "lmer_state_dir", lambda: tmp_path / "lmer-state")
+    captured = {}
+    env_in = {
+        **_BASE_ENV, "SLACK_BOT_TOKEN": "xoxb-test-bot-token",
+        "LMER_SESSION_KIND": session_kind,
+        "LMER_MATRIX_HOMESERVER": "https://hs.example.org", "LMER_MATRIX_USER_ID": BOT,
+        "LMER_MATRIX_ACCESS_TOKEN": "matrix-fixture", "LMER_SLACK_POLL_SECONDS": "0.05",
+    }
+    if supplied_control:
+        env_in["LMER_FASTAPI_TOKEN"] = "host-control-fixture"
+    log = None
+    inbound = threading.Event()
+    replayed = threading.Event()
+    servers = []
+    def launch(*args, **kwargs):
+        nonlocal log
+        assert captured["LMER_SESSION_KIND"] == session_kind
+        log = supervisor._open_comms_log(str(tmp_path), captured)
+        def heard(record, accepted):
+            # Send the live probe only after the attach snapshot is settled.
+            if record.source.channel == channel and record.text.startswith("[replay notice] "):
+                replayed.set()
+            if record.text == "inbound seam":
+                inbound.set()
+
+        log.add_listener(heard)
+        assert captured["LMER_FASTAPI_TOKEN"] is None
+        assert captured["SLACK_BOT_TOKEN"] is None
+        assert captured["LMER_MATRIX_ACCESS_TOKEN"] is None
+        app = supervisor._build_fastapi_app(
+            supervisor.OutputBuffer(), lambda data: len(data), "", comms=log,
+            agent_token="agent-fixture", token_hash=captured["LMER_FASTAPI_TOKEN_SHA256"],
+        )
+        servers.append(supervisor._start_fastapi_server(app, "127.0.0.1", int(captured["LMER_FASTAPI_PORT"])))
+        from ask_channel.bus import BusClient, Endpoint
+
+        client = BusClient(Endpoint(
+            url=f"http://127.0.0.1:{captured['LMER_FASTAPI_PORT']}", token="agent-fixture",
+        ))
+        assert client.wait_ready(budget=10, interval=0.01)
+        outgoing = client.post("note", "outbound seam")["message"]
+        assert outgoing["source"]["channel"] == ("uber-lmer" if session_kind == "assistant" else "agent")
+        assert received.wait(10), "CLI never connected the thread to its supervisor"
+        assert replayed.wait(10), "the attach notice never reached the supervisor"
+        transport.human_says("inbound seam")
+        assert inbound.wait(10), "thread reply never reached the supervisor"
+        record = next(r for r in log.read_since(0)[0] if r.text == "inbound seam")
+        assert record.source.channel == channel
+        return 0
+    try:
+        with patch.dict(os.environ, env_in, clear=True), _make_main_mocks(captured):
+            with patch("lmer_cli.cli.subprocess.call", side_effect=launch):
+                assert cli.main(["chat", target]) == 0
+    finally:
+        for thread, shutdown in servers:
+            shutdown()
+            thread.join(timeout=3)
+        if log is not None:
+            log.close()

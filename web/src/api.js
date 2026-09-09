@@ -330,15 +330,28 @@ export function fetchSessionMessages(sessionId, { since = 0, limit } = {}) {
 // is prose intended to steer the session, rather than raw terminal keystrokes.
 // That lets the supervisor defuse a message a TUI would otherwise run as a shell
 // command. Off unless a caller says so, so raw paths keep their old semantics.
+//
+// Since the unified channel (issue 407) a *submitted* message is a record on the
+// session's bus, so every connected channel sees it. The keystroke form —
+// `appendNewline: false`, text left in the prompt unsent — is not a message
+// anyone else should see and keeps the raw `/input` route. `sanitize` is
+// accepted for the callers that still pass it; the bus defuses by construction.
 export function sendSessionInput(
   sessionId, data, { appendNewline = true, sanitize = false } = {},
 ) {
-  const body = { data, append_newline: appendNewline }
-  if (sanitize) body.sanitize = true
-  return request(`api/sessions/${encodeURIComponent(sessionId)}/input`, {
+  if (!appendNewline) {
+    const body = { data, append_newline: false }
+    if (sanitize) body.sanitize = true
+    return request(`api/sessions/${encodeURIComponent(sessionId)}/input`, {
+      method: 'POST',
+      headers: jsonHeaders,
+      body: JSON.stringify(body),
+    })
+  }
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/comms`, {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify(body),
+    body: JSON.stringify({ kind: 'message', text: data }),
   })
 }
 
@@ -413,6 +426,59 @@ export function answerSessionQuestion(sessionId, questionId, answer) {
 // a client renders one shape however it arrived at it — and a read that starts
 // nothing: the route is deliberately not the module's `ensure_running` (api.py),
 // because opening a drawer must not cost a session slot.
+// The chat threads one session is mirrored into (issue #412). Three calls over
+// one record: the daemon runs a connector process per connection, so connecting
+// is a write and disconnecting is a delete — neither restarts anything.
+//
+// Nothing here patches a local copy of the reply: the fleet poll (and the
+// assistant status, for uber lmer) is what the icons render from, and one source
+// for that is what keeps every copy of the icons on screen agreeing — which is
+// also why there is no client for the GET: nothing would read it.
+// The permalink and nothing else: the transport is read out of the link, and a
+// field naming it could disagree with it.
+export function connectSessionThread(sessionId, permalink) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/threads`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ permalink }),
+  })
+}
+
+// Open a new thread in a channel and connect the session to it (#429). The same
+// route as a connect, and each body carries exactly one of the two: a permalink
+// names a thread that exists, a channel a place to make one.
+export function openSessionThread(sessionId, channel, title) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/threads`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ channel, title }),
+  })
+}
+
+export function disconnectSessionThread(sessionId, threadId) {
+  return request(
+    `api/sessions/${encodeURIComponent(sessionId)}/threads/${encodeURIComponent(threadId)}`,
+    { method: 'DELETE' },
+  )
+}
+
+// A thread the run is pointed at rather than connected to (#414): saving one
+// starts nothing — the run is told once and reads or posts it on demand.
+export function addSessionReference(sessionId, permalink, title) {
+  return request(`api/sessions/${encodeURIComponent(sessionId)}/references`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify({ permalink, title }),
+  })
+}
+
+export function removeSessionReference(sessionId, referenceId) {
+  return request(
+    `api/sessions/${encodeURIComponent(sessionId)}/references/${encodeURIComponent(referenceId)}`,
+    { method: 'DELETE' },
+  )
+}
+
 export function fetchAssistant() {
   return request('api/assistant')
 }

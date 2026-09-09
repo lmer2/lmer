@@ -1072,3 +1072,23 @@ def slot_host(tmp_path, monkeypatch):
     slots_mod.clear_probe_cache()
     yield calls
     slots_mod.clear_probe_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_comms_hub():
+    """Drop the process-wide comms hub between tests (issue #407).
+
+    ``lmer_platform.comms.ensure_hub`` registers a hub on first use, and its
+    journal path is resolved from the platform state dir at that moment — so a
+    hub left over from one test would journal a later test's traffic into the
+    earlier test's tmp dir. Cheap: a lazy import and a lock.
+    """
+    yield
+    try:
+        from lmer_platform import comms as platform_comms
+    except Exception:  # pragma: no cover - the package is always importable here
+        return
+    hub = platform_comms.get_hub()
+    if hub is not None:
+        hub.stop()
+    platform_comms.register_hub(None)

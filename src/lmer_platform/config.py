@@ -70,6 +70,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import stat
 import subprocess
@@ -94,6 +95,7 @@ from lmer_cli.util import get_bool_env
 # here (!272 review). The type table lives with the code that sniffs bytes; this
 # module only needs to know which names are checkable.
 from .uploads import KNOWN_TYPES
+from .thread_targets import validate_thread_targets
 # The forge names are the URL builder's, imported rather than spelled again here:
 # what ``work_repo_forge`` accepts has to be exactly what
 # :func:`work_repo.git_ops.forge_web_url` knows how to build paths for, and a
@@ -107,6 +109,11 @@ from .store import (
 
 logger = logging.getLogger("lmer_platform.config")
 
+CONNECTORS_DIRNAME = "connectors"
+_CONNECTORS_MEMO: tuple = (None, {})
+_CHANNEL_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+
 __all__ = [
     "ConfigError", "PlatformConfig", "CONFIG_FILENAME", "SECRET_FILENAME",
     "DEFAULT_BIND_ADDRESS", "DEFAULT_BIND_PORT", "ENV_REPO_URL",
@@ -115,9 +122,12 @@ __all__ = [
     "DOCKER_BRIDGE_INTERFACE", "ContainerReach", "config_path",
     "load", "save", "read_secret", "ensure_secret", "active_secret",
     "ASSISTANT_CREDENTIAL_FILENAME", "assistant_credential_path",
+    "CONNECTORS_DIRNAME", "connectors_dir", "connector_path",
+    "mint_connector_credential", "revoke_connector_credential",
+    "list_connectors", "active_connectors",
     "mint_assistant_credential", "active_assistant_credential",
     "revoke_assistant_credential",
-    "binding_notice", "configured_repo_url", "container_base_url",
+    "binding_notice", "configured_repo_url", "container_base_url", "control_ui_url",
     "ASSISTANT_SETTING_KEYS", "AssistantSetting", "assistant_settings",
     "update_stored", "validate_assistant_override",
     "CHECKIN_SETTING_KEYS", "DEFAULT_CHECKIN_WINDOW_SECONDS",
@@ -400,14 +410,15 @@ INT_SETTINGS = {
     ),
 }
 
-#: setting key -> (PlatformConfig field, env var). The one table the loader,
+#: setting key -> (PlatformConfig field, optional env var). The one table the loader,
 #: the resolver and the API routes all read, so a fifth setting is added in
-#: exactly one place.
+#: exactly one place. Threads have no environment layer.
 ASSISTANT_SETTING_KEYS = {
     "model": ("assistant_model", ENV_ASSISTANT_MODEL),
     "harness": ("assistant_harness", ENV_ASSISTANT_HARNESS),
     "preset": ("assistant_preset", ENV_ASSISTANT_PRESET),
     "agents": ("assistant_agents", ENV_ASSISTANT_AGENTS),
+    "threads": ("assistant_threads", None),
 }
 
 #: ``work_repo_forge``'s third value, which is not a forge: the operator saying
@@ -501,6 +512,7 @@ class PlatformConfig:
     assistant_harness: Optional[str] = None
     assistant_preset: Optional[str] = None
     assistant_agents: Optional[str] = None
+    assistant_threads: Optional[list[str]] = None
     #: Service slots this host declares (issue #245) — the raw ``config.json``
     #: entries, deliberately unparsed here. :mod:`lmer_platform.slots` turns
     #: them into definitions and skips a malformed one with a warning; parsing
@@ -837,7 +849,7 @@ def validate_checkin_window(value: object) -> int:
     return validate_int_setting("checkin_window_seconds", value)
 
 
-def _assistant_value(value: object, *, field: str) -> Optional[str]:
+def _assistant_value(value: object, *, field: str) -> Optional[object]:
     """A usable assistant launch setting, or ``None`` with a warning.
 
     The ``_resolve_pids_limit`` house rule rather than :func:`_validate`'s
@@ -870,10 +882,10 @@ def _assistant_value(value: object, *, field: str) -> Optional[str]:
         logger.warning(
             "platform_assistant_setting_invalid field=%s value=%r — %s; "
             "ignoring it and resolving as if this layer were unset",
-            field, value, reason,
+            field, "<thread list>" if field == "assistant_threads" else value, reason,
         )
         return None
-    return str(value).strip()
+    return list(value) if field == "assistant_threads" else str(value).strip()
 
 
 #: Ceiling on one launch-setting value. Names are a few dozen characters; the
@@ -1055,6 +1067,12 @@ def _unusable_reason(field: str, value: object) -> Optional[str]:
     *field* accepts both spellings — the setting key (``agents``) and the
     config field (``assistant_agents``) — so the callers do not translate.
     """
+    if field in ("threads", "assistant_threads"):
+        try:
+            validate_thread_targets(value)
+        except ValueError as exc:
+            return str(exc)
+        return None
     if not isinstance(value, str) or not value.strip():
         return "not non-empty text"
     text = value.strip()
@@ -1088,7 +1106,7 @@ def _unusable_reason(field: str, value: object) -> Optional[str]:
     return None
 
 
-def validate_assistant_override(key: str, value: object) -> str:
+def validate_assistant_override(key: str, value: object) -> object:
     """A usable *explicit* launch-setting value, or a refusal naming *key*.
 
     The other posture over :func:`_unusable_reason`'s one rule set: the caller
@@ -1101,8 +1119,10 @@ def validate_assistant_override(key: str, value: object) -> str:
     """
     reason = _unusable_reason(key, value)
     if reason is not None:
+        if key == "threads":
+            raise ConfigError(f"threads is unusable: {reason}")
         raise ConfigError(f"{key} is unusable ({value!r}): {reason}")
-    return str(value).strip()
+    return list(value) if key == "threads" else str(value).strip()
 
 
 def load(overrides: Optional[dict] = None) -> PlatformConfig:
@@ -1149,7 +1169,7 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         },
         **{
             field: _env_str(env_var)
-            for field, env_var in ASSISTANT_SETTING_KEYS.values()
+            for field, env_var in ASSISTANT_SETTING_KEYS.values() if env_var
         },
         # Same warn-don't-refuse posture as the two above: an unusable export
         # costs its own layer and lets ``config.json`` show through.
@@ -1300,14 +1320,16 @@ def assistant_settings() -> dict:
         # serialized rather than dropped: served as null it would prefill the
         # field empty, make clearing a no-op diff, and warn on every resolve
         # with nothing on any screen to remove.
-        if isinstance(raw, str):
+        if key == "threads" and isinstance(raw, list):
+            stored_text = raw
+        elif isinstance(raw, str):
             stored_text = raw.strip() or None
         elif raw is None:
             stored_text = None
         else:
             stored_text = json.dumps(raw)
         file_value = _assistant_value(raw, field=field)
-        env_value = _assistant_value(_env_str(env_var), field=field)
+        env_value = _assistant_value(_env_str(env_var), field=field) if env_var else None
         if env_value is not None:
             resolved[key] = AssistantSetting(
                 value=env_value, source="env", stored=stored_text
@@ -1866,6 +1888,120 @@ def revoke_assistant_credential() -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Connector credentials (issue #407, spec decision 6)
+# ---------------------------------------------------------------------------
+
+def connectors_dir() -> Path:
+    return platform_dir() / CONNECTORS_DIRNAME
+
+
+def connector_path(name: str) -> Path:
+    if not _CHANNEL_RE.match(name or ""):
+        raise ConfigError(
+            f"invalid connector name {name!r}: lowercase letters, digits and dashes"
+        )
+    return connectors_dir() / f"{name}.json"
+
+
+def mint_connector_credential(name: str, channel: str) -> str:
+    """Mint (or replace) the credential for connector *name* bound to *channel*.
+
+    The assistant's shape (:func:`mint_assistant_credential`): a random value,
+    owner-only from creation, revocable by deleting the file. Unlike the
+    assistant's it is not per incarnation — a connector is a long-lived host
+    process and its operator rotates it by re-running this.
+    """
+    if not _CHANNEL_RE.match(channel or ""):
+        raise ConfigError(
+            f"invalid channel {channel!r}: lowercase letters, digits and dashes"
+        )
+    path = connector_path(name)
+    credential = secrets.token_urlsafe(32)
+    payload = json.dumps(
+        {"schema": 1, "name": name, "channel": channel, "credential": credential},
+        indent=2,
+    ) + "\n"
+    try:
+        ensure_state_dir(path.parent)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise ConfigError(f"cannot write connector credential {path} ({exc})")
+    logger.info("platform_connector_credential_minted name=%s channel=%s", name, channel)
+    return credential
+
+
+def revoke_connector_credential(name: str) -> bool:
+    path = connector_path(name)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ConfigError(f"cannot remove connector credential {path} ({exc})")
+    logger.info("platform_connector_credential_revoked name=%s", name)
+    return True
+
+
+def list_connectors() -> list:
+    """``[{"name", "channel"}]`` for every minted connector, never the values."""
+    return [
+        {"name": item["name"], "channel": item["channel"]}
+        for item in active_connectors().values()
+    ]
+
+
+def active_connectors() -> dict:
+    """``{credential: {"name", "channel"}}`` for every connector file.
+
+    Memoized on the directory's stat so the per-request lookup in
+    ``require_secret`` costs a stat, not a directory read — and re-read when
+    the operator mints or revokes one. Unreadable or malformed files are
+    skipped, loudly, so one bad file cannot lock every connector out.
+    """
+    global _CONNECTORS_MEMO
+    directory = connectors_dir()
+    try:
+        paths = sorted(directory.glob("*.json"))
+    except OSError:
+        paths = []
+    # Fingerprint the files, not the directory: a mint followed by a revoke
+    # inside one clock tick leaves the directory's own stat unchanged, and a
+    # stale memo then keeps a revoked credential valid.
+    key = tuple(item for path in paths for item in (_stat_key(path),) if item is not None)
+    if not key:
+        _CONNECTORS_MEMO = ((), {})
+        return {}
+    cached_key, cached = _CONNECTORS_MEMO
+    if cached_key == key:
+        return cached
+    found: dict = {}
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("platform_connector_unreadable path=%s error=%s", path, exc)
+            continue
+        if not isinstance(data, dict):
+            continue
+        credential = data.get("credential")
+        name = data.get("name")
+        channel = data.get("channel")
+        if not (isinstance(credential, str) and credential and isinstance(name, str)
+                and isinstance(channel, str) and _CHANNEL_RE.match(channel)):
+            logger.warning("platform_connector_malformed path=%s", path)
+            continue
+        _warn_if_permissive(path)
+        found[credential] = {"name": name, "channel": channel}
+    _CONNECTORS_MEMO = (key, found)
+    return found
+
+
 def binding_notice(config: PlatformConfig) -> str:
     """The one-line startup notice about where the daemon bound (spec D14).
 
@@ -2230,6 +2366,35 @@ def container_base_url(
             source="host-alias",
         )
     return ContainerReach(reason=_unreachable_reason(config, kind, detected))
+
+
+def control_ui_url(config: PlatformConfig) -> Optional[str]:
+    """The URL a **person in a chat thread** can open to reach this fleet.
+
+    ``matrix.control_url`` when the operator set one — the same key the fleet
+    bridge asks for, for the same reason it is asked rather than derived
+    (docs/MATRIX-CHAT.md): what the daemon knows is a bind pair, and a
+    reverse proxy or a tunnel is not derivable from one. A routable bind is used
+    as it stands, since that address is one somebody else can dial.
+
+    ``None`` for a loopback or wildcard bind with no configured URL, because
+    ``http://127.0.0.1:8600`` posted into somebody's Slack channel is not a link
+    — the same judgement, and the same wording, as the bridge's.
+    """
+    configured = (config.matrix or {}).get("control_url")
+    if isinstance(configured, str) and configured.strip():
+        parts = urlsplit(configured.strip())
+        if parts.scheme in ("http", "https") and parts.netloc:
+            return configured.strip().rstrip("/")
+        # Said rather than dropped: the bridge refuses a malformed one outright,
+        # and falling through in silence is how a typo becomes a wrong link.
+        logger.warning(
+            "platform_control_url_unusable value=%r — matrix.control_url needs a "
+            "scheme and a host; falling back to the bind address", configured,
+        )
+    if _address_kind(config.bind_address) == "routable":
+        return config.base_url
+    return None
 
 
 def with_overrides(config: PlatformConfig, **changes) -> PlatformConfig:

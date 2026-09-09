@@ -56,6 +56,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import logging
 import math
 import os
 import secrets
@@ -73,9 +74,16 @@ from typing import Callable, Iterable, Mapping, Optional
 
 from pydantic import BaseModel, Field
 
+from . import comms as _comms
+from . import thread_requests as _threads
 from .harness import UnknownHarnessError, resolve_harness, resolve_harness_name
 from .util import decode_escape_bytes
 
+
+ASK_DIR_WATCH_SECONDS = 2.0
+CALLER_CONTROL = "control"
+CALLER_AGENT = "agent"
+CONTROL_TOKEN_HASH_ENV = "LMER_FASTAPI_TOKEN_SHA256"
 
 DEFAULT_PORT_RANGE = (8700, 8799)
 DEFAULT_AUTO_START_DELAY = 1.5
@@ -529,6 +537,67 @@ class _InputBody(BaseModel):
     #: A steering caller can still intend a registered slash command. This only
     #: narrows ``sanitize``; it never transforms or enables commands by itself.
     preserve_slash_commands: bool = False
+    #: Who is typing, for raw keystrokes only: the terminal line reconstruction
+    #: (issue #407) tags what a browser terminal's user typed with this name.
+    author: Optional[str] = None
+
+
+class _MessageBody(BaseModel):
+    """``POST /messages``: one record for the session bus (issue #407)."""
+
+    kind: str
+    text: str = ""
+    source: dict = Field(default_factory=dict)
+    in_reply_to: Optional[str] = None
+    #: On an answer: the 1-based index of the option the human picked, from a
+    #: channel that showed them a numbered list. The bus resolves it to the
+    #: option's text; nothing is inferred from `text` (#428).
+    #:
+    #: `strict` because lax mode coerces `true` to `1` — silently answering
+    #: with the first option — before `comms.option_index` can refuse it. This
+    #: is the only layer that still has the raw value.
+    option: Optional[int] = Field(default=None, strict=True)
+    options: list = Field(default_factory=list)
+    attachments: list = Field(default_factory=list)
+    meta: dict = Field(default_factory=dict)
+    #: On a question: this caller will be waiting for the answer, so hold it
+    #: for them from now rather than from their first poll (#407 §7).
+    wait: Optional[float] = None
+
+
+class _ThreadRequestBody(BaseModel):
+    """``POST /thread/requests``: work for the host side (issue #414).
+
+    ``permalink`` names a thread and ``channel`` a place to open one in (#429);
+    which of the two a request needs is its ``op``'s to say, and
+    :meth:`lmer_cli.thread_requests.ThreadRequests.submit` says it.
+    """
+
+    op: str
+    permalink: str = ""
+    channel: str = ""
+    limit: int = Field(default=_threads.DEFAULT_READ_LIMIT, ge=1, le=_threads.MAX_READ_LIMIT)
+    text: str = ""
+    attachments: list = Field(default_factory=list)
+
+
+class _ThreadResultBody(BaseModel):
+    """What a servicer answers with. Opaque here: handed back to the asker
+    unread, since this process holds no credential that could check it."""
+
+    result: dict = Field(default_factory=dict)
+
+
+class _AckBody(BaseModel):
+    subscriber: str
+    seq: int = Field(ge=0)
+    #: This subscriber is leaving; the drain should stop waiting for it.
+    final: bool = False
+
+
+class _ReleaseBody(BaseModel):
+    question: str
+    ttl: Optional[float] = None
 
 
 class _OutputResponse(BaseModel):
@@ -1319,6 +1388,97 @@ def _resolve_fastapi_port(options: dict, env: Mapping[str, str]) -> int:
     return _pick_port(options["port_range"], options["host"])
 
 
+def _relay_wanted(log: "_comms.MessageLog", message: "_comms.Message") -> bool:
+    """Whether an accepted record gets a PTY leg: inbound, of a relayed kind,
+    not an answer a waiting CLI already took, and not an answer to a question
+    whose asker is polling the ask directory (issue #421) — that one is
+    delivered by the file it is mirrored into, and a PTY leg would deliver it
+    twice."""
+    if message.source.channel == _comms.CHANNEL_AGENT or message.meta.get("session_origin"):
+        return False
+    if message.kind not in _comms.RELAYED_KINDS:
+        return False
+    if message.kind == _comms.KIND_ANSWER and message.meta.get("delivered") == _comms.DELIVERY_CLI:
+        return False
+    if message.kind == _comms.KIND_ANSWER:
+        question = log.question_of(message)
+        ref = question.source.ref if question is not None else None
+        if _comms.ask_dir_ref_file(ref) is not None:
+            return False
+    return True
+
+
+def _relay_message(
+    log: "_comms.MessageLog",
+    message: "_comms.Message",
+    submit: Callable[[str], tuple[int, str]],
+    harness: str,
+) -> dict:
+    """Type one inbound record into the harness and describe what happened.
+
+    Same receipt fields as ``/input`` (#197). A failed write is reported in the
+    result rather than raised: the record is already on the log, and the caller
+    decides what a session whose PTY is gone means.
+    """
+    text, tagged = _comms.relay_payload(message, log.question_of(message))
+    if not tagged:
+        text = _rewrite_harness_command(text, harness)
+    payload = text.encode("utf-8")
+    receipt = {
+        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+        "payload_length": len(payload),
+        "tagged": tagged,
+    }
+    try:
+        written, verdict = submit(text)
+    except OSError as exc:
+        return {**receipt, "bytes_written": 0, "submit_text": SUBMIT_TEXT_UNKNOWN, "error": str(exc)}
+    return {**receipt, "bytes_written": written, "submit_text": verdict}
+
+
+class _InboundRelay:
+    """Queue typing independently of bus acceptance across startup (§4).
+
+    Callers hold ``lock`` through append and enqueue, then flush outside it.
+    """
+
+    def __init__(self, log, submit, harness, *, startup_pending=False):
+        self.log = log
+        self.submit = submit
+        self.harness = harness
+        self.lock = threading.RLock()
+        self._submit_lock = threading.Lock()
+        self._pending: list[tuple[_comms.Message, dict]] = []
+        self._ready = not startup_pending
+
+    def enqueue(self, message: _comms.Message) -> dict:
+        with self.lock:
+            receipt = {"queued": True, "bytes_written": 0}
+            self._pending.append((message, receipt))
+            return receipt
+
+    def flush(self) -> None:
+        with self.lock:
+            if not self._ready:
+                return
+        with self._submit_lock:
+            while True:
+                with self.lock:
+                    if not self._pending:
+                        return
+                    self._pending.sort(key=lambda item: item[0].seq)
+                    message, receipt = self._pending.pop(0)
+                delivered = _relay_message(self.log, message, self.submit, self.harness)
+                with self.lock:
+                    receipt.clear()
+                    receipt.update(delivered)
+
+    def startup_submitted(self) -> None:
+        with self.lock:
+            self._ready = True
+        self.flush()
+
+
 def _build_fastapi_app(
     output: OutputBuffer,
     write_input: "callable[[bytes], int]",
@@ -1327,8 +1487,20 @@ def _build_fastapi_app(
     resize: Optional[Callable[[int, int], None]] = None,
     get_winsize: Optional[Callable[[], Optional[tuple[int, int]]]] = None,
     submit: Optional[Callable[[str], tuple[int, str]]] = None,
+    comms: Optional["_comms.MessageLog"] = None,
+    threads: Optional["_threads.ThreadRequests"] = None,
+    on_raw_input: Optional[Callable[[bytes, Optional[str]], None]] = None,
+    agent_token: Optional[str] = None,
+    token_hash: Optional[str] = None,
+    inbound_relay: Optional[_InboundRelay] = None,
 ):
-    """Construct the FastAPI app exposing ``/input``, ``/output`` and ``/resize``.
+    """Construct the FastAPI app exposing ``/input``, ``/output``, ``/resize``
+    and, when a :class:`lmer_cli.comms.MessageLog` is supplied, the session
+    bus under ``/messages`` (issue #407).
+
+    ``on_raw_input`` receives every raw keystroke payload ``/input`` writes
+    (no ``append_newline``) with the caller-supplied author, so the terminal
+    line reconstruction sees what a browser terminal's user typed.
 
     ``write_input`` is called with the bytes to deliver to the wrapped
     process's stdin. ``token`` gates every endpoint via the
@@ -1370,6 +1542,10 @@ def _build_fastapi_app(
 
     app = FastAPI(title="lmer claude supervisor", version="1")
 
+    # Always present, unlike the bus: whether anyone can serve a request is a
+    # question about a servicer polling, not about how this app was built.
+    thread_queue = threads if threads is not None else _threads.ThreadRequests()
+
     def _unlocked_submit(payload: str) -> tuple[int, str]:
         """Fallback for an app with no terminal behind it — see ``submit`` above."""
         return _submit_payload(
@@ -1382,15 +1558,27 @@ def _build_fastapi_app(
         )
 
     submit_payload = submit if submit is not None else _unlocked_submit
+    relay_inbound = inbound_relay or _InboundRelay(comms, submit_payload, _active_harness_name())
 
-    def _check_auth(authorization):
-        expected = f"Bearer {token}"
-        if not authorization or not secrets.compare_digest(authorization, expected):
-            raise HTTPException(status_code=401, detail="invalid bearer token")
+    def _check_auth(authorization) -> str:
+        """Identify the session credential or the externally held control credential."""
+        presented = None
+        if authorization and authorization.startswith("Bearer "):
+            presented = authorization[len("Bearer "):]
+        if presented:
+            if agent_token and secrets.compare_digest(presented, agent_token):
+                return CALLER_AGENT
+            if token and secrets.compare_digest(presented, token):
+                return CALLER_CONTROL
+            if token_hash and secrets.compare_digest(
+                hashlib.sha256(presented.encode("utf-8")).hexdigest(), token_hash
+            ):
+                return CALLER_CONTROL
+        raise HTTPException(status_code=401, detail="invalid bearer token")
 
     @app.post("/input")
     def post_input(body: _InputBody, authorization: Optional[str] = Header(default=None)):
-        _check_auth(authorization)
+        caller = _check_auth(authorization)
         payload = body.data
         # The delivery receipt (#197): what this process was asked to type,
         # as the caller can independently recompute it. A write accepted here
@@ -1421,7 +1609,10 @@ def _build_fastapi_app(
         # ``append_newline`` for backwards-compatible API shape but the
         # behavior is "press Enter after the text".
         if not body.append_newline:
-            return {"bytes_written": write_input(payload_bytes), **receipt}
+            written = write_input(payload_bytes)
+            if on_raw_input is not None and caller == CALLER_CONTROL:
+                on_raw_input(payload_bytes, body.author)
+            return {"bytes_written": written, **receipt}
 
         # A whole submitted command can use lmer's portable spelling even when
         # the harness namespaces custom commands.  Deliberately after the raw
@@ -1494,6 +1685,229 @@ def _build_fastapi_app(
             ) from exc
         return {"rows": body.rows, "cols": body.cols}
 
+    def _require_comms() -> "_comms.MessageLog":
+        if comms is None:
+            raise HTTPException(
+                status_code=503,
+                detail="comms unavailable: this supervisor keeps no message bus",
+            )
+        return comms
+
+    @app.post("/messages")
+    def post_message(body: _MessageBody, authorization: Optional[str] = Header(default=None)):
+        caller = _check_auth(authorization)
+        log = _require_comms()
+        claimed = (body.source or {}).get("channel") or _comms.CHANNEL_AGENT
+        if caller == CALLER_AGENT and (
+            claimed != _comms.CHANNEL_AGENT or (body.source or {}).get("author")
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"a post from inside the session may only be the agent's own "
+                    f"(claimed {claimed!r}); channels are stamped by the party that "
+                    "vouches for them"
+                ),
+            )
+        with relay_inbound.lock:
+            try:
+                source = _comms.Source.from_dict(
+                    body.source, default_channel=_comms.CHANNEL_AGENT
+                )
+                # On the normalised ref, not the body's: `from_dict` strips, so a
+                # padded copy would be refused as sent and stored as kept (§10).
+                if (source.ref or "").startswith(_comms.ASK_DIR_REF_PREFIX):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"source.ref may not begin with {_comms.ASK_DIR_REF_PREFIX!r}: "
+                            "that prefix is the supervisor's own record of what it lifted "
+                            "out of the ask directory"
+                        ),
+                    )
+                message, accepted = log.append(
+                    kind=body.kind,
+                    text=body.text,
+                    source=source,
+                    in_reply_to=body.in_reply_to,
+                    option=body.option,
+                    options=body.options,
+                    attachments=body.attachments,
+                    meta=body.meta,
+                    session_caller=caller == CALLER_AGENT,
+                )
+                if body.wait and message.kind == _comms.KIND_QUESTION:
+                    log.claim(message.id, ttl=body.wait)
+            except _comms.CommsError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            relay = None
+            if accepted != _comms.ACCEPTED_DUPLICATE and _relay_wanted(log, message):
+                relay = relay_inbound.enqueue(message)
+        if relay is not None:
+            relay_inbound.flush()
+            with relay_inbound.lock:
+                relay = dict(relay)
+        # The receipt (#197) over what was *received*, like `send_input` hashes
+        # before `sanitize`: it answers "did my bytes reach the session?", and
+        # an answer naming its option is stored as the option's text, which the
+        # sender never sent and cannot check. `meta.option` and the record's own
+        # text say what was stored. Not the relay's hash, which covers the
+        # tagged line the PTY got.
+        received = body.text.encode("utf-8")
+        return {
+            "message": message.to_dict(),
+            "accepted_as": accepted,
+            "relay": relay,
+            "receipt": {
+                "payload_sha256": hashlib.sha256(received).hexdigest(),
+                "payload_length": len(received),
+            },
+        }
+
+    @app.get("/messages")
+    def get_messages(
+        since: int = Query(default=0, ge=0),
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        kinds: Optional[str] = Query(default=None),
+        waiter: Optional[str] = Query(default=None),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        _check_auth(authorization)
+        log = _require_comms()
+        wanted = [k for k in (kinds or "").split(",") if k] or None
+        waiter_id = None
+        if waiter:
+            state = log.question(waiter)
+            if state is None:
+                raise HTTPException(status_code=400, detail=f"waiter {waiter!r} names no question")
+            waiter_id = state.question.id
+        messages, cursor = log.read_since(since, timeout=timeout, kinds=wanted, waiter=waiter_id)
+        return {
+            "messages": [m.to_dict() for m in messages],
+            "cursor": cursor,
+            "schema": _comms.SCHEMA_VERSION,
+        }
+
+    @app.post("/messages/ack")
+    def post_ack(body: _AckBody, authorization: Optional[str] = Header(default=None)):
+        if _check_auth(authorization) == CALLER_AGENT:
+            # An ack is a subscriber saying it holds a record. The session is
+            # not a subscriber, and one acking on the daemon's behalf would end
+            # the drain grace over records nobody outside has.
+            raise HTTPException(
+                status_code=403, detail="acks come from subscribers, not from the session"
+            )
+        log = _require_comms()
+        try:
+            log.ack(body.subscriber, body.seq, final=body.final)
+        except _comms.CommsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"subscribers": log.subscribers()}
+
+    @app.post("/messages/claim")
+    def post_claim(body: _ReleaseBody, authorization: Optional[str] = Header(default=None)):
+        """A CLI about to wait, holding the answer against the PTY leg."""
+        _check_auth(authorization)
+        log = _require_comms()
+        state = log.question(body.question)
+        if state is None:
+            raise HTTPException(status_code=400, detail=f"{body.question!r} names no question")
+        log.claim(state.question.id, ttl=body.ttl or _comms.CLAIM_GRACE_SECONDS)
+        return {"claimed": state.question.id}
+
+    @app.post("/messages/release")
+    def post_release(body: _ReleaseBody, authorization: Optional[str] = Header(default=None)):
+        """A waiting CLI giving up its claim, so a later answer is typed in."""
+        _check_auth(authorization)
+        log = _require_comms()
+        state = log.question(body.question)
+        if state is None:
+            raise HTTPException(status_code=400, detail=f"{body.question!r} names no question")
+        log.release(state.question.id)
+        return {"released": state.question.id}
+
+    @app.get("/messages/questions")
+    def get_questions(
+        open: bool = Query(default=False),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        _check_auth(authorization)
+        log = _require_comms()
+        return {"questions": [state.to_dict() for state in log.questions(open_only=open)]}
+
+    # --- threads this session is not connected to (issue #414) ---------------
+    #
+    # An RPC to the host, deliberately not on the bus — see
+    # :mod:`lmer_cli.thread_requests` and docs/COMMS.md §12.
+
+    def _thread_refusal(exc: "_threads.ThreadRequestError"):
+        return HTTPException(status_code=exc.status, detail=str(exc))
+
+    @app.post("/thread/requests")
+    def post_thread_request(
+        body: _ThreadRequestBody, authorization: Optional[str] = Header(default=None)
+    ):
+        _check_auth(authorization)
+        try:
+            request = thread_queue.submit(
+                body.op, body.permalink, channel=body.channel, limit=body.limit,
+                text=body.text, attachments=body.attachments,
+            )
+        except _threads.ThreadRequestError as exc:
+            raise _thread_refusal(exc)
+        return {"request": request.to_dict(include_result=False)}
+
+    @app.get("/thread/requests/{request_id}")
+    def get_thread_request(
+        request_id: str,
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        _check_auth(authorization)
+        try:
+            return {"request": thread_queue.await_result(request_id, timeout=timeout).to_dict()}
+        except _threads.ThreadRequestError as exc:
+            raise _thread_refusal(exc)
+
+    @app.get("/thread/requests")
+    def get_thread_requests(
+        since: int = Query(default=0, ge=0),
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        authorization: Optional[str] = Header(default=None),
+    ):
+        """A servicer's poll. Every request it returns is claimed: handed to this
+        caller and never offered again — a post delivered twice is two messages
+        in a thread."""
+        if _check_auth(authorization) == CALLER_AGENT:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "the session may ask for thread work and collect its result, "
+                    "but the work is done on the host — the credentials are there"
+                ),
+            )
+        claimed, cursor = thread_queue.claim(since, timeout=timeout)
+        return {
+            "requests": [request.to_dict(include_result=False) for request in claimed],
+            "cursor": cursor,
+        }
+
+    @app.post("/thread/requests/{request_id}/result")
+    def post_thread_result(
+        request_id: str, body: _ThreadResultBody,
+        authorization: Optional[str] = Header(default=None),
+    ):
+        if _check_auth(authorization) == CALLER_AGENT:
+            raise HTTPException(
+                status_code=403,
+                detail="a thread result comes from the host side, not from the session",
+            )
+        try:
+            request = thread_queue.complete(request_id, body.result)
+        except _threads.ThreadRequestError as exc:
+            raise _thread_refusal(exc)
+        return {"request": request.to_dict()}
+
     @app.get("/healthz")
     def healthz(authorization: Optional[str] = Header(default=None)):
         _check_auth(authorization)
@@ -1528,6 +1942,12 @@ def _build_fastapi_app(
             # supervisor running a checkout that predated /resize, and every
             # probe of it looked healthy right up until a route was missing.
             "source": __file__,
+            # Absent (null) on a supervisor with no bus. The daemon reads this
+            # key to tell a #407 image from an older one; there is no other
+            # version negotiation.
+            "comms": comms.health() if comms is not None else None,
+            # So "nobody can do this" is an answer rather than a timeout (#414).
+            "threads": thread_queue.health(),
             **_activity_report(output.idle_seconds),
         }
 
@@ -1629,6 +2049,7 @@ def _resolve_options(args: argparse.Namespace) -> dict:
 
     host = args.fastapi_host or os.environ.get("LMER_FASTAPI_HOST") or DEFAULT_FASTAPI_HOST
     token = args.fastapi_token or os.environ.get("LMER_FASTAPI_TOKEN") or ""
+    token_hash = (os.environ.get(CONTROL_TOKEN_HASH_ENV) or "").strip().lower()
 
     delay_raw = args.auto_start_delay
     if delay_raw is None:
@@ -1721,6 +2142,7 @@ def _resolve_options(args: argparse.Namespace) -> dict:
         "port_range": port_range,
         "host": host,
         "token": token,
+        "token_hash": token_hash,
         "auto_start_delay": auto_start_delay,
         "auto_start_nudge_delay": auto_start_nudge_delay,
         "auto_start_ready_marker": auto_start_ready_marker,
@@ -1831,6 +2253,9 @@ def _start_auto_start_thread(
     write: Callable[[bytes], int],
     options: dict,
     cancel: threading.Event,
+    *,
+    submit_start: Optional[Callable[[str], tuple[int, str]]] = None,
+    on_started: Optional[Callable[[], None]] = None,
 ) -> threading.Thread:
     """Spawn the auto-/start daemon thread and return it.
 
@@ -1876,7 +2301,11 @@ def _start_auto_start_thread(
             return
         if settle_delay > 0 and cancel.wait(settle_delay):
             return
-        _inject_auto_start(write, AUTO_START_NUDGE_COUNT, nudge_delay, start_command)
+        submitted = False
+        if start_command:
+            submitted = _inject_auto_start(
+                write, AUTO_START_NUDGE_COUNT, nudge_delay, start_command, submit=submit_start,
+            )
         if start_prompt:
             # Pause so the follow-up doesn't interleave with the trailing CR
             # nudges (which would submit it prematurely or into a non-empty box)
@@ -1888,6 +2317,8 @@ def _start_auto_start_thread(
             _inject_start_prompt(
                 write, start_prompt, AUTO_START_NUDGE_COUNT, nudge_delay
             )
+        if submitted and on_started is not None:
+            on_started()
 
     thread = threading.Thread(
         target=_run, name="lmer-supervisor-auto-start", daemon=True
@@ -1970,7 +2401,9 @@ def _inject_auto_start(
     nudge_count: int,
     nudge_delay: float,
     start_command: str = DEFAULT_START_COMMAND,
-) -> None:
+    *,
+    submit: Optional[Callable[[str], tuple[int, str]]] = None,
+) -> bool:
     """Type the start command and submit it, then send a few bare-CR nudges.
 
     ``start_command`` is claude's native ``/start`` slash command by default;
@@ -1988,13 +2421,23 @@ def _inject_auto_start(
     timer thread this runs on.
     """
     payload = _ensure_submit_cr(start_command).encode("utf-8")
-    with contextlib.suppress(OSError):
-        write(payload)
+    submitted = False
+    try:
+        if submit is None:
+            submitted = write(payload) == len(payload)
+        else:
+            written, _verdict = submit(start_command)
+            submitted = written >= len(payload)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("startup_submit_failed error=%s", exc)
+    if not submitted:
+        logging.getLogger(__name__).warning("startup_submit_incomplete inbound_typing=held")
     for _ in range(nudge_count):
         if nudge_delay > 0:
             time.sleep(nudge_delay)
         with contextlib.suppress(OSError):
             write(_SUBMIT_CR)
+    return submitted
 
 
 def _inject_start_prompt(
@@ -2127,6 +2570,49 @@ def _self_shutdown(
         os.kill(child_pid, signal.SIGKILL)
 
 
+def _open_comms_log(
+    directory: Optional[str] = None, env: Optional[Mapping[str, str]] = None
+) -> "_comms.MessageLog":
+    """The session bus, on disk when the session directory is mounted.
+
+    Must run before the fork: the log's path is exported as
+    :data:`lmer_cli.comms.COMMS_LOG_ENV` so hooks inside the harness can read
+    it, and the child's environment is frozen at exec.
+    """
+    environ = os.environ if env is None else env
+    if directory is None:
+        directory = CONTAINER_SESSION_LOG_DIR
+    path = os.path.join(directory, _comms.COMMS_LOG_NAME) if os.path.isdir(directory) else None
+    session = (environ.get("LMER_SESSION_ID") or "").strip() or f"local-{os.getpid()}"
+    agent_channel = (
+        _comms.CHANNEL_UBER if environ.get("LMER_SESSION_KIND") == "assistant"
+        else _comms.CHANNEL_AGENT
+    )
+    log = _comms.MessageLog(session, path, agent_channel=agent_channel)
+    if log.path and env is None:
+        os.environ[_comms.COMMS_LOG_ENV] = log.path
+    return log
+
+
+def _open_ask_projection(
+    log: "_comms.MessageLog", env: Optional[Mapping[str, str]] = None
+) -> "Optional[_comms.AskDirProjection]":
+    """The one-release ask-directory projection, when a channel is mounted."""
+    environ = os.environ if env is None else env
+    directory = (environ.get(_comms_ask_dir_env()) or "").strip()
+    if not directory or not os.path.isdir(directory):
+        return None
+    projection = _comms.AskDirProjection(directory, log)
+    log.add_listener(projection.mirror)
+    return projection
+
+
+def _comms_ask_dir_env() -> str:
+    from ask_channel.protocol import ASK_DIR_ENV
+
+    return ASK_DIR_ENV
+
+
 def run_supervisor(
     cmd: list[str],
     options: dict,
@@ -2157,14 +2643,26 @@ def run_supervisor(
     # frozen and consumers inside the container would have no way to discover
     # an auto-generated token.
     fastapi_token = options["token"]
+    fastapi_token_hash = options.get("token_hash") or ""
     fastapi_host = options["host"]
     fastapi_port: Optional[int] = None
+    agent_token: Optional[str] = None
+    control_origin = (
+        "held outside this container" if fastapi_token_hash
+        else "supplied by the host" if fastapi_token
+        else "generated here; no external holder"
+    )
     if options["fastapi"]:
-        if not fastapi_token:
+        if not fastapi_token and not fastapi_token_hash:
             fastapi_token = secrets.token_urlsafe(32)
+        # The harness gets a credential of its own rather than the one the
+        # daemon uses: with the control token it could post as any human on any
+        # channel (``_check_auth``). Minted here so it exists even when the host
+        # sent only the hash of its own.
+        agent_token = secrets.token_urlsafe(32)
         fastapi_port = _resolve_fastapi_port(options, os.environ)
         os.environ["LMER_FASTAPI_PORT"] = str(fastapi_port)
-        os.environ["LMER_FASTAPI_TOKEN"] = fastapi_token
+        os.environ["LMER_FASTAPI_TOKEN"] = agent_token
 
     # Publish the supervisor's own PID to the wrapped process (and everything it
     # spawns) BEFORE fork, so the child inherits it through its initial
@@ -2180,6 +2678,8 @@ def run_supervisor(
     # that window, the less of a session's start is described by two different
     # streams.
     session_log = SessionLog.open_if_mounted()
+    comms_log = _open_comms_log()
+    ask_projection = _open_ask_projection(comms_log)
 
     master_fd, slave_fd = os.openpty()
 
@@ -2266,9 +2766,68 @@ def run_supervisor(
     # Types a message and presses Enter as two writes with nothing able to land
     # between them — see :func:`_make_submit`, which owns that guarantee and is
     # tested on it directly.
+    harness_name = _active_harness_name()
     submit_to_child = _make_submit(
-        master_fd, write_lock, slave_path, harness=_active_harness_name()
+        master_fd, write_lock, slave_path, harness=harness_name
     )
+
+    inbound_relay = _InboundRelay(
+        comms_log, submit_to_child, harness_name,
+        startup_pending=(
+            not options["manual_start"] and bool(options.get("start_command", DEFAULT_START_COMMAND))
+        ),
+    )
+
+    # The terminal as a source (issue #407): lines a human typed at the host
+    # TTY or the browser terminal, rebuilt from keystrokes and put on the bus
+    # for the connectors. Never relayed back into the PTY — the harness already
+    # has them.
+    terminal_mirror = _comms.terminal_mirror_enabled()
+    stdin_tracker = _comms.TerminalTracker()
+    raw_input_tracker = _comms.TerminalTracker()
+
+    def mirror_terminal(tracker: "_comms.TerminalTracker", data: bytes, author: Optional[str] = None) -> None:
+        if not terminal_mirror:
+            return
+        for line in tracker.feed(data):
+            with contextlib.suppress(_comms.CommsError):
+                comms_log.append(
+                    kind=_comms.KIND_MESSAGE,
+                    text=line,
+                    source=_comms.Source(_comms.CHANNEL_TERMINAL, author=author),
+                    meta={"fidelity": "reconstructed"},
+                )
+
+    def on_raw_input(data: bytes, author: Optional[str]) -> None:
+        mirror_terminal(raw_input_tracker, data, author)
+
+    watcher_stop = threading.Event()
+    watcher_thread: Optional[threading.Thread] = None
+
+    def _watch_bus() -> None:
+        """One tick, two jobs: lift what another writer filed in the ask
+        directory — an older daemon's answer, or every record of a session
+        whose own CLI predates the bus (#421) — and type in an answer whose
+        waiting CLI never came back."""
+        while not watcher_stop.wait(ASK_DIR_WATCH_SECONDS):
+            with inbound_relay.lock:
+                if ask_projection is not None:
+                    for message, accepted in ask_projection.lift_foreign_records():
+                        if accepted != _comms.ACCEPTED_DUPLICATE and _relay_wanted(comms_log, message):
+                            inbound_relay.enqueue(message)
+                for message in comms_log.lapsed_answers():
+                    # Deliberately not through `_relay_wanted`: the record says it
+                    # was for the CLI, and this is the case where that stopped
+                    # being true (the process is gone). §7's guarantee is that the
+                    # answer reaches the agent one way or the other.
+                    inbound_relay.enqueue(message)
+
+            inbound_relay.flush()
+
+    watcher_thread = threading.Thread(
+        target=_watch_bus, name="lmer-supervisor-bus-watch", daemon=True
+    )
+    watcher_thread.start()
 
     # The FastAPI control plane touches the PTY's geometry through these two
     # closures instead of being handed the fd, so the app never has to know it
@@ -2293,6 +2852,11 @@ def run_supervisor(
             resize=set_child_winsize,
             get_winsize=get_child_winsize,
             submit=submit_to_child,
+            comms=comms_log,
+            on_raw_input=on_raw_input,
+            agent_token=agent_token,
+            token_hash=fastapi_token_hash or None,
+            inbound_relay=inbound_relay,
         )
         server_thread, fastapi_shutdown = _start_fastapi_server(app, fastapi_host, fastapi_port)
         # Status line carries only host + port (no secret value): the bearer
@@ -2301,7 +2865,10 @@ def run_supervisor(
         # secret-bearing options dict.
         sys.stderr.write(
             f"🛰  lmer-supervisor FastAPI listening on http://{fastapi_host}:{fastapi_port} "
-            f"(bearer token in LMER_FASTAPI_TOKEN)\n"
+            f"(the session's own bearer token is in LMER_FASTAPI_TOKEN; the "
+            f"control credential is "
+            + control_origin
+            + ")\n"
             # Which file this control plane is actually running. A supervisor
             # imported from the wrong tree serves whatever routes THAT code has,
             # and #236 was diagnosed by noticing the mismatch — this line puts
@@ -2315,7 +2882,8 @@ def run_supervisor(
     auto_start_cancel = threading.Event()
     if not options["manual_start"]:
         auto_start_thread = _start_auto_start_thread(
-            output, write_to_child, options, auto_start_cancel
+            output, write_to_child, options, auto_start_cancel,
+            submit_start=submit_to_child, on_started=inbound_relay.startup_submitted,
         )
 
     def _apply_host_winsize_to_master() -> None:
@@ -2440,6 +3008,7 @@ def run_supervisor(
                     stdin_open = False
                 else:
                     pending_stdin += chunk
+                    mirror_terminal(stdin_tracker, chunk)
 
             if pending_stdin:
                 accepted = None
@@ -2464,6 +3033,9 @@ def run_supervisor(
             with contextlib.suppress(termios.error):
                 termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
         if fastapi_shutdown is not None:
+            # The daemon reads the bus over this control plane and nowhere
+            # else, so the last records must be fetched before it goes.
+            comms_log.wait_drained(_comms.drain_grace())
             fastapi_shutdown()
         if server_thread is not None:
             server_thread.join(timeout=2.0)
@@ -2471,6 +3043,10 @@ def run_supervisor(
         # that has just ended and someone is about to read it back.
         if session_log is not None:
             session_log.close()
+        watcher_stop.set()
+        if watcher_thread is not None:
+            watcher_thread.join(timeout=ASK_DIR_WATCH_SECONDS + 1.0)
+        comms_log.close()
 
     _, status = os.waitpid(pid, 0)
     # A requested self-shutdown is a deliberate, clean sign-off: report exit 0 so

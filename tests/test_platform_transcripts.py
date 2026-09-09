@@ -1537,6 +1537,51 @@ def test_messages_route_serves_the_normalised_conversation(client, platform_root
     assert body["sessions"][0]["id"] == "claude-session"
 
 
+@pytest.mark.parametrize("dialect", ["claude", "pi", "codex"])
+def test_messages_route_carries_only_complete_scrubbed_commands(client, platform_root, dialect):
+    commands = [
+        'lmer-signal post "done"',
+        'lmer-signal post "done"\n./scripts/deploy.sh production',
+        'lmer-signal post "' + 'a' * 200 + '"',
+        'lmer-signal post "done"' + ' ' * 160 + '; ./scripts/deploy.sh production',
+        'x' * transcripts.TEXT_LIMIT,
+        'x' * (transcripts.TEXT_LIMIT + 1),
+        'echo safe\necho glpat-' + 'a' * 20,
+        None,
+    ]
+    rows = []
+    for index, command in enumerate(commands):
+        arguments = {"cmd" if dialect == "codex" else "command": command}
+        if dialect == "codex":
+            rows.append({"type": "response_item", "payload": {
+                "type": "function_call", "name": "exec_command",
+                "call_id": str(index), "arguments": json.dumps(arguments),
+            }})
+        else:
+            block = {"type": "tool_use" if dialect == "claude" else "toolCall",
+                     "name": "bash", "id": str(index)}
+            block["input" if dialect == "claude" else "arguments"] = arguments
+            rows.append({"type": "assistant" if dialect == "claude" else "message",
+                         "message": {"role": "assistant", "content": [block]}})
+    session = "s-command"
+    path = plant_session(session)
+    plant_log(session)
+    path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    response = client.get(f"/api/sessions/{session}/messages", headers=bearer_header())
+    assert response.status_code == 200
+    calls = [tool for message in response.json()["messages"] for tool in message["tools"]]
+    assert len(calls) == len(commands)
+    for call, command in zip(calls[:5], commands[:5]):
+        assert call["command"] == command
+        assert call["detail"] == command.splitlines()[0][:transcripts.DETAIL_LIMIT].rstrip()
+    assert calls[0]["detail"] == calls[1]["detail"]
+    assert calls[5]["command"] is None
+    assert len(calls[5]["detail"]) == transcripts.DETAIL_LIMIT
+    assert calls[6]["command"].startswith("echo safe\necho ")
+    assert "glpat-" not in response.text
+    assert calls[7]["command"] is None
+
+
 def test_messages_route_serves_a_monitor_event_as_the_watch(client, platform_root):
     """End to end for T99: the role is what the browser keys on, and the payload
     is where it could be dropped."""

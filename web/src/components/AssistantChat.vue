@@ -94,6 +94,7 @@ import {
   mdiStopCircleOutline,
 } from '@mdi/js'
 import AssistantSettings from './AssistantSettings.vue'
+import ThreadLinks from './ThreadLinks.vue'
 import Chat from './Chat.vue'
 import {
   fetchAssistant,
@@ -293,6 +294,15 @@ onBeforeUnmount(() => {
          that gets tapped in a hurry, and the overflow beside it is two icon-only
          buttons away from being ambiguous already. -->
     <template v-if="status || problem">
+      <!-- Uber lmer's own threads. The same control as a run row's, and the same
+           three calls: connecting here also moves the standing `threads` launch
+           setting, so a thread attached from this header survives a rotation. -->
+      <ThreadLinks
+        :session-id="sessionId"
+        :threads="status?.threads"
+        :live="running"
+        @changed="load"
+      />
       <v-btn
         v-if="running"
         :prepend-icon="mdiRestart"

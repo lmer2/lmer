@@ -1,0 +1,2 @@
+added:
+- "Answers may name one of a question's options by its 1-based index, on the bus, both platform routes and lmer-ctl answer --option N"

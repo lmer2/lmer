@@ -44,8 +44,9 @@ a thread that is never reconnected lingers as a tiny, harmless file.
 The delete path is ownership-checked for the same reason: ``register``
 overwrites unconditionally, so with two manual sessions on one thread the
 first to exit would otherwise unlink the entry out from under the survivor.
-:func:`deregister` therefore removes the entry only when its recorded PID is
-the calling process's own (see its docstring for the residual TOCTOU window).
+:func:`deregister` therefore removes the entry only when its recorded PID is the
+one the caller owns — its own process by default, or the pid it names (see its
+docstring for the residual TOCTOU window).
 
 PID reuse is the one accepted edge: if the recorded PID is dead but the OS has
 since recycled it to an unrelated process, :func:`is_thread_connected` reports a
@@ -77,24 +78,31 @@ logger = logging.getLogger("lmer_slack.registry")
 REGISTRY_DIR: str | None = None
 
 
-def _registry_dir() -> Path:
-    """Return the directory holding registry entries."""
+def _registry_dir(kind: str = "slack") -> Path:
+    """Return the directory holding registry entries for one channel *kind*.
+
+    ``slack`` is the historical registry; ``matrix`` threads (issue #407) keep
+    their own directory beside it, same shape, so a room id and a Slack channel
+    id can never collide in one namespace.
+    """
     if REGISTRY_DIR is not None:
-        return Path(REGISTRY_DIR)
-    return lmer_state_dir() / "slack-sessions"
+        base = Path(REGISTRY_DIR)
+        return base if kind == "slack" else base / kind
+    return lmer_state_dir() / f"{kind}-sessions"
 
 
-def _entry_path(channel: str, thread_ts: str) -> Path:
+def _entry_path(channel: str, thread_ts: str, kind: str = "slack") -> Path:
     """Return the path of the registry file for one ``(channel, thread_ts)``.
 
     ``channel`` and ``thread_ts`` come from
     :func:`slack_chat.permalink.parse_slack_permalink` (e.g. ``"C0123ABC"`` and
-    ``"1700000000.123456"``), which can't contain a path separator — but the
+    ``"1700000000.123456"``) — or, for ``kind="matrix"``, a room id and a
+    thread-root event id — none of which can contain a path separator; the
     separators are stripped defensively so a crafted value can never escape the
     registry directory.
     """
     safe = f"{channel}-{thread_ts}".replace("/", "_").replace(os.sep, "_")
-    return _registry_dir() / f"{safe}.json"
+    return _registry_dir(kind) / f"{safe}.json"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -124,14 +132,24 @@ def register(
     *,
     permalink: str | None = None,
     pid: int | None = None,
+    kind: str = "slack",
+    owner: str | None = None,
 ) -> None:
     """Record that an lmer session is attached to ``(channel, thread_ts)``.
 
     *pid* defaults to the calling process — the host-side ``lmer`` process,
-    whose lifetime is the session's. The write is atomic (temp file + rename)
-    so a concurrent reader never sees a half-written entry, and best-effort: any
-    failure is logged and swallowed so a registry problem can't break the
-    session it only annotates.
+    whose lifetime is the session's.
+
+    *owner* says **who started the holder**, which the pid alone cannot: the
+    platform daemon writes ``"platform"`` for the connector processes it runs,
+    and a CLI session writes nothing. Without it a reader can only say "a live
+    pid holds this thread", and the two cases need opposite handling — a
+    platform holder found by a restarted daemon is its own orphan to reclaim,
+    while anything else is somebody else's session to leave alone.
+
+    The write is atomic (temp file + rename) so a concurrent reader never sees a
+    half-written entry, and best-effort: any failure is logged and swallowed so a
+    registry problem can't break the session it only annotates.
     """
     if not channel or not thread_ts:
         return
@@ -140,10 +158,12 @@ def register(
     entry = {"pid": pid, "channel": channel, "thread_ts": thread_ts}
     if permalink:
         entry["permalink"] = permalink
+    if owner:
+        entry["owner"] = owner
     try:
-        directory = _registry_dir()
+        directory = _registry_dir(kind)
         directory.mkdir(parents=True, exist_ok=True)
-        path = _entry_path(channel, thread_ts)
+        path = _entry_path(channel, thread_ts, kind)
         # Per-PID temp name so two processes racing on the same thread (which
         # should not happen, but might pathologically) can't clobber each
         # other's temp file mid-write; rename is atomic on the same filesystem.
@@ -165,9 +185,19 @@ def register(
         )
 
 
-def deregister(channel: str | None, thread_ts: str | None) -> None:
+def deregister(
+    channel: str | None,
+    thread_ts: str | None,
+    *,
+    kind: str = "slack",
+    pid: int | None = None,
+) -> None:
     """Remove the registry entry for ``(channel, thread_ts)`` if present —
-    but only when this process owns it.
+    but only when *pid* owns it (this process, by default).
+
+    *pid* is for an owner that is not the caller: the platform daemon registers
+    a thread under the pid of the connector **process** it started, which is the
+    lifetime the entry is about, and then has to be able to release it.
 
     Best-effort and idempotent: a missing entry (already gone, or never written)
     is not an error.
@@ -185,13 +215,13 @@ def deregister(channel: str | None, thread_ts: str | None) -> None:
     """
     if not channel or not thread_ts:
         return
-    path = _entry_path(channel, thread_ts)
+    path = _entry_path(channel, thread_ts, kind)
     try:
         try:
             owner_pid = json.loads(path.read_text()).get("pid")
         except (ValueError, AttributeError):
             owner_pid = None  # corrupt entry: safe to remove
-        if owner_pid is not None and owner_pid != os.getpid():
+        if owner_pid is not None and owner_pid != (os.getpid() if pid is None else pid):
             logger.debug(
                 "slack_session_deregister_skipped channel=%s thread_ts=%s "
                 "owner_pid=%s (not ours)",
@@ -217,7 +247,43 @@ def deregister(channel: str | None, thread_ts: str | None) -> None:
         )
 
 
-def is_thread_connected(channel: str | None, thread_ts: str | None) -> bool:
+def thread_holder(
+    channel: str | None, thread_ts: str | None, *, kind: str = "slack"
+) -> dict | None:
+    """The live entry holding ``(channel, thread_ts)``, or ``None``.
+
+    :func:`is_thread_connected` with its answer shown: a caller that has to
+    *refuse* needs to say which process is in the way, and "a thread is busy" is
+    not a message anyone can act on. Same liveness rule, same never-mutate-on-read
+    rule, same fail-open — see :func:`is_thread_connected` and the module
+    docstring.
+    """
+    if not channel or not thread_ts:
+        return None
+    path = _entry_path(channel, thread_ts, kind)
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        logger.warning(
+            "slack_session_read_failed channel=%s thread_ts=%s error=%s",
+            channel,
+            thread_ts,
+            exc,
+        )
+        return None
+    try:
+        entry = json.loads(raw)
+        pid = int(entry.get("pid", 0))
+    except (ValueError, TypeError, AttributeError, json.JSONDecodeError):
+        # Corrupt/unexpected content — treat as not connected. Left in place
+        # (not unlinked); the thread's next register() overwrites it.
+        return None
+    return entry if _pid_alive(pid) else None
+
+
+def is_thread_connected(channel: str | None, thread_ts: str | None, *, kind: str = "slack") -> bool:
     """Whether a *live* lmer session is registered for ``(channel, thread_ts)``.
 
     Returns ``True`` only when an entry exists and its recorded PID is still
@@ -234,28 +300,4 @@ def is_thread_connected(channel: str | None, thread_ts: str | None) -> bool:
     just wrote — failing unsafe by letting a duplicate session spawn. See the
     module docstring's Liveness section.
     """
-    if not channel or not thread_ts:
-        return False
-    path = _entry_path(channel, thread_ts)
-    try:
-        raw = path.read_text()
-    except FileNotFoundError:
-        return False
-    except OSError as exc:
-        logger.warning(
-            "slack_session_read_failed channel=%s thread_ts=%s error=%s",
-            channel,
-            thread_ts,
-            exc,
-        )
-        return False
-    try:
-        pid = int(json.loads(raw).get("pid", 0))
-    except (ValueError, TypeError, AttributeError, json.JSONDecodeError):
-        # Corrupt/unexpected content — treat as not connected. Left in place
-        # (not unlinked); the thread's next register() overwrites it.
-        return False
-    # A live PID means a session is attached; a dead one is a stale entry that
-    # the thread's next register() will overwrite. Either way, never mutate on
-    # read (see the docstring for the race that read-path unlinking would open).
-    return _pid_alive(pid)
+    return thread_holder(channel, thread_ts, kind=kind) is not None

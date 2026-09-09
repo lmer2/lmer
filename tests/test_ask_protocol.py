@@ -92,6 +92,28 @@ def test_the_question_carries_its_options_verbatim(channel):
     assert stored.options == ("a b", "c/d", "é")
 
 
+def test_an_answer_may_record_the_option_it_named(channel):
+    """#428: the index rides along as provenance. The words are still required —
+    this file's reader may be a session with no bus, and it reads `text`."""
+    question = protocol.post_question(channel, "which?", ["red", "blue"])
+    written = protocol.write_answer(channel, question, "blue", option=2)
+    assert written.option == 2
+    reread = protocol.answer_for(channel, question)
+    assert (reread.text, reread.option) == ("blue", 2)
+    assert reread.to_dict()["option"] == 2
+
+
+def test_an_answer_that_named_no_option_keeps_the_shape_it_always_had(channel):
+    question = protocol.post_question(channel, "which?", ["red", "blue"])
+    protocol.write_answer(channel, question, "blue")
+    answer = protocol.answer_for(channel, question)
+    assert answer.option is None
+    assert "option" not in answer.to_dict()
+    assert "option" not in json.loads(
+        (channel / f"{question.id}{protocol.ANSWER_SUFFIX}").read_text()
+    )
+
+
 def test_a_note_is_an_entry_nobody_can_answer(channel):
     note = protocol.post_note(channel, "cloning the repo, back shortly")
     entries = protocol.read_entries(channel)

@@ -109,6 +109,7 @@ import {
   fetchSessionMessages, sendSessionInput, sessionUploadUrl, uploadSessionFile,
 } from '../api.js'
 import { ago } from '../format.js'
+import { withoutOutboundCopies } from '../outbound.js'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
 // never open, and the fleet view must not pay for it on first paint.
@@ -476,7 +477,7 @@ const visible = computed(() => {
   const shown = showInjected.value
     ? messages.value
     : messages.value.filter((message) => message.kind === 'said')
-  return shown.map((message) => ({
+  return withoutOutboundCopies(shown).map((message) => ({
     ...message,
     // Only what you sent: these lines are put in a message by this pane, and an
     // agent quoting one back is quoting, not attaching.
@@ -523,7 +524,42 @@ function ground(message) {
   return message.role === 'assistant' ? 'agent' : 'action'
 }
 
+// How a bus channel reads in a header (issue 407); anything unlisted is already
+// a word.
+const CHANNEL_LABELS = { 'uber-lmer': 'uber lmer' }
+
+function sourceLabel(source) {
+  const name = CHANNEL_LABELS[source.channel] || source.channel
+  return source.author ? `${name} · ${source.author}` : name
+}
+
+// The one href in this component whose value the container chooses. The daemon
+// already drops a `meta.thread` that is not a thread permalink
+// (`transcripts._thread_link`); this is the last hop saying so too, because a
+// scheme check is one line and the caption stays honest either way — the marker
+// still renders, as plain text, for anything that gets past the first.
+function threadLink(message) {
+  const value = message.thread
+  if (typeof value !== 'string') return null
+  try {
+    return new URL(value).protocol === 'https:' ? value : null
+  } catch {
+    return null
+  }
+}
+
+// Several people in several channels share one conversation now (issue 407), so
+// a bus turn says who spoke and from where instead of the flat "you" — except
+// the operator's own channel, which is still "you". An agent record keeps the
+// agent's label; its kind is a chip in the header, not a speaker.
 function speaker(message) {
+  const source = message.source
+  if (source && source.channel && source.channel !== 'agent') {
+    if (source.channel === 'platform' && (!source.author || source.author === 'operator')) {
+      return SPEAKERS.user
+    }
+    return sourceLabel(source)
+  }
   if (message.role === 'assistant') return props.agentLabel
   return SPEAKERS[message.role] || OTHER_SPEAKER
 }
@@ -651,17 +687,20 @@ function comparable(text) {
 // this rule exists to prevent, arriving one poll late and invisible to any fixture
 // that settles once.
 //
-// It keys on `seq` because that is what names a turn everywhere else in this
-// component — the render key, the prepend dedupe, the cursor itself. The server
-// renumbers the whole merged conversation on every read, but deterministically from
-// the same history, and nothing here rewrites the seq of a turn already absorbed, so
-// the numbers a settled bubble left behind go on naming the turns they matched. The
-// exception is history that renumbers underneath a live view (a transcript file that
-// appeared late, or an answer merged in behind the end — lmer_platform.transcripts
-// bounds both), and that is the case which already moves the cursor and the render
-// keys with it: this memory shares their fate rather than adding one. `start()` drops
-// all of them together — a different session behind the view is a different
-// numbering, and none of this one's turns may be remembered against it.
+// It keys on `seq` because that is what still names a *position* here — the
+// prepend dedupe and the cursor. The server renumbers the whole merged
+// conversation on every read, but deterministically from the same history, and
+// nothing here rewrites the seq of a turn already absorbed, so the numbers a
+// settled bubble left behind go on naming the turns they matched. What they do
+// not survive is history renumbering underneath a live view (a transcript file
+// that appeared late, or an answer merged in behind the end —
+// lmer_platform.transcripts bounds both): the turns already rendered keep the
+// numbering they arrived with while a later page carries a new one, so one seq
+// can name two of them. That is the same positional reasoning the append dedupe
+// above stopped relying on, and removing it from the rest of the read path is
+// issue 419. `start()` drops all of them together — a different session behind
+// the view is a different numbering, and none of this one's turns may be
+// remembered against it.
 function settlePending() {
   if (!pending.value.length) return
   const said = messages.value.filter(
@@ -698,16 +737,40 @@ function absorb(page, mode = 'append') {
     messages.value = arriving
     cursor = page.cursor
   } else if (mode === 'prepend') {
-    // Older messages, so the cursor — which tracks the *end* — is untouched. The
-    // seq filter is what keeps a page that overlaps what is already rendered from
-    // showing a turn twice.
-    const known = new Set(messages.value.map((message) => message.seq))
+    // Older messages, so the cursor — which tracks the *end* — is untouched. Keyed
+    // on the same `id` as the forward read below, and for the same reason: this
+    // page deliberately overlaps what is rendered, and a `seq` filter compares a
+    // number the page was just renumbered under against the one a held turn
+    // arrived with. When they disagree the overlap is drawn twice — under one
+    // render key, since the row is keyed by `id`.
+    const known = new Set(messages.value.map((message) => message.id))
     messages.value = [
-      ...arriving.filter((message) => !known.has(message.seq)),
+      ...arriving.filter((message) => !message.id || !known.has(message.id)),
       ...messages.value,
     ]
   } else {
-    if (arriving.length) messages.value = [...messages.value, ...arriving]
+    // By `id`, not by `seq`: `seq` is a position in the merged conversation and
+    // every read renumbers it, so a transcript row written late lands below the
+    // served cursor, shifts every turn after it up one, and the poll hands back a
+    // record already on screen — two identical bubbles, same time, same chip
+    // (issue 407, operator screenshot 2026-09-05). The id the server now puts on
+    // every turn does not move, so the turn is recognised wherever it lands.
+    //
+    // This drops a redelivered turn and nothing more. The pane still appends to a
+    // window it reads by position, so a turn the server stopped serving is not
+    // withdrawn, one that changed is not replaced where it stands, and — the case
+    // that is a skip rather than a duplicate — the turn whose arrival caused the
+    // renumber is below the cursor by the time the cursor moves, so no forward
+    // read offers it again. All three need a read path that does not reason about
+    // positions at all, which is issue 419; docs/COMMS.md §4 names them.
+    if (arriving.length) {
+      const known = new Set(messages.value.map((message) => message.id))
+      // A turn with no id at all cannot be recognised, so it is kept rather than
+      // guessed at. The route names every turn it serves, so this is reachable
+      // only from a daemon older than the bundle talking to it.
+      const fresh = arriving.filter((message) => !message.id || !known.has(message.id))
+      if (fresh.length) messages.value = [...messages.value, ...fresh]
+    }
     // Taken even from an empty page: it is the server's answer about where the end
     // is, and history can be renumbered by a transcript file that appeared late.
     cursor = page.cursor
@@ -1087,7 +1150,7 @@ watch(rendererLoaded, () => {
       <div ref="scroller" class="chat" @scroll="onScroll">
         <div
           v-for="message in visible"
-          :key="message.seq"
+          :key="message.id ?? message.seq"
           class="turn"
           :class="[`turn-${message.role}`, `ground-${ground(message)}`]"
         >
@@ -1099,6 +1162,36 @@ watch(rendererLoaded, () => {
                  but neither is in the transcript, so neither is presented as if
                  it were. See lmer_platform.transcripts on the merge. -->
             <span v-if="message.via === 'ask'">· ask channel</span>
+            <!-- A record from the session's bus: what kind of thing was said
+                 (a note, a milestone, a question, an answer — a late one says
+                 so), beside who said it. A plain message carries no chip. -->
+            <span v-if="message.comms_kind">· {{ message.comms_kind }}</span>
+            <!-- A terminal line rebuilt from keystrokes, not read: it is a
+                 prediction of what the human typed, and an edited or completed
+                 line can differ from it. Marked so the people reading the
+                 mirror — here and in the connected threads — can see which
+                 lines are one. -->
+            <span
+              v-if="message.fidelity === 'reconstructed'"
+              class="reconstructed"
+              title="rebuilt from keystrokes: what was typed may differ"
+            >· typed</span>
+            <!-- Said here because the run said it, but addressed elsewhere: a
+                 `lmer-signal post --thread` goes into a thread this session is
+                 not connected to. Without this line the operator reading the
+                 pane is being addressed by a message that was not for them. -->
+            <a
+              v-if="threadLink(message)"
+              :href="threadLink(message)"
+              target="_blank"
+              rel="noopener"
+              class="text-medium-emphasis"
+              :title="message.thread"
+            >· ↗ posted into a thread</a>
+            <span
+              v-else-if="message.thread"
+              class="text-medium-emphasis"
+            >· ↗ posted into a thread</span>
             <span :title="message.at || ''">{{ ago(message.at, now) }}</span>
           </div>
 
@@ -1516,6 +1609,14 @@ watch(rendererLoaded, () => {
    from; a body is no longer the only part of one that can hold a URL. Scroll
    chaining is left alone deliberately — reaching the end of a message has to
    carry on scrolling the conversation, or a thumb gets stuck in one bubble. */
+/* The one chip in the header that is a caveat rather than a label: it says the
+   line beside it was rebuilt rather than read (spec 407 §3.4). Dotted, so it
+   reads as provisional next to the flat text of the others. */
+.reconstructed {
+  border-bottom: 1px dotted currentColor;
+  cursor: help;
+}
+
 .said {
   margin: 2px 0 4px;
   max-height: 30vh;

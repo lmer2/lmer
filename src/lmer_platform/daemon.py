@@ -44,10 +44,20 @@ import logging
 import sys
 from typing import Optional
 
+from lmer_cli import comms as bus_comms
 from lmer_cli import runref
 
 from .api import build_state, create_app
 from .assistant import Supervisor, register_supervisor
+from .comms import CommsHub, register_hub
+from .connectors import ThreadConnectors, register_connectors
+from .thread_service import ThreadServices, register_services
+from .config import (
+    connector_path,
+    list_connectors,
+    mint_connector_credential,
+    revoke_connector_credential,
+)
 from .config import (
     ConfigError, binding_notice, ensure_secret, load as load_config, read_secret,
 )
@@ -150,6 +160,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--ports", type=int, default=0,
         help="Number of host ports to publish for the session",
     )
+
+    connector = sub.add_parser(
+        "connector",
+        help="Mint, list or revoke a channel-bound connector credential (#407)",
+    )
+    connector_sub = connector.add_subparsers(dest="connector_action")
+    connector_add = connector_sub.add_parser("add", help="Mint a credential; prints it once")
+    connector_add.add_argument("name", help="Connector name, e.g. slack-bridge")
+    connector_add.add_argument(
+        "--channel", required=True,
+        help="The bus channel its posts are stamped with, e.g. slack",
+    )
+    connector_remove = connector_sub.add_parser("remove", help="Revoke a credential")
+    connector_remove.add_argument("name")
+    connector_sub.add_parser("list", help="Names and channels, never the values")
+    connector.set_defaults(connector_action="list")
 
     resume_cmd = sub.add_parser(
         "resume", help="Continue a tracked run by starting its next session"
@@ -378,6 +404,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # about correctness — it is that the assistant's own row is in the fleet view
     # the first tick baselines against, so its start is never itself an event.
     detector = _watch_for_attention(config)
+    hub = _subscribe_to_comms()
+    threads = _run_thread_connectors()
+    services = _serve_thread_requests()
 
     app = create_app(config, secret)
     uvicorn.run(
@@ -402,6 +431,136 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # detector sitting in its interval would otherwise keep fetching a mirror for
     # a daemon that has stopped.
     detector.stop()
+    hub.stop()
+    register_hub(None)
+    # Last, and after the hub: a connector still running would go on posting
+    # into a thread from a daemon that has stopped watching it, and the note it
+    # posts on the way out is the only thing that tells the thread so.
+    threads.stop()
+    register_connectors(None)
+    # The servicers hold nothing between requests, so this is only about not
+    # answering for a daemon that has stopped.
+    services.stop()
+    register_services(None)
+    return 0
+
+
+def _run_thread_connectors() -> ThreadConnectors:
+    """Start the chat-thread connectors: one process per (session, thread), and
+    the loop that keeps that set equal to the recorded connections (issue #412).
+
+    Published like the hub because the routes write the records this reconciles,
+    and started here because a daemon restart with connections recorded has to
+    reattach them — which is the same first pass as any other tick.
+    """
+    threads = ThreadConnectors()
+    threads.start()
+    register_connectors(threads)
+    return threads
+
+
+def _serve_thread_requests() -> ThreadServices:
+    """Start the thread servicers: one per live session, so a session can read
+    and post threads it is not connected to (issue #414).
+
+    Published like the hub because the daemon's own ``/api/comms/thread`` routes
+    do the same work in the same process, and started here because a restart
+    with sessions already up has to pick them all back up — which is the same
+    first pass as any other tick.
+    """
+    services = ThreadServices()
+    services.start()
+    register_services(services)
+    return services
+
+
+def _subscribe_to_comms() -> CommsHub:
+    """Start the comms hub: one subscriber per session bus, one fleet journal
+    (issue #407). Published like the assistant supervisor so the API routes and
+    the detector can reach it; milestones it delivers are skipped by the ask-dir
+    reader, and everything else it sees is batched into the assistant's spool.
+    """
+    hub = CommsHub()
+    hub.add_consumer(_assistant_consumer(hub))
+    hub.start()
+    register_hub(hub)
+    return hub
+
+
+def _assistant_consumer(hub: CommsHub):
+    """Feed the assistant from the fleet journal.
+
+    A milestone keeps the immediate digest and platform event it has always had
+    (the detector's own path, skipped for these sessions); every other record is
+    queued and flushed as one ``session_comms`` digest per session — the
+    assistant receives everything, batched.
+    """
+    from . import assistant, detect
+    from .store import append_event
+
+    def consume(event) -> None:
+        message = event.message
+        if message.get("kind") == "milestone":
+            run = event.run or {}
+            identity = None
+            if run.get("host") and run.get("project") and run.get("slug"):
+                identity = (run["host"], run["project"], run["slug"])
+            entry_id = _ask_dir_entry(message) or str(message.get("seq", "")).zfill(6)
+            signal = detect.SessionSignal(
+                session=event.session,
+                entry_id=entry_id,
+                seq=int(entry_id or 0),
+                text=str(message.get("text", "")),
+                at=str(message.get("at", "")),
+                host=identity[0] if identity else None,
+                project=identity[1] if identity else None,
+                slug=identity[2] if identity else None,
+            )
+            append_event(detect.SESSION_SIGNALLED, note=event.session, data=signal.event_data())
+            assistant.notify(signal.digest, kind=detect.SIGNAL_DIGEST_KIND, data=signal.data())
+            try:
+                # Shared with the ask-directory reader, so recovery does not
+                # re-spool what the hub delivered. The mark counts directory
+                # entries and never seqs — docs/COMMS.md §10 (#421).
+                detect.record_ingested_signals([signal])
+            except Exception as exc:
+                logger.warning("platform_comms_mark_failed session=%s error=%s", event.session, exc)
+            return
+        hub.queue_digest(event)
+
+    return consume
+
+
+def _ask_dir_entry(message: dict) -> Optional[str]:
+    """The ask-directory entry id a lifted record came from, if it was lifted.
+
+    ``lmer_cli.comms.AskDirProjection`` puts the file name in ``source.ref``;
+    that module owns the parser.
+    """
+    source = message.get("source")
+    ref = source.get("ref") if isinstance(source, dict) else None
+    return bus_comms.ask_dir_ref_stem(ref)
+
+
+def _cmd_connector(args: argparse.Namespace) -> int:
+    """Mint, list or revoke connector credentials (#407, spec decision 6)."""
+    action = args.connector_action
+    if action == "add":
+        credential = mint_connector_credential(args.name, args.channel)
+        print(credential)
+        print(
+            f"# connector {args.name!r} posts as channel {args.channel!r}; stored in "
+            f"{connector_path(args.name)} (mode 0600). Shown once — put it in the "
+            "connector's environment, e.g. LMER_PLATFORM_SECRET.",
+            file=sys.stderr,
+        )
+        return 0
+    if action == "remove":
+        removed = revoke_connector_credential(args.name)
+        print("revoked" if removed else "no such connector", file=sys.stderr)
+        return 0 if removed else 1
+    for item in list_connectors():
+        print(f"{item['name']}\t{item['channel']}")
     return 0
 
 
@@ -620,6 +779,7 @@ _COMMANDS = {
     "forget": _cmd_forget,
     "spawn": _cmd_spawn,
     "resume": _cmd_resume,
+    "connector": _cmd_connector,
 }
 
 

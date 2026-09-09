@@ -13,8 +13,11 @@ The CLI supports both interactive Claude Code sessions and arbitrary command exe
 """
 
 import argparse
+import hashlib
 import json
 import os
+import secrets
+import time
 import shlex
 import signal
 import subprocess
@@ -327,6 +330,50 @@ def _make_sigterm_cleanup_handler(container_env):
     return _handler
 
 
+def _thread_post_label(ns, task_id: str | None) -> str:
+    """How a thread is told which session posted into it: a shell session has no
+    run, so it says the session id it was given, else its task."""
+    session = (getattr(ns, "session", None) or "").strip()
+    if session:
+        return f"lmer session {session}"
+    return f"lmer {task_id}" if task_id else "an lmer session"
+
+
+def _start_thread_servicer(
+    ns, host_port, control_token: str, uploads_host, uploads_container, task_id
+):
+    """This process's answer to `lmer-signal read` / `post --thread` (docs/COMMS.md §12).
+
+    A servicer that will not start costs the session those two verbs and nothing
+    else, so it is a warning rather than a failed launch.
+    """
+    if not host_port or not control_token:
+        return None
+    try:
+        from lmer_cli.thread_access import CLI_ENVIRONMENT, ThreadServicer, UploadStore
+
+        servicer = ThreadServicer(
+            supervisor_url=f"http://127.0.0.1:{host_port}",
+            token=control_token,
+            label=_thread_post_label(ns, task_id),
+            # The run's own name, not the label above: that one already says
+            # "lmer" and `Poster.author` adds it (#427, review of !300).
+            run_name=task_id or "",
+            store=UploadStore.of(
+                str(uploads_host) if uploads_host else None, uploads_container
+            ),
+            where=CLI_ENVIRONMENT,
+        )
+        servicer.start()
+        return servicer
+    except Exception as exc:
+        warning(
+            f"Thread servicer did not start ({exc}) — this session cannot read or "
+            "post threads it is not connected to"
+        )
+        return None
+
+
 def _apply_port_passthrough(
     ns: argparse.Namespace, env: dict, run: list[str]
 ) -> int | None:
@@ -557,6 +604,7 @@ def parse_args(
     parser.add_argument("--skip-build", dest="skip_build", action="store_true", help="Do not auto-build or pull the container image if missing")
     # Supervisor / FastAPI controls (consumed inside the container by lmer-supervisor)
     parser.add_argument("--fastapi", dest="fastapi", action="store_true", help="Expose a FastAPI endpoint to read/write the claude process (POST /input, GET /output)")
+    parser.add_argument("--no-thread-connectors", dest="no_thread_connectors", action="store_true", help="This session's host side belongs to another process: set the container's chat context for any Slack/matrix thread targets, but run no connector for them, claim no thread in the host registry, prepare no chat upload store, and run no thread servicer (issue #414). The platform daemon passes this for every session it spawns, because it owns all of those itself — the connectors so they can be added and removed while the session runs (issue #412). Nothing else should: without a connector the thread neither hears the session nor reaches it, and without a servicer the session cannot read or post a thread at all.")
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
@@ -2212,6 +2260,33 @@ def main(argv: list[str] | None = None) -> int:
             error(f"❌ {env_error}")
             return 1
 
+    # A chat-thread target implies the supervisor control plane (issue #407):
+    # the connector that carries the thread runs in this process against the
+    # session's bus, so the plane is on and its token is minted here when the
+    # environment did not supply one — otherwise the supervisor would mint its
+    # own and this process would never learn it.
+    chat_connected = any(handler.needs_control_plane for handler in special_targets)
+    # The control plane is still on, and its token still minted here: the
+    # connectors need it whoever runs them, and under --no-thread-connectors the
+    # daemon reads it from the file it wrote for this session (issue #412).
+    for handler in special_targets:
+        handler.hosts_connectors = not ns.no_thread_connectors
+    if chat_connected:
+        ns.fastapi = True
+    control_token = ns.fastapi_token or os.environ.get("LMER_FASTAPI_TOKEN")
+    # Any session with a control plane: whoever holds this token is the session's
+    # host side. Minted here because a token this process never learns is one it
+    # can attach nothing to.
+    if ns.fastapi and not control_token:
+        control_token = secrets.token_urlsafe(32)
+    # What crosses into the container is the hash, never the token: the harness
+    # can read the container's initial environment (`/proc/1/environ`, same user)
+    # and the control credential is what says who a record came from (#407 §3.2).
+    # The supervisor verifies against this and mints the session's own token.
+    control_token_digest = (
+        hashlib.sha256(control_token.encode("utf-8")).hexdigest() if control_token else None
+    )
+
     # Resolve taskdef directory for the selected task
     resolved_taskdef_dir: Path | None = None
     if not ns.no_task:
@@ -2408,6 +2483,36 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         error(f"❌ Invalid directory mount: {exc}")
         return 1
+
+    # A chat-thread session gets an upload store the way a platform-spawned one
+    # does (issue #407, #246): the connector copies files from the thread into
+    # it and the agent's `lmer-signal --attach` copies files out through it.
+    # Per session, under the state dir, owner-only.
+    # Not under --no-thread-connectors: the daemon has already prepared its own
+    # store for this session and passed a --mount-dir for it, so a second one
+    # here puts two bind mounts on one container path — and the pointer in the
+    # registry entry, which is what the upload routes read, names the daemon's.
+    chat_uploads_container: str | None = None
+    chat_uploads_host: Path | None = None
+    if chat_connected and not ns.no_thread_connectors:
+        from lmer_platform.uploads import CONTAINER_UPLOADS_DIR
+
+        store_id = ns.session or f"chat-{os.getpid()}-{int(time.time())}"
+        chat_uploads_host = lmer_state_dir() / "uploads" / store_id
+        try:
+            chat_uploads_host.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(chat_uploads_host, 0o700)
+        except OSError as exc:
+            error(f"❌ Cannot create the session's upload store {chat_uploads_host}: {exc}")
+            return 1
+        chat_uploads_container = CONTAINER_UPLOADS_DIR
+        dir_mount_specs = [
+            *dir_mount_specs,
+            DirMountSpec(host=chat_uploads_host, container=CONTAINER_UPLOADS_DIR, mode="rw"),
+        ]
+        for handler in special_targets:
+            if handler.needs_control_plane:
+                handler.attach_uploads(str(chat_uploads_host), CONTAINER_UPLOADS_DIR)
 
     clashes = conflicting_mount_destinations(file_mount_specs, dir_mount_specs)
     if clashes:
@@ -2821,6 +2926,7 @@ def main(argv: list[str] | None = None) -> int:
         # Task routing env
         "LMER_TASK": task_id if not ns.no_task else None,
         "LMER_TASK_TARGET": primary_target if not ns.no_task else None,
+        "LMER_SESSION_KIND": os.environ.get("LMER_SESSION_KIND"),
         "LMER_SECONDARY_TARGETS": ",".join(secondary_targets) if secondary_targets else None,
         "LMER_CORE_TASKS": ",".join(sorted(known_tasks)) if (known_tasks and not ns.no_task) else None,
         # Container paths for task definitions (remapped from host paths).
@@ -2913,20 +3019,20 @@ def main(argv: list[str] | None = None) -> int:
         # harness still coalescing input in userspace (issue #210). It has to reach
         # the in-container supervisor, or retuning that window needs a release.
         "LMER_SUBMIT_ENTER_DELAY": os.environ.get("LMER_SUBMIT_ENTER_DELAY"),
+        # Read by the supervisor, inside the container, so they have to cross:
+        # how long it holds its control plane open after the harness exits, and
+        # whether it mirrors what a human types at the terminal (issue #407).
+        "LMER_COMMS_DRAIN_GRACE": os.environ.get("LMER_COMMS_DRAIN_GRACE"),
+        "LMER_COMMS_TERMINAL_MIRROR": os.environ.get("LMER_COMMS_TERMINAL_MIRROR"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which
         # only works if the container-side bind is 0.0.0.0. The host CLI
         # publishes to 127.0.0.1 on the host, so it is not network-exposed.
         "LMER_FASTAPI_HOST": ns.fastapi_host or ("0.0.0.0" if ns.fastapi else None),
-        # Flag > env, as everywhere else. The env fallback exists because a
-        # process that spawns lmer may need to know the bearer token *before* the
-        # session exists — the platform orchestrator mints one, records where it
-        # put it, and hands it down here (issue #141). Without the fallback the
-        # supervisor would generate its own and the spawner's copy would be
-        # wrong, which is worse than having none: everything downstream looks
-        # wired and fails only when someone tries to drive the session. Passing it
-        # as a flag instead would put the credential in `ps` output.
-        "LMER_FASTAPI_TOKEN": ns.fastapi_token or os.environ.get("LMER_FASTAPI_TOKEN"),
+        # Seed None to block the control preimage from the later .env merge;
+        # the supervisor exports a separate session token under this name.
+        "LMER_FASTAPI_TOKEN": None,
+        "LMER_FASTAPI_TOKEN_SHA256": control_token_digest,
         # Container-side path of the orchestrator's ask channel (issue #141):
         # the directory the platform bind-mounts so a session can ask its
         # operator a question through `lmer-ask` instead of posing it in a
@@ -2943,7 +3049,7 @@ def main(argv: list[str] | None = None) -> int:
         # mount the spawner made rather than an operator control — a value
         # without the matching mount is an agent told to read files out of an
         # empty directory. No flag, for the same reason.
-        "LMER_UPLOADS_DIR": os.environ.get("LMER_UPLOADS_DIR"),
+        "LMER_UPLOADS_DIR": chat_uploads_container or os.environ.get("LMER_UPLOADS_DIR"),
         # Container-side path of this session's status document (issue #248),
         # forwarded for the same reasons as the two above. No flag either.
         "LMER_STATUS_DIR": os.environ.get("LMER_STATUS_DIR"),
@@ -2958,12 +3064,11 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_NO_REPO": "1" if (no_repo_session or no_repo_env) else None,
     }
 
-    # Slack-bridged sessions (a SlackThreadTargets handler contributed
-    # LMER_SLACK_CHANNEL above) default the Claude Code AFK timeout to
-    # 5 minutes when the host left it unset; terminal sessions keep None.
+    # Chat-bridged sessions (a Slack or matrix thread target) default the
+    # Claude Code AFK timeout to 5 minutes when the host left it unset;
+    # terminal sessions keep None.
     env["CLAUDE_AFK_TIMEOUT_MS"] = _resolve_afk_timeout_ms(
-        env["CLAUDE_AFK_TIMEOUT_MS"],
-        any(isinstance(handler, SlackThreadTargets) for handler in special_targets),
+        env["CLAUDE_AFK_TIMEOUT_MS"], chat_connected,
     )
 
     # Preset env entries applied host-side are seeded into the container env
@@ -3048,6 +3153,11 @@ def main(argv: list[str] | None = None) -> int:
         env["LMER_FASTAPI_PORT"] = str(host_port)
         _publish_host_ports(run, [host_port])
         info(f"🛰  FastAPI endpoint will be published on http://127.0.0.1:{host_port}")
+        for handler in special_targets:
+            if handler.needs_control_plane and control_token:
+                handler.attach_control_plane(
+                    f"http://127.0.0.1:{host_port}", control_token
+                )
 
     # General port passthrough (--ports / --port-pool): allocate N free ports
     # and publish them so a service Claude runs inside is reachable on the host.
@@ -3130,9 +3240,17 @@ def main(argv: list[str] | None = None) -> int:
         # --exec / --no-task one-shots are not interactive sessions, so they don't
         # announce.
         announce_session = use_clone_script and not exec_mode
+        thread_servicer = None
         if announce_session:
             for handler in special_targets:
                 handler.on_session_start()
+            # The host side of `lmer-signal read` / `post --thread`, keyed on the
+            # control plane rather than on a chat target (docs/COMMS.md §12).
+            if ns.fastapi and control_token and not ns.no_thread_connectors:
+                thread_servicer = _start_thread_servicer(
+                    ns, env.get("LMER_FASTAPI_PORT"), control_token,
+                    chat_uploads_host, chat_uploads_container, task_id,
+                )
 
         success(f"🚀 Launching container ({runtime} run {image})")
         if runtime == "podman":
@@ -3148,6 +3266,8 @@ def main(argv: list[str] | None = None) -> int:
             if announce_session:
                 for handler in special_targets:
                     handler.on_session_end()
+                if thread_servicer is not None:
+                    thread_servicer.stop()
     finally:
         # Cleanup BEFORE restoring the disposition: in the other order a
         # SIGTERM landing between the two statements gets the default

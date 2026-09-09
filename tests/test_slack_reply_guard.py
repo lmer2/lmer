@@ -286,3 +286,58 @@ class TestSettingsWiring:
         ]
         assert any("slack_reply_guard.py" in c for c in commands), (
             "Stop hook for slack_reply_guard.py missing from settings.json")
+
+
+# ---------------------------------------------------------------------------
+# #407: the post that resets the counter is now `lmer-signal post`, with the
+# `lmer-slack post` shim still counting for one release
+# ---------------------------------------------------------------------------
+
+from hooks.slack_reply_guard import _is_slack_post  # noqa: E402
+
+
+class TestSignalPost:
+    @pytest.mark.parametrize("cmd", [
+        "lmer-signal post --message-file /tmp/r.md",
+        "lmer-signal post 'hi there'",
+        "cat /tmp/r.md | lmer-signal post --stdin",
+        "lmer-slack post --stdin",
+    ])
+    def test_posts_reset(self, cmd):
+        assert _is_slack_post(cmd) is True
+        assert unposted_reply_chars([_assistant_text(LONG), _assistant_bash(cmd)]) == 0
+
+    @pytest.mark.parametrize("cmd", [
+        'lmer-signal "pushed MR"',
+        'lmer-signal note "working"',
+        'lmer-signal ask "which?"',
+        "lmer-signal list",
+        'grep "lmer-signal post" notes.md',
+    ])
+    def test_other_verbs_do_not(self, cmd):
+        assert _is_slack_post(cmd) is False
+
+    def test_the_reason_names_the_new_verb(self):
+        reason = evaluate([_assistant_text(LONG)])
+        assert "lmer-signal post" in reason
+
+
+class TestChatChannelTrigger:
+    def _run(self, env_extra, tmp_path):
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text(json.dumps(_assistant_text(LONG)) + "\n", encoding="utf-8")
+        env = {k: v for k, v in os.environ.items() if k not in ("LMER_SLACK_CHANNEL", "LMER_CHAT_CHANNEL")}
+        env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parents[1] / "hooks" / "slack_reply_guard.py")],
+            input=json.dumps({"transcript_path": str(transcript)}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+
+    def test_a_matrix_target_arms_the_guard_too(self, tmp_path):
+        result = self._run({"LMER_CHAT_CHANNEL": "matrix"}, tmp_path)
+        assert result.returncode == 0 and '"decision": "block"' in result.stdout
+
+    def test_no_chat_target_no_guard(self, tmp_path):
+        result = self._run({}, tmp_path)
+        assert result.returncode == 0 and result.stdout.strip() == ""

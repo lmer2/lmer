@@ -28,7 +28,7 @@ const mode = ref('spawn')
 // only the harness can, and it does so by rejecting what it does not know.
 const spawn = ref({
   taskdef: 'develop', target: '', repo_url: '', preset: '', agents: [],
-  model: '', ports: 0, slot: null,
+  model: '', ports: 0, slot: null, references: [],
 })
 const busy = ref(false)
 const error = ref(null)
@@ -257,6 +257,14 @@ async function doSpawn() {
     // with a guess: unset means "whatever this session's environment, preset or
     // harness settles on", which the session itself reports back once it knows.
     if (typed(spawn.value.model)) payload.model = typed(spawn.value.model)
+    // Threads the run should know about, not be connected to (#414). Sent as
+    // objects because a title rides with each; the chip's text is the permalink,
+    // and a title is added later from the run's own thread menu.
+    const references = (spawn.value.references || [])
+      .map((permalink) => typed(permalink))
+      .filter(Boolean)
+      .map((permalink) => ({ permalink }))
+    if (references.length) payload.references = references
     const result = await spawnSession(payload)
     notice.value = `spawned ${result.session_id}`
     // The daemon says so when a session it just started belongs to no run it can
@@ -410,6 +418,20 @@ async function doAdopt(candidate) {
             hint="the session's LMER_LLM_NAME (--model); blank runs the harness default"
             persistent-hint
             placeholder="opus"
+            class="mb-3"
+          />
+          <!-- Context threads, not connections: nothing is mirrored, nothing
+               starts listening, and a thread another run holds can be listed
+               here. The run is told about each one once (#414). -->
+          <v-combobox
+            v-model="spawn.references"
+            label="reference threads"
+            hint="Slack or matrix permalinks the run should read; it is told about each once, and connects to none"
+            persistent-hint
+            multiple
+            chips
+            closable-chips
+            clearable
             class="mb-3"
           />
           <v-text-field

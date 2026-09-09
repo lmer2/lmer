@@ -1105,7 +1105,8 @@ class TestStartAutoStartThread:
         write = lambda data: (sink.append(bytes(data)), len(data))[1]
         cancel = self._FakeCancel()
         thread = supervisor._start_auto_start_thread(
-            output=None, write=write, options=self._options(), cancel=cancel
+            output=None, write=write, options=self._options(), cancel=cancel,
+            on_started=lambda: write(b"inbound\r"),
         )
         thread.join(timeout=2)
         assert not thread.is_alive()
@@ -1113,6 +1114,7 @@ class TestStartAutoStartThread:
         assert sink[0] == b"/start\r"
         assert b"hello\r" in sink
         assert sink.index(b"/start\r") < sink.index(b"hello\r")
+        assert sink.index(b"hello\r") < sink.index(b"inbound\r")
 
     def test_waits_start_prompt_delay_before_prompt(self):
         # The gap before the prompt must come from start_prompt_delay, not the
@@ -1145,6 +1147,39 @@ class TestStartAutoStartThread:
         assert sink[0] == b"/start\r"
         assert all(b"hello" not in chunk for chunk in sink)
         assert 5.0 not in cancel.waits
+
+    @pytest.mark.parametrize("written", [0, 3, 7])
+    def test_start_callback_requires_a_complete_submit(self, written, caplog):
+        events = []
+
+        def submit(text):
+            events.append(("submit", text))
+            return written, supervisor.SUBMIT_TEXT_UNKNOWN
+
+        thread = supervisor._start_auto_start_thread(
+            output=None, write=lambda data: len(data), options=self._options(start_prompt=""),
+            cancel=self._FakeCancel(), submit_start=submit,
+            on_started=lambda: events.append(("ready", None)),
+        )
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert events == [("submit", "/start")] + ([("ready", None)] if written == 7 else [])
+        assert ("startup_submit_incomplete" in caplog.text) == (written != 7)
+
+    def test_failed_startup_is_logged_and_does_not_release_input(self, caplog):
+        released = []
+
+        def fail(text):
+            raise OSError("closed PTY")
+
+        thread = supervisor._start_auto_start_thread(
+            output=None, write=lambda data: len(data), options=self._options(start_prompt=""),
+            cancel=self._FakeCancel(), submit_start=fail, on_started=lambda: released.append(True),
+        )
+        thread.join(timeout=2)
+        assert not thread.is_alive() and released == []
+        assert "startup_submit_failed error=closed PTY" in caplog.text
+        assert "inbound_typing=held" in caplog.text
 
 
 class TestTheSuiteNeverWritesTheLiveSessionLog:
@@ -3368,6 +3403,13 @@ class TestFastApiApp:
         assert resp.json() == {
             "ok": True, "cursor": 0, "rows": None, "cols": None,
             "source": supervisor.__file__,
+            # No bus behind this app: the key is present and null, which is how
+            # a reader tells "no comms" from "an image that predates comms".
+            "comms": None,
+            # The thread facility is always there, unlike the bus: whether
+            # anything can serve a thread request is a question about a servicer
+            # polling, not about how this app was built (issue #414).
+            "threads": {"servicer": False, "in_flight": 0, "seq": 0},
             "last_output_at": None, "idle_seconds": None,
         }
 

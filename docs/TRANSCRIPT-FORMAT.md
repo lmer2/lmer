@@ -161,6 +161,19 @@ advice.
   Rewriting or reordering a line renumbers history under every cursor in flight,
   which makes a live reader skip or repeat turns. File order is conversation
   order; timestamps never re-sort it.
+
+  It also **renames**, which costs more than renumbering. Each turn the platform
+  serves carries an `id` that is stable across reads — the file's path below the
+  session directory or the harness transcript root, plus the turn's position in
+  that file, with a digest of the path standing in for a file below neither — and
+  a live view uses it to tell a turn it already holds from a new one. That closes
+  the *repeat* half of the skip-or-repeat above and only that half: a name the
+  view already has answers for its turn wherever the new numbering puts it, but it
+  says nothing about the turn the renumber inserted, which lands below the
+  reader's cursor and is never served again. A **rename** is worse than either,
+  because then every turn after the edited line is a turn the view has never seen
+  and redraws as new. So the rule is about identity, not only about order: append,
+  and nothing before the end ever changes meaning.
 - **Every line stands alone.** Stall detection reads the last 256 KiB of the
   newest file from a mid-file seek and drops the first (probably half) line in
   that window, so each record must be independently parseable — no record that

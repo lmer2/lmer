@@ -555,6 +555,39 @@ def test_binding_notice_names_default_as_source(platform_root):
     assert "bind from default" in cfg.binding_notice(cfg.load())
 
 
+# --- the link a person in a chat thread can open -----------------------------
+
+
+def test_control_ui_url_prefers_what_the_operator_configured(platform_root):
+    """The bridge's own key, for the bridge's own reason: a reverse proxy or a
+    tunnel is not derivable from a bind pair (docs/MATRIX-CHAT.md)."""
+    config = cfg.load({"matrix": {"control_url": "https://lmer.example.org/"}})
+    assert cfg.control_ui_url(config) == "https://lmer.example.org"
+
+
+def test_a_routable_bind_is_a_link_somebody_else_can_dial(platform_root):
+    assert cfg.control_ui_url(cfg.load({"bind_address": "10.0.0.5"})) == "http://10.0.0.5:8600"
+
+
+def test_a_loopback_or_wildcard_bind_yields_no_link_at_all(platform_root):
+    """``http://127.0.0.1:8600`` posted into somebody's Slack channel is not a
+    link, and a wildcard address is not a destination."""
+    assert cfg.control_ui_url(cfg.load()) is None
+    assert cfg.control_ui_url(cfg.load({"bind_address": "0.0.0.0"})) is None
+
+
+def test_a_configured_url_that_is_not_one_falls_through_and_says_so(
+    platform_root, caplog,
+):
+    """Review aside on !299: the bridge refuses a malformed one outright, so
+    dropping it here without a word is how a typo becomes an invisible wrong
+    link."""
+    config = cfg.load({"matrix": {"control_url": "lmer.example.org"}})
+    with caplog.at_level("WARNING"):
+        assert cfg.control_ui_url(config) is None
+    assert "platform_control_url_unusable" in caplog.text
+
+
 # --- the docker bridge gateway probe ----------------------------------------
 #
 # `container_base_url`'s rules are asserted in tests/test_platform_assistant.py,

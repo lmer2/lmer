@@ -14,6 +14,13 @@ nothing but the standard library.
 directory, three file shapes, and the rules for allocating an id. It is the only
 re-export here; the CLI is deliberately not imported at package level, so
 importing the format costs nothing (the :mod:`slack_chat` convention).
+
+Since issue #407 the directory is a *projection*: the session's communications
+live on the supervisor's bus (:mod:`lmer_cli.comms`), the agent's command is
+``lmer-signal`` (:mod:`ask_channel.signal_cli`, over :mod:`ask_channel.bus`),
+and ``lmer-ask`` (:mod:`ask_channel.cli`) is a one-release shim over it. The
+supervisor keeps writing the directory's shapes for readers that predate the
+bus, which is why this format still has a home.
 """
 
 from . import protocol

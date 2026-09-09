@@ -1,0 +1,2 @@
+fixed:
+- "Files arriving in a connected matrix thread are size-capped and written without following a symlink, as Slack's already were"

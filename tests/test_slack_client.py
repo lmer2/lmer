@@ -87,7 +87,8 @@ class TestTokenFromEnv:
 # ---------------------------------------------------------------------------
 
 class TestPostMessage:
-    def test_post_message_payload_shape(self, monkeypatch):
+    @pytest.mark.parametrize("connection_notice", [False, True])
+    def test_post_message_payload_shape(self, monkeypatch, connection_notice):
         """post_message sends correct JSON body to chat.postMessage."""
         _require_impl()
         client = SlackClient(bot_token=BOT_TOKEN)
@@ -111,6 +112,7 @@ class TestPostMessage:
             channel="C12345",
             thread_ts="1700000000.123456",
             text="Hello, world!",
+            connection_notice=connection_notice,
         )
 
         assert ts == "1700000001.000100"
@@ -119,6 +121,13 @@ class TestPostMessage:
         assert body["channel"] == "C12345"
         assert body["thread_ts"] == "1700000000.123456"
         assert body["text"] == "Hello, world!"
+        if connection_notice:
+            block, = body["blocks"]
+            assert block["type"] == "section"
+            assert block["block_id"].startswith("lmer-connection-status:")
+            assert block["text"] == {"type": "mrkdwn", "text": body["text"]}
+        else:
+            assert "blocks" not in body
 
     def test_post_message_returns_ts(self, monkeypatch):
         """post_message returns the ts field from the Slack response."""
@@ -560,3 +569,40 @@ class TestAuthHeader:
 
         auth_header = client.session.headers.get("Authorization", "")
         assert auth_header == f"Bearer {BOT_TOKEN}"
+
+
+# ---------------------------------------------------------------------------
+# 8. The workspace probe: one auth.test, two answers (issue #429)
+# ---------------------------------------------------------------------------
+
+class TestWorkspaceProbe:
+    """`workspace()` reads the host from the body and the granted scopes from
+    the `x-oauth-scopes` **header** — the only place Slack states them, and what
+    decides whether opening a thread can rely on `not_in_channel`."""
+
+    def _client(self, monkeypatch, headers):
+        _require_impl()
+        client = SlackClient(bot_token=BOT_TOKEN)
+        monkeypatch.setattr(
+            client.session, "request",
+            lambda *a, **kw: _make_response(
+                {"ok": True, "user_id": "U1", "url": "https://example.slack.com/"},
+                headers=headers,
+            ),
+        )
+        return client
+
+    def test_the_header_becomes_a_scope_list(self, monkeypatch):
+        client = self._client(
+            monkeypatch, {"x-oauth-scopes": "chat:write,channels:history, chat:write.public"},
+        )
+        probe = client.workspace()
+        assert probe["host"] == "example.slack.com"
+        assert probe["scopes"] == ["chat:write", "channels:history", "chat:write.public"]
+
+    def test_no_header_is_not_an_empty_scope_list(self, monkeypatch):
+        """`None` is *not knowing* — a proxy that strips the header, an older
+        API — and the caller treats it differently from a known set."""
+        probe = self._client(monkeypatch, {}).workspace()
+        assert probe["host"] == "example.slack.com"
+        assert probe["scopes"] is None

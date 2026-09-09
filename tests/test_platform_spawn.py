@@ -4355,3 +4355,32 @@ def test_the_link_pairs_never_name_a_destination_nothing_bound(
         if flag == "--mount-dir"
     }
     assert all(staged in mounted for _, staged in channels.link_pairs)
+
+
+@pytest.mark.parametrize("kind", ["worker", "assistant"])
+def test_spawn_passes_all_threads_and_host_assigned_kind(config, monkeypatch, kind):
+    from lmer_cli.targets import partition_targets
+
+    links = ["https://team.slack.com/archives/C1/p1700000000000001", "https://matrix.to/#/!room:example.org/$root"]
+    captured = {}
+    original = spawn.subprocess.Popen
+    def capture(*args, **kwargs):
+        captured.update(kwargs["env"])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(spawn.subprocess, "Popen", capture)
+    monkeypatch.setenv("LMER_SESSION_KIND", "incorrect-inherited-kind")
+    request = spawn.SpawnRequest("orchestrate", "fleet", targets=links, no_repo=True)
+    result = spawn.spawn_session(config, request, kind=kind)
+    parsed, _ = parse_args(result.command[1:])
+    assert parsed.target == ["fleet", *links]
+    repo, handlers = partition_targets(parsed.target)
+    assert repo == ["fleet"]
+    assert [h.targets for h in handlers] == [[links[0]], [links[1]]]
+    assert captured["LMER_SESSION_KIND"] == kind
+
+
+@pytest.mark.parametrize("targets", ["url", {}, False, [None], ["--exec"], ["https://example.org/repo"], ["https://team.slack.com/archives/C1/p1700000000000001\n"]])
+def test_spawn_refuses_invalid_extra_thread_targets(config, targets):
+    with pytest.raises(spawn.SpawnError, match="targets"):
+        spawn.spawn_session(config, spawn.SpawnRequest("chat", "fleet", targets=targets, no_repo=True))
+    assert registry.list_sessions(live_only=False) == []

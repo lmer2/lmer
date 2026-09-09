@@ -503,6 +503,104 @@ def _cmd_post(args: argparse.Namespace, client: SlackClient) -> int:
     return 0
 
 
+_SHIM_DEPRECATIONS = {
+    "post": "lmer-slack post: deprecated — use `lmer-signal post`; forwarded for this release",
+    "history": "lmer-slack history: deprecated — use `lmer-signal list`; inbound messages now arrive as turns",
+    "watch": "lmer-slack watch: deprecated — inbound messages now arrive as turns tagged [slack · name]",
+    "poll": "lmer-slack poll: deprecated — inbound messages now arrive as turns tagged [slack · name]",
+}
+
+#: Exit code when the session has no bus and no legacy token: the ask
+#: channel's "no channel" code, so scripts see one meaning.
+NO_CHANNEL_EXIT_CODE = 3
+
+
+def _cmd_post_shim(args: argparse.Namespace) -> int:
+    """``lmer-slack post`` → a ``message`` on the bus.
+
+    A session that still carries ``SLACK_BOT_TOKEN`` (a manual ``lmer chat``
+    from before the host-side connector, or an image between the two halves of
+    this change) also posts to the thread directly, as it always did — so the
+    thread hears it whether or not a connector is listening. When neither a
+    bus nor a token exists there is no way to reach the human, and the exit
+    code says so.
+    """
+    from ask_channel import bus as _bus
+    from ask_channel import signal_cli
+
+    text = _resolve_post_text(args)
+    bus_error: Optional[Exception] = None
+    try:
+        result = signal_cli._client().post("message", text)
+        print(f"{int(result['message']['seq']):06d}")
+    except _bus.NoChannel as exc:
+        bus_error = exc
+    except _bus.BusError as exc:
+        print(f"lmer-slack post: the bus refused the message: {exc}", file=sys.stderr)
+        return 1
+
+    if os.environ.get("SLACK_BOT_TOKEN"):
+        try:
+            channel, thread_ts = _resolve_channel_thread(args)
+            slack = SlackClient()
+            print(slack.post_message(channel, thread_ts, text))
+        except SlackError as exc:
+            print(f"Slack error: {exc}", file=sys.stderr)
+            return 1 if bus_error is not None else 0
+        return 0
+
+    if bus_error is not None:
+        print(f"lmer-slack post: {bus_error}", file=sys.stderr)
+        return NO_CHANNEL_EXIT_CODE
+    return 0
+
+
+def _cmd_end_session_shim(args: argparse.Namespace) -> int:
+    """``lmer-slack end-session`` in a session with no Slack token.
+
+    Since #407 the bot token lives on the host, so the goodbye goes out the way
+    everything else does — a ``message`` on the bus, which the connector puts in
+    the thread — and the shutdown happens whether or not it lands. The shutdown
+    is the point of the verb: a session that cannot say goodbye must still free
+    its slot rather than hold it to the idle timeout.
+    """
+    from ask_channel import bus as _bus
+    from ask_channel import signal_cli
+
+    goodbye = _resolve_optional_post_text(args)
+    if goodbye:
+        try:
+            signal_cli._client().post("message", goodbye)
+        except (_bus.NoChannel, _bus.BusError) as exc:
+            print(f"Warning: could not post goodbye message: {exc}", file=sys.stderr)
+
+    result = request_session_end()
+    if not result.ok:
+        print(f"Error: {result.message}", file=sys.stderr)
+        return result.code
+    print(result.message.capitalize())
+    return 0
+
+
+def _cmd_inbound_shim(args: argparse.Namespace) -> int:
+    """``history``/``poll``/``watch`` on a session with no Slack token.
+
+    Inbound Slack messages reach the harness as tagged turns now, so there is
+    nothing to poll or watch; ``history`` becomes the bus's ``list``.
+    """
+    from ask_channel import signal_cli
+
+    if args.subcommand == "history":
+        return signal_cli.main(["list"])
+    print(
+        "lmer-slack: nothing to watch — messages from the thread arrive in this "
+        "session as turns tagged [slack · name]; `lmer-signal list` shows the "
+        "conversation so far",
+        file=sys.stderr,
+    )
+    return 0
+
+
 def _cmd_poll(args: argparse.Namespace, client: SlackClient) -> int:
     """Handle the 'poll' subcommand.
 
@@ -745,6 +843,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.subcommand not in known:
         print(f"Unknown subcommand: {args.subcommand!r}", file=sys.stderr)
         return 1
+
+    # Since #407 the conversation runs over the supervisor's bus and the Slack
+    # connector on the host; these four verbs are one-release shims over it.
+    if args.subcommand in _SHIM_DEPRECATIONS:
+        print(_SHIM_DEPRECATIONS[args.subcommand], file=sys.stderr)
+    if args.subcommand == "post":
+        return _cmd_post_shim(args)
+    if args.subcommand in ("history", "poll", "watch") and not os.environ.get("SLACK_BOT_TOKEN"):
+        return _cmd_inbound_shim(args)
+    if args.subcommand == "end-session" and not os.environ.get("SLACK_BOT_TOKEN"):
+        # Dispatched before the client is built: constructing one without a
+        # token fails, and this verb's job — freeing the session slot — has
+        # nothing to do with Slack.
+        return _cmd_end_session_shim(args)
 
     try:
         client = SlackClient()
