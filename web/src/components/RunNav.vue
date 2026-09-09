@@ -6,7 +6,7 @@ import {
   mdiCheckCircleOutline, mdiCloseCircleOutline, mdiCommentAlertOutline,
   mdiCommentQuestionOutline, mdiEyeOffOutline, mdiHandBackLeftOutline,
   mdiHelpCircleOutline, mdiHumanQueue, mdiPauseCircleOutline,
-  mdiPlayCircleOutline, mdiPowerSleep, mdiRepeatOff, mdiSkullOutline,
+  mdiPlayCircleOutline, mdiPowerSleep, mdiRepeatOff, mdiSkullOutline, mdiTimerAlertOutline,
 } from '@mdi/js'
 import { ago, attentionLabel, stateMeta, toneColor } from '../format.js'
 import { runKey } from '../runref.js'
@@ -41,6 +41,7 @@ import { runKey } from '../runref.js'
 // session nothing is recording must never read as a healthy one.
 const STATE_ICONS = {
   running: mdiPlayCircleOutline,
+  stuck_teardown: mdiTimerAlertOutline,
   detached: mdiEyeOffOutline,
   held: mdiPauseCircleOutline,
   feedback: mdiCommentAlertOutline,

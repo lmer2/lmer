@@ -272,6 +272,44 @@ conversation window is lost.
   config fields take effect; there is no migration, and an existing
   `config.json` without them takes the defaults.
 
+- **Stuck teardown** — after the supervisor acknowledges an end request, a
+  launcher that stays alive while its control plane continuously fails to
+  respond is shown as **stuck teardown**. The assistant gets one digest naming
+  the session, including its id in the digest's structured data. The daemon
+  does not terminate it automatically; the operator or orchestrator decides
+  whether to use exit. Wind down alone does not start this timer.
+
+  Before typing quit, the supervisor allows up to six seconds for the daemon
+  to confirm the acknowledgment over the authenticated bus. The API stays up
+  through this bounded handoff even if the harness exits naturally first. This
+  covers the daemon's five-second subscription reconciliation cycle. Without
+  authenticated delivery to the daemon, shutdown proceeds and the detector
+  remains unarmed.
+  Container-written files cannot arm it. The subscriber identifies the platform
+  session; the work-session id in the record stays intact.
+
+  `LMER_PLATFORM_STUCK_TEARDOWN_SECONDS` overrides `stuck_teardown_seconds` in
+  `~/.lmer/platform/config.json`; the default is **60** seconds. Accepts positive
+  integers; zero, negative values and malformed values are refused. A blank
+  environment value falls through to the config file. Restart the daemon after
+  changing it, as with the halt-detection thresholds above.
+
+  Timing starts at the first failed control-plane sample after acknowledgment.
+  The detector samples every 30 seconds, so the warning appears on the first
+  tick at or beyond the configured grace. An HTTP response, including an HTTP
+  error, clears the loss interval. Missing local probe credentials cannot prove
+  connection failure and also clear the interval.
+
+  This is the safety net for shutdown. The supervisor first asks the harness to
+  quit, allows 10 seconds, sends SIGTERM, allows another 10 seconds, then sends
+  SIGKILL. A blocked PTY writer cannot delay this ladder. It reaps the harness
+  before stopping the control plane, including when the PTY closes early or a
+  descendant retains it. Transient tiny host dimensions preserve the previous
+  terminal size; a headless session starts at 80 columns by 24 rows.
+
+  Upgrade the session image, daemon, and UI bundle together. Existing sessions
+  from older images do not publish the acknowledgment needed by this detector.
+
 - **Digest nudges** — the daemon spools digests for uber lmer, and nothing reads
   that spool until uber lmer takes it. When digests sit there while the session
   is quiet, the daemon types one reminder into it. Defaults: one digest, three

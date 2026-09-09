@@ -211,6 +211,7 @@ DEFAULT_STALL_IDLE_SECONDS = 600
 #: Silence past this raises the flag whatever the transcript says, so a halt the
 #: precise paths cannot recognise is found an hour late rather than never.
 DEFAULT_STALL_BACKSTOP_SECONDS = 3600
+DEFAULT_STUCK_TEARDOWN_SECONDS = 60
 
 ENV_BIND_ADDRESS = "LMER_PLATFORM_BIND_ADDRESS"
 ENV_BIND_PORT = "LMER_PLATFORM_BIND_PORT"
@@ -243,6 +244,7 @@ ENV_CONTAINER_URL = "LMER_PLATFORM_CONTAINER_URL"
 #: neighbours.
 ENV_STALL_IDLE_SECONDS = "LMER_PLATFORM_STALL_IDLE_SECONDS"
 ENV_STALL_BACKSTOP_SECONDS = "LMER_PLATFORM_STALL_BACKSTOP_SECONDS"
+ENV_STUCK_TEARDOWN_SECONDS = "LMER_PLATFORM_STUCK_TEARDOWN_SECONDS"
 
 #: How the orchestrating assistant's session is *run*, per platform instance
 #: (issue #234): the model, harness, preset and agents fan-out its ``lmer``
@@ -498,6 +500,7 @@ class PlatformConfig:
     #: fire, and when silence alone is enough. ``0`` disables each.
     stall_idle_seconds: int = DEFAULT_STALL_IDLE_SECONDS
     stall_backstop_seconds: int = DEFAULT_STALL_BACKSTOP_SECONDS
+    stuck_teardown_seconds: int = DEFAULT_STUCK_TEARDOWN_SECONDS
     autonomous_default: bool = False
     park_idle_side: bool = False
     #: How the orchestrating assistant's session is run (issue #234) — see
@@ -627,6 +630,7 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         "work_repo_pull_interval",
         "max_concurrent_sessions",
         "max_followup_rounds",
+        "stuck_teardown_seconds",
     ):
         value = getattr(config, name)
         if not isinstance(value, int) or isinstance(value, bool) or value < 1:
@@ -1156,6 +1160,7 @@ def load(overrides: Optional[dict] = None) -> PlatformConfig:
         "work_repo_forge": _env_str(ENV_WORK_REPO_FORGE),
         "stall_idle_seconds": _env_int(ENV_STALL_IDLE_SECONDS),
         "stall_backstop_seconds": _env_int(ENV_STALL_BACKSTOP_SECONDS),
+        "stuck_teardown_seconds": _env_int(ENV_STUCK_TEARDOWN_SECONDS),
         # Not `_env_int`: it raises, which is right for a bind port and wrong
         # for a reminder interval. Cleaned here rather than in ``_validate`` so
         # an unusable export costs its own layer and lets ``config.json`` show

@@ -41,7 +41,7 @@ assert.equal(stateMeta(undefined).label, 'unknown')
 // stays in step); this checks the tone each one carries actually paints.
 const RUN_STATES = [
   'running', 'held', 'feedback', 'waiting_on_you', 'yielded', 'parked',
-  'failed', 'crashed', 'dormant', 'complete', 'unknown',
+  'failed', 'crashed', 'stuck_teardown', 'dormant', 'complete', 'unknown',
 ]
 for (const state of RUN_STATES) {
   const { label, tone } = stateMeta(state)

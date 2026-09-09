@@ -5,6 +5,7 @@
 // lmer_platform.inventory.RUN_STATES.
 const STATE_META = {
   running: { label: 'running', tone: 'live' },
+  stuck_teardown: { label: 'stuck teardown', tone: 'attention' },
   // Not 'live' and not 'bad': the process is up but the platform lost its only
   // view of it (the host terminal died with a daemon restart and the container
   // did not answer), so nothing is being recorded. Rendering that as a healthy
@@ -42,6 +43,7 @@ const ATTENTION_LABELS = {
   // something else that ended a turn it never came back from (#243). The note
   // beside it says how long, and how confidently that was decided.
   stalled: 'stopped responding',
+  stuck_teardown: 'is stuck ending its session',
 }
 
 // Tones are this domain's urgency vocabulary; Vuetify colours are how a chip or

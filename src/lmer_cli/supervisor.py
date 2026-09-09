@@ -88,6 +88,8 @@ CONTROL_TOKEN_HASH_ENV = "LMER_FASTAPI_TOKEN_SHA256"
 DEFAULT_PORT_RANGE = (8700, 8799)
 DEFAULT_AUTO_START_DELAY = 1.5
 DEFAULT_FASTAPI_HOST = "127.0.0.1"
+# Allow the daemon's five-second reconciliation cycle plus the acknowledgment round trip.
+END_REQUEST_HANDOFF_SECONDS = 6.0
 
 # After the initial ``/start\r`` injection, claude's TUI occasionally shows
 # the typed ``/start`` but never registers the trailing CR — the submit gets
@@ -237,6 +239,8 @@ DEFAULT_SHUTDOWN_CHORD_GAP = 0.5
 DEFAULT_SHUTDOWN_ESCALATE_GRACE = 10.0
 # Poll cadence while waiting for the child to exit between escalation steps.
 SHUTDOWN_POLL_INTERVAL = 0.2
+# A descendant writing after the harness exits must not keep teardown open.
+CHILD_OUTPUT_DRAIN_SECONDS = 1.0
 
 # Where the session's own log goes, and the one rule about these two names: they
 # are a cross-version interface, so they may not change. The orchestrator
@@ -725,6 +729,12 @@ def _get_winsize(fd: int) -> Optional[tuple[int, int]]:
         return None
     rows, cols, _, _ = struct.unpack("HHHH", packed)
     return rows, cols
+
+
+def _usable_host_winsize(size: Optional[tuple[int, int]]) -> bool:
+    """Ignore transient host layouts that would destroy the TUI's wrapping."""
+    return bool(size and 5 <= size[0] <= MAX_WINSIZE_DIMENSION
+                and 20 <= size[1] <= MAX_WINSIZE_DIMENSION)
 
 
 def _resolve_submit_enter_delay() -> float:
@@ -2543,6 +2553,7 @@ def _self_shutdown(
     chord_gap: float = DEFAULT_SHUTDOWN_CHORD_GAP,
     escalate_grace: float = DEFAULT_SHUTDOWN_ESCALATE_GRACE,
     quit_sequence: tuple[bytes, ...] = DEFAULT_QUIT_SEQUENCE,
+    child_exited: Optional[threading.Event] = None,
 ) -> None:
     """Quit the wrapped child on request, escalating until it actually exits.
 
@@ -2555,16 +2566,24 @@ def _self_shutdown(
     3. If it is *still* alive after another ``escalate_grace``, send SIGKILL.
 
     Runs on a daemon thread spawned from the SIGUSR1 handler so the timed gaps
-    don't execute in async-signal context. Signals are sent to the child PID
+    don't execute in async-signal context. A separate writer attempts the quit
+    sequence, so a blocked PTY cannot postpone either escalation deadline.
+    Signals are sent to the child PID
     only (not its group): the child is its own session/group leader (the fork
     path calls ``setsid``), and ``run_supervisor`` reaps it via ``waitpid``.
     """
-    _inject_shutdown_chord(write, chord_gap, quit_sequence)
-    if _wait_child_exit(child_pid, escalate_grace):
+    # Neither a held submit lock nor a full PTY input buffer may stop the clock
+    # that eventually signals the child. The writer dies with this supervisor.
+    threading.Thread(target=_inject_shutdown_chord, args=(write, chord_gap, quit_sequence),
+                     name="lmer-supervisor-quit", daemon=True).start()
+    wait_exited = child_exited.wait if child_exited is not None else (
+        lambda timeout: _wait_child_exit(child_pid, timeout)
+    )
+    if wait_exited(escalate_grace):
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(child_pid, signal.SIGTERM)
-    if _wait_child_exit(child_pid, escalate_grace):
+    if wait_exited(escalate_grace):
         return
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.kill(child_pid, signal.SIGKILL)
@@ -2592,6 +2611,48 @@ def _open_comms_log(
     if log.path and env is None:
         os.environ[_comms.COMMS_LOG_ENV] = log.path
     return log
+
+
+def _announce_shutdown(log: "_comms.MessageLog") -> "_comms.Message":
+    """Publish the supervisor's acknowledgment on the authenticated bus."""
+    message, _ = log.append(
+        kind=_comms.KIND_NOTE,
+        text="Session shutdown requested.",
+        source=_comms.Source(_comms.CHANNEL_SUPERVISOR),
+        meta={"event": _comms.EVENT_SESSION_END_REQUESTED},
+    )
+    return message
+
+
+class _ShutdownHandoff:
+    """One delivery deadline shared by quit escalation and API finalization."""
+
+    def __init__(self, log: "_comms.MessageLog", timeout: float) -> None:
+        self.log = log
+        self.deadline = time.monotonic() + timeout
+        self.done = threading.Event()
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def start(self) -> None:
+        threading.Thread(target=self._publish, name="lmer-supervisor-end-handoff", daemon=True).start()
+
+    def _publish(self) -> None:
+        try:
+            message = _announce_shutdown(self.log)
+            if not self.log.wait_acknowledged(_comms.PLATFORM_SUBSCRIBER, message.seq, self.remaining()):
+                logging.getLogger(__name__).warning(
+                    "supervisor_end_handoff_unconfirmed session=%s seq=%s subscriber=%s",
+                    self.log.session, message.seq, _comms.PLATFORM_SUBSCRIBER,
+                )
+        except Exception as exc:  # noqa: BLE001 - delivery failure must not prevent quitting
+            logging.getLogger(__name__).warning("supervisor_end_handoff_failed error=%s", exc)
+        finally:
+            self.done.set()
+
+    def wait(self) -> None:
+        self.done.wait(self.remaining())
 
 
 def _open_ask_projection(
@@ -2700,8 +2761,7 @@ def run_supervisor(
         _preconfigure_pty_for_injection(slave_fd)
 
     initial_winsize = _get_winsize(stdin_fd) if os.isatty(stdin_fd) else None
-    if initial_winsize:
-        _set_winsize(master_fd, *initial_winsize)
+    _set_winsize(master_fd, *(initial_winsize if _usable_host_winsize(initial_winsize) else (24, 80)))
 
     pid = os.fork()
     if pid == 0:
@@ -2888,7 +2948,7 @@ def run_supervisor(
 
     def _apply_host_winsize_to_master() -> None:
         size = _get_winsize(stdin_fd)
-        if size:
+        if _usable_host_winsize(size):
             _set_winsize(master_fd, *size)
 
     winsize_recheck_timer: Optional[threading.Timer] = None
@@ -2920,18 +2980,29 @@ def run_supervisor(
     # flips the flag (idempotent — repeated signals don't spawn racing threads)
     # and kicks the thread off.
     shutdown_requested = threading.Event()
+    shutdown_handoff: Optional[_ShutdownHandoff] = None
+    child_exited = threading.Event()
+    child_status: Optional[int] = None
+    child_output_deadline: Optional[float] = None
 
     def request_shutdown(*_args) -> None:
+        nonlocal shutdown_handoff
         if shutdown_requested.is_set():
             return
+        handoff = shutdown_handoff = _ShutdownHandoff(comms_log, END_REQUEST_HANDOFF_SECONDS)
         shutdown_requested.set()
-        threading.Thread(
-            target=_self_shutdown,
-            args=(write_to_child, pid),
-            kwargs={"quit_sequence": options.get("quit_sequence", DEFAULT_QUIT_SEQUENCE)},
-            name="lmer-supervisor-self-shutdown",
-            daemon=True,
-        ).start()
+
+        def shutdown() -> None:
+            handoff.start()
+            handoff.wait()
+            if not child_exited.is_set():
+                _self_shutdown(
+                    write_to_child, pid,
+                    quit_sequence=options.get("quit_sequence", DEFAULT_QUIT_SEQUENCE),
+                    child_exited=child_exited,
+                )
+
+        threading.Thread(target=shutdown, name="lmer-supervisor-self-shutdown", daemon=True).start()
 
     previous_winch = signal.signal(signal.SIGWINCH, forward_winsize) if hasattr(signal, "SIGWINCH") else None
     previous_int = signal.signal(signal.SIGINT, forward_signal)
@@ -2951,20 +3022,33 @@ def run_supervisor(
     # stdin is left out of the select set while anything is queued, so a later
     # keystroke cannot overtake an earlier one.
     pending_stdin = b""
+    master_open = True
     try:
         while True:
-            watch = [master_fd]
+            if child_status is None:
+                reaped, status = os.waitpid(pid, os.WNOHANG)
+                if reaped:
+                    child_status = status
+                    child_exited.set()
+                    child_output_deadline = time.monotonic() + CHILD_OUTPUT_DRAIN_SECONDS
+            if child_output_deadline is not None and time.monotonic() >= child_output_deadline:
+                break
+            # PTY EOF and child exit are independent: a child may close stdio
+            # early, or a descendant may keep the slave open after it exits.
+            watch = [master_fd] if master_open else []
             # Nothing to read stdin *for* while a keystroke is still waiting on
             # the lock: stop selecting on it so the loop spins on master_fd
             # instead of re-reading input it cannot yet deliver.
-            if stdin_open and not pending_stdin:
+            if stdin_open and not pending_stdin and child_status is None:
                 watch.append(stdin_fd)
             try:
                 # A held-back keystroke needs a wake-up that does not depend on
                 # either fd becoming readable, since the thing being waited for is
                 # a lock release.
                 rlist, _, _ = select.select(
-                    watch, [], [], STDIN_RETRY_SECONDS if pending_stdin else None
+                    watch, [], [], 0 if child_status is not None else (
+                        STDIN_RETRY_SECONDS if pending_stdin else SHUTDOWN_POLL_INTERVAL
+                    )
                 )
             except InterruptedError:
                 continue
@@ -2973,13 +3057,19 @@ def run_supervisor(
                     break
                 raise
 
+            if child_status is not None and not rlist:
+                break
+
             if master_fd in rlist:
                 try:
                     chunk = os.read(master_fd, 4096)
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    break
+                    master_open = False
+                    stdin_open = False
+                    pending_stdin = b""
+                    continue
                 output.append(chunk)
                 # Persisted before it is forwarded, deliberately: the file is the
                 # copy that has to survive, stdout is the copy that might not, and
@@ -3010,7 +3100,7 @@ def run_supervisor(
                     pending_stdin += chunk
                     mirror_terminal(stdin_tracker, chunk)
 
-            if pending_stdin:
+            if pending_stdin and child_status is None:
                 accepted = None
                 with contextlib.suppress(OSError):
                     accepted = try_write_to_child(pending_stdin)
@@ -3019,10 +3109,26 @@ def run_supervisor(
                     # remainder stays queued instead of being dropped.
                     pending_stdin = pending_stdin[accepted:]
     finally:
+        if child_status is None:
+            # An exceptional forwarding exit still owns a live child. Keep the
+            # API and its signal handlers until the same bounded ladder reaps it.
+            if not shutdown_requested.is_set():
+                threading.Thread(
+                    target=_self_shutdown, args=(write_to_child, pid),
+                    kwargs={"child_exited": child_exited,
+                            "quit_sequence": options.get("quit_sequence", DEFAULT_QUIT_SEQUENCE)},
+                    daemon=True,
+                ).start()
+            _, child_status = os.waitpid(pid, 0)
+            child_exited.set()
         if auto_start_thread is not None:
             auto_start_cancel.set()
         if winsize_recheck_timer is not None:
             winsize_recheck_timer.cancel()
+        if shutdown_handoff is not None:
+            # Natural harness exit does not mean the daemon has received the
+            # request. Share the original deadline, without joining a PTY writer.
+            shutdown_handoff.wait()
         if previous_winch is not None and hasattr(signal, "SIGWINCH"):
             signal.signal(signal.SIGWINCH, previous_winch)
         signal.signal(signal.SIGINT, previous_int)
@@ -3047,8 +3153,9 @@ def run_supervisor(
         if watcher_thread is not None:
             watcher_thread.join(timeout=ASK_DIR_WATCH_SECONDS + 1.0)
         comms_log.close()
+        os.close(master_fd)
 
-    _, status = os.waitpid(pid, 0)
+    status = child_status
     # A requested self-shutdown is a deliberate, clean sign-off: report exit 0 so
     # the orchestrator (e.g. the Slack session reaper) frees the slot quietly and
     # does NOT post a crash notice — even if the quit chord had to be escalated to

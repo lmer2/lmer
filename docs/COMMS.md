@@ -49,7 +49,7 @@ line in the log and the same object on the wire.
 | `seq` | int | Per-session, allocated by the supervisor, strictly increasing, dense. **The cursor.** |
 | `session` | str | The session id (`LMER_SESSION_ID`). |
 | `at` | str | UTC ISO-8601 with milliseconds, stamped on acceptance. Order by `seq`, not `at`. |
-| `source.channel` | str | `agent`, `terminal`, `platform`, `uber-lmer`, `slack`, `matrix`, or a future connector's name (lowercase, letters/digits/dashes). Stamped by the party that vouches for it, never taken from the body alone. |
+| `source.channel` | str | `agent`, `supervisor`, `terminal`, `platform`, `uber-lmer`, `slack`, `matrix`, or a future connector's name (lowercase, letters/digits/dashes). Stamped by the party that vouches for it, never taken from the body alone. |
 | `source.author` | str? | Who spoke, for rendering: a Slack display name, an MXID, an operator identity. Absent for `agent`, `uber-lmer` and an unnamed terminal. |
 | `source.ref` | str? | The origin channel's own id for the message (Slack `channel:thread_ts:message_ts`, matrix `event_id`, a request id). Dedupe key for retries, and how a connector recognises its own message. |
 | `kind` | str | `message`, `note`, `milestone`, `question`, `answer`, `close`, `command`. An unknown kind is stored, fanned out and rendered as plain text labelled with the kind. |
@@ -57,14 +57,14 @@ line in the log and the same object on the wire.
 | `in_reply_to` | str? | An `id` on the same session. Required on `answer` and `close`; optional on `message`. |
 | `options` | [str] | Questions only. At most 12, each at most 200 characters. A hint, not a menu. |
 | `attachments` | [obj] | `{"name", "bytes", "media_type", "path"}` — references into the session's upload store. |
-| `meta` | obj | For renderers, never for routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), and `session_origin` on a session's own record posted for it. Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included. |
+| `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), and `session_origin` on a session's own record posted for it. Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included. |
 
 ### Kinds
 
 | kind | who posts it | typed into the harness? | meaning |
 |---|---|---|---|
 | `message` | any channel; the agent via `lmer-signal post` | inbound yes, agent-origin no | conversational text |
-| `note` | agent | no | progress, no reply wanted |
+| `note` | agent or supervisor | no | progress or lifecycle status, no reply wanted |
 | `milestone` | agent | no | reportable work happened (what a bare `lmer-signal "…"` means) |
 | `question` | agent | no | blocks the asker until an `answer`; carries `options` |
 | `answer` | any channel | to the waiting CLI if one is attached, else into the PTY | reply to a `question` |
@@ -100,6 +100,48 @@ acked subscriber stands at the last `seq` or `LMER_COMMS_DRAIN_GRACE` seconds
 
 Inside the container the path is exported as `LMER_COMMS_LOG` so stdlib-only
 hooks (`hooks/signal_guard.py`) can read it.
+
+### Accepted session end
+
+On an end request the supervisor publishes a `note` with
+`source.channel: "supervisor"` and `meta.event: "session_end_requested"` before
+attempting the harness's quit sequence. Its `at` timestamp is the acknowledgment
+of shutdown; neither the CLI's printed message nor a wind-down prompt is one.
+The agent credential cannot claim the supervisor channel.
+
+The daemon associates the acknowledgment with the registry session established
+by its authenticated subscriber. The record retains its container work-session
+identity; that identity differs from the platform's `s-...` registry id.
+The daemon persists the acknowledgment before acknowledging the bus record.
+
+Before typing quit, the supervisor waits up to **six seconds** for the
+`platform` subscriber to confirm receipt of this specific record through
+`POST /messages/ack`. This covers the daemon's five-second reconciliation cycle
+plus a round trip. No subscribers, registration at sequence zero, and another
+subscriber's acknowledgment do not satisfy this wait. The agent credential
+cannot acknowledge records on the daemon's behalf. The ordinary bus drain
+still uses `LMER_COMMS_DRAIN_GRACE`.
+
+Quit escalation and API finalization share this handoff deadline. If the harness
+exits naturally while publication or delivery is pending, the API stays up for
+the remaining handoff window. Once delivery is confirmed or the deadline expires,
+the usual 10+10-second escalation can proceed; a blocked PTY writer cannot delay
+it. Without authenticated delivery to the daemon, shutdown proceeds and the
+detector stays unarmed.
+
+Only authenticated bus ingestion can set the daemon's teardown acknowledgment.
+Container-written files, including an old `end-request.json`, are never read as
+lifecycle authority. They cannot turn a wind-down prompt into an accepted end.
+
+The daemon samples the ending session's control plane and uses the configurable grace
+described in [PLATFORM-QUICKSTART.md](PLATFORM-QUICKSTART.md) to flag stuck
+teardown. Replaying the record does not reset a recorded loss interval. A failed
+first fleet read retains newly stuck sessions for the next successful snapshot
+so their named digests are not lost while establishing the daemon's baseline.
+
+This lifecycle metadata is not typed into the harness. The supervisor keeps the
+control plane until the harness has been reaped, then gives subscribers the
+normal final-record drain grace before stopping it.
 
 ---
 
