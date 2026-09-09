@@ -1182,7 +1182,7 @@ def probe_health(session_id: str) -> dict:
     offset) and the PTY's ``rows``/``cols``. Both are why a re-attach probes at
     all rather than just opening ``/output``: the cursor is where a reader must
     start to avoid re-reading output the host log already holds, and a geometry
-    of ``0x0`` — which is what a session spawned with no host terminal reports —
+    of ``0x0`` — which older sessions spawned with no host terminal may report —
     is the signal that nothing has ever told this PTY how big it is.
     """
     endpoint = control_endpoint(session_id)

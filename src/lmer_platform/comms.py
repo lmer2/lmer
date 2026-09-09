@@ -29,7 +29,7 @@ from typing import Callable, Iterable, Optional
 from lmer_cli import comms as bus_comms
 from lmer_cli import runref
 
-from . import registry, session_io
+from . import registry, session_io, teardown
 from .store import (
     StoreError, ensure_state_dir, mutating, platform_dir,
     read_json, utc_now_iso, write_json,
@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 #: How this daemon acks itself to every supervisor.
-SUBSCRIBER = "platform"
+SUBSCRIBER = bus_comms.PLATFORM_SUBSCRIBER
 
 COMMS_DIRNAME = "comms"
 JOURNAL_FILE = "journal.jsonl"
@@ -641,6 +641,9 @@ class CommsHub:
             run = entry.get("run") or None
             kind = entry.get("kind")
         try:
+            # Before the journal/ack: a transient registry write failure must
+            # leave this lifecycle fact eligible for the subscriber's retry.
+            teardown.record_request(session_id, message)
             event = self.journal.append(session_id, message, run=run, session_kind=kind)
         except StoreError as exc:
             logger.warning("platform_comms_journal_failed session=%s error=%s", session_id, exc)

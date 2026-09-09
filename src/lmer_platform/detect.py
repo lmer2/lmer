@@ -316,7 +316,7 @@ from work_repo import run_state
 
 from lmer_cli import runref
 
-from . import ask, assistant, checkin, nudge, registry, transcripts
+from . import ask, assistant, checkin, nudge, registry, teardown, transcripts
 from .api import build_state
 from . import config as config_module
 from .config import PlatformConfig, checkin_settings, nudge_settings
@@ -496,9 +496,9 @@ class Signal:
     what gets said about it once it turns out to be new.
     """
 
-    host: str
-    project: str
-    slug: str
+    host: Optional[str]
+    project: Optional[str]
+    slug: Optional[str]
     #: An attention reason from :data:`lmer_platform.inventory.ATTENTION_REASONS`,
     #: or a state from :data:`MATERIAL_STATES`. Not an enum here on purpose — the
     #: vocabulary belongs to :mod:`lmer_platform.inventory`, and a copy of it
@@ -508,10 +508,13 @@ class Signal:
     since: Optional[str] = None
     label: Optional[str] = None
     state: Optional[str] = None
+    session: Optional[str] = None
 
     @property
     def ref(self) -> str:
         """``<host>/<project>/<slug>`` — the identity every run route takes."""
+        if self.kind == "stuck_teardown" and self.session:
+            return f"session {self.session}"
         return runref.compose(self.host, self.project, self.slug)
 
     @property
@@ -528,6 +531,8 @@ class Signal:
         is what ``/api/runs/answer`` and ``/api/runs/resume`` take. The label is
         on :meth:`data` for when it wants to speak about the run instead.
         """
+        if self.kind == "stuck_teardown" and self.note:
+            return _clamp(self.note, assistant.MAX_NOTE_CHARS)
         if self.kind in MATERIAL_STATES:
             text = f"{self.ref} is now {self.kind}"
         else:
@@ -561,7 +566,7 @@ class Signal:
 
     def data(self) -> dict:
         """The structured half of the digest: enough to act without a fleet read."""
-        return {
+        data = {
             "host": self.host,
             "project": self.project,
             "slug": self.slug,
@@ -570,6 +575,9 @@ class Signal:
             "state": self.state,
             "since": self.since,
         }
+        if self.session:
+            data["session"] = self.session
+        return data
 
 
 def _identity(row: object) -> Optional[tuple]:
@@ -599,6 +607,18 @@ def _signals_of_row(row: object) -> list:
     that staying true.
     """
     identity = _identity(row)
+    if isinstance(row, dict):
+        attention = row.get("attention")
+        session = row.get("session")
+        if (isinstance(attention, dict) and attention.get("reason") == "stuck_teardown"
+                and isinstance(session, dict) and _text(session.get("id"))):
+            host, project, slug = identity or (None, None, None)
+            return [Signal(
+                host=host, project=project, slug=slug, kind="stuck_teardown",
+                note=_text(attention.get("note")), since=_text(attention.get("since")),
+                label=_text(row.get("label")), state=_text(row.get("state")),
+                session=_text(session.get("id")),
+            )]
     if identity is None:
         return []
     host, project, slug = identity
@@ -1212,6 +1232,8 @@ class Detector:
         #: The previous tick's conditions. ``None`` means no baseline has been
         #: established, which is the one state in which nothing is notified.
         self._seen: Optional[dict] = None
+        # A sweep can persist a new condition before the fleet snapshot fails.
+        self._pending_teardowns: set[str] = set()
         #: stage -> (cause, consecutive count), for the log dedupe.
         self._failed: dict = {}
         #: ``{run ref: announced_at}`` for digests spooled but not recorded on
@@ -1368,6 +1390,13 @@ class Detector:
             self._clear("signals")
 
         try:
+            self._pending_teardowns.update(teardown.sweep(self.config.stuck_teardown_seconds))
+        except Exception as exc:  # noqa: BLE001 - one failed stage must not stop detection
+            self._absorb("teardown", exc)
+        else:
+            self._clear("teardown")
+
+        try:
             payload = self._read_state(self.config)
         except Exception as exc:  # noqa: BLE001 - the daemon serves regardless
             self._absorb("scan", exc)
@@ -1389,20 +1418,24 @@ class Detector:
             self._clear("checkin")
 
         baseline, self._seen = self._seen, current
+        newly_stuck, self._pending_teardowns = self._pending_teardowns, set()
         if baseline is None:
-            # The silent first tick. Logged, because "the assistant was told
-            # nothing about the four runs waiting on you" needs an explanation
-            # that is not "detection is broken".
+            # Existing conditions stay silent across restart. A teardown timer
+            # that matured since startup is new, even on the first fleet read.
+            fresh = [item for item in current.values()
+                     if item.kind == "stuck_teardown" and item.session in newly_stuck]
+            for item in fresh:
+                self._deliver(item)
             logger.info(
-                "platform_detection_baseline conditions=%d — the first tick "
-                "records what is already true and notifies nothing; standing "
-                "state is what GET /api/state answers", len(current),
+                "platform_detection_baseline conditions=%d fresh_teardowns=%d — "
+                "existing conditions stay silent; standing state is what "
+                "GET /api/state answers", len(current), len(fresh),
             )
             # The nudge stage still runs: the baseline rule is about not
             # re-announcing conditions, and a spool inherited across a restart is
             # the one that has waited longest.
             self._nudge_stage()
-            return []
+            return fresh
 
         fresh = [signal for key, signal in current.items() if key not in baseline]
         fresh = self._confirmed(fresh)

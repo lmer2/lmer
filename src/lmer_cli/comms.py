@@ -36,6 +36,7 @@ __all__ = [
     "KIND_ANSWER", "KIND_CLOSE", "KIND_COMMAND", "KNOWN_KINDS", "AGENT_KINDS",
     "RELAYED_KINDS", "CHANNEL_AGENT", "CHANNEL_TERMINAL", "CHANNEL_PLATFORM",
     "CHANNEL_UBER", "CHANNEL_SLACK", "CHANNEL_MATRIX", "CHANNEL_LABELS",
+    "CHANNEL_SUPERVISOR", "EVENT_SESSION_END_REQUESTED", "PLATFORM_SUBSCRIBER",
     "COMMAND_CHANNELS", "MAX_TEXT_CHARS", "MAX_OPTIONS", "MAX_OPTION_CHARS",
     "MAX_OPEN_QUESTIONS", "MAX_AGENT_ENTRIES", "ACCEPTED_NEW",
     "ACCEPTED_DUPLICATE", "ACCEPTED_LATE", "DELIVERY_CLI", "DELIVERY_PTY",
@@ -59,6 +60,9 @@ RESERVED_META_KEYS = (
 #: interface like ``session.log``: the platform reads it from the host side.
 COMMS_LOG_NAME = "messages.jsonl"
 
+#: The daemon's authenticated delivery acknowledgment identity.
+PLATFORM_SUBSCRIBER = "platform"
+
 #: Exported to the wrapped harness before fork, so stdlib-only hooks can read
 #: the log without knowing the mount point. Absent when nothing is mounted.
 COMMS_LOG_ENV = "LMER_COMMS_LOG"
@@ -68,7 +72,7 @@ TERMINAL_MIRROR_ENV = "LMER_COMMS_TERMINAL_MIRROR"
 
 #: How long the supervisor keeps its control plane up after the harness
 #: exits, so a subscriber can fetch and ack the last records over HTTP. The
-#: daemon reads no file the container wrote, so this is its only drain.
+#: daemon receives these records over HTTP, never from a container-written file.
 DRAIN_GRACE_ENV = "LMER_COMMS_DRAIN_GRACE"
 DEFAULT_DRAIN_GRACE = 5.0
 DRAIN_GRACE_MAX = 60.0
@@ -100,6 +104,10 @@ CHANNEL_PLATFORM = "platform"
 CHANNEL_UBER = "uber-lmer"
 CHANNEL_SLACK = "slack"
 CHANNEL_MATRIX = "matrix"
+CHANNEL_SUPERVISOR = "supervisor"
+
+# Structured lifecycle acknowledgment; consumers never infer it from prose.
+EVENT_SESSION_END_REQUESTED = "session_end_requested"
 
 #: How a channel reads inside a source tag. A channel not listed here is shown
 #: by its identifier.
@@ -491,6 +499,7 @@ class MessageLog:
         #: question id → answer id stamped for a CLI that has not read it yet
         self._unclaimed: dict[str, str] = {}
         self._subscribers: dict[str, int] = {}
+        self._acknowledged: dict[str, int] = {}
         self._listeners: list[Callable[[Message, str], None]] = []
         self._fd: Optional[int] = None
         if path is not None:
@@ -893,6 +902,7 @@ class MessageLog:
         if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
             raise CommsError("seq must be a non-negative integer")
         with self._cond:
+            self._acknowledged[subscriber] = max(self._acknowledged.get(subscriber, 0), seq)
             if final:
                 self._subscribers.pop(subscriber, None)
             else:
@@ -910,18 +920,36 @@ class MessageLog:
             last = len(self._messages)
             return all(seq >= last for seq in self._subscribers.values())
 
-    def wait_drained(self, timeout: float) -> bool:
-        """Block up to *timeout* seconds for :meth:`drained`. Returns it."""
+    def _wait_until(self, predicate: Callable[[], bool], timeout: float) -> bool:
         deadline = time.monotonic() + max(0.0, timeout)
-        with self._cond:
-            while True:
-                last = len(self._messages)
-                if all(seq >= last for seq in self._subscribers.values()):
+        while True:
+            if not self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                return False
+            try:
+                if predicate():
                     return True
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                self._cond.wait(timeout=remaining)
+            finally:
+                self._lock.release()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            # Condition.wait reacquires its lock without a deadline. A stalled
+            # publisher must not defeat the timeout while that lock is held.
+            time.sleep(min(.01, remaining))
+
+    def wait_drained(self, timeout: float) -> bool:
+        """Wait up to *timeout* seconds for an observed drained state."""
+        return self._wait_until(
+            lambda: all(seq >= len(self._messages) for seq in self._subscribers.values()), timeout,
+        )
+
+    def wait_acknowledged(self, subscriber: str, seq: int, timeout: float) -> bool:
+        """Wait for a specific delivered record, including a departing subscriber's ack.
+
+        Registration alone, no subscribers, or a different subscriber cannot
+        satisfy this handoff. Only the authenticated control route accepts acks.
+        """
+        return self._wait_until(lambda: self._acknowledged.get(subscriber, 0) >= seq, timeout)
 
     def subscribers(self) -> dict:
         with self._lock:

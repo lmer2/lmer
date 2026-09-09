@@ -1,0 +1,2 @@
+fixed:
+- "Sessions finish shutdown despite blocked terminal input; stuck teardown is reported with a configurable grace, and terminal width is preserved. (#434)"

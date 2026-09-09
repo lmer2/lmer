@@ -156,6 +156,7 @@ __all__ = [
 #: happen. See :mod:`lmer_platform.reattach`.
 RUN_STATES = (
     "running",
+    "stuck_teardown",
     "detached",
     "held",
     "feedback",
@@ -193,6 +194,7 @@ ATTENTION_REASONS = (
     "cap_reached",
     "slot_contention",
     "stalled",
+    "stuck_teardown",
 )
 
 #: Sort order for the attention list: a direct question outranks a crash, because
@@ -209,6 +211,7 @@ ATTENTION_PRIORITY = {
     "yield": 3,
     "cap_reached": 4,
     "stalled": 5,
+    "stuck_teardown": 5,
     "critical_error": 6,
     "crashed": 7,
     "slot_contention": 8,
@@ -996,6 +999,24 @@ def _observed_bad_exit(session: Optional[dict]) -> bool:
     return True
 
 
+def _stuck_teardown(session: Optional[dict]) -> Optional[Attention]:
+    if not session or not session.get("live"):
+        return None
+    record = session.get("teardown")
+    if not isinstance(record, dict) or not record.get("stuck_at"):
+        return None
+    return Attention(
+        reason="stuck_teardown",
+        note=(
+            f"Session {session.get('id')} has stuck teardown: its launcher is alive "
+            f"but its control plane has been unreachable for at least "
+            f"{record.get('grace_seconds')} seconds after accepting shutdown. "
+            "Decide whether to exit the session."
+        ),
+        since=record["stuck_at"],
+    )
+
+
 def _derive(
     state: Optional[dict],
     session: Optional[dict],
@@ -1017,6 +1038,9 @@ def _derive(
     holding a slot — while the attention record says a person is the only thing it
     is waiting for.
     """
+    teardown_attention = _stuck_teardown(session)
+    if teardown_attention is not None:
+        return "stuck_teardown", teardown_attention
     if unreadable:
         return "unknown", Attention(
             reason="unreadable",
@@ -1176,14 +1200,16 @@ def _view_from_session(
         state = "dormant" if wound_down else "crashed"
     else:
         state = "detached" if _is_blind(entry) else "running"
-    attention = None
+    attention = _stuck_teardown(entry)
+    if attention is not None:
+        state = "stuck_teardown"
     if not live and not wound_down:
         attention = Attention(
             reason="crashed",
             note="session process is gone and its run state is not in the mirror",
             since=entry.get("started_at"),
         )
-    elif live and questions:
+    elif live and questions and attention is None:
         attention = Attention(
             reason="live_question",
             note=_live_question_note(questions),
