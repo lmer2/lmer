@@ -35,6 +35,7 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { mdiRestart } from '@mdi/js'
 import { fetchAssistantConfig, setAssistantConfig } from '../api.js'
+import { applyChatSettings } from '../operatorChat.js'
 
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
@@ -66,13 +67,15 @@ const problem = ref(null)
 const loading = ref(false)
 const saving = ref(false)
 const saved = ref(false)
+const savedLaunch = ref(false)
+const savedDisplay = ref(false)
 // True when every key the save changed came back still pinned by an export —
 // the one case the offered restart provably does nothing: the incumbent's
 // context window would be paid and the exported value would run again. The
 // reply carries everything needed to tell (`changed` + per-key `source`), so
 // the banner can be as honest as the field captions above it.
 const savedShadowed = ref(false)
-const fields = reactive({ model: '', harness: '', preset: '', agents: '', threads: '' })
+const fields = reactive({ model: '', harness: '', preset: '', agents: '', threads: '', chatKeepLast: '0' })
 
 let seq = 0
 let disposed = false
@@ -118,6 +121,8 @@ async function load() {
 }
 
 function prefill(config) {
+  fields.chatKeepLast = String(config.chat?.keep_last?.stored ?? 0)
+  applyChatSettings(config)
   for (const key of SETTING_KEYS) {
     const stored = config.settings?.[key]?.stored
     fields[key] = key === 'threads' && Array.isArray(stored) ? stored.join('\n') : stored || ''
@@ -140,12 +145,19 @@ function changes() {
     const edited = (fields[key] || '').trim()
     if (edited !== stored) named[key] = edited || null
   }
+  const keepLast = Number(fields.chatKeepLast)
+  if (!Number.isSafeInteger(keepLast) || keepLast < 0) {
+    problem.value = 'Keep last must be a whole number of 0 or more.'
+    return null
+  }
+  if (keepLast !== (reply.value?.chat?.keep_last?.stored ?? 0)) named.chat_keep_last = keepLast
   return named
 }
 
 async function save() {
   if (saving.value) return
   const named = changes()
+  if (!named) return
   if (!Object.keys(named).length) {
     open.value = false
     return
@@ -160,9 +172,12 @@ async function save() {
     problem.value = null
     saved.value = true
     const changed = config.changed || []
+    const launchChanges = changed.filter((key) => SETTING_KEYS.includes(key))
+    savedLaunch.value = launchChanges.length > 0
+    savedDisplay.value = changed.includes('chat_keep_last')
     savedShadowed.value =
-      changed.length > 0 &&
-      changed.every((key) => config.settings?.[key]?.source === 'env')
+      launchChanges.length > 0 &&
+      launchChanges.every((key) => config.settings?.[key]?.source === 'env')
     prefill(config)
   } catch (exc) {
     if (stale(mine)) return
@@ -201,7 +216,7 @@ onBeforeUnmount(() => {
       <v-card-text>
         <p class="text-body-small text-medium-emphasis mb-3">
           How the session is run — not what it is told (standing orders stay in
-          the chat). Changes here apply to the <strong>next</strong> incarnation:
+          the chat). Launch changes apply to the <strong>next</strong> incarnation:
           the one running keeps its context window until you restart it.
         </p>
 
@@ -271,6 +286,19 @@ onBeforeUnmount(() => {
             </p>
           </div>
 
+          <v-text-field
+            v-model="fields.chatKeepLast"
+            label="Operator chat: keep last"
+            type="number"
+            min="0"
+            step="1"
+            hint="Keep the newest N entries. 0 turns auto-clear off. Applies to the pane now; history is kept."
+            persistent-hint
+            density="compact"
+            variant="outlined"
+            :disabled="saving"
+          />
+
           <!-- Two banners, because a save has two truths: the shadowed one must
                not offer a restart that provably runs the exported value again —
                the operator would pay a context window for nothing. -->
@@ -279,13 +307,18 @@ onBeforeUnmount(() => {
             type="warning"
             density="compact"
           >
-            Saved to config.json, but every value you changed is still pinned by
+            Saved to config.json, but every launch value you changed is still pinned by
             an exported environment variable — a restart would run the export,
             not what you saved. Remove the export first.
+            <p v-if="savedDisplay">Operator chat display applies now.</p>
+          </v-alert>
+          <v-alert v-else-if="saved && !savedLaunch" type="success" density="compact">
+            Saved. Operator chat display applies now. No session restart is needed.
           </v-alert>
           <v-alert v-else-if="saved" type="success" density="compact">
             Saved. It applies when a fresh uber lmer starts — restart to apply it
             now, or let the change wait for the next incarnation.
+            <p v-if="savedDisplay">Operator chat display applies now.</p>
             <template #append>
               <v-btn
                 size="small"

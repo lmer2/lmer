@@ -23,3 +23,8 @@ or visual appearance. One worker bounds memory use on development hosts.
 
 The pane's outbound-copy and thread-pending rules, including complete-command and file/stdin
 correlation limit, are documented in [COMMS.md §4](../../docs/COMMS.md#what-the-chat-pane-draws).
+
+The mounted chat cases cover both sides of the four outbound guards: legacy
+Slack commands are post-only; `--no-wait` is ask-only; equals-style options
+must be known; milestone and bare signal commands remain visible. These cases
+use a matching message record so a record-kind refusal cannot mask a verb guard.

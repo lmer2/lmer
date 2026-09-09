@@ -1,0 +1,5 @@
+added:
+- "Copy message source and fenced code from the platform chat views"
+- "Keep the newest operator-chat entries with a saved retention setting, message count, and unread indicator"
+- "Show waiting, working, idle, or offline fleet state in the browser tab title"
+- "Forget all completed, stopped runs from the fleet view after confirmation"

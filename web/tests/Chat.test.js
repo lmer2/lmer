@@ -118,3 +118,42 @@ it('spends one bus record on one matching tool call', async () => {
   ])
   expect(wrapper.findAll('.tools')).toHaveLength(2)
 })
+
+it.each([
+  ['lmer-slack post "The pane is ready"', 0],
+  ['lmer-slack ask "The pane is ready"', 1],
+  ['lmer-slack note "The pane is ready"', 1],
+])('restricts lmer-slack to post: %s', async (command, count) => {
+  const wrapper = await open([turn({ tools: [tool(command)] }), record()])
+  expect(wrapper.findAll('.tools')).toHaveLength(count)
+  expect(wrapper.findAll('.turn').some((row) => row.text().includes(text))).toBe(true)
+})
+
+it.each([
+  ['lmer-signal ask --no-wait "The pane is ready"', 0],
+  ['lmer-signal post --no-wait "The pane is ready"', 1],
+  ['lmer-signal note --no-wait "The pane is ready"', 1],
+])('restricts --no-wait to ask: %s', async (command, count) => {
+  const wrapper = await open([turn({ tools: [tool(command)] }), record()])
+  expect(wrapper.findAll('.tools')).toHaveLength(count)
+})
+
+it.each([
+  ['lmer-signal ask --option=Yes "The pane is ready"', 0],
+  ['lmer-signal post --thread=https://example.org/thread "The pane is ready"', 0],
+  ['lmer-signal ask --timeout=2 --interval=1 "The pane is ready"', 0],
+  ['lmer-signal post --dir=/tmp/channel "The pane is ready"', 1],
+  ['lmer-signal post --unknown=value "The pane is ready"', 1],
+])('accepts only known equals flags: %s', async (command, count) => {
+  const wrapper = await open([turn({ tools: [tool(command)] }), record()])
+  expect(wrapper.findAll('.tools')).toHaveLength(count)
+})
+
+it.each([
+  ['lmer-signal post "The pane is ready"', 0],
+  ['lmer-signal milestone "The pane is ready"', 1],
+  ['lmer-signal "The pane is ready"', 1],
+])('excludes milestone and bare verbs: %s', async (command, count) => {
+  const wrapper = await open([turn({ tools: [tool(command)] }), record()])
+  expect(wrapper.findAll('.tools')).toHaveLength(count)
+})

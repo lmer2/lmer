@@ -1596,3 +1596,43 @@ def test_session_api_threads_reach_the_launch(client, monkeypatch):
         "taskdef": "chat", "target": "fleet", "targets": "--exec",
     })
     assert bad.status_code == 400, bad.text
+
+
+def test_chat_retention_defaults_off_and_round_trips_through_config(client, platform_root):
+    headers = bearer_header()
+    initial = client.get("/api/assistant/config", headers=headers)
+    assert initial.status_code == 200
+    assert initial.json()["chat"]["keep_last"] == {
+        "value": 0, "source": "default", "stored": None,
+    }
+    cfg.update_stored({"assistant_model": "kept"})
+    for value in (25, 0, None):
+        reply = client.post(
+            "/api/assistant/config", headers=headers, json={"chat_keep_last": value},
+        )
+        assert reply.status_code == 200
+        expected = {
+            "value": value or 0,
+            "source": "default" if value is None else "config.json",
+            "stored": value,
+        }
+        assert reply.json()["changed"] == ["chat_keep_last"]
+        assert reply.json()["chat"]["keep_last"] == expected
+        assert client.get("/api/assistant/config", headers=headers).json()["chat"]["keep_last"] == expected
+        assert cfg.load().chat_keep_last == (value or 0)
+        stored = store.read_json(cfg.config_path())
+        assert stored["assistant_model"] == "kept"
+        if value is None:
+            assert "chat_keep_last" not in stored
+        else:
+            assert stored["chat_keep_last"] == value
+
+
+@pytest.mark.parametrize("bad", [-1, True, 1.5, "many", [], {}])
+def test_chat_retention_refuses_invalid_values_without_writing(client, platform_root, bad):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json={"chat_keep_last": bad},
+    )
+    assert reply.status_code == 400
+    assert "chat_keep_last" in reply.json()["detail"]
+    assert not cfg.config_path().exists()

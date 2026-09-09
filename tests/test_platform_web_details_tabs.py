@@ -376,7 +376,7 @@ def test_every_tab_in_both_rows_draws_a_shape_beside_its_word():
         )
         # Tight against the label and before it, which is what makes the icon part
         # of the tab rather than a second thing on the line.
-        assert f"/>{TAB_LABELS[value]}</v-tab>" in tab, (
+        assert f"/>{TAB_LABELS[value]}" in tab, (
             f"the {value!r} tab lost its word, or the icon no longer sits in front "
             f"of it: {' '.join(tab.split())}"
         )

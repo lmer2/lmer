@@ -955,6 +955,7 @@ globalThis.savedCalls = []
 const source = compiled.content
   .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
   .replace(/from ['"]@mdi\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
+  .replace(/from ['"]\.\.\/operatorChat.js['"]/g, `from '${import.meta.resolve('./src/operatorChat.js')}'`)
   .replace(/import .* from ['"]\.\.\/api.js['"]/, `
     const fetchAssistantConfig = async () => ({ settings: {} });
     const setAssistantConfig = async (body) => {

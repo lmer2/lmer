@@ -81,7 +81,8 @@
 // tests/test_platform_web_markdown.py and run against hostile input under Node, so
 // it stays free of anything that needs Vue or a DOM.
 
-import { computed } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
+import CopyButton from './CopyButton.vue'
 import DOMPurify from 'dompurify'
 import MarkdownIt from 'markdown-it'
 
@@ -230,9 +231,39 @@ const props = defineProps({
   inline: { type: Boolean, default: false },
 })
 
+const body = ref(null)
+const copyHosts = []
+
+function clearCodeButtons() {
+  for (const { host, wrapper, pre } of copyHosts.splice(0)) {
+    render(null, host)
+    wrapper.replaceWith(pre)
+  }
+}
+
+function addCodeButtons() {
+  clearCodeButtons()
+  for (const code of body.value?.querySelectorAll('pre > code') || []) {
+    const pre = code.parentElement
+    const wrapper = document.createElement('div')
+    wrapper.className = 'code-block'
+    const host = document.createElement('span')
+    host.className = 'code-copy'
+    pre.before(wrapper)
+    wrapper.append(pre, host)
+    render(h(CopyButton, { text: code.textContent, label: 'Copy code' }), host)
+    copyHosts.push({ host, wrapper, pre })
+  }
+}
+
+onMounted(addCodeButtons)
+onBeforeUnmount(clearCodeButtons)
+
 const rendered = computed(() => (props.inline
   ? renderMarkdownInline(props.text)
   : renderMarkdown(props.text)))
+
+watch(rendered, addCodeButtons, { flush: 'post' })
 
 // Delegated, because the markup is injected: one listener per rendered block,
 // which also covers text that arrives later. `preventDefault` runs for any run
@@ -271,6 +302,7 @@ function onClick(event) {
        still exactly one binding to keep an eye on. -->
   <component
     :is="inline ? 'span' : 'div'"
+    ref="body"
     class="markdown"
     v-html="rendered"
     @click="onClick"
@@ -361,15 +393,26 @@ function onClick(event) {
    the half of it that gets pasted is a real hazard. The `white-space` has to be
    restated on the <code> inside — style.css's `nowrap` would otherwise collapse
    the newlines out of the block and leave the whole script on one line. */
-.markdown :deep(pre) {
+.markdown :deep(.code-block) {
+  position: relative;
   margin: 0 0 8px;
-  padding: 8px 10px;
+}
+
+.markdown :deep(pre) {
+  margin: 0;
+  padding: 40px 10px 8px;
   border-radius: 6px;
   background: rgb(var(--v-theme-code));
   color: rgb(var(--v-theme-on-code));
   white-space: pre;
   overflow-wrap: normal;
   overflow-x: auto;
+}
+
+.markdown :deep(.code-copy) {
+  position: absolute;
+  top: 4px;
+  right: 4px;
 }
 
 .markdown :deep(pre code) {
