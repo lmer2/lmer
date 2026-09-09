@@ -16,6 +16,8 @@ import {
   mdiWeatherSunny,
 } from '@mdi/js'
 import AddRun from './components/AddRun.vue'
+import ForgetCompleted from './components/ForgetCompleted.vue'
+import { fleetTitle } from './fleetTitle.js'
 import AssistantChat from './components/AssistantChat.vue'
 import RunCard from './components/RunCard.vue'
 import RunDetail from './components/RunDetail.vue'
@@ -182,6 +184,10 @@ let poll = null
 let tick = null
 
 const keyOf = runKey
+
+const fleetOnline = ref(false)
+const browserTitle = computed(() => fleetTitle(state.value, fleetOnline.value))
+watch(browserTitle, (value) => { document.title = value }, { immediate: true })
 
 const attention = computed(() => state.value?.attention || [])
 const runs = computed(() => state.value?.runs || [])
@@ -411,6 +417,7 @@ function load() {
   inFlight = (async () => {
     try {
       state.value = await fetchState()
+      fleetOnline.value = true
       error.value = null
       // Rows the daemon no longer reports are forgotten for real, so the key has
       // nothing left to hide; keeping them would grow this list for the life of
@@ -419,6 +426,7 @@ function load() {
         (key) => runs.value.some((run) => keyOf(run) === key),
       )
     } catch (exc) {
+      fleetOnline.value = false
       error.value = exc.status === 401
         ? 'Not authenticated — reload and enter the shared secret.'
         : exc.message
@@ -743,6 +751,13 @@ onUnmounted(() => {
               as of {{ ago(state.generated_at, now) }}
             </span>
           </div>
+
+          <ForgetCompleted
+            v-if="runs.length"
+            :runs="runs.filter((run) => !hiddenKeys.includes(keyOf(run)))"
+            @forgotten="(run) => { hiddenKeys = [...hiddenKeys, keyOf(run)] }"
+            @changed="load"
+          />
 
           <div v-if="loading" class="text-center text-medium-emphasis py-8">
             <v-progress-circular indeterminate size="18" width="2" class="me-2" />

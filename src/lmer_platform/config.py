@@ -137,7 +137,7 @@ __all__ = [
     "ENV_NUDGE_PENDING_THRESHOLD", "nudge_settings", "validate_int_setting",
     "UPLOAD_SETTING_KEYS", "ENV_UPLOAD_TYPES", "ENV_UPLOAD_MAX_BYTES",
     "DEFAULT_UPLOAD_TYPES", "DEFAULT_UPLOAD_MAX_BYTES", "MAX_UPLOAD_MAX_BYTES",
-    "upload_settings", "upload_types",
+    "upload_settings", "upload_types", "chat_settings",
     "DEFAULT_STALL_IDLE_SECONDS", "DEFAULT_STALL_BACKSTOP_SECONDS",
     "ENV_STALL_IDLE_SECONDS", "ENV_STALL_BACKSTOP_SECONDS",
 ]
@@ -352,6 +352,14 @@ class _IntSettingRule:
 #: which raises: a daemon bound where nobody expects it beats one that will not
 #: start.
 INT_SETTINGS = {
+    "chat_keep_last": _IntSettingRule(
+        default=0,
+        minimum=0,
+        floor_reason="the count cannot be negative — 0 disables chat auto-clear",
+        log_key="platform_chat_keep_last_invalid",
+        unit="entries",
+        singular_unit="entry",
+    ),
     "checkin_window_seconds": _IntSettingRule(
         default=DEFAULT_CHECKIN_WINDOW_SECONDS,
         minimum=0,
@@ -513,6 +521,7 @@ class PlatformConfig:
     assistant_preset: Optional[str] = None
     assistant_agents: Optional[str] = None
     assistant_threads: Optional[list[str]] = None
+    chat_keep_last: int = 0
     #: Service slots this host declares (issue #245) — the raw ``config.json``
     #: entries, deliberately unparsed here. :mod:`lmer_platform.slots` turns
     #: them into definitions and skips a malformed one with a warning; parsing
@@ -1344,6 +1353,13 @@ def assistant_settings() -> dict:
     return resolved
 
 
+def chat_settings() -> dict:
+    """Operator-pane retention, read fresh from stored configuration."""
+    return _int_group_settings(
+        {"keep_last": ("chat_keep_last", None)}, group="chat",
+    )
+
+
 def checkin_settings() -> dict:
     """The check-in group's effective settings, one per :data:`CHECKIN_SETTING_KEYS`.
 
@@ -1479,7 +1495,9 @@ def _int_group_settings(keys: dict, *, group: str) -> dict:
     resolved = {}
     for key, (field, env_var) in keys.items():
         raw = stored.get(field)
-        env_value = _layer_int(_env_str(env_var), layer="env", field=field)
+        env_value = _layer_int(
+            _env_str(env_var) if env_var else None, layer="env", field=field,
+        )
         file_value = _layer_int(raw, layer="config.json", field=field)
         if env_value is not None:
             resolved[key] = AssistantSetting(

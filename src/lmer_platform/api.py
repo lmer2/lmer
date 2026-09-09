@@ -120,6 +120,7 @@ from .config import (
     active_assistant_credential,
     active_connectors,
     assistant_settings,
+    chat_settings,
     list_connectors,
     checkin_settings,
     _slots_value,
@@ -506,12 +507,13 @@ def _instructions_reply(state) -> dict:
 #: persisted value that never takes effect looks broken unless the reply says an
 #: export is standing in front of it.
 _CONFIG_SCOPE_NOTE = (
-    "settings apply to the NEXT incarnation: the running assistant keeps its "
+    "launch settings apply to the NEXT incarnation: the running assistant keeps its "
     "context window until it is stopped or rotated. A value whose source is "
     "'env' is an export shadowing config.json — what POST persists here has no "
-    "effect until that export is removed. The checkin and nudge groups are the "
-    "exception to the first sentence: the daemon reads both on its next tick, so "
-    "a change there takes effect without a rotation."
+    "effect until that export is removed. The daemon reads the checkin and nudge "
+    "groups on its next tick, so a change there takes effect without a rotation. "
+    "chat_keep_last is a browser display setting applied on config refresh; "
+    "it does not require an assistant rotation."
 )
 
 
@@ -532,8 +534,11 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
             key: setting.to_dict()
             for key, setting in assistant_settings().items()
         },
-        # Their own groups rather than more entries above (issues #244, #317):
-        # those four are argv tokens, these are read on the daemon's own tick.
+        # These groups can apply without restarting the assistant.
+        "chat": {
+            key: setting.to_dict()
+            for key, setting in chat_settings().items()
+        },
         "checkin": {
             key: setting.to_dict()
             for key, setting in checkin_settings().items()
@@ -4006,7 +4011,7 @@ def create_app(
         (:func:`lmer_platform.config.update_stored`).
 
         Keys are the launch-setting names (including ``threads``) plus the integer settings
-        (``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
+        (pane-only ``chat_keep_last``, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
         ``nudge_pending_threshold`` from #317), which are spelled as their config
         fields because they are not launch flags and do not share their
         short-name vocabulary. Omitted keys

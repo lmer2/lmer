@@ -21,10 +21,7 @@
 // root a fragment in a development build, which is a different component from the
 // one that ships.)
 //
-// Presentation only: nothing here fetches, filters or emits. What the two views
-// legitimately disagree about is which entries they show and what may be done with
-// one — the dock may stop showing an entry and may offer a reply box, the record
-// may do neither — and that stays with them.
+// Selection and reply controls belong to the containing view.
 //
 // The few things one view says about an entry and the other does not are the props
 // below, each argued where it is declared, rather than one prop naming the view.
@@ -39,6 +36,7 @@
 // misreporting what it got. Markdown.vue is the renderer, shared with the chat,
 // and it is one component for a reason its header explains.
 
+import CopyButton from './CopyButton.vue'
 import { defineAsyncComponent } from 'vue'
 import { mdiCommentQuestionOutline, mdiInformationOutline } from '@mdi/js'
 import { ago, askEntryLabel, askPartColor } from '../format.js'
@@ -105,6 +103,8 @@ function closureReason(entry) {
         />
         <span>{{ askEntryLabel(entry, live) }}</span>
         <span :title="entry.at || ''">{{ ago(entry.at, now) }}</span>
+        <v-spacer />
+        <CopyButton :text="entry.text || ''" />
       </div>
 
       <!-- Which half of the exchange starts here, in a word, coloured from
@@ -129,10 +129,13 @@ function closureReason(entry) {
            stays on the line under it: the label says which half of the exchange
            this is, and that is not the same fact as whose words they are. -->
       <template v-if="entry.answer">
-        <div
-          class="part reply"
-          :class="`text-${askPartColor('answer')}`"
-        >ANSWER</div>
+        <div class="d-flex justify-end align-center ga-2">
+          <div
+            class="part reply"
+            :class="`text-${askPartColor('answer')}`"
+          >ANSWER</div>
+          <CopyButton :text="entry.answer.text || ''" />
+        </div>
         <p class="text-body-medium said plain reply">
           you: {{ entry.answer.text }}
         </p>

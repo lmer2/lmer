@@ -17,6 +17,7 @@ import RunMeta from './RunMeta.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
 import { forgetRun, resumeRun } from '../api.js'
+import { chatKeepLast, chatConfigProblem, useOperatorChat } from '../operatorChat.js'
 import {
   ago, attentionLabel, duration, ledgerSummary, portUrl, shortTarget, stateMeta,
   targetLink, targetRef, toneColor,
@@ -252,6 +253,16 @@ const targetHref = computed(() => targetLink(props.run.target))
 // A clean exit removes the registry entry while the log deliberately stays, and
 // that history is the record of everything the run did.
 const terminalSession = computed(() => props.run.last_session_id || null)
+const operatorEntries = ref([])
+const operatorActive = computed(() => tab.value === 'lmer' && pane.value === 'chat')
+const { count: operatorCount, unread: operatorUnread } = useOperatorChat(
+  terminalSession, operatorEntries, operatorActive,
+)
+watch(terminalSession, () => { operatorEntries.value = [] })
+
+function receiveOperatorEntries(page) {
+  if (page.sessionId === terminalSession.value) operatorEntries.value = page.entries
+}
 
 // A run stopped on a question has no session to type into, and answering it is a
 // separate action from chatting (T19). The chat view needs to know which of those
@@ -747,6 +758,7 @@ async function forget() {
       :session-id="terminalSession"
       :live="!!run.live"
       :initial="run.questions || []"
+      @entries="receiveOperatorEntries"
       :now="now"
       @answered="emit('changed')"
     />
@@ -1136,7 +1148,7 @@ async function forget() {
            three are offered for a session that has gone. -->
       <v-tabs-window-item value="lmer" class="pt-3">
         <template v-if="terminalSession">
-          <v-tabs v-model="pane" grow color="primary">
+          <v-tabs v-model="pane" grow color="primary" class="session-panes">
             <v-tab value="conversation"><v-icon
               :icon="mdiForumOutline"
               size="small"
@@ -1151,11 +1163,16 @@ async function forget() {
                  this pane renders and the drawer draws on a run that is waiting to
                  be answered. Nothing like the conversation's: replying to the
                  session and reading what it said are different acts. -->
-            <v-tab value="chat"><v-icon
+            <v-tab value="chat" class="operator-chat-tab"><v-icon
               :icon="mdiCommentQuestionOutline"
               size="small"
               class="me-1"
-            />operator chat</v-tab>
+            />operator chat
+              <span class="operator-count">
+                {{ operatorCount }}
+                <span v-if="operatorUnread" class="text-primary" aria-label="Unread messages" title="Unread messages">●</span>
+              </span>
+            </v-tab>
           </v-tabs>
 
           <v-tabs-window v-model="pane">
@@ -1173,22 +1190,18 @@ async function forget() {
             </v-tabs-window-item>
 
             <v-tabs-window-item value="chat" class="pt-3">
-              <!-- The record, not the dock (T40). Everything the session posted
-                   on its channel is here — including whatever was cleared from
-                   above, which is what makes clearing up there a view operation
-                   rather than a deletion. Read-only on purpose: replying belongs
-                   in the one place the question that needs an answer is, and a
-                   second box down here would be a second way to send the same
-                   file, out of sight of the alert that says whether the session
-                   is even alive. -->
               <p class="text-medium-emphasis mb-3">
-                Everything this run's session posted on its channel and everything
-                you replied, oldest first — notes, questions it was blocked on, the
-                ones it stopped waiting for, and any that were never answered.
-                Clearing the dock above this page does not remove anything from
-                here. A session that never used the channel has nothing here.
+                This session’s notes and questions, with your replies, oldest first.
+                <template v-if="chatKeepLast">Auto-clear shows the newest {{ chatKeepLast }} entries.</template>
+                <template v-else>Auto-clear is off; all entries are shown.</template>
+                Change it in settings. Clearing the dock does not change
+                this pane. The journal and transcript keep the full history.
               </p>
+              <v-alert v-if="chatConfigProblem" type="warning" density="compact" class="mb-3">
+                Could not load chat display settings: {{ chatConfigProblem }}
+              </v-alert>
               <AskHistory
+                :keep-last="chatKeepLast"
                 :session-id="terminalSession"
                 :live="!!run.live"
                 :now="now"
@@ -1362,3 +1375,21 @@ async function forget() {
     <RelatedRuns :run="run" @open="emit('open', $event)" />
   </div>
 </template>
+
+<style scoped>
+.operator-count {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  font-size: 10px;
+  line-height: 12px;
+}
+@media (max-width: 600px) {
+  .session-panes :deep(.v-tab) {
+    min-width: 0;
+    padding-inline: 4px;
+    font-size: 12px;
+    letter-spacing: 0;
+  }
+}
+</style>

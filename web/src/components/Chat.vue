@@ -91,6 +91,7 @@
 // itself: a raw role string on the screen is the bug being fixed, and the next
 // harness release is free to invent one.
 
+import CopyButton from './CopyButton.vue'
 import {
   computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch,
 } from 'vue'
@@ -1193,6 +1194,8 @@ watch(rendererLoaded, () => {
               class="text-medium-emphasis"
             >· ↗ posted into a thread</span>
             <span :title="message.at || ''">{{ ago(message.at, now) }}</span>
+            <v-spacer />
+            <CopyButton v-if="message.text" :text="message.text" />
           </div>
 
           <!-- Yours verbatim, the agent's rendered. See the header comment for
@@ -1307,6 +1310,8 @@ watch(rendererLoaded, () => {
               aria-label="stop showing me this message"
               @click="dismissPending(item.id)"
             />
+            <v-spacer />
+            <CopyButton v-if="item.text" :text="item.text" />
           </div>
           <p class="text-body-medium said plain">{{ item.text }}</p>
           <!-- What was attached, from the file still in the browser: this needs
