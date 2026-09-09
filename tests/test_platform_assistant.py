@@ -2942,3 +2942,20 @@ def test_a_thread_taken_during_the_rotation_does_not_cost_the_assistant(
         finally:
             kill(rotated.pid)
             wait_for(lambda: not registry.is_live({"pid": rotated.pid}))
+
+
+def test_a_refused_rotation_has_its_own_history_and_keeps_the_incumbent(
+    config, thread_component, long_lived, caplog,
+):
+    with started(config) as first:
+        worker_holding(thread_component)
+        with pytest.raises(assistant.AssistantThreadHeld):
+            assistant.rotate(config, settings={"threads": [HELD_LINK]})
+        assert assistant.status().session_id == first.session_id
+        assert assistant.status().running
+        events = events_of("assistant_rotate_refused")
+        assert len(events) == 1
+        assert events[0]["data"]["reason"] == "thread_held"
+        assert "develop-412" in events[0]["data"]["detail"]
+        assert events_of("assistant_start_refused") == []
+        assert "platform_assistant_rotate_refused" in caplog.text

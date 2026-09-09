@@ -295,6 +295,7 @@ __all__ = [
     "sessions_for_run", "normalise_records", "read_source", "read_messages",
     "scrub_transcript", "scrub_session_transcripts", "scrub_credentials",
     "LAST_TURN_TAIL_BYTES", "last_turn",
+    "prompt_from_record",
 ]
 
 #: Where a harness leaves its transcripts when the platform has not been told
@@ -368,17 +369,8 @@ DEFAULT_MESSAGE_LIMIT = 100
 #: Ceiling on one read. A client that wants more of a long conversation pages.
 MAX_MESSAGE_LIMIT = 500
 
-#: Per-message text ceiling, and what survives is the END of the message — see
-#: :func:`_present`.
-#:
-#: Raised from 1500, which was about three paragraphs and so cut ordinary agent
-#: reports constantly. Two of the three reasons for a tight cap have since gone
-#: away: a tool-heavy turn is bounded separately (``DETAIL_LIMIT`` collapses each
-#: tool call to one line, so this only ever capped *prose*), and the chat pane now
-#: bounds and scrolls each message, so a long one no longer pushes the page
-#: around. What remains is payload size — a page of 100 messages at this ceiling
-#: is a few hundred KB over a LAN, which is why there is still a limit and why
-#: clients page rather than asking for everything.
+#: Per-field ceiling for message text and native tool commands, not a page budget.
+#: Message text retains its tail; canonical tools never supply a command.
 TEXT_LIMIT = 8000
 
 #: Ceiling on a tool's one-line hint and on a tool failure's text.
@@ -771,7 +763,7 @@ def _long_enough(value: Optional[str], *, what: str) -> Optional[str]:
 
 @dataclass
 class ToolCall:
-    """One tool the assistant ran, collapsed to what a phone can show.
+    """One tool the assistant ran, with a hint and optional full command.
 
     Mutable on purpose. The transcript records a ``tool_use`` and its
     ``tool_result`` as separate lines, so the outcome is only known later —
@@ -783,6 +775,7 @@ class ToolCall:
     detail: Optional[str] = None
     status: str = "pending"
     error: Optional[str] = None
+    #: Native arguments only; the canonical tier never supplies a command.
     command: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -1394,7 +1387,27 @@ def _api_error_fields(flag, kind, status) -> tuple:
     return True, kind, status
 
 
-def _claude_message(record: dict, pending: dict) -> Optional[Message]:
+def _prompt_text(text: str, presentation: bool) -> tuple:
+    return _present(text, TEXT_LIMIT, keep="tail") if presentation else (text, False)
+
+
+def prompt_from_record(record: dict) -> Optional[str]:
+    """A user prompt for local matching, before display scrubbing/truncation.
+
+    The caller owns file freshness and canonical-version validation. This is
+    transcript evidence only: no bus merge or previous-session aggregation.
+    """
+    try:
+        message = _message_from_record(record, {}, presentation=False)
+    except Exception:
+        logger.debug("terminal_transcript_record_skipped")
+        return None
+    if message is not None and message.role == "user" and message.kind == "said":
+        return message.text
+    return None
+
+
+def _claude_message(record: dict, pending: dict, *, presentation: bool = True) -> Optional[Message]:
     """Normalise one Claude Code record, or ``None`` when it carries nothing.
 
     *pending* maps ``tool_use`` id to the :class:`ToolCall` awaiting its result,
@@ -1476,9 +1489,7 @@ def _claude_message(record: dict, pending: dict) -> Optional[Message]:
             return None
         # The operator's own words, so through exactly what a typed turn's text
         # goes through below: wrappers off, then the scrub-and-cap chokepoint.
-        text, truncated = _present(
-            _strip_wrappers(prompt), TEXT_LIMIT, keep="tail"
-        )
+        text, truncated = _prompt_text(_strip_wrappers(prompt), presentation)
         if not text:
             return None
         return Message(
@@ -1557,7 +1568,7 @@ def _claude_message(record: dict, pending: dict) -> Optional[Message]:
         text = (text if isinstance(text, str) else "").strip()
         kind = "said"
 
-    text, truncated = _present(text, TEXT_LIMIT, keep="tail")
+    text, truncated = _prompt_text(text, presentation)
     api_refusal, api_error, api_error_status = _api_error_of(record)
     result = Message(
         role=role, kind=kind, text=text, at=timestamp, truncated=truncated,
@@ -1567,7 +1578,7 @@ def _claude_message(record: dict, pending: dict) -> Optional[Message]:
     return None if result.empty else result
 
 
-def _pi_message(record: dict, pending: dict) -> Optional[Message]:
+def _pi_message(record: dict, pending: dict, *, presentation: bool = True) -> Optional[Message]:
     """Normalise one pi record (pi 0.84.1, session format 3).
 
     Only ``message`` records carry a conversation. The rest of pi's vocabulary is
@@ -1640,7 +1651,7 @@ def _pi_message(record: dict, pending: dict) -> Optional[Message]:
     # anyone said.
     text = _strip_wrappers(text) if role == "user" else text.strip()
 
-    text, truncated = _present(text, TEXT_LIMIT, keep="tail")
+    text, truncated = _prompt_text(text, presentation)
     result = Message(
         role=role, kind="said", text=text, at=timestamp, truncated=truncated,
         tools=tools,
@@ -1732,7 +1743,7 @@ def _codex_injected(text: str) -> bool:
     return not _codex_unwrapped(text).strip()
 
 
-def _codex_message(record: dict, pending: dict) -> Optional[Message]:
+def _codex_message(record: dict, pending: dict, *, presentation: bool = True) -> Optional[Message]:
     """Normalise one codex record (codex-cli 0.147.0 rollout format).
 
     ``response_item`` is the only record type read. Everything else in a rollout
@@ -1873,7 +1884,7 @@ def _codex_message(record: dict, pending: dict) -> Optional[Message]:
     else:
         return None
 
-    text, truncated = _present(text, TEXT_LIMIT, keep="tail")
+    text, truncated = _prompt_text(text, presentation)
     result = Message(
         role=role, kind=kind, text=text, at=timestamp, truncated=truncated,
     )
@@ -1968,9 +1979,7 @@ def _lmer_tool_call(entry, pending: dict) -> Optional[ToolCall]:
     error = entry.get("error")
     call = ToolCall(
         name=_present(name.strip(), DETAIL_LIMIT)[0],
-        # Already a one-line hint by contract, so this bounds and scrubs a claim
-        # rather than deriving one: :func:`_first_line` is exactly the chokepoint
-        # the other adapters put their derived hints through.
+        # Canonical tools carry hints only; even an explicit command key is ignored.
         detail=_first_line(detail) if isinstance(detail, str) else None,
         status=status,
         error=_first_line(error) if isinstance(error, str) else None,
@@ -1983,7 +1992,7 @@ def _lmer_tool_call(entry, pending: dict) -> Optional[ToolCall]:
     return call
 
 
-def _lmer_message(record: dict, pending: dict) -> Optional[Message]:
+def _lmer_message(record: dict, pending: dict, *, presentation: bool = True) -> Optional[Message]:
     """Normalise one record of the canonical format — version 1 (#296).
 
     The one vocabulary here that is *not* a harness's. It serialises the shape
@@ -2091,7 +2100,7 @@ def _lmer_message(record: dict, pending: dict) -> Optional[Message]:
     # could claim it would be a container asserting the operator had spoken.
     via = MONITOR_VIA if record.get("via") == MONITOR_VIA else None
 
-    text, truncated = _present(text, TEXT_LIMIT, keep="tail")
+    text, truncated = _prompt_text(text, presentation)
     api_refusal, api_error, api_error_status = _api_error_fields(
         record.get("api_refusal"),
         record.get("api_error"),
@@ -2123,7 +2132,7 @@ def _harness_of_record(record: dict) -> Optional[str]:
     return None
 
 
-def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
+def _message_from_record(record: dict, pending: dict, *, presentation: bool = True) -> Optional[Message]:
     """Normalise one transcript record, whichever harness wrote it.
 
     Per record rather than per file — see the module docstring — and an
@@ -2132,13 +2141,13 @@ def _message_from_record(record: dict, pending: dict) -> Optional[Message]:
     """
     harness = _harness_of_record(record)
     if harness == "claude":
-        return _claude_message(record, pending)
+        return _claude_message(record, pending, presentation=presentation)
     if harness == "pi":
-        return _pi_message(record, pending)
+        return _pi_message(record, pending, presentation=presentation)
     if harness == "codex":
-        return _codex_message(record, pending)
+        return _codex_message(record, pending, presentation=presentation)
     if harness == _LMER_HARNESS:
-        return _lmer_message(record, pending)
+        return _lmer_message(record, pending, presentation=presentation)
     return None
 
 

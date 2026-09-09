@@ -44,7 +44,7 @@ from lmer_cli.util import get_bool_env
 from matrix_bridge.scrub import scrub_bytes, scrub_text
 from slack_chat.connector import (
     ATTACH_ACK, ATTACH_ACK_ENV, ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV, DETACH_NOTE,
-    _int_env, _with_references, answer_binding, option_for,
+    _int_env, _with_references, answer_binding, attachment_notice, option_for,
     post_replay_notice, render_outbound as _render_slack, replay_stamp,
 )
 
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ConnectorConfig", "MatrixConnector", "render_outbound", "strip_reply_fallback",
-    "resolve_thread_root", "CHANNEL", "SUBSCRIBER", "main",
+    "resolve_thread_root", "CHANNEL", "SUBSCRIBER", "ATTACH_ACK", "main",
 ]
 
 CHANNEL = "matrix"
@@ -228,6 +228,7 @@ class MatrixConnector:
         self._seen: set = set()
         self._last_event_id: Optional[str] = None
         self._bus_cursor = 0
+        self._launch_settings: Optional[dict] = None
         self._next_batch: Optional[str] = None
         self._names: dict = {}
         #: question id → the event this connector posted for it, for `_replies_to`
@@ -347,6 +348,8 @@ class MatrixConnector:
         except bus.BusError as exc:
             logger.warning("matrix_connector_seed_failed error=%s", exc)
             return
+        launch = health.get("launch")
+        self._launch_settings = launch if isinstance(launch, dict) else None
         acked = (health.get("subscribers") or {}).get(self.subscriber)
         if isinstance(acked, int) and not isinstance(acked, bool):
             self._bus_cursor = acked
@@ -364,7 +367,7 @@ class MatrixConnector:
         """Say the session is listening — the Slack connector's rule and words."""
         if not self.config.attach_ack or self._announced:
             return
-        self._note(ATTACH_ACK, connection_notice=True)
+        self._note(attachment_notice(self._launch_settings, slack_markup=False), connection_notice=True)
         self._announced = True
 
     def _announce_detached(self) -> None:

@@ -1499,6 +1499,7 @@ def test_integer_settings_warn_under_their_own_log_keys(platform_root):
     assert set(cfg.INT_SETTINGS) == {
         "chat_keep_last", "checkin_window_seconds", "nudge_after_seconds",
         "nudge_pending_threshold",
+        "terminal_confirm_seconds",
         # The chat upload cap (issue 246) resolves through the same warn-
         # don't-refuse path: a host that will not boot cannot be reconfigured
         # through its own UI, and this is a number bounding one request.

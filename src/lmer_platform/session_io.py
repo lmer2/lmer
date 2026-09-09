@@ -200,7 +200,7 @@ __all__ = [
     "DEFAULT_LOG_LIMIT", "MAX_LOG_LIMIT", "DEFAULT_TAIL_BYTES",
     "POLL_INTERVAL_SECONDS", "TICKET_TTL_SECONDS", "MAX_LIVE_TICKETS",
     "CONTROL_TIMEOUT_SECONDS", "LOG_SOURCE_CONTAINER", "LOG_SOURCE_HOST",
-    "session_log_path", "container_log_path", "canonical_log", "named_log",
+    "session_log_path", "container_log_path", "canonical_log", "named_log", "quiet_health",
     "require_session", "session_is_live", "read_log",
     "read_log_at", "follow_log", "control_endpoint", "send_input", "apply_resize",
     "probe_health", "read_control_output", "session_activity",
@@ -1195,7 +1195,7 @@ def probe_health(session_id: str) -> dict:
     return reply.payload
 
 
-def _quiet_health(session_id: str) -> Optional[dict]:
+def quiet_health(session_id: str) -> Optional[dict]:
     """One cheap health probe, or ``None`` for every way of not getting an answer.
 
     The shared half of :func:`session_activity` and :func:`control_plane_answers`:
@@ -1254,7 +1254,7 @@ def control_plane_answers(session_id: str) -> bool:
     and a gone one look identical), so callers must treat it as "no reader can be
     proved" rather than as "the container is gone".
     """
-    return _quiet_health(session_id) is not None
+    return quiet_health(session_id) is not None
 
 
 def session_activity(session_id: str) -> Optional[dict]:
@@ -1292,7 +1292,7 @@ def session_activity(session_id: str) -> Optional[dict]:
     tooltip and the loggable form of a measurement that ``idle_seconds`` *is*: a
     record with the timestamp and no number would have nothing to render.
     """
-    return _activity_of(_quiet_health(session_id))
+    return _activity_of(quiet_health(session_id))
 
 
 def _activity_of(payload: Optional[dict]) -> Optional[dict]:
@@ -1339,7 +1339,7 @@ def session_output_state(session_id: str) -> Optional[dict]:
     Only ``False`` is a fact a caller may act on; ``None`` keeps whatever the
     caller does with "not knowable".
     """
-    payload = _quiet_health(session_id)
+    payload = quiet_health(session_id)
     if payload is None:
         return None
     cursor = payload.get("cursor")

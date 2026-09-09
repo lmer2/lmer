@@ -33,6 +33,17 @@ def _clean_lmer_env(monkeypatch):
     strip_lmer_env(monkeypatch)
 
 
+@pytest.fixture(autouse=True)
+def disconnect_notices(monkeypatch):
+    from lmer_platform import comms
+    from types import SimpleNamespace
+
+    posted = []
+    hub = SimpleNamespace(post=lambda session, **message: posted.append((session, message)))
+    monkeypatch.setattr(comms, "ensure_hub", lambda: hub)
+    return posted
+
+
 @pytest.fixture
 def platform_root(tmp_path, monkeypatch):
     root = tmp_path / "platform"
@@ -896,7 +907,7 @@ class TestAnAttachmentRemembersWhereItGot:
         threads = component(platform_root)
         record = threads.adopt_launch_targets("s-1", [SLACK_LINK], by="operator")[0]
         monkeypatch.setattr(
-            connectors.session_io, "_quiet_health",
+            connectors.session_io, "quiet_health",
             lambda sid: self.health(sid, {record["id"]: 3}),
         )
 
@@ -915,7 +926,7 @@ class TestAnAttachmentRemembersWhereItGot:
         threads = component(platform_root, runner=runner)
         record = threads.adopt_launch_targets("s-1", [SLACK_LINK], by="operator")[0]
         monkeypatch.setattr(
-            connectors.session_io, "_quiet_health",
+            connectors.session_io, "quiet_health",
             lambda sid: self.health(sid, {record["id"]: 3}),
         )
         threads.reconcile()
@@ -923,7 +934,7 @@ class TestAnAttachmentRemembersWhereItGot:
 
         # The clean stop is what takes the supervisor's answer away.
         monkeypatch.setattr(
-            connectors.session_io, "_quiet_health", lambda sid: self.health(sid, {}),
+            connectors.session_io, "quiet_health", lambda sid: self.health(sid, {}),
         )
         again = component(platform_root, runner=(restarted := Runner()))
         again.reconcile()
@@ -937,12 +948,12 @@ class TestAnAttachmentRemembersWhereItGot:
         threads = component(platform_root)
         record = threads.adopt_launch_targets("s-1", [SLACK_LINK], by="operator")[0]
         monkeypatch.setattr(
-            connectors.session_io, "_quiet_health",
+            connectors.session_io, "quiet_health",
             lambda sid: self.health(sid, {record["id"]: 5}),
         )
         threads.reconcile()
         monkeypatch.setattr(
-            connectors.session_io, "_quiet_health",
+            connectors.session_io, "quiet_health",
             lambda sid: self.health(sid, {record["id"]: 2}),
         )
         threads.reconcile()
@@ -955,7 +966,7 @@ class TestAnAttachmentRemembersWhereItGot:
         threads = component(platform_root)
         asked = []
         monkeypatch.setattr(
-            connectors.session_io, "_quiet_health",
+            connectors.session_io, "quiet_health",
             lambda sid: asked.append(sid) or self.health(sid, {}),
         )
         threads.reconcile()
@@ -1035,3 +1046,120 @@ class TestAnUnreadableHolder:
             lambda self: (_ for _ in ()).throw(FileNotFoundError()),
         )
         assert threads._is_our_connector(4321, connectors.parse_thread(SLACK_LINK)) is False
+
+
+class TestDisconnectNotices:
+    def test_explicit_disconnect_posts_once_to_the_affected_session(self, platform_root, disconnect_notices):
+        live_session()
+        threads = component(platform_root)
+        connected = threads.connect("s-1", SLACK_LINK, by="operator")
+        assert disconnect_notices == []
+        threads.disconnect("s-1", connected["id"])
+        assert disconnect_notices == [("s-1", {
+            "kind": "message", "channel": "platform",
+            "text": "thread disconnected: " + connected["label"],
+        })]
+        with pytest.raises(connectors.ThreadError):
+            threads.disconnect("s-1", connected["id"])
+        assert len(disconnect_notices) == 1
+
+    def test_a_held_thread_notifies_once_until_it_can_attach_again(self, platform_root, disconnect_notices):
+        now = [0.0]
+        live_session("s-1")
+        live_session("s-2")
+        threads = component(platform_root, clock=lambda: now[0])
+        first = threads.connect("s-1", SLACK_LINK, by="operator")
+        threads.adopt_launch_targets("s-2", [SLACK_LINK], by="operator")
+        for _ in range(3):
+            now[0] += 100
+            threads.reconcile()
+        assert [session for session, _ in disconnect_notices] == ["s-2"]
+        threads.disconnect("s-1", first["id"])
+        now[0] += 100
+        threads.reconcile()
+        assert threads.listing("s-2")[0]["running"]
+        threads.disconnect("s-2", first["id"])
+        assert [session for session, _ in disconnect_notices] == ["s-2", "s-1", "s-2"]
+        threads.stop()
+        assert len(disconnect_notices) == 3
+
+    def test_a_notice_failure_does_not_restore_the_connection(self, platform_root, monkeypatch, caplog):
+        from lmer_platform import comms
+        live_session()
+        threads = component(platform_root)
+        connected = threads.connect("s-1", SLACK_LINK, by="operator")
+
+        def unavailable(*args, **kwargs):
+            raise comms.CommsError("bus unavailable")
+
+        monkeypatch.setattr(comms.ensure_hub(), "post", unavailable)
+        assert threads.disconnect("s-1", connected["id"])["id"] == connected["id"]
+        assert threads.records("s-1") == []
+        assert "platform_thread_disconnect_notice_failed" in caplog.text
+
+    def test_forgetting_connections_notifies_but_daemon_shutdown_does_not(self, platform_root, disconnect_notices):
+        live_session()
+        threads = component(platform_root)
+        threads.connect("s-1", SLACK_LINK, by="operator")
+        threads.connect("s-1", OTHER_SLACK_LINK, by="operator")
+        threads.stop()
+        assert disconnect_notices == []
+        assert threads.drop_session("s-1") == 2
+        assert [session for session, _ in disconnect_notices] == ["s-1", "s-1"]
+
+
+class TestVerifiedLaunchThreadIdentity:
+    @pytest.mark.parametrize("failure", ["network", "empty", "malformed"])
+    def test_unverifiable_slack_roots_refuse_but_adoption_still_records(self, platform_root, failure):
+        class Unavailable(FakeSlack):
+            def get_replies(self, *args, **kwargs):
+                if failure == "network":
+                    raise OSError("transport unavailable")
+                return [] if failure == "empty" else [{}]
+
+        threads = component(platform_root, slack=Unavailable())
+        with pytest.raises(connectors.ThreadError) as caught:
+            threads.refuse_held_targets([SLACK_LINK])
+        assert caught.value.status == 502
+        assert threads.records("s-1") == []
+        assert threads.adopt_launch_targets("s-1", [SLACK_LINK], by="operator")
+
+    def test_missing_slack_credentials_refuse_before_launch(self, platform_root):
+        threads = component(platform_root, environ={})
+        with pytest.raises(connectors.ThreadError, match="SLACK_BOT_TOKEN"):
+            threads.refuse_held_targets([SLACK_LINK])
+        assert threads.sessions() == {}
+
+    def test_client_construction_failure_is_not_an_unheld_verdict(self, platform_root):
+        threads = component(platform_root)
+
+        def unavailable(token):
+            raise RuntimeError("client unavailable")
+
+        threads._slack_client = unavailable
+        with pytest.raises(connectors.ThreadError, match="cannot verify"):
+            threads.refuse_held_targets([SLACK_LINK])
+
+    @pytest.mark.parametrize("answer", [None, "#alias:example.org", "network"])
+    def test_matrix_alias_requires_a_room_id_but_literal_ids_need_no_lookup(self, platform_root, answer):
+        class Unavailable(FakeMatrix):
+            def resolve_room(self, room):
+                if answer == "network":
+                    raise OSError("transport unavailable")
+                return answer
+
+        threads = component(platform_root, environ=matrix_env(), matrix=Unavailable())
+        alias = "https://matrix.to/#/%23alias%3Aexample.org/%24event"
+        with pytest.raises(connectors.ThreadError) as caught:
+            threads.refuse_held_targets([alias])
+        assert caught.value.status == 502
+        threads.refuse_held_targets([MATRIX_LINK])
+
+    def test_an_equivalent_reply_cannot_bypass_a_held_root(self, platform_root):
+        live_session()
+        slack = FakeSlack(root="1712345678.000900")
+        threads = component(platform_root, slack=slack)
+        threads.connect("s-1", SLACK_LINK, by="operator")
+        with pytest.raises(connectors.ThreadError) as caught:
+            threads.refuse_held_targets([OTHER_SLACK_LINK])
+        assert caught.value.status == 409

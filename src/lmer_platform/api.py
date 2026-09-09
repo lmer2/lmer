@@ -127,6 +127,7 @@ from .config import (
     configured_repo_url,
     mutate_stored,
     nudge_settings,
+    terminal_settings,
     upload_settings,
     upload_types,
     update_stored,
@@ -546,6 +547,10 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
         "nudge": {
             key: setting.to_dict()
             for key, setting in nudge_settings().items()
+        },
+        "terminal": {
+            key: setting.to_dict()
+            for key, setting in terminal_settings().items()
         },
         # The chat-upload group (issue 246). Here because the write route already
         # accepts ``upload_max_bytes`` — it is in ``INT_SETTINGS`` — and a key a

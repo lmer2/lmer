@@ -1503,6 +1503,8 @@ def _build_fastapi_app(
     agent_token: Optional[str] = None,
     token_hash: Optional[str] = None,
     inbound_relay: Optional[_InboundRelay] = None,
+    terminal_mirror=None,
+    launch_settings: Optional[dict] = None,
 ):
     """Construct the FastAPI app exposing ``/input``, ``/output``, ``/resize``
     and, when a :class:`lmer_cli.comms.MessageLog` is supplied, the session
@@ -1619,9 +1621,9 @@ def _build_fastapi_app(
         # ``append_newline`` for backwards-compatible API shape but the
         # behavior is "press Enter after the text".
         if not body.append_newline:
-            written = write_input(payload_bytes)
             if on_raw_input is not None and caller == CALLER_CONTROL:
                 on_raw_input(payload_bytes, body.author)
+            written = write_input(payload_bytes)
             return {"bytes_written": written, **receipt}
 
         # A whole submitted command can use lmer's portable spelling even when
@@ -1791,12 +1793,28 @@ def _build_fastapi_app(
             if state is None:
                 raise HTTPException(status_code=400, detail=f"waiter {waiter!r} names no question")
             waiter_id = state.question.id
-        messages, cursor = log.read_since(since, timeout=timeout, kinds=wanted, waiter=waiter_id)
+        messages, cursor = log.read_since(
+            since, timeout=timeout, kinds=wanted, waiter=waiter_id, include_local=False,
+        )
         return {
             "messages": [m.to_dict() for m in messages],
             "cursor": cursor,
             "schema": _comms.SCHEMA_VERSION,
+            **({"terminal_mirror": {"window_seconds": terminal_mirror.window}}
+               if terminal_mirror is not None else {}),
         }
+
+    @app.post("/messages/terminal-mirror")
+    def configure_terminal_mirror(body: dict, authorization: Optional[str] = Header(default=None)):
+        if _check_auth(authorization) == CALLER_AGENT:
+            raise HTTPException(status_code=403, detail="terminal timing is controlled by the host")
+        if terminal_mirror is None:
+            raise HTTPException(status_code=503, detail="terminal mirror is unavailable")
+        try:
+            terminal_mirror.configure(body.get("window_seconds"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"window_seconds": terminal_mirror.window}
 
     @app.post("/messages/ack")
     def post_ack(body: _AckBody, authorization: Optional[str] = Header(default=None)):
@@ -1942,6 +1960,9 @@ def _build_fastapi_app(
         # *ends* (spec D24). "Nothing produced yet" answers null, exactly like an
         # unknown geometry, so a reader that renders it has one absent case to
         # handle rather than two.
+        bus_health = comms.health() if comms is not None else None
+        if bus_health is not None and launch_settings is not None:
+            bus_health["launch"] = dict(launch_settings)
         return {
             "ok": True,
             "cursor": output.end_offset,
@@ -1955,7 +1976,7 @@ def _build_fastapi_app(
             # Absent (null) on a supervisor with no bus. The daemon reads this
             # key to tell a #407 image from an older one; there is no other
             # version negotiation.
-            "comms": comms.health() if comms is not None else None,
+            "comms": bus_health,
             # So "nobody can do this" is an answer rather than a timeout (#414).
             "threads": thread_queue.health(),
             **_activity_report(output.idle_seconds),
@@ -2838,28 +2859,23 @@ def run_supervisor(
         ),
     )
 
-    # The terminal as a source (issue #407): lines a human typed at the host
-    # TTY or the browser terminal, rebuilt from keystrokes and put on the bus
-    # for the connectors. Never relayed back into the PTY — the harness already
-    # has them.
-    terminal_mirror = _comms.terminal_mirror_enabled()
+    from .terminal_mirror import TerminalMirror, TranscriptReader
+
+    try:
+        transcript_dir = resolve_harness().session_dir
+    except UnknownHarnessError:
+        transcript_dir = None
+    mirror_enabled = _comms.terminal_mirror_enabled()
+    terminal_mirror = TerminalMirror(
+        comms_log, TranscriptReader(transcript_dir if mirror_enabled else None, harness_name),
+        enabled=mirror_enabled,
+    )
+    terminal_mirror.poll()
     stdin_tracker = _comms.TerminalTracker()
     raw_input_tracker = _comms.TerminalTracker()
 
-    def mirror_terminal(tracker: "_comms.TerminalTracker", data: bytes, author: Optional[str] = None) -> None:
-        if not terminal_mirror:
-            return
-        for line in tracker.feed(data):
-            with contextlib.suppress(_comms.CommsError):
-                comms_log.append(
-                    kind=_comms.KIND_MESSAGE,
-                    text=line,
-                    source=_comms.Source(_comms.CHANNEL_TERMINAL, author=author),
-                    meta={"fidelity": "reconstructed"},
-                )
-
     def on_raw_input(data: bytes, author: Optional[str]) -> None:
-        mirror_terminal(raw_input_tracker, data, author)
+        terminal_mirror.feed(raw_input_tracker, data, author)
 
     watcher_stop = threading.Event()
     watcher_thread: Optional[threading.Thread] = None
@@ -2888,6 +2904,11 @@ def run_supervisor(
         target=_watch_bus, name="lmer-supervisor-bus-watch", daemon=True
     )
     watcher_thread.start()
+    terminal_thread = threading.Thread(
+        target=terminal_mirror.run, args=(watcher_stop,),
+        name="lmer-supervisor-terminal-watch", daemon=True,
+    )
+    terminal_thread.start()
 
     # The FastAPI control plane touches the PTY's geometry through these two
     # closures instead of being handed the fd, so the app never has to know it
@@ -2917,6 +2938,11 @@ def run_supervisor(
             agent_token=agent_token,
             token_hash=fastapi_token_hash or None,
             inbound_relay=inbound_relay,
+            terminal_mirror=terminal_mirror,
+            launch_settings={
+                "preset": os.environ.get("LMER_SESSION_PRESET") or None,
+                "model": os.environ.get("LMER_LLM_NAME") or None,
+            },
         )
         server_thread, fastapi_shutdown = _start_fastapi_server(app, fastapi_host, fastapi_port)
         # Status line carries only host + port (no secret value): the bearer
@@ -3098,7 +3124,7 @@ def run_supervisor(
                     stdin_open = False
                 else:
                     pending_stdin += chunk
-                    mirror_terminal(stdin_tracker, chunk)
+                    terminal_mirror.feed(stdin_tracker, chunk)
 
             if pending_stdin and child_status is None:
                 accepted = None
@@ -3139,6 +3165,7 @@ def run_supervisor(
             with contextlib.suppress(termios.error):
                 termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
         if fastapi_shutdown is not None:
+            terminal_mirror.poll()
             # The daemon reads the bus over this control plane and nowhere
             # else, so the last records must be fetched before it goes.
             comms_log.wait_drained(_comms.drain_grace())
@@ -3152,6 +3179,7 @@ def run_supervisor(
         watcher_stop.set()
         if watcher_thread is not None:
             watcher_thread.join(timeout=ASK_DIR_WATCH_SECONDS + 1.0)
+        terminal_thread.join(timeout=1.0)
         comms_log.close()
         os.close(master_fd)
 

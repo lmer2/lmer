@@ -96,7 +96,7 @@ class FakeSlack:
 
 
 class Rig:
-    def __init__(self, tmp_path, *, uploads=None):
+    def __init__(self, tmp_path, *, uploads=None, launch_settings=None):
         from fastapi.testclient import TestClient
 
         self.log = comms.MessageLog("sess-1", str(tmp_path / "messages.jsonl"))
@@ -107,7 +107,9 @@ class Rig:
             self.sink.append(bytes(data))
             return len(data)
 
-        app = supervisor._build_fastapi_app(buf, write_input, "tok", comms=self.log)
+        app = supervisor._build_fastapi_app(
+            buf, write_input, "tok", comms=self.log, launch_settings=launch_settings,
+        )
         http = TestClient(app)
         client = bus.BusClient(bus.Endpoint(url="http://testserver", token="tok"), session=_Session(http))
         self.bus = client
@@ -905,11 +907,12 @@ def test_failed_inbound_post_keeps_the_free_answer_retryable(rig, monkeypatch):
 
 
 @pytest.mark.parametrize("renderer", ["slack", "matrix"])
-def test_reconstructed_terminal_text_is_marked_in_both_threads(renderer):
+@pytest.mark.parametrize("fidelity", ["reconstructed", "confirmed"])
+def test_reconstructed_terminal_text_is_marked_in_both_threads(renderer, fidelity):
     from matrix_chat.connector import render_outbound as matrix_render
     render = connector.render_outbound if renderer == "slack" else matrix_render
     record = {"kind": "message", "text": "words", "source": {"channel": "terminal", "author": "alice"},
-              "meta": {"fidelity": "reconstructed"}}
+              "meta": {"fidelity": fidelity}}
     assert "terminal · alice · typed" in render(record)
     record["meta"] = {}
     assert "typed" not in render(record)
@@ -993,3 +996,30 @@ def test_assistant_reply_reaches_slack_and_human_reply_reaches_its_pty(rig):
         assert [r.source.channel for r in rig.log.read_since(0)[0] if r.text == "hello from the assistant"] == ["uber-lmer"]
     finally:
         rig.connector.stop()
+
+
+@pytest.mark.parametrize("launch, expected", [
+    ({"preset": "astra", "model": "gpt-test"}, "Preset: astra; model: gpt-test."),
+    ({"preset": None, "model": None}, "Preset: none; model: harness default."),
+    ({"preset": "a<&b", "model": "<@everyone>\nmodel"},
+     "Preset: a&lt;&amp;b; model: &lt;@everyone&gt; model."),
+    (None, ""),
+])
+def test_attachment_notice_names_the_supervisors_launch_settings(tmp_path, launch, expected):
+    rig = Rig(tmp_path, launch_settings=launch)
+    rig.connector.config = replace(rig.config, attach_ack=True)
+    rig.connector._seed_cursor()
+    rig.connector._announce_attached()
+    rig.connector._announce_attached()
+    text = connector.ATTACH_ACK + (" " + expected if expected else "")
+    assert [posted[2] for posted in rig.slack.posted] == [text]
+    assert rig.slack.replies[-1]["blocks"][0]["block_id"].startswith(connector.CONNECTION_NOTICE_BLOCK_PREFIX)
+    rig.log.close()
+
+
+def test_attachment_metadata_does_not_override_the_ack_off_switch(tmp_path):
+    rig = Rig(tmp_path, launch_settings={"preset": "astra", "model": "gpt-test"})
+    rig.connector._seed_cursor()
+    rig.connector._announce_attached()
+    assert rig.slack.posted == []
+    rig.log.close()

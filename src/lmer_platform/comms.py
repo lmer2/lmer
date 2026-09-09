@@ -453,6 +453,26 @@ class _Subscriber(threading.Thread):
                 self.stop_event.wait(min(BACKOFF_MAX, 0.5 * (2 ** min(self.failures, 6))))
                 continue
             self.failures = 0
+            timing = reply.payload.get("terminal_mirror")
+            if isinstance(timing, dict):
+                from .config import terminal_settings
+
+                seconds = terminal_settings()["confirm_seconds"].value
+                if timing.get("window_seconds") != seconds:
+                    try:
+                        changed = session_io._post(
+                            endpoint, "/messages/terminal-mirror",
+                            {"window_seconds": seconds},
+                        )
+                        if not changed.ok:
+                            logger.warning(
+                                "platform_terminal_timing_failed session=%s status=%s",
+                                session_id, changed.status,
+                            )
+                    except session_io.SessionIOError as exc:
+                        logger.warning(
+                            "platform_terminal_timing_failed session=%s error=%s", session_id, exc,
+                        )
             if not self.registered:
                 # Registering, not acking a record: until a subscriber is known
                 # to the supervisor its drain has nobody to wait for, and a
@@ -578,7 +598,7 @@ class CommsHub:
         cached = self._supports.get(session_id)
         if cached is True:
             return True
-        health = session_io._quiet_health(session_id)
+        health = session_io.quiet_health(session_id)
         if health is None:
             return False
         supported = isinstance(health.get("comms"), dict)

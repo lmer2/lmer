@@ -1,0 +1,2 @@
+fixed:
+  - Sessions are notified on each chat thread disconnect or held-thread refusal, including later losses after reconnecting.

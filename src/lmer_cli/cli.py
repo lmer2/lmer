@@ -1612,6 +1612,8 @@ def _resolve_and_apply_preset(
     for the caller to seed into the container env dict — or an exit code on
     failure. No preset selected returns the inputs unchanged.
     """
+    # Report only this invocation's resolved preset, never an inherited label.
+    os.environ.pop("LMER_SESSION_PRESET", None)
     # --no-task runs have no taskdef id, so only the flag and LMER_PRESET can
     # select for them.
     task_id = _selected_task_id(ns)
@@ -1688,6 +1690,8 @@ def _resolve_and_apply_preset(
             os.environ[key] = value
             early_env_file_sources[key] = f"preset ({preset.name})"
             applied_env[key] = value
+    os.environ["LMER_SESSION_PRESET"] = preset.name
+    applied_env.pop("LMER_SESSION_PRESET", None)
     details = []
     # The flag is visible in the command line the operator just typed; an env
     # var (especially a .env-sourced one) is not, so attribute those.
@@ -2785,6 +2789,7 @@ def main(argv: list[str] | None = None) -> int:
         # explicit host setting would only apply on the host side.
         "LMER_GITLAB_TOKEN_HOST": os.environ.get("LMER_GITLAB_TOKEN_HOST"),
         "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
+        "LMER_SESSION_PRESET": os.environ.get("LMER_SESSION_PRESET"),
         # No human attached (cron/scheduled launches): the AGENTS.md gates
         # report instead of asking when this is set. Never inferred from the
         # launch shape — only an explicit host value crosses over, while
@@ -3023,6 +3028,7 @@ def main(argv: list[str] | None = None) -> int:
         # how long it holds its control plane open after the harness exits, and
         # whether it mirrors what a human types at the terminal (issue #407).
         "LMER_COMMS_DRAIN_GRACE": os.environ.get("LMER_COMMS_DRAIN_GRACE"),
+        "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": os.environ.get("LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS"),
         "LMER_COMMS_TERMINAL_MIRROR": os.environ.get("LMER_COMMS_TERMINAL_MIRROR"),
         "LMER_FASTAPI_PORT_RANGE": ns.fastapi_port_range,
         # When --fastapi is on we publish the port range to the host, which

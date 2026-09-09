@@ -1173,7 +1173,7 @@ watch(rendererLoaded, () => {
                  mirror — here and in the connected threads — can see which
                  lines are one. -->
             <span
-              v-if="message.fidelity === 'reconstructed'"
+              v-if="message.fidelity === 'reconstructed' || message.fidelity === 'confirmed'"
               class="reconstructed"
               title="rebuilt from keystrokes: what was typed may differ"
             >· typed</span>

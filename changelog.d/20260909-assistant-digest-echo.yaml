@@ -1,0 +1,2 @@
+fixed:
+  - The assistant no longer receives digests of its own records; its milestones remain in platform history.

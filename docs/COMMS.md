@@ -57,6 +57,7 @@ line in the log and the same object on the wire.
 | `in_reply_to` | str? | An `id` on the same session. Required on `answer` and `close`; optional on `message`. |
 | `options` | [str] | Questions only. At most 12, each at most 200 characters. A hint, not a menu. |
 | `attachments` | [obj] | `{"name", "bytes", "media_type", "path"}` — references into the session's upload store. |
+| `local_only` | bool? | Supervisor-only routing field, absent by default. Terminal candidates carry `true`: retained locally and omitted from every HTTP bus read, including replay (§5). Callers cannot set it through `POST /messages`. |
 | `meta` | obj | Rendering and lifecycle status, never message routing. The supervisor sets `delivered` (`cli` or `pty`) on an accepted answer, `late: true` and `answered_by` on a late one, `option` on an answer that named its choice by index (§6), and `session_origin` on a session's own record posted for it. Every key in that list is reserved: a caller's own copy of one is dropped rather than stored. Any other key is kept as sent, `fidelity: "reconstructed"` from the terminal tracker included. |
 
 ### Kinds
@@ -303,7 +304,13 @@ accepted from the operator and the assistant only.
 
 The assistant receives everything: a `milestone` as the immediate
 `session_signal` digest it always had, everything else coalesced into one
-`session_comms` digest per session every 20 seconds.
+`session_comms` digest per session every 20 seconds. Assistant-origin records
+(`source.channel: uber-lmer` or the supervisor's `meta.session_origin: true`)
+remain in the journal but do not spool back to the assistant, including
+milestones. Milestones still enter platform history and advance ingestion marks.
+The ask-directory reader preserves the same history and suppresses only the
+assistant's notification when the hub is absent or reconnecting. Worker and human
+records still reach the assistant through the immediate and batched paths.
 
 ---
 
@@ -365,18 +372,24 @@ nowhere else.
 hides a literal `lmer-signal` `post`, `note` or `ask`, or `lmer-slack post`, tool call
 when its whitespace-normalised body matches a loaded `message`, `note` or
 `question` assistant bus record from `agent` or `uber-lmer`. It removes only the matching
-tool: unrelated tools, failed calls and the agent's own prose (including closing
+tool: unrelated tools, calls marked failed and the agent's own prose (including closing
 prose) stay; an otherwise empty turn disappears. The record must be in the
 pane's loaded window; each record hides at most one preceding tool copy, nearest
 first. The route's nullable tool `command` field carries the complete scrubbed
 command from Claude, pi or Codex arguments, up to 8,000 characters. Missing or
-over-limit commands are `null`; canonical transcripts without full arguments
-also supply no command. The existing first-line, 160-character `detail` remains
-unchanged and is never match evidence. Shell expansions, compound commands and
+over-limit commands are `null`. Canonical transcripts never supply a command,
+even if an unknown `command` key is present; their tool schema carries hints
+rather than raw arguments. The existing first-line, 160-character `detail` remains
+unchanged and is never match evidence. The 8,000-character ceiling is per field: a
+tool-heavy turn can contain several full native commands. It does not bound the
+whole page payload, so clients still need pagination. Shell expansions, compound commands and
 unknown/incomplete commands stay visible. File/stdin bodies and attachment posts
 remain visible because command text alone does not describe their payloads.
-Milestones, the bare `lmer-signal "text"` spelling, unsupported options and failed
-asks (including wait timeouts) remain visible too.
+Milestones, the bare `lmer-signal "text"` spelling and unsupported options remain
+visible too. Claude and pi report failed calls, so failed asks (including wait
+timeouts) remain visible with those adapters. Codex currently marks every
+returned `function_call_output` as `ok`; a failed ask can therefore be hidden
+when it matches a bus record. Its adapter cannot guarantee failed-ask visibility.
 
 **Thread feedback.** Connect and Disconnect immediately show `connecting…` or
 `disconnecting…` beside the thread controls and on the affected entry, with repeat
@@ -444,7 +457,46 @@ printable bytes accumulate, backspace removes a character, escape sequences
 are dropped, bracketed paste is taken verbatim, Ctrl-C and Ctrl-U clear the
 line, Enter emits it. Each emitted line becomes
 `kind: message, source: {channel: "terminal", author?}, meta: {fidelity:
-"reconstructed"}` and is fanned out to the connectors.
+"reconstructed"}` on the local bus.
+
+With a supported transcript reader, this is a **candidate**, stamped
+`local_only: true`. The supervisor holds it until a fresh user turn matches its
+complete text after whitespace normalisation. Each transcript occurrence can
+confirm one candidate. The matcher reads the transcript directly; the merged
+chat view includes bus records and cannot provide independent evidence.
+
+A match appends a terminal message with `meta.fidelity: "confirmed"` and
+`in_reply_to` naming the local candidate. External subscribers receive only
+this message. The original remains immutable. Unmatched candidates stay in the
+local log after expiry and never appear in external bus reads, even on replay.
+The cursor advances past local records, so they do not hold up other messages.
+
+The window defaults to **30 seconds**. The daemon resolves
+`LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS` over `terminal_confirm_seconds` in
+`~/.lmer/platform/config.json` over the default. Values are positive integer
+seconds; blank or invalid environment values fall through to the stored value.
+Set or clear the stored value through `POST /api/assistant/config`; GET reports
+the effective value and source under `terminal.confirm_seconds`.
+The daemon passes it at launch and updates running supervisors on their next
+bus poll. New submissions use the new window; existing candidates retain their
+submission-time deadlines. Each poll matches fetched evidence against its
+delivery timestamp before expiring candidates. Delivery before the deadline
+can confirm even when that poll arrives late; delivery at or after the deadline
+cannot. Without a timestamp, the poll must arrive before the deadline. Increase
+the window for sessions where queued prompts commonly take longer.
+
+Claude, Codex and pi use native transcript readers. A temporarily missing or
+unreadable transcript does not confirm anything. Drop-ins with a recognised
+native or canonical lmer transcript can confirm once that format is detected.
+Harnesses with no declared transcript directory or no recognised reader retain
+immediate `fidelity: "reconstructed"` delivery. For standalone sessions, the
+same environment override sets the supervisor window over the default.
+
+The supervisor reports `terminal_mirror.window_seconds` on `GET /messages`.
+The host control credential may update it with
+`POST /messages/terminal-mirror`, body `{"window_seconds": 30}`. Non-positive
+values and non-integers return 400; session credentials return 403. This
+updates timing only and does not expose candidates.
 
 This is best effort and says so — in the message, not only here: the chat pane
 marks such a line **· typed** (`fidelity` on the turn), Slack and matrix add
@@ -453,7 +505,10 @@ the same record, because cursor movement, tab completion and a TUI's own edits
 are invisible to the tracker, so the mirror can differ from what the harness
 received. A line whose first character is `/`, `!` or `#` is the human
 driving the TUI and is not mirrored. `LMER_COMMS_TERMINAL_MIRROR=0` turns the
-tracker off.
+tracker and confirmation off. Both reconstructed and confirmed external
+messages retain the **· typed** label.
+Bus validation applies to each reconstructed line separately. A rejected line
+does not prevent later lines in the same input chunk from being mirrored.
 
 ---
 
@@ -1048,7 +1103,11 @@ on one thread used to trade the connector back and forth, each reconcile
 stopping the other's and starting its own, which a human saw as "lmer has
 stopped listening" / "lmer is listening" several times a minute.
 
-**Rotating uber lmer.** A rotation is a stop and a start, and it settles both of
+**Rotating uber lmer.** A held-thread refusal before the incumbent is stopped is recorded as
+`assistant_rotate_refused`, with its reason and detail; ordinary start refusals
+remain `assistant_start_refused`.
+
+ A rotation is a stop and a start, and it settles both of
 its refusals *before* the stop, while there is still an assistant to keep: an
 unusable launch override, and a thread another live run holds. The two are
 settled differently, and the difference is the whole of it.
@@ -1119,6 +1178,13 @@ connectors, and every reply in it twice. A transport that cannot be asked leaves
 the link's own reading standing, because a directory lookup must not be what
 makes a connect fail.
 
+The launch-time held-thread check requires a verified identity: Slack lookup
+failures or empty answers, and matrix aliases that cannot resolve to a room id,
+refuse the launch instead of accepting the link's spelling as a different
+thread. Restore transport access and retry, or launch without that thread.
+Literal matrix room ids need no directory lookup. Adoption of an already
+started session retains best-effort resolution.
+
 **What the thread sees.** Exactly one announcement per attachment, and one line
 when it ends:
 
@@ -1126,13 +1192,25 @@ when it ends:
   the session got and how long the first reply may take, and tells its child not
   to announce again (`LMER_CHAT_ATTACH_ACK=0`);
 - otherwise the connector posts a one-line ack when it attaches — a live
-  connect, a launch-time target, a shell `lmer chat <permalink>`;
+  connect, a launch-time target, a shell `lmer chat <permalink>`. Slack and matrix include
+  the session's resolved launch preset and model from its supervisor's
+  `comms.launch` health metadata. An unset preset is shown as `none`, an unset
+  model as `harness default`; older supervisors without metadata retain the
+  original notice. Slack escapes markup in these labels; matrix sends plain text;
 - and the connector posts a one-line note whenever it stops: a disconnect, a
   session that ended, a daemon shutting down. A daemon restart therefore posts a
   note and then an ack in every thread it holds that no listener spawned, which
   is honest — those connectors really do stop listening for those seconds.
 
 Both lines pass `strip_run_references` like every other post.
+
+The affected session also receives a platform-origin bus message,
+`thread disconnected: <label>`, when a connection is removed or another holder
+prevents it from attaching. A held connection is reported once until it attaches
+successfully; reconcile retries do not repeat the notice. A later loss after
+reconnection produces a new bus record. A routine daemon
+shutdown keeps the connection records and sends no session disconnect notice.
+A bus failure is logged and does not undo a completed disconnect.
 
 **Uber lmer.** The routes work on its session id like any other, and a write
 there also edits the stored `threads` setting, so a thread connected from the

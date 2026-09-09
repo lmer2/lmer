@@ -162,6 +162,7 @@ from . import (
     ask, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
 )
 from .config import (
+    terminal_settings,
     ENV_REPO_URL,
     PlatformConfig,
     configured_repo_url,
@@ -2992,6 +2993,9 @@ def spawn_session(
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
         "LMER_SESSION_KIND": kind,
+        "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": str(
+            terminal_settings()["confirm_seconds"].value
+        ),
     }
     child_env.update(channels.env)
     child_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)

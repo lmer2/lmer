@@ -194,7 +194,8 @@ class FakeMatrix:
 
 
 class Rig:
-    def __init__(self, tmp_path, *, uploads=None, encrypted=False, authenticated_media=False):
+    def __init__(self, tmp_path, *, uploads=None, encrypted=False, authenticated_media=False,
+                 launch_settings=None):
         from fastapi.testclient import TestClient
 
         self.log = comms.MessageLog("sess-1", str(tmp_path / "messages.jsonl"))
@@ -205,7 +206,9 @@ class Rig:
             self.sink.append(bytes(data))
             return len(data)
 
-        app = supervisor._build_fastapi_app(buf, write_input, "tok", comms=self.log)
+        app = supervisor._build_fastapi_app(
+            buf, write_input, "tok", comms=self.log, launch_settings=launch_settings,
+        )
         client = bus.BusClient(bus.Endpoint(url="http://testserver", token="tok"), session=_Session(TestClient(app)))
         self.bus = client
         self.matrix = FakeMatrix(encrypted=encrypted)
@@ -837,3 +840,59 @@ class TestPostsFromOtherRuns:
         lines = [r for r in caplog.records if "unattributed_post" in r.getMessage()]
         assert len(lines) == 1
         assert "docs/COMMS.md" in lines[0].getMessage()
+
+
+@pytest.mark.parametrize("resuming", [False, True])
+@pytest.mark.parametrize("launch, expected", [
+    ({"preset": "astra", "model": "gpt-test"}, " Preset: astra; model: gpt-test."),
+    ({"preset": None, "model": None}, " Preset: none; model: harness default."),
+    ({"preset": "a<&b", "model": "<model>\nname"}, " Preset: a<&b; model: <model> name."),
+    (None, ""),
+])
+def test_attachment_notice_names_launch_settings_as_plain_text(tmp_path, launch, expected, resuming):
+    from dataclasses import replace
+
+    rig = Rig(tmp_path, launch_settings=launch)
+    rig.connector.config = replace(rig.config, attach_ack=True)
+    rig.connector.connect()
+    if resuming:
+        rig.agent("message", "already read")
+        rig.bus.ack(rig.connector.subscriber, 1)
+    try:
+        rig.connector._seed_cursor()
+        assert rig.connector._bus_cursor == (1 if resuming else 0)
+        rig.connector._announce_attached()
+        rig.connector._announce_attached()
+        assert rig.matrix.sent == [(ROOM, ROOT, connector.ATTACH_ACK + expected, "m.notice")]
+        assert rig.matrix.stamps == [{"net.20c.lmer.connection": True}]
+    finally:
+        rig.log.close()
+
+
+def test_attachment_settings_do_not_override_matrix_ack_off(tmp_path):
+    rig = Rig(tmp_path, launch_settings={"preset": "astra", "model": "gpt-test"})
+    try:
+        rig.connector._seed_cursor()
+        rig.connector._announce_attached()
+        assert rig.matrix.sent == []
+    finally:
+        rig.log.close()
+
+
+def test_matrix_attachment_notice_survives_missing_health(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    rig = Rig(tmp_path)
+    rig.connector.config = replace(rig.config, attach_ack=True)
+    rig.connector.connect()
+
+    def unavailable():
+        raise bus.BusError("health unavailable")
+
+    monkeypatch.setattr(rig.bus, "health", unavailable)
+    try:
+        rig.connector._seed_cursor()
+        rig.connector._announce_attached()
+        assert rig.matrix.sent == [(ROOM, ROOT, connector.ATTACH_ACK, "m.notice")]
+    finally:
+        rig.log.close()
