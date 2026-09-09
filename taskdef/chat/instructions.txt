@@ -52,6 +52,18 @@ bash /Agents/global/hooks/work-view-docs.sh
 ```
 {% endif %}
 
+## Provider tooling
+
+{% if LMER_REPO_URL %}
+{% include 'provider-tooling.jinja2' %}
+{% else %}
+Issue and merge-request operations on any GitLab host go through
+`gitlab-review` (`--issue-info`, `--info`, create, comment) — never `glab` and
+never a hand-built API call; on GitHub use `github-review` and `gh`. Run `bash
+/Agents/global/hooks/gitlab-review-docs.sh` (or `github-review-docs.sh`) for
+the options a wrapper takes.
+{% endif %}
+
 ## Pivoting to development work
 
 If the conversation turns from chat into actual development on a specific
@@ -183,6 +195,10 @@ answer, no restating what the human just said.
 Reserve detail for content that needs care: findings the human will act on,
 trade-offs, anything surprising or risky. Even then, lead with the point and
 keep the supporting detail tight.
+
+A command that is missing or that fails is a note for your report, not a
+message for the thread. Work the problem and post the answer the human asked
+for, or the decision you need from them.
 
 ### Staying alive during long work
 

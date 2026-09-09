@@ -74,6 +74,12 @@ def _assert_fully_rendered(out):
     assert "{%" not in out and "{{" not in out
 
 
+def _prose(out):
+    """Rendered text with its line wrapping collapsed, so a sentence
+    assertion survives a reflow of the paragraph it lives in."""
+    return " ".join(out.split())
+
+
 def _assert_mode(out, work_mode, has_phasic_include=True):
     if not has_phasic_include:
         return
@@ -169,16 +175,70 @@ class TestRenderMatrix:
 
     @pytest.mark.parametrize("provider", sorted(PROVIDERS))
     @pytest.mark.parametrize("work_mode", WORK_MODES)
+    @pytest.mark.parametrize("repo_backed", (True, False))
     def test_builtin_only_chat_renders_with_zero_config(
-        self, work_mode, provider, monkeypatch, capsys
+        self, repo_backed, work_mode, provider, monkeypatch, capsys
     ):
         """chat must work out of the box: no work repo, no external paths."""
-        monkeypatch.setenv("LMER_REPO_HOST", PROVIDERS[provider])
+        host = PROVIDERS[provider]
+        monkeypatch.setenv("LMER_REPO_HOST", host)
+        if repo_backed:
+            monkeypatch.setenv(
+                "LMER_REPO_URL", f"https://{host}/acme/widget.git"
+            )
         out = _render(REPO_TASKDEF / "chat" / "instructions.txt", work_mode)
         _assert_fully_rendered(out)
         assert "no fixed script" in out
         banner = capsys.readouterr().out
         assert f"taskdef source: {REPO_TASKDEF} (schema 1)" in banner
+
+    @pytest.mark.parametrize("provider", sorted(PROVIDERS))
+    def test_repo_backed_chat_carries_the_provider_tooling_block(
+        self, provider, monkeypatch
+    ):
+        """chat was the one taskdef without the shared block, so a chat run
+        guessed at `glab` and raw API calls the moment the conversation
+        touched an issue (#442)."""
+        host = PROVIDERS[provider]
+        monkeypatch.setenv("LMER_REPO_HOST", host)
+        monkeypatch.setenv("LMER_REPO_URL", f"https://{host}/acme/widget.git")
+
+        out = _render(REPO_TASKDEF / "chat" / "instructions.txt", "finish")
+
+        _assert_fully_rendered(out)
+        if provider == "github":
+            assert "github-review" in out
+            assert "gitlab-review" not in out
+        else:
+            assert "gitlab-review" in out
+            assert "github-review" not in out
+
+    def test_chat_without_a_repo_names_the_wrappers_itself(self):
+        """A chat session with no checkout has no host to switch on, so the
+        provider block cannot render — the no-repo branch names the wrappers
+        so the session does not fall back to `glab` or a raw API call."""
+        out = _render(REPO_TASKDEF / "chat" / "instructions.txt", "finish")
+
+        _assert_fully_rendered(out)
+        prose = _prose(out)
+        assert "operations on any GitLab host go through `gitlab-review`" in prose
+        assert "never `glab` and never a hand-built API call" in prose
+        assert "on GitHub use `github-review` and `gh`" in prose
+
+    @pytest.mark.parametrize("channel", ("slack", "matrix"))
+    def test_a_connected_chat_keeps_failed_commands_out_of_the_thread(
+        self, channel, monkeypatch
+    ):
+        monkeypatch.setenv("LMER_CHAT_CHANNEL", channel)
+
+        out = _render(REPO_TASKDEF / "chat" / "instructions.txt", "finish")
+
+        _assert_fully_rendered(out)
+        assert "## Conversation mode" in out
+        assert (
+            "is a note for your report, not a message for the thread"
+            in _prose(out)
+        )
 
     def test_repository_guidance_sends_progress_to_the_work_repository(self):
         guidance = (REPO_TASKDEF.parent / "AGENTS.md").read_text()

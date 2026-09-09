@@ -1,0 +1,3 @@
+changed:
+- "The chat taskdef now names `gitlab-review` / `github-review` for issue and merge-request
+  work, and keeps failed commands out of the connected thread (#442)"
