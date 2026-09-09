@@ -1,0 +1,3 @@
+fixed:
+- "A thread post from another lmer session or the platform now reaches the run connected to that thread instead of being skipped as an echo"
+- "A run attaching to a thread a previous run held is now replayed that run's side of the conversation, not only the human messages"

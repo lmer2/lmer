@@ -163,10 +163,12 @@ in the transcript (the `_MILESTONE_PATTERNS` list — `gate-push`,
 `gitlab-review --create-mr`/`--review-file`/`--reply-thread`,
 `github-review --review-file`, `work state set --status=complete`)
 or a run record reporting itself complete, with no signal-equivalent act after
-it (a successful `lmer-signal`; a newer signal file in the channel dir, but
-only when the transcript holds no signal of its own — ordered evidence wins
-over a file with no position in the turn; or a newly opened `lmer-ask`
-question). The reminder asks the agent to run `lmer-signal`; the hook **never
+it (a successful `lmer-signal` in one of its **milestone** forms — bare text or
+`lmer-signal milestone`; its `note`/`post`/`ask` verbs are not signals; a newer
+milestone on the session bus log (`LMER_COMMS_LOG`, falling back to a signal
+file in the ask dir), but only when the transcript holds no signal of its own —
+ordered evidence wins over a record with no position in the turn; or a newly
+opened `lmer-signal ask` question). The reminder asks the agent to run `lmer-signal`; the hook **never
 signals on the agent's behalf** — a signal must keep meaning a milestone. The
 GitLab and GitHub post-review wrappers own their milestone instead: after the
 review command succeeds they call `lmer-signal` directly. Signalling is

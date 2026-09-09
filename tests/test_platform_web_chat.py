@@ -2095,15 +2095,13 @@ _AS_THE_SESSION_RECORDS_IT = f'. {_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND}'
 
 
 def test_a_message_from_the_composer_is_marked_as_typed_by_a_person():
-    """Executed, both hops. The chat pane is the only place that knows a human
-    wrote these words in a box, and the supervisor cannot infer it: the same route
-    carries the terminal's keystrokes, where a leading `!` is an escape somebody
-    means. So the composer says so, and the flag has to survive the client — a
-    component that sets an option api.js drops puts nothing on the wire, and
-    neither half fails on its own.
-
-    The message is not touched here, which is the other half of the design: this
-    end asserts a fact, the far end decides what to do about it.
+    """Executed, both hops. The composer still says a person typed these words
+    (`sanitize`), and since the unified channel (issue 407) the words ride the
+    session's bus: api.js posts them to the comms route as a plain message, and
+    the supervisor tags them with their source — a tag that takes the first
+    column, so the `!` this test is named for can no longer reach a TUI's bash
+    escape. The message is not touched here, which is the other half of the
+    design: this end asserts a fact, the far end decides what to do about it.
     """
     seen = _wire(_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND)
 
@@ -2115,10 +2113,11 @@ def test_a_message_from_the_composer_is_marked_as_typed_by_a_person():
         "the message was edited in the browser — the words that go are the "
         "operator's, and what a TUI would make of them is decided in the session"
     )
+    assert seen["flagged"]["path"].endswith("/comms"), seen["flagged"]["path"]
     body = json.loads(seen["flagged"]["body"])
-    assert body["sanitize"] is True, f"the flag never reached the wire: {body}"
-    assert body["data"] == _A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND
-    assert body["append_newline"] is True, "a chat message is typed AND submitted"
+    assert body == {"kind": "message", "text": _A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND}, (
+        f"a submitted chat message is a bus record and nothing else: {body}"
+    )
 
 
 def test_multi_kilobyte_fenced_paste_reaches_the_wire_as_one_message():
@@ -2127,21 +2126,23 @@ def test_multi_kilobyte_fenced_paste_reaches_the_wire_as_one_message():
 
     assert seen["composed"]["data"] == payload
     body = json.loads(seen["flagged"]["body"])
-    assert body["data"] == payload
-    assert body["append_newline"] is True
+    assert body["text"] == payload and body["kind"] == "message"
 
 
 def test_a_send_nobody_flagged_puts_nothing_new_on_the_wire():
-    """Every other caller of this client — the terminal's keystrokes, anything
-    typing on the operator's behalf — sends the body it always has. Absent rather
-    than `false`, so a session running an older image sees a request it already
-    understands."""
+    """Flagged or not, a *submitted* send is the same bus record: the flag was
+    the composer's assertion for the supervisor's defusal, and the bus needs
+    none. What stays distinct is the keystroke form — `appendNewline: false`
+    keeps the raw input route — which is pinned on the client source, because
+    the probe only exercises submitted sends."""
     seen = _wire(_A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND)
 
-    body = json.loads(seen["unflagged"]["body"])
-    assert body == {
-        "data": _A_MESSAGE_THAT_STARTS_LIKE_A_COMMAND, "append_newline": True,
-    }, f"an unflagged send grew a field: {body}"
+    assert json.loads(seen["unflagged"]["body"]) == json.loads(seen["flagged"]["body"])
+    assert seen["unflagged"]["path"] == seen["flagged"]["path"]
+    client = (WEB / "src" / "api.js").read_text(encoding="utf-8")
+    keystroke = client[client.index("if (!appendNewline) {"):]
+    keystroke = keystroke[:keystroke.index("return request(`api/sessions/${encodeURIComponent(sessionId)}/comms`")]
+    assert "/input" in keystroke and "append_newline: false" in keystroke
 
 
 def _grace():

@@ -168,12 +168,13 @@ from .config import (
     with_stored_slots,
 )
 from .store import StoreError, append_event, logs_dir, utc_now_iso
+from .thread_targets import validate_thread_targets
 from . import store
 
 logger = logging.getLogger("lmer_platform.spawn")
 
 __all__ = [
-    "SpawnError", "CapacityError", "RunAlreadyLive", "SlotOccupied",
+    "SpawnError", "CapacityError", "RunAlreadyLive", "SlotOccupied", "ThreadHeld",
     "live_session_for_run",
     "SpawnRequest", "SpawnResult", "ANSWER_FLAG", "SESSION_FLAG",
     "wait_for_exit_recorded",
@@ -257,6 +258,13 @@ MODEL_FLAG = "--model"
 #: ``extra_args`` would win on argparse's last-wins rule and leave the entry, the
 #: fleet view and every post-mortem naming a harness the session never ran.
 HARNESS_FLAG = "--harness"
+
+#: How ``lmer`` is told that something else runs the connectors for its thread
+#: targets. Emitted whenever this module passes thread permalinks: the daemon
+#: runs one connector process per (session, thread) so a connection can be made
+#: and broken while the session runs, and two hosts for one thread would mean two
+#: subscribers on the bus and two copies of every reply in the thread (#412).
+NO_THREAD_CONNECTORS_FLAG = "--no-thread-connectors"
 
 #: How ``lmer`` is told a session deliberately has no repository (spec D17).
 #: Passed in the child's environment rather than as a flag because that is where
@@ -358,6 +366,14 @@ class RunAlreadyLive(SpawnError):
     :class:`CapacityError` is: the request was well formed and the same request
     will work once that session stops, so it is a 409 rather than the 400 a bare
     ``SpawnError`` means.
+    """
+
+
+class ThreadHeld(SpawnError):
+    """A launch target is a chat thread another live session already holds.
+
+    Its own class because the route answers it 409 rather than 400: the request
+    is well formed and works once the holding session lets the thread go.
     """
 
 
@@ -633,6 +649,11 @@ class SpawnRequest:
     #: is the slot's *preset* that is emitted, which is what makes occupying a
     #: slot and running in service mode one act rather than two that must agree.
     slot: Optional[str] = None
+    targets: Optional[list[str]] = None
+    #: Threads this run should *know about* without being connected to them
+    #: (issue #414): ``[{"permalink", "title"?}, …]``. Unlike ``targets`` these
+    #: reach no launch argument — the run is told about them once its bus is up.
+    references: Optional[list] = None
 
     def validate(self) -> "SpawnRequest":
         if not isinstance(self.taskdef, str) or not self.taskdef.strip():
@@ -645,6 +666,35 @@ class SpawnRequest:
         _reject_positional_flag("taskdef", self.taskdef)
         _reject_positional_flag("target", self.target)
         _reject_unsafe_taskdef(self.taskdef)
+        if self.targets is not None:
+            try:
+                validate_thread_targets(self.targets)
+            except ValueError as exc:
+                raise SpawnError(f"targets: {exc}") from exc
+        if self.references is not None:
+            # Shape here, thread-hood in `references.add`.
+            if not isinstance(self.references, list):
+                raise SpawnError("references: must be a list of {permalink, title?}")
+            for item in self.references:
+                if not isinstance(item, dict) or not item.get("permalink"):
+                    raise SpawnError(
+                        "references: each entry is an object naming a permalink"
+                    )
+            try:
+                validate_thread_targets(
+                    [item.get("permalink") for item in self.references]
+                )
+            except ValueError as exc:
+                raise SpawnError(f"references: {exc}") from exc
+            # The title too, before the container starts: a refusal after it is
+            # up can only be logged.
+            from . import references as run_references
+
+            for item in self.references:
+                try:
+                    run_references.checked_title(item.get("title"))
+                except run_references.ThreadReferenceError as exc:
+                    raise SpawnError(f"references: {exc}") from None
         if not isinstance(self.ports, int) or isinstance(self.ports, bool) or self.ports < 0:
             raise SpawnError(f"ports must be a non-negative integer, got {self.ports!r}")
         # Not a second copy of the answer path's own checks (length, emptiness
@@ -1127,6 +1177,47 @@ def _write_run_meta(
             "set a title with POST /api/runs/meta."
         )
     return None
+
+
+def _write_run_references(
+    request: SpawnRequest, host: str, project: str, slug: str
+) -> Optional[str]:
+    """Attach the spawn's reference threads to the run it just tracked (#414).
+
+    Nothing is connected and nothing is told here: the daemon's own tick tells the
+    run once its bus is up, which is the only moment there is anything to tell.
+
+    A refusal is a warning rather than an exception, for :func:`_write_run_meta`'s
+    reason — by the time this runs the session is up. A warning and not only a log
+    line, because a 201 with nothing said is how the operator's context thread
+    goes missing.
+    """
+    if not request.references:
+        return None
+    from . import references as run_references
+
+    lost = []
+    for item in request.references:
+        try:
+            run_references.add(
+                host, project, slug, item.get("permalink"),
+                title=item.get("title"), by="operator",
+            )
+        except Exception as exc:
+            logger.warning(
+                "platform_spawn_reference_refused host=%s project=%s slug=%s error=%s "
+                "— the run is running, without that reference",
+                host, project, slug, exc,
+            )
+            lost.append(f"{item.get('permalink')} ({exc})")
+    if not lost:
+        return None
+    return (
+        "the run was started and tracked, but "
+        f"{len(lost)} reference thread(s) were not attached to it: {'; '.join(lost)}. "
+        "Add them from the run's thread menu, or with POST "
+        "/api/sessions/{id}/references."
+    )
 
 
 def log_path_for(session_id: str) -> Path:
@@ -2259,7 +2350,16 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
     """
     _reject_reserved_args(request.extra_args)
     cmd = [resolve_lmer_bin(config)]
-    cmd += [request.taskdef, request.target, "--fastapi"]
+    cmd += [request.taskdef, request.target, *(request.targets or []), "--fastapi"]
+    # The thread permalinks stay positional — they are what sets the container's
+    # chat context and what lets a repo-less `chat` session start — but the
+    # connectors for them are the daemon's, so they can be added and removed
+    # while the session runs (issue #412).
+    #
+    # Unconditional: the flag says the host side of this session belongs to
+    # somebody else, which is true of every session this daemon spawns.
+    # docs/COMMS.md §12 has what emitting it only for thread targets cost.
+    cmd += [NO_THREAD_CONNECTORS_FLAG]
     if request.preset:
         cmd += [PRESET_FLAG, request.preset]
     if request.agents:
@@ -2389,6 +2489,31 @@ def _refuse_if_run_is_live(
         f"that session instead (POST /api/sessions/{entry.get('id')}/input), or "
         "wait for it to stop"
     )
+
+
+def _refuse_if_threads_are_held(targets) -> None:
+    """One live session per chat thread, enforced before a spawn creates anything.
+
+    Here for the reason :func:`_refuse_if_run_is_live` is here — every spawn path
+    passes through — and with the same timing: nothing is started, so a refused
+    launch leaves no session, no connection and no line in the thread (issue
+    #413). The rule itself lives in :mod:`lmer_platform.connectors`, which owns
+    the records it is decided from.
+
+    A host with no connectors component checks nothing: it is the daemon that
+    runs them, so there is no fleet for a thread to be held by.
+    """
+    if not targets:
+        return
+    from . import connectors as thread_connectors
+
+    component = thread_connectors.get_connectors()
+    if component is None:
+        return
+    try:
+        component.refuse_held_targets(targets)
+    except thread_connectors.ThreadError as exc:
+        raise ThreadHeld(str(exc)) from None
 
 
 def _claimed_control_ports() -> set:
@@ -2780,6 +2905,7 @@ def spawn_session(
     publish_registration: Optional[
         Callable[[Callable[[], None], str, int], None]
     ] = None,
+    refuse_held_targets: bool = True,
 ) -> SpawnResult:
     """Start a session, register it, and track its run.
 
@@ -2800,6 +2926,12 @@ def spawn_session(
     Raises :class:`RunAlreadyLive` when a live session already holds the run this
     spawn would land in — the one-run-one-session invariant, here for the reason
     the cap is here and with the reasoning in :func:`_refuse_if_run_is_live`.
+
+    Raises :class:`ThreadHeld` when a launch target names a chat thread another
+    live session holds. *refuse_held_targets* turns that off for the one caller
+    that decides it elsewhere: the assistant's targets are its **standing** list,
+    and a standing thread that is held defers rather than refusing, so uber lmer
+    still comes up (:func:`lmer_platform.assistant.start`).
     """
     request = request.validate()
     if kind not in registry.SESSION_KINDS:
@@ -2824,6 +2956,8 @@ def spawn_session(
     # refused for a run that is already running leaves nothing behind — no argv, no
     # port drawn, no directory made.
     _refuse_if_run_is_live(host, project, slug)
+    if refuse_held_targets:
+        _refuse_if_threads_are_held(request.targets)
     command = _build_command(config, request)
 
     # Before anything is created on disk, so a range with no free port leaves no
@@ -2857,6 +2991,7 @@ def spawn_session(
         "LMER_PLATFORM_PORTS_FILE": str(ports_file_for(session_id)),
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
+        "LMER_SESSION_KIND": kind,
     }
     child_env.update(channels.env)
     child_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
@@ -2911,6 +3046,7 @@ def spawn_session(
             task={
                 "taskdef": request.taskdef,
                 "target": request.target,
+                "targets": list(request.targets or []),
                 "repo": repo_url,
                 "preset": request.preset,
                 # Names only, which is all that was ever passed: the presets these
@@ -2974,6 +3110,20 @@ def spawn_session(
     else:
         publish_registration(register, session_id, process.pid)
 
+    # The launch's thread targets become connections like any other, so the fleet
+    # payload, the routes and the UI see one kind of thing and the reconcile loop
+    # starts their connectors as soon as the control plane answers (issue #412).
+    # After registration, because the reconcile reads the entry; best-effort,
+    # because a session that is already running must not fail over its bookkeeping.
+    if request.targets:
+        from . import connectors as thread_connectors
+
+        component = thread_connectors.get_connectors()
+        if component is not None:
+            component.adopt_launch_targets(
+                session_id, request.targets, by="operator",
+            )
+
     # Track the run so it appears in this orchestrator's fleet view (D25). Only
     # possible with a full identity; a session whose repo URL could not be parsed
     # still shows up via its registry entry — for as long as that entry exists,
@@ -2990,6 +3140,10 @@ def spawn_session(
         )
         # Only now: until the call above, this was a run meta.write would refuse.
         warning = _write_run_meta(request, host, project, slug)
+        # Same ordering and the same reason as the metadata above; both warnings
+        # reach the caller, because they are different losses.
+        lost_references = _write_run_references(request, host, project, slug)
+        warning = " ".join(part for part in (warning, lost_references) if part) or None
     elif request.no_repo:
         # Not the failure below, and kept apart from it deliberately: a session
         # with no repository (spec D17) has no run to file anywhere, so nothing

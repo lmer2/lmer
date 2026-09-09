@@ -61,12 +61,13 @@ import sys
 # replies. Trivial acks ("ok", "done", an emoji) are well below it.
 MIN_SUBSTANTIVE_CHARS = 40
 
-# Matches an `lmer-slack post` invocation inside a shell command. The leading
-# boundary class (start-of-string or a shell separator / path slash) keeps a
-# quoted mention like `grep "lmer-slack post"` from counting as an actual
-# post. `history`, `watch`, and `poll` do not match — only `post` resets the
-# counter.
-_SLACK_POST_RE = re.compile(r"(?:^|[\s;&|()/])lmer-slack\s+post(?:\s|$)")
+# Matches a post to the conversation inside a shell command: `lmer-signal post`
+# (issue #407) or its one-release shim `lmer-slack post`. The leading boundary
+# class (start-of-string or a shell separator / path slash) keeps a quoted
+# mention like `grep "lmer-slack post"` from counting as an actual post.
+# `history`, `watch`, `poll`, `note`, `ask` and a bare milestone do not match —
+# only `post` resets the counter, because only `post` is a reply to the human.
+_SLACK_POST_RE = re.compile(r"(?:^|[\s;&|()/])(?:lmer-slack|lmer-signal)\s+post(?:\s|$)")
 
 
 def _is_slack_post(command: str) -> bool:
@@ -178,14 +179,15 @@ def unposted_reply_chars(events: list[dict]) -> int:
 def build_reason() -> str:
     """The message fed back to the agent when the guard blocks a stop."""
     return (
-        "Slack reply-routing check: this turn produced visible reply text but "
-        "made no `lmer-slack post` call. In a Slack-bridged session the human "
-        "is reached ONLY through the Slack thread — the terminal is a separate, "
-        "normally-unattended channel, so that reply went into the void and the "
-        "human did not see it. Post your reply now with `lmer-slack post` "
-        "(use `--message-file PATH` or `--stdin` for any body containing "
-        "backticks, `$`, or quotes). If you genuinely owed the human no reply "
-        "this turn (internal/working output only), simply stop again."
+        "Reply-routing check: this turn produced visible reply text but made "
+        "no `lmer-signal post` (or `lmer-slack post`) call. In a chat-bridged "
+        "session the human is reached ONLY through the conversation channel — "
+        "the terminal is a separate, normally-unattended channel, so that reply "
+        "went into the void and the human did not see it. Post your reply now "
+        "with `lmer-signal post` (use `--message-file PATH` or `--stdin` for any "
+        "body containing backticks, `$`, or quotes). If you genuinely owed the "
+        "human no reply this turn (internal/working output only), simply stop "
+        "again."
     )
 
 
@@ -223,8 +225,13 @@ def main(argv: list[str] | None = None) -> int:
     if payload.get("stop_hook_active"):
         return 0
 
-    # No-op outside Slack-bridged sessions.
-    if not os.environ.get("LMER_SLACK_CHANNEL", "").strip():
+    # No-op outside chat-bridged sessions: a Slack thread (LMER_SLACK_CHANNEL,
+    # the historical trigger) or any chat-thread target (LMER_CHAT_CHANNEL,
+    # which the Slack and matrix target handlers both set since #407).
+    if not (
+        os.environ.get("LMER_SLACK_CHANNEL", "").strip()
+        or os.environ.get("LMER_CHAT_CHANNEL", "").strip()
+    ):
         return 0
 
     transcript_path = payload.get("transcript_path")

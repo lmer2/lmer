@@ -2,14 +2,20 @@
 
 import os
 import time
-import requests
+import uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+import requests
 
 from lmer_cli import runref
 
 
 # Maximum number of times to retry after an HTTP 429 response.
 _MAX_RETRIES = 3
+# Slack's replies response schema includes messages[].blocks[].block_id;
+# the upstream references for this transport marker are in docs/COMMS.md §9.
+CONNECTION_NOTICE_BLOCK_PREFIX = "lmer-connection-status:"
 
 
 def strip_run_references(text: str) -> str:
@@ -30,8 +36,18 @@ def strip_run_references(text: str) -> str:
 
 
 class SlackError(Exception):
-    """Typed exception for Slack API errors."""
-    pass
+    """Typed exception for Slack API errors.
+
+    ``code`` is Slack's own ``error`` field when the failure was an ``ok: false``
+    reply, and ``None`` for a transport or HTTP failure. Carried as a field
+    because callers classify on it — "your token cannot see this channel" and
+    "Slack is having a bad day" are different answers with different statuses —
+    and the message text is not a contract anything should match on.
+    """
+
+    def __init__(self, message: str, *, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class SlackClient:
@@ -77,6 +93,17 @@ class SlackClient:
         Raises:
             SlackError: On {ok: false} responses or persistent HTTP 429 errors.
         """
+        return self._request_with_response(method, endpoint, **kwargs)[0]
+
+    def _request_with_response(self, method: str, endpoint: str, **kwargs):
+        """The same call, with the response beside the parsed body.
+
+        Slack states the token's **granted scopes** in a response header
+        (`x-oauth-scopes`) rather than in any body, and one caller has to read
+        them: opening a thread refuses an app carrying `chat:write.public`,
+        because that scope is what makes `not_in_channel` — lmer's only evidence
+        that a channel is off limits — stop firing (issue #429).
+        """
         url = f"{self.BASE_URL}/{endpoint}"
 
         for attempt in range(_MAX_RETRIES + 1):
@@ -107,9 +134,9 @@ class SlackClient:
             if not data.get("ok"):
                 error_code = data.get("error", "unknown_error")
                 raise SlackError(
-                    f"Slack API error: {error_code}"
+                    f"Slack API error: {error_code}", code=error_code
                 )
-            return data
+            return data, response
 
         # Should not be reached — the loop either returns or raises.
         raise SlackError("Slack API request failed after retries")  # pragma: no cover
@@ -123,6 +150,8 @@ class SlackClient:
         channel: str,
         thread_ts: str,
         text: str,
+        *,
+        connection_notice: bool = False,
     ) -> str:
         """Post a message to a channel thread.
 
@@ -130,6 +159,7 @@ class SlackClient:
             channel: Slack channel ID.
             thread_ts: Thread timestamp to reply in.
             text: Message text.
+            connection_notice: Mark a connector lifecycle notice for later attach snapshots.
 
         Returns:
             The ``ts`` of the posted message.
@@ -144,11 +174,67 @@ class SlackClient:
             # poster added here a surface that leaks raw markdown (#241).
             "text": strip_run_references(text),
         }
+        if connection_notice:
+            payload["blocks"] = [{
+                "type": "section",
+                "block_id": CONNECTION_NOTICE_BLOCK_PREFIX + uuid.uuid4().hex,
+                "text": {"type": "mrkdwn", "text": payload["text"]},
+            }]
         data = self._request("POST", "chat.postMessage", json=payload)
         ts = data.get("ts")
         if ts is None:
             raise SlackError("Slack chat.postMessage response missing 'ts' field")
         return ts
+
+    def post_root(self, channel: str, text: str) -> Dict[str, Any]:
+        """Post a message that is not a reply, opening a thread on it (#429).
+
+        Args:
+            channel: Slack channel ID, or a channel name (``#general``), which
+                     ``chat.postMessage`` resolves itself.
+            text: Message text.
+
+        Returns:
+            ``{"channel": <the id Slack resolved>, "ts": <the root's ts>}``.
+
+        Raises:
+            SlackError: On Slack API errors — ``not_in_channel`` and
+                        ``channel_not_found`` among them, which is how a channel
+                        the bot is not in is refused by name.
+        """
+        payload = {"channel": channel, "text": strip_run_references(text)}
+        data = self._request("POST", "chat.postMessage", json=payload)
+        ts = data.get("ts")
+        resolved = data.get("channel")
+        if ts is None or not isinstance(resolved, str):
+            raise SlackError(
+                "Slack chat.postMessage response missing 'ts' or 'channel' field"
+            )
+        return {"channel": resolved, "ts": ts}
+
+    def workspace(self) -> Dict[str, Any]:
+        """``{"host": …, "scopes": [...]}`` — the workspace, and what this token may do.
+
+        One ``auth.test``, which needs no scope of its own, answering both
+        questions opening a thread has to ask: which host to compose the new
+        thread's permalink on, and whether the app carries a scope that would
+        let it post into a channel nobody invited it to. ``scopes`` is ``None``
+        when the header is absent — a proxy that strips it, an older API — which
+        is *not knowing* rather than "no scopes".
+        """
+        data, response = self._request_with_response("POST", "auth.test")
+        url = data.get("url")
+        host = urlparse(url).hostname if isinstance(url, str) else None
+        if not host:
+            raise SlackError("Slack auth.test response carries no workspace url")
+        granted = response.headers.get("x-oauth-scopes")
+        return {
+            "host": host,
+            "scopes": (
+                [scope.strip() for scope in granted.split(",") if scope.strip()]
+                if isinstance(granted, str) else None
+            ),
+        }
 
     def get_replies(
         self,

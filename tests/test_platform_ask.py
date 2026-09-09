@@ -27,7 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ask_channel import protocol
-from lmer_platform import api, ask, inventory, registry, spawn, store
+from lmer_platform import api, ask, comms, inventory, registry, spawn, store
 from lmer_platform import config as cfg
 from tests.conftest import strip_lmer_env
 from tests.test_platform_inventory import plant_run, session, state_yaml
@@ -77,6 +77,9 @@ class _Handler(BaseHTTPRequestHandler):
             {"ok": True, "cursor": 0, "rows": 24, "cols": 80} if status == 200
             else {"detail": "no"}
         )
+        if status == 200 and plane.comms is not None:
+            # What tells a reader this session keeps a bus (docs/COMMS.md §3).
+            payload["comms"] = plane.comms
         encoded = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -100,6 +103,7 @@ class HealthPlane:
     def __init__(self):
         self.calls = []
         self.healthz_status = 200
+        self.comms = None
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self._server.plane = self
         self.port = self._server.server_address[1]
@@ -900,6 +904,86 @@ def test_answering_over_the_api_lands_in_the_channel(client, platform_root):
     assert protocol.answer_for(directory, question).text == "prep-release"
 
 
+def test_answering_by_option_index_lands_the_option_s_text(client, platform_root):
+    """#428: the operator reads a numbered list and names N. This leg's reader is
+    a session with no bus, so the file has to carry the words, not the index."""
+    session_id = live_session(platform_root)
+    directory = channel_for(session_id)
+    question = protocol.post_question(directory, "which branch?", ["main", "prep-release"])
+
+    reply = client.post(
+        f"/api/sessions/{session_id}/ask/{question.id}/answer",
+        json={"option": 2},
+        headers=auth(),
+    )
+    assert reply.status_code == 200
+    answer = protocol.answer_for(directory, question)
+    assert (answer.text, answer.option) == ("prep-release", 2)
+
+
+def test_the_file_leg_refuses_an_index_beside_words_like_the_bus_does(client, platform_root):
+    """Round 3, major: this leg overwrote the caller's text with the indexed
+    option, so the same route meant two different things depending on the
+    session's vintage — 400 on a bus session, 200-and-the-words-are-gone here.
+    This is the population the leg exists for (every #421 rollout session)."""
+    session_id = live_session(platform_root)
+    directory = channel_for(session_id)
+    question = protocol.post_question(directory, "which branch?", ["main", "prep-release"])
+
+    reply = client.post(
+        f"/api/sessions/{session_id}/ask/{question.id}/answer",
+        json={"answer": "main, but rebase onto prep first", "option": 2},
+        headers=auth(),
+    )
+    assert reply.status_code == 400
+    assert "not both" in reply.json()["detail"]
+    assert protocol.answer_for(directory, question) is None, "nothing was written"
+
+
+def test_the_file_leg_keeps_an_index_beside_words_that_name_it(client, platform_root):
+    """The exception the bus makes, for the same reason: it is what the
+    ask-directory answer file's own shape is."""
+    session_id = live_session(platform_root)
+    directory = channel_for(session_id)
+    question = protocol.post_question(directory, "which branch?", ["main", "prep-release"])
+
+    reply = client.post(
+        f"/api/sessions/{session_id}/ask/{question.id}/answer",
+        json={"answer": "PREP-RELEASE", "option": 2},
+        headers=auth(),
+    )
+    assert reply.status_code == 200
+    answer = protocol.answer_for(directory, question)
+    assert (answer.text, answer.option) == ("prep-release", 2)
+
+
+def test_an_option_index_the_question_does_not_offer_is_a_400(client, platform_root):
+    session_id = live_session(platform_root)
+    question = protocol.post_question(channel_for(session_id), "which?", ["main", "prep"])
+    reply = client.post(
+        f"/api/sessions/{session_id}/ask/{question.id}/answer",
+        json={"option": 3},
+        headers=auth(),
+    )
+    assert reply.status_code == 400
+    assert "not one of the 2" in reply.json()["detail"]
+
+
+@pytest.mark.parametrize("body, expected", [
+    ({}, "answer must be text"),
+    ({"option": "2"}, "option must be a whole number"),
+    ({"option": True}, "option must be a whole number"),
+])
+def test_an_answer_that_names_nothing_is_a_400(client, platform_root, body, expected):
+    session_id = live_session(platform_root)
+    question = protocol.post_question(channel_for(session_id), "which?", ["main", "prep"])
+    reply = client.post(
+        f"/api/sessions/{session_id}/ask/{question.id}/answer", json=body, headers=auth(),
+    )
+    assert reply.status_code == 400
+    assert expected in reply.json()["detail"]
+
+
 def test_the_answer_text_is_not_echoed_back(client, platform_root):
     session_id = live_session(platform_root)
     question = protocol.post_question(channel_for(session_id), "which branch?")
@@ -1035,6 +1119,70 @@ def test_the_route_list_keeps_the_two_answer_paths_apart(client):
     text = client.get("/api", headers=auth()).text
     assert "/api/sessions/{id}/ask" in text
     assert "No container is started." in text
+
+
+# --- issue #421: a bus session whose in-tree CLI predates the bus --------------
+#
+# The daemon cannot tell such a session from one using the bus: both answer
+# `/healthz` with `comms`. What separates them is where the question is — the
+# ask directory only, because the CLI that asked writes nowhere else. The other
+# direction, a question the bus does know, is pinned in
+# `tests/test_platform_comms.py` against a real supervisor bus.
+
+
+def _bus_session(platform_root, plane):
+    """A session whose supervisor keeps a bus, with a hub to read it."""
+    plane.comms = {"schema": 1, "seq": 0, "log": None, "open_questions": 0}
+    session_id = live_session(platform_root)
+    comms.ensure_hub()
+    return session_id
+
+
+def test_a_question_only_the_ask_directory_holds_is_answered_by_file(
+    client, platform_root, plane
+):
+    session_id = _bus_session(platform_root, plane)
+    directory = channel_for(session_id)
+    question = protocol.post_question(directory, "which branch?")
+
+    listed = client.get(f"/api/sessions/{session_id}/ask", headers=auth()).json()
+    assert [entry["id"] for entry in listed["entries"]] == [question.id]
+
+    reply = client.post(
+        f"/api/sessions/{session_id}/ask/{question.id}/answer",
+        json={"answer": "prep-release"}, headers=auth(),
+    )
+    assert reply.status_code == 200, reply.text
+    assert protocol.answer_for(directory, question).text == "prep-release"
+
+
+def test_the_refusals_the_file_path_owns_still_reach_the_operator(
+    client, platform_root, plane
+):
+    """Answered and closed are this path's refusals, and they say more than a
+    bus 400 would: the bus does not know the question at all."""
+    session_id = _bus_session(platform_root, plane)
+    directory = channel_for(session_id)
+    question = protocol.post_question(directory, "ship?")
+    url = f"/api/sessions/{session_id}/ask/{question.id}/answer"
+    assert client.post(url, json={"answer": "yes"}, headers=auth()).status_code == 200
+    assert client.post(url, json={"answer": "no"}, headers=auth()).status_code == 409
+
+
+def test_a_session_without_a_bus_is_untouched_by_the_fallback(
+    client, platform_root, plane
+):
+    """`comms` absent from /healthz: the file path was always this row's."""
+    session_id = live_session(platform_root)
+    directory = channel_for(session_id)
+    question = protocol.post_question(directory, "which branch?")
+    comms.ensure_hub()
+    reply = client.post(
+        f"/api/sessions/{session_id}/ask/{question.id}/answer",
+        json={"answer": "prep-release"}, headers=auth(),
+    )
+    assert reply.status_code == 200
+    assert protocol.answer_for(directory, question).text == "prep-release"
 
 
 def test_the_channel_survives_the_session(client, platform_root):

@@ -66,7 +66,7 @@ def _git_config(key: str) -> str | None:
 TRUTHY_VALUES = frozenset({"1", "yes", "true"})
 
 
-def get_bool_env(var_name: str, default: bool = False) -> bool:
+def get_bool_env(var_name: str, default: bool = False, *, env=None) -> bool:
     """
     Parse a boolean environment variable.
 
@@ -78,11 +78,14 @@ def get_bool_env(var_name: str, default: bool = False) -> bool:
     Args:
         var_name: Name of the environment variable
         default: Default value if variable is unset or empty
+        env: Mapping to read instead of ``os.environ`` — for a caller that is
+            handed an environment rather than running in it (a connector's
+            config, a test)
 
     Returns:
         Boolean value parsed from environment variable
     """
-    value = os.environ.get(var_name, "").strip().lower()
+    value = (env if env is not None else os.environ).get(var_name, "").strip().lower()
     if not value:
         return default
 

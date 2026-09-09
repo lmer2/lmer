@@ -1,0 +1,2 @@
+fixed:
+- "Refused a second session attaching to a chat thread another live run holds, instead of the two connectors stopping and restarting each other"

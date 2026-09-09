@@ -1,6 +1,7 @@
 """Tests for the orchestrator signal-reminder Stop hook (hooks/signal_guard.py)."""
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -371,6 +372,29 @@ class TestPatternsMatchRealCommands:
         assert bare, "expected at least one bare-command row (gate-push)"
         for label in bare:
             assert (REPO_ROOT / "bin" / label).exists()
+
+    def test_the_non_milestone_verbs_are_every_verb_but_milestone(self):
+        """The one string that decides what a milestone looks like, held against
+        the CLI that owns the verbs.
+
+        Nothing held it before, and two verbs were added past it — `read` (#414)
+        and `thread` (#429) — each of which then cleared a pending nudge for work
+        that reported nothing. A verb added to `lmer-signal` without a thought
+        for this hook now fails here instead.
+        """
+        from ask_channel.signal_cli import VERBS
+
+        from hooks.signal_guard import _NON_MILESTONE_VERBS, _is_signal
+
+        # Parsed rather than stripped: `.strip("()?:r")` would eat a verb
+        # beginning or ending in `r` (reviewer's nit on !299).
+        inside = re.fullmatch(r"\(\?:(.+)\)", _NON_MILESTONE_VERBS)
+        assert inside, f"the alternation moved: {_NON_MILESTONE_VERBS}"
+        spelled = set(inside.group(1).split("|"))
+        assert spelled == {verb for verb in VERBS if verb != "milestone"}
+        # And the bare form, which carries no verb at all, is still a milestone.
+        assert _is_signal('lmer-signal "the MR is up"')
+        assert not _is_signal("lmer-signal thread open #a-channel")
 
     def test_the_completion_status_value_is_a_real_choice(self):
         # The row matches `--status=complete` specifically, so the *value* has to
@@ -809,6 +833,10 @@ GUARD_ENV_VARS = (
     "LMER_SIGNAL_GUARD",
     "LMER_ASK_DIR",
     "LMER_SESSION_ID",
+    # The hook prefers the bus log over the ask dir when this names a readable
+    # file (#407), so a stray one from anywhere in the suite decides these
+    # tests' outcome instead of the fixture.
+    "LMER_COMMS_LOG",
 )
 
 
@@ -1536,3 +1564,101 @@ class TestSettingsWiring:
         source = (REPO_ROOT / "src" / "lmer_cli" / "cli.py").read_text()
         assert '"LMER_SIGNAL_GUARD": os.environ.get("LMER_SIGNAL_GUARD")' in source, (
             "LMER_SIGNAL_GUARD entry missing from cli.py env dict")
+
+
+# ---------------------------------------------------------------------------
+# #407: lmer-signal grew verbs; only its milestone forms are signals, and the
+# bus log is the first evidence source
+# ---------------------------------------------------------------------------
+
+from hooks.signal_guard import _is_signal as _is_signal_cmd, read_comms_log  # noqa: E402
+
+
+class TestSignalVerbs:
+    @pytest.mark.parametrize("cmd", [
+        'lmer-signal "pushed MR !167"',
+        "lmer-signal pushed",
+        'lmer-signal milestone "pushed MR !167"',
+        "lmer-signal --message-file /tmp/m.txt",
+        "cat /tmp/m | lmer-signal --stdin",
+        'gate-push && lmer-signal "done"',
+        'lmer-signal "note"',  # a milestone whose text is the word note
+    ])
+    def test_milestone_forms_are_signals(self, cmd):
+        assert _is_signal_cmd(cmd) is True
+
+    @pytest.mark.parametrize("cmd", [
+        'lmer-signal note "working on the tests"',
+        'lmer-signal post "here is the result"',
+        'lmer-signal ask "which branch?" --option main',
+        "lmer-signal wait 000003",
+        "lmer-signal close 000003",
+        "lmer-signal list --open",
+        'echo "then run lmer-signal when done"',
+    ])
+    def test_other_verbs_and_mentions_are_not(self, cmd):
+        assert _is_signal_cmd(cmd) is False
+
+
+class TestCommsLogEvidence:
+    def _write(self, tmp_path, records):
+        path = tmp_path / "messages.jsonl"
+        path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        return str(path)
+
+    def test_newest_milestone_and_open_question(self, tmp_path):
+        path = self._write(tmp_path, [
+            {"seq": 1, "id": "s/000001", "kind": "milestone"},
+            {"seq": 2, "id": "s/000002", "kind": "question"},
+            {"seq": 3, "id": "s/000003", "kind": "note"},
+            {"seq": 4, "id": "s/000004", "kind": "milestone"},
+            {"seq": 5, "id": "s/000005", "kind": "question"},
+            {"seq": 6, "id": "s/000006", "kind": "answer", "in_reply_to": "s/000005"},
+        ])
+        assert read_comms_log(path) == {"newest_milestone": 4, "newest_open_question": 2}
+
+    def test_a_close_ends_a_question_and_a_late_answer_does_not(self, tmp_path):
+        path = self._write(tmp_path, [
+            {"seq": 1, "id": "s/000001", "kind": "question"},
+            {"seq": 2, "id": "s/000002", "kind": "close", "in_reply_to": "s/000001"},
+            {"seq": 3, "id": "s/000003", "kind": "question"},
+            {"seq": 4, "id": "s/000004", "kind": "answer", "in_reply_to": "s/000003", "meta": {"late": True}},
+        ])
+        assert read_comms_log(path) == {"newest_milestone": None, "newest_open_question": 3}
+
+    def test_unreadable_or_torn_lines_fail_open(self, tmp_path):
+        assert read_comms_log(str(tmp_path / "absent.jsonl")) is None
+        path = tmp_path / "messages.jsonl"
+        path.write_text('{"seq": 1, "kind": "milestone"}\n{"seq": 2, "kind": "mil', encoding="utf-8")
+        assert read_comms_log(str(path)) == {"newest_milestone": 1, "newest_open_question": None}
+
+    def test_the_hook_prefers_the_bus_log_over_the_ask_dir(self, tmp_path, monkeypatch):
+        """With a bus log naming a milestone the ask dir does not have, the
+        channel-signal suppressor still fires — the projection may lag."""
+        ask_dir = tmp_path / "ask"
+        ask_dir.mkdir()
+        log = self._write(tmp_path, [{"seq": 7, "id": "s/000007", "kind": "milestone"}])
+        marker = tmp_path / "marker.json"
+        transcript = tmp_path / "t.jsonl"
+        transcript.write_text(
+            json.dumps(_assistant_bash("gate-push", tool_id="t1")) + "\n"
+            + json.dumps(_tool_result("ok", tool_use_id="t1")) + "\n",
+            encoding="utf-8",
+        )
+        env = {
+            **os.environ,
+            "LMER_ASK_DIR": str(ask_dir),
+            "LMER_COMMS_LOG": log,
+            "LMER_SESSION_ID": f"t-{uuid.uuid4().hex}",
+        }
+        env.pop("LMER_NONINTERACTIVE", None)
+        import hooks.signal_guard as guard
+        monkeypatch.setattr(guard, "MARKER_TEMPLATE", str(marker).replace("marker", "{session}"))
+        result = subprocess.run(
+            [sys.executable, str(HOOK)],
+            input=json.dumps({"transcript_path": str(transcript)}),
+            capture_output=True, text=True, env=env, timeout=30,
+        )
+        assert result.returncode == 0
+        # A signal file newer than the (absent) baseline suppresses this stop.
+        assert result.stdout.strip() == ""

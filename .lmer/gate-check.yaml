@@ -62,6 +62,9 @@ tests:
     # `Path(__file__).parent.parent`, an idiom the scanner does not model —
     # listed by hand, as the header above says such a test must be.
     - tests/test_statusline.py
+    # Reads docs/COMMS.md's §1 `meta` row: the reserved-key set is asserted
+    # against the keys that row names, so a text-only edit to it must run this.
+    - tests/test_supervisor_comms.py
     - tests/test_platform_web_app.py
     - tests/test_platform_web_assistant.py
     - tests/test_platform_web_bundle.py

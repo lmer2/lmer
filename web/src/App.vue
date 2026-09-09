@@ -776,6 +776,7 @@ onUnmounted(() => {
                 @open="open"
                 @forget="forget"
                 @open-chat="uberOpen = true"
+                @threads-changed="load"
               />
             </template>
 
@@ -790,6 +791,7 @@ onUnmounted(() => {
               @open="open"
               @forget="forget"
               @open-chat="uberOpen = true"
+              @threads-changed="load"
             />
 
             <p

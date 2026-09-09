@@ -193,13 +193,26 @@ conversation window is lost.
   Whether a given TUI repaints on being resized is the TUI's own behaviour; if it
   does not, tap again or use its own redraw key.
 - **uber lmer settings** — how its session is *run* (model, harness, preset,
-  agents fan-out), per platform instance: the settings entry in the drawer's
+  agents fan-out, Slack/matrix threads), per platform instance: the settings entry in the drawer's
   overflow menu, or `GET`/`POST /api/assistant/config`. Each value shows which
   layer decided it (an `LMER_PLATFORM_ASSISTANT_*` export beats what the
   dialog persists to `config.json`, and the dialog says so). Changes apply to
   the **next** incarnation — the running one keeps its context window until
   you restart it, and the dialog offers the restart. Standing orders are the
-  chat's to edit and are deliberately not in this dialog.
+  chat's to edit and are deliberately not in this dialog. Thread permalinks go
+  one per line; save and rotate to connect. The saved list survives rotations.
+  Workers accept the same links through `POST /api/sessions` (`targets`) or
+  repeatable `lmer-ctl spawn --target-thread` flags. See
+  [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).
+- **Thread icons** — every run row, the run view header and the uber lmer chat
+  pane header carry two small icons, Slack and matrix. A dim one opens a
+  one-field prompt for a thread permalink; a coloured one names the threads on
+  hover, carries a count when there is more than one, and offers a link and a
+  disconnect for each. Connecting and disconnecting happen **while the session
+  runs** — nothing restarts — and doing it on uber lmer also moves its standing
+  `threads` setting, so the connection survives a rotation. A run with no live
+  session shows what it was connected to and offers no new connection. The same
+  three calls are `lmer-ctl threads list|connect|disconnect`.
 - **A message that never settles** — a message you sent is shown as a bubble until
   the harness writes that turn into its transcript, which is how a queued message
   stays visible. When one gets stuck there — a transcript gap, which is a bug rather

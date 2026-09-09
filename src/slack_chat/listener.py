@@ -30,6 +30,7 @@ from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.tls import ensure_ca_bundle
 
 from .registry import is_thread_connected
+from .sessions import preset_ack_parts
 from .sessions import SessionManager
 
 logger = logging.getLogger("lmer_slack.listener")
@@ -108,65 +109,6 @@ DM_ALLOWED_USERS: set[str] = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
 # Whether a listener-wide default is defined is a question about the spawned
 # CLI's environment instead — see SessionManager.child_presets (issue #279).
 PRESETS: dict[str, Preset] = load_presets()
-
-
-def _preset_ack_parts(preset: Preset | None) -> tuple[str, str]:
-    """Say which preset the session being spawned is actually getting.
-
-    Returns ``(clause, warning)`` — a fragment appended to the connecting ack,
-    and an optional separate warning line.
-
-    Both selectors are reported, because both are invisible from Slack
-    (issue #181). A ``$preset:`` token names the preset it applies and, when it
-    replaced a listener-wide default, says so; with no token the
-    env-selected default is named too, since "my session silently got a preset
-    I never asked for" is exactly the confusion this is fixing. The person who
-    needs to know is the one who just typed the message, so this belongs in the
-    thread and not only in ``lmer_session_spawned``.
-
-    A default naming a preset that is not defined gets the warning line: the
-    spawned CLI rejects an unknown preset with exit 2, so the session would
-    otherwise die seconds after a cheerful "Connecting…" with the reason
-    visible only in the listener's log. Unlike an unknown *token* — a user
-    error, rejected before spawning — this is an operator misconfiguration of
-    the listener itself, so the spawn still goes ahead and only the diagnosis
-    is surfaced.
-
-    The default is resolved through the session manager because it owns the
-    ``.env`` files the spawned CLI seeds itself from: a default that lives
-    only in the forwarded ``--env-file`` applies to the session and must be
-    named here too (issue #259). Its *availability* is asked of the manager for
-    the same reason (issue #279): ``LMER_PRESETS_FILE`` travels those same
-    tiers, so checking a file-sourced default against the listener's own
-    ``PRESETS`` — loaded from an environment that never reads that file —
-    warned that a session would fail to start when the child was about to load
-    the very preset being named. ``PRESETS`` still answers for a ``$preset:``
-    token, which is resolved here and must name something this listener holds.
-    """
-    default_name, default_source = session_manager.default_preset()
-    if preset is not None:
-        if default_name and default_name != preset.name:
-            return (
-                f" using preset `{preset.name}` (replacing the listener "
-                f"default `{default_name}` from `{default_source}`)",
-                "",
-            )
-        return f" using preset `{preset.name}`", ""
-    if not default_name:
-        return "", ""
-    child_presets = session_manager.child_presets()
-    if default_name in child_presets:
-        return (
-            f" using the listener default preset `{default_name}` "
-            f"(from `{default_source}`)",
-            "",
-        )
-    available = ", ".join(sorted(child_presets)) or "(none configured)"
-    return "", (
-        f"⚠️ The listener default preset `{default_name}` (from "
-        f"`{default_source}`) is not defined, so this session will fail to "
-        f"start. Available presets: {available}."
-    )
 
 
 def build_app(token: str | None = None):
@@ -417,7 +359,7 @@ async def _connect_lmer_session(
             )
             return
 
-    preset_clause, preset_warning = _preset_ack_parts(preset)
+    preset_clause, preset_warning = preset_ack_parts(preset, session_manager)
     ack = "Connecting a session to this thread"
     ack += preset_clause
     ack += "... ⏳ (the first reply can take a minute)"

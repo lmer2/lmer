@@ -342,18 +342,34 @@ def test_cli_publishes_the_resolved_fastapi_port():
     assert re.search(r"_publish_host_ports\(\s*run,\s*\[host_port\]", source)
 
 
-def test_cli_forwards_a_host_set_fastapi_token():
-    """A spawner that minted the bearer token must have it reach the container.
+def test_cli_forwards_a_host_set_fastapi_token_as_its_hash():
+    """A spawner that minted the bearer token must have the container able to
+    verify it — and unable to read it.
 
-    Otherwise the in-container supervisor generates its own and the spawner's
-    recorded copy opens nothing. The flag still wins over the env var.
+    The supervisor authenticates the control credential against this digest and
+    mints the session's own token separately (issue #407): the preimage stays
+    out of the container, where any process the harness runs could read it from
+    `/proc/1/environ` and post as a human on any channel. Without the digest the
+    in-container supervisor generates a token nobody outside knows and the
+    spawner's recorded copy opens nothing. The flag still wins over the env var.
     """
     source = CLI_PY.read_text()
     assert re.search(
-        r'["\']LMER_FASTAPI_TOKEN["\']\s*:\s*ns\.fastapi_token'
+        r'control_token\s*=\s*ns\.fastapi_token'
         r'\s*or\s*os\.environ\.get\(\s*["\']LMER_FASTAPI_TOKEN["\']\s*\)',
         source,
-    ), "the env dict must fall back to $LMER_FASTAPI_TOKEN when --fastapi-token is absent"
+    ), "the token must fall back to $LMER_FASTAPI_TOKEN when --fastapi-token is absent"
+    assert re.search(
+        r'control_token_digest\s*=\s*\(?\s*hashlib\.sha256\('
+        r'\s*control_token\.encode\(["\']utf-8["\']\)\s*\)\.hexdigest\(\)',
+        source,
+    ), "the resolved token must be hashed for the container"
+    assert re.search(
+        r'["\']LMER_FASTAPI_TOKEN_SHA256["\']\s*:\s*control_token_digest', source,
+    ), "the env dict must forward the digest"
+    assert re.search(
+        r'["\']LMER_FASTAPI_TOKEN["\']\s*:\s*None', source,
+    ), "the preimage must be seeded None so no .env merge forwards it"
 
 
 class TestRecordPublishedPorts:

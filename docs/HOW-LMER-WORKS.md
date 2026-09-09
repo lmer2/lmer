@@ -149,11 +149,15 @@ flowchart TD
 
 How a running session reaches you:
 
-- **Ask channel** — an agent that needs a decision runs `lmer-ask`; the
-  question appears as a card in the UI (and in Matrix), and the agent waits
-  for your answer.
-- **Signals** — milestones ("MR pushed", "review done") go to uber lmer,
-  which decides what to spawn or wind down next.
+- **One channel, both directions** — the supervisor inside the container keeps
+  the session's message bus. An agent that needs a decision runs
+  `lmer-signal ask`; the question appears in the chat pane, in a connected
+  Slack thread and in a connected matrix thread at once, the first answer from
+  any of them wins, and the others see who answered. Whatever anyone types in
+  any of those channels reaches the agent as a turn tagged with its source
+  (`[slack · vegu] …`). See [COMMS.md](./COMMS.md).
+- **Signals** — milestones (`lmer-signal "MR pushed"`) ride the same bus and
+  reach uber lmer, which decides what to spawn or wind down next.
 - **Digests** — the daemon, not an AI, notices when a run needs attention or
   has stopped, and nudges uber lmer once when it goes quiet.
 - **Uploads** — a screenshot or log you attach in chat lands in the

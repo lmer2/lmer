@@ -172,13 +172,30 @@ _MILESTONE_PATTERNS = (
      re.compile(_BOUNDARY + r"work\s+state\s+set\s[^\n]*--status(?:=|\s+)complete" + _TRAIL)),
 )
 
-# A signal invocation. Matched loosely on purpose: any command that runs
-# `lmer-signal` at all counts, because the message body is the agent's and the
-# guard only cares that the channel was used. Quote-stripped like the milestone
-# patterns — a mention inside a quoted string
-# (`echo "then run lmer-signal when done"`) would otherwise clear a genuinely
-# pending milestone, which is the expensive direction to be wrong in.
-_SIGNAL_RE = re.compile(_BOUNDARY + r"lmer-signal" + _TRAIL)
+# A signal invocation: `lmer-signal` in its milestone forms — bare text, or the
+# explicit `milestone` verb. Since #407 the same command also carries notes,
+# posts and questions, and those are NOT signals: a progress note must not
+# clear a pending milestone. Quote-stripped like the milestone patterns — a
+# mention inside a quoted string (`echo "then run lmer-signal when done"`)
+# would otherwise clear a genuinely pending milestone, which is the expensive
+# direction to be wrong in; and because quoted spans are blanked first, a
+# milestone whose text happens to be the word `note` still counts.
+# Every verb but `milestone`, and complete: one missing reads as a milestone and
+# clears a pending nudge, which happened twice running (`read` in #414, `thread`
+# in #429) with nothing holding this string against the CLI. Now
+# tests/test_signal_guard.py does. Spelled out rather than imported from
+# `ask_channel.signal_cli`: a hook needing the package on its path fails closed.
+_NON_MILESTONE_VERBS = r"(?:note|post|read|thread|ask|wait|close|list|end-session)"
+_SIGNAL_RE = re.compile(
+    _BOUNDARY + r"lmer-signal" + r"(?!\s+" + _NON_MILESTONE_VERBS + _TRAIL + r")" + _TRAIL
+)
+
+# The bus log (issue #407): the supervisor's per-session record, exported to
+# the harness as LMER_COMMS_LOG when the session directory is mounted. When it
+# is readable it is the first source for the two facts the ask dir used to
+# answer — the newest milestone and the newest open question — because the ask
+# dir is now a projection of it. Ids agree: the bus `seq` is the ask-dir id.
+COMMS_LOG_ENV = "LMER_COMMS_LOG"
 
 # Marker key for the facts-side milestone. Distinct from any transcript key
 # (those are tool_use ids) so a run reporting itself complete costs exactly
@@ -502,6 +519,49 @@ def has_open_question(names: list[str]) -> bool:
     return newest_open_question_id(names) is not None
 
 
+def read_comms_log(path: str) -> dict | None:
+    """The newest milestone seq and the newest open question seq on the bus log.
+
+    ``None`` when the log cannot be read — the caller falls back to the ask
+    dir. A question is open when no later ``answer`` (that is not late) or
+    ``close`` names it; that is the supervisor's own fold, re-derived here from
+    the same records because hooks import no project code.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    newest_milestone: int | None = None
+    open_questions: dict = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("kind")
+        seq = record.get("seq")
+        if not isinstance(seq, int):
+            continue
+        if kind == "milestone":
+            if newest_milestone is None or seq > newest_milestone:
+                newest_milestone = seq
+        elif kind == "question":
+            open_questions[record.get("id")] = seq
+        elif kind in ("answer", "close"):
+            meta = record.get("meta") if isinstance(record.get("meta"), dict) else {}
+            if kind == "answer" and meta.get("late"):
+                continue
+            open_questions.pop(record.get("in_reply_to"), None)
+    newest_question = max(open_questions.values()) if open_questions else None
+    return {"newest_milestone": newest_milestone, "newest_open_question": newest_question}
+
+
 def signal_is_new(newest_id: int | None, baseline: int | None) -> bool:
     """
     Whether the channel dir shows a signal the guard has not accounted for.
@@ -797,6 +857,12 @@ def main(argv: list[str] | None = None) -> int:
 
     newest_signal = newest_signal_id(names)
     newest_question = newest_open_question_id(names)
+    comms_log = os.environ.get(COMMS_LOG_ENV, "").strip()
+    if comms_log:
+        facts = read_comms_log(comms_log)
+        if facts is not None:
+            newest_signal = facts["newest_milestone"]
+            newest_question = facts["newest_open_question"]
     signal_seen = signal_is_new(newest_signal, baseline)
     question_seen = signal_is_new(newest_question, question_baseline)
 

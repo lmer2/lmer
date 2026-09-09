@@ -287,7 +287,7 @@ def test_status_does_not_wait_for_the_container_spawn(
     status_done = threading.Event()
     started = {}
 
-    def held_spawn(_config, _request, *, kind, publish_registration):
+    def held_spawn(_config, _request, *, kind, publish_registration, **_):
         spawn_held.set()
         assert release_spawn.wait(timeout=10), "the held spawn was never released"
 

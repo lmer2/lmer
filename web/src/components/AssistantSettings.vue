@@ -52,12 +52,13 @@ const open = computed({
   set: (value) => emit('update:modelValue', value),
 })
 
-const SETTING_KEYS = ['model', 'harness', 'preset', 'agents']
+const SETTING_KEYS = ['model', 'harness', 'preset', 'agents', 'threads']
 const SETTING_HINTS = {
   model: 'the model the session runs, handed to the harness verbatim',
   harness: 'agent harness (e.g. claude, codex, pi)',
   preset: 'named startup preset from the host’s presets file',
   agents: 'comma-separated preset names the session may fan out to',
+  threads: 'Slack or matrix thread permalinks, one per line',
 }
 
 const reply = ref(null)
@@ -71,7 +72,7 @@ const saved = ref(false)
 // reply carries everything needed to tell (`changed` + per-key `source`), so
 // the banner can be as honest as the field captions above it.
 const savedShadowed = ref(false)
-const fields = reactive({ model: '', harness: '', preset: '', agents: '' })
+const fields = reactive({ model: '', harness: '', preset: '', agents: '', threads: '' })
 
 let seq = 0
 let disposed = false
@@ -118,7 +119,8 @@ async function load() {
 
 function prefill(config) {
   for (const key of SETTING_KEYS) {
-    fields[key] = config.settings?.[key]?.stored || ''
+    const stored = config.settings?.[key]?.stored
+    fields[key] = key === 'threads' && Array.isArray(stored) ? stored.join('\n') : stored || ''
   }
 }
 
@@ -128,6 +130,12 @@ function prefill(config) {
 function changes() {
   const named = {}
   for (const key of SETTING_KEYS) {
+    if (key === 'threads') {
+      const stored = reply.value?.settings?.threads?.stored || []
+      const edited = (fields.threads || '').split('\n').map((line) => line.trim()).filter(Boolean)
+      if (JSON.stringify(edited) !== JSON.stringify(stored)) named.threads = edited
+      continue
+    }
     const stored = reply.value?.settings?.[key]?.stored || ''
     const edited = (fields[key] || '').trim()
     if (edited !== stored) named[key] = edited || null
@@ -176,6 +184,7 @@ function runningDiffers(key) {
   if (!props.running) return false
   const current = props.runningSettings?.[key] || null
   const next = reply.value?.settings?.[key]?.value || null
+  if (key === 'threads') return JSON.stringify(current || []) !== JSON.stringify(next || [])
   return current !== next
 }
 
@@ -210,7 +219,20 @@ onBeforeUnmount(() => {
 
         <template v-else-if="reply">
           <div v-for="key in SETTING_KEYS" :key="key" class="mb-2">
+            <v-textarea
+              v-if="key === 'threads'"
+              v-model="fields.threads"
+              label="threads"
+              :hint="SETTING_HINTS.threads"
+              persistent-hint
+              rows="3"
+              density="compact"
+              variant="outlined"
+              clearable
+              :disabled="saving"
+            />
             <v-text-field
+              v-else
               v-model="fields[key]"
               :label="key"
               :hint="SETTING_HINTS[key]"
@@ -224,7 +246,13 @@ onBeforeUnmount(() => {
                  layer below says, so "unset" here means lmer's own resolution
                  (environment, preset, harness default) — not a platform value. -->
             <p class="text-body-small text-medium-emphasis mt-n2 mb-0">
-              <template v-if="reply.settings[key].source === 'env'">
+              <template v-if="key === 'threads'">
+                next incarnation connects to {{ (reply.settings[key]?.value || []).length }} threads
+                <template v-if="runningDiffers(key)">
+                  · running now: {{ (props.runningSettings?.threads || []).join(', ') || 'none' }}
+                </template>
+              </template>
+              <template v-else-if="reply.settings[key].source === 'env'">
                 ⚠️ an exported environment variable pins this to
                 “{{ reply.settings[key].value }}” — what you save here is
                 persisted but has no effect until that export is removed.
@@ -236,7 +264,7 @@ onBeforeUnmount(() => {
               <template v-else>
                 unset — the session decides (harness default)
               </template>
-              <template v-if="runningDiffers(key)">
+              <template v-if="key !== 'threads' && runningDiffers(key)">
                 · running now:
                 {{ props.runningSettings?.[key] || 'unset' }}
               </template>

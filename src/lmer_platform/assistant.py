@@ -369,7 +369,7 @@ import os
 import signal
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -387,6 +387,7 @@ from .config import (
     mint_assistant_credential,
     read_secret,
     revoke_assistant_credential,
+    update_stored,
     validate_assistant_override,
 )
 # The credential scrub, imported rather than reimplemented — the trade
@@ -592,6 +593,26 @@ class AssistantCapacityError(AssistantError):
     """
 
     status = 429
+
+
+class AssistantThreadsFull(AssistantError):
+    """The assistant's standing thread list cannot take another link.
+
+    409 for :class:`AssistantAlreadyRunning`'s reason: the request is well formed
+    and works again the moment a thread is removed from its settings.
+    """
+
+    status = 409
+
+
+class AssistantThreadHeld(AssistantError):
+    """A thread the operator explicitly asked this incarnation to hold is taken.
+
+    409 for :class:`AssistantThreadsFull`'s reason: the request is well formed
+    and works again once the run holding the thread lets it go.
+    """
+
+    status = 409
 
 
 class TaskdefMissing(AssistantError):
@@ -806,6 +827,12 @@ class AssistantStatus:
     #: running, and for a running one that publishes nothing. Served here
     #: because this is the route the chat pane already polls.
     statusline: Optional[dict] = None
+    #: The chat threads this incarnation is connected to right now (issue #412),
+    #: which is not ``settings["threads"]``: that one is the list the session was
+    #: *launched* with, while this one moves when the operator connects or
+    #: disconnects a thread from the pane header. Served here because this is the
+    #: route the pane already polls.
+    threads: list = field(default_factory=list)
 
     @property
     def age_seconds(self) -> Optional[float]:
@@ -829,6 +856,7 @@ class AssistantStatus:
             "settings": self.settings,
             "memory": self.memory,
             "statusline": self.statusline,
+            "threads": self.threads,
             "taskdef": TASKDEF,
             "target": TARGET,
         }
@@ -956,6 +984,153 @@ def _require_taskdef() -> Optional[Path]:
     return found
 
 
+def refuse_unusable_thread_list(session_id: object, permalink: object) -> None:
+    """Refuse a connect that would leave the assistant's launch list unusable.
+
+    ``MAX_PER_SESSION`` bounds the *connections of one session*;
+    ``assistant_threads`` is a different list — the launch list, editable straight
+    from the settings dialog — so the two diverge, and appending to the second
+    with only the first checked is how it goes over.
+
+    Over is worse than it sounds: :func:`config.update_stored` validates by
+    building a ``PlatformConfig``, and an unusable launch setting is *tolerated*
+    there (warned and resolved as unset) rather than raised, so a 17th link is
+    written to ``config.json`` and the whole list then resolves to ``None`` —
+    uber lmer rotates back connected to nothing, a moment after the pane showed
+    sixteen icons, with only a log line to say so.
+
+    So the list the write *would* produce is validated first, and the connect is
+    refused before anything is recorded or started. A no-op for every session but
+    the running assistant's.
+    """
+    if not isinstance(permalink, str) or not permalink:
+        return
+    if not _writes_the_launch_list(session_id):
+        return
+    current = _stored_threads()
+    if permalink in current:
+        return
+    _refuse_unusable([*current, permalink])
+
+
+def refuse_full_thread_list(session_id: object) -> None:
+    """The same refusal for a caller with no link yet: is there room for one?
+
+    Opening a thread (issue #429) settles this **before** it posts a root
+    message and cannot name the link until after — but the bound is a fact about
+    the stored list, not about the link, and a thread about to be created cannot
+    already be in it. So: capacity, and the same verdict on what is stored.
+    """
+    from .thread_targets import MAX_THREAD_TARGETS
+
+    if not _writes_the_launch_list(session_id):
+        return
+    current = _stored_threads()
+    _refuse_unusable(current)
+    if len(current) >= MAX_THREAD_TARGETS:
+        _threads_full(f"must contain at most {MAX_THREAD_TARGETS} thread permalinks")
+
+
+def _writes_the_launch_list(session_id: object) -> bool:
+    """Whether a connect on this session also edits the standing setting. A
+    no-op for every session but the running assistant's."""
+    live = _live_assistant()
+    return live is not None and live.get("id") == session_id
+
+
+def _refuse_unusable(candidate: list) -> None:
+    """Refuse when *candidate* is not a list uber lmer could launch with."""
+    from .thread_targets import validate_thread_targets
+
+    try:
+        validate_thread_targets(candidate)
+    except ValueError as exc:
+        _threads_full(str(exc))
+
+
+def _threads_full(reason: str) -> None:
+    raise AssistantThreadsFull(
+        f"uber lmer's standing thread list would become unusable: {reason}. "
+        "Remove one in its settings first — the list there is what each "
+        "start and rotation reads."
+    ) from None
+
+
+def _refuse_held_explicit_threads(
+    launch: dict, sources: dict, *, besides: Optional[str] = None
+) -> None:
+    """Refuse an explicitly asked-for thread that another live run holds (#413).
+
+    The layer decides the posture, as it does for every other launch setting
+    (:func:`_launch_settings`): a thread named in *this* call has a caller
+    attached to refuse to, while the standing list defers instead. What
+    deferring means, and why, is in docs/COMMS.md §9.
+    """
+    if sources.get("threads") != "override":
+        return
+    from . import connectors as thread_connectors
+
+    component = thread_connectors.get_connectors()
+    if component is None:
+        return
+    try:
+        component.refuse_held_targets(launch.get("threads") or [], besides=besides)
+    except thread_connectors.ThreadError as exc:
+        raise AssistantThreadHeld(str(exc)) from None
+
+
+def _stored_threads() -> list:
+    """The assistant's stored launch list, as it is in ``config.json``."""
+    stored = assistant_settings().get("threads")
+    raw = getattr(stored, "stored", None)
+    return list(raw) if isinstance(raw, list) else []
+
+
+def note_thread_change(session_id: object, permalink: object, *, connected: bool) -> bool:
+    """Keep the standing ``threads`` setting in step with a live connect (#412).
+
+    Called on every thread connect and disconnect, and a no-op for every session
+    but the running assistant's: a worker's connections are its session's, while
+    the assistant's are also *how the next incarnation is launched*, so a thread
+    connected from the chat pane has to survive a rotation and one disconnected
+    there has to stay gone.
+
+    Returns whether the stored list changed. Best-effort by design — the
+    connection is already made or already broken by the time this runs, and a
+    config file that could not be written is a launch setting to fix, not a
+    reason to report a working connection as a failure.
+    """
+    if not isinstance(permalink, str) or not permalink:
+        return False
+    live = _live_assistant()
+    if live is None or live.get("id") != session_id:
+        return False
+    current = _stored_threads()
+    if connected:
+        if permalink in current:
+            return False
+        current.append(permalink)
+    else:
+        if permalink not in current:
+            return False
+        current = [entry for entry in current if entry != permalink]
+    from .thread_targets import validate_thread_targets
+
+    try:
+        # ``update_stored`` tolerates an unusable launch setting rather than
+        # raising (it warns and resolves as unset), so the only thing standing
+        # between a too-long list and a config.json that silently launches with
+        # no threads at all is this check.
+        validate_thread_targets(current)
+        update_stored({"assistant_threads": current})
+    except (ConfigError, ValueError) as exc:
+        logger.warning(
+            "platform_assistant_threads_unwritable connected=%s error=%s", connected, exc,
+        )
+        return False
+    return True
+
+
 def _live_assistant() -> Optional[dict]:
     """The registry entry of the running assistant, or ``None``.
 
@@ -1042,7 +1217,30 @@ def status() -> AssistantStatus:
     # a container writes must not hold up a start or a stop.
     if answer.session_id is None:
         return answer
-    return replace(answer, statusline=statusline.for_session(answer.session_id))
+    return replace(
+        answer,
+        statusline=statusline.for_session(answer.session_id),
+        threads=_connected_threads(answer.session_id),
+    )
+
+
+def _connected_threads(session_id: str) -> list:
+    """The chat threads this incarnation is connected to, or ``[]``.
+
+    Read outside the lock like the status line beside it, and tolerant for the
+    same reason: an assistant whose pane cannot be drawn because a thread record
+    could not be read is a worse answer than a pane with no icons.
+    """
+    from . import connectors
+
+    component = connectors.get_connectors()
+    if component is None:
+        return []
+    try:
+        return component.listing(session_id)
+    except Exception as exc:
+        logger.warning("platform_assistant_threads_unreadable error=%s", exc)
+        return []
 
 
 def _memory_snapshot() -> dict:
@@ -1098,12 +1296,12 @@ def _parsed_stamp(value) -> Optional[datetime]:
 
 
 def _launched_settings(live: dict) -> dict:
-    """The four launch settings off a live registry entry (issue #234).
+    """The launch settings off a live registry entry (issue #234).
 
     What the running incarnation was *actually* started with, read where the
-    spawn recorded what it emitted. Always the four keys, so a client renders
+    spawn recorded what it emitted. Always the same keys, so a client renders
     one shape: an adopted assistant an older build spawned simply reads as
-    all-``None``, which is also the truth.
+    unset, with no thread targets.
 
     The model gets one extra source: the ordinary assistant spawn names none,
     and the session reports the one it resolved strictly after the registry
@@ -1121,6 +1319,7 @@ def _launched_settings(live: dict) -> dict:
     task = live.get("task")
     task = task if isinstance(task, dict) else {}
     settings = {key: _opt_str(task.get(key)) for key in ASSISTANT_SETTING_KEYS}
+    settings["threads"] = task.get("targets") or []
     if settings["model"] is None:
         settings["model"] = _reported_model(live.get("id"))
     return settings
@@ -1465,6 +1664,7 @@ def start(
     *,
     handoff: Optional[str] = None,
     settings: Optional[dict] = None,
+    refuse_held_threads: bool = True,
 ) -> AssistantStatus:
     """Start the assistant. Refuses if one is already running.
 
@@ -1479,12 +1679,16 @@ def start(
     informed as a planned rotation.
 
     *settings* is the per-call override layer for how the session is run —
-    ``model``/``harness``/``preset``/``agents`` (issue #234). Omitted keys fall
+    ``model``/``harness``/``preset``/``agents``/``threads``. Omitted keys fall
     through to the standing answer (env, then a fresh ``config.json`` read,
     then today's behaviour); see :func:`_launch_settings`. The supervisor's
     respawns pass nothing here, which is what makes a respawn after a crash run
     with the operator's *standing* configuration rather than with whatever a
     one-off start once asked for.
+
+    *refuse_held_threads* is for :func:`rotate` alone, which settles that
+    question before it stops the incumbent; asking again after the stop would
+    answer for a moment the caller never saw (docs/COMMS.md §9).
     """
     with _LOCK:
         live = _live_assistant()
@@ -1506,6 +1710,11 @@ def start(
         now = utc_now_iso()
         text, stamp = _handoff_update(state, handoff, now)
         launch, launch_sources = _launch_settings(settings)
+        if refuse_held_threads:
+            try:
+                _refuse_held_explicit_threads(launch, launch_sources)
+            except AssistantThreadHeld as exc:
+                raise _refuse(exc, "thread_held")
 
         # After the refusals this module raises and before the spawn, so a second
         # start against a live assistant cannot rewrite the file the live one was
@@ -1529,6 +1738,7 @@ def start(
         request = spawn.SpawnRequest(
             taskdef=TASKDEF,
             target=TARGET,
+            targets=launch["threads"],
             no_repo=True,
             # The four launch settings travel as the typed fields the platform
             # already emits as its own flags for workers — never appended to
@@ -1583,6 +1793,9 @@ def start(
                 request,
                 kind=KIND,
                 publish_registration=publish_registration,
+                # Settled above, where the layer each thread came from is still
+                # known: explicit refuses, standing defers (issue #413).
+                refuse_held_targets=False,
             )
         except spawn.CapacityError as exc:
             raise _refuse(
@@ -1740,20 +1953,22 @@ def rotate(
     override here.
     """
     with _LOCK:
-        # Refusals before side effects, with more at stake than in start: the
-        # stop below ends the incumbent, so an override start() would refuse
-        # must be refused while there is still an assistant to keep. The result
-        # is discarded and start() resolves again — what this guarantees is
-        # only that the *overrides* both calls validate are the same object,
-        # which is the one part that can refuse. The standing layers are not
-        # frozen between the two reads (a concurrent settings write serializes
-        # on config._STORED_LOCK, not this lock) and do not need to be: an
-        # unusable standing value warns and resolves as unset rather than
-        # refusing, so nothing that changes underneath can turn the second
-        # resolve into a refusal.
-        _launch_settings(settings)
+        # Refusals before side effects: the stop below ends the incumbent, so
+        # anything start() would refuse has to refuse while there is still an
+        # assistant to keep. Both questions are settled here, and start() is told
+        # not to re-ask the thread one — its answer can change between the stop
+        # and the respawn. docs/COMMS.md §9, "Rotating uber lmer", has the why.
+        launch, launch_sources = _launch_settings(settings)
+        live = _live_assistant()
+        try:
+            # The incumbent holds the threads this rotation is asking for again.
+            _refuse_held_explicit_threads(
+                launch, launch_sources, besides=(live or {}).get("id"),
+            )
+        except AssistantThreadHeld as exc:
+            raise _refuse(exc, "thread_held")
         stop(reason="rotation", handoff=handoff)
-        return start(config, settings=settings)
+        return start(config, settings=settings, refuse_held_threads=False)
 
 
 def ensure_running(config: PlatformConfig) -> AssistantStatus:

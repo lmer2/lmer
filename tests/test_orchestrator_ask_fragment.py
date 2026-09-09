@@ -53,8 +53,8 @@ class TestPackagedTemplate:
     def test_it_renders_and_names_the_tool(self):
         rendered = render_fragment()
         assert HEADING in rendered
-        assert "lmer-ask ask" in rendered
-        assert "lmer-ask note" in rendered
+        assert "lmer-signal ask" in rendered
+        assert "lmer-signal note" in rendered
 
     def test_it_tells_the_agent_what_the_exit_codes_mean(self):
         """The two an agent has to branch on, and they must match the CLI.
@@ -74,12 +74,12 @@ class TestPackagedTemplate:
         on the channel after the agent moved on, which is the answer-into-the-
         void case the verb was built to end."""
         text = TEMPLATE.read_text(encoding="utf-8")
-        assert "lmer-ask close" in text
+        assert "lmer-signal close" in text
 
     def test_it_tells_the_agent_to_re_run_the_wait_between_tasks(self):
         """The drift this fragment failed to prevent once: a wait timed out, the
         agent worked for an hour, never waited again, and reported the question
-        unanswered while the reply was on the channel. "Resume with `lmer-ask wait
+        unanswered while the reply was on the channel. "Resume with `lmer-signal wait
         <id>`" was already there, so the re-arm loop has to be its own line."""
         text = TEMPLATE.read_text(encoding="utf-8")
         assert "Answers arrive while you work" in text
@@ -97,8 +97,8 @@ class TestPackagedTemplate:
         """Prose-only gates do not hold in this fleet, so the fragment names the
         two things that will notice on the agent's behalf."""
         text = TEMPLATE.read_text(encoding="utf-8")
-        assert "answered (unread)" in text, "the list marker is how it is seen"
-        assert "lmer-end-session" in text, "the refusal is what enforces the rule"
+        assert "arrives as a tagged message" in text, "a late answer reaches the agent anyway"
+        assert "lmer-signal list --open" in text, "the survey is how an open question is seen"
 
     def test_it_suggests_a_watch_tool_without_assuming_one(self):
         """Harnesses differ: some have a monitor tool and some have none, so this
@@ -116,7 +116,7 @@ class TestPackagedTemplate:
         which is what the contract line points the agent at instead.
         """
         rendered = render_fragment()
-        assert "One question per `lmer-ask ask`" in rendered
+        assert "One question per `lmer-signal ask`" in rendered
         assert "several open questions at once" in rendered
         assert "Options belong to exactly one question" in rendered
 
@@ -157,7 +157,7 @@ class TestPackagedTemplate:
         assert "lmer-signal" in rendered
         assert "milestone" in rendered
         assert "One-way" in rendered
-        assert "rather than to your operator" in rendered
+        assert "supervising assistant" in rendered
 
 
 def test_the_commands_the_fragment_names_are_installed():
@@ -208,7 +208,7 @@ class TestClaudeRunner:
         assert "Operator ask channel injected into system prompt" in result.output
         assert result.prompt is not None, "no --append-system-prompt-file was passed"
         assert HEADING in result.prompt
-        assert "lmer-ask ask" in result.prompt
+        assert "lmer-signal ask" in result.prompt
 
     def test_a_value_with_shell_metacharacters_is_not_evaluated(self, tmp_path):
         """The gate reads the value; it must never let the shell run it.
@@ -236,7 +236,7 @@ class TestOtherHarnesses:
         )
         context = (tmp_path / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
         assert HEADING in context
-        assert "lmer-ask ask" in context
+        assert "lmer-signal ask" in context
 
     def test_pi_gets_the_fragment(self, tmp_path):
         run_harness_runner(

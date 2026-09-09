@@ -1,0 +1,4 @@
+added:
+- "Sessions can read and post into any Slack or matrix thread by permalink, without connecting to it"
+- "The platform and `lmer-ctl thread` can read and post a thread by permalink with the daemon's own credentials"
+- "A run can be pointed at reference threads from its thread menu or when it is spawned; it is told about each once"

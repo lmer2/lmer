@@ -60,7 +60,12 @@ def test_no_external_hosts_referenced(source):
     text = source.read_text(encoding="utf-8")
     offenders = re.findall(r"https?://[^\s'\"`)]+", text)
     allowed = ("http://127.0.0.1", "http://localhost", "https://git.example.com",
-               "https://gitlab.example.com")
+               "https://gitlab.example.com",
+               # Placeholder text in the thread-connect field (issue #412): the
+               # example shape of a Slack permalink, and matrix.to, which is what
+               # a matrix client actually puts on the clipboard. Both are strings
+               # in a form hint; neither is ever fetched.
+               "https://example.slack.com", "https://matrix.to")
     for url in offenders:
         # Interpolated hosts are built from window.location at runtime (a link to
         # a port on the operator's own machine), so they name no fixed host and
@@ -127,6 +132,7 @@ def test_dependency_set_is_minimal():
     reviewed act instead of something that drifts in with a feature:
 
     - vue, vite, @vitejs/plugin-vue — the app and its build
+    - jsdom, @vue/test-utils, vitest — mounted DOM tests; rationale in web/docs/TESTING.md
     - vuetify — the component library the UI is built from
     - vite-plugin-vuetify — resolves the components each template uses, so the
       bundle carries those rather than the whole framework
@@ -152,6 +158,7 @@ def test_dependency_set_is_minimal():
     }
     assert set(payload["devDependencies"]) == {
         "@vitejs/plugin-vue", "vite", "vite-plugin-vuetify",
+        "jsdom", "@vue/test-utils", "vitest",
     }
 
 
@@ -683,7 +690,19 @@ def test_the_list_can_be_searched_over_what_the_row_shows():
     #: it shows — the state word is what carries them into the search. The status
     #: line is percentages that change on every render, so a query over it is
     #: never a way to find a run (issue 248).
-    unsearchable = {"updated", "session", "ledger", "live", "statusline"}
+    unsearchable = {
+        "updated", "session", "ledger", "live", "statusline",
+        # Chat-thread connections (issue #412): a list of records, not text — what
+        # a query would match is a channel id (`C0123ABCDEF`) or a room id, which
+        # is not how anyone looks for a run. The icons are how the row answers
+        # "is this one in a thread".
+        "threads",
+        # Reference threads (issue #414), for the same reason and one more: their
+        # titles are the operator's words about a *thread*, not about the run, so a
+        # run matching one would match on something the row does not show and does
+        # not claim to be about.
+        "references",
+    }
     card = re.sub(r"<!--.*?-->", "", RUN_CARD.read_text(encoding="utf-8"), flags=re.S)
     card = re.sub(r"^\s*//.*$", "", card, flags=re.M)
     shown = {match for match in re.findall(r"\brun\.(\w+)", card)} - unsearchable

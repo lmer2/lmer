@@ -136,6 +136,18 @@ def parse_slack_permalink(url: str):
     return (channel, thread_ts)
 
 
+def slack_thread_link(host: str, channel: str, thread_ts: str) -> str:
+    """The canonical permalink for ``(channel, thread_ts)`` on *host*.
+
+    The inverse of :func:`parse_slack_permalink`, for a caller that has resolved a
+    thread and needs to name it as a link again — a link to a *reply* names that
+    reply, and a component given one polls a message rather than the thread it is
+    in (``conversations.replies`` returns only the message named when it has no
+    replies of its own).
+    """
+    return f"https://{host}/archives/{channel}/p{thread_ts.replace('.', '')}"
+
+
 def is_slack_thread_url(s) -> bool:
     """Return True iff *s* is a recognisable Slack thread permalink.
 

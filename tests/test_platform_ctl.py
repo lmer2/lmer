@@ -390,18 +390,23 @@ ROUTE_TABLE = [
     (["spawn", "develop", "issue-245", "--slot", "webapp"],
      "POST", "/api/sessions", None,
      {"taskdef": "develop", "target": "issue-245", "slot": "webapp"}),
-    (["send", "s-1", "/followup rebase please"], "POST",
-     "/api/sessions/s-1/input", None,
-     {"data": "/followup rebase please", "append_newline": True,
-      "sanitize": True, "preserve_slash_commands": True}),
+    # #407: a message rides the session's bus, stamped with this caller's
+    # channel; the keystroke form (--no-newline) stays a raw PTY write.
+    (["send", "s-1", "the review is posted, fix the two majors"], "POST",
+     "/api/sessions/s-1/comms", None,
+     {"kind": "message", "text": "the review is posted, fix the two majors"}),
     (["send", "s-1", "!206 was merged"], "POST",
-     "/api/sessions/s-1/input", None,
-     {"data": "!206 was merged", "append_newline": True, "sanitize": True,
-      "preserve_slash_commands": True}),
+     "/api/sessions/s-1/comms", None,
+     {"kind": "message", "text": "!206 was merged"}),
     (["send", "s-1", "half a thought", "--no-newline"], "POST",
      "/api/sessions/s-1/input", None,
-     {"data": "half a thought", "append_newline": False, "sanitize": True,
-      "preserve_slash_commands": True}),
+     {"data": "half a thought", "append_newline": False}),
+    (["command", "s-1", "/followup rebase please"], "POST",
+     "/api/sessions/s-1/comms", None,
+     {"kind": "command", "text": "/followup rebase please"}),
+    (["comms", "s-1", "--since", "40", "--timeout", "10"], "GET",
+     "/api/sessions/s-1/comms", {"since": 40, "timeout": 10.0}, None),
+    (["feed", "--since", "7"], "GET", "/api/comms/feed", {"since": 7}, None),
     (["log", "s-1"], "GET", "/api/sessions/s-1/log", {}, None),
     (["log", "s-1", "--offset", "-4096", "--limit", "4096",
       "--source", "host"],
@@ -412,6 +417,8 @@ ROUTE_TABLE = [
     (["questions", "s-1"], "GET", "/api/sessions/s-1/ask", None, None),
     (["answer", "s-1", "q-7", "prep-release"], "POST",
      "/api/sessions/s-1/ask/q-7/answer", None, {"answer": "prep-release"}),
+    (["answer", "s-1", "q-7", "--option", "2"], "POST",
+     "/api/sessions/s-1/ask/q-7/answer", None, {"option": 2}),
     (["wind-down", "s-1"], "POST", "/api/sessions/s-1/wind-down", None, {}),
     (["wind-down", "s-1", "--note", "skip the MR"], "POST",
      "/api/sessions/s-1/wind-down", None, {"note": "skip the MR"}),
@@ -492,6 +499,23 @@ def test_every_route_this_cli_names_is_served_by_the_app(client):
         assert any(pattern.match(built) for _served, pattern in patterns), (
             f"{' '.join(argv)} names {built}, which this build does not serve"
         )
+
+
+def test_an_answer_with_neither_text_nor_an_option_is_refused_before_the_request():
+    """#428: the text argument is optional now, so the CLI has to be the one to
+    notice an invocation that names nothing — the route would see an empty body."""
+    with pytest.raises(ctl.CtlError, match="--option"):
+        build("answer", "s-1", "q-7")
+
+
+def test_an_answer_with_both_text_and_an_option_is_refused_with_the_words_shown():
+    """Round 2, major: this invocation used to be sent as both fields and the bus
+    dropped the words. The CLI cannot know whether they name the same option — it
+    never sees the question — so it refuses the pair and quotes what it would
+    have discarded."""
+    with pytest.raises(ctl.CtlError, match="not both") as caught:
+        build("answer", "s-1", "q-7", "prep-release, but rebase first", "--option", "2")
+    assert "prep-release, but rebase first" in str(caught.value)
 
 
 def test_the_two_answer_verbs_are_two_routes():
@@ -633,8 +657,21 @@ def test_a_channel_whose_session_is_gone_passes_the_410_through(
 def test_typing_into_a_session_that_never_existed_passes_the_404_through(
     configured, client, platform_root, capsys
 ):
-    payload = refused(["send", "s-nope", "/followup"], client, capsys)
+    payload = refused(["send", "s-nope", "carry on"], client, capsys)
     assert payload["status"] == 404
+
+
+def test_send_refuses_a_slash_command_and_names_the_verb_that_runs_it(
+    configured, client, platform_root, capsys
+):
+    """`send` carried live slash commands before the unified channel. A message
+    is relayed tagged now and the tag takes column one, so `/followup` would
+    reach the harness as prose — silently, on the assistant's main steering
+    path."""
+    payload = refused(["send", "s-1", "/followup"], client, capsys)
+    assert payload.get("status") != 200
+    message = json.dumps(payload)
+    assert "lmer-ctl command" in message and "prose" in message
 
 
 def test_a_run_key_round_trips_through_adopt_and_meta(
@@ -760,3 +797,17 @@ def test_an_occupied_slot_comes_back_as_a_409_the_assistant_can_relay(
 
     assert payload["status"] == 409
     assert "s-7" in payload["body"]["detail"]
+
+
+@pytest.mark.parametrize("text", ["/tmp/build.log has the traceback", "/tmp/build.log", "/followup please explain"])
+def test_send_accepts_path_and_slash_leading_prose(text):
+    import argparse
+    call = ctl._call_send(argparse.Namespace(text=text, session="s-1", no_newline=False))
+    assert call.body == {"kind": "message", "text": text}
+
+
+def test_spawn_accepts_repeatable_thread_targets():
+    links = ["https://team.slack.com/archives/C1/p1700000000000001", "https://matrix.to/#/!room:example.org/$root"]
+    call = build("spawn", "develop", "issue", "--target-thread", links[0], "--target-thread", links[1])
+    assert call.body == {"taskdef": "develop", "target": "issue", "targets": links}
+    assert "targets" not in build("spawn", "develop", "issue").body

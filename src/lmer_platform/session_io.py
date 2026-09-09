@@ -448,7 +448,14 @@ class _ControlReply:
     def detail(self) -> str:
         """Upstream explanation, truncated — a 422's ``detail`` is a whole list."""
         detail = self.payload.get("detail")
-        return str(detail)[:_DETAIL_LIMIT] if detail else f"HTTP {self.status}"
+        text = str(detail)[:_DETAIL_LIMIT] if detail else f"HTTP {self.status}"
+        if self.status == 401:
+            text += (
+                "; the session image may predate digest credentials. "
+                "Roll the session image first, then the platform and host CLI, "
+                "and start a new session; also check that the control credential matches"
+            )
+        return text
 
 
 def _validated(session_id: str) -> str:

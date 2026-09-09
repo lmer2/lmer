@@ -14,6 +14,7 @@ import AskHistory from './AskHistory.vue'
 import Chat from './Chat.vue'
 import RelatedRuns from './RelatedRuns.vue'
 import RunMeta from './RunMeta.vue'
+import ThreadLinks from './ThreadLinks.vue'
 import StatusStrip from './StatusStrip.vue'
 import { forgetRun, resumeRun } from '../api.js'
 import {
@@ -588,6 +589,19 @@ async function forget() {
         v-if="run.title"
         class="text-body-small text-medium-emphasis scroll-x"
       >{{ run.label }}</span>
+      <v-spacer />
+      <!-- The same two icons the fleet row carries, in the header for the same
+           reason the state chip is: which humans can reach this run, and how to
+           change it, is a fact about the run and not a panel to go looking for.
+           `changed` is the shell's reload, so the row and this view never
+           disagree about what is connected. -->
+      <ThreadLinks
+        :session-id="run.session?.id"
+        :threads="run.threads"
+        :references="run.references || []"
+        :live="run.live"
+        @changed="emit('changed')"
+      />
     </div>
 
     <!-- What the run IS — the taskdef, the repo and the thing it is working on —

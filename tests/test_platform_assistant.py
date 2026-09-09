@@ -41,7 +41,7 @@ from lmer_cli.harness import HARNESSES
 from lmer_cli.mounts import MOUNT_LINK_MARKER
 from lmer_platform import assistant
 from lmer_platform import config as cfg
-from lmer_platform import memory, registry, runs, spawn, store
+from lmer_platform import connectors, memory, registry, runs, spawn, store
 from tests.conftest import strip_lmer_env
 
 
@@ -1929,7 +1929,9 @@ def test_an_unwritable_env_file_costs_the_credentials_not_the_chat(
 ORCHESTRATE_ROUTES = (
     "/api/state",
     "/api/sessions",
-    "/api/sessions/{id}/input",
+    # Since the unified channel (#407) the assistant's steering verb posts a
+    # record on the session's bus; `/input` keeps the keystroke form only.
+    "/api/sessions/{id}/comms",
     "/api/sessions/{id}/messages",
     "/api/sessions/{id}/ask/{qid}/answer",
     "/api/runs/answer",
@@ -2323,6 +2325,7 @@ def test_start_with_no_settings_is_todays_behaviour(config, long_lived):
             assert task.get(key) is None
         assert assistant.status().settings == {
             "model": None, "harness": None, "preset": None, "agents": None,
+            "threads": [],
         }
     # ``started`` SIGKILLs the stub and returns; the registry entry goes when the
     # spawn's watcher thread records the exit, which is asynchronous — so this
@@ -2786,3 +2789,156 @@ def test_the_memory_walk_does_not_run_under_the_publication_lock(
     monkeypatch.setattr(memory, "measure", lambda directory=None: probe())
     assistant.status()
     assert held == [False], "the lock was held while the store was measured"
+
+
+# --- a thread another run holds (issue #413) --------------------------------
+#
+# uber lmer starts through the same spawn as every worker, so the
+# one-live-session-per-thread rule reaches it too — but its ``threads`` come
+# from two different places and the layer decides the posture: an explicit ask
+# is refused, the standing list defers so the orchestrator still comes up.
+
+HELD_LINK = "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
+
+
+class _ThreadFake:
+    def __init__(self, argv, env):
+        self.argv, self.env, self.pid, self.returncode = list(argv), dict(env), os.getpid(), None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+@pytest.fixture
+def thread_component(platform_root, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        connectors.thread_registry, "REGISTRY_DIR", str(tmp_path / "threads"),
+    )
+    built = connectors.ThreadConnectors(
+        runner=lambda argv, env, log_path=None: _ThreadFake(argv, env),
+        environ={"SLACK_BOT_TOKEN": "xoxb-test"},
+        slack_client=lambda token: _ThreadSlack(),
+        clock=lambda: 0.0,
+    )
+    connectors.register_connectors(built)
+    yield built
+    connectors.register_connectors(None)
+
+
+class _ThreadSlack:
+    def get_replies(self, channel, ts, oldest=None):
+        return [{"ts": ts}]
+
+
+def worker_holding(component, link=HELD_LINK, *, session_id="s-worker"):
+    """A live worker session with *link* connected, as the operator would see it."""
+    registry.register(
+        session_id,
+        kind="worker",
+        pid=os.getpid(),
+        run={"host": "gitlab.example.com", "project": "agents/global", "slug": "develop-412"},
+        task={"taskdef": "develop", "target": "issue-412"},
+        control={
+            "host": "127.0.0.1",
+            "port": 8123,
+            "token_ref": str(spawn.token_file_for(session_id)),
+        },
+        started_at="2026-09-05T09:00:00Z",
+    )
+    spawn.token_file_for(session_id).write_text("control-token", encoding="utf-8")
+    component.connect(session_id, link, by="operator")
+    return session_id
+
+
+def test_an_explicitly_asked_for_thread_that_is_held_refuses_the_start(
+    config, thread_component, long_lived,
+):
+    worker_holding(thread_component)
+
+    with pytest.raises(assistant.AssistantThreadHeld) as caught:
+        assistant.start(config, settings={"threads": [HELD_LINK]})
+
+    assert caught.value.status == 409
+    assert "develop-412" in str(caught.value)
+    assert assistant.status().running is False, "nothing was started"
+    assert [e["data"]["reason"] for e in events_of("assistant_start_refused")] == [
+        "thread_held"
+    ]
+
+
+def test_a_held_thread_in_the_standing_list_still_lets_the_assistant_up(
+    config, thread_component, long_lived,
+):
+    """The orchestrator must come back up. The thread is recorded rather than
+    connected, so the pane can show it as not running with the holder named, and
+    it attaches by itself once the worker lets go."""
+    cfg.update_stored({"assistant_threads": [HELD_LINK]})
+    worker_holding(thread_component)
+
+    with started(config) as status:
+        assert status.running is True
+        assert [
+            record["permalink"]
+            for record in thread_component.records(status.session_id)
+        ] == [HELD_LINK]
+
+
+def test_a_rotation_may_name_the_threads_the_incumbent_itself_holds(
+    config, thread_component, long_lived,
+):
+    """The incumbent is about to stop, so its own claim must not refuse the
+    rotation that replaces it."""
+    with started(config) as first:
+        thread_component.connect(first.session_id, HELD_LINK, by="operator")
+
+        rotated = assistant.rotate(config, settings={"threads": [HELD_LINK]})
+        try:
+            assert rotated.running is True
+            assert rotated.session_id != first.session_id
+        finally:
+            kill(rotated.pid)
+            wait_for(lambda: not registry.is_live({"pid": rotated.pid}))
+
+
+def test_a_thread_taken_during_the_rotation_does_not_cost_the_assistant(
+    config, thread_component, long_lived, monkeypatch,
+):
+    """The window between `stop()` and the respawn belongs to nobody.
+
+    A spawn or a live connect landing in it takes the thread on
+    `connectors._lock`, which does not serialise against this module's `_LOCK` —
+    so a `start()` that asked again would answer for a moment the caller never
+    saw, and its answer would be "no assistant at all". The question is settled
+    once, before the stop; the thread comes back as a deferred connection.
+    """
+    real_stop = assistant.stop
+
+    with started(config) as first:
+        thread_component.connect(first.session_id, HELD_LINK, by="operator")
+
+        def stop_then_lose_the_thread(**kwargs):
+            stopped = real_stop(**kwargs)
+            thread_component.drop_session(first.session_id)
+            worker_holding(thread_component)
+            return stopped
+
+        monkeypatch.setattr(assistant, "stop", stop_then_lose_the_thread)
+        rotated = assistant.rotate(config, settings={"threads": [HELD_LINK]})
+        try:
+            assert rotated.running is True
+            assert [
+                record["permalink"]
+                for record in thread_component.records(rotated.session_id)
+            ] == [HELD_LINK]
+        finally:
+            kill(rotated.pid)
+            wait_for(lambda: not registry.is_live({"pid": rotated.pid}))

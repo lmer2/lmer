@@ -1,0 +1,3 @@
+fixed:
+- "Connected sessions receive backlog notices instead of old messages; inbound typing waits for the launcher to submit its startup command. (#432)"
+- "Attach notices exclude marked connector status posts across reconnects and offer a read command within the existing message limit. (#432)"

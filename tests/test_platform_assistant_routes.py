@@ -1490,3 +1490,109 @@ def test_config_write_refuses_a_threshold_above_the_spools_capacity(
         json={"nudge_pending_threshold": assistant.MAX_PENDING},
     )
     assert at_capacity.status_code == 200, at_capacity.text
+
+
+THREADS = [
+    "https://team.slack.com/archives/C1/p1700000000000001",
+    "https://team.slack.com/archives/C2/p1700000000000002",
+    "https://matrix.to/#/!room:example.org/$root",
+]
+
+
+def test_assistant_threads_persist_and_reach_rotations(client, config, long_lived, monkeypatch):
+    from lmer_cli.cli import parse_args
+    from lmer_platform import spawn
+
+    commands = []
+    original = spawn.spawn_session
+    def capture(*args, **kwargs):
+        result = original(*args, **kwargs)
+        commands.append(result.command)
+        return result
+    monkeypatch.setattr(spawn, "spawn_session", capture)
+    saved = client.post("/api/assistant/config", headers=bearer_header(), json={"threads": THREADS})
+    assert saved.status_code == 200, saved.text
+    assert store.read_json(cfg.config_path())["assistant_threads"] == THREADS
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["settings"]["threads"] == {
+        "stored": THREADS, "value": THREADS, "source": "config.json",
+    }
+    with running(client) as first:
+        assert first["settings"]["threads"] == THREADS
+        for override, expected in (({}, THREADS), ({"threads": []}, []), ({}, THREADS)):
+            rotated = client.post("/api/assistant/rotate", headers=bearer_header(), json=override)
+            assert rotated.status_code == 200, rotated.text
+            current = rotated.json()
+            try:
+                assert current["settings"]["threads"] == expected
+                task = registry.read_session(current["session_id"])["task"]
+                assert task["targets"] == expected
+                assert parse_args(commands[-1][1:])[0].target == ["fleet", *expected]
+            finally:
+                kill(current.get("pid"))
+
+
+@pytest.mark.parametrize("value", [
+    "https://team.slack.com/archives/C1/p1700000000000001", {}, 7, ["--exec"], ["https://example.org/repo"], [None],
+    ["https://team.slack.com/archives/C1/pABCDEFGHIJKLMNOP"],
+    [THREADS[0] + "?thread_ts=not-a-ts"],
+    [THREADS[0] + "?thread_ts="],
+    ["https://team.slack.com/archives/C1/pABCDEFGHIJKLMNOP?thread_ts=1700000000.000001"],
+])
+def test_bad_thread_settings_are_refused_before_rotation(client, long_lived, value):
+    with running(client) as first:
+        for route in ("config", "rotate"):
+            response = client.post(f"/api/assistant/{route}", headers=bearer_header(), json={"threads": value})
+            assert response.status_code == 400, response.text
+            assert "threads" in response.json()["detail"]
+            assert assistant.status().session_id == first["session_id"]
+
+
+@pytest.mark.parametrize("link", [
+    "https://team.slack.com/archives/C1/pABCDEFGHIJKLMNOP",
+    THREADS[0] + "?thread_ts=not-a-ts",
+    THREADS[0] + "?thread_ts=1700000000.abcdef",
+])
+def test_invalid_slack_timestamps_never_launch_sessions(client, monkeypatch, link):
+    from lmer_platform import spawn
+
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail("invalid thread target reached process launch")
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", unexpected_launch)
+    for route, body in (
+        ("/api/sessions", {"taskdef": "chat", "target": "fleet", "targets": [link]}),
+        ("/api/assistant/start", {"threads": [link]}),
+    ):
+        response = client.post(route, headers=bearer_header(), json=body)
+        assert response.status_code == 400, response.text
+
+
+def test_start_threads_override_is_temporary_and_saved_empty_list_disconnects(client, long_lived):
+    with running(client, threads=THREADS) as current:
+        assert current["settings"]["threads"] == THREADS
+        assert client.get("/api/assistant/config", headers=bearer_header()).json()["settings"]["threads"]["value"] is None
+    for value in (THREADS, [], None):
+        response = client.post("/api/assistant/config", headers=bearer_header(), json={"threads": value})
+        assert response.status_code == 200, response.text
+        assert response.json()["settings"]["threads"]["value"] == value
+
+
+def test_session_api_threads_reach_the_launch(client, monkeypatch):
+    from lmer_cli.cli import parse_args
+
+    captured = []
+    original = api.spawn_session
+    def capture(*args, **kwargs):
+        result = original(*args, **kwargs)
+        captured.append(result.command)
+        return result
+    monkeypatch.setattr(api, "spawn_session", capture)
+    response = client.post("/api/sessions", headers=bearer_header(), json={
+        "taskdef": "chat", "target": "fleet", "targets": THREADS,
+    })
+    assert response.status_code == 201, response.text
+    assert parse_args(captured[0][1:])[0].target == ["fleet", *THREADS]
+    bad = client.post("/api/sessions", headers=bearer_header(), json={
+        "taskdef": "chat", "target": "fleet", "targets": "--exec",
+    })
+    assert bad.status_code == 400, bad.text

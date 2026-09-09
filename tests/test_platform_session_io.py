@@ -1431,10 +1431,14 @@ def test_the_route_forwards_the_steering_flags_and_invents_them_for_nobody(
         json={"data": "!206 was merged", "append_newline": True},
     )
 
-    assert control_plane.calls[0]["body"]["sanitize"] is True
-    assert control_plane.calls[0]["body"]["preserve_slash_commands"] is True
-    assert "sanitize" not in control_plane.calls[1]["body"]
-    assert "preserve_slash_commands" not in control_plane.calls[1]["body"]
+    # A steering send first asks the supervisor's /healthz whether it keeps a
+    # bus (issue #407); this fake plane has none, so the send falls through to
+    # /input. Only the /input calls are the subject here.
+    inputs = [call for call in control_plane.calls if call["path"] == "/input"]
+    assert inputs[0]["body"]["sanitize"] is True
+    assert inputs[0]["body"]["preserve_slash_commands"] is True
+    assert "sanitize" not in inputs[1]["body"]
+    assert "preserve_slash_commands" not in inputs[1]["body"]
 
 
 def test_an_unconfirmed_submit_reaches_the_caller(
@@ -2183,3 +2187,19 @@ def test_both_log_paths_ask_the_registry_what_a_legal_id_is(
             resolve(pf.SESSION_IDS[0])
 
     assert asked == [pf.SESSION_IDS[0], pf.SESSION_IDS[0]]
+
+
+@pytest.mark.parametrize("operation, path", [
+    (lambda: session_io.send_input("s-1", "hello"), "/input"),
+    (lambda: session_io.probe_health("s-1"), "/healthz"),
+    (lambda: session_io.read_control_output("s-1", cursor=0), "/output?cursor=0&timeout=0.0"),
+])
+def test_control_401_explains_possible_image_skew(platform_root, control_plane, operation, path):
+    control_plane.answer(path, 401, {"detail": "invalid bearer token"})
+    plant_session("s-1", port=control_plane.port)
+    with pytest.raises(session_io.ControlPlaneError) as caught:
+        operation()
+    detail = str(caught.value)
+    assert "invalid bearer token" in detail
+    assert "may predate" in detail and "session image" in detail
+    assert "credential" in detail and "first" in detail

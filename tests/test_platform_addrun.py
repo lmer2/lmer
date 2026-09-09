@@ -1784,6 +1784,21 @@ def test_no_selection_is_sent_empty():
     assert "if (typed(spawn.value.model)) payload.model" in text
 
 
+def test_reference_threads_are_offered_as_free_text_and_sent_as_objects():
+    """Context threads a spawn can name (issue #414). Free text because a
+    permalink is nothing the host can enumerate, and objects on the wire because
+    a title rides with each one — added later from the run's thread menu, which
+    is why the form asks for the link alone.
+    """
+    text = _add_run_source()
+    element = _field_element(text, "spawn.references")
+    assert element.split()[0] == "v-combobox"
+    assert "multiple" in element and ":items=" not in element
+    assert ".map((permalink) => ({ permalink }))" in text
+    # Untouched is not a value here either.
+    assert "if (references.length) payload.references = references" in text
+
+
 def test_the_model_field_is_typeable_and_offers_no_menu():
     """The one name field the host cannot even partially enumerate: which models
     a harness serves is the harness's business, and it says so by rejecting what

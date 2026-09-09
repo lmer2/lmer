@@ -93,9 +93,9 @@ class TestPackagedTemplate:
 
     def test_it_does_not_offer_the_store_as_a_reply_channel(self):
         """Writing a file into it shows the operator nothing: the channel back is
-        lmer-ask, which the session's other fragment describes."""
+        lmer-signal, which the session's other fragment describes."""
         rendered = render_fragment()
-        assert "lmer-ask" in rendered
+        assert "lmer-signal" in rendered
 
     def test_it_names_the_env_var_it_is_gated_on(self):
         assert uploads.UPLOADS_DIR_ENV in TEMPLATE.read_text(encoding="utf-8")

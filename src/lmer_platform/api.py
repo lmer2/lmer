@@ -90,11 +90,21 @@ from . import SCHEMA_VERSION
 from . import ask
 from . import assistant
 from . import checkin
+from . import comms
+from . import connectors
 from . import lifecycle
+from lmer_cli import comms as bus_comms
+from lmer_cli import thread_access
+from lmer_cli import thread_posts
+from lmer_cli import thread_requests as thread_queue
+from lmer_cli.threads import ThreadError
+
 from . import meta
+from . import references
 from . import reattach
 from . import relations
 from . import session_io
+from . import session_threads
 from . import statusline
 from . import transcripts
 from . import uploads
@@ -108,7 +118,9 @@ from .config import (
     ConfigError,
     PlatformConfig,
     active_assistant_credential,
+    active_connectors,
     assistant_settings,
+    list_connectors,
     checkin_settings,
     _slots_value,
     configured_repo_url,
@@ -155,6 +167,7 @@ from .spawn import (
     SlotOccupied,
     SpawnError,
     SpawnRequest,
+    ThreadHeld,
     _repo_urls,
     absorb_ports,
     derive_run_identity,
@@ -176,6 +189,7 @@ logger = logging.getLogger("lmer_platform.api")
 __all__ = [
     "build_state", "create_app", "discover_spawn_options", "REALM",
     "WS_POLICY_VIOLATION", "Caller", "CALLER_ASSISTANT", "CALLER_OPERATOR",
+    "CALLER_CONNECTOR",
 ]
 
 REALM = "lmer platform"
@@ -186,6 +200,7 @@ REALM = "lmer platform"
 #: indistinguishable, which is why the assistant got its own.
 CALLER_OPERATOR = "operator"
 CALLER_ASSISTANT = "assistant"
+CALLER_CONNECTOR = "connector"
 
 #: Close code for a tty socket the platform will not serve. 1008 (policy
 #: violation) rather than a private code because a browser can read neither: a
@@ -707,6 +722,56 @@ def _fold_checkins(payload: dict) -> None:
             row["checkin"] = checkin.row_checkin(row, marks, window=window)
 
 
+def _fold_threads(payload: dict) -> None:
+    """Put each row's chat-thread connections on the row, in place (issue #412).
+
+    On the payload for the same reason as the check-ins above it: the icons are
+    drawn on every row of the first screen the app paints, and a request per row
+    to find out whether a run is mirrored into a thread is one per tracked run.
+
+    Keyed by the row's *current* session, because that is what a connection is a
+    connection to. A row whose session has ended keeps its connections and shows
+    them as not running, rather than losing them the moment the run stops.
+
+    Both lists get it: ``attention`` holds separate copies of the same rows.
+    """
+    component = connectors.get_connectors()
+    if component is None:
+        return
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if not isinstance(row, dict):
+            continue
+        session = row.get("session")
+        session_id = session.get("id") if isinstance(session, dict) else None
+        row["threads"] = component.listing(session_id) if session_id else []
+
+
+def _fold_references(payload: dict) -> None:
+    """Put each row's reference threads on the row, in place (issue #414).
+
+    On the payload for :func:`_fold_threads`'s reason, but keyed by the **run**
+    rather than by its session, which it outlives.
+
+    Both lists get it: ``attention`` holds separate copies of the same rows.
+    """
+    stored = references.load_all()
+    if not stored:
+        return
+    for row in (payload.get("runs") or []) + (payload.get("attention") or []):
+        if not isinstance(row, dict):
+            continue
+        run = row.get("run") if isinstance(row.get("run"), dict) else {}
+        try:
+            key = run_key(run.get("host"), run.get("project"), run.get("slug"))
+        except Exception:
+            continue
+        row["references"] = [
+            item for item in (references.ThreadReference.from_dict(raw) for raw in stored.get(key) or [])
+            if item is not None
+        ]
+        row["references"] = [item.to_dict() for item in row["references"]]
+
+
 def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     """Assemble the fleet view for the runs **this orchestrator tracks**.
 
@@ -784,6 +849,8 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     }
     payload.update(inventory.to_dict())
     _fold_checkins(payload)
+    _fold_threads(payload)
+    _fold_references(payload)
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
@@ -1514,10 +1581,57 @@ class Caller:
     """
 
     kind: str
+    #: For a connector credential (issue #407): which connector, and the one
+    #: channel it may post as. Identification still, not authorization — the
+    #: channel is what the bus stamps on the record, so a source tag cannot be
+    #: forged by naming another channel in the body.
+    name: Optional[str] = None
+    channel: Optional[str] = None
 
     @property
     def is_assistant(self) -> bool:
         return self.kind == CALLER_ASSISTANT
+
+    @property
+    def source_channel(self) -> str:
+        """The bus channel this caller's posts are stamped with."""
+        if self.kind == CALLER_ASSISTANT:
+            return "uber-lmer"
+        if self.kind == CALLER_CONNECTOR and self.channel:
+            return self.channel
+        return "platform"
+
+
+#: What ``POST …/input``'s steering form answers once it rides the bus.
+_SUBMIT_VIA_BUS_NOTE = (
+    "Delivered as a message on the session's bus (POST …/comms is the current "
+    "route; this form is deprecated and goes away next release). Enter was sent "
+    "after the tagged text; whether the TUI registered it is not observable here."
+)
+
+
+def _author_of(caller: "Caller", requested: object) -> Optional[str]:
+    """The author a post is stamped with.
+
+    The assistant has none (its tag is ``uber lmer``); anyone else may name the
+    human behind the call — an operator identity, a Slack display name — and an
+    operator who names nothing is ``operator``.
+    """
+    if caller.kind == CALLER_ASSISTANT:
+        return None
+    if isinstance(requested, str) and requested.strip():
+        return requested.strip()[:200]
+    return "operator" if caller.kind == CALLER_OPERATOR else None
+
+
+def _thread_label(caller: "Caller") -> str:
+    """Who a thread is told wrote a post the platform made: from the credential,
+    never from the body — the rule the bus already applies to ``source.channel``."""
+    if caller.is_assistant:
+        return "uber lmer"
+    if caller.kind == CALLER_CONNECTOR and caller.channel:
+        return caller.channel
+    return CALLER_OPERATOR
 
 
 def _note_check(
@@ -1652,6 +1766,13 @@ def create_app(
                 # `assistant.read_state()` per request — file, handoff re-scrub and
                 # up to MAX_PENDING notes — for a field nothing consumed.
                 return Caller(CALLER_ASSISTANT)
+            # Connector credentials (#407): compared one by one so timing tells
+            # nothing about which one matched; the set is small by construction.
+            for credential, identity in active_connectors().items():
+                if secrets_mod.compare_digest(offered, credential.encode("utf-8")):
+                    return Caller(
+                        CALLER_CONNECTOR, name=identity["name"], channel=identity["channel"]
+                    )
         logger.warning(
             "platform_auth_rejected scheme=%s",
             (authorization or "").partition(" ")[0].lower() or "none",
@@ -1721,13 +1842,15 @@ def create_app(
             "                              session published about its own status\n"
             "                              line (context, usage windows, effort)\n"
             "  POST /api/sessions          spawn {taskdef,target,repo_url,\n"
-            "                              preset,agents,harness,ports,\n"
+            "                              preset,agents,harness,ports,targets?,\n"
             "                              title?,description?,...} — title names\n"
             "                              the run in the fleet view, exactly as\n"
             "                              POST /api/runs/meta would afterwards;\n"
             "                              it is written once the run is tracked,\n"
             "                              and a 201 says so in warning if it\n"
-            "                              could not be\n"
+            "                              could not be. A target thread another\n"
+            "                              live run holds is 409 and starts\n"
+            "                              nothing\n"
             "  GET  /api/spawn-options     taskdefs and preset names this host\n"
             "                              can see — suggestions, not a\n"
             "                              vocabulary: any taskdef may be named;\n"
@@ -1845,7 +1968,7 @@ def create_app(
             "                               non-consuming signal that something is\n"
             "                               waiting — watch it, do not drain to ask\n"
             "  POST /api/assistant/start    start it {handoff?, model?, harness?,\n"
-            "                               preset?, agents?} — 409 when one is\n"
+            "                               preset?, agents?, threads?} — 409 when one is\n"
             "                               already up, which is how the incumbent\n"
             "                               keeps its context window. 200, not 202:\n"
             "                               the session is up when this returns\n"
@@ -1859,7 +1982,7 @@ def create_app(
             "                               no start lands in the gap. Takes the\n"
             "                               same launch overrides as start\n"
             "  GET  /api/assistant/config   how the NEXT incarnation will be run —\n"
-            "                               model/harness/preset/agents, each with\n"
+            "                               model/harness/preset/agents/threads, with\n"
             "                               the layer that decided it (env /\n"
             "                               config.json / default). What the running\n"
             "                               one uses is on GET /api/assistant\n"
@@ -1969,6 +2092,11 @@ def create_app(
             request = SpawnRequest(
                 taskdef=body.get("taskdef") or "",
                 target=body.get("target") or "",
+                targets=body.get("targets"),
+                # Threads the run should know about but not be connected to
+                # (issue #414). Not a launch argument: nothing reaches the
+                # container, and the daemon tells the run once its bus is up.
+                references=body.get("references"),
                 repo_url=body.get("repo_url"),
                 # Typed fields, never appended to extra_args: the platform emits
                 # each flag itself and records what it emitted, so a second
@@ -2008,6 +2136,11 @@ def create_app(
         # an occupied slot is a well-formed request that works once the holding
         # session ends. Unknown or unusable falls through to the 400 (#245).
         except SlotOccupied as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        # 409 for the third instance of the reason above: a thread has one live
+        # session at a time (issue #413), so a target another run holds is a
+        # request that works once that run lets it go. Nothing was started.
+        except ThreadHeld as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except SpawnError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
@@ -2089,6 +2222,54 @@ def create_app(
                 status_code=400,
                 detail="input needs a string 'data' field (\"\" is allowed)",
             )
+        # The steering form — prose meant for the agent, submitted — is a
+        # message, and since #407 a message travels the bus. Converted here for
+        # one release so an older lmer-ctl or UI bundle lands in the comms too;
+        # the keystroke form (no Enter) stays a PTY write for good.
+        hub = comms.ensure_hub()
+        if (
+            body.get("append_newline") and body.get("sanitize")
+            and hub is not None and hub.supports(session_id)
+        ):
+            kind = comms.KIND_COMMAND if (
+                body.get("preserve_slash_commands") and data.startswith("/")
+                and caller.kind in comms.COMMAND_CALLERS
+            ) else comms.KIND_MESSAGE
+            try:
+                session_io.require_session(session_id)
+                result = hub.post(
+                    session_id, kind=kind, text=data.rstrip("\r\n"),
+                    channel=caller.source_channel,
+                    author=_author_of(caller, body.get("author")),
+                )
+            except SessionIOError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            except comms.CommsError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            relay = result.get("relay") or {}
+            receipt = result.get("receipt") or {}
+            _note_check(caller, session_id=session_id)
+            return JSONResponse({
+                "session": session_id,
+                "bytes_written": relay.get("bytes_written"),
+                "queued": bool(relay.get("queued")),
+                "submit_confirmed": False,
+                "note": (
+                    "Accepted; typing is held until startup submission completes. "
+                    if relay.get("queued") else ""
+                ) + _SUBMIT_VIA_BUS_NOTE,
+                "submit_text": relay.get("submit_text"),
+                "deprecated": True,
+                "message_id": (result.get("message") or {}).get("id"),
+                # §8.3: the reply keeps its shape, receipt included, so a client
+                # that verified delivery before this change still can.
+                "payload_sha256": receipt.get("payload_sha256"),
+                "payload_length": receipt.get("payload_length"),
+            }, headers={
+                # §8.3, in the reply's own metadata rather than only in its body.
+                "Deprecation": "true",
+                "Link": f'</api/sessions/{session_id}/comms>; rel="successor-version"',
+            })
         try:
             reply = session_io.send_input(
                 session_id, data,
@@ -2209,6 +2390,48 @@ def create_app(
             "entries": [entry.to_dict() for entry in entries],
         }
 
+    def _option_index(value: object) -> Optional[int]:
+        """A body's ``option`` as a 1-based index, refused as a 400.
+
+        The shape check itself is the bus's, so this door and `POST /messages`
+        cannot drift apart on what an index is; the range is checked wherever
+        the question's own options are held.
+        """
+        try:
+            return bus_comms.option_index(value)
+        except bus_comms.CommsError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _answer_target(hub, session_id: str, question_id: str) -> Optional[str]:
+        """The bus question this answer names, or ``None`` to answer by file.
+
+        A session can have a bus and still ask through the ask directory: its
+        image carries the supervisor but the CLI that asked predates it, which
+        is every self-dev run on a checkout older than the unified channel
+        (issue #421). The question is then in the directory, and the bus either
+        does not know it or knows it under an id of its own — never under the
+        entry id, which counts something else.
+
+        So the id is looked up rather than computed. A question the directory
+        does not hold at all leaves the bus to answer, refusal included; one it
+        holds goes to the bus only if the bus can be shown to hold the same
+        question, and otherwise to the file, which is where its asker is
+        waiting.
+        """
+        entry = ask.question_on_channel(session_id, question_id)
+        if entry is None:
+            return question_id
+        if entry.closure is not None and entry.answer is None:
+            # The session stopped waiting, and the file holds the reason it gave.
+            # The bus would refuse this too, as a late answer — but "already
+            # answered" names an event that did not happen and drops the one
+            # thing the operator can act on.
+            return None
+        return hub.question_for_ask_entry(
+            session_id, question_id,
+            mirrored=ask.entry_is_the_bus_projection(session_id, question_id),
+        )
+
     @app.post(
         "/api/sessions/{session_id}/ask/{question_id}/answer", dependencies=guard
     )
@@ -2230,17 +2453,61 @@ def create_app(
         on disk and the session's next poll — seconds away — picks it up. Nothing
         is spawned, so there is no "started, will apply later" to report.
 
+        ``option`` names one of the question's options by its 1-based index,
+        for an operator who read a numbered list rather than the option's text
+        (#428). It may stand alone: the resolved option becomes the answer.
+
         The answer text is not echoed back. The operator already has it, and the
         one thing a reply body would add is another copy of it in a log.
         """
+        option = _option_index(body.get("option"))
         text = body.get("answer")
+        if text is None and option is not None:
+            text = ""
         if not isinstance(text, str):
             raise HTTPException(
-                status_code=400, detail="answer must be text"
+                status_code=400,
+                detail="answer must be text, or name an option by its index",
             )
+        # A session on the bus (#407) takes its answer there, so the supervisor
+        # arbitrates first-answer-wins and every channel sees who answered. The
+        # reply keeps this route's shape; a late answer keeps its 409.
+        hub = comms.ensure_hub()
+        target = (
+            _answer_target(hub, session_id, question_id)
+            if hub is not None and hub.supports(session_id) else None
+        )
+        if target is not None:
+            try:
+                session_io.require_session(session_id)
+                result = hub.post(
+                    session_id, kind="answer", text=text, in_reply_to=target,
+                    option=option,
+                    channel=caller.source_channel,
+                    author=_author_of(caller, body.get("author")),
+                )
+            except SessionIOError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            except comms.CommsError as exc:
+                raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+            if result.get("accepted_as") == "late":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"question {question_id} was already answered",
+                )
+            _note_check(caller, session_id=session_id)
+            record = result.get("message") or {}
+            return {
+                "session": session_id,
+                "question_id": question_id,
+                "answered_at": record.get("at"),
+                "message_id": record.get("id"),
+            }
         try:
             session_io.require_session(session_id)
-            recorded = ask.answer_question(session_id, question_id, text)
+            recorded = ask.answer_question(
+                session_id, question_id, text, option=option
+            )
         except SessionIOError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         except AskChannelError as exc:
@@ -2251,6 +2518,390 @@ def create_app(
             "question_id": recorded["question_id"],
             "answered_at": recorded["answered_at"],
         }
+
+    # Comms source channels are stamped from credentials, not request bodies.
+
+    def _require_hub() -> "comms.CommsHub":
+        return comms.ensure_hub()
+
+    def _require_connectors() -> "connectors.ThreadConnectors":
+        return connectors.ensure_connectors()
+
+    def _comms_reply(session_id: str, hub, page: tuple) -> dict:
+        events, cursor = page
+        return {
+            "session": session_id,
+            "messages": [event.message for event in events],
+            "cursor": cursor,
+            "live": session_io.session_is_live(session_id),
+        }
+
+    @app.get("/api/sessions/{session_id}/comms", dependencies=guard)
+    def session_comms(
+        session_id: str,
+        since: int = Query(default=0, ge=0),
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        limit: int = Query(default=500, ge=1, le=2000),
+        caller: Caller = Depends(require_secret),
+    ) -> dict:
+        """One session's conversation as the daemon journaled it.
+
+        ``since`` is the **fleet cursor** of the last event the caller saw, not
+        the session's own ``seq`` — the journal is what is served, so the
+        cursor is the journal's. ``cursor`` in the reply is what to pass next.
+        """
+        try:
+            session_io.require_session(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        hub = _require_hub()
+        _note_check(caller, session_id=session_id)
+        return _comms_reply(
+            session_id, hub, hub.feed(since, timeout=timeout, session=session_id, limit=limit)
+        )
+
+    @app.post("/api/sessions/{session_id}/comms", dependencies=guard)
+    def session_comms_post(
+        session_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Post one record on a session's bus, stamped with the caller's channel.
+
+        The operator's credential posts as ``platform`` (with ``author`` from the
+        body when given), the assistant's as ``uber-lmer``, a connector's as the
+        channel bound to it. ``command`` is accepted from the operator and the
+        assistant only.
+        """
+        try:
+            session_io.require_session(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        hub = _require_hub()
+        kind = body.get("kind") or "message"
+
+        option = _option_index(body.get("option"))
+        text = body.get("text")
+        if text is None and option is not None:
+            text = ""
+        if not isinstance(kind, str) or not isinstance(text, str):
+            raise HTTPException(status_code=400, detail="comms needs string 'kind' and 'text'")
+        if kind == comms.KIND_COMMAND and caller.kind not in comms.COMMAND_CALLERS:
+            raise HTTPException(
+                status_code=403,
+                detail="only the operator and the assistant may run a harness command",
+            )
+        options = body.get("options") or []
+        attachments = body.get("attachments") or []
+        if not isinstance(options, list) or not isinstance(attachments, list):
+            raise HTTPException(status_code=400, detail="options and attachments must be lists")
+        try:
+            result = hub.post(
+                session_id,
+                kind=kind,
+                text=text,
+                channel=caller.source_channel,
+                author=_author_of(caller, body.get("author")),
+                ref=body.get("ref") if isinstance(body.get("ref"), str) else None,
+                in_reply_to=body.get("in_reply_to") if isinstance(body.get("in_reply_to"), str) else None,
+                option=option,
+                options=[str(item) for item in options],
+                attachments=[item for item in attachments if isinstance(item, dict)],
+                meta=body.get("meta") if isinstance(body.get("meta"), dict) else None,
+            )
+        except comms.NoBus:
+            if option is not None and kind == comms.KIND_ANSWER:
+                # Nothing on this path holds the question's options — a bus-less
+                # session's question lives in the ask directory, and `in_reply_to`
+                # names a bus id that is not there — so the index resolves against
+                # nothing and typing an unresolved number in is the failure #428
+                # exists to stop. Retrying here with the text would 409 again on
+                # the kind, so the detail names the door that can answer it.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"session {session_id} has no message bus, so an option "
+                        "index cannot be resolved here — answer it through "
+                        f"POST /api/sessions/{session_id}/ask/{{question_id}}/answer, "
+                        "which reads the question's options from the ask directory"
+                    ),
+                )
+            # A session started from an image older than the unified channel
+            # (spec §8's third row). It has no bus, but it has the route the bus
+            # replaced, and during the deployment window it is every session
+            # already running: without this the chat composer and `lmer-ctl
+            # send` fail with a 409 at the exact moment they used to work.
+            return _post_without_a_bus(session_id, kind, text, caller, body)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except comms.CommsError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"session": session_id, **result}
+
+    def _post_without_a_bus(
+        session_id: str, kind: str, text: str, caller: Caller, body: dict,
+    ) -> dict:
+        """The pre-#407 path for one record: type it in, say the bus was absent.
+
+        Only prose reaches a session this way — a `command` keeps its leading
+        slash, everything else is guarded as before — and nothing else on the
+        session hears it, because there is nothing to hear it with.
+        """
+        if kind not in (comms.KIND_MESSAGE, comms.KIND_COMMAND):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"session {session_id} has no message bus (its image predates the "
+                    f"unified channel), so a {kind!r} record has nowhere to go"
+                ),
+            )
+        try:
+            reply = session_io.send_input(
+                session_id, text, append_newline=True, sanitize=True,
+                preserve_slash_commands=(kind == comms.KIND_COMMAND),
+            )
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {
+            "session": session_id,
+            "message": None,
+            "accepted_as": "typed",
+            "relay": {
+                "bytes_written": reply.get("bytes_written"),
+                "submit_text": reply.get("submit_text"),
+            },
+            "receipt": {
+                key: reply.get(key) for key in ("payload_sha256", "payload_length")
+                if reply.get(key) is not None
+            } or None,
+            "bus": False,
+            "note": (
+                "this session predates the unified channel: the text was typed into "
+                "the harness and no other channel saw it"
+            ),
+        }
+
+    @app.get("/api/comms/feed", dependencies=guard)
+    def comms_feed(
+        since: int = Query(default=0, ge=0),
+        timeout: float = Query(default=0.0, ge=0.0, le=30.0),
+        session: Optional[str] = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=2000),
+    ) -> dict:
+        """The fleet feed: every journaled record, with its session and run.
+
+        A platform-side client's whole subscription is a loop over this route
+        passing back ``cursor``; ``since=0`` replays from the journal's start.
+        """
+        hub = _require_hub()
+        events, cursor = hub.feed(since, timeout=timeout, session=session, limit=limit)
+        return {"events": [event.to_dict() for event in events], "cursor": cursor}
+
+    @app.post("/api/comms/ack", dependencies=guard)
+    def comms_ack(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        hub = _require_hub()
+        cursor = body.get("cursor")
+        connector = body.get("connector") or caller.name or caller.kind
+        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
+            raise HTTPException(status_code=400, detail="cursor must be a non-negative integer")
+        if not isinstance(connector, str) or not connector.strip():
+            raise HTTPException(status_code=400, detail="connector must be a name")
+        hub.ack_connector(connector.strip(), cursor)
+        return {"connectors": hub.connectors()}
+
+    @app.get("/api/comms/connectors", dependencies=guard)
+    def comms_connectors() -> dict:
+        hub = _require_hub()
+        return {
+            "connectors": hub.connectors(),
+            "credentials": list_connectors(),
+        }
+
+    @app.get("/api/comms/questions", dependencies=guard)
+    def comms_questions(open: bool = Query(default=False)) -> dict:
+        hub = _require_hub()
+        return {"questions": hub.questions(open_only=open)}
+
+    # --- chat-thread connections (issue #412) --------------------------------
+    #
+    # Three routes over one record: a connection is a (session, thread) pair the
+    # daemon keeps and runs a connector process for, which is what makes connect
+    # and disconnect things that happen to a session that is already up. Every
+    # refusal comes out of :mod:`lmer_platform.connectors` carrying the status it
+    # should answer with — the reason is known there, and re-deriving it from the
+    # message at each caller is how the route and `lmer-ctl` start disagreeing.
+
+    @app.get("/api/sessions/{session_id}/threads", dependencies=guard)
+    def session_thread_list(session_id: str) -> dict:
+        """This session's chat-thread connections, and what each connector is doing.
+
+        A record whose connector is not running is still a record and still
+        listed, with ``detail`` saying why — a thread that has gone quiet
+        otherwise looks exactly like one that is working.
+        """
+        try:
+            session_io.require_session(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {
+            "schema": connectors.SCHEMA,
+            "threads": _require_connectors().listing(session_id),
+        }
+
+    @app.post("/api/sessions/{session_id}/threads", dependencies=guard, status_code=201)
+    def session_thread_connect(
+        session_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Connect a running session to a thread, or open a new one for it.
+
+        ``{"permalink": …}`` connects a thread that exists. ``{"channel": …,
+        "title": …?}`` opens one there and connects that (issue #429), and the
+        record it answers with carries the new thread's permalink. Never both:
+        a permalink's channel is read out of the link, so a body naming the two
+        is naming a thread and a place to make one.
+
+        On the live assistant's session this also edits the standing ``threads``
+        setting, so a thread connected from the chat pane survives a rotation.
+        """
+        channel, permalink = body.get("channel"), body.get("permalink")
+        by = _author_of(caller, None) or caller.source_channel
+        try:
+            if channel and permalink:
+                raise connectors.ThreadError(
+                    "give a permalink to connect a thread that exists, or a "
+                    "channel to open a new one — not both",
+                )
+            if channel:
+                record = session_threads.open_for(
+                    session_id, channel, title=body.get("title"), by=by,
+                    # A root the *platform* posted, and stamped as such (#427):
+                    # nobody's session wrote it, and the run this thread is being
+                    # opened for should read it as the operator addressing it
+                    # rather than as its own echo to skip.
+                    poster=thread_posts.Poster.for_platform(_thread_label(caller)),
+                )
+            else:
+                record = session_threads.connect(session_id, permalink, by=by)
+        except connectors.ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"thread": record}
+
+    @app.delete("/api/sessions/{session_id}/threads/{thread_id}", dependencies=guard)
+    def session_thread_disconnect(
+        session_id: str, thread_id: str, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Stop mirroring one thread. The connector posts a line saying so."""
+        try:
+            record = session_threads.disconnect(session_id, thread_id)
+        except connectors.ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"disconnected": record}
+
+    # --- threads a run is pointed at, without connecting them (issue #414) ---
+    #
+    # Session-scoped because that is where the operator is, stored against the
+    # run because that is what outlives the session (docs/COMMS.md §12).
+
+    def _run_of_session(session_id: str) -> tuple:
+        session_io.require_session(session_id)
+        identity = run_for_session(session_id)
+        if identity is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"session {session_id} belongs to no run this orchestrator "
+                    "tracks, and a reference thread is attached to a run"
+                ),
+            )
+        return identity
+
+    @app.get("/api/sessions/{session_id}/references", dependencies=guard)
+    def session_references(session_id: str) -> dict:
+        """The threads this run has been pointed at. Connected to nothing."""
+        try:
+            identity = _run_of_session(session_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return {
+            "run": dict(zip(("host", "project", "slug"), identity)),
+            "references": references.listing(*identity),
+            "local": True,
+            "note": references.LOCALITY_NOTE,
+        }
+
+    @app.post("/api/sessions/{session_id}/references", dependencies=guard, status_code=201)
+    def session_reference_add(
+        session_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Point this run at a thread: no connector, no ack in the thread, no
+        claim on it. The run is told once, when its bus is up."""
+        try:
+            identity = _run_of_session(session_id)
+            record = references.add(
+                *identity, body.get("permalink"), title=body.get("title"),
+                by=_author_of(caller, None) or caller.source_channel,
+            )
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except references.ThreadReferenceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"reference": record.to_dict(), "note": references.LOCALITY_NOTE}
+
+    @app.delete("/api/sessions/{session_id}/references/{reference_id}", dependencies=guard)
+    def session_reference_remove(
+        session_id: str, reference_id: str, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        try:
+            identity = _run_of_session(session_id)
+            record = references.remove(*identity, reference_id)
+        except SessionIOError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except references.ThreadReferenceError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return {"removed": record.to_dict()}
+
+    # --- a thread nothing here is connected to (issue #414) ------------------
+    #
+    # The session's two verbs, done here with the daemon's own credentials for
+    # the UI and for uber lmer. No session and no connection is involved.
+
+    @app.get("/api/comms/thread", dependencies=guard)
+    def comms_thread_read(
+        permalink: str = "",
+        limit: int = Query(
+            default=thread_queue.DEFAULT_READ_LIMIT, ge=1, le=thread_queue.MAX_READ_LIMIT
+        ),
+    ) -> dict:
+        """A thread's most recent messages, as the records a session would see.
+
+        No upload store: no session is behind this call, so a file is described
+        rather than copied anywhere.
+        """
+        try:
+            return thread_access.read_thread(permalink, limit=limit)
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @app.post("/api/comms/thread", dependencies=guard)
+    def comms_thread_post(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Post once into a thread, attributed to whoever holds the credential."""
+        label = _thread_label(caller)
+        try:
+            return thread_access.post_thread(
+                body.get("permalink"), body.get("text") or "", label=label,
+                # Stamped like a run's own post (#427), so a connector watching
+                # that thread relays this instead of taking it for its own echo.
+                # No session is behind it, so the credential's name is the label.
+                poster=thread_posts.Poster.for_platform(label),
+            )
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
     # --- files the operator hands a session (issue #246) ---------------------
     #
@@ -2700,6 +3351,14 @@ def create_app(
             )
         except RunIndexError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+        if removed:
+            # Its chat-thread connections go with it (issue #412): a crashed
+            # session's registry entry is kept on purpose as the crash signal, so
+            # the reconcile's prune would leave the records of a run this
+            # orchestrator has been told to forget.
+            _require_connectors().drop_run(
+                (body.get("host"), body.get("project"), body.get("slug"))
+            )
         return {"forgotten": removed}
 
     # --- what a run is about (T52) -------------------------------------------
@@ -3111,7 +3770,7 @@ def create_app(
         branched on it would be reading the daemon's wiring out of an assistant's
         status.
 
-        ``model``/``harness``/``preset``/``agents`` are the per-call launch
+        ``model``/``harness``/``preset``/``agents``/``threads`` are the per-call launch
         overrides (issue #234), beating the standing chain the way an explicit
         override beats an export everywhere else in the config; omitted keys fall
         through to it (:func:`lmer_platform.assistant._launch_settings`).
@@ -3346,7 +4005,7 @@ def create_app(
         never an env-resolved value baked in where it would outlive the export
         (:func:`lmer_platform.config.update_stored`).
 
-        Keys are the four launch-setting names plus the integer settings
+        Keys are the launch-setting names (including ``threads``) plus the integer settings
         (``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
         ``nudge_pending_threshold`` from #317), which are spelled as their config
         fields because they are not launch flags and do not share their

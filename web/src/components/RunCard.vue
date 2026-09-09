@@ -11,6 +11,7 @@ import {
   portUrl, shortTarget, stateMeta, targetLink, targetRef, toneColor,
 } from '../format.js'
 import StatusStrip from './StatusStrip.vue'
+import ThreadLinks from './ThreadLinks.vue'
 
 // Which kind of thing the run is against. The word in the chip says it too, and
 // that is the point: main.js names colour-carrying-a-signal-alone as this UI's
@@ -37,7 +38,7 @@ const props = defineProps({
   now: { type: Number, default: () => Date.now() },
 })
 
-defineEmits(['open', 'forget', 'open-chat'])
+defineEmits(['open', 'forget', 'open-chat', 'threads-changed'])
 
 const meta = computed(() => stateMeta(props.run.state))
 const ledger = computed(() => ledgerSummary(props.run.ledger))
@@ -435,6 +436,16 @@ const forgettable = computed(
           aria-label="talk to uber lmer"
           @click="$emit('open-chat')"
         >chat</v-btn>
+        <!-- Which chat threads this run is mirrored into, and the way to change
+             it. On the row because that is where an operator decides a run needs
+             a human in a thread, and the fleet poll already carries the answer. -->
+        <ThreadLinks
+          :session-id="run.session?.id"
+          :threads="run.threads"
+          :references="run.references || []"
+          :live="run.live"
+          @changed="$emit('threads-changed')"
+        />
         <v-btn
           v-if="answerable"
           variant="tonal"

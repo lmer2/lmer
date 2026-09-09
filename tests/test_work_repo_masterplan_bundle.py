@@ -53,6 +53,11 @@ from tests.conftest import strip_lmer_env
 from tests.test_masterplan_runs_dir_session import _Recorder
 from work_repo import run_state, specs_index, utils
 
+#: The instant staleness is measured against, so this file's verdicts do not
+#: depend on the wall clock: the fixture's sessions are stamped 2026-08-24, and
+#: `record.session-stale` fires 14 days after that.
+NOW = datetime(2026, 8, 24, 12, 0, 0, tzinfo=timezone.utc)
+
 
 @pytest.fixture(autouse=True)
 def _clean_lmer_env(monkeypatch):
@@ -352,9 +357,7 @@ class TestTheValidatorAcceptsEveryLinkThisSyncWrites:
         assert _entries(schema_plexus.specs_dir)
         report = Report(Form.SCHEMA)
         check_index_links(schema_plexus.root, report)
-        check_record(
-            schema_plexus.root, report, now=datetime(2026, 8, 25, tzinfo=timezone.utc)
-        )
+        check_record(schema_plexus.root, report, now=NOW)
         assert [(f.code, f.path) for f in report.findings] == []
 
 

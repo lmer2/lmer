@@ -1059,9 +1059,15 @@ def new_signals() -> list:
     """
     marks = _signal_marks()
     found: list = []
+    hub = _comms_hub()
     for entry in registry.list_sessions(live_only=True):
         session_id = entry.get("id") if isinstance(entry, dict) else None
         if not isinstance(session_id, str) or not session_id:
+            continue
+        # A session on the bus (#407) has its milestones delivered by the
+        # comms hub; its ask directory is a projection of the same records, and
+        # reading both would spool every milestone twice.
+        if hub is not None and hub.handles(session_id):
             continue
         try:
             directory = ask.session_ask_dir(session_id)
@@ -1088,6 +1094,13 @@ def new_signals() -> list:
                 continue
             found.append(record)
     return found
+
+
+def _comms_hub():
+    """The running comms hub, if the daemon started one (issue #407)."""
+    from . import comms
+
+    return comms.get_hub()
 
 
 def record_ingested_signals(signals: list) -> None:
