@@ -705,6 +705,7 @@ class AssistantState:
     #: :func:`take_pending`; a future value is durably bounded to the current
     #: time by :func:`clamp_future_nudged_at` before the detector reads it.
     nudged_at: Optional[str] = None
+    codex_wake: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {
@@ -721,6 +722,7 @@ class AssistantState:
             "pending_since": self.pending_since,
             "pending_seq": self.pending_seq,
             "nudged_at": self.nudged_at,
+            "codex_wake": self.codex_wake,
         }
 
     @classmethod
@@ -780,6 +782,7 @@ class AssistantState:
             pending_since=_opt_str(payload.get("pending_since")),
             pending_seq=pending_seq,
             nudged_at=_opt_str(payload.get("nudged_at")),
+            codex_wake=_opt_str(payload.get("codex_wake")),
         )
 
 
@@ -2586,6 +2589,15 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
             "assistant_notified", note=label, data={"kind": label, "note": text}
         )
         return _live_assistant() is not None
+
+
+def mark_codex_wake(session_id: str, pending_seq: int, delivery_id: str) -> bool:
+    """Acknowledge one native delivery without draining or retargeting the spool."""
+    with _LOCK:
+        state = read_state()
+        if state.session_id != session_id or state.pending_seq != pending_seq or not state.pending:
+            return False
+        return _write_state(replace(state, codex_wake=delivery_id, nudged_at=utc_now_iso()))
 
 
 def mark_nudged() -> Optional[str]:

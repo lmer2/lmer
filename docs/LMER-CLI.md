@@ -241,6 +241,14 @@ The following environment variables control LMER behavior:
 
 - **`LMER_PORT_BIND`** - Host bind address used when publishing `--ports`/`LMER_PORT_COUNT` mappings (default `127.0.0.1`). Equivalent to the `--port-bind` flag, which takes precedence when both are set. Set to `0.0.0.0` to expose the allocated ports on every host interface (so other machines on the LAN can reach a service Claude starts inside the container), or to a specific IP (e.g. `192.168.1.42`) to publish only on that interface. The value is also used to probe for free ports in the pool, so the chosen ports are guaranteed bindable on that address. **Security note:** the default is loopback for a reason — opening published ports to the network exposes any service Claude binds inside the container; only widen the bind when you trust both the network and what the agent is running. Read by the host CLI only.
 
+Codex uses native startup and structured delivery. The PTY timing settings
+`LMER_AUTO_START_DELAY`, `LMER_AUTO_START_READY_TIMEOUT`,
+`LMER_AUTO_START_READY_MARKER`, `LMER_AUTO_START_NUDGE_DELAY`,
+`LMER_AUTO_START_SETTLE_DELAY`, `LMER_START_PROMPT_DELAY` and
+`LMER_SUBMIT_ENTER_DELAY` do not apply to Codex.
+`LMER_START_PROMPT` still submits after startup acceptance, and may steer the
+active turn. See [Codex delivery](CODEX-DELIVERY.md).
+
 - **`LMER_AUTO_START_DELAY`** - Seconds the supervisor waits before injecting the initial `/start` into Claude (the marker-based prompt-ready wait, see `LMER_AUTO_START_READY_TIMEOUT`, may extend this). Accepts a float (default `1.5`); negative values are clamped to `0`. Also settable per-invocation with `--auto-start-delay`. Has no effect under `--manual-start`/`LMER_MANUAL_START`. Parsed by `lmer-supervisor` and forwarded into the container by the host CLI.
 
 - **`LMER_AUTO_START_NUDGE_DELAY`** - Seconds between the follow-up carriage-return "nudges" that the supervisor sends after auto-injecting `/start`. The initial Enter is occasionally swallowed during Claude's startup re-render, leaving `/start` typed but unsubmitted; the supervisor sends a few bare CRs afterward to re-trigger submission (each is a harmless no-op once `/start` has gone through). Accepts a float (default `0.5`); negative values are clamped to `0`. Has no effect under `--manual-start`/`LMER_MANUAL_START`. Parsed by `lmer-supervisor` and forwarded into the container by the host CLI.

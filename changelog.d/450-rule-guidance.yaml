@@ -1,0 +1,2 @@
+fixed:
+- "Container rule-reading guidance now points to installed files instead of unavailable host shortcuts (#450)."

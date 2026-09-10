@@ -27,6 +27,7 @@ Time moves by writing stamps and by passing ``now``; nothing here sleeps.
 
 import json
 import threading
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -34,7 +35,7 @@ import pytest
 
 from lmer_platform import assistant, detect, nudge, store
 from lmer_platform.config import PlatformConfig
-from lmer_platform.session_io import ControlPlaneError
+from lmer_platform.session_io import ControlPlaneError, SessionIOError
 
 AFTER = 180
 THRESHOLD = 1
@@ -1035,3 +1036,373 @@ def test_an_unwritable_future_mark_fails_open_to_one_nudge(
     instance.nudge_once()
 
     assert len(sender.calls) == 1
+
+
+# Codex uses the same daemon tick, independently of the idle fallback.
+def test_codex_wake_during_conversation_coalesces_and_ack_survives_restart(detector, monkeypatch):
+    from unittest.mock import Mock
+    assistant.notify('question waiting')
+    assistant._write_state(replace(assistant.read_state(), session_id='assistant-1'))
+    sender = Mock(return_value={'transport': 'codex-app-server', 'state': 'accepted', 'submit_confirmed': False})
+    instance = detector(sender=sender, idle=0)
+    native = {'runtime': {'model': 'gpt-6-astra', 'effort': 'high'}, 'receipts': []}
+    health = Mock(return_value={'codex_delivery': native})
+    monkeypatch.setattr(detect, 'quiet_health', health)
+    instance._nudge_stage()
+    assert sender.call_count == 1
+    ident = sender.call_args.kwargs['delivery_id']
+    assert assistant.read_state().codex_wake is None
+    assert len(assistant.read_state().pending) == 1
+    native['receipts'] = [{'delivery_id': ident, **sender.return_value}]
+    assistant.notify('another digest')
+    instance._nudge_stage()
+    assert sender.call_count == 1
+    native['receipts'][0].update(state='confirmed', submit_confirmed=True)
+    instance._nudge_stage()
+    assert assistant.read_state().codex_wake == ident
+    assert len(assistant.read_state().pending) == 2
+    before = health.call_count
+    detector(sender=sender, idle=0)._nudge_stage()
+    assert health.call_count == before and sender.call_count == 1
+    assistant.take_pending()
+    assistant.notify('new accumulation')
+    instance._nudge_stage()
+    assert sender.call_count == 2 and sender.call_args.kwargs['delivery_id'] != ident
+
+
+def test_codex_wake_lost_response_uses_same_identity_and_original_text(detector, monkeypatch):
+    from unittest.mock import Mock
+    assistant.notify('pending')
+    sender = Mock(side_effect=[SessionIOError('response lost'), {
+        'transport': 'codex-app-server', 'state': 'accepted', 'submit_confirmed': False,
+    }])
+    instance = detector(sender=sender, idle=0)
+    monkeypatch.setattr(detect, 'quiet_health', lambda _: {'codex_delivery': {'runtime': {'model': 'astra'}, 'receipts': []}})
+    instance._nudge_stage()
+    assistant.notify('burst changes count')
+    instance._nudge_stage()
+    assert sender.call_args_list[0] == sender.call_args_list[1]
+    assert len(assistant.read_state().pending) == 2
+    assert assistant.read_state().codex_wake is None
+
+
+@pytest.mark.parametrize('health', [None, {}, {'codex_delivery': {'runtime': None}}])
+def test_codex_wake_never_uses_legacy_or_unready_transport(detector, monkeypatch, health):
+    from unittest.mock import Mock
+    assistant.notify('pending')
+    sender = Mock()
+    instance = detector(sender=sender, idle=0)
+    monkeypatch.setattr(detect, 'quiet_health', lambda _: health)
+    instance._nudge_stage()
+    sender.assert_not_called()
+
+
+def test_codex_wake_ack_cannot_mark_a_new_accumulation(platform_root):
+    assistant.notify('first')
+    assistant._write_state(replace(assistant.read_state(), session_id='assistant-1'))
+    sequence = assistant.read_state().pending_seq
+    assistant.take_pending()
+    assistant.notify('second')
+    assert not assistant.mark_codex_wake('assistant-1', sequence, 'old')
+    assert assistant.read_state().codex_wake is None
+    assert len(assistant.read_state().pending) == 1
+
+
+@pytest.fixture
+def native_wake_adapter(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    from lmer_cli.codex_delivery import CodexDelivery
+
+    adapter = CodexDelivery(['codex'], notify=Mock())
+    adapter.outbox = tmp_path / 'delivery.json'
+    adapter._connect = Mock()
+    adapter._disconnect = Mock()
+    thread = {'id': 't', 'threadSource': 'user', 'model': 'gpt-6-astra',
+              'reasoningEffort': 'high', 'turns': [{'id': 'turn', 'status': 'inProgress', 'items': []}]}
+    starts = []
+
+    def request(method, params):
+        if method == 'thread/loaded/list':
+            return {'data': ['t']}
+        if method == 'thread/read':
+            return {'thread': thread}
+        assert method == 'turn/start'
+        starts.append(params)
+        return {'turn': {'id': 'turn'}}
+
+    adapter._request = request
+    adapter._thread()
+    monkeypatch.setattr(detect, 'quiet_health', lambda _: {'codex_delivery': adapter.snapshot()})
+    return adapter, thread, starts
+
+
+def test_codex_idle_fallback_response_loss_and_restart_do_not_replay(detector, native_wake_adapter):
+    import hashlib
+
+    adapter, thread, starts = native_wake_adapter
+    assistant.notify('pending question')
+    _age_spool(minutes=10)
+    state = assistant.read_state()
+    ident = 'digest-' + hashlib.sha256(f'assistant-1:{state.pending_seq}'.encode()).hexdigest()[:32]
+    assistant._write_state(replace(state, session_id='assistant-1', codex_wake=ident))
+
+    def sender(session, text, **kwargs):
+        adapter.deliver(text, client_id=kwargs.get('delivery_id'))
+        raise SessionIOError('HTTP response lost after native acceptance')
+
+    instance = detector(sender=sender)
+    instance._nudge_stage()
+    assert len(starts) == 1 and starts[0]['clientUserMessageId'].startswith('digest-idle-')
+    assistant.notify('burst changes count')
+    _age_spool(minutes=20)
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == 1
+    assert assistant.read_state().nudged_at is None
+    thread['turns'][0]['items'].append({'type': 'userMessage', 'clientId': starts[0]['clientUserMessageId'],
+                                      'content': starts[0]['input']})
+    adapter.refresh()
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == 1 and assistant.read_state().nudged_at is not None
+    assert len(assistant.read_state().pending) == 2
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == 1
+
+
+def test_codex_wake_recovers_only_proven_unsent_input_across_restart(detector, native_wake_adapter):
+    adapter, thread, starts = native_wake_adapter
+    assistant.notify('pending question')
+    assistant._write_state(replace(assistant.read_state(), session_id='assistant-1'))
+
+    def sender(session, text, **kwargs):
+        return adapter.deliver(text, client_id=kwargs['delivery_id'])
+
+    adapter._connect.side_effect = OSError('connection unavailable before send')
+    detector(sender=sender, idle=0)._nudge_stage()
+    assert starts == []
+    adapter._connect.side_effect = None
+    detector(sender=sender, idle=0)._nudge_stage()
+    assert len(starts) == 1
+    detector(sender=sender, idle=0)._nudge_stage()
+    assert len(starts) == 1 and assistant.read_state().codex_wake is None
+    thread['turns'][0]['items'].append({'type': 'userMessage', 'clientId': starts[0]['clientUserMessageId'],
+                                      'content': starts[0]['input']})
+    adapter.refresh()
+    detector(sender=sender, idle=0)._nudge_stage()
+    assert assistant.read_state().codex_wake == starts[0]['clientUserMessageId']
+    assert len(starts) == 1 and len(assistant.read_state().pending) == 1
+
+
+@pytest.mark.parametrize('idle', [0, 600])
+def test_codex_uncertain_wake_is_blocked_across_restart(detector, native_wake_adapter, idle):
+    import hashlib
+
+    adapter, _, starts = native_wake_adapter
+    assistant.notify('pending question')
+    _age_spool(minutes=10)
+    state = assistant.read_state()
+    ident = 'digest-' + hashlib.sha256(f'assistant-1:{state.pending_seq}'.encode()).hexdigest()[:32]
+    assistant._write_state(replace(state, session_id='assistant-1', codex_wake=ident if idle else None))
+    request = adapter._request
+
+    def lost_response(method, params):
+        result = request(method, params)
+        if method == 'turn/start':
+            raise TimeoutError('native response lost')
+        return result
+
+    adapter._request = lost_response
+
+    def sender(session, text, **kwargs):
+        return adapter.deliver(text, client_id=kwargs.get('delivery_id'))
+
+    for _ in range(3):
+        detector(sender=sender, idle=idle)._nudge_stage()
+    assert len(starts) == 1
+    assert adapter.snapshot()['receipts'][0]['state'] == 'uncertain'
+    assert assistant.read_state().nudged_at is None
+
+
+@pytest.mark.parametrize('health', [None, {}, {'codex_delivery': {'runtime': None}}])
+def test_known_codex_idle_fallback_holds_when_native_health_is_unavailable(detector, monkeypatch, health):
+    from unittest.mock import Mock
+
+    sender = Mock()
+    instance = detector(sender=sender)
+    assistant.notify('pending question')
+    _age_spool(minutes=10)
+    status = replace(assistant.status(), settings={'harness': 'codex'})
+    monkeypatch.setattr(assistant, 'status', lambda: status)
+    monkeypatch.setattr(detect, 'quiet_health', lambda _: health)
+    instance._nudge_stage()
+    sender.assert_not_called()
+    assert assistant.read_state().nudged_at is None
+
+
+@pytest.mark.parametrize('failure', ['accepted', 'http-loss', 'uncertain', 'rejected', 'unsent'])
+def test_codex_overdue_idle_spool_has_one_outstanding_wake(detector, native_wake_adapter, failure):
+    from lmer_cli.codex_delivery import CodexDeliveryError
+
+    adapter, _, starts = native_wake_adapter
+    assistant.notify('overdue question')
+    _age_spool(minutes=20)
+    assistant._write_state(replace(assistant.read_state(), session_id='assistant-1'))
+    request = adapter._request
+
+    def rpc(method, params):
+        result = request(method, params)
+        if method == 'turn/start':
+            if failure == 'uncertain':
+                raise TimeoutError('primary native response lost')
+            if failure == 'rejected':
+                raise CodexDeliveryError('primary native rejection')
+        return result
+
+    adapter._request = rpc
+    if failure == 'unsent':
+        adapter._connect.side_effect = OSError('primary connection unavailable')
+    sends = []
+
+    def sender(session, text, **kwargs):
+        sends.append((text, kwargs))
+        receipt = adapter.deliver(text, client_id=kwargs['delivery_id'])
+        if failure == 'http-loss':
+            raise SessionIOError('primary HTTP response lost')
+        return receipt
+
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == (0 if failure == 'unsent' else 1)
+    assert len(sends) == 1
+    adapter._connect.side_effect = None
+    assistant.notify('another digest in the same accumulation')
+    detector(sender=sender)._nudge_stage()
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == 1
+    assert all(s[1]['delivery_id'] == sends[0][1]['delivery_id'] for s in sends)
+    assert len(assistant.read_state().pending) == 2
+    assert assistant.read_state().codex_wake is None
+    assert assistant.read_state().nudged_at is None
+
+
+def test_codex_confirmed_primary_starts_interval_before_later_idle_reminder(detector, native_wake_adapter, monkeypatch):
+    adapter, thread, starts = native_wake_adapter
+    assistant.notify('overdue question')
+    _age_spool(minutes=20)
+    assistant._write_state(replace(assistant.read_state(), session_id='assistant-1'))
+
+    def sender(session, text, **kwargs):
+        return adapter.deliver(text, client_id=kwargs['delivery_id'])
+
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == 1
+    thread['turns'][0]['items'].append({'type': 'userMessage', 'clientId': starts[0]['clientUserMessageId'],
+                                      'content': starts[0]['input']})
+    adapter.refresh()
+    detector(sender=sender)._nudge_stage()
+    state = assistant.read_state()
+    assert state.codex_wake == starts[0]['clientUserMessageId'] and state.nudged_at
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == 1
+    later = datetime.now(timezone.utc) + timedelta(seconds=AFTER + 1)
+    age = nudge.age_seconds
+    monkeypatch.setattr(nudge, 'age_seconds', lambda stamp, now=None: age(stamp, now=later))
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == 2 and starts[1]['clientUserMessageId'].startswith('digest-idle-')
+    assert starts[0]['input'] != starts[1]['input']
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == 2 and len(assistant.read_state().pending) == 1
+
+
+@pytest.mark.parametrize('failed_mark', ['primary', 'idle'])
+@pytest.mark.parametrize('outcome', ['accepted', 'uncertain', 'rejected', 'unsent'])
+def test_codex_mark_recovery_cannot_replace_outstanding_idle_identity(
+    detector, native_wake_adapter, monkeypatch, failed_mark, outcome,
+):
+    from lmer_cli.codex_delivery import CodexDeliveryError
+
+    adapter, thread, starts = native_wake_adapter
+    clock = [datetime.now(timezone.utc)]
+    stamp = lambda: clock[0].strftime('%Y-%m-%dT%H:%M:%SZ')
+    age = store.age_seconds
+    for module in (assistant, detect, nudge):
+        monkeypatch.setattr(module, 'age_seconds', lambda value, now=None: age(value, now=clock[0]))
+    for module in (assistant, detect):
+        monkeypatch.setattr(module, 'utc_now_iso', stamp)
+    assistant.notify('pending original')
+    _age_spool(minutes=20)
+    assistant._write_state(replace(assistant.read_state(), session_id='assistant-1'))
+    sends = []
+
+    def sender(session, text, **kwargs):
+        sends.append((text, kwargs['delivery_id']))
+        return adapter.deliver(text, client_id=kwargs['delivery_id'])
+
+    def confirm_latest():
+        thread['turns'][0]['items'].append({
+            'type': 'userMessage', 'clientId': starts[-1]['clientUserMessageId'],
+            'content': starts[-1]['input'],
+        })
+        adapter.refresh()
+
+    instance = detector(sender=sender)
+    instance._nudge_stage()
+    confirm_latest()
+    if failed_mark == 'idle':
+        instance._nudge_stage()
+        clock[0] += timedelta(seconds=AFTER + 1)
+        instance._nudge_stage()
+        confirm_latest()
+    confirmed_count = len(starts)
+    before_mark = assistant.read_state()
+    writer = assistant._write_state
+    monkeypatch.setattr(assistant, '_write_state', lambda state: False)
+    instance._nudge_stage()
+    assert assistant.read_state() == before_mark
+    clock[0] += timedelta(seconds=AFTER + 1)
+    instance._nudge_stage()
+    assert len(starts) == confirmed_count, 'failed durable mark must not authorize another idle identity'
+    detector(sender=sender)._nudge_stage()
+    assert len(starts) == confirmed_count
+
+    monkeypatch.setattr(assistant, '_write_state', writer)
+    instance = detector(sender=sender)
+    instance._nudge_stage()
+    recovered = assistant.read_state()
+    assert recovered.nudged_at == stamp()
+    assert recovered.codex_wake == starts[0]['clientUserMessageId']
+    assert len(starts) == confirmed_count
+    clock[0] += timedelta(seconds=AFTER - 1)
+    instance._nudge_stage()
+    assert len(starts) == confirmed_count
+
+    request = adapter._request
+
+    def rpc(method, params):
+        result = request(method, params)
+        if method == 'turn/start':
+            if outcome == 'uncertain':
+                raise TimeoutError('idle native response lost')
+            if outcome == 'rejected':
+                raise CodexDeliveryError('idle native rejection')
+        return result
+
+    adapter._request = rpc
+    if outcome == 'unsent':
+        adapter._connect.side_effect = OSError('idle connection unavailable before submission')
+    clock[0] += timedelta(seconds=2)
+    instance._nudge_stage()
+    original = sends[-1]
+    assert original[1].startswith('digest-idle-')
+    assert original[1] not in {p['clientUserMessageId'] for p in starts[:confirmed_count]}
+    assert len(starts) == confirmed_count + (outcome != 'unsent')
+    adapter._connect.side_effect = None
+    assistant.notify('burst after pending idle')
+    for _ in range(3):
+        clock[0] += timedelta(seconds=AFTER + 1)
+        detector(sender=sender)._nudge_stage()
+    assert len(starts) == confirmed_count + 1
+    assert (starts[-1]['input'][0]['text'], starts[-1]['clientUserMessageId']) == original
+    receipt = next(r for r in adapter.snapshot()['receipts'] if r['delivery_id'] == original[1])
+    assert receipt['state'] == ('accepted' if outcome == 'unsent' else outcome)
+    assert not receipt['submit_confirmed'] and not receipt['retryable']
+    assert assistant.read_state().nudged_at == recovered.nudged_at
+    assert [item.note for item in assistant.read_state().pending] == ['pending original', 'burst after pending idle']

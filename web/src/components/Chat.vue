@@ -474,7 +474,7 @@ function uploadUrl(name, message) {
   return sessionUploadUrl(owner, name)
 }
 
-const visible = computed(() => {
+const presented = computed(() => {
   const shown = showInjected.value
     ? messages.value
     : messages.value.filter((message) => message.kind === 'said')
@@ -485,6 +485,15 @@ const visible = computed(() => {
     uploads: message.role === 'user' ? uploadsIn(message.text) : [],
   }))
 })
+
+function emptyWrapper(message) {
+  return !message.text?.trim() && message.tools?.length > 0 && message.tools.every(
+    (tool) => tool.wrapper && !tool.detail && !tool.error && tool.status !== 'failed',
+  )
+}
+
+const visible = computed(() => presented.value.filter((message) => !emptyWrapper(message)))
+const wrappers = computed(() => presented.value.filter(emptyWrapper))
 
 const hiddenCount = computed(
   () => messages.value.length - messages.value.filter((m) => m.kind === 'said').length,
@@ -1149,6 +1158,16 @@ watch(rendererLoaded, () => {
       </div>
 
       <div ref="scroller" class="chat" @scroll="onScroll">
+        <details v-if="wrappers.length" class="wrapper-details text-body-small">
+          <summary>{{ wrappers.length }} empty tool wrappers · details</summary>
+          <template v-for="message in wrappers" :key="message.id ?? message.seq">
+            <div v-for="(tool, index) in message.tools" :key="index">
+              <strong>{{ tool.name }}</strong> · {{ tool.status }}
+              <pre>{{ tool.raw_input }}</pre>
+              <pre v-if="tool.raw_output">{{ tool.raw_output }}</pre>
+            </div>
+          </template>
+        </details>
         <div
           v-for="message in visible"
           :key="message.id ?? message.seq"
@@ -1277,6 +1296,11 @@ watch(rendererLoaded, () => {
                 <template v-if="tool.detail"> · {{ tool.detail }}</template>
                 <template v-if="tool.status === 'pending'"> · running</template>
                 <template v-if="tool.error"> — {{ tool.error }}</template>
+                <details v-if="tool.wrapper" class="wrapper-details">
+                  <summary>tool details</summary>
+                  <pre>{{ tool.raw_input }}</pre>
+                  <pre v-if="tool.raw_output">{{ tool.raw_output }}</pre>
+                </details>
               </span>
             </div>
           </div>
@@ -1556,12 +1580,16 @@ watch(rendererLoaded, () => {
    is also why Markdown.vue's fences are untouched: `overflow-wrap: normal` on the
    <pre> and its <code> is a rule on those elements and beats a value coming down
    from here, so a command still scrolls in its own box instead of reflowing. */
+.wrapper-details,
+.turn {
+  overflow-wrap: anywhere;
+}
+
 .turn {
   min-width: 0;
   max-width: 92%;
   border-radius: 10px;
   padding: 4px 10px 6px;
-  overflow-wrap: anywhere;
 }
 
 /* The colour coding, and only which class gets which: the tones themselves are
@@ -1712,5 +1740,11 @@ watch(rendererLoaded, () => {
   width: auto;
   height: auto;
   border-radius: 6px;
+}
+
+.wrapper-details pre {
+  white-space: pre-wrap;
+  max-height: 20rem;
+  overflow: auto;
 }
 </style>

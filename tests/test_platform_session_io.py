@@ -2203,3 +2203,15 @@ def test_control_401_explains_possible_image_skew(platform_root, control_plane, 
     assert "invalid bearer token" in detail
     assert "may predate" in detail and "session image" in detail
     assert "credential" in detail and "first" in detail
+
+
+@pytest.mark.parametrize('state, ambiguous', [('rejected', False), ('uncertain', True)])
+def test_codex_delivery_failures_are_visible_without_legacy_semantic_changes(platform_root, control_plane, state, ambiguous):
+    plant_session('s-1', port=control_plane.port)
+    control_plane.answer('/input', 200, {
+        'transport': 'codex-app-server', 'state': state, 'error': 'native response unavailable',
+    })
+    with pytest.raises(session_io.ControlPlaneError, match='Original input is retained') as exc:
+        session_io.send_input('s-1', 'original', append_newline=True, delivery_id='stable-1')
+    assert exc.value.delivered == ambiguous
+    assert control_plane.calls[0]['body']['delivery_id'] == 'stable-1'

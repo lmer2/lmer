@@ -307,6 +307,7 @@ Two consequences worth stating, because both are ways this goes wrong quietly:
 from __future__ import annotations
 
 import logging
+import hashlib
 import threading
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -320,7 +321,7 @@ from . import ask, assistant, checkin, nudge, registry, teardown, transcripts
 from .api import build_state
 from . import config as config_module
 from .config import PlatformConfig, checkin_settings, nudge_settings
-from .session_io import SessionIOError, send_input, session_output_state
+from .session_io import SessionIOError, send_input, session_output_state, quiet_health
 from .inventory import _TERMINAL_STATUSES, _observed_bad_exit, _was_wound_down
 from .spawn import ports_file_for
 from .store import (
@@ -1509,23 +1510,64 @@ class Detector:
         mirror hides one.
         """
         try:
+            self.codex_wake_once()
+        except Exception as exc:
+            self._absorb("codex-wake", exc)
+        try:
             self.nudge_once()
         except Exception as exc:  # noqa: BLE001 - one reminder, not the tick
             self._absorb("nudge", exc)
 
+    def codex_wake_once(self) -> None:
+        """Use the existing daemon tick to wake Codex even during conversation."""
+        state = assistant.read_state()
+        if not state.pending:
+            return
+        status = assistant.status()
+        if not status.running or not status.session_id:
+            return
+        ident = self._codex_accumulation_id(status.session_id, state.pending_seq)
+        if state.codex_wake == ident:
+            return
+        health = quiet_health(status.session_id) or {}
+        adapter = health.get('codex_delivery')
+        if not isinstance(adapter, dict) or not adapter.get('runtime'):
+            return
+        if self._codex_notice(status.session_id, adapter, ident,
+                              '[platform] Your digest spool has pending items. This is an automatic wake-up, '
+                              'not a new task. Take the spool with POST /api/assistant/pending, '
+                              'act on what you took, and continue the current conversation.'):
+            marked = assistant.mark_codex_wake(status.session_id, state.pending_seq, ident)
+            if not marked:
+                raise SessionIOError('Codex wake confirmed but acknowledgement was not persisted; idle held')
+            append_event('assistant_codex_woken', note=status.session_id, data={
+                'accumulation': state.pending_seq, 'pending': len(state.pending),
+                'delivery_id': ident, 'marked': marked,
+            })
+            self._clear('codex-wake')
+
+    @staticmethod
+    def _codex_accumulation_id(session_id, pending_seq):
+        return 'digest-' + hashlib.sha256(f'{session_id}:{pending_seq}'.encode()).hexdigest()[:32]
+
+    def _codex_notice(self, session_id, adapter, ident, text) -> bool:
+        """A stable notice is complete only when its native receipt confirms it."""
+        if not adapter or not adapter.get('runtime'):
+            return False
+        receipt = next((r for r in adapter.get('receipts', []) if r.get('delivery_id') == ident), None)
+        if receipt is None or (receipt.get('state') == 'rejected' and receipt.get('retryable')):
+            receipt = self._send(session_id, text, append_newline=True, delivery_id=ident)
+        if receipt.get('transport') != 'codex-app-server':
+            raise SessionIOError('Codex digest notice did not use structured delivery')
+        if receipt.get('state') in ('rejected', 'uncertain'):
+            raise SessionIOError(f'Codex digest notice {ident} is {receipt["state"]}; original retained')
+        return receipt.get('state') == 'confirmed' and receipt.get('submit_confirmed') is True
+
     def nudge_once(self) -> Optional[nudge.Nudge]:
-        """Type one reminder into the assistant's session if its spool is owed one.
+        """Send a due reminder, then mark its delivery; otherwise return None.
 
-        Returns the nudge that was delivered, or ``None`` for both "nothing was
-        due" and "it could not be sent" — the caller does the same with either and
-        the log says which.
-
-        Send, then mark, then record, as :func:`lmer_platform.lifecycle.wind_down`
-        does: a mark written first would silence the retry a refused send earns.
-        What decides retry-versus-bound is whether the bytes arrived, not whether
-        the call raised (see the ``except`` branch), and a durable mark that fails
-        to write costs nothing while this process lives — :attr:`_nudged` is the
-        bound — and one early repeat across a restart.
+        Codex requires a native receipt before advancing the interval. Legacy
+        PTY sends retain their byte-delivery bound. See docs/CODEX-DELIVERY.md.
         """
         settings = nudge_settings()
         after = settings["after_seconds"].value
@@ -1561,20 +1603,36 @@ class Detector:
             # that changes is the one that tells it.
             return None
         text = nudge.prompt(due)
+        adapter = (quiet_health(status.session_id) or {}).get('codex_delivery')
+        codex = isinstance(adapter, dict) or (getattr(status, 'settings', None) or {}).get('harness') == 'codex'
         sent_error: Optional[str] = None
         try:
-            # append_newline, or the reminder sits unsent in the input box.
-            self._send(status.session_id, text, append_newline=True)
+            if codex:
+                durable = assistant.read_state()
+                primary = self._codex_accumulation_id(status.session_id, state.pending_seq)
+                if primary != durable.codex_wake:
+                    return None
+                due = nudge.due(
+                    durable, running=True, idle_seconds=reading.get('idle_seconds'),
+                    produced_output=reading.get('produced'), after_seconds=after,
+                    pending_threshold=threshold,
+                )
+                if due is None:
+                    return None
+                key = f'{status.session_id}:{durable.pending_seq}:{durable.nudged_at or ""}'
+                ident = 'digest-idle-' + hashlib.sha256(key.encode()).hexdigest()[:32]
+                text = ('[platform] Your digest spool is still pending. This is an automatic idle reminder, '
+                        'not a new task. Take the spool with POST /api/assistant/pending, '
+                        'act on what you took, and continue the current conversation.')
+                if not self._codex_notice(status.session_id, adapter, ident, text):
+                    return None
+            else:
+                self._send(status.session_id, text, append_newline=True)
         except SessionIOError as exc:
-            # Absorbed: an unreachable control plane must not end the tick. Only
-            # the raiser knows whether the bytes were typed, and the two cases
-            # need opposite recoveries — retry a refusal, bound a delivered one.
-            # A transport failure cannot be told apart and counts as retryable,
-            # since a duplicate reminder beats a lost window. ``getattr`` is a
-            # positive-delivery test: a refused write is false, while a timeout
-            # after the child read the bytes is unknown and therefore false too.
+            # Codex waits for its receipt. Legacy transports keep their existing
+            # positive byte-delivery bound, including a delivered error.
             self._absorb("nudge", exc)
-            if not getattr(exc, "delivered", False):
+            if codex or not getattr(exc, "delivered", False):
                 return None
             sent_error = _clamp(f"{type(exc).__name__}: {exc}", MAX_SEND_ERROR_CHARS)
         else:

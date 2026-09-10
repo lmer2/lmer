@@ -777,15 +777,21 @@ class ToolCall:
     error: Optional[str] = None
     #: Native arguments only; the canonical tier never supplies a command.
     command: Optional[str] = None
+    wrapper: bool = False
+    raw_input: Optional[str] = None
+    raw_output: Optional[str] = None
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "name": self.name,
             "detail": self.detail,
             "status": self.status,
             "error": self.error,
             "command": self.command,
         }
+        if self.wrapper:
+            result.update(wrapper=True, raw_input=self.raw_input, raw_output=self.raw_output)
+        return result
 
 
 @dataclass
@@ -1819,6 +1825,20 @@ def _codex_message(record: dict, pending: dict, *, presentation: bool = True) ->
         call = pending.pop(call_id, None) if isinstance(call_id, str) else None
         if call is not None:
             call.status = "ok"
+            if call.wrapper:
+                output = payload.get("output")
+                if isinstance(output, list):
+                    output = _block_text(output, types={"input_text", "text"})
+                elif not isinstance(output, str):
+                    output = json.dumps(output, ensure_ascii=False) if output is not None else ""
+                call.raw_output = _present(output, TEXT_LIMIT)[0]
+                meaningful = re.sub(
+                    r"\AScript completed\nWall time [^\n]+\nOutput:\n?", "", output,
+                ).strip()
+                call.detail = _present(meaningful, DETAIL_LIMIT)[0] or None
+                if payload.get("isError") is True or output.startswith("Script failed\n"):
+                    call.status = "failed"
+                    call.error = call.detail or "Codex wrapper failed"
         return None
 
     if isinstance(kind_of_payload, str) and kind_of_payload.endswith("_call"):
@@ -1837,6 +1857,10 @@ def _codex_message(record: dict, pending: dict, *, presentation: bool = True) ->
             detail=_tool_detail(arguments),
             command=_tool_command(arguments),
         )
+        if (kind_of_payload == "custom_tool_call" and name in ("exec", "functions.exec")
+                and isinstance(payload.get("input"), str)):
+            call.wrapper = True
+            call.raw_input = _present(payload["input"], TEXT_LIMIT)[0]
         call_id = payload.get("call_id")
         if isinstance(call_id, str) and call_id:
             pending[call_id] = call
