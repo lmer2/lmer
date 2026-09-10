@@ -37,6 +37,7 @@ tests:
     - tests/test_containerfile.py
     - tests/test_doctor_sources.py
     - tests/test_gate_cache.py
+    - tests/test_gate_concurrency.py
     - tests/test_gate_inflight_hold.py
     - tests/test_gate_inflight_lock.py
     - tests/test_gate_text_diff_subset.py
