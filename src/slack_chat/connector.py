@@ -1,25 +1,6 @@
-"""The Slack connector: one thread mirrored onto one session's bus (issue #407).
+"""Slack thread transport for the shared connector lifecycle.
 
-A separable component. It is given a supervisor address and token, a Slack
-thread and a bot token, and it does two things until told to stop:
-
-- **outbound** — long-polls the supervisor's ``GET /messages`` and posts every
-  record that did not come from Slack into the thread, rendered for a human
-  (a question with numbered options, an answer from another channel with who
-  gave it, a note, a milestone), then acks its position;
-- **inbound** — polls the thread's replies with the bot token and posts every
-  new human message onto the bus as ``source {channel: slack, author, ref:
-  channel:thread_ts:ts}`` — an ``answer`` to the oldest open question when the
-  session has one (a reply that is exactly an option's number or text is that option), else a
-  ``message``. Files attached to a message are copied into the session's
-  upload store when one is mounted, and the record names them.
-
-Today the host ``lmer`` process hosts it on a thread whenever a Slack thread
-is a target (:class:`lmer_cli.targets.SlackThreadTargets`); the same
-component runs standalone as ``lmer-slack-connector`` against
-``LMER_SUPERVISOR_URL`` — a sidecar in a session Pod, later. It knows
-nothing about the CLI, the platform daemon or the container: the Slack token
-stays in the process that runs it.
+See docs/COMMS.md and docs/CONNECTOR-RECOVERY.md for delivery and recovery.
 """
 from __future__ import annotations
 
@@ -43,6 +24,8 @@ import requests
 
 from ask_channel import bus
 from lmer_cli import thread_posts
+from lmer_cli.connector_lifecycle import ConnectorLifecycle
+from lmer_cli.connector_ownership import ThreadKey
 from lmer_cli.thread_requests import MAX_READ_LIMIT
 from lmer_cli.util import get_bool_env
 
@@ -65,29 +48,14 @@ SUBSCRIBER = "slack"
 POLL_SECONDS_ENV = "LMER_SLACK_POLL_SECONDS"
 DEFAULT_POLL_SECONDS = 3.0
 
-#: Whether this connector announces its own attachment in the thread. Off for a
-#: session a listener spawned: the listener announces that thread itself, at once
-#: and with more to say (which preset the session got, how long the first reply
-#: may take), and a thread must not get two announcements for one attachment.
-#: It gates the **ack** only — the note below is what tells a thread that nobody
-#: is listening any more, and that is true however the attachment was made.
+#: Enable attachment and matching detach notices. Listener-owned threads disable
+#: these because the listener announces their lifecycle.
 ATTACH_ACK_ENV = "LMER_CHAT_ATTACH_ACK"
 
-#: Whether a fresh attachment starts at the *current* bus position rather than at
-#: the beginning. Set by the platform daemon for a connection made while the
-#: session is already running: without it such a connector posts the run's whole
-#: journal into the thread, one message per record. A connection that exists for
-#: the session's whole life leaves it off — the thread is meant to have seen all
-#: of it. A connector resuming after its own death ignores this either way and
-#: continues from the position the supervisor has it acked at.
+#: Start a new attachment at the current bus position; saved checkpoints win.
 ATTACH_FROM_NOW_ENV = "LMER_CHAT_ATTACH_FROM_NOW"
 
-#: Where this attachment had read up to, according to whoever remembers it for
-#: the connector. The supervisor's own record of a subscriber's position is
-#: fresher and wins where it exists — but a clean stop acks ``final``, which
-#: *removes* that name, so after a graceful restart this is all that is left of
-#: it. Without it a connection that exists for the session's whole life falls
-#: back to the beginning and re-posts the whole journal into its thread.
+#: Initial cursor when neither a durable checkpoint nor a subscriber ack exists.
 ATTACH_SINCE_ENV = "LMER_CHAT_ATTACH_SINCE"
 
 #: The two lines a connector says for itself. Deliberately short, deliberately
@@ -315,13 +283,7 @@ def answer_binding(
 
 
 def replay_stamp(epoch_seconds: Optional[float]) -> str:
-    """A history timestamp in UTC, or "time unknown" for an unusable value.
-
-    Every unusable value answers "time unknown" rather than raising: the stamp
-    comes from the transport — a homeserver's ``origin_server_ts`` arrives over
-    federation — and ``nan``, an infinity or a year outside ``datetime``'s range
-    would otherwise end the connector's inbound thread, which nothing restarts.
-    """
+    """A history timestamp in UTC, or "time unknown" for unusable remote values."""
     try:
         return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except (TypeError, OverflowError, OSError, ValueError):
@@ -386,8 +348,12 @@ def option_for(text: str, options: Iterable[str]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-class SlackConnector:
+class SlackConnector(ConnectorLifecycle):
     """Two loops on two threads, one thread in Slack. See the module docstring."""
+
+    _transport_fields = ("_cursor_ts", "_accepted_inbound")
+    _detach_note = DETACH_NOTE
+    _bus_poll_seconds = BUS_POLL_SECONDS
 
     def __init__(
         self,
@@ -432,6 +398,8 @@ class SlackConnector:
             ),
         )
         self.failures = 0
+        self._accepted_inbound = set()
+        self._init_lifecycle()
 
     # -- clients, resolved lazily so construction never touches the network --
 
@@ -451,46 +419,6 @@ class SlackConnector:
 
     # -- lifecycle -------------------------------------------------------------
 
-    def start(self) -> None:
-        """Run the two loops once the bus answers, on a thread of its own.
-
-        The host CLI starts this connector *before* it launches the container
-        (``targets.py``), so for the first seconds — minutes, on a cold image —
-        there is nothing listening on the supervisor's port. Dialing from
-        ``start`` would hand both loops a :class:`NoChannel` they read as "the
-        session is over" and end the connector before the session begins.
-        """
-        with self._threads_lock:
-            if self._threads:
-                return
-            thread = threading.Thread(
-                target=self._run_when_ready, name="lmer-slack-connector-connect", daemon=True,
-            )
-            self._threads.append(thread)
-        thread.start()
-
-    def _run_when_ready(self) -> None:
-        if not self.bus.wait_ready(budget=self.config.connect_budget, stop=self._stop):
-            if not self._stop.is_set():
-                self._warn(
-                    f"the supervisor at {self.config.supervisor_url} never came up "
-                    f"within {self.config.connect_budget:.0f}s — this Slack thread "
-                    "will not hear the session"
-                )
-            return
-        self._seed_cursor()
-        # Once the bus answers and before the loops: "connected" has to mean the
-        # session can actually be heard, and a connector that announced itself
-        # from ``start`` would say so through a whole cold start in which nothing
-        # was listening.
-        self._announce_attached()
-        started = []
-        for name, target in (("outbound", self._outbound_loop), ("inbound", self._inbound_loop)):
-            thread = threading.Thread(target=target, name=f"lmer-slack-connector-{name}", daemon=True)
-            thread.start()
-            started.append(thread)
-        with self._threads_lock:
-            self._threads.extend(started)
 
     def _warn(self, message: str) -> None:
         """Loud on both sides: the host `lmer` process configures no logging, so
@@ -499,246 +427,71 @@ class SlackConnector:
         if self._notify is not None:
             self._notify(message)
 
-    def _seed_cursor(self) -> None:
-        """Where in the session's bus this attachment starts reading.
-
-        Two facts, both from the supervisor rather than guessed here.
-
-        **Its own acked position wins.** ``/healthz`` reports every subscriber's
-        high-water mark, so a connector that died resumes exactly where it
-        stopped. It is the freshest answer and the only one that needs nobody
-        else to have been watching.
-
-        **Then whatever the caller remembers** (:data:`ATTACH_SINCE_ENV`). A
-        clean stop acks ``final``, which *removes* the subscriber name — so the
-        answer above is gone precisely when the connector was shut down
-        politely, which is what a graceful daemon restart does to every
-        connector it holds. Something that outlives the process has to hold the
-        position, or a connection that exists for the session's whole life comes
-        back at the beginning and re-posts the whole journal.
-
-        **A fresh attach — one nobody remembers — starts where its caller says.** Zero — the whole journal
-        — is right for a connection that exists for the session's whole life: the
-        thread is meant to have seen all of it, and under #407 the connector and
-        the session started together anyway. It is wrong for one made *during* a
-        session, which would post hours of records into the thread one message at
-        a time; :data:`ATTACH_FROM_NOW_ENV` is how the caller that knows the
-        difference says so, and the current ``seq`` is where such an attach
-        starts. Either way the session receives a notice describing the thread's
-        history, which it can read on demand.
-        """
-        try:
-            health = self.bus.health()
-        except bus.BusError as exc:
-            logger.warning("slack_connector_seed_failed error=%s", exc)
-            return
-        launch = health.get("launch")
-        self._launch_settings = launch if isinstance(launch, dict) else None
-        acked = (health.get("subscribers") or {}).get(self.subscriber)
-        if isinstance(acked, int) and not isinstance(acked, bool):
-            self._bus_cursor = acked
-            return
-        if self.config.attach_since is not None:
-            self._bus_cursor = self.config.attach_since
-            return
-        if not self.config.attach_from_now:
-            return
-        seq = health.get("seq")
-        if isinstance(seq, int) and not isinstance(seq, bool):
-            self._bus_cursor = seq
-
-    def _announce_attached(self) -> None:
-        """Tell the thread a session is listening — unless something else did.
-
-        A post that fails is logged and forgotten: a thread that never got the
-        line still works, and refusing to serve it over a missing courtesy would
-        be the worse trade.
-        """
-        if not self.config.attach_ack or self._announced:
-            return
-        notice = attachment_notice(self._launch_settings)
-        try:
-            self._mirrored(
-                self.slack.post_message(self.config.channel, self.config.thread_ts, notice,
-                                        connection_notice=True)
-            )
-        except SlackError as exc:
-            logger.warning("slack_connector_ack_failed error=%s", exc)
-            return
-        self._announced = True
-
-    def _announce_detached(self) -> None:
-        """The other half, and unconditional where the ack was made: a disconnect,
-        a session that ended and a daemon shutting down are the same fact to the
-        humans in the thread — nobody is reading it any more."""
-        if not self._announced:
-            return
-        self._announced = False
-        try:
-            self._mirrored(
-                self.slack.post_message(self.config.channel, self.config.thread_ts, DETACH_NOTE,
-                                        connection_notice=True)
-            )
-        except SlackError as exc:
-            logger.warning("slack_connector_note_failed error=%s", exc)
-
-    def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        self._announce_detached()
-        if self._bus is not None:
-            # "Not waiting for me": without it the supervisor's drain grace is
-            # spent in full on a subscriber that has already gone.
-            with contextlib.suppress(Exception):
-                self._bus.ack(self.subscriber, self._bus_cursor, final=True)
-        for _ in range(2):  # the connect thread may append the loops as we join
-            with self._threads_lock:
-                threads, self._threads = list(self._threads), []
-            for thread in threads:
-                thread.join(timeout=timeout)
-
-    def run_forever(self) -> None:
-        self.start()
-        try:
-            while not self._stop.is_set():
-                self._stop.wait(1.0)
-        finally:
-            self.stop()
-
-    def _backoff(self) -> None:
-        self.failures += 1
-        self._stop.wait(min(30.0, 0.5 * (2 ** min(self.failures, 6))))
 
     # -- outbound: bus → Slack -------------------------------------------------
 
-    def _outbound_loop(self) -> None:
-        questions: dict = {}
-        while not self._stop.is_set():
-            try:
-                records, cursor = self.bus.messages(self._bus_cursor, timeout=BUS_POLL_SECONDS)
-            except bus.NoChannel as exc:
-                logger.info("slack_connector_bus_gone reason=%s", exc)
-                # The session is over, and that is terminal for both loops — so
-                # end the *process*, not just this thread. It used to live on a
-                # thread of an `lmer` process that was itself exiting; as a
-                # detached process (issue #412) a connector whose loops have both
-                # given up would otherwise spin forever, and its live pid keeps
-                # the thread claimed against every future session.
-                self._stop.set()
-                break
-            except bus.BusError as exc:
-                logger.warning("slack_connector_bus_error error=%s", exc)
-                self._backoff()
-                continue
-            self.failures = 0
-            delivered = self._bus_cursor
-            for record in records:
-                if record.get("kind") == "question":
-                    questions[record.get("id")] = record
-                text = render_outbound(record, questions)
-                if text is not None:
-                    try:
-                        self._mirrored(
-                            self.slack.post_message(
-                                self.config.channel, self.config.thread_ts, text,
-                            )
-                        )
-                    except SlackError as exc:
-                        # The cursor stops here: one 500 from Slack used to drop
-                        # the record for good — an answer to a question the
-                        # thread had asked, posted nowhere, with nobody told.
-                        # The records are immutable and a re-post is cheap, so
-                        # the next poll reads this one again.
-                        logger.warning(
-                            "slack_connector_post_failed seq=%s error=%s — holding the cursor",
-                            record.get("seq"), exc,
-                        )
-                        self._backoff()
-                        break
-                delivered = max(delivered, int(record.get("seq") or delivered))
-            else:
-                delivered = max(delivered, cursor)
-            if delivered > self._bus_cursor:
-                self._bus_cursor = delivered
-                try:
-                    self.bus.ack(self.subscriber, delivered)
-                except bus.BusError:
-                    pass
 
     # -- inbound: Slack → bus --------------------------------------------------
 
-    def _inbound_loop(self) -> None:
-        first = True
-        while not self._stop.is_set():
-            try:
-                self._poll_thread(replay=first)
-                first = False
-                self.failures = 0
-            except SlackError as exc:
-                logger.warning("slack_connector_read_failed error=%s", exc)
-                self._backoff()
-                continue
-            except bus.NoChannel as exc:
-                logger.info("slack_connector_bus_gone reason=%s", exc)
-                # The session is over, and that is terminal for both loops — so
-                # end the *process*, not just this thread. It used to live on a
-                # thread of an `lmer` process that was itself exiting; as a
-                # detached process (issue #412) a connector whose loops have both
-                # given up would otherwise spin forever, and its live pid keeps
-                # the thread claimed against every future session.
-                self._stop.set()
-                break
-            except bus.BusError as exc:
-                logger.warning("slack_connector_bus_error error=%s", exc)
-                self._backoff()
-                continue
-            self._stop.wait(self.config.poll_seconds)
+    def _inbound_loop(self):
+        self._loop("inbound", self._inbound_once, interval=self.config.poll_seconds)
 
     @property
     def thread_label(self) -> str:
         """The thread identity shown in an attach notice."""
         return f"the slack thread {self.config.channel}:{self.config.thread_ts}"
 
-    def _poll_thread(self, *, replay: bool = False) -> int:
-        """Read the thread once; post what is new. Returns how many were posted —
-        attach posts one notice regardless of the backlog's length."""
+    def _poll_thread(self, *, replay=False):
+        self._ensure_ready()
+        resumed = self._resume_pending_inbound()
         if self._bot_user_id is None:
             self._bot_user_id = self.slack.auth_test()
-        messages = self.slack.get_replies(self.config.channel, self.config.thread_ts, oldest=self._cursor_ts)
-        if replay:
-            snapshot = sorted(
-                (message for message in messages if message.get("ts") and not (
-                    message.get("user") == self._bot_user_id and any(
-                        isinstance(block, dict)
-                        and str(block.get("block_id", "")).startswith(CONNECTION_NOTICE_BLOCK_PREFIX)
-                        for block in (message.get("blocks") or [])
-                    )
-                )),
-                key=lambda message: message["ts"],
-            )
-            posted = int(self._post_replay(snapshot)) if snapshot else 0
-        else:
-            fresh = [
-                message for message in messages
-                if (self._cursor_ts is None or message.get("ts", "") > self._cursor_ts)
-                and not message.get("subtype")
-            ]
-            fresh.sort(key=lambda message: message.get("ts", ""))
-            inbound = []
-            for message in fresh:
-                if self._is_human(message):
-                    inbound.append((message, None))
-                elif message.get("user") == self._bot_user_id:
-                    verdict, poster = self._posters.decide(message)
-                    if verdict == thread_posts.INGEST:
-                        inbound.append((message, poster))
-            posted = 0
-            for message, poster in self._posters.due() + inbound:
-                self._post_inbound(message, poster)
-                posted += 1
-        latest = max((message.get("ts", "") for message in messages if message.get("ts")), default=None)
-        if latest and (self._cursor_ts is None or latest > self._cursor_ts):
-            self._cursor_ts = latest
-        return posted
+        messages = self.slack.get_replies(self.config.channel, self.config.thread_ts,
+                                         oldest=None if replay else self._cursor_ts)
+        try:
+            if replay:
+                snapshot = sorted(
+                    (message for message in messages if message.get("ts") and not (
+                        message.get("user") == self._bot_user_id and any(
+                            isinstance(block, dict) and str(block.get("block_id", "")).startswith(CONNECTION_NOTICE_BLOCK_PREFIX)
+                            for block in (message.get("blocks") or [])
+                        )
+                    )), key=lambda message: message["ts"],
+                )
+                posted = resumed + (int(self._post_replay(snapshot)) if snapshot else 0)
+            else:
+                with self._state.lock:
+                    fresh = sorted((message for message in messages
+                                    if (self._cursor_ts is None or message.get("ts", "") > self._cursor_ts)
+                                    and message.get("ts") not in self._accepted_inbound
+                                    and not message.get("subtype")), key=lambda message: message.get("ts", ""))
+                    inbound = []
+                    for message in fresh:
+                        if self._is_human(message):
+                            inbound.append((message, None))
+                        elif message.get("user") == self._bot_user_id:
+                            verdict, poster = self._posters.decide(message)
+                            if verdict == thread_posts.INGEST:
+                                inbound.append((message, poster))
+                    ready = self._posters.due() + inbound
+                    self._state.save()
+                posted = resumed
+                for message, poster in ready:
+                    self._post_inbound(message, poster)
+                    with self._state.lock:
+                        self._posters.ack(message)
+                        self._state.save()
+                    posted += 1
+            with self._state.lock:
+                latest = max((message.get("ts", "") for message in messages if message.get("ts")), default=None)
+                if latest and (self._cursor_ts is None or latest > self._cursor_ts):
+                    self._cursor_ts = latest
+                self._accepted_inbound = {ref for ref in self._accepted_inbound
+                                          if self._cursor_ts is None or ref > self._cursor_ts}
+                self._state.save()
+            return posted
+        finally:
+            self._posters.release()
 
     def _post_replay(self, messages: list) -> bool:
         permalink = slack_thread_link(
@@ -787,33 +540,30 @@ class SlackConnector:
             return None
         return session if isinstance(session, str) and session else None
 
-    def _post_inbound(self, message: dict, poster=None) -> dict:
-        body, attachments = self._inbound_body(message)
-        text = _with_references(body, attachments)
-        if not text:
-            return {}
-        author = self._author(message, poster)
+    def _post_inbound(self, message, poster=None):
         ts = message.get("ts")
-        source = {
-            "channel": CHANNEL, "author": author,
-            "ref": f"{self.config.channel}:{self.config.thread_ts}:{ts}" if ts else None,
-        }
-        kind = "message"
-        in_reply_to = None
-        oldest = self._oldest_open_question()
-        if oldest is not None:
-            bound = answer_binding(
-                text, oldest, first_since_question=self._first_since(oldest),
-            )
-            if bound is not None:
-                kind, in_reply_to, text = "answer", oldest.get("id"), bound
-        result = self.bus.post(
-            kind, text, source=source, in_reply_to=in_reply_to,
-            attachments=[{k: v for k, v in item.items() if k != "reference"} for item in attachments],
-        )
-        if oldest is not None:
-            self._answered_freely.add(oldest["id"])
-        return result
+        def prepare():
+            body, attachments = self._inbound_body(message)
+            text = _with_references(body, attachments)
+            if not text:
+                return None
+            if not ts:
+                raise ValueError("Slack input has no source timestamp")
+            source = {"channel": CHANNEL, "author": self._author(message, poster),
+                      "ref": f"{self.config.channel}:{self.config.thread_ts}:{ts}"}
+            kind, in_reply_to = "message", None
+            oldest = self._oldest_open_question()
+            if oldest is not None:
+                bound = answer_binding(text, oldest, first_since_question=self._first_since(oldest))
+                if bound is not None:
+                    kind, in_reply_to, text = "answer", oldest.get("id"), bound
+            return {"question": oldest.get("id") if oldest else None,
+                    "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
+                                "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
+        return self._post_prepared(ts, prepare, lambda: self._accept_inbound(ts)) or {}
+
+    def _accept_inbound(self, ref):
+        self._accepted_inbound.add(ref)
 
     def _first_since(self, question: dict) -> bool:
         """Whether no human message has been accepted since this question."""
@@ -864,6 +614,32 @@ class SlackConnector:
             if record is not None:
                 staged.append(record)
         return staged
+
+    def _prepare(self):
+        self._acquire(ThreadKey(CHANNEL, self.config.channel, self.config.thread_ts))
+
+    def _attachment_notice(self):
+        return attachment_notice(self._launch_settings)
+
+    def _send_notice(self, text):
+        return self.slack.post_message(self.config.channel, self.config.thread_ts, text,
+                                       connection_notice=True)
+
+    def _remember_notice(self, receipt):
+        self._mirrored(receipt)
+
+    def _send_record(self, record):
+        text = render_outbound(record, self._questions)
+        if text is not None:
+            self._deliver_part(record, "text", {"text": text},
+                               lambda: self.slack.post_message(self.config.channel, self.config.thread_ts, text),
+                               self._mirrored)
+
+    def _inbound_once(self):
+        self._poll_thread(replay=not self._replayed)
+        with self._state.lock:
+            self._replayed = True
+            self._state.save()
 
 
 # ---------------------------------------------------------------------------
@@ -928,13 +704,13 @@ def main(argv: Optional[list] = None) -> int:
         connector.run_forever()
     except KeyboardInterrupt:
         connector.stop()
-    return 0
+    return connector.exit_code
 
 
 def _stop_on_sigterm(connector) -> None:
-    """Turn SIGTERM into an ordinary stop, in the process's main thread."""
+    """Record SIGTERM for the main monitor."""
     def handler(_signum, _frame):
-        connector._stop.set()
+        connector._signal_stop = True
 
     with contextlib.suppress(ValueError):  # not the main thread: nothing to install
         signal.signal(signal.SIGTERM, handler)

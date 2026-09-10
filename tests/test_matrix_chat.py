@@ -24,8 +24,24 @@ from tests.test_lmer_signal_cli import _Session
 
 
 @pytest.fixture(autouse=True)
-def _clean_lmer_env(monkeypatch):
+def _clean_lmer_env(monkeypatch, tmp_path):
+    from slack_chat import registry
+
     strip_lmer_env(monkeypatch)
+    monkeypatch.setattr(registry, "REGISTRY_DIR", str(tmp_path / "thread-owners"))
+    monkeypatch.setattr(thread_posts, "REGISTRY_DIR", str(tmp_path / "thread-posts"))
+    instances = []
+    original_init = connector.MatrixConnector.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._bus_poll_seconds = 0.05
+        instances.append(self)
+
+    monkeypatch.setattr(connector.MatrixConnector, "__init__", tracked_init)
+    yield
+    for built in instances:
+        assert built.stop(timeout=2), "test connector did not drain"
 
 
 ROOM = "!room:example.org"
@@ -222,6 +238,7 @@ class Rig:
             attach_ack=False,
         )
         self.connector = connector.MatrixConnector(self.config, matrix=self.matrix, bus_client=client)
+        self.connector._bus_poll_seconds = 0.05
 
     def agent(self, kind, text, **kw):
         return self.log.append(kind=kind, text=text, source=comms.Source("agent"), **kw)[0]
@@ -238,6 +255,8 @@ def rig(tmp_path):
     rig = Rig(tmp_path)
     yield rig
     rig.connector.stop()
+    rig.bus._session._http.close()
+    rig.log.close()
 
 
 # ---------------------------------------------------------------------------
@@ -483,6 +502,8 @@ class TestConnector:
         assert any("withheld" in s[2] and "LMER_MATRIX_AUTHENTICATED_MEDIA" in s[2] for s in rig.matrix.sent)
 
         asserted = Rig(tmp_path, uploads=str(store), authenticated_media=True)
+        from dataclasses import replace
+        asserted.connector.config = replace(asserted.connector.config, thread_event="$separate-media-policy-case")
         asserted.connector.room_id = ROOM
         asserted.connector._post_outbound(record, {})
         assert asserted.matrix.uploads == [("report.txt", "text/plain", b"all green")]
@@ -528,12 +549,12 @@ class TestConfigAndTargets:
         assert env["LMER_MATRIX_ROOM_ID"] == ROOM and env["SLACK_BOT_TOKEN"] is None
         assert handler.supports_repoless_session("chat")
 
-    def test_the_handler_registers_under_the_matrix_kind(self, tmp_path, monkeypatch):
+    def test_the_handler_without_a_control_plane_does_not_claim_the_thread(self, tmp_path, monkeypatch):
         monkeypatch.setattr(registry, "REGISTRY_DIR", str(tmp_path))
         handler = targets.MatrixThreadTargets()
         handler.add(permalink.matrix_to_link(ROOM, ROOT))
-        handler.on_session_start()  # no control plane: warns, registers anyway
-        assert registry.is_thread_connected(ROOM, ROOT, kind="matrix")
+        handler.on_session_start()
+        assert not registry.is_thread_connected(ROOM, ROOT, kind="matrix")
         assert not registry.is_thread_connected(ROOM, ROOT)
         handler.on_session_end()
         assert not registry.is_thread_connected(ROOM, ROOT, kind="matrix")
@@ -576,8 +597,7 @@ def test_explicit_reply_targets_newer_question_before_oldest_options(rig, reply)
     rig.connector.replay()
     older = rig.agent("question", "deploy?", options=["yes", "no"])
     newer = rig.agent("question", "branch?", options=["main", "prep"])
-    for question in (older, newer):
-        rig.connector._post_outbound(question.to_dict(), {})
+    rig.connector._outbound_once()
     rig.matrix.human_says(reply, **{"m.relates_to": {
         "rel_type": "m.thread", "event_id": ROOT, "is_falling_back": False,
         "m.in_reply_to": {"event_id": rig.connector._question_events[newer.id]},
@@ -671,11 +691,15 @@ def test_matrix_root_only_and_unchanged_restart(rig):
     assert rig.connector.replay() == 1
     (record,) = rig.log.read_since(0)[0]
     assert "has 1 earlier message" in record.text and record.source.ref == ROOT
+    rig.connector.stop()
     fresh = connector.MatrixConnector(rig.config, matrix=rig.matrix, bus_client=rig.bus)
+    rig.connector = fresh
     assert fresh.replay() == 1
     assert rig.log.seq == record.seq
     newest = rig.matrix.human_says("while down", live=False)
+    rig.connector.stop()
     again = connector.MatrixConnector(rig.config, matrix=rig.matrix, bus_client=rig.bus)
+    rig.connector = again
     assert again.replay() == 1
     (notice,) = rig.log.read_since(record.seq)[0]
     assert "has 2 earlier messages" in notice.text and notice.source.ref == newest["event_id"]
@@ -806,7 +830,9 @@ class TestPostsFromOtherRuns:
         rig.matrix.human_says("working on it", sender=BOT, live=False)
         rig.matrix.app_says("have a look", live=False,
                             poster=thread_posts.Poster.for_session("s-other", "chat-mr-288"))
+        rig.connector.stop()
         reconnected = connector.MatrixConnector(rig.config, matrix=rig.matrix, bus_client=rig.bus)
+        rig.connector = reconnected
         assert reconnected.replay() == 1
         notice = rig.log.read_since(0)[0][-1]
         assert "has 3 earlier messages" in notice.text
@@ -879,7 +905,7 @@ def test_attachment_settings_do_not_override_matrix_ack_off(tmp_path):
         rig.log.close()
 
 
-def test_matrix_attachment_notice_survives_missing_health(tmp_path, monkeypatch):
+def test_matrix_attachment_notice_waits_for_supervisor_identity(tmp_path, monkeypatch):
     from dataclasses import replace
 
     rig = Rig(tmp_path)
@@ -889,10 +915,16 @@ def test_matrix_attachment_notice_survives_missing_health(tmp_path, monkeypatch)
     def unavailable():
         raise bus.BusError("health unavailable")
 
-    monkeypatch.setattr(rig.bus, "health", unavailable)
     try:
+        with monkeypatch.context() as fault:
+            fault.setattr(rig.bus, "health", unavailable)
+            with pytest.raises(bus.BusError, match="health unavailable"):
+                rig.connector._seed_cursor()
+            assert rig.matrix.sent == []
         rig.connector._seed_cursor()
         rig.connector._announce_attached()
         assert rig.matrix.sent == [(ROOM, ROOT, connector.ATTACH_ACK, "m.notice")]
     finally:
+        rig.connector.stop(timeout=1)
+        rig.bus._session._http.close()
         rig.log.close()

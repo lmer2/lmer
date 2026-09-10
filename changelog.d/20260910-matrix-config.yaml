@@ -1,0 +1,2 @@
+fixed:
+  - "Matrix room creation preserves concurrent configuration edits when saving the new room id."

@@ -42,8 +42,7 @@ class TestTheHandlerUnderTheFlag:
 
     def test_no_connector_is_started_and_no_thread_is_claimed(self, monkeypatch):
         claimed, started = [], []
-        monkeypatch.setattr(target_handlers, "register", lambda *a, **k: claimed.append(a))
-        monkeypatch.setattr(target_handlers, "deregister", lambda *a, **k: claimed.append(a))
+        monkeypatch.setattr(target_handlers.ConnectorProcess, "start", lambda instance: claimed.append(instance.key.parts))
 
         import slack_chat.connector as slack_connector
 
@@ -59,8 +58,7 @@ class TestTheHandlerUnderTheFlag:
 
     def test_matrix_is_the_same_in_both_directions(self, monkeypatch):
         claimed = []
-        monkeypatch.setattr(target_handlers, "register", lambda *a, **k: claimed.append(a))
-        monkeypatch.setattr(target_handlers, "deregister", lambda *a, **k: claimed.append(a))
+        monkeypatch.setattr(target_handlers.ConnectorProcess, "start", lambda instance: claimed.append(instance.key.parts))
         built = handler(MATRIX_LINK, hosts_connectors=False)
         built.on_session_start()
         built.on_session_end()
@@ -71,22 +69,21 @@ class TestTheHandlerUnderTheFlag:
         ``lmer chat <permalink>`` and both listeners take."""
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
         claimed = []
-        monkeypatch.setattr(target_handlers, "register", lambda *a, **k: claimed.append(a))
+        monkeypatch.setattr(target_handlers.ConnectorProcess, "start", lambda instance: claimed.append(instance.key.parts))
         built = handler(SLACK_LINK, hosts_connectors=True)
         monkeypatch.setattr(built, "_start_additional_targets", lambda: None)
         import slack_chat.connector as slack_connector
 
-        monkeypatch.setattr(slack_connector, "SlackConnector", _Recorder)
         built.on_session_start()
-        assert claimed == [("C0123ABCDEF", "1712345678.000900")]
-        assert isinstance(built.connector, _Recorder)
+        assert claimed == [["slack", "C0123ABCDEF", "1712345678.000900"]]
+        assert isinstance(built.connector, target_handlers.ConnectorProcess)
 
     def test_a_second_thread_is_delegated_too(self, monkeypatch):
         """A handler may hold several threads, each with its own connector. The
         flag has to reach every one of them, or the daemon and this process would
         both serve the second."""
         claimed = []
-        monkeypatch.setattr(target_handlers, "register", lambda *a, **k: claimed.append(a))
+        monkeypatch.setattr(target_handlers.ConnectorProcess, "start", lambda instance: claimed.append(instance.key.parts))
         built = handler(SLACK_LINK, hosts_connectors=False)
         built.add("https://example.slack.com/archives/C0123ABCDEF/p1712345678000901")
         built.on_session_start()

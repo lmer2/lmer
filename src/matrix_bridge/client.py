@@ -597,15 +597,13 @@ class MatrixClient:
 
 
 def _record_room_id(room_id: str) -> None:
-    """Write the created room's id back into ``config.json`` (D5).
+    """Persist the room id without overwriting concurrent Matrix settings."""
+    def compute(current: dict) -> dict:
+        matrix = dict(current.get("matrix") or {})
+        matrix["room_id"] = room_id
+        return {"matrix": matrix}
 
-    Through the platform's own writer, which merges into the stored mapping and
-    preserves what it does not know — the reason ``matrix`` is a declared field
-    rather than a key the loader tolerates (see the run's ``spike.md``).
-    """
-    stored = dict(getattr(platform_config.load(), "matrix", None) or {})
-    stored["room_id"] = room_id
-    platform_config.update_stored({"matrix": stored})
+    platform_config.mutate_stored(compute)
 
 
 def _state_store_class():

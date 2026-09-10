@@ -28,7 +28,7 @@ from typing import ClassVar
 
 from matrix_chat.permalink import is_matrix_thread_url, parse_matrix_permalink
 from slack_chat.permalink import is_slack_thread_url, parse_slack_permalink
-from slack_chat.registry import deregister, register
+from lmer_cli.connector_process import ConnectorProcess
 
 
 class TargetHandler:
@@ -166,8 +166,8 @@ class SlackThreadTargets(TargetHandler):
     (``LMER_SLACK_CHANNEL`` / ``LMER_SLACK_THREAD_TS`` /
     ``LMER_SLACK_PERMALINK`` / ``LMER_CHAT_CHANNEL``); additional Slack targets
     each get their own connector. ``SLACK_BOT_TOKEN`` is required on the
-    **host** whenever a Slack target is present — since issue #407 the thread is
-    served by a connector running in this process
+    **host** whenever a Slack target is present. The thread is
+    served by a supervised connector child
     (:mod:`slack_chat.connector`), so the token never enters the container: both
     Slack tokens are seeded ``None`` in the container env, which is what keeps a
     ``.env`` file from forwarding them. Repo-less sessions are allowed for the
@@ -237,51 +237,25 @@ class SlackThreadTargets(TargetHandler):
         }
 
     def on_session_start(self) -> None:
-        """Record the attachment in the host-side registry and start the connector.
-
-        The registry lets the Slack listener detect that an lmer is already
-        connected to the thread — including a session it didn't spawn, e.g. a
-        manual ``lmer chat <permalink>`` from a shell — and decline to connect a
-        second one (issue #74). The connector is what carries the conversation
-        (issue #407): it needs the control plane the CLI attached; without one
-        the session runs and the thread stays silent, and that is said out loud.
-        """
         if not self.hosts_connectors:
             return
         self._start_additional_targets()
-        register(self.channel, self.thread_ts, permalink=self.permalink)
         if self.control_plane is None or not self.channel or not self.thread_ts:
-            print(
-                "⚠️  Slack thread target without a supervisor control plane — the "
-                "connector cannot run, so the thread will not hear this session",
-                file=sys.stderr,
-            )
+            print("⚠️  slack thread target without a supervisor control plane — the connector cannot run", file=sys.stderr)
             return
-        try:
-            from slack_chat.connector import ConnectorConfig, SlackConnector
-
-            url, token = self.control_plane
-            host_dir, container_dir = self.uploads or (None, None)
-            config = ConnectorConfig.from_env(
-                channel=self.channel, thread_ts=self.thread_ts,
-                supervisor_url=url, supervisor_token=token,
-                uploads_dir=host_dir, container_uploads_dir=container_dir,
-            )
-            self.connector = SlackConnector(config, notify=_warn)
-            self.connector.start()
-        except Exception as exc:  # a dead connector must not stop the session
-            print(f"⚠️  Slack connector did not start: {exc}", file=sys.stderr)
-            self.connector = None
+        self.connector = ConnectorProcess(
+            "slack", self.channel, self.thread_ts, self.permalink,
+            self.control_plane, self.uploads,
+        )
+        self.connector.start()
 
     def on_session_end(self) -> None:
-        """Stop the connector and clear the registry entry."""
         if not self.hosts_connectors:
             return
         self._stop_additional_targets()
         if self.connector is not None:
             self.connector.stop()
             self.connector = None
-        deregister(self.channel, self.thread_ts)
 
 
 class MatrixThreadTargets(TargetHandler):
@@ -291,7 +265,7 @@ class MatrixThreadTargets(TargetHandler):
     container's chat context (``LMER_MATRIX_ROOM_ID`` / ``LMER_MATRIX_THREAD_EVENT``
     / ``LMER_MATRIX_PERMALINK`` / ``LMER_CHAT_CHANNEL``), the bot account's
     credentials are required on the **host** and never enter the container, and
-    the connector runs in this process (:mod:`matrix_chat.connector`).
+    the connector runs as a supervised child (:mod:`matrix_chat.connector`).
     """
 
     repoless_task_ids = frozenset({"chat"})
@@ -369,29 +343,14 @@ class MatrixThreadTargets(TargetHandler):
         if not self.hosts_connectors:
             return
         self._start_additional_targets()
-        register(self.room, self.thread_event, permalink=self.permalink, kind="matrix")
         if self.control_plane is None or not self.room or not self.thread_event:
-            print(
-                "⚠️  matrix thread target without a supervisor control plane — the "
-                "connector cannot run, so the thread will not hear this session",
-                file=sys.stderr,
-            )
+            print("⚠️  matrix thread target without a supervisor control plane — the connector cannot run", file=sys.stderr)
             return
-        try:
-            from matrix_chat.connector import ConnectorConfig, MatrixConnector
-
-            url, token = self.control_plane
-            host_dir, container_dir = self.uploads or (None, None)
-            config = ConnectorConfig.from_env(
-                room=self.room, thread_event=self.thread_event,
-                supervisor_url=url, supervisor_token=token,
-                uploads_dir=host_dir, container_uploads_dir=container_dir,
-            )
-            self.connector = MatrixConnector(config, notify=_warn)
-            self.connector.start()
-        except Exception as exc:  # a dead connector must not stop the session
-            print(f"⚠️  matrix connector did not start: {exc}", file=sys.stderr)
-            self.connector = None
+        self.connector = ConnectorProcess(
+            "matrix", self.room, self.thread_event, self.permalink,
+            self.control_plane, self.uploads,
+        )
+        self.connector.start()
 
     def on_session_end(self) -> None:
         if not self.hosts_connectors:
@@ -400,7 +359,6 @@ class MatrixThreadTargets(TargetHandler):
         if self.connector is not None:
             self.connector.stop()
             self.connector = None
-        deregister(self.room, self.thread_event, kind="matrix")
 
 
 #: Registry of special target types, in match-priority order.

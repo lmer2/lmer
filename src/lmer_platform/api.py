@@ -1393,7 +1393,7 @@ def _slot_text(body: dict, key: str) -> Optional[str]:
 #: Slot names the ``PUT``/``DELETE`` routes cannot address, because they carry
 #: the name as one path segment. Measured against the real routes rather than
 #: reasoned about: a percent-encoded ``/`` is resolved before routing and never
-#: matches (404), and ``.``/``..`` are normalised away by the path (405).
+#: matches (404), and the client's URL parser collapses ``.``/``..`` before routing.
 #: Everything else round-trips — spaces, ``?``, ``#``, ``%``, ``:`` and
 #: non-ASCII all resolve, so none of them is refused.
 _UNADDRESSABLE_NAMES = frozenset({".", ".."})

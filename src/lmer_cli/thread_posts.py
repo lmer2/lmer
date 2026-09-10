@@ -301,8 +301,8 @@ WAIT = "wait"
 #: poll can land in between (docs/COMMS.md §9).
 GRACE_SECONDS = 30.0
 
-#: Bounds on the two things :class:`Attribution` remembers, so neither grows
-#: with the length of a session.
+#: Bounds for unknown-attribution grace and recently written references.
+#: Known pending input remains retained until supervisor acceptance.
 HELD_LIMIT = 32
 WROTE_LIMIT = 256
 
@@ -315,104 +315,123 @@ WARN_INTERVAL_SECONDS = 600.0
 
 
 class Attribution:
-    """Who posted a thread message, for one connector.
+    """Retain attributed input until acceptance; batch claims are process-local."""
 
-    *poster_of* and *ref_of* are the transport's two answers — the stamp on a
-    message, and the message's own id. *session_of* is asked for this
-    connector's own session id and is retried until it answers, because the
-    difference between "another run posted this" and "I did" cannot be made
-    without it.
-
-    Both of a connector's loops reach one of these: the outbound thread calls
-    :meth:`wrote` and the inbound thread reads it. No lock, because every shared
-    step is a single dict operation — a duplicated ``session_of`` call is the
-    worst a race costs, and it returns the same answer.
-    """
-
-    def __init__(
-        self,
-        *,
-        poster_of,
-        ref_of,
-        session_of,
-        clock=time.monotonic,
-        warn=None,
-        grace: float = GRACE_SECONDS,
-    ) -> None:
-        self._poster_of = poster_of
-        self._ref_of = ref_of
-        self._session_of = session_of
-        self._clock = clock
-        self._warn = warn
-        self._grace = grace
+    def __init__(self, *, poster_of, ref_of, session_of, clock=time.monotonic,
+                 warn=None, grace: float = GRACE_SECONDS) -> None:
+        self._poster_of, self._ref_of = poster_of, ref_of
+        self._session_of, self._clock = session_of, clock
+        self._warn, self._grace = warn, grace
         self._session: Optional[str] = None
         self._held: dict = {}
+        self._ready: dict = {}
+        self._claims: set = set()
         self._wrote: dict = {}
         self._warned_at: Optional[float] = None
+        self.lock = threading.RLock()
 
     @property
     def session(self) -> Optional[str]:
-        if self._session is None:
-            self._session = self._session_of() or None
-        return self._session
+        with self.lock:
+            if self._session is None:
+                self._session = self._session_of() or None
+            return self._session
 
     def wrote(self, ref: object) -> None:
-        """Remember one message this connector posted itself: its own mirror
-        carries no stamp, so this is what keeps it out of :data:`WAIT`."""
-        if not isinstance(ref, str) or not ref:
-            return
-        self._wrote[ref] = True
-        while len(self._wrote) > WROTE_LIMIT:
-            self._wrote.pop(next(iter(self._wrote)))
+        with self.lock:
+            if not isinstance(ref, str) or not ref:
+                return
+            self._wrote[ref] = True
+            while len(self._wrote) > WROTE_LIMIT:
+                self._wrote.pop(next(iter(self._wrote)))
 
     def decide(self, message: dict) -> tuple:
-        """``(verdict, poster)`` for one live message this app's account sent."""
-        ref = self._ref_of(message)
-        if isinstance(ref, str) and ref in self._wrote:
-            return SKIP, None
-        poster = self._poster_of(message)
-        if poster is None:
+        with self.lock:
+            ref = self._ref_of(message)
+            if isinstance(ref, str) and ref in self._wrote:
+                self.ack(message)
+                return SKIP, None
+            poster = self._ready.get(ref) or self._poster_of(message)
+            if poster is None or (poster.origin == ORIGIN_SESSION and self.session is None):
+                self._hold(ref, message)
+                return WAIT, None
+            if poster.is_session(self.session):
+                self.ack(message)
+                return SKIP, None
+            self._ready[ref] = poster
             self._hold(ref, message)
-            return WAIT, None
-        self._held.pop(ref, None)
-        if poster.origin == ORIGIN_SESSION and self.session is None:
-            # Not answerable until the supervisor has said who we are.
-            self._hold(ref, message)
-            return WAIT, None
-        if poster.is_session(self.session):
-            return SKIP, None
-        return INGEST, poster
+            self._claims.add(ref)
+            return INGEST, poster
 
     def due(self) -> list:
-        """Held messages that can now be attributed, oldest first.
+        with self.lock:
+            ready = []
+            for ref, (message, deadline) in list(self._held.items()):
+                if ref in self._claims:
+                    continue
+                if ref in self._wrote:
+                    self.ack(message)
+                    continue
+                poster = self._ready.get(ref) or self._poster_of(message)
+                if poster is not None and not (
+                    poster.origin == ORIGIN_SESSION and self.session is None
+                ):
+                    if poster.is_session(self.session):
+                        self.ack(message)
+                    else:
+                        self._ready[ref] = poster
+                        self._claims.add(ref)
+                        ready.append((message, poster))
+                elif self._clock() >= deadline:
+                    self.ack(message)
+                    self._unattributed(ref)
+            return ready
 
-        Also the prune: a message still unattributable when its grace runs out
-        is dropped, and the first one to be dropped says so.
-        """
-        ready = []
-        for ref, (message, deadline) in list(self._held.items()):
-            if ref in self._wrote:
-                # Held before the outbound thread got round to recording it:
-                # ours after all, and never a reason to warn.
-                del self._held[ref]
-                continue
-            poster = self._poster_of(message)
-            if poster is not None and not (
-                poster.origin == ORIGIN_SESSION and self.session is None
-            ):
-                del self._held[ref]
-                if not poster.is_session(self.session):
-                    ready.append((message, poster))
-            elif self._clock() >= deadline:
-                del self._held[ref]
-                self._unattributed(ref)
-        return ready
+    def ack(self, message: dict) -> None:
+        self.ack_ref(self._ref_of(message))
+
+    def ack_ref(self, ref: str) -> None:
+        with self.lock:
+            self._held.pop(ref, None)
+            self._ready.pop(ref, None)
+            self._claims.discard(ref)
+
+    def release(self) -> None:
+        with self.lock:
+            self._claims.clear()
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            now = time.time()
+            return {
+                "held": [{"ref": ref, "message": message,
+                          "expires": now + max(0, deadline - self._clock()),
+                          "poster": self._ready[ref].to_dict() if ref in self._ready else None}
+                         for ref, (message, deadline) in self._held.items()],
+                "wrote": list(self._wrote),
+            }
+
+    def restore(self, state: dict) -> None:
+        with self.lock:
+            self._held.clear()
+            self._ready.clear()
+            self._claims.clear()
+            self._wrote = dict.fromkeys(state.get("wrote", ()), True)
+            for item in state.get("held", []):
+                ref = item["ref"]
+                self._held[ref] = (item["message"], self._clock() + max(0, item["expires"] - time.time()))
+                poster = Poster.from_dict(item.get("poster"))
+                if poster is not None:
+                    self._ready[ref] = poster
 
     def _hold(self, ref: object, message: dict) -> None:
         if not isinstance(ref, str) or not ref or ref in self._held:
             return
-        while len(self._held) >= HELD_LIMIT:
-            self._held.pop(next(iter(self._held)))
+        unknown = [key for key in self._held if key not in self._ready]
+        if ref not in self._ready and len(unknown) >= HELD_LIMIT:
+            oldest = unknown[0]
+            del self._held[oldest]
+            self._unattributed(oldest)
         self._held[ref] = (message, self._clock() + self._grace)
 
     def _unattributed(self, ref: str) -> None:

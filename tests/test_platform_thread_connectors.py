@@ -46,10 +46,18 @@ def disconnect_notices(monkeypatch):
 
 @pytest.fixture
 def platform_root(tmp_path, monkeypatch):
+    instances = []
+    original = connectors.ThreadConnectors.__init__
+    def track(instance, *args, **kwargs):
+        original(instance, *args, **kwargs)
+        instances.append(instance)
+    monkeypatch.setattr(connectors.ThreadConnectors, "__init__", track)
     root = tmp_path / "platform"
     monkeypatch.setattr(store, "PLATFORM_DIR", str(root))
     monkeypatch.setattr(thread_registry, "REGISTRY_DIR", str(tmp_path / "threads"))
-    return root
+    yield root
+    for instance in instances:
+        instance.stop()
 
 
 class FakeProcess:
@@ -89,7 +97,7 @@ class Runner:
     def __init__(self):
         self.started = []
 
-    def __call__(self, argv, env, log_path=None):
+    def __call__(self, argv, env, log_path=None, *, pass_fds=()):
         process = FakeProcess(argv, env)
         self.started.append(process)
         return process
@@ -271,7 +279,7 @@ class TestConnect:
         threads = component(platform_root)
         threads.connect("s-1", SLACK_LINK, by="operator")
         registry.register("s-1", pid=2 ** 22 - 1, kind="worker", started_at="2026-09-05T09:00:00Z")
-        thread_registry.deregister("C0123ABCDEF", "1712345678.000900", pid=os.getpid())
+        threads.reconcile()
         assert threads.connect("s-2", SLACK_LINK, by="operator")["running"] is True
 
     def test_a_missing_slack_token_names_the_variable(self, platform_root):
@@ -399,7 +407,9 @@ class TestLifecycle:
 
     def test_a_fresh_component_over_the_same_file_reattaches(self, platform_root):
         live_session()
-        component(platform_root).connect("s-1", SLACK_LINK, by="operator")
+        previous = component(platform_root)
+        previous.connect("s-1", SLACK_LINK, by="operator")
+        previous.stop()
 
         runner = Runner()
         again = component(platform_root, runner=runner)
@@ -564,7 +574,29 @@ class TestReclaimingAnOrphan:
     signal leaves it running — and the restart used to start a *second* one for
     the same thread, doubling every post and every injected reply."""
 
-    def test_a_platform_orphan_is_asked_to_stop_and_the_start_waits(self, platform_root, monkeypatch):
+    def test_reclaim_uses_supervisor_identity_not_platform_registry_id(self, platform_root, monkeypatch):
+        live_session("s-1")
+        runner = Runner()
+        threads = component(platform_root, runner=runner)
+        monkeypatch.setattr(connectors.session_io, "quiet_health", lambda sid: {"session": "run-session"})
+        monkeypatch.setattr(connectors.thread_registry, "thread_holder", lambda *args, **kwargs: {
+            "token": "test-lease", "version": 1, "session": "run-session",
+        })
+        reclaimed = []
+
+        def reclaim(key, *, session, canonical):
+            reclaimed.append((session, canonical))
+            return True
+
+        monkeypatch.setattr(connectors, "reclaim_orphan", reclaim)
+        threads.adopt_launch_targets("s-1", [SLACK_LINK], by="operator")
+        threads.reconcile()
+
+        assert reclaimed == [("run-session", SLACK_LINK)]
+        assert runner.started == []
+        assert "validated orphan" in threads.listing("s-1")[0]["detail"]
+
+    def test_a_legacy_claim_without_start_identity_is_not_signalled(self, platform_root, monkeypatch):
         live_session()
         runner = Runner()
         threads = component(platform_root, runner=runner)
@@ -572,7 +604,6 @@ class TestReclaimingAnOrphan:
             "C0123ABCDEF", "1712345678.000900", permalink=SLACK_LINK,
             pid=4321, owner=connectors.OWNER,
         )
-        monkeypatch.setattr(connectors.ThreadConnectors, "_is_our_connector", lambda *a: True)
         signalled = record_signals(monkeypatch)
         monkeypatch.setattr(
             connectors.thread_registry, "_pid_alive", lambda pid: pid == 4321,
@@ -581,20 +612,12 @@ class TestReclaimingAnOrphan:
         threads.adopt_launch_targets("s-1", [SLACK_LINK], by="operator")
         threads.reconcile()
 
-        assert signalled == [(4321, connectors.signal.SIGTERM)]
+        assert signalled == []
         assert runner.started == [], "the replacement waits for the orphan to go"
-        assert "asked to stop" in threads.listing("s-1")[0]["detail"]
+        assert "legacy connector claim" in threads.listing("s-1")[0]["detail"]
 
     def test_a_recycled_pid_is_never_signalled(self, platform_root, monkeypatch):
-        """The registry documents pid reuse as an accepted edge because its only
-        consumer *reads*. Signalling on the same evidence is not safe, so the
-        process is checked against what it actually is.
-
-        The holder here is **this** process: alive, with a readable argv that is
-        demonstrably not a connector. An absent pid would exercise the
-        *unreadable* branch instead — which is a different answer with a
-        different consequence, and has its own test below.
-        """
+        """A live legacy PID cannot authorize connector signaling."""
         live_session()
         runner = Runner()
         threads = component(platform_root, runner=runner)
@@ -604,17 +627,11 @@ class TestReclaimingAnOrphan:
         )
         signalled = record_signals(monkeypatch)
 
-        # The branch under test, named rather than assumed: the argv was read,
-        # and it is not ours.
-        assert threads._is_our_connector(
-            os.getpid(), connectors.parse_thread(SLACK_LINK),
-        ) is False
-
         threads.adopt_launch_targets("s-1", [SLACK_LINK], by="operator")
         threads.reconcile()
 
         assert signalled == [], "a process that is not a connector is never signalled"
-        assert len(runner.started) == 1, "a stale claim leaves the thread free"
+        assert runner.started == [], "legacy liveness cannot establish a safe child identity"
 
     def test_a_cli_holder_is_left_alone(self, platform_root, monkeypatch):
         live_session()
@@ -633,7 +650,7 @@ class TestReclaimingAnOrphan:
 
         assert signalled == []
         assert runner.started == []
-        assert "did not start" in threads.listing("s-1")[0]["detail"]
+        assert "legacy connector claim" in threads.listing("s-1")[0]["detail"]
 
     def test_a_connector_that_exits_lets_go_of_its_thread(self, platform_root):
         """Its entry used to outlive it, leaving the next start to reason about a
@@ -710,15 +727,7 @@ class TestOneLiveSessionPerThread:
     def test_a_second_sessions_record_never_takes_the_connector(
         self, platform_root, monkeypatch
     ):
-        """The regression: two live sessions, one thread. The second attaches
-        nothing, the thread is told nothing, and the first is left alone.
-
-        ``_is_our_connector`` is forced true, as the orphan tests do it, so that
-        "never signalled" is an assertion rather than a coincidence: the holder
-        here is the pytest process, whose argv carries no permalink, so without
-        the stub the pre-guard path reads it as a stale claim and never reaches
-        ``os.kill`` either way.
-        """
+        """A second session leaves the live owner and its connector untouched."""
         live_session("s-1")
         live_session(
             "s-2",
@@ -728,7 +737,6 @@ class TestOneLiveSessionPerThread:
         threads = component(platform_root, runner=runner)
         threads.connect("s-1", SLACK_LINK, by="operator")
         holder = runner.started[0]
-        monkeypatch.setattr(connectors.ThreadConnectors, "_is_our_connector", lambda *a: True)
         signalled = record_signals(monkeypatch)
 
         threads.adopt_launch_targets("s-2", [SLACK_LINK], by="operator")
@@ -745,14 +753,7 @@ class TestOneLiveSessionPerThread:
     def test_a_recycled_pid_on_another_thread_does_not_hold_this_one(
         self, platform_root,
     ):
-        """The holder question is "this thread, this pid", not the pid alone.
-
-        A stale claim on thread Y naming a pid the OS has since given to a
-        connector for thread X would otherwise read as Y's holder — and this
-        answer stands in front of ``_is_our_connector``, which is what catches a
-        recycled pid. Y would then be refused for as long as X's connector lives,
-        with a detail naming the wrong run.
-        """
+        """A stale legacy claim cannot authorize taking another thread's child."""
         live_session("s-1")
         live_session("s-2")
         runner = Runner()
@@ -770,8 +771,8 @@ class TestOneLiveSessionPerThread:
         threads.adopt_launch_targets("s-2", [OTHER_SLACK_LINK], by="operator")
         threads.reconcile()
 
-        assert len(runner.started) == 2, "the stale claim is not this thread's holder"
-        assert threads.listing("s-2")[0]["running"] is True
+        assert len(runner.started) == 1, "the legacy claim cannot authorize a takeover"
+        assert threads.listing("s-2")[0]["running"] is False
 
     def test_the_deferred_connection_attaches_once_the_holder_goes(self, platform_root):
         """What makes the deferral a wait rather than a loss: the record stays,
@@ -1010,42 +1011,6 @@ class TestTheConnectorIsGivenTheResolvedThread:
             "s-1", "https://matrix.to/#/%23lmer%3Aexample.org/%24event", by="operator",
         )
         assert "%21room%3Aexample.org" in runner.started[0].argv[4]
-
-
-class TestAnUnreadableHolder:
-    def test_it_is_not_read_as_somebody_elses_process(self, platform_root, monkeypatch):
-        """Review iteration 2: "could not read the argv" was collapsed into "not
-        ours", so the thread was treated as free and a second connector started —
-        the duplicate the whole path exists to prevent."""
-        live_session()
-        runner = Runner()
-        threads = component(platform_root, runner=runner)
-        thread_registry.register(
-            "C0123ABCDEF", "1712345678.000900", permalink=SLACK_LINK,
-            pid=4321, owner=connectors.OWNER,
-        )
-        monkeypatch.setattr(
-            connectors.thread_registry, "_pid_alive", lambda pid: pid == 4321,
-        )
-        monkeypatch.setattr(connectors.ThreadConnectors, "_is_our_connector", lambda *a: None)
-        signalled = record_signals(monkeypatch)
-
-        threads.adopt_launch_targets("s-1", [SLACK_LINK], by="operator")
-        threads.reconcile()
-
-        assert runner.started == [], "nothing is started over a holder nobody can identify"
-        assert signalled == [], "and nothing is signalled either"
-        assert "cannot read what it is" in threads.listing("s-1")[0]["detail"]
-
-    def test_a_pid_that_vanished_leaves_the_thread_free(self, platform_root, monkeypatch):
-        """A gone process is a known answer, not an unreadable one."""
-        live_session()
-        threads = component(platform_root)
-        monkeypatch.setattr(
-            connectors.Path, "read_bytes",
-            lambda self: (_ for _ in ()).throw(FileNotFoundError()),
-        )
-        assert threads._is_our_connector(4321, connectors.parse_thread(SLACK_LINK)) is False
 
 
 class TestDisconnectNotices:

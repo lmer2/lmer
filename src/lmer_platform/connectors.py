@@ -7,7 +7,7 @@ writes a record; disconnecting drops one; a daemon restart reattaches, because
 the records are the state and reconcile is the only thing that acts on them.
 
 The connectors themselves are the same ``lmer-slack-connector`` /
-``lmer-matrix-connector`` entrypoints the CLI hosts in-process, given a
+``lmer-matrix-connector`` entrypoints the CLI supervises as children, given a
 supervisor address, that session's control token, a thread and the channel's
 credentials. Those credentials come from the daemon's own environment and stay
 there: a connector process is the daemon's child on the host, never anything a
@@ -30,6 +30,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from lmer_cli import thread_access
+from lmer_cli.connector_delivery import RecoveryRequired
+from lmer_cli.connector_lifecycle import EXIT_RECOVERY
+from lmer_cli.connector_ownership import Lease, ThreadKey
+from lmer_cli.connector_process import OwnedProcess, reclaim_orphan, spawn_child, spawn_owned
 from lmer_cli.threads import ThreadError, ThreadRef, parse_thread
 
 from slack_chat import registry as thread_registry
@@ -64,7 +68,7 @@ RECONCILE_SECONDS = 5.0
 
 #: How long a connector gets to post its "disconnected" line and unwind before
 #: it is killed.
-STOP_GRACE_SECONDS = 5.0
+STOP_GRACE_SECONDS = 47.0
 
 BACKOFF_MAX = 30.0
 
@@ -101,6 +105,7 @@ class _Process:
     popen: object
     ref: ThreadRef
     since: str
+    lease: Lease
 
 
 class ThreadConnectors:
@@ -557,7 +562,9 @@ class ThreadConnectors:
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=STOP_GRACE_SECONDS + 5)
+            if self._thread.is_alive():
+                raise RuntimeError("connector reconciliation did not finish draining its child")
             self._thread = None
         for key in list(self._procs):
             self._stop_process(key)
@@ -672,21 +679,13 @@ class ThreadConnectors:
                 code = process.popen.poll()
                 if code is None:
                     return
+                code = OwnedProcess(process.popen, process.lease).collect()
                 self._procs.pop(key, None)
                 self._exits[key] = code
                 self._penalise(key)
                 logger.info(
                     "platform_thread_connector_exited session=%s thread=%s code=%s",
                     key[0], key[1], code,
-                )
-                # Its claim on the thread goes with it. The pid is dead, so the
-                # entry already reads as free — but leaving it makes the next
-                # start reason about a pid nobody owns, which is the shape the
-                # reclaim above exists to be careful about.
-                thread_registry.deregister(
-                    *process.ref.registry_key(),
-                    kind=process.ref.channel,
-                    pid=getattr(process.popen, "pid", None),
                 )
             if self._clock() < self._next_attempt.get(key, 0.0):
                 return
@@ -709,22 +708,33 @@ class ThreadConnectors:
                 self._fail(key, str(exc))
                 return
         ref = _ref_of(record)
-        held = self._reclaim(ref, key)
+        health = session_io.quiet_health(session_id) or {}
+        supervisor_session = health.get("session")
+        if not isinstance(supervisor_session, str) or not supervisor_session:
+            supervisor_session = None
+        # Registry IDs name platform records; leases bind to authenticated supervisor IDs.
+        held = self._reclaim(ref, key, supervisor_session=supervisor_session)
         if held is not None:
             self._fail(key, held)
             return held
         try:
             argv = self._argv(record, session_id)
-            popen = self._runner(
-                argv,
+            owned = spawn_owned(
+                ThreadKey(ref.channel, *ref.registry_key()), argv,
                 self._environment(endpoint, session_id, record),
-                self._log_path(record),
+                owner=OWNER, session=supervisor_session, permalink=ref.canonical,
+                runner=self._runner, log_path=self._log_path(record),
             )
+            popen = owned.popen
+        except RecoveryRequired as exc:
+            self._exits[key] = EXIT_RECOVERY
+            self._fail(key, f"recovery required: {exc}; use lmer_cli.connector_recovery")
+            return
         except Exception as exc:
             self._fail(key, f"the connector process would not start: {exc}")
             return
         with self._lock:
-            self._procs[key] = _Process(popen=popen, ref=ref, since=utc_now_iso())
+            self._procs[key] = _Process(popen=popen, ref=ref, since=utc_now_iso(), lease=owned.lease)
             self._disconnected.discard(key)
             self._detail.pop(key, None)
             self._attempts.pop(key, None)
@@ -733,13 +743,6 @@ class ThreadConnectors:
             # back reported `running: true` beside it for the rest of the
             # daemon's life, because only `connect()` ever cleared it.
             self._exits.pop(key, None)
-        thread_registry.register(
-            *ref.registry_key(),
-            permalink=ref.permalink,
-            pid=getattr(popen, "pid", None),
-            kind=ref.channel,
-            owner=OWNER,
-        )
         logger.info(
             "platform_thread_connector_started session=%s thread=%s pid=%s",
             session_id, thread_id, getattr(popen, "pid", None),
@@ -783,9 +786,7 @@ class ThreadConnectors:
         # the whole of it. Without this a live connect posts the run's whole
         # journal into the thread, one message per record.
         env[ATTACH_FROM_NOW_ENV] = "1" if record.get("origin") == "live" else "0"
-        # Where this attachment had read up to, if it has ever read anything. The
-        # supervisor's own answer is fresher and wins when it is there; this is
-        # what is left after a clean stop has taken that answer away.
+        # A launch hint only: a validated connector checkpoint takes precedence.
         cursor = record.get("cursor")
         if isinstance(cursor, int) and not isinstance(cursor, bool):
             env[ATTACH_SINCE_ENV] = str(cursor)
@@ -812,152 +813,37 @@ class ThreadConnectors:
 
     def _stop_process(self, key: tuple) -> None:
         with self._lock:
-            process = self._procs.pop(key, None)
-            self._attempts.pop(key, None)
-            self._next_attempt.pop(key, None)
+            process = self._procs.get(key)
         if process is None:
             return
-        popen = process.popen
         try:
-            if popen.poll() is None:
-                # SIGTERM rather than a kill: it is what gives the connector the
-                # seconds it needs to post its "disconnected" line in the thread.
-                popen.terminate()
-                try:
-                    popen.wait(timeout=STOP_GRACE_SECONDS)
-                except Exception:
-                    popen.kill()
-                    popen.wait(timeout=STOP_GRACE_SECONDS)
-        except Exception as exc:
-            logger.warning(
-                "platform_thread_connector_stop_failed session=%s thread=%s error=%s",
-                key[0], key[1], exc,
-            )
-        thread_registry.deregister(
-            *process.ref.registry_key(),
-            kind=process.ref.channel,
-            pid=getattr(popen, "pid", None),
-        )
+            OwnedProcess(process.popen, process.lease).stop(STOP_GRACE_SECONDS)
+        except Exception:
+            logger.exception("platform_thread_connector_stop_failed session=%s thread=%s", *key)
+            return
+        with self._lock:
+            self._procs.pop(key, None)
+            self._attempts.pop(key, None)
+            self._next_attempt.pop(key, None)
 
-    def _reclaim(self, ref: ThreadRef, key: tuple) -> Optional[str]:
-        """Clear the way for a connector for *ref*. ``None`` when the way is clear.
-
-        A connector is a detached process (``start_new_session``), so it outlives
-        a daemon that dies by signal. A restart would otherwise start a *second*
-        one for every reattached connection — both holding valid control tokens,
-        both with their own cursor, so every record posted twice and every human
-        reply injected twice. Reconcile never reaches :meth:`connect`'s holder
-        check, and ``thread_registry.register`` overwrites by contract, so
-        nothing else would notice.
-
-        A pid is not enough to act on. The registry documents pid reuse as an
-        accepted edge because its only consumer *reads* — reporting a thread busy
-        when it is free is the safe direction. Signalling on the same evidence is
-        not safe, so the pid is checked against what the process actually is
-        (:meth:`_is_our_connector`) before anything is sent to it; an entry that
-        does not match is a stale record over a recycled pid, and the thread is
-        free.
-
-        Nothing is waited for: the answer is "not yet", the backoff brings the
-        next attempt round, and the reason is on the record meanwhile — waiting
-        would hold this component's lock for seconds per orphan on the one pass
-        that has the most of them.
-        """
+    def _reclaim(self, ref: ThreadRef, key: tuple, *, supervisor_session=None) -> Optional[str]:
+        """Reclaim only a validated connector child of a dead native owner."""
+        holder_session = self._live_holder(ref, besides=key[0])
+        if holder_session is not None:
+            return f"that thread is connected to {_run_label(holder_session)}; waiting for its owner to release it"
         holder = thread_registry.thread_holder(*ref.registry_key(), kind=ref.channel)
         if holder is None:
             return None
-        pid = holder.get("pid")
-        if holder.get("owner") != OWNER or not isinstance(pid, int):
-            return (
-                f"that thread is held by an lmer session this daemon did not "
-                f"start (host process {pid}); connect it here once that one has "
-                "let it go"
-            )
-        running = self._connector_holding(pid, ref, except_key=key)
-        if running is not None and registry.is_live(registry.read_session(running[0])):
-            # Not an orphan but a live session's connector. Signalling it is
-            # what made two registrations trade the connector back and forth
-            # until one session ended (issue #413).
-            return (
-                f"that thread is connected to {_run_label(running[0])} — a thread "
-                "has one live session at a time, and this one attaches when that "
-                "session lets it go"
-            )
-        ours = self._is_our_connector(pid, ref)
-        if ours is None:
-            # Unreadable is not the same answer as "not ours", and treating it as
-            # one starts a second connector on the thread — the duplicate this
-            # whole path exists to prevent. Nothing is signalled and nothing is
-            # started: the claim stands until something can be established about
-            # the process holding it.
-            return (
-                f"a live process holds the thread (host process {pid}) and this "
-                "daemon cannot read what it is; nothing will be started on that "
-                "thread until it goes"
-            )
-        if not ours:
-            logger.info(
-                "platform_thread_stale_claim thread=%s pid=%s — the entry names a "
-                "connector, the process is not one", ref.id, pid,
-            )
-            return None
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError as exc:
-            logger.warning("platform_thread_orphan_unkillable pid=%s error=%s", pid, exc)
-            return None
-        logger.info("platform_thread_orphan_reclaimed thread=%s pid=%s", ref.id, pid)
-        return (
-            f"a connector this daemon started earlier still holds the thread "
-            f"(host process {pid}); it has been asked to stop"
-        )
-
-    def _connector_holding(
-        self, pid: int, ref: ThreadRef, *, except_key: tuple
-    ) -> Optional[tuple]:
-        """The connection whose running connector is *pid* **on *ref*'s thread**.
-
-        This daemon's own process table, so the answer is what it started rather
-        than what a registry entry claims — and a pid it is not running is a pid
-        it may still have to reclaim.
-
-        The thread is half the question, not decoration: a pid alone would answer
-        for a connector on a *different* thread that inherited the pid from a
-        stale claim, and this stands in front of :meth:`_is_our_connector`, which
-        is the check for exactly that.
-        """
-        with self._lock:
-            for key, process in self._procs.items():
-                if key == except_key or process.ref.id != ref.id:
-                    continue
-                if getattr(process.popen, "pid", None) != pid:
-                    continue
-                return key if process.popen.poll() is None else None
-        return None
-
-    def _is_our_connector(self, pid: int, ref: ThreadRef) -> Optional[bool]:
-        """Whether *pid* really is a connector process for *ref*'s thread.
-
-        Three answers, not two, and the third is the one that matters: ``True``
-        is a match, ``False`` is a process that is demonstrably something else —
-        a recycled pid — and ``None`` is **not knowing**, where the argv cannot
-        be read at all. Collapsing ``None`` into ``False`` reads an absence of
-        evidence as evidence, and the cost of that mistake is the duplicate
-        connector the caller is trying to avoid.
-
-        Read off the process rather than believed from the registry entry that
-        named it: the argv this module built carries the module name and the
-        thread's canonical permalink, so a match is evidence.
-        """
-        try:
-            argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode("utf-8", "replace")
-        except FileNotFoundError:
-            # The pid is gone between the liveness read and this one — a race
-            # this side loses harmlessly: no process, no holder, no duplicate.
-            return False
-        except OSError:
-            return None
-        return _MODULES[ref.channel] in argv and ref.canonical in argv
+        if holder.get("token") and holder.get("version") == 1:
+            try:
+                stopped = reclaim_orphan(
+                    ThreadKey(ref.channel, *ref.registry_key()),
+                    session=supervisor_session, canonical=ref.canonical,
+                )
+                return "validated orphan connector has been asked to stop" if stopped else None
+            except Exception as exc:
+                return f"connector ownership conflict: {exc}"
+        return "a legacy connector claim is still live; stop its owner before attaching"
 
     def _fail(self, key: tuple, detail: str) -> None:
         with self._lock:
@@ -1044,42 +930,8 @@ def _run_label(session_id: str) -> str:
     return f"{title} ({key})" if title else key
 
 
-def _spawn_process(argv: list, env: dict, log_path: Optional[Path] = None):
-    """The connector, as the daemon's own child.
-
-    ``sys.executable -m`` rather than the ``lmer-slack-connector`` console
-    script: the daemon already imports these packages, so its own interpreter is
-    the one environment guaranteed to have them, and a console script hidden by
-    a PATH difference would surface as "the thread went quiet" long after the
-    cause.
-
-    Its output goes to a file rather than to ``/dev/null``. ``last_exit`` and
-    ``detail`` cover a process that died and one that would not start; the case
-    they cannot reach is a connector that is *running* and cannot post — a Slack
-    ``missing_scope``, a bus error, a refused ack — which is the "connected but
-    silent" state the runtime block exists for, and the only place it says so is
-    its own stderr.
-    """
-    stream = subprocess.DEVNULL
-    if log_path is not None:
-        try:
-            ensure_state_dir(log_path.parent)
-            stream = open(log_path, "ab")  # noqa: SIM115 - owned by the child
-        except OSError as exc:
-            logger.warning("platform_thread_log_unwritable path=%s error=%s", log_path, exc)
-            stream = subprocess.DEVNULL
-    try:
-        return subprocess.Popen(  # noqa: S603 - argv is built here, never from a body
-            argv,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=stream,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    finally:
-        if stream is not subprocess.DEVNULL:
-            stream.close()
+def _spawn_process(argv: list, env: dict, log_path: Optional[Path] = None, *, pass_fds=()):
+    return spawn_child(argv, env, log_path, pass_fds=pass_fds)
 
 
 def _slack_client(token: str):

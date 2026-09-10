@@ -757,15 +757,17 @@ handler in the host `lmer` process (`SlackThreadTargets`,
   `matrix`) beside the channel's own variables — and keeps every credential
   out of it: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` and `LMER_MATRIX_*`
   credentials are seeded `None` so a `.env` file cannot forward them;
-- runs the **connector** for that thread on a thread of the `lmer` process,
-  and stops it when the session ends.
+- supervises a separate **connector child** for that thread and waits for it
+  to stop when the session ends.
 
 The connector is a separable component with its own entrypoint and
 configuration — `lmer-slack-connector`, `lmer-matrix-connector` — given a
 supervisor address (`LMER_SUPERVISOR_URL`, or `LMER_FASTAPI_PORT` on
 loopback), the supervisor token, the thread, and the channel's credentials.
-The CLI hosts it in-process today; the same entrypoint runs beside a session
-that has no host `lmer` process. It does two things until stopped:
+Both the CLI and platform supervise connector children. Ownership, durable
+receipts, module reload and explicit per-operation recovery are described in
+[CONNECTOR-RECOVERY.md](CONNECTOR-RECOVERY.md). A failed or uncertain remote send
+is never blindly replayed. The connector does two things until stopped:
 
 - **outbound**: long-polls the supervisor's `GET /messages`, posts every record
   not from its own channel into the thread (a question with numbered options,
