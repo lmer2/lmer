@@ -246,3 +246,136 @@ fingerprint is recomputed after the run, so a hook autofix or concurrent
 checked-content change prevents recording the pass. Entries use an owner-only
 `/tmp/lmer-precommit-cache` directory and fail soft to running the hooks
 normally. Override that directory with `LMER_PRECOMMIT_CACHE_DIR`.
+
+
+## Parallel test runner overrides
+
+Parallel execution is an operator-owned, work-repo-only opt-in for the **test
+runner step**. Lint, secrets, permissions and the other gate checks still run.
+Third-party projects need no source-repo configuration, helper or dependency
+change: their work override invokes what their environment already supports.
+
+Put this pair in `{host}/{project}/info/`, or in
+`{host}/{project}/{task}/info/` for a task override:
+
+```text
+gate-check.yaml
+gate-check-run-tests-parallel.sh  (executable)
+```
+
+```yaml
+tests:
+  parallel:
+    min_cpus: 4
+    min_memory_mib: 4096
+```
+
+The parallel script runs with the project root as cwd, with no added arguments,
+just like `gate-check-run-tests.sh`. Shared selection is framework-agnostic; the
+project owns its command, dependencies, worker count and workload safety. An
+executed failure stays a failure: there is no normal-runner retry.
+
+Selection reads task policy before project policy, independently of the existing
+generic configuration loader. At each level `gate-check.yaml` wins over `.yml`.
+The first explicit `tests.parallel` block must pair with an executable parallel
+script **in that same directory**. `tests: {parallel: false}`, invalid policy,
+insufficient resources or a missing script stop lower-tier parallel selection.
+A valid mapping with no parallel block permits project policy. Malformed root
+or `tests` containers stop lookup with a diagnostic. An unreadable policy
+file falls back conservatively. Repo-local `.lmer/gate-check.yaml` cannot enable,
+disable or override this policy. Other configuration precedence is unchanged.
+
+Normal fallback retains existing task `gate-check-run-tests.sh`, then project
+`gate-check-run-tests.sh`, then default pytest precedence. Set
+`LMER_GATE_NO_PARALLEL=1` (also `true`/`yes`, forwarded into containers) to force
+that normal path. A custom normal command may itself use concurrency; this switch
+does not rewrite it.
+
+Eligibility uses finite Linux cgroup v1/v2 CPU quotas and memory limits, taking
+visible ancestors into account and bounding CPU allocation by process affinity.
+Fractional CPU quotas round down. Unknown limits or affinity, malformed values,
+or allocations below either declared minimum select the normal runner. The
+memory requirement is an **eligibility floor**, not measured available memory or
+a promise of headroom. Cgroup ancestors hidden by the container mount cannot be
+inspected; the operator must provide an accurate effective allocation.
+
+### lmer: retain subset, cache and commit handoff
+
+lmer uses the same pair, with one additional explicit contract:
+
+```yaml
+tests:
+  parallel:
+    min_cpus: 4
+    min_memory_mib: 4096
+    protocol: argv-v1
+```
+
+Its executable work script contains:
+
+```sh
+#!/bin/sh
+exec python3 ci/gate-tests.py "$@"
+```
+
+`ci/gate-tests.py` owns pytest/xdist selection. It retains the gate-selected
+interpreter and exact targets, checks xdist in that interpreter, and adds at most
+four workers, bounded again by quota and affinity. Missing xdist or unknown
+resources keeps serial pytest. Its tracked execution wrapper disables override
+discovery in nested gates under test, then execs the already selected pytest
+command, including its explicit workers. Dedicated policy tests clear that
+inherited switch and exercise selection directly. The cache records the wrapper
+and child argv together; no default-pytest receipt is fabricated. pytest-xdist is a development
+dependency of lmer only. Install its locked development environment
+before enabling the pair; no operational `/Agents/global` edits are needed.
+
+`argv-v1` explicitly opts into command description instead of opaque script
+execution. The gate calls the script with `--lmer-command`, JSON stdin
+`{"targets": [...], "argv": [...]}`, the normal test environment and a 30-second
+timeout. A dedicated lifecycle process owns the descriptor process group and
+collects its descendants on completion or failure, with up to four additional
+seconds for cleanup.
+The script must **only describe**, returning a JSON object containing
+its exact executable `argv` and the identical `targets` as acknowledgement. It
+must honor those targets without hidden selection or environment changes. Invalid
+output, a failed description or an executed suite failure fails the test step.
+The gate executes the returned argv directly, without shell interpolation.
+
+Description runs before every cache lookup. The existing fingerprint covers the
+actual returned argv, interpreter, dependencies, source tree and execution
+environment; the environment additionally carries the work script's SHA-256.
+Changing worker choice therefore changes the command key. Existing cache limits
+still apply: unknown interpreter/dependency identity means execution without a
+cache entry. This contract does not make arbitrary external test environments
+cacheable. lmer's helper and test inputs are in the tree being hashed.
+
+The normal text-diff target selector, full/subset receipts, pass recording and
+post-commit cache handoff are reused. An unchanged parallel command can hit its
+own cache; a subset pass cannot answer for a full suite. Ordinary custom runners,
+including parallel overrides without `protocol`, remain opaque and uncached;
+their optional mode label does not establish structured coverage.
+
+### Measurement and limits
+
+Issue #454 measured one sequential serial/n2/n4 run each on identical source and
+dependency overlay, with a verified quota of `400000 / 100000 = 4` CPUs and
+`4294967296` bytes memory. Every run collected 14,695 tests, with 14,646 passing
+and 49 skipped; all collection IDs and setup/call/teardown outcomes matched.
+
+| Mode | pytest seconds | Gate seconds | External cleanup seconds | Total seconds |
+|---|---:|---:|---:|---:|
+| serial | 1761.20 | 1792.38 | 2.04 | 1794.42 |
+| n2 | 898.23 | 911.75 | 1.70 | 913.45 |
+| n4 | 532.89 | 546.11 | 1.76 | 547.87 |
+
+n4 reduced total time 69.5% against serial, but reached 4096 MiB and increased
+cgroup memory allocation-limit failures by 217,614, without an OOM kill. That
+is evidence of cap/reclaim pressure. n2 peaked around 3902 MiB without allocation
+failures. OS caches were not flushed; initial cgroup memory rose across the
+sequential runs, and unrelated host load varied. These single-run observations
+justify the small opt-in, not a universal speedup or memory-safety claim.
+All benchmark descendants were bounded and reaped; suite/worker shutdown is
+included in gate time and external cleanup is reported separately.
+
+Collection, outcome, timing, cgroup and cleanup evidence is retained with the
+change review and benchmark report.

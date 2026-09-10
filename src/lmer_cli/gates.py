@@ -21,7 +21,7 @@ import time
 
 import yaml
 
-from lmer_cli import gate_cache, precommit_cache, push_allow
+from lmer_cli import gate_cache, gate_descriptor, precommit_cache, push_allow, test_resources
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.util import get_bool_env
 from work_repo.utils import project_info_dir, redact_secrets, task_info_dir
@@ -455,14 +455,51 @@ class GateSystem:
                 return candidate
         return None
 
+    def _find_parallel_test_runner(self) -> Optional[Tuple[Path, str]]:
+        """Select a work-repo override paired with its resource policy."""
+        for directory in (task_info_dir(), project_info_dir()):
+            if directory is None:
+                continue
+            for filename in ("gate-check.yaml", "gate-check.yml"):
+                path = directory / filename
+                if not path.is_file():
+                    continue
+                try:
+                    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, yaml.YAMLError):
+                    print("Python Tests — normal runner: unreadable parallel policy")
+                    return None
+                if not isinstance(config, dict):
+                    print("Python Tests — normal runner: parallel policy root must be a mapping")
+                    return None
+                if "tests" not in config:
+                    break
+                tests = config["tests"]
+                if not isinstance(tests, dict):
+                    print("Python Tests — normal runner: parallel policy tests must be a mapping")
+                    return None
+                if "parallel" not in tests:
+                    break
+                selection = test_resources.select_parallel(tests["parallel"])
+                script = directory / "gate-check-run-tests-parallel.sh"
+                if selection.parallel and script.is_file() and os.access(script, os.X_OK):
+                    print(f"Python Tests — project parallel runner: {selection.reason}")
+                    return script, tests["parallel"].get("protocol", "opaque")
+                reason = selection.reason if not selection.parallel else "parallel runner unavailable"
+                print(f"Python Tests — normal runner: {reason}")
+                return None
+        return None
+
     def _run_custom_test_runner(self, script: Path) -> CheckResult:
         """Run a project-supplied test runner script and map its exit code."""
-        result = subprocess.run(
-            [str(script)],
-            capture_output=True,
-            text=True,
-            cwd=self.project_root,
-        )
+        try:
+            result = subprocess.run(
+                [str(script)], capture_output=True, text=True,
+                cwd=self.project_root,
+            )
+        except OSError as exc:
+            return CheckResult(name="Python Tests", status=CheckStatus.FAILED,
+                               message=f"Could not start custom test runner: {exc}")
 
         combined_output = _capture(result)
         non_empty = [line for line in combined_output.splitlines() if line.strip()]
@@ -637,7 +674,10 @@ class GateSystem:
     def check_tests(self) -> CheckResult:
         """Run pytest tests, or a project-supplied custom test runner if present."""
         self._passing_suite = None
-        custom_runner = self._find_custom_test_runner()
+        parallel_runner = self._find_parallel_test_runner()
+        if parallel_runner and parallel_runner[1] == "opaque":
+            return self._run_custom_test_runner(parallel_runner[0])
+        custom_runner = None if parallel_runner else self._find_custom_test_runner()
         if custom_runner is not None:
             return self._run_custom_test_runner(custom_runner)
 
@@ -690,6 +730,36 @@ class GateSystem:
                        "--tb=short", "-q",
                        "--ignore=tests/test_container_build.py"]
 
+        if parallel_runner:
+            script = parallel_runner[0]
+            try:
+                description = gate_descriptor.describe(
+                    [str(script), "--lmer-command"],
+                    input=json.dumps({"targets": targets, "argv": pytest_argv}),
+                    cwd=self.project_root, env=env, timeout=30,
+                )
+                command = json.loads(description.stdout)
+                if not isinstance(command, dict):
+                    raise ValueError("argv-v1 response must be an object")
+                argv = command["argv"]
+                if (command.get("targets") != targets or not isinstance(argv, list)
+                        or not argv or not all(isinstance(arg, str) and arg
+                                              and "\0" not in arg for arg in argv)):
+                    raise ValueError("invalid argv-v1 command or target acknowledgement")
+                pytest_argv = argv
+                env["LMER_GATE_RUNNER_SHA256"] = hashlib.sha256(script.read_bytes()).hexdigest()
+            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+                details = str(exc)
+                if isinstance(exc, subprocess.CalledProcessError):
+                    details += "\n" + _capture(exc)
+                details = redact_secrets(details)
+                return CheckResult(
+                    name="Python Tests", status=CheckStatus.FAILED,
+                    message="Parallel test command description failed",
+                    details=details.splitlines()[-5:], full_output=details,
+                    scope=scope, scope_targets=list(targets),
+                )
+
         # A tree already proven green in this environment is not proven again
         # (#269): the 0.7.0 release ran this suite five times over one
         # unchanged tree. The key covers the tree, everything uncommitted,
@@ -723,13 +793,20 @@ class GateSystem:
         self._print_cache_miss_notice(fingerprint)
 
         # Run pytest and capture output
-        result = subprocess.run(
-            pytest_argv,
-            capture_output=True,
-            text=True,
-            cwd=self.project_root,
-            env=env,
-        )
+        try:
+            result = subprocess.run(
+                pytest_argv,
+                capture_output=True,
+                text=True,
+                cwd=self.project_root,
+                env=env,
+            )
+        except OSError as exc:
+            return CheckResult(
+                name="Python Tests", status=CheckStatus.FAILED,
+                message=f"Could not start test command: {exc}",
+                scope=scope, scope_targets=list(targets),
+            )
 
         code = result.returncode
         stdout = result.stdout or ""
