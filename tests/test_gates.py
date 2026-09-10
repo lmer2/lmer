@@ -3622,7 +3622,7 @@ class TestGateStructure:
 
         # Check for checklist items
         assert "- [ ] Summarize what was just completed" in content
-        assert "- [ ] Run rgr-[relevant module]" in content
+        assert "- [ ] Read the relevant file under `/Agents/global/rules/`" in content
         assert "- [ ] State the new objective clearly" in content
 
 

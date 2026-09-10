@@ -1439,7 +1439,7 @@ class TestWriteAll:
         """
         import inspect
 
-        source = inspect.getsource(supervisor.run_supervisor)
+        source = inspect.getsource(supervisor._run_supervisor)
         assert "_write_all(master_fd, data)" in source, (
             "write_to_child no longer writes through _write_all, so a short write "
             "silently truncates whatever an operator typed"

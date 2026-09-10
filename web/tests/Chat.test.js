@@ -157,3 +157,30 @@ it.each([
   const wrapper = await open([turn({ tools: [tool(command)] }), record()])
   expect(wrapper.findAll('.tools')).toHaveLength(count)
 })
+
+
+const execWrapper = (extra = {}) => ({
+  name: 'exec', wrapper: true, detail: null, error: null, status: 'ok',
+  raw_input: 'text("raw input")', raw_output: 'Script completed', ...extra,
+})
+
+it('collapses empty Codex wrappers while retaining inspectable raw details', async () => {
+  const wrapper = await open([turn({ tools: [execWrapper()] })])
+  expect(wrapper.findAll('.turn')).toHaveLength(0)
+  const details = wrapper.find('.wrapper-details')
+  expect(details.find('summary').text()).toContain('1 empty tool wrappers')
+  expect(details.attributes('open')).toBeUndefined()
+  expect(details.text()).toContain('raw input')
+  expect(details.text()).toContain('Script completed')
+})
+
+it.each([
+  { text: 'Meaningful prose', tools: [execWrapper()] },
+  { tools: [execWrapper({ detail: '14 passed' })] },
+  { tools: [execWrapper({ error: 'ReferenceError', status: 'failed' })] },
+  { tools: [execWrapper({ wrapper: false })] },
+  { tools: [execWrapper(), tool('pytest')] },
+])('keeps prose, results, failures and unrelated exec tools (%j)', async (extra) => {
+  const wrapper = await open([turn(extra)])
+  expect(wrapper.findAll('.turn')).toHaveLength(1)
+})

@@ -1,5 +1,6 @@
 """Test rule file structure and consistency."""
 import re
+import subprocess
 import pytest
 
 
@@ -39,6 +40,15 @@ class TestRuleStructure:
             expected_ref = f"rules/{rule_file.name}"
             assert expected_ref in main_content, \
                 f"{rule_file.name} not referenced in AGENTS.md"
+
+    def test_advertised_all_rules_command_outputs_every_module(self, main_config, all_rule_files):
+        content = main_config.read_text()
+        command = re.search(r'To read all global rules, run `([^`]+)`', content).group(1)
+        command = command.replace('/Agents/global', str(main_config.parent))
+        result = subprocess.run(['bash', '-c', command], capture_output=True, text=True, check=True)
+        assert content in result.stdout
+        for module in all_rule_files:
+            assert module.read_text() in result.stdout, module.name
 
     def test_markdown_headers_valid(self, all_rule_files):
         """Check markdown headers are properly formatted."""

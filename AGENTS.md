@@ -83,13 +83,15 @@ This configuration is organized into focused modules. Each module contains speci
 - [`rules/ci-cd.md`](rules/ci-cd.md) - GitHub Actions, monitoring, verification
 - [`rules/dependencies.md`](rules/dependencies.md) - Lock files, package management
 
-### 🎯 Quick Access Commands
-Use these focused commands:
-- `rgr` - Read all global rules
-- `rgr-git` - Read only git rules
-- `rgr-test` - Read only testing rules
-- `rgr-security` - Read only security rules
-- `rgr-code` - Read only code quality rules
+### 🎯 Reading Rules
+Read the installed rule files with your file-reading tool or these commands:
+
+- `cat /Agents/global/rules/git.md` - Git rules
+- `cat /Agents/global/rules/testing.md` - Testing rules
+- `cat /Agents/global/rules/security.md` - Security rules
+- `cat /Agents/global/rules/code-quality.md` - Code quality rules
+
+To read all global rules, run `cat /Agents/global/AGENTS.md /Agents/global/rules/*.md`.
 
 ### 🔒 Gate Commands (MANDATORY)
 - `gate-check` - Run all checks without committing
@@ -123,7 +125,7 @@ Use these focused commands:
 ## 🛑 CONTEXT SWITCH GATE
 **When switching between tasks, STOP and:**
 - [ ] Summarize what was just completed
-- [ ] Run rgr-[relevant module] for new task (e.g., rgr-git, rgr-test)
+- [ ] Read the relevant file under `/Agents/global/rules/` for the new task
 - [ ] State the new objective clearly
 - [ ] List specific files/areas you'll be working with
 - [ ] STOP: Confirm understanding with user
@@ -132,7 +134,7 @@ Use these focused commands:
 ```
 Completed: Added test coverage for user authentication
 Switching to: Bug fix for login timeout
-Reading: rgr-git (for commit rules)
+Reading: /Agents/global/rules/git.md (for commit rules)
 Objective: Fix timeout issue in auth.py line 45
 Will modify: src/auth.py, tests/test_auth.py
 Is this correct?

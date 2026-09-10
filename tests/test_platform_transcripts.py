@@ -4228,3 +4228,36 @@ def test_the_worked_examples_output_is_a_conversation_on_the_messages_route(
         for tool in message["tools"]
     ]
     assert ("bash", "ok") in tools, tools
+
+
+@pytest.mark.parametrize('name', ['exec', 'functions.exec'])
+def test_codex_empty_wrapper_keeps_scrubbed_raw_details(name):
+    messages = transcripts.normalise_records([
+        {'type': 'response_item', 'payload': {
+            'type': 'custom_tool_call', 'name': name, 'call_id': 'wrapper',
+            'input': 'text("safe"); // Authorization: Bearer ' + 'a' * 64,
+        }},
+        {'type': 'response_item', 'payload': {
+            'type': 'custom_tool_call_output', 'call_id': 'wrapper',
+            'output': [{'type': 'input_text', 'text': 'Script completed\nWall time 0.1 seconds\nOutput:\n'}],
+        }},
+    ])
+    call = messages[0].tools[0]
+    assert call.wrapper and call.detail is None and call.status == 'ok'
+    assert 'safe' in call.raw_input and 'a' * 64 not in call.raw_input
+    assert call.to_dict()['raw_output'].startswith('Script completed')
+    assert call.command is None
+
+
+@pytest.mark.parametrize('output, status', [
+    ('Script completed\nWall time 0.1 seconds\nOutput:\nUseful test result', 'ok'),
+    ('Script failed\nReferenceError: missing name', 'failed'),
+])
+def test_codex_wrapper_meaningful_results_and_errors_stay_visible(output, status):
+    call = transcripts.normalise_records([
+        {'type': 'response_item', 'payload': {'type': 'custom_tool_call', 'name': 'exec', 'call_id': 'w', 'input': 'text(1)'}},
+        {'type': 'response_item', 'payload': {'type': 'custom_tool_call_output', 'call_id': 'w', 'output': output}},
+    ])[0].tools[0]
+    assert call.status == status and call.detail
+    assert call.raw_output == output
+    assert bool(call.error) == (status == 'failed')

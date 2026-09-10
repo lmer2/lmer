@@ -934,35 +934,18 @@ def _record_attempt(
 def send_input(
     session_id: str, data: str, *, append_newline: bool = False,
     sanitize: bool = False, preserve_slash_commands: bool = False,
+    delivery_id: Optional[str] = None,
 ) -> dict:
-    """Type *data* into a running session. Returns the control plane's answer.
+    """Send input and return its receipt; failures are surfaced without payload logs.
 
-    Loud by design: everything that can go wrong raises. This is the path an
-    operator uses to answer a session that stopped to ask a question, and an
-    answer that quietly went nowhere leaves them believing the session was
-    unblocked while it sits there waiting.
+    ``append_newline`` requests submission; otherwise input is raw terminal data.
+    Codex submits through its native adapter, with ``delivery_id`` correlating
+    retries. Legacy PTY delivery cannot confirm native submission. See
+    docs/CODEX-DELIVERY.md for receipt states and recovery.
 
-    *append_newline* defaults off, matching the control plane it forwards to — a
-    caller that means "and press Enter" says so. The payload itself is never
-    logged: an answer routinely contains whatever the operator was asked for.
-
-    *sanitize* says the payload is prose intended to steer the session, from
-    either the chat composer or ``lmer-ctl send``. That lets the supervisor
-    defuse shapes a TUI reads as a command rather than as text
-    (``lmer_cli.supervisor._sanitize_user_chat``). Off by default and only put
-    on the wire when set: raw terminal keystrokes and injected lifecycle
-    commands send exactly the body they sent before the flag existed.
-
-    *preserve_slash_commands* narrows that transformation for an orchestration
-    caller whose leading slash is intentional. It has no effect unless
-    *sanitize* is also set; the supervisor remains the owner of the harness's
-    escape set and leaves only slash commands out of the prose guard.
-
-    The reply carries ``submit_confirmed`` and a ``note`` when Enter was asked
-    for, and both are passed to the caller rather than dropped: the supervisor
-    writes the CR to the PTY and cannot see whether the TUI registered it as a
-    submit, and "loud by design" has to include the part that is uncertain. See
-    ``lmer_cli.supervisor._SUBMIT_UNCONFIRMED_NOTE``.
+    ``sanitize`` enables the supervisor's prose guard for PTY delivery;
+    ``preserve_slash_commands`` keeps intentional orchestration slash commands.
+    Neither flag transforms structured Codex prose.
     """
     if not isinstance(data, str):
         raise SessionIOError(
@@ -978,6 +961,8 @@ def send_input(
     payload_bytes = data.encode("utf-8")
     sent_sha256 = hashlib.sha256(payload_bytes).hexdigest()
     body = {"data": data, "append_newline": bool(append_newline)}
+    if delivery_id is not None:
+        body["delivery_id"] = delivery_id
     if sanitize:
         body["sanitize"] = True
         if preserve_slash_commands:
@@ -1030,6 +1015,13 @@ def send_input(
     if not reply.ok:
         raise ControlPlaneError(
             f"session {session_id} refused the input ({reply.detail})"
+        )
+    if reply.payload.get("transport") == "codex-app-server" and reply.payload.get("state") in ("rejected", "uncertain"):
+        raise ControlPlaneError(
+            f"session {session_id} Codex delivery is {reply.payload['state']}: "
+            f"{reply.payload.get('error') or reply.payload.get('note')}. "
+            "Original input is retained; do not retype an unconfirmed submission.",
+            delivered=reply.payload["state"] == "uncertain",
         )
     receipt_sha256 = reply.payload.get("payload_sha256")
     if receipt_sha256 is not None and receipt_sha256 != sent_sha256:

@@ -15,6 +15,11 @@ This will:
 
 ## Commands
 
+These optional host shortcuts are created by `hooks/install.sh`; container
+sessions do not install them. In a container, read the installed rule directly,
+for example `cat /Agents/global/rules/git.md`, or run
+`cat /Agents/global/AGENTS.md /Agents/global/rules/*.md` for all rules.
+
 ### Basic Commands
 
 - `rgr` - Read Global Rules with tracking

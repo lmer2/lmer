@@ -532,6 +532,7 @@ class SessionLog:
 class _InputBody(BaseModel):
     data: str
     append_newline: bool = False
+    delivery_id: Optional[str] = None
     #: "This is prose meant to steer the session", whether a human composed it
     #: in chat or an assistant sent it through ``lmer-ctl``. Everything else
     #: (which harness is running, what its TUI does with the text) is decided
@@ -1423,12 +1424,12 @@ def _relay_message(
     message: "_comms.Message",
     submit: Callable[[str], tuple[int, str]],
     harness: str,
+    codex_delivery=None,
 ) -> dict:
-    """Type one inbound record into the harness and describe what happened.
+    """Deliver an inbound record with its transport receipt.
 
-    Same receipt fields as ``/input`` (#197). A failed write is reported in the
-    result rather than raised: the record is already on the log, and the caller
-    decides what a session whose PTY is gone means.
+    Codex uses the durable record ID for native delivery; other runners use PTY
+    submission. See docs/CODEX-DELIVERY.md for confirmation and recovery.
     """
     text, tagged = _comms.relay_payload(message, log.question_of(message))
     if not tagged:
@@ -1439,6 +1440,8 @@ def _relay_message(
         "payload_length": len(payload),
         "tagged": tagged,
     }
+    if codex_delivery is not None:
+        return {**receipt, **codex_delivery.deliver(text, client_id=message.id)}
     try:
         written, verdict = submit(text)
     except OSError as exc:
@@ -1447,15 +1450,16 @@ def _relay_message(
 
 
 class _InboundRelay:
-    """Queue typing independently of bus acceptance across startup (§4).
+    """Queue delivery independently of bus acceptance across startup (§4).
 
     Callers hold ``lock`` through append and enqueue, then flush outside it.
     """
 
-    def __init__(self, log, submit, harness, *, startup_pending=False):
+    def __init__(self, log, submit, harness, *, startup_pending=False, codex_delivery=None):
         self.log = log
         self.submit = submit
         self.harness = harness
+        self.codex_delivery = codex_delivery
         self.lock = threading.RLock()
         self._submit_lock = threading.Lock()
         self._pending: list[tuple[_comms.Message, dict]] = []
@@ -1478,7 +1482,9 @@ class _InboundRelay:
                         return
                     self._pending.sort(key=lambda item: item[0].seq)
                     message, receipt = self._pending.pop(0)
-                delivered = _relay_message(self.log, message, self.submit, self.harness)
+                delivered = _relay_message(
+                    self.log, message, self.submit, self.harness, self.codex_delivery,
+                )
                 with self.lock:
                     receipt.clear()
                     receipt.update(delivered)
@@ -1505,6 +1511,7 @@ def _build_fastapi_app(
     inbound_relay: Optional[_InboundRelay] = None,
     terminal_mirror=None,
     launch_settings: Optional[dict] = None,
+    codex_delivery=None,
 ):
     """Construct the FastAPI app exposing ``/input``, ``/output``, ``/resize``
     and, when a :class:`lmer_cli.comms.MessageLog` is supplied, the session
@@ -1570,7 +1577,9 @@ def _build_fastapi_app(
         )
 
     submit_payload = submit if submit is not None else _unlocked_submit
-    relay_inbound = inbound_relay or _InboundRelay(comms, submit_payload, _active_harness_name())
+    relay_inbound = inbound_relay or _InboundRelay(
+        comms, submit_payload, _active_harness_name(), codex_delivery=codex_delivery,
+    )
 
     def _check_auth(authorization) -> str:
         """Identify the session credential or the externally held control credential."""
@@ -1592,71 +1601,41 @@ def _build_fastapi_app(
     def post_input(body: _InputBody, authorization: Optional[str] = Header(default=None)):
         caller = _check_auth(authorization)
         payload = body.data
-        # The delivery receipt (#197): what this process was asked to type,
-        # as the caller can independently recompute it. A write accepted here
-        # but never submitted used to leave no trace anywhere; the hash and
-        # length let the sender prove after the fact WHAT was handed to the
-        # PTY without the payload's content ever entering a log.
+        # Hash the original wire payload before transport-specific transforms.
         payload_bytes = payload.encode("utf-8")
         receipt = {
             "payload_sha256": hashlib.sha256(payload_bytes).hexdigest(),
             "payload_length": len(payload_bytes),
         }
-        # After the receipt, deliberately: the receipt exists to prove the wire
-        # was clean, and the sender checks it against the hash of what IT sent
-        # (``session_io.send_input``, which refuses a mismatch loudly). Hashing
-        # the transformed text would turn every sanitized message into that
-        # alarm. What this line does is not corruption in transit — it is what
-        # the caller asked for by setting the flag.
-        if body.sanitize:
+        if body.sanitize and not (codex_delivery is not None and body.append_newline):
             payload = _sanitize_user_chat(
                 payload,
                 _active_harness_name(),
                 preserve_slash_commands=body.preserve_slash_commands,
             )
             payload_bytes = payload.encode("utf-8")
-        # Append CR (\r), not LF (\n): claude's TUI runs in raw mode where
-        # the Enter key arrives as \r. \n would be inserted as a literal
-        # newline in the input box and never submit. The field is named
-        # ``append_newline`` for backwards-compatible API shape but the
-        # behavior is "press Enter after the text".
+        # Raw terminal input stays separate from submitted prose.
         if not body.append_newline:
             if on_raw_input is not None and caller == CALLER_CONTROL:
                 on_raw_input(payload_bytes, body.author)
             written = write_input(payload_bytes)
             return {"bytes_written": written, **receipt}
 
-        # A whole submitted command can use lmer's portable spelling even when
-        # the harness namespaces custom commands.  Deliberately after the raw
-        # keystroke return above: translating one byte at a time is impossible,
-        # and the direct terminal documents Codex's native spelling instead.
+        # Rewrite portable commands only after the raw-keystroke return.
         payload = _rewrite_harness_command(payload, _active_harness_name())
+        if codex_delivery is not None:
+            try:
+                return {**codex_delivery.deliver(payload, client_id=body.delivery_id), **receipt}
+            except OSError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-        # Type it and submit it, ONCE — and with the Enter as a write of its own,
-        # because a CR glued to the text is read as part of a paste and inserted
-        # as a newline instead of submitting (#210; :func:`_submit_payload` has
-        # the mechanism and the measurements).
-        #
-        # Still exactly one Enter, and still no follow-up "nudge" CRs — see
-        # :data:`_SUBMIT_UNCONFIRMED_NOTE` for the whole of why, in short: a bare
-        # CR is a no-op only against an empty input box with no dialog on screen,
-        # and this handler cannot see the screen. The auto-start path nudges
-        # because it waits for an observed readiness marker first and runs before
-        # the session can raise a permission prompt at all; this one runs
-        # mid-session, which is exactly when one is up.
+        # Legacy PTY submission sends one separate CR, with no follow-up nudges.
         written, submit_text = submit_payload(payload)
-        # Said in the reply rather than assumed away: the CR went to the PTY, and
-        # whether the TUI registered it as a submit is not something this process
-        # observes. A caller that wants certainty has the terminal view.
         return {
             "bytes_written": written,
             "submit_confirmed": False,
             "note": _SUBMIT_UNCONFIRMED_NOTE,
-            # The one half of the delivery this process can see, and the half that
-            # explains a message left in the box: with the text observed read, the
-            # Enter behind it cannot have been swallowed by the paste this bug is
-            # about. Three values rather than a flag, so "not observed" is read as
-            # neither a failure nor a clean delivery — see :data:`SUBMIT_TEXT_READ`.
+            # PTY readback observes text consumption, not native submission.
             "submit_text": submit_text,
             **receipt,
         }
@@ -1979,6 +1958,7 @@ def _build_fastapi_app(
             "comms": bus_health,
             # So "nobody can do this" is an answer rather than a timeout (#414).
             "threads": thread_queue.health(),
+            **({"codex_delivery": codex_delivery.snapshot()} if codex_delivery is not None else {}),
             **_activity_report(output.idle_seconds),
         }
 
@@ -2695,13 +2675,24 @@ def _comms_ask_dir_env() -> str:
     return ASK_DIR_ENV
 
 
-def run_supervisor(
+def run_supervisor(cmd, options, *, stdin_fd=None, stdout_fd=None, write_lock=None):
+    kwargs = dict(stdin_fd=stdin_fd, stdout_fd=stdout_fd, write_lock=write_lock)
+    if _active_harness_name() != "codex":
+        return _run_supervisor(cmd, options, **kwargs)
+    from .codex_delivery import CodexDelivery
+
+    with CodexDelivery(cmd) as delivery:
+        return _run_supervisor(cmd, options, codex_delivery=delivery, **kwargs)
+
+
+def _run_supervisor(
     cmd: list[str],
     options: dict,
     *,
     stdin_fd: Optional[int] = None,
     stdout_fd: Optional[int] = None,
     write_lock: Optional["threading.Lock"] = None,
+    codex_delivery=None,
 ) -> int:
     """Run the supervisor loop.
 
@@ -2752,6 +2743,8 @@ def run_supervisor(
     # SIGUSR1 to ask for a graceful self-shutdown. Set after fork it would not
     # reach the already-frozen child env.
     os.environ[SUPERVISOR_PID_ENV] = str(os.getpid())
+    if codex_delivery is not None:
+        cmd = codex_delivery.start()
 
     # Before the fork, so the file exists from the earliest moment this session
     # could have produced a byte. A reader that finds it treats it as the log of
@@ -2761,6 +2754,14 @@ def run_supervisor(
     # streams.
     session_log = SessionLog.open_if_mounted()
     comms_log = _open_comms_log()
+    if codex_delivery is not None:
+        def report_codex_delivery(text):
+            logging.getLogger(__name__).warning("%s", text)
+            comms_log.append(
+                kind=_comms.KIND_NOTE, text=text,
+                source=_comms.Source(_comms.CHANNEL_PLATFORM),
+            )
+        codex_delivery.notify = report_codex_delivery
     ask_projection = _open_ask_projection(comms_log)
 
     master_fd, slave_fd = os.openpty()
@@ -2854,10 +2855,13 @@ def run_supervisor(
 
     inbound_relay = _InboundRelay(
         comms_log, submit_to_child, harness_name,
+        codex_delivery=codex_delivery,
         startup_pending=(
             not options["manual_start"] and bool(options.get("start_command", DEFAULT_START_COMMAND))
         ),
     )
+    if codex_delivery is not None:
+        codex_delivery.start_monitor()
 
     from .terminal_mirror import TerminalMirror, TranscriptReader
 
@@ -2933,6 +2937,7 @@ def run_supervisor(
             resize=set_child_winsize,
             get_winsize=get_child_winsize,
             submit=submit_to_child,
+            codex_delivery=codex_delivery,
             comms=comms_log,
             on_raw_input=on_raw_input,
             agent_token=agent_token,
@@ -2967,10 +2972,15 @@ def run_supervisor(
     auto_start_thread: Optional[threading.Thread] = None
     auto_start_cancel = threading.Event()
     if not options["manual_start"]:
-        auto_start_thread = _start_auto_start_thread(
-            output, write_to_child, options, auto_start_cancel,
-            submit_start=submit_to_child, on_started=inbound_relay.startup_submitted,
-        )
+        if codex_delivery is not None:
+            auto_start_thread = codex_delivery.auto_start(
+                options, auto_start_cancel, inbound_relay.startup_submitted,
+            )
+        else:
+            auto_start_thread = _start_auto_start_thread(
+                output, write_to_child, options, auto_start_cancel,
+                submit_start=submit_to_child, on_started=inbound_relay.startup_submitted,
+            )
 
     def _apply_host_winsize_to_master() -> None:
         size = _get_winsize(stdin_fd)
@@ -3149,6 +3159,10 @@ def run_supervisor(
             child_exited.set()
         if auto_start_thread is not None:
             auto_start_cancel.set()
+        if codex_delivery is not None:
+            if auto_start_thread is not None:
+                auto_start_thread.join(timeout=4.0)
+            codex_delivery.close()
         if winsize_recheck_timer is not None:
             winsize_recheck_timer.cancel()
         if shutdown_handoff is not None:
