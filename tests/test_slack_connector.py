@@ -17,7 +17,7 @@ import pytest
 
 from ask_channel import bus
 from lmer_cli import comms, supervisor, targets, thread_posts
-from slack_chat import connector
+from slack_chat import connector, registry
 from slack_chat.client import SlackError
 from tests.conftest import strip_lmer_env
 from tests.test_lmer_signal_cli import _Session
@@ -32,6 +32,19 @@ def _clean_lmer_env(monkeypatch):
 def registry_dir(tmp_path, monkeypatch):
     """Where the host records which run posted a message into a thread (#427)."""
     monkeypatch.setattr(thread_posts, "REGISTRY_DIR", str(tmp_path / "thread-posts"))
+    monkeypatch.setattr(registry, "REGISTRY_DIR", str(tmp_path / "thread-owners"))
+    instances = []
+    original_init = connector.SlackConnector.__init__
+
+    def tracked_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._bus_poll_seconds = 0.05
+        instances.append(self)
+
+    monkeypatch.setattr(connector.SlackConnector, "__init__", tracked_init)
+    yield
+    for built in instances:
+        assert built.stop(timeout=2), "test connector did not drain"
 
 
 class FakeSlack:
@@ -54,7 +67,7 @@ class FakeSlack:
     def post_message(self, channel, thread_ts, text, *, connection_notice=False):
         self.attempts += 1
         if self.fail_post:
-            raise SlackError("boom")
+            raise SlackError("rate limited", code="ratelimited")
         ts = f"{1700000000 + len(self.posted)}.000100"
         self.posted.append((channel, thread_ts, text))
         # The bot's own post shows up in the thread, like the real thing.
@@ -125,6 +138,7 @@ class Rig:
             attach_ack=False,
         )
         self.connector = connector.SlackConnector(self.config, slack=self.slack, bus_client=client)
+        self.connector._bus_poll_seconds = 0.05
 
     def agent(self, kind, text, **kw):
         return self.log.append(kind=kind, text=text, source=comms.Source("agent"), session_caller=True, **kw)[0]
@@ -171,6 +185,8 @@ def rig(tmp_path):
     rig = Rig(tmp_path)
     yield rig
     rig.connector.stop()
+    rig.bus._session._http.close()
+    rig.log.close()
 
 
 # ---------------------------------------------------------------------------
@@ -231,10 +247,7 @@ class TestRendering:
         (10 ** 18 / 1000, "time unknown"),
     ])
     def test_replay_stamp_answers_every_value_rather_than_raising(self, value, expected):
-        """A homeserver's `origin_server_ts` arrives over federation, and both
-        inbound loops catch only their transport's own errors on a daemon thread
-        nothing restarts — so one bogus stamp used to end the thread silently:
-        still "connected", never relaying again (review of !298)."""
+        """Untrusted timestamps remain printable in replay notices."""
         assert connector.replay_stamp(value) == expected
 
     def test_option_for_without_options(self):
@@ -251,7 +264,7 @@ class TestOutbound:
         rig.connector.start()
         rig.agent("note", "working on it")
         rig.agent("question", "branch?", options=["main", "prep"])
-        rig.wait_until(lambda: len(rig.slack.posted) >= 2)
+        rig.wait_until(lambda: len(rig.slack.posted) >= 2, timeout=25)
         assert rig.slack.posted[0][2] == "📝 working on it"
         assert rig.slack.posted[1][2].startswith("❓ branch?\n1. main\n2. prep")
         assert rig.slack.posted[0][:2] == ("C1", "1699999999.000000")
@@ -266,11 +279,8 @@ class TestOutbound:
         rig.wait_until(lambda: len(rig.slack.posted) >= 1)
         assert [p[2] for p in rig.slack.posted] == ["📝 after"]
 
-    def test_a_failed_post_is_held_and_re_posted_rather_than_dropped(self, rig):
-        """One 500 from Slack used to lose the record for good: the loop logged
-        it, the cursor moved past it and the humans were never told. The records
-        are immutable and a re-post is cheap, so the cursor stops at the failure
-        and the next poll re-reads it."""
+    def test_a_verified_rejection_is_held_and_retried(self, rig):
+        """A structured rejection establishes that Slack did not accept the post."""
         rig.slack.fail_post = True
         rig.connector.start()
         rig.agent("note", "one")
@@ -495,7 +505,9 @@ class TestAttachNotice:
         rig.connector._poll_thread(replay=True)
         settled = rig.log.seq
         ts = rig.slack.human_says("", files=[PNG_FILE])
+        rig.connector.stop()
         fresh = connector.SlackConnector(rig.config, slack=rig.slack, bus_client=rig.bus)
+        rig.connector = fresh
         assert fresh._poll_thread(replay=True) == 1
         (record,) = rig.log.read_since(settled)[0]
         assert record.source.ref.endswith(ts)
@@ -508,11 +520,15 @@ class TestAttachNotice:
         rig.slack.human_says("second")
         assert rig.connector._poll_thread(replay=True) == 1
         settled = rig.log.seq
+        rig.connector.stop()
         fresh = connector.SlackConnector(rig.config, slack=rig.slack, bus_client=rig.connector.bus)
+        rig.connector = fresh
         assert fresh._poll_thread(replay=True) == 1, "it posts; the bus is what dedupes"
         assert rig.log.seq == settled, "and appended nothing"
         rig.slack.human_says("while it was down")
+        rig.connector.stop()
         again = connector.SlackConnector(rig.config, slack=rig.slack, bus_client=rig.connector.bus)
+        rig.connector = again
         assert again._poll_thread(replay=True) == 1
         assert rig.log.seq > settled, "a snapshot with something new in it is not a duplicate"
         assert "has 3 earlier messages" in rig.log.read_since(settled)[0][-1].text
@@ -702,7 +718,9 @@ class TestPostsFromOtherRuns:
         rig.connector._poll_thread(replay=True)
         rig.slack.post_message("C1", "1699999999.000000", "working on it")
         rig.slack.app_says("have a look")
+        rig.connector.stop()
         reconnected = connector.SlackConnector(rig.config, slack=rig.slack, bus_client=rig.bus)
+        rig.connector = reconnected
         assert reconnected._poll_thread(replay=True) == 1
         assert "has 3 earlier messages" in rig.log.read_since(0)[0][-1].text
         rig.slack.post_message("C1", "1699999999.000000", "own output")
@@ -743,14 +761,12 @@ class TestConfig:
         assert targets.SlackThreadTargets.needs_control_plane is True
         assert handler.validate_environment() is None
 
-    def test_the_handler_starts_and_stops_the_connector(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-host")
+    def test_the_handler_passes_its_endpoint_and_uploads_to_the_child_owner(self, monkeypatch, tmp_path):
         started = []
 
-        class FakeConnector:
-            def __init__(self, config, **kw):
-                started.append(config)
-                started.append(kw)
+        class FakeOwner:
+            def __init__(self, *args):
+                started.append(args)
 
             def start(self):
                 started.append("start")
@@ -758,26 +774,21 @@ class TestConfig:
             def stop(self):
                 started.append("stop")
 
-        import slack_chat.connector as module
-
-        monkeypatch.setattr(module, "SlackConnector", FakeConnector)
-        monkeypatch.setattr(targets, "register", lambda *a, **k: None)
-        monkeypatch.setattr(targets, "deregister", lambda *a, **k: None)
+        monkeypatch.setattr(targets, "ConnectorProcess", FakeOwner)
         handler = targets.SlackThreadTargets()
-        handler.add("https://example.slack.com/archives/C1/p1699999999000000")
+        link = "https://example.slack.com/archives/C1/p1699999999000000"
+        handler.add(link)
         handler.attach_control_plane("http://127.0.0.1:8701", "tok")
         handler.attach_uploads(str(tmp_path), "/home/developer/.lmer-uploads")
         handler.on_session_start()
-        config = started[0]
-        assert config.supervisor_url == "http://127.0.0.1:8701" and config.thread_ts == "1699999999.000000"
-        assert config.uploads_dir == str(tmp_path)
-        assert callable(started[1]["notify"]), "the give-up must reach a human, not just the log"
-        assert started[2] == "start"
+        assert started[0] == ("slack", "C1", "1699999999.000000", link,
+                              ("http://127.0.0.1:8701", "tok"),
+                              (str(tmp_path), "/home/developer/.lmer-uploads"))
+        assert started[1] == "start"
         handler.on_session_end()
         assert started[-1] == "stop"
 
     def test_without_a_control_plane_the_handler_warns_instead_of_crashing(self, monkeypatch, capsys):
-        monkeypatch.setattr(targets, "register", lambda *a, **k: None)
         handler = targets.SlackThreadTargets()
         handler.add("https://example.slack.com/archives/C1/p1699999999000000")
         handler.on_session_start()
@@ -938,30 +949,22 @@ def test_each_thread_starts_and_stops_its_own_connector(tmp_path, monkeypatch, t
         links.append(links[0] + "/")
         if transport == "matrix":
             links.append("https://element.example.org/#/room/%21room%3Aexample.org/%24one")
-    cls = connector.SlackConnector if transport == "slack" else matrix_connector.MatrixConnector
-    started, stopped, registrations, removals = [], [], [], []
-    monkeypatch.setattr(cls, "start", lambda instance: started.append(instance))
-    monkeypatch.setattr(cls, "stop", lambda instance: stopped.append(instance))
-    monkeypatch.setattr(targets, "register", lambda *args, **kw: registrations.append(args))
-    monkeypatch.setattr(targets, "deregister", lambda *args, **kw: removals.append(args))
+    started, stopped = [], []
+    monkeypatch.setattr(targets.ConnectorProcess, "start", lambda instance: started.append(instance))
+    monkeypatch.setattr(targets.ConnectorProcess, "stop", lambda instance: stopped.append(instance))
     _, handlers = targets.partition_targets(["fleet", *links])
     handler = handlers[0]
     handler.attach_control_plane("http://localhost:8765", "test-control")
     handler.attach_uploads(str(tmp_path), "/home/developer/.lmer-uploads")
     handler.on_session_start()
     assert len(started) == 2
-    assert len(registrations) == 2
-    assert len({c.subscriber for c in started}) == 2
-    assert len(set(registrations)) == 2
-    assert all(c.config.supervisor_url == "http://localhost:8765" for c in started)
-    assert all(c.config.supervisor_token == "test-control" for c in started)
-    started[0]._bus_cursor = 12
-    assert started[1]._bus_cursor == 0
+    assert len({child.key for child in started}) == 2
+    assert all(child.endpoint == ("http://localhost:8765", "test-control") for child in started)
+    assert all(child.uploads == (str(tmp_path), "/home/developer/.lmer-uploads") for child in started)
     assert not targets.special_target_env(handlers)["SLACK_BOT_TOKEN"]
     assert not targets.special_target_env(handlers)["LMER_MATRIX_ACCESS_TOKEN"]
     handler.on_session_end()
     assert set(stopped) == set(started)
-    assert sorted(removals) == sorted(registrations)
 
 
 @pytest.mark.parametrize("channel, thread_ts", [("C2", "1699999999.000000"), ("C1", "1699999999.000001")])

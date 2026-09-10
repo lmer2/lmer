@@ -1,27 +1,6 @@
-"""The matrix connector: one thread mirrored onto one session's bus (issue #407).
+"""Matrix thread transport for the shared connector lifecycle.
 
-The mirror of :mod:`slack_chat.connector`, over the client-server API as a
-bot account:
-
-- **outbound** — long-polls the supervisor's ``GET /messages`` and posts every
-  record that did not come from matrix into the thread (an ``m.thread``
-  relation on the root event), rendered for a human, then acks its position;
-- **inbound** — ``/sync`` with a filter on the one room, taking the thread's
-  replies from anyone but the bot and posting each onto the bus as
-  ``source {channel: matrix, author: <mxid>, ref: <event_id>}`` — an
-  ``answer`` to the oldest open question when the session has one (a reply
-  that is exactly an option's number or text is that option), else a
-  ``message``. Media events are downloaded into the session's upload store
-  when one is mounted and the record names them.
-
-Hosted on a thread in the ``lmer`` process for a matrix-thread target
-(:class:`lmer_cli.targets.MatrixThreadTargets`); runnable standalone as
-``lmer-matrix-connector``. The account's access token stays in the process
-that runs it.
-
-An encrypted room is refused at connect time with its own name: this
-connector reads and writes plaintext events only. Encryption for it is the
-follow-up :mod:`matrix_chat` names.
+See docs/COMMS.md and docs/CONNECTOR-RECOVERY.md for delivery and recovery.
 """
 from __future__ import annotations
 
@@ -40,6 +19,9 @@ from typing import Callable, Optional
 
 from ask_channel import bus
 from lmer_cli import thread_posts
+from lmer_cli.connector_delivery import RecoveryRequired
+from lmer_cli.connector_lifecycle import ConnectorLifecycle
+from lmer_cli.connector_ownership import ThreadKey
 from lmer_cli.util import get_bool_env
 from matrix_bridge.scrub import scrub_bytes, scrub_text
 from slack_chat.connector import (
@@ -204,7 +186,11 @@ def resolve_thread_root(event: dict) -> str:
     return str(event.get("event_id") or "")
 
 
-class MatrixConnector:
+class MatrixConnector(ConnectorLifecycle):
+    _transport_fields = ("_seen", "_next_batch", "_last_event_id", "_question_events")
+    _detach_note = DETACH_NOTE
+    _bus_poll_seconds = BUS_POLL_SECONDS
+
     def __init__(
         self,
         config: ConnectorConfig,
@@ -248,6 +234,7 @@ class MatrixConnector:
             ),
         )
         self.failures = 0
+        self._init_lifecycle()
 
     @property
     def matrix(self) -> MatrixClient:
@@ -265,60 +252,23 @@ class MatrixConnector:
 
     # -- lifecycle -------------------------------------------------------------
 
-    def connect(self) -> str:
-        """Resolve and join the room; refuse an encrypted one. Returns the room id."""
+    def connect(self):
         room_id = self.matrix.resolve_room(self.config.room)
+        self._acquire(ThreadKey(CHANNEL, room_id, self.config.thread_event))
         try:
-            self.matrix.join(room_id)
-        except MatrixError as exc:
-            logger.info("matrix_connector_join_skipped room=%s error=%s", room_id, exc)
-        if self.matrix.room_is_encrypted(room_id):
-            raise MatrixError(
-                f"room {room_id} is end-to-end encrypted, and the matrix chat connector "
-                "reads and writes plaintext events only — use an unencrypted room for "
-                "lmer threads (encryption for this connector is a follow-up)"
-            )
+            try:
+                self.matrix.join(room_id)
+            except MatrixError as exc:
+                logger.info("matrix_connector_join_skipped room=%s error=%s", room_id, exc)
+            if self.matrix.room_is_encrypted(room_id):
+                raise MatrixError(f"room {room_id} is end-to-end encrypted; this connector requires a plaintext room")
+        except BaseException:
+            self._lease.close()
+            self._lease = self._state = None
+            raise
         self.room_id = room_id
         return room_id
 
-    def start(self) -> None:
-        """Join the room now; run the loops once the bus answers.
-
-        The room is resolved synchronously so an encrypted one is refused where
-        the caller can still say so. The *bus* is the part that is not up yet:
-        the host CLI starts this connector before it launches the container, and
-        both loops read :class:`bus.NoChannel` as "the session is over".
-        """
-        with self._threads_lock:
-            if self._threads:
-                return
-        if self.room_id is None:
-            self.connect()
-        thread = threading.Thread(
-            target=self._run_when_ready, name="lmer-matrix-connector-connect", daemon=True,
-        )
-        with self._threads_lock:
-            self._threads.append(thread)
-        thread.start()
-
-    def _run_when_ready(self) -> None:
-        if not self.bus.wait_ready(budget=self.config.connect_budget, stop=self._stop):
-            if not self._stop.is_set():
-                self._warn(
-                    f"the supervisor at {self.config.supervisor_url} never came up "
-                    f"within {self.config.connect_budget:.0f}s — this matrix thread "
-                    "will not hear the session"
-                )
-            return
-        self._seed_cursor()
-        self._announce_attached()
-        started = []
-        for name, target in (("outbound", self._outbound_loop), ("inbound", self._inbound_loop)):
-            thread = threading.Thread(target=target, name=f"lmer-matrix-connector-{name}", daemon=True)
-            thread.start()
-            started.append(thread)
-        with self._threads_lock:
-            self._threads.extend(started)
 
     def _warn(self, message: str) -> None:
         """Loud on both sides: the host `lmer` process configures no logging."""
@@ -335,110 +285,9 @@ class MatrixConnector:
             return None
         return session if isinstance(session, str) and session else None
 
-    def _seed_cursor(self) -> None:
-        """Where this attachment starts reading — the Slack connector's rule.
-
-        See :meth:`slack_chat.connector.SlackConnector._seed_cursor`: the
-        supervisor's own ``/healthz`` answers both "did I read this bus before"
-        and "where is it now", so a mid-life attach mirrors the conversation from
-        now on rather than the whole journal.
-        """
-        try:
-            health = self.bus.health()
-        except bus.BusError as exc:
-            logger.warning("matrix_connector_seed_failed error=%s", exc)
-            return
-        launch = health.get("launch")
-        self._launch_settings = launch if isinstance(launch, dict) else None
-        acked = (health.get("subscribers") or {}).get(self.subscriber)
-        if isinstance(acked, int) and not isinstance(acked, bool):
-            self._bus_cursor = acked
-            return
-        if self.config.attach_since is not None:
-            self._bus_cursor = self.config.attach_since
-            return
-        if not self.config.attach_from_now:
-            return
-        seq = health.get("seq")
-        if isinstance(seq, int) and not isinstance(seq, bool):
-            self._bus_cursor = seq
-
-    def _announce_attached(self) -> None:
-        """Say the session is listening — the Slack connector's rule and words."""
-        if not self.config.attach_ack or self._announced:
-            return
-        self._note(attachment_notice(self._launch_settings, slack_markup=False), connection_notice=True)
-        self._announced = True
-
-    def _announce_detached(self) -> None:
-        if not self._announced:
-            return
-        self._announced = False
-        self._note(DETACH_NOTE, connection_notice=True)
-
-    def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        self._announce_detached()
-        if self._bus is not None:
-            with contextlib.suppress(Exception):
-                self._bus.ack(self.subscriber, self._bus_cursor, final=True)
-        for _ in range(2):  # the connect thread may append the loops as we join
-            with self._threads_lock:
-                threads, self._threads = list(self._threads), []
-            for thread in threads:
-                thread.join(timeout=timeout)
-
-    def run_forever(self) -> None:
-        self.start()
-        try:
-            while not self._stop.is_set():
-                self._stop.wait(1.0)
-        finally:
-            self.stop()
-
-    def _backoff(self) -> None:
-        self.failures += 1
-        self._stop.wait(min(30.0, 0.5 * (2 ** min(self.failures, 6))))
 
     # -- outbound: bus → thread --------------------------------------------------
 
-    def _outbound_loop(self) -> None:
-        questions: dict = {}
-        while not self._stop.is_set():
-            try:
-                records, cursor = self.bus.messages(self._bus_cursor, timeout=BUS_POLL_SECONDS)
-            except bus.NoChannel as exc:
-                logger.info("matrix_connector_bus_gone reason=%s", exc)
-                # The session is over, and that is terminal for both loops — so
-                # end the *process*, not just this thread. It used to live on a
-                # thread of an `lmer` process that was itself exiting; as a
-                # detached process (issue #412) a connector whose loops have both
-                # given up would otherwise spin forever, and its live pid keeps
-                # the thread claimed against every future session.
-                self._stop.set()
-                break
-            except bus.BusError as exc:
-                logger.warning("matrix_connector_bus_error error=%s", exc)
-                self._backoff()
-                continue
-            self.failures = 0
-            delivered = self._bus_cursor
-            for record in records:
-                if record.get("kind") == "question":
-                    questions[record.get("id")] = record
-                if not self._post_outbound(record, questions):
-                    # Held, not skipped: the next poll re-reads this record.
-                    self._backoff()
-                    break
-                delivered = max(delivered, int(record.get("seq") or delivered))
-            else:
-                delivered = max(delivered, cursor)
-            if delivered > self._bus_cursor:
-                self._bus_cursor = delivered
-                try:
-                    self.bus.ack(self.subscriber, delivered)
-                except bus.BusError:
-                    pass
 
     def _mirror_content(self) -> dict:
         """Identify our own echoes and attribute live posts for other runs."""
@@ -446,66 +295,84 @@ class MatrixConnector:
             thread_posts.Poster.for_session(self._posters.session)
         )
 
-    def _post_outbound(self, record: dict, questions: dict) -> bool:
-        """Put one record in the thread. ``False`` means it did not land and the
-        caller must not move past it."""
+    def _post_outbound(self, record, questions):
+        self._ensure_ready()
         text = render_outbound(record, questions)
         if text is None:
             return True
-        try:
-            event_id = self.matrix.send_thread_text(
-                self.room_id, self.config.thread_event, text,
-                last_event_id=self._last_event_id, extra=self._mirror_content(),
-            )
-            self._seen.add(event_id)
-            self._posters.wrote(event_id)
-            self._last_event_id = event_id
+        def remember(receipt):
+            self._seen.add(receipt)
+            self._posters.wrote(receipt)
+            self._last_event_id = receipt
             if record.get("kind") == "question" and record.get("id"):
-                # Which event a human replies *to* when they mean to answer.
-                self._question_events[record["id"]] = event_id
-        except MatrixError as exc:
-            logger.warning(
-                "matrix_connector_post_failed seq=%s error=%s — holding the cursor",
-                record.get("seq"), exc,
-            )
-            return False
-        for item in record.get("attachments") or []:
+                self._question_events[record["id"]] = receipt
+        self._deliver_part(record, "text", {"text": text},
+                           lambda: self.matrix.send_thread_text(
+                               self.room_id, self.config.thread_event, text,
+                               last_event_id=self._last_event_id, extra=self._mirror_content()), remember)
+        for index, item in enumerate(record.get("attachments") or []):
             if isinstance(item, dict):
-                self._post_attachment(item)
+                self._post_attachment(item, record=record, index=index)
         return True
 
-    def _post_attachment(self, item: dict) -> None:
-        """Upload one of the agent's attachments into the thread — only under the
-        operator's authenticated-media assertion, and only bytes the scrub passes."""
+    def _post_attachment(self, item, *, record=None, index=0):
+        self._ensure_ready()
+        source = record if record is not None else {"attachment": item}
+        part = f"file:{index}"
         name = str(item.get("name") or "file")
-        if not self.config.authenticated_media:
-            self._note(f"📎 {name} withheld: set {AUTHENTICATED_MEDIA_ENV}=1 once the homeserver requires authentication for media")
-            return
-        try:
-            data = self._attachment_bytes(item)
-        except Exception as exc:
-            self._note(f"📎 {name} withheld: it is not a readable file in this session's upload store")
-            logger.info("matrix_connector_attachment_unreadable name=%s error=%s", name, exc)
-            return
-        media_type = str(item.get("media_type") or "application/octet-stream")
-        scrubbed = scrub_bytes(data, media_type)
-        if scrubbed.refused:
-            self._note(f"📎 {name} withheld: it carries something that looks like a credential")
-            return
-        clean = scrubbed.data
-        try:
-            mxc = self.matrix.upload(clean, content_type=media_type, filename=name)
-            event_id = self.matrix.send_thread_file(
-                self.room_id, self.config.thread_event, mxc=mxc, name=name,
-                media_type=media_type, size=len(clean), last_event_id=self._last_event_id,
-            )
-            self._seen.add(event_id)
-            self._last_event_id = event_id
-        except MatrixError as exc:
-            # A fixed phrase, not the exception: this line is posted into a
-            # thread, and a homeserver's error carries URLs and paths with it.
-            logger.warning("matrix_connector_attachment_upload_failed name=%s error=%s", name, exc)
-            self._note(f"📎 {name} withheld: the homeserver would not take it")
+        def remember(receipt):
+            self._seen.add(receipt)
+            self._posters.wrote(receipt)
+            self._last_event_id = receipt
+        with self._state.outbound:
+            pending = self._state.begin(source)
+            existing = pending["parts"].get(part)
+            if existing:
+                payload = existing["payload"]
+            else:
+                note = None
+                media_type = str(item.get("media_type") or "application/octet-stream")
+                if not self.config.authenticated_media:
+                    note = f"📎 {name} withheld: set {AUTHENTICATED_MEDIA_ENV}=1 once the homeserver requires authentication for media"
+                else:
+                    try:
+                        data = self._attachment_bytes(item)
+                    except Exception:
+                        note = f"📎 {name} withheld: it is not a readable file in this session's upload store"
+                    else:
+                        scrubbed = scrub_bytes(data, media_type)
+                        if scrubbed.refused:
+                            note = f"📎 {name} withheld: it carries something that looks like a credential"
+                        else:
+                            clean = scrubbed.data
+                if note is not None:
+                    payload = {"text": note, "index": index}
+                else:
+                    identity = {"index": index, "name": name, "sha256": hashlib.sha256(clean).hexdigest(),
+                                "size": len(clean), "media_type": media_type}
+                    with self._state.lock:
+                        upload = pending.setdefault("uploads", {}).get(part)
+                        if upload and upload["identity"] != identity:
+                            raise RecoveryRequired("pending attachment bytes changed")
+                    if upload is None:
+                        mxc = self.matrix.upload(clean, content_type=media_type, filename=name)
+                        upload = {"identity": identity, "mxc": mxc}
+                        with self._state.lock:
+                            pending["uploads"][part] = upload
+                            self._state.save()
+                    payload = {**identity, "mxc": upload["mxc"]}
+            def send():
+                if "text" in payload:
+                    return self.matrix.send_thread_text(
+                        self.room_id, self.config.thread_event, payload["text"],
+                        last_event_id=self._last_event_id, msgtype="m.notice")
+                return self.matrix.send_thread_file(
+                    self.room_id, self.config.thread_event, mxc=payload["mxc"], name=payload["name"],
+                    media_type=payload["media_type"], size=payload["size"], last_event_id=self._last_event_id,
+                    extra=self._mirror_content())
+            self._deliver_part(source, part, payload, send, remember)
+            if record is None:
+                self._state.finish(lambda: None)
 
     def _attachment_bytes(self, item: dict) -> bytes:
         """The bytes of one of the agent's attachments, read the way the host
@@ -517,15 +384,9 @@ class MatrixConnector:
             item, UploadStore.of(self.config.uploads_dir, self.config.container_uploads_dir)
         )
 
-    def _note(self, text: str, *, connection_notice: bool = False) -> None:
-        try:
-            event_id = self.matrix.send_thread_text(
-                self.room_id, self.config.thread_event, text, last_event_id=self._last_event_id, msgtype="m.notice",
-                extra={"net.20c.lmer.connection": True} if connection_notice else None,
-            )
-            self._seen.add(event_id)
-        except MatrixError as exc:
-            logger.warning("matrix_connector_note_failed error=%s", exc)
+    def _note(self, text, *, connection_notice=False):
+        self._ensure_ready()
+        self._notice(text, "note")
 
     # -- inbound: thread → bus ---------------------------------------------------
 
@@ -542,31 +403,8 @@ class MatrixConnector:
             "account_data": {"types": []},
         }
 
-    def _inbound_loop(self) -> None:
-        replayed = False
-        while not self._stop.is_set():
-            try:
-                if not replayed:
-                    self.replay()
-                    replayed = True
-                self.sync_once()
-                self.failures = 0
-            except MatrixError as exc:
-                logger.warning("matrix_connector_sync_failed error=%s", exc)
-                self._backoff()
-            except bus.NoChannel as exc:
-                logger.info("matrix_connector_bus_gone reason=%s", exc)
-                # The session is over, and that is terminal for both loops — so
-                # end the *process*, not just this thread. It used to live on a
-                # thread of an `lmer` process that was itself exiting; as a
-                # detached process (issue #412) a connector whose loops have both
-                # given up would otherwise spin forever, and its live pid keeps
-                # the thread claimed against every future session.
-                self._stop.set()
-                break
-            except bus.BusError as exc:
-                logger.warning("matrix_connector_bus_error error=%s", exc)
-                self._backoff()
+    def _inbound_loop(self):
+        self._loop("inbound", self._inbound_once)
 
     @property
     def thread_label(self) -> str:
@@ -575,8 +413,7 @@ class MatrixConnector:
 
     def replay(self) -> int:
         """Announce the full thread snapshot and take the token for live events."""
-        if self.room_id is None:
-            self.connect()
+        self._ensure_ready()
         events = []
         try:
             events.append(self.matrix.get_event(self.room_id, self.config.thread_event))
@@ -600,40 +437,47 @@ class MatrixConnector:
         }
         ordered = sorted(snapshot.values(), key=lambda event: event.get("origin_server_ts", 0))
         posted = int(self._post_replay(ordered)) if ordered else 0
-        for event in events:
-            if isinstance(event.get("event_id"), str):
-                self._seen.add(event["event_id"])
-        self._next_batch = initial.get("next_batch")
+        with self._state.lock:
+            for event in events:
+                if isinstance(event.get("event_id"), str):
+                    self._seen.add(event["event_id"])
+            self._next_batch = initial.get("next_batch")
+            self._state.save()
         return posted
 
-    def sync_once(self) -> int:
+    def sync_once(self):
+        self._ensure_ready()
+        resumed = self._resume_pending_inbound()
         body = self.matrix.sync(since=self._next_batch, filter_body=self._room_filter(), timeout_ms=SYNC_TIMEOUT_MS)
         rooms = ((body.get("rooms") or {}).get("join") or {})
-        room = rooms.get(self.room_id) or {}
-        events = ((room.get("timeline") or {}).get("events") or [])
-        posted = 0
-        fresh: list = []
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            if event.get("type") == "m.room.encrypted":
-                logger.warning("matrix_connector_encrypted_event room=%s — cannot read it", self.room_id)
-                continue
-            if resolve_thread_root(event) != self.config.thread_event:
-                continue
-            fresh.append(event)
-        # Held first, as on the Slack side: a message held from an earlier poll
-        # predates these, and the order decides which one takes a question's
-        # first-free-text answer slot.
-        for event, poster in self._posters.due():
-            if self._post_inbound(event, poster):
-                posted += 1
-        for event in fresh:
-            relay, poster = self._inbound(event)
-            if relay and self._post_inbound(event, poster):
-                posted += 1
-        self._next_batch = body.get("next_batch") or self._next_batch
-        return posted
+        events = (((rooms.get(self.room_id) or {}).get("timeline") or {}).get("events") or [])
+        try:
+            with self._state.lock:
+                inbound = []
+                for event in events:
+                    if event.get("type") == "m.room.encrypted":
+                        logger.warning("matrix_connector_encrypted_event room=%s", self.room_id)
+                        continue
+                    if resolve_thread_root(event) != self.config.thread_event:
+                        continue
+                    relay, poster = self._inbound(event)
+                    if relay:
+                        inbound.append((event, poster))
+                ready = self._posters.due() + inbound
+                self._state.save()
+            posted = resumed
+            for event, poster in ready:
+                if self._post_inbound(event, poster):
+                    posted += 1
+                with self._state.lock:
+                    self._posters.ack(event)
+                    self._state.save()
+            with self._state.lock:
+                self._next_batch = body.get("next_batch") or self._next_batch
+                self._state.save()
+            return posted
+        finally:
+            self._posters.release()
 
     def _relayable(self, event: dict) -> bool:
         """Whether this is a message event this connector has not already had.
@@ -660,7 +504,9 @@ class MatrixConnector:
             count=len(events), oldest=stamp(events[0]), newest=stamp(events[-1]), ref=newest,
         )
         if posted:
-            self._last_event_id = newest
+            with self._state.lock:
+                self._last_event_id = newest
+                self._state.save()
         return posted
 
     def _inbound_body(self, event: dict) -> tuple:
@@ -694,43 +540,37 @@ class MatrixConnector:
         sender = event.get("sender")
         return sender if isinstance(sender, str) else None
 
-    def _post_inbound(self, event: dict, poster=None) -> bool:
-        event_id = str(event.get("event_id"))
-        content = event.get("content") if isinstance(event.get("content"), dict) else {}
-        body, attachments = self._inbound_body(event)
-        text = _with_references(body, attachments)
-        if not text:
-            return False
-        author = self._author(event, poster)
-        source = {"channel": CHANNEL, "author": author, "ref": event_id}
-        kind = "message"
-        in_reply_to = None
-        states = self.bus.questions()
-        related = next(
-            (state["question"] for state in states if self._replies_to(content, state["question"])),
-            None,
-        )
-        oldest = min(
-            (state["question"] for state in states if state["state"] == "open"),
-            key=lambda question: question["seq"], default=None,
-        )
-        question = related or oldest
-        if question is not None:
-            bound = answer_binding(
-                text, question, replies_to_question=related is not None,
-                first_since_question=self._first_since(question),
-            )
-            if bound is not None:
-                kind, in_reply_to, text = "answer", question["id"], bound
-        self.bus.post(
-            kind, text, source=source, in_reply_to=in_reply_to,
-            attachments=[{k: v for k, v in item.items() if k != "reference"} for item in attachments],
-        )
-        if question is not None:
-            self._answered_freely.add(question["id"])
-        self._seen.add(event_id)
-        self._last_event_id = event_id
-        return True
+    def _post_inbound(self, event, poster=None):
+        event_id = event.get("event_id")
+        def prepare():
+            content = event.get("content") if isinstance(event.get("content"), dict) else {}
+            body, attachments = self._inbound_body(event)
+            text = _with_references(body, attachments)
+            if not text:
+                return None
+            if not event_id:
+                raise ValueError("Matrix input has no event identity")
+            source = {"channel": CHANNEL, "author": self._author(event, poster), "ref": event_id}
+            kind, in_reply_to = "message", None
+            states = self.bus.questions()
+            related = next((state["question"] for state in states
+                            if self._replies_to(content, state["question"])), None)
+            oldest = min((state["question"] for state in states if state["state"] == "open"),
+                         key=lambda question: question["seq"], default=None)
+            question = related or oldest
+            if question is not None:
+                bound = answer_binding(text, question, replies_to_question=related is not None,
+                                       first_since_question=self._first_since(question))
+                if bound is not None:
+                    kind, in_reply_to, text = "answer", question["id"], bound
+            return {"question": question["id"] if question else None,
+                    "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
+                                "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
+        return bool(self._post_prepared(event_id, prepare, lambda: self._accept_inbound(event_id)))
+
+    def _accept_inbound(self, ref):
+        self._seen.add(ref)
+        self._last_event_id = ref
 
     def _replies_to(self, content: dict, question: dict) -> bool:
         """Whether this event is a matrix reply to the event this connector
@@ -787,6 +627,35 @@ class MatrixConnector:
             logger.info("matrix_connector_file_too_large name=%s bytes=over %s", name, MAX_FILE_BYTES)
             return None
         return stage_upload(store, name, data, str(info.get("mimetype") or media_type))
+
+    def _prepare(self):
+        if self.room_id is None:
+            self.connect()
+        else:
+            self._acquire(ThreadKey(CHANNEL, self.room_id, self.config.thread_event))
+
+    def _attachment_notice(self):
+        return attachment_notice(self._launch_settings, slack_markup=False)
+
+    def _send_notice(self, text):
+        return self.matrix.send_thread_text(self.room_id, self.config.thread_event, text,
+                                           last_event_id=self._last_event_id, msgtype="m.notice",
+                                           extra={"net.20c.lmer.connection": True})
+
+    def _remember_notice(self, receipt):
+        self._seen.add(receipt)
+        self._posters.wrote(receipt)
+
+    def _send_record(self, record):
+        self._post_outbound(record, self._questions)
+
+    def _inbound_once(self):
+        if not self._replayed:
+            self.replay()
+            with self._state.lock:
+                self._replayed = True
+                self._state.save()
+        self.sync_once()
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -851,13 +720,13 @@ def main(argv: Optional[list] = None) -> int:
         return 1
     except KeyboardInterrupt:
         connector.stop()
-    return 0
+    return connector.exit_code
 
 
 def _stop_on_sigterm(connector) -> None:
-    """Turn SIGTERM into an ordinary stop, in the process's main thread."""
+    """Record SIGTERM for the main monitor."""
     def handler(_signum, _frame):
-        connector._stop.set()
+        connector._signal_stop = True
 
     with contextlib.suppress(ValueError):  # not the main thread: nothing to install
         signal.signal(signal.SIGTERM, handler)

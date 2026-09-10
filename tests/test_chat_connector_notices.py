@@ -6,8 +6,7 @@ at once, and naming the preset the session got — so it tells its child's
 connector to stay quiet; every other attachment (a live connect from the UI, a
 launch-time target, a shell ``lmer chat``) is announced by the connector.
 
-The disconnect note is not gated: a disconnect, a session that ended and a daemon
-shutting down are one fact to the humans in the thread.
+A previously announced attachment still owes its detach notice after restoration.
 """
 from __future__ import annotations
 
@@ -17,6 +16,26 @@ from matrix_chat import connector as matrix_connector
 from slack_chat import connector as slack_connector
 from slack_chat import sessions as slack_sessions
 from slack_chat.client import SlackError
+from tests.connector_fakes import isolated_connectors
+from tests.test_matrix_chat import FakeMatrix
+
+
+@pytest.fixture(autouse=True)
+def connector_lifetimes(monkeypatch):
+    instances = []
+    for cls in (slack_connector.SlackConnector, matrix_connector.MatrixConnector):
+        original = cls.__init__
+        def track(instance, *args, _init=original, _cls=cls, **kwargs):
+            if _cls is matrix_connector.MatrixConnector:
+                kwargs.setdefault("matrix", FakeMatrix())
+            _init(instance, *args, **kwargs)
+            instance._bus = _FakeBus({"seq": 0, "subscribers": {}})
+            instances.append(instance)
+        monkeypatch.setattr(cls, "__init__", track)
+    yield
+    for instance in instances:
+        assert instance.stop(timeout=1, announce=False)
+
 
 
 class FakeSlack:
@@ -28,7 +47,7 @@ class FakeSlack:
         if self.fail:
             raise SlackError("slack said no")
         self.posted.append(text)
-        return "ts-1"
+        return f"ts-{len(self.posted)}"
 
 
 def slack_connector_with(*, attach_ack=True, slack=None):
@@ -45,6 +64,7 @@ class TestTheConnectorsOwnLines:
         slack = FakeSlack()
         built = slack_connector_with(slack=slack)
 
+        built._ensure_ready()
         built._announce_attached()
         built._announce_detached()
 
@@ -53,7 +73,9 @@ class TestTheConnectorsOwnLines:
     def test_the_ack_is_posted_once_however_many_times_it_is_asked_for(self):
         slack = FakeSlack()
         built = slack_connector_with(slack=slack)
+        built._ensure_ready()
         built._announce_attached()
+        built._ensure_ready()
         built._announce_attached()
         assert slack.posted == [slack_connector.ATTACH_ACK]
 
@@ -69,23 +91,26 @@ class TestTheConnectorsOwnLines:
     def test_the_ack_is_off_when_something_else_announced_the_thread(self):
         slack = FakeSlack()
         built = slack_connector_with(attach_ack=False, slack=slack)
+        built._ensure_ready()
         built._announce_attached()
         assert slack.posted == []
 
-    def test_the_note_is_not_gated_by_the_ack_switch(self):
-        """The switch says "somebody else said hello", not "say nothing": a
-        listener-spawned session that ends still owes its thread the line."""
+    def test_saved_announcement_still_owes_its_detach_notice(self):
         slack = FakeSlack()
         built = slack_connector_with(attach_ack=False, slack=slack)
+        built._ensure_ready()
         built._announced = True
         built._announce_detached()
         assert slack.posted == [slack_connector.DETACH_NOTE]
 
-    def test_a_thread_that_refuses_the_ack_is_served_anyway(self):
-        """A courtesy that fails is a log line, never a connector that gives up
-        on the conversation it exists for."""
+    def test_an_ack_with_unknown_outcome_requires_recovery(self):
+        from lmer_cli.connector_delivery import RecoveryRequired
+
         built = slack_connector_with(slack=FakeSlack(fail=True))
-        built._announce_attached()
+        built._ensure_ready()
+        with pytest.raises(RecoveryRequired, match="uncertain"):
+            built._announce_attached()
+        assert built._state.blocked
         assert built._announced is False
 
     def test_the_env_switch_reaches_the_config(self):
@@ -119,13 +144,11 @@ class TestBothTransportsSayTheSameThing:
             access_token="syt_secret", room="!room:example.org", thread_event="$root",
         )
         built = matrix_connector.MatrixConnector(config)
-        said = []
-        built._note = lambda text, **kwargs: said.append(text)
-
+        built._ensure_ready()
         built._announce_attached()
         built._announce_detached()
 
-        assert said == [matrix_connector.ATTACH_ACK, matrix_connector.DETACH_NOTE]
+        assert [item[2] for item in built.matrix.sent] == [matrix_connector.ATTACH_ACK, matrix_connector.DETACH_NOTE]
 
     def test_matrix_honours_the_same_switch(self):
         env = {
@@ -283,8 +306,10 @@ class TestWhereAnAttachmentStartsReading:
         assert built._bus_cursor == 5
 
     def test_a_supervisor_that_will_not_answer_leaves_the_cursor_alone(self):
+        from ask_channel.bus import BusError
         built = self.build(None, from_now=True)
-        built._seed_cursor()
+        with pytest.raises(BusError):
+            built._seed_cursor()
         assert built._bus_cursor == 0
 
     def test_matrix_reads_the_same_two_facts(self):
@@ -344,11 +369,14 @@ class _FakeBus:
 
         if self.health_body is None:
             raise bus_mod.BusError("supervisor said no")
-        return self.health_body
+        return {"session": "notice-session", **self.health_body}
 
 
 class _GoneBus:
     raised = None
+
+    def health(self):
+        return {"session": "gone-session", "seq": 0, "subscribers": {}}
 
     def messages(self, since, timeout=None):
         from ask_channel import bus as bus_mod

@@ -2824,13 +2824,14 @@ def thread_component(platform_root, tmp_path, monkeypatch):
         connectors.thread_registry, "REGISTRY_DIR", str(tmp_path / "threads"),
     )
     built = connectors.ThreadConnectors(
-        runner=lambda argv, env, log_path=None: _ThreadFake(argv, env),
+        runner=lambda argv, env, log_path=None, *, pass_fds=(): _ThreadFake(argv, env),
         environ={"SLACK_BOT_TOKEN": "xoxb-test"},
         slack_client=lambda token: _ThreadSlack(),
         clock=lambda: 0.0,
     )
     connectors.register_connectors(built)
     yield built
+    built.stop()
     connectors.register_connectors(None)
 
 

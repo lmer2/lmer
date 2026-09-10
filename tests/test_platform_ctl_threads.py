@@ -51,7 +51,7 @@ def platform(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
     monkeypatch.setattr(thread_registry, "REGISTRY_DIR", str(tmp_path / "threads"))
     component = connectors.ThreadConnectors(
-        runner=lambda argv, env, log_path=None: FakeProcess(argv, env),
+        runner=lambda argv, env, log_path=None, *, pass_fds=(): FakeProcess(argv, env),
         environ={"SLACK_BOT_TOKEN": "xoxb-test"},
         slack_client=lambda token: _FakeSlack(),
         clock=lambda: 0.0,
@@ -69,7 +69,10 @@ def platform(tmp_path, monkeypatch):
         started_at="2026-09-05T09:00:00Z",
     )
     spawn.token_file_for("s-1").write_text("control-token", encoding="utf-8")
-    yield TestClient(api.create_app(cfg.load(), SECRET))
+    client = TestClient(api.create_app(cfg.load(), SECRET))
+    yield client
+    client.close()
+    component.stop()
     connectors.register_connectors(None)
 
 

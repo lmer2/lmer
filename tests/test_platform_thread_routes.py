@@ -63,7 +63,7 @@ class FakeProcess:
 @pytest.fixture
 def component(platform_root, monkeypatch):
     built = connectors.ThreadConnectors(
-        runner=lambda argv, env, log_path=None: FakeProcess(argv, env),
+        runner=lambda argv, env, log_path=None, *, pass_fds=(): FakeProcess(argv, env),
         environ={
             "SLACK_BOT_TOKEN": "xoxb-test",
             "LMER_MATRIX_HOMESERVER": "https://matrix.example.org",
@@ -76,6 +76,7 @@ def component(platform_root, monkeypatch):
     )
     connectors.register_connectors(built)
     yield built
+    built.stop()
     connectors.register_connectors(None)
 
 

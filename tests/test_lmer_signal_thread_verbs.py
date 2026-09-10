@@ -25,6 +25,7 @@ from ask_channel import bus, signal_cli
 from lmer_cli import comms, supervisor, thread_access
 from lmer_cli.thread_access import ThreadServicer, UploadStore
 from tests.conftest import strip_lmer_env
+from tests.connector_fakes import isolated_connectors
 from tests.test_lmer_thread_access import SLACK_ENV, SLACK_LINK, FakeSlack
 
 

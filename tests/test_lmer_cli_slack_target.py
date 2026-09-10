@@ -412,7 +412,7 @@ _EXPECTED_CHANNEL = "C0123ABCDEF"
 _EXPECTED_THREAD_TS = "1700000000.123456"
 
 
-def _make_main_mocks(captured_env: dict | None = None):
+def _make_main_mocks(captured_env: dict | None = None, *, registry_dir=None):
     """Return a context-manager stack of patches sufficient to let main() run
     without a real container runtime.  Patches are applied in the caller via
     ``unittest.mock.patch`` calls so the test controls what is returned.
@@ -432,7 +432,7 @@ def _make_main_mocks(captured_env: dict | None = None):
     # --- session registry: point it at a throwaway dir so the on_session_start
     # / on_session_end hooks (issue #74) that fire on the real claude-runner
     # launch path never write to the host's ~/.lmer/slack-sessions during tests.
-    _tmp_registry = stack.enter_context(tempfile.TemporaryDirectory())
+    _tmp_registry = registry_dir or stack.enter_context(tempfile.TemporaryDirectory())
     stack.enter_context(
         patch.object(_slack_registry, "REGISTRY_DIR", _tmp_registry)
     )
@@ -1047,8 +1047,8 @@ class TestSlackSessionRegistration:
                     else nullcontext()
                 )
                 with resolve_ctx, mpatch(
-                    "lmer_cli.targets.register", reg
-                ), mpatch("lmer_cli.targets.deregister", dereg):
+                    "lmer_cli.targets.ConnectorProcess.start", lambda owner: reg(owner.key.conversation, owner.key.root)
+                ), mpatch("lmer_cli.targets.ConnectorProcess.stop", lambda owner: dereg(owner.key.conversation, owner.key.root)):
                     from lmer_cli.cli import main
 
                     return main(argv)
@@ -1104,99 +1104,84 @@ def test_chat_launch_starts_connector_with_digest_only_container(
     tmp_path, monkeypatch, channel, supplied_control, session_kind,
 ):
     """Real CLI → target → connector → HTTP bus, starting the bus at launch."""
-    import threading
+    import json
     import time
-    from lmer_cli import cli, supervisor
-    from slack_chat import connector as slack_connector
-    from matrix_chat import connector as matrix_connector
-    from tests.test_slack_connector import FakeSlack
-    from tests.test_matrix_chat import FakeMatrix, ROOM, ROOT, BOT
+    from types import SimpleNamespace
+    from lmer_cli import cli, supervisor, connector_process, thread_access
+    from lmer_cli.connector_ownership import ThreadKey
+    from lmer_cli.threads import parse_thread
+    from tests.connector_fakes import ChildHarness
+    from tests.test_connector_process import wait_for
+    from tests.test_platform_thread_connectors import FakeSlack, FakeMatrix
+    from ask_channel.bus import BusClient, Endpoint
 
-    received = threading.Event()
-    transport = FakeSlack() if channel == "slack" else FakeMatrix()
-    if channel == "slack":
-        original = transport.post_message
-        def post(*args, **kwargs):
-            result = original(*args, **kwargs)
-            if "outbound seam" in args[2]:
-                received.set()
-            return result
-        transport.post_message = post
-        monkeypatch.setattr(slack_connector, "SlackClient", lambda *a, **kw: transport)
-        target = SLACK_URL
-    else:
-        original = transport.send_thread_text
-        def post(*args, **kwargs):
-            result = original(*args, **kwargs)
-            if "outbound seam" in args[2]:
-                received.set()
-            return result
-        transport.send_thread_text = post
-        original_sync = transport.sync
-        def sync(**kwargs):
-            time.sleep(0.01)
-            return original_sync(**kwargs)
-        transport.sync = sync
-        monkeypatch.setattr(matrix_connector, "MatrixClient", lambda *a, **kw: transport)
-        target = f"https://matrix.to/#/{ROOM}/{ROOT}"
-    monkeypatch.setattr(slack_connector, "BUS_POLL_SECONDS", 0.05)
-    monkeypatch.setattr(matrix_connector, "BUS_POLL_SECONDS", 0.05)
+    target = SLACK_URL if channel == "slack" else "https://matrix.to/#/!room:example.org/$root_event_id"
+    ref = parse_thread(target)
+    holder = SimpleNamespace(endpoint=Endpoint("http://not-started", "placeholder"))
+    harness = ChildHarness(tmp_path / "connector-child", channel, holder)
+    harness.key = ThreadKey(channel, *ref.registry_key())
+    harness.link = target
+    original_init = connector_process.ConnectorProcess.__init__
+    owners = []
+    def construct(owner, *args, **kwargs):
+        kwargs["runner"] = harness.runner
+        original_init(owner, *args, **kwargs)
+        owners.append(owner)
+    monkeypatch.setattr(connector_process.ConnectorProcess, "__init__", construct)
+    monkeypatch.setattr(thread_access, "_slack_client", lambda *args: FakeSlack())
+    monkeypatch.setattr(thread_access, "_matrix_client", lambda *args: FakeMatrix())
     monkeypatch.setattr(cli, "lmer_state_dir", lambda: tmp_path / "lmer-state")
     captured = {}
-    env_in = {
-        **_BASE_ENV, "SLACK_BOT_TOKEN": "xoxb-test-bot-token",
-        "LMER_SESSION_KIND": session_kind,
-        "LMER_MATRIX_HOMESERVER": "https://hs.example.org", "LMER_MATRIX_USER_ID": BOT,
-        "LMER_MATRIX_ACCESS_TOKEN": "matrix-fixture", "LMER_SLACK_POLL_SECONDS": "0.05",
-    }
+    env_in = {**_BASE_ENV, **{key: value for key, value in harness.environment().items()
+                            if key.startswith(("CONNECTOR_FIXTURE_", "LMER_MATRIX_", "LMER_CHAT_ATTACH_"))
+                            or key in {"SLACK_BOT_TOKEN", "LMER_COMMS_CONNECT_BUDGET", "LMER_SLACK_POLL_SECONDS"}},
+              "LMER_SESSION_KIND": session_kind}
+    env_in.pop("LMER_SUPERVISOR_URL", None)
+    env_in.pop("LMER_FASTAPI_TOKEN", None)
     if supplied_control:
         env_in["LMER_FASTAPI_TOKEN"] = "host-control-fixture"
     log = None
-    inbound = threading.Event()
-    replayed = threading.Event()
     servers = []
     def launch(*args, **kwargs):
         nonlocal log
         assert captured["LMER_SESSION_KIND"] == session_kind
         log = supervisor._open_comms_log(str(tmp_path), captured)
-        def heard(record, accepted):
-            # Send the live probe only after the attach snapshot is settled.
-            if record.source.channel == channel and record.text.startswith("[replay notice] "):
-                replayed.set()
-            if record.text == "inbound seam":
-                inbound.set()
-
-        log.add_listener(heard)
         assert captured["LMER_FASTAPI_TOKEN"] is None
         assert captured["SLACK_BOT_TOKEN"] is None
         assert captured["LMER_MATRIX_ACCESS_TOKEN"] is None
         app = supervisor._build_fastapi_app(
-            supervisor.OutputBuffer(), lambda data: len(data), "", comms=log,
+            supervisor.OutputBuffer(), len, "", comms=log,
             agent_token="agent-fixture", token_hash=captured["LMER_FASTAPI_TOKEN_SHA256"],
         )
         servers.append(supervisor._start_fastapi_server(app, "127.0.0.1", int(captured["LMER_FASTAPI_PORT"])))
-        from ask_channel.bus import BusClient, Endpoint
-
-        client = BusClient(Endpoint(
-            url=f"http://127.0.0.1:{captured['LMER_FASTAPI_PORT']}", token="agent-fixture",
-        ))
-        assert client.wait_ready(budget=10, interval=0.01)
+        client = BusClient(Endpoint(f"http://127.0.0.1:{captured['LMER_FASTAPI_PORT']}", "agent-fixture"))
+        assert client.wait_ready(budget=5, interval=.01)
         outgoing = client.post("note", "outbound seam")["message"]
         assert outgoing["source"]["channel"] == ("uber-lmer" if session_kind == "assistant" else "agent")
-        assert received.wait(10), "CLI never connected the thread to its supervisor"
-        assert replayed.wait(10), "the attach notice never reached the supervisor"
-        transport.human_says("inbound seam")
-        assert inbound.wait(10), "thread reply never reached the supervisor"
-        record = next(r for r in log.read_since(0)[0] if r.text == "inbound seam")
+        wait_for(lambda: any("outbound seam" in item["text"] for item in harness.events()), harness)
+        wait_for(lambda: any(item.text.startswith("[replay notice]") for item in log.read_since(0)[0]), harness)
+        with (harness.root / "events.jsonl").open("a") as stream:
+            stream.write(json.dumps({"ref": f"{time.time():.6f}" if channel == "slack" else "$human-live",
+                                     "sender": "U1" if channel == "slack" else "@operator:example.org",
+                                     "text": "inbound seam"}) + "\n")
+        wait_for(lambda: any(item.text == "inbound seam" for item in log.read_since(0)[0]), harness)
+        record = next(item for item in log.read_since(0)[0] if item.text == "inbound seam")
         assert record.source.channel == channel
         return 0
     try:
-        with patch.dict(os.environ, env_in, clear=True), _make_main_mocks(captured):
+        with patch.dict(os.environ, env_in, clear=True), _make_main_mocks(
+            captured, registry_dir=str(tmp_path / "claims"),
+        ):
             with patch("lmer_cli.cli.subprocess.call", side_effect=launch):
                 assert cli.main(["chat", target]) == 0
     finally:
+        for owner in owners:
+            owner.stop()
+        harness.close()
         for thread, shutdown in servers:
             shutdown()
             thread.join(timeout=3)
+            assert not thread.is_alive()
         if log is not None:
             log.close()
+    assert all(child.returncode is not None for child in harness.children)
