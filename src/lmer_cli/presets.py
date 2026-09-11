@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .harness import HARNESS_ENV, LLM_NAME_ENV, harness_for_model, known_harnesses
+from .util import env_name_segment
 
 logger = logging.getLogger("lmer_cli.presets")
 
@@ -79,11 +80,6 @@ PRESET_ENV = "LMER_PRESET"
 # operator can pin a per-task default in ~/.lmer/.env without it bleeding
 # into every other task. Read host-side alongside PRESET_ENV.
 TASK_PRESET_ENV_TEMPLATE = "LMER_{task}_PRESET"
-
-# Characters a taskdef id may contribute to an env-var name; everything else
-# (dashes, dots) becomes an underscore so `code-review` can be selected as
-# LMER_CODE_REVIEW_PRESET.
-_ENV_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9]")
 
 # Env var selecting the agent fan-out presets for a CLI invocation, as a
 # comma-delimited list of preset names (the --agents flag wins over it,
@@ -200,7 +196,9 @@ def task_preset_env_name(task_id: str | None) -> str | None:
     ``LMER_CODE_REVIEW_PRESET``. Taskdef ids are directory names from the
     taskdef search path (including work-repo and ``LMER_TASKDEF_PATHS``
     ones), so the derivation cannot assume the built-in set: everything
-    outside ``[A-Za-z0-9]`` collapses to an underscore.
+    outside ``[A-Za-z0-9]`` collapses to an underscore
+    (:func:`lmer_cli.util.env_name_segment`, shared with the scoped resource
+    limits).
 
     The mapping is therefore **many-to-one**: ``code-review``,
     ``code_review`` and ``code.review`` all derive
@@ -216,9 +214,7 @@ def task_preset_env_name(task_id: str | None) -> str | None:
     the suffix: the ``LMER_`` prefix keeps the full name a legal env-var
     identifier (``2fa`` → ``LMER_2FA_PRESET``).
     """
-    if not task_id or not task_id.strip():
-        return None
-    suffix = _ENV_NAME_SAFE_RE.sub("_", task_id.strip()).strip("_").upper()
+    suffix = env_name_segment(task_id)
     if not suffix:
         return None
     return TASK_PRESET_ENV_TEMPLATE.format(task=suffix)

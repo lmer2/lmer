@@ -113,10 +113,16 @@ from .runtime import (
     base_run_args,
     build_container_env,
     ContainerEnvError,
+    CPUS_HINT,
     default_env_file_candidates,
     detect_runtime,
+    LaunchScope,
     lmer_state_dir,
+    MEMORY_HINT,
     repo_root_path,
+    resource_limit_plan,
+    _valid_cpus,
+    _valid_memory,
 )
 from .service import (
     ServiceError,
@@ -587,6 +593,8 @@ def parse_args(
     parser.add_argument("--checkout", dest="checkout", help="Path to existing local source checkout (mounted as /workspace)")
     parser.add_argument("--user", dest="user", help="Container user (e.g., developer or 0:0)")
     parser.add_argument("--match-uid", dest="match_uid", action="store_true", help="Run container as your host UID:GID (fixes SSH agent permissions)")
+    parser.add_argument("--memory", dest="memory", help="Container memory cap for this launch, overriding every environment tier (LMER_<TASK>__<REPO>__MEMORY, LMER_<TASK>_MEMORY, LMER_MEMORY). Same grammar as LMER_MEMORY — an integer with an optional b/k/m/g suffix, at least 6m. Unlike the environment tiers, an invalid value here aborts the run rather than falling through: an explicit request is not something to silently substitute.")
+    parser.add_argument("--cpus", dest="cpus", help="Container CPU quota for this launch, overriding every environment tier (LMER_<TASK>__<REPO>__CPUS, LMER_<TASK>_CPUS, LMER_CPUS). Same grammar as LMER_CPUS — a positive number of cores, integer or fractional. Invalid values abort the run, as with --memory.")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable verbose logging (same as LMER_VERBOSE=1).")
     parser.add_argument("--debug", action="store_true",
@@ -1178,6 +1186,24 @@ def _display_env_config_cli(
     print("---")
 
 
+def _announce_resource_limits(limits: "list") -> None:
+    """Say what bounds this container gets and what set each one (issue #453).
+
+    Rendered from the plan the run arguments are built from, so the line and
+    the arguments cannot disagree — including a flag the rootless-podman
+    delegation gate dropped, which is absent from both. The source is the
+    variable that answered, ``--memory``/``--cpus`` when a flag overrode the
+    ladder, or ``default``; with three tiers per knob, which one won is the
+    thing an operator cannot infer from the value alone.
+    """
+    if not limits:
+        return
+    shown = ", ".join(
+        f"{limit.flag.lstrip('-')}={limit.value} ({limit.source})" for limit in limits
+    )
+    info(f"📐 Limits: {shown}")
+
+
 def _display_sources_config_cli() -> None:
     """Render the canonical-sources block (sources.yaml, issue #105) for --show-env.
 
@@ -1411,6 +1437,31 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
             "--service-group requires --checkout (path to local source checkout)"
         )
         return 2
+    for flag, dest, validator, hint in (
+        ("--memory", "memory", _valid_memory, MEMORY_HINT),
+        ("--cpus", "cpus", _valid_cpus, CPUS_HINT),
+    ):
+        # The other posture over the same grammar (issue #453): the environment
+        # tiers warn and fall through, because a typo in a file must never stop
+        # a session starting, while a flag is an attached caller saying what
+        # they want — and running with some other bound is the failure.
+        #
+        # Blank is the exception, and it is the same rule the tiers follow: a
+        # wrapper that passes --memory "$OVERRIDE" with the variable unset has
+        # expressed no preference, and refusing to launch over an empty string
+        # would be answering a question nobody asked.
+        raw = (getattr(ns, dest) or "").strip()
+        if not raw:
+            setattr(ns, dest, None)
+            continue
+        accepted = validator(raw)
+        if accepted is None:
+            error(f"{flag} {getattr(ns, dest)!r} is not a usable value: it {hint}")
+            return 2
+        # The accepted spelling, not what was typed: the validators may
+        # normalise (as _valid_pids_limit does), and the env path already
+        # passes what the validator returned.
+        setattr(ns, dest, accepted)
     if ns.session is not None:
         # Refused here, where the operator can read it. The value becomes a
         # directory name in the work repo (D22), and every layer below this
@@ -2427,7 +2478,24 @@ def main(argv: list[str] | None = None) -> int:
     # Build docker/podman run args
     exec_mode = bool(ns.exec_mode)
     run: list[str] = []
-    run += base_run_args(runtime, exec_mode, container_user)
+    # Resolved once and both announced and passed (issue #453), so the
+    # diagnostic below cannot describe a launch other than the one that
+    # happens. The scope is what the ladder reads: this session's taskdef and
+    # the repository it works on, with the host dropped.
+    limits = resource_limit_plan(
+        runtime,
+        LaunchScope(
+            task_id=task_id,
+            repo_project=_parse_repo_url(repo_url)[1] if repo_url else None,
+        ),
+        overrides={
+            flag: value
+            for flag, value in (("--memory", ns.memory), ("--cpus", ns.cpus))
+            if value
+        },
+    )
+    _announce_resource_limits(limits)
+    run += base_run_args(runtime, exec_mode, container_user, limits)
 
     # In developer mode, mount local repo dirs into the container to override
     # baked-in assets (for live development). In installed mode, the container

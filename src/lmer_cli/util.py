@@ -3,6 +3,7 @@ Utility functions
 """
 
 import os
+import re
 import subprocess
 
 
@@ -119,3 +120,35 @@ def decode_escape_bytes(value: str) -> bytes:
         return decoded.encode("latin-1")
     except UnicodeEncodeError:
         return decoded.encode("utf-8")
+
+
+# Characters an identifier may contribute to an env-var name; everything else
+# (dashes, dots, slashes) becomes an underscore.
+_ENV_NAME_SAFE_RE = re.compile(r"[^A-Za-z0-9]")
+
+
+def env_name_segment(text: str | None) -> str | None:
+    """Return *text* as the segment an ``LMER_`` variable name can carry.
+
+    The one home for that normalization, shared by the taskdef-scoped preset
+    selector (``LMER_<TASK>_PRESET``) and the scoped resource limits
+    (``LMER_<TASK>__<REPO>__MEMORY``) so the two conventions cannot drift:
+    uppercased, with every non-alphanumeric collapsed to ``_`` and the result
+    stripped of leading and trailing underscores.
+
+    The mapping is deliberately **many-to-one** — ``code-review``,
+    ``code_review`` and ``code.review`` all yield ``CODE_REVIEW``, as do
+    ``agents/global`` and ``agents-global``. Callers name things that come from
+    a filesystem or a forge, neither of which promises a spelling an env-var
+    name could carry.
+
+    Returns ``None`` when *text* is empty or normalizes to nothing — an id of
+    only separators (``"-"``), or one with no ASCII alphanumerics at all
+    (``"レビュー"``) — which leaves that caller with no scoped name rather than
+    with a malformed one. A digit may lead the result: the ``LMER_`` prefix
+    keeps the full name a legal identifier.
+    """
+    if not text or not text.strip():
+        return None
+    segment = _ENV_NAME_SAFE_RE.sub("_", text.strip()).strip("_").upper()
+    return segment or None

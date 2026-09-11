@@ -162,6 +162,7 @@ from . import (
     ask, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
 )
 from .config import (
+    assistant_resource_settings,
     terminal_settings,
     ENV_REPO_URL,
     PlatformConfig,
@@ -260,6 +261,15 @@ MODEL_FLAG = "--model"
 #: fleet view and every post-mortem naming a harness the session never ran.
 HARNESS_FLAG = "--harness"
 
+#: The two ``lmer`` flags carrying the supervising assistant's own container
+#: allocation (issue #453), spelled by :func:`_assistant_resource_flags` from
+#: ``LMER_PLATFORM_ASSISTANT_MEMORY`` / ``_CPUS``. Flags rather than environment
+#: because the daemon's own environment is what a spawned session inherits: a
+#: worker default exported there would be indistinguishable from the
+#: assistant's setting, and a preset's env could shadow either.
+MEMORY_FLAG = "--memory"
+CPUS_FLAG = "--cpus"
+
 #: How ``lmer`` is told that something else runs the connectors for its thread
 #: targets. Emitted whenever this module passes thread permalinks: the daemon
 #: runs one connector process per (session, thread) so a connection can be made
@@ -281,8 +291,10 @@ NO_REPO_ENV = "LMER_NO_REPO"
 #: rather than a caller mistake, hence a refusal rather than a note in the docs.
 #: The first four would move, weaken or delete the control plane the session's
 #: registry entry advertises, leaving an entry that promises a session nobody can
-#: drive; the next two belong to verbs that validate before they spawn; the last
-#: four are flags this module emits itself, from typed fields, and records.
+#: drive; the next two belong to verbs that validate before they spawn; the four
+#: after those are flags this module emits itself, from typed fields, and
+#: records; the last two are the assistant's resource bounds, emitted here from
+#: the environment for one session kind.
 _RESERVED_ARGS = (
     # Would replace the token minted here and written 0600, so the entry's
     # token_ref would stop opening anything.
@@ -319,7 +331,7 @@ _RESERVED_ARGS = (
     # A raw POST /api/sessions must not be able to do from argv what those verbs
     # will not do from a request body.
     SESSION_FLAG,
-    # The last four are reserved for a different reason from the rest, and it
+    # The next four are reserved for a different reason from the rest, and it
     # is not that they are dangerous to a session: the platform *emits* all
     # four, from typed fields, and writes what it emitted into the registry
     # entry (``task.preset`` / ``task.agents`` / ``task.model`` /
@@ -349,6 +361,14 @@ _RESERVED_ARGS = (
     # "codex"]}`` runs codex while the entry, the fleet view and every
     # post-mortem say claude.
     HARNESS_FLAG,
+    # The assistant's own allocation (issue #453). Emitted here from the
+    # environment for kind="assistant" and for nothing else, so a second
+    # spelling in extra_args would win over it by the same last-wins rule — and
+    # a worker could hand itself a bound the operator never configured, since
+    # extra_args comes verbatim from the POST /api/sessions body. Resource
+    # overrides per spawn are deliberately not a request field.
+    MEMORY_FLAG,
+    CPUS_FLAG,
 )
 
 
@@ -1966,6 +1986,32 @@ def _prepare_session_channels(session_id: str, kind: str) -> SessionChannels:
     )
 
 
+def _assistant_resource_flags(kind: str) -> list:
+    """``--memory``/``--cpus`` for the supervising assistant, or nothing.
+
+    Keyed on the registry *kind* rather than on the taskdef (issue #453): a
+    worker spawned with the ``orchestrate`` taskdef is not the supervising
+    session, and giving it the assistant's allocation because its taskdef
+    matched would be wrong in exactly the case an operator would never think
+    to check. One assistant exists at a time and this is the one place it is
+    started, so start, rotate and the supervisor's respawn all pass through
+    here.
+
+    An unset or unusable setting contributes no flag, which leaves the launch
+    on the worker ladder — the documented fallback rather than a guess at what
+    the assistant should have.
+    """
+    if kind != registry.ASSISTANT_KIND:
+        return []
+    settings = assistant_resource_settings()
+    flags: list = []
+    for key, flag in (("memory", MEMORY_FLAG), ("cpus", CPUS_FLAG)):
+        value = settings[key].value
+        if value:
+            flags += [flag, str(value)]
+    return flags
+
+
 def _with_host_flags(command: list, flags: list) -> list:
     """Insert platform-added ``lmer`` flags ahead of the caller's ``extra_args``.
 
@@ -2975,8 +3021,11 @@ def spawn_session(
         raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
 
     channels = _prepare_session_channels(session_id, kind)
-    if channels.host_flags:
-        command = _with_host_flags(command, channels.host_flags)
+    # One call, because _with_host_flags inserts at a fixed anchor and two
+    # would interleave in reverse.
+    host_flags = channels.host_flags + _assistant_resource_flags(kind)
+    if host_flags:
+        command = _with_host_flags(command, host_flags)
 
     control_token, token_file = _mint_control_token(session_id)
 

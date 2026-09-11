@@ -4393,3 +4393,72 @@ def test_spawn_refuses_invalid_extra_thread_targets(config, targets):
     with pytest.raises(spawn.SpawnError, match="targets"):
         spawn.spawn_session(config, spawn.SpawnRequest("chat", "fleet", targets=targets, no_repo=True))
     assert registry.list_sessions(live_only=False) == []
+
+
+class TestAssistantResourceFlags:
+    """The supervising assistant's own allocation (issue #453), keyed on the
+    registry kind rather than on the taskdef it happens to run."""
+
+    def test_the_assistant_launch_carries_both_flags(self, config, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert result.command[result.command.index("--memory") + 1] == "2g"
+        assert result.command[result.command.index("--cpus") + 1] == "2"
+
+    def test_a_worker_on_the_orchestrate_taskdef_gets_neither(self, config, monkeypatch):
+        """The taskdef is not the identity: only one session at a time IS the
+        supervising assistant, and a worker running the same taskdef must not
+        inherit its allocation."""
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        result = spawn.spawn_session(config, request_for(taskdef="orchestrate"))
+        assert "--memory" not in result.command
+        assert "--cpus" not in result.command
+
+    def test_a_worker_default_does_not_leak_into_the_assistant(self, config, monkeypatch):
+        """Raising the global worker allocation still emits the assistant's own
+        values. That the flag then beats the environment the child inherits is
+        the CLI's half, covered in tests/test_lmer_cli_runtime.py; what is
+        asserted here is that the daemon emits the assistant's numbers rather
+        than the worker ones."""
+        monkeypatch.setenv("LMER_MEMORY", "8g")
+        monkeypatch.setenv("LMER_CPUS", "8")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert result.command[result.command.index("--memory") + 1] == "2g"
+        assert result.command[result.command.index("--cpus") + 1] == "2"
+
+    def test_an_unset_setting_contributes_no_flag(self, config, monkeypatch):
+        """Nothing configured leaves the launch on the worker ladder rather
+        than on a guess."""
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_MEMORY", raising=False)
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_CPUS", raising=False)
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert "--memory" not in result.command
+        assert "--cpus" not in result.command
+
+    def test_an_invalid_setting_costs_the_flag_not_the_assistant(self, config, monkeypatch):
+        """A typo in an export must never make the assistant unstartable: the
+        standing layer warns and resolves as unset."""
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "heaps")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert "--memory" not in result.command
+        assert result.command[result.command.index("--cpus") + 1] == "2"
+
+    def test_one_knob_alone_is_enough(self, config, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_CPUS", raising=False)
+        result = spawn.spawn_session(config, request_for(), kind=registry.ASSISTANT_KIND)
+        assert result.command[result.command.index("--memory") + 1] == "2g"
+        assert "--cpus" not in result.command
+
+    @pytest.mark.parametrize("flag", ["--memory", "--cpus"])
+    def test_a_request_may_not_smuggle_a_second_spelling(self, config, flag):
+        """extra_args arrives verbatim from POST /api/sessions and argparse is
+        last-wins, so an unreserved spelling would let a worker hand itself a
+        bound nobody configured."""
+        with pytest.raises(spawn.SpawnError):
+            spawn.spawn_session(config, request_for(extra_args=(flag, "64g")))

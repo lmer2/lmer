@@ -119,6 +119,7 @@ from .config import (
     PlatformConfig,
     active_assistant_credential,
     active_connectors,
+    assistant_resource_settings,
     assistant_settings,
     chat_settings,
     list_connectors,
@@ -514,7 +515,9 @@ _CONFIG_SCOPE_NOTE = (
     "effect until that export is removed. The daemon reads the checkin and nudge "
     "groups on its next tick, so a change there takes effect without a rotation. "
     "chat_keep_last is a browser display setting applied on config refresh; "
-    "it does not require an assistant rotation."
+    "it does not require an assistant rotation. The resources group is "
+    "read-only and environment-only, and like the launch settings it applies "
+    "to the next incarnation: changing it does not resize a running container."
 )
 
 
@@ -565,6 +568,15 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
                 for key, setting in upload_settings().items()
             },
             "types": list(upload_types()),
+        },
+        # The assistant's own container allocation (issue #453). Read-only:
+        # these resolve from the daemon's environment alone, so there is no
+        # stored value for a write route to persist — reported here because a
+        # setting an operator cannot see the effect of is one they cannot
+        # check, and the source says whether an export is answering.
+        "resources": {
+            key: setting.to_dict()
+            for key, setting in assistant_resource_settings().items()
         },
         "note": _CONFIG_SCOPE_NOTE,
     }
