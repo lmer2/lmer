@@ -2960,3 +2960,44 @@ def test_a_refused_rotation_has_its_own_history_and_keeps_the_incumbent(
         assert "develop-412" in events[0]["data"]["detail"]
         assert events_of("assistant_start_refused") == []
         assert "platform_assistant_rotate_refused" in caplog.text
+
+
+def test_start_passes_the_configured_resource_flags(config, long_lived, monkeypatch):
+    """The assistant's own allocation reaches its launch (issue #453).
+
+    Asserted on the argv the start actually spawns rather than on the registry
+    entry, which records launch settings and not resource bounds: the claim is
+    that the container gets them, and argv is where that is true or not.
+    """
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_MEMORY, "2g")
+    monkeypatch.setenv(cfg.ENV_ASSISTANT_CPUS, "2")
+    seen: list = []
+    original = spawn.subprocess.Popen
+
+    def capture(*args, **kwargs):
+        seen.append(list(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", capture)
+    with started(config):
+        assert seen, "the start must have spawned something"
+        command = seen[0]
+        assert command[command.index("--memory") + 1] == "2g"
+        assert command[command.index("--cpus") + 1] == "2"
+
+
+def test_start_without_resource_settings_passes_no_such_flags(
+    config, long_lived, monkeypatch
+):
+    monkeypatch.delenv(cfg.ENV_ASSISTANT_MEMORY, raising=False)
+    monkeypatch.delenv(cfg.ENV_ASSISTANT_CPUS, raising=False)
+    seen: list = []
+    original = spawn.subprocess.Popen
+
+    def capture(*args, **kwargs):
+        seen.append(list(args[0]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(spawn.subprocess, "Popen", capture)
+    with started(config):
+        assert seen and "--memory" not in seen[0] and "--cpus" not in seen[0]

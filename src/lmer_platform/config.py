@@ -83,7 +83,14 @@ from urllib.parse import urlsplit
 # One definition of the credential scrub, imported rather than reimplemented —
 # the same trade :mod:`lmer_platform.workrepo` makes, and it says why there.
 from lmer_cli.container.clone_and_exec import _scrub_credentials
-from lmer_cli.runtime import RuntimeErrorDetect, detect_runtime
+from lmer_cli.runtime import (
+    CPUS_HINT,
+    MEMORY_HINT,
+    RuntimeErrorDetect,
+    detect_runtime,
+    _valid_cpus,
+    _valid_memory,
+)
 # The token lookup's own host parser: the issuing-host default seeded below has
 # to agree with what :func:`lmer_cli.tokens._gitlab_token_issuing_host` reads.
 from lmer_cli.tokens import _host_from_git_url
@@ -131,6 +138,8 @@ __all__ = [
     "revoke_assistant_credential",
     "binding_notice", "configured_repo_url", "container_base_url", "control_ui_url",
     "ASSISTANT_SETTING_KEYS", "AssistantSetting", "assistant_settings",
+    "ASSISTANT_RESOURCE_KEYS", "assistant_resource_settings",
+    "ENV_ASSISTANT_MEMORY", "ENV_ASSISTANT_CPUS",
     "update_stored", "validate_assistant_override",
     "CHECKIN_SETTING_KEYS", "DEFAULT_CHECKIN_WINDOW_SECONDS",
     "ENV_CHECKIN_WINDOW", "checkin_settings", "validate_checkin_window",
@@ -268,6 +277,29 @@ ENV_ASSISTANT_MODEL = "LMER_PLATFORM_ASSISTANT_MODEL"
 ENV_ASSISTANT_HARNESS = "LMER_PLATFORM_ASSISTANT_HARNESS"
 ENV_ASSISTANT_PRESET = "LMER_PLATFORM_ASSISTANT_PRESET"
 ENV_ASSISTANT_AGENTS = "LMER_PLATFORM_ASSISTANT_AGENTS"
+
+#: The supervising assistant's own container allocation (issue #453). It
+#: coordinates workers rather than running their test suites, so it has no use
+#: for whatever the worker defaults happen to be — and worker defaults move.
+#:
+#: Deliberately NOT in :data:`ASSISTANT_SETTING_KEYS`: those four are persisted
+#: in ``config.json`` and writable through ``POST /api/assistant/config``, while
+#: these resolve from the daemon's environment only and are reported read-only
+#: (the operator's call on this issue). They still travel as flags —
+#: ``--memory``/``--cpus`` on the assistant's own ``lmer`` invocation — for that
+#: table's reason: a flag beats the container's environment and a preset's env,
+#: so model or preset selection cannot discard the allocation.
+ENV_ASSISTANT_MEMORY = "LMER_PLATFORM_ASSISTANT_MEMORY"
+ENV_ASSISTANT_CPUS = "LMER_PLATFORM_ASSISTANT_CPUS"
+
+#: setting key -> (env var, validator, grammar). The validators are the CLI's
+#: own, so a value this accepts is one the spawned ``lmer`` accepts: the flag
+#: posture there is refuse-not-default, and an assistant that will not start
+#: because of a typo in an export is the failure this group must not have.
+ASSISTANT_RESOURCE_KEYS = {
+    "memory": (ENV_ASSISTANT_MEMORY, _valid_memory, MEMORY_HINT),
+    "cpus": (ENV_ASSISTANT_CPUS, _valid_cpus, CPUS_HINT),
+}
 
 #: The check-in window, per platform instance (issue #244) — how often to sweep
 #: what has gone quiet is a property of a host's fleet, not of a build.
@@ -1399,6 +1431,39 @@ def nudge_settings() -> dict:
     to the next tick rather than the next restart.
     """
     return _int_group_settings(NUDGE_SETTING_KEYS, group="nudge")
+
+
+def assistant_resource_settings() -> dict:
+    """The assistant's effective container allocation, value and source.
+
+    :func:`assistant_settings`' sibling with one layer instead of three: the
+    environment, then unset. Unset is not a gap to fill here — it means the
+    assistant launches with no resource flags of its own and the worker
+    ladder answers, which is the documented fallback and today's behaviour.
+
+    An unusable value warns and resolves as unset rather than refusing, the
+    posture every standing layer in this module takes: a typo in an export must
+    cost the assistant its allocation, never its ability to start. The flags the
+    CLI grows for these refuse instead — see
+    :data:`ASSISTANT_RESOURCE_KEYS`.
+    """
+    resolved = {}
+    for key, (env_var, validator, hint) in ASSISTANT_RESOURCE_KEYS.items():
+        raw = _env_str(env_var)
+        if raw is None:
+            resolved[key] = AssistantSetting()
+            continue
+        accepted = validator(raw)
+        if accepted is None:
+            logger.warning(
+                "platform_assistant_resource_invalid key=%s value=%r (%s) — "
+                "ignored; the assistant launches on the worker default",
+                key, raw, hint,
+            )
+            resolved[key] = AssistantSetting()
+            continue
+        resolved[key] = AssistantSetting(value=accepted, source="env")
+    return resolved
 
 
 def upload_settings() -> dict:

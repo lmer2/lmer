@@ -1606,3 +1606,51 @@ def test_a_disabled_backstop_is_not_read_as_an_inverted_pair(platform_root):
         "stall_idle_seconds": 600, "stall_backstop_seconds": 0,
     })
     assert config.stall_backstop_seconds == 0
+
+
+class TestAssistantResourceSettings:
+    """LMER_PLATFORM_ASSISTANT_MEMORY / _CPUS (issue #453): one layer, the
+    environment, and the warn-never-refuse posture every standing layer here
+    takes."""
+
+    def test_unset_reports_no_value(self, monkeypatch):
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_MEMORY", raising=False)
+        monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_CPUS", raising=False)
+        settings = cfg.assistant_resource_settings()
+        assert settings["memory"].value is None
+        assert settings["cpus"].value is None
+
+    def test_a_configured_value_is_reported_with_its_source(self, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+        settings = cfg.assistant_resource_settings()
+        assert (settings["memory"].value, settings["memory"].source) == ("2g", "env")
+        assert (settings["cpus"].value, settings["cpus"].source) == ("2", "env")
+
+    def test_blank_reads_as_unset(self, monkeypatch):
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "   ")
+        assert cfg.assistant_resource_settings()["memory"].value is None
+
+    def test_an_unusable_value_falls_back_rather_than_refusing(self, monkeypatch):
+        """A typo in an export costs the allocation, never the assistant's
+        ability to start."""
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "heaps")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "0")
+        settings = cfg.assistant_resource_settings()
+        assert settings["memory"].value is None
+        assert settings["cpus"].value is None
+
+    def test_the_grammar_is_the_cli_grammar(self, monkeypatch):
+        """A value this accepts is one the spawned lmer accepts — the
+        validators are imported from the CLI rather than restated."""
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "512m")
+        monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "0.5")
+        settings = cfg.assistant_resource_settings()
+        assert settings["memory"].value == "512m"
+        assert settings["cpus"].value == "0.5"
+
+    def test_it_is_not_a_writable_launch_setting(self):
+        """Read-only and environment-only by decision: no config.json key, so
+        no write route can persist one."""
+        assert "memory" not in cfg.ASSISTANT_SETTING_KEYS
+        assert "cpus" not in cfg.ASSISTANT_SETTING_KEYS

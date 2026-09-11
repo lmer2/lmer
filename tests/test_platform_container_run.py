@@ -317,3 +317,46 @@ def test_runtime_arguments_land_before_the_image(host):
     run = host.run("--runtime-arg", "--memory=2g", "--", "status")
     image = run.argv.index("lmer-platform:dev")
     assert run.argv.index("--memory=2g") < image, run.argv
+
+
+def test_container_resource_limits_are_forwarded_including_scoped_spellings(host):
+    """Issue #453's ladder is resolved by the ``lmer`` inside this container.
+
+    A develop run the supervising assistant spawns is the case that issue was
+    filed for, so a limit exported on the host has to arrive here or the
+    feature is inert for it. The scoped names carry a taskdef id and a project
+    path, so they are matched as a pattern rather than enumerated —
+    ``GITLAB_TOKEN_*``'s reason.
+    """
+    values = {
+        "LMER_MEMORY": "4g",
+        "LMER_CPUS": "4",
+        "LMER_DEVELOP_MEMORY": "8g",
+        "LMER_DEVELOP__AGENTS_GLOBAL__MEMORY": "16g",
+        "LMER_CODE_REVIEW__OWNER_REPO__CPUS": "2",
+    }
+    run = host.run(env=values)
+    for name in values:
+        assert name in run.env_names, f"{name} is not forwarded: {run.argv}"
+
+
+def test_the_assistants_own_allocation_still_forwards_on_the_platform_prefix(host):
+    """The asymmetry #453's review found: both halves of the feature have to
+    survive one shell. ``LMER_PLATFORM_ASSISTANT_MEMORY`` matches the
+    ``LMER_PLATFORM_*`` prefix and must keep doing so, rather than being
+    captured by the resource pattern that was added after it."""
+    run = host.run(env={
+        "LMER_PLATFORM_ASSISTANT_MEMORY": "2g",
+        "LMER_PLATFORM_ASSISTANT_CPUS": "2",
+        "LMER_MEMORY": "4g",
+    })
+    for name in ("LMER_PLATFORM_ASSISTANT_MEMORY", "LMER_PLATFORM_ASSISTANT_CPUS", "LMER_MEMORY"):
+        assert name in run.env_names, f"{name} is not forwarded: {run.argv}"
+
+
+def test_an_unrelated_lmer_variable_is_still_not_forwarded(host):
+    """The pattern is the two resource knobs, not LMER_* at large: forwarding
+    by prefix would carry names this allowlist exists to withhold."""
+    run = host.run(env={"LMER_SOMETHING_ELSE": "x", "LMER_MEMORY_LIMIT_NOTES": "y"})
+    assert "LMER_SOMETHING_ELSE" not in run.env_names
+    assert "LMER_MEMORY_LIMIT_NOTES" not in run.env_names

@@ -1636,3 +1636,38 @@ def test_chat_retention_refuses_invalid_values_without_writing(client, platform_
     assert reply.status_code == 400
     assert "chat_keep_last" in reply.json()["detail"]
     assert not cfg.config_path().exists()
+
+
+# The assistant's own container allocation (issue #453). Read-only and
+# environment-only by decision, so the route reports it and no write accepts it.
+
+def test_config_serves_the_assistant_resources_in_their_own_group(
+    client, platform_root, monkeypatch
+):
+    monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_MEMORY", "2g")
+    monkeypatch.setenv("LMER_PLATFORM_ASSISTANT_CPUS", "2")
+    body = client.get("/api/assistant/config", headers=bearer_header()).json()
+    assert body["resources"]["memory"] == {"value": "2g", "source": "env", "stored": None}
+    assert body["resources"]["cpus"] == {"value": "2", "source": "env", "stored": None}
+    assert "memory" not in body["settings"], (
+        "a resource bound is not one of the four launch settings a write persists"
+    )
+
+
+def test_config_reports_unset_resources_rather_than_omitting_them(
+    client, platform_root, monkeypatch
+):
+    """An operator reading the screen has to be able to tell 'not configured'
+    from 'this group does not exist'."""
+    monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_MEMORY", raising=False)
+    monkeypatch.delenv("LMER_PLATFORM_ASSISTANT_CPUS", raising=False)
+    body = client.get("/api/assistant/config", headers=bearer_header()).json()
+    assert body["resources"]["memory"]["value"] is None
+    assert body["resources"]["cpus"]["value"] is None
+
+
+def test_config_note_says_the_resources_do_not_resize_a_running_container(
+    client, platform_root
+):
+    body = client.get("/api/assistant/config", headers=bearer_header()).json()
+    assert "does not resize a running container" in body["note"]

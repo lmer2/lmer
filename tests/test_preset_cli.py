@@ -460,7 +460,7 @@ class TestContainerUserFromDotenv:
     def _run_capturing_user(self, argv, env_in=None, home=None):
         captured_users: list = []
 
-        def _capture_base_run_args(runtime, exec_mode, container_user):
+        def _capture_base_run_args(runtime, exec_mode, container_user, limits=None):
             captured_users.append(container_user)
             return []
 
@@ -1119,3 +1119,129 @@ def test_resolved_preset_has_an_explicit_container_passthrough():
     from pathlib import Path
     source = (Path(__file__).resolve().parents[1] / "src/lmer_cli/cli.py").read_text()
     assert '"LMER_SESSION_PRESET": os.environ.get("LMER_SESSION_PRESET")' in source
+
+
+class TestScopedResourceLimitsAgainstPresets:
+    """The point of issue #453: a taskdef's allocation survives model/preset
+    selection, whichever preset the supervising assistant picks that day."""
+
+    @pytest.fixture
+    def resource_presets(self, tmp_path):
+        path = tmp_path / "resource-presets.json"
+        path.write_text(
+            json.dumps({
+                "astra": {"env": {"LMER_LLM_NAME": "opus", "LMER_MEMORY": "9g"}},
+                "plain": {"env": {"LMER_LLM_NAME": "opus"}},
+            })
+        )
+        return path
+
+    def _limits(self, argv, env_in, tmp_path):
+        """The resource plan main() hands to base_run_args."""
+        captured: list = []
+
+        def _capture(runtime, exec_mode, container_user, limits=None):
+            captured.append(limits)
+            return []
+
+        env = {**_BASE_ENV, **env_in, "HOME": str(tmp_path)}
+        with patch.dict(os.environ, env, clear=True):
+            with _make_main_mocks():
+                with patch("lmer_cli.cli.base_run_args", side_effect=_capture):
+                    from lmer_cli.cli import main
+
+                    rc = main(argv)
+        assert rc == 0, f"main() must succeed; rc={rc}"
+        assert captured and captured[0] is not None
+        return {limit.flag: (limit.value, limit.source) for limit in captured[0]}
+
+    def test_a_presets_own_memory_does_not_displace_the_taskdef_value(
+        self, resource_presets, tmp_path
+    ):
+        """The headline claim: specificity decides, not the layer a value came
+        from. LMER_MEMORY is deliberately NOT exported here — preset env is
+        applied only over keys os.environ lacks, so an exported one would keep
+        the preset's value out of the environment entirely and the case would
+        prove nothing."""
+        limits = self._limits(
+            ["--preset", "astra", "develop", REPO_URL, "--exec", "true"],
+            {
+                "LMER_PRESETS_FILE": str(resource_presets),
+                "LMER_DEVELOP_MEMORY": "4g",
+            },
+            tmp_path,
+        )
+        assert limits["--memory"] == ("4g", "LMER_DEVELOP_MEMORY")
+
+    def test_the_presets_memory_is_what_applies_when_nothing_is_more_specific(
+        self, resource_presets, tmp_path
+    ):
+        """The other half of the case above: the preset's value really does
+        reach the environment, so the test above is a comparison and not a
+        preset that was inert all along."""
+        limits = self._limits(
+            ["--preset", "astra", "develop", REPO_URL, "--exec", "true"],
+            {"LMER_PRESETS_FILE": str(resource_presets)},
+            tmp_path,
+        )
+        assert limits["--memory"] == ("9g", "LMER_MEMORY")
+
+    def test_a_dotenv_scoped_value_beats_an_exported_general_one(self, tmp_path):
+        """Specificity over source tier, in the combination that makes the
+        feature worth having: the scoped value is in a file and the general one
+        is exported, and the scoped one still wins."""
+        (tmp_path / ".env").write_text("LMER_DEVELOP_MEMORY=4g\n")
+        with patch("pathlib.Path.cwd", return_value=tmp_path):
+            limits = self._limits(
+                ["develop", REPO_URL, "--exec", "true"],
+                {"LMER_MEMORY": "2g"},
+                tmp_path,
+            )
+        assert limits["--memory"] == ("4g", "LMER_DEVELOP_MEMORY")
+
+    def test_the_same_value_applies_with_no_preset_at_all(self, tmp_path):
+        limits = self._limits(
+            ["develop", REPO_URL, "--exec", "true"],
+            {"LMER_MEMORY": "2g", "LMER_DEVELOP_MEMORY": "4g"},
+            tmp_path,
+        )
+        assert limits["--memory"] == ("4g", "LMER_DEVELOP_MEMORY")
+
+    def test_a_flag_beats_the_ladder_the_preset_could_not_reach(
+        self, resource_presets, tmp_path
+    ):
+        limits = self._limits(
+            [
+                "--preset", "astra", "--memory", "16g",
+                "develop", REPO_URL, "--exec", "true",
+            ],
+            {
+                "LMER_PRESETS_FILE": str(resource_presets),
+                "LMER_MEMORY": "2g",
+                "LMER_DEVELOP_MEMORY": "4g",
+            },
+            tmp_path,
+        )
+        assert limits["--memory"] == ("16g", "--memory")
+
+    def test_another_taskdef_keeps_the_general_limit(self, tmp_path):
+        limits = self._limits(
+            ["review", REPO_URL, "--exec", "true"],
+            {"LMER_MEMORY": "2g", "LMER_DEVELOP_MEMORY": "4g"},
+            tmp_path,
+        )
+        assert limits["--memory"] == ("2g", "LMER_MEMORY")
+
+    def test_the_repo_tier_reaches_the_launch(self, tmp_path):
+        """The per-taskdef-per-repo spelling, end to end: owner/repo derives
+        OWNER_REPO and outranks both the taskdef and the general value."""
+        limits = self._limits(
+            ["develop", REPO_URL, "--exec", "true"],
+            {
+                "LMER_MEMORY": "2g",
+                "LMER_DEVELOP_MEMORY": "4g",
+                "LMER_DEVELOP__OWNER_REPO__MEMORY": "8g",
+            },
+            tmp_path,
+        )
+        assert limits["--memory"] == ("8g", "LMER_DEVELOP__OWNER_REPO__MEMORY")

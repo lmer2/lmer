@@ -276,9 +276,9 @@ The container runs with:
 - Dropped capabilities (only essential ones retained: CHOWN, DAC_OVERRIDE, FOWNER, SETGID, SETUID)
 - No new privileges flag (`--security-opt no-new-privileges`)
 - Resource limits when running via the `lmer` CLI (defaults; each overridable, see [LMER-CLI.md](./LMER-CLI.md)):
-  - CPU: 1 core (`LMER_CPUS`)
-  - Memory: 2GB (`LMER_MEMORY`)
-  - Process limit: 512 (`LMER_PIDS_LIMIT`)
+  - CPU: 1 core (`LMER_CPUS`, or per taskdef/repo: `LMER_<TASK>_CPUS`, `LMER_<TASK>__<REPO>__CPUS`; `--cpus` overrides all three)
+  - Memory: 2GB (`LMER_MEMORY`, or per taskdef/repo: `LMER_<TASK>_MEMORY`, `LMER_<TASK>__<REPO>__MEMORY`; `--memory` overrides all three)
+  - Process limit: 512 (`LMER_PIDS_LIMIT`, global only)
 
 ## Makefile Commands
 

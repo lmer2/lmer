@@ -25,6 +25,7 @@ from typing import Callable, List
 from dotenv import dotenv_values, load_dotenv
 
 from .log import warning
+from .util import env_name_segment
 
 
 class InstallMode(Enum):
@@ -286,19 +287,70 @@ def default_env_file_candidates(
     ]
 
 
+@dataclass(frozen=True)
+class LaunchScope:
+    """What a launch is, for the scoped resource variables (issue #453).
+
+    ``task_id`` is the taskdef id the session runs (``None`` under
+    ``--no-task``) and ``repo_project`` the repository's project path —
+    ``agents/global``, host dropped — or ``None`` for a session with no
+    repository. Neither is trusted to be a legal env-var segment as it stands:
+    both are directory- and forge-supplied names, normalised on the way into a
+    variable name by :func:`resource_env_names`.
+    """
+
+    task_id: "str | None" = None
+    repo_project: "str | None" = None
+
+
+def resource_env_names(knob: str, scope: "LaunchScope | None") -> List[str]:
+    """Every variable that can set *knob* for this launch, most specific first.
+
+    ``LMER_<TASK>__<REPO>__<KNOB>`` > ``LMER_<TASK>_<KNOB>`` > ``LMER_<KNOB>``
+    (issue #453), so an operator can pin a taskdef's allocation — or one
+    taskdef's allocation on one repository — without it bleeding into every
+    other session.
+
+    Specificity decides, and the layer a value arrived through does not: by the
+    time a container is built, exports, ``.env`` files and the selected
+    preset's ``env`` have all been merged into ``os.environ``
+    (:func:`apply_env_file_defaults`, ``cli._resolve_and_apply_preset``), so
+    this ladder reads one already-merged environment. That is what stops a
+    general ``LMER_MEMORY`` — exported, or carried by whichever preset the
+    model selection happened to pick — from masking the taskdef's own value.
+
+    The single home of the candidate list: the resolvers read it and so does
+    anything that needs to say which variables were consulted, so "what is
+    read" cannot drift from "what is reported".
+
+    A scope whose ids normalise to nothing contributes no tier, leaving the
+    generic name — never a malformed one.
+    """
+    task = env_name_segment(scope.task_id) if scope else None
+    repo = env_name_segment(scope.repo_project) if scope else None
+    names: List[str] = []
+    if task and repo:
+        names.append(f"LMER_{task}__{repo}__{knob}")
+    if task:
+        names.append(f"LMER_{task}_{knob}")
+    names.append(f"LMER_{knob}")
+    return names
+
+
 def _resolve_limit_env(
-    name: str,
+    names: "list[str]",
     default: str,
     validator: Callable[[str], str | None],
     hint: str,
-) -> str:
-    """Resolve one container resource limit from ``name``, or warn and default.
+) -> "tuple[str, str]":
+    """Resolve one container resource limit from a candidate ladder.
 
     The shared skeleton behind :func:`_resolve_pids_limit`,
-    :func:`_resolve_cpus` and :func:`_resolve_memory`: read the variable,
-    strip it, and hand what remains to ``validator``. Unset or empty (after
-    stripping) is not a misconfiguration — it is the ordinary "no override"
-    case and yields ``default`` silently, without consulting ``validator``.
+    :func:`_resolve_cpus` and :func:`_resolve_memory`: walk *names* most
+    specific first (:func:`resource_env_names`), reading, stripping and
+    handing what remains to ``validator``. Unset or empty (after stripping) is
+    not a misconfiguration — it is the ordinary "no override" case and falls
+    through to the next candidate without consulting ``validator``.
 
     ``validator`` returns the string to hand the runtime rather than a bool,
     so a limit whose accepted spelling differs from what was typed can
@@ -306,21 +358,41 @@ def _resolve_limit_env(
     ``5``); ``None`` means rejected. Each validator's docstring is the single
     home for that limit's grammar and why it is drawn where it is.
 
-    Rejection is always warn-and-default — never an abort, never a
-    pass-through. That is the safety property these limits exist for: a
-    misconfigured value must not silently weaken or remove the bound, and it
-    must not stop a session from launching either. The warning therefore
-    names the variable, quotes what was read, states the grammar (``hint``)
-    and the default it fell back to.
+    A rejected value warns and falls through to the **next candidate** rather
+    than to the default (issue #453): a typo'd ``LMER_DEVELOP_MEMORY`` beside a
+    good ``LMER_MEMORY`` lands on the general value, which is what the operator
+    who set both would expect, and lands on the default only when nothing else
+    answers. Rejection is never an abort and never a pass-through, which is the
+    safety property these limits exist for: a misconfigured value must not
+    silently weaken or remove the bound, and must not stop a session launching
+    either.
+
+    Warnings are emitted after the walk rather than during it, so each one
+    names the bound that actually took effect. Naming the next *set* candidate
+    as it went would have predicted a value it had not validated — with two bad
+    candidates the first warning would name the second, which is then rejected
+    too.
+
+    Returns ``(value, source)`` — the string to pass the runtime, and the
+    variable that supplied it or ``"default"``. The source travels because the
+    launch diagnostics report it; see :func:`resource_limit_plan`.
     """
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    accepted = validator(raw)
-    if accepted is not None:
-        return accepted
-    warning(f"⚠️  Ignoring invalid {name}={raw!r} ({hint}); using default {default}")
-    return default
+    value, source = default, "default"
+    rejected: "list[tuple[str, str]]" = []
+    for name in names:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        accepted = validator(raw)
+        if accepted is None:
+            rejected.append((name, raw))
+            continue
+        value, source = accepted, name
+        break
+    outcome = f"using {source} ({value})" if source != "default" else f"using the default {value}"
+    for name, raw in rejected:
+        warning(f"⚠️  Ignoring invalid {name}={raw!r} ({hint}); {outcome}")
+    return value, source
 
 
 def _valid_pids_limit(raw: str) -> str | None:
@@ -353,10 +425,15 @@ def _valid_pids_limit(raw: str) -> str | None:
     return None
 
 
-def _resolve_pids_limit() -> str:
+#: The fork-bomb bound stays global-only: no taskdef- or repo-scoped spelling
+#: (issue #453 keeps PID policy as it is), so its ladder is one name long.
+PIDS_LIMIT_ENV = "LMER_PIDS_LIMIT"
+
+
+def _resolve_pids_limit() -> "tuple[str, str]":
     """The container ``--pids-limit`` value, from ``LMER_PIDS_LIMIT``."""
     return _resolve_limit_env(
-        "LMER_PIDS_LIMIT",
+        [PIDS_LIMIT_ENV],
         DEFAULT_PIDS_LIMIT,
         _valid_pids_limit,
         "must be a positive integer, or -1 for unlimited",
@@ -411,8 +488,9 @@ def _valid_cpus(raw: str) -> str | None:
 
     Anything else — ``0``, negatives, ``inf``/``nan``/scientific notation,
     non-numeric, magnitudes past :data:`_MAX_CPUS` (which could wrap to the
-    runtime's "unset" encoding) — is rejected and :func:`_resolve_limit_env`
-    warns and keeps :data:`DEFAULT_CPUS`. There is no "unlimited" spelling: a
+    runtime's "unset" encoding) — is rejected, and :func:`_resolve_limit_env`
+    warns and tries the next candidate in the ladder, reaching
+    :data:`DEFAULT_CPUS` when none answers. There is no "unlimited" spelling: a
     misconfigured value must never silently remove the CPU bound.
     """
     if _CPUS_RE.match(raw) and 0 < float(raw) <= _MAX_CPUS:
@@ -420,13 +498,16 @@ def _valid_cpus(raw: str) -> str | None:
     return None
 
 
-def _resolve_cpus() -> str:
-    """The container ``--cpus`` value, from ``LMER_CPUS``."""
+CPUS_HINT = f"must be a positive number of cores up to {_MAX_CPUS:g}, e.g. 2 or 0.5"
+
+
+def _resolve_cpus(scope: "LaunchScope | None" = None) -> "tuple[str, str]":
+    """The container ``--cpus`` value, from the ``CPUS`` ladder for *scope*."""
     return _resolve_limit_env(
-        "LMER_CPUS",
+        resource_env_names("CPUS", scope),
         DEFAULT_CPUS,
         _valid_cpus,
-        f"must be a positive number of cores up to {_MAX_CPUS:g}, e.g. 2 or 0.5",
+        CPUS_HINT,
     )
 
 
@@ -442,8 +523,9 @@ def _valid_memory(raw: str) -> str | None:
 
     Anything else — sizes below the runtime's minimum (e.g. a bare ``8``
     meaning eight bytes), ``0``, negatives, fractions, unknown suffixes,
-    non-numeric — is rejected and :func:`_resolve_limit_env` warns and keeps
-    :data:`DEFAULT_MEMORY`. As with :func:`_valid_cpus`, there is no
+    non-numeric — is rejected, and :func:`_resolve_limit_env` warns and tries
+    the next candidate in the ladder, reaching :data:`DEFAULT_MEMORY` when none
+    answers. As with :func:`_valid_cpus`, there is no
     "unlimited" spelling: a misconfigured value must never silently remove
     the memory bound. (Oversized values need no ceiling here: the runtime's
     int64 saturation is negative, not the "unset" encoding, so they fail
@@ -456,19 +538,52 @@ def _valid_memory(raw: str) -> str | None:
     return raw if size >= _MIN_MEMORY_BYTES else None
 
 
-def _resolve_memory() -> str:
-    """The container ``--memory`` value, from ``LMER_MEMORY``."""
+MEMORY_HINT = "must be a size of at least 6m, e.g. 4g or 512m"
+
+
+def _resolve_memory(scope: "LaunchScope | None" = None) -> "tuple[str, str]":
+    """The container ``--memory`` value, from the ``MEMORY`` ladder for *scope*."""
     return _resolve_limit_env(
-        "LMER_MEMORY",
+        resource_env_names("MEMORY", scope),
         DEFAULT_MEMORY,
         _valid_memory,
-        "must be a size of at least 6m, e.g. 4g or 512m",
+        MEMORY_HINT,
     )
 
 
-def _resource_limit_args(runtime: str) -> List[str]:
+@dataclass(frozen=True)
+class ResourceLimit:
+    """One resource bound as the launch actually settled it (issue #453).
+
+    ``source`` is the variable that supplied the value, the flag that
+    overrode it, or ``"default"``. It exists so the launch diagnostic can be
+    rendered from the same object the container arguments are built from — a
+    diagnostic computed separately is one that can disagree with what was
+    passed. A flag the rootless-podman delegation gate dropped is not in the
+    plan at all, so it reaches neither.
     """
-    Resource-limit flags (CPU, memory, PIDs), gated where required.
+
+    flag: str
+    value: str
+    source: str
+
+
+def resource_limit_plan(
+    runtime: str,
+    scope: "LaunchScope | None" = None,
+    overrides: "dict[str, str] | None" = None,
+) -> "List[ResourceLimit]":
+    """What resource bounds this launch gets, and where each came from.
+
+    The one resolution: :func:`_resource_limit_args` renders these into
+    ``docker``/``podman`` arguments and the CLI renders the same list into its
+    launch diagnostic.
+
+    *overrides* maps a flag (``"--memory"``) to a value the caller has already
+    validated — the ``--memory``/``--cpus`` launch flags, which beat every
+    environment tier because the caller is attached and has said what they
+    want. The environment ladder is not consulted for an overridden flag, so
+    no scoped variable can displace it.
 
     crun aborts when --cpus is set but the cpu controller isn't delegated
     to the user slice, so ROOTLESS podman on cgroup v2 gates each flag on
@@ -479,28 +594,32 @@ def _resource_limit_args(runtime: str) -> List[str]:
     would silently shed the --pids-limit fork-bomb bound on hosts where
     the limits worked fine. Docker (root daemon) always passes the flags.
     """
+    overrides = overrides or {}
     # Resolvers stay unevaluated until a flag is actually passed, so an
     # invalid override never warns about a default the gate then drops.
     flag_specs = [
-        ("--cpus", _resolve_cpus, "cpu"),
-        ("--memory", _resolve_memory, "memory"),
+        ("--cpus", lambda: _resolve_cpus(scope), "cpu"),
+        ("--memory", lambda: _resolve_memory(scope), "memory"),
         ("--pids-limit", _resolve_pids_limit, "pids"),
     ]
     controllers = None
     if runtime == "podman" and os.geteuid() != 0:
         controllers = _available_controllers()
-    if controllers is None:
-        # Gate does not apply (docker, root, cgroup v1, unreadable slice) —
-        # pass all resource flags.
-        return [arg for flag, resolve, _controller in flag_specs for arg in (flag, resolve())]
 
-    args: List[str] = []
+    plan: List[ResourceLimit] = []
     dropped: list[str] = []
     for flag, resolve, controller in flag_specs:
-        if controller in controllers:
-            args += [flag, resolve()]
-        else:
+        # None means the gate does not apply (docker, root, cgroup v1,
+        # unreadable slice): pass every flag, as before.
+        applied = controllers is None or controller in controllers
+        if not applied:
             dropped.append(controller)
+            continue
+        if flag in overrides:
+            plan.append(ResourceLimit(flag, overrides[flag], flag))
+            continue
+        value, source = resolve()
+        plan.append(ResourceLimit(flag, value, source))
     if dropped:
         uid = os.getuid()
         dropped_flags = [f for f, _, c in flag_specs if c in dropped]
@@ -514,10 +633,20 @@ def _resource_limit_args(runtime: str) -> List[str]:
         warning("     [Service]")
         warning("     Delegate=cpu cpuset io memory pids")
         warning("   then: sudo systemctl daemon-reload")
-    return args
+    return plan
 
 
-def base_run_args(runtime: str, exec_mode: bool, user: str) -> List[str]:
+def _resource_limit_args(plan: "List[ResourceLimit]") -> List[str]:
+    """Render a resource plan into runtime arguments."""
+    return [arg for limit in plan for arg in (limit.flag, limit.value)]
+
+
+def base_run_args(
+    runtime: str,
+    exec_mode: bool,
+    user: str,
+    limits: "List[ResourceLimit] | None" = None,
+) -> List[str]:
     """
     Build base container run arguments.
 
@@ -532,6 +661,9 @@ def base_run_args(runtime: str, exec_mode: bool, user: str) -> List[str]:
         runtime: Container runtime ('docker' or 'podman')
         exec_mode: Whether running in exec mode
         user: Container user specification (e.g., 'developer' or '1000:1000')
+        limits: The resource plan from :func:`resource_limit_plan`, so the
+            caller that announced it passes exactly what it announced.
+            Omitted, an unscoped plan is resolved here.
 
     Returns:
         List of base Docker/Podman arguments
@@ -550,8 +682,10 @@ def base_run_args(runtime: str, exec_mode: bool, user: str) -> List[str]:
         args += ["--security-opt", "label=disable"]
 
     # Resource limits (CPU, memory, PIDs), gated on rootless podman where
-    # delegation requires it — see _resource_limit_args.
-    args += _resource_limit_args(runtime)
+    # delegation requires it — see resource_limit_plan.
+    args += _resource_limit_args(
+        resource_limit_plan(runtime) if limits is None else limits
+    )
     if runtime == "podman":
         # Podman-specific: maintain user ID mapping for SSH agent and file permissions
         args += ["--userns=keep-id"]

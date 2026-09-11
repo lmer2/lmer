@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the top-level lmer CLI argument parser."""
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -321,3 +322,101 @@ def test_the_command_line_still_exits_the_way_it_did(capsys):
     with pytest.raises(SystemExit):
         parse_args(["--ports"])
     assert "usage:" in capsys.readouterr().err
+
+
+class TestResourceLimitFlags:
+    """``--memory`` / ``--cpus``: a launch-side override of the env ladder
+    (issue #453). The platform's assistant launch passes them; they are not a
+    spawn API field."""
+
+    def test_both_flags_parse(self):
+        ns, _ = parse_args(["develop", "https://example.com/x/y", "--memory", "4g", "--cpus", "2"])
+        assert (ns.memory, ns.cpus) == ("4g", "2")
+
+    def test_absent_flags_are_none_so_the_ladder_answers(self):
+        ns, _ = parse_args(["develop", "https://example.com/x/y"])
+        assert ns.memory is None and ns.cpus is None
+
+    def test_an_invalid_memory_value_is_refused_not_defaulted(self, capsys):
+        """The other posture from the environment tiers: an attached caller
+        asked for something, and starting with a different bound is the
+        failure, so this aborts instead of warning."""
+        ns, _ = parse_args(["develop", "https://example.com/x/y", "--memory", "8"])
+        assert _validate_parsed_args(ns) == 2
+        assert "--memory" in capsys.readouterr().out
+
+    def test_an_invalid_cpus_value_is_refused(self):
+        ns, _ = parse_args(["develop", "https://example.com/x/y", "--cpus", "all"])
+        assert _validate_parsed_args(ns) == 2
+
+    def test_valid_values_pass_validation(self):
+        ns, _ = parse_args(["develop", "https://example.com/x/y", "--memory", "512m", "--cpus", "0.5"])
+        assert _validate_parsed_args(ns) is None
+
+    def test_surrounding_whitespace_is_accepted_as_the_env_tiers_do(self):
+        ns, _ = parse_args(["develop", "https://example.com/x/y", "--memory", "  4g  "])
+        assert _validate_parsed_args(ns) is None
+
+    def test_a_blank_value_is_no_override_rather_than_a_refusal(self):
+        """A wrapper passing --memory "$OVERRIDE" with the variable unset has
+        expressed no preference; the env tiers read blank as unset and so does
+        this."""
+        ns, _ = parse_args(["develop", "https://example.com/x/y", "--memory", ""])
+        assert _validate_parsed_args(ns) is None
+        assert ns.memory is None
+
+    def test_an_accepted_value_is_stored_normalised(self):
+        """The validators may normalise; the env path passes what the validator
+        returned, so the flag path must too."""
+        ns, _ = parse_args(["develop", "https://example.com/x/y", "--cpus", "  2  "])
+        assert _validate_parsed_args(ns) is None
+        assert ns.cpus == "2"
+
+    def test_help_points_at_the_scoped_variables(self, capsys):
+        """The flag is where an operator meets this feature; the help has to
+        name the ladder it overrides."""
+        with pytest.raises(SystemExit):
+            parse_args(["--help"])
+        out = capsys.readouterr().out
+        assert "LMER_<TASK>_MEMORY" in out
+        assert "LMER_<TASK>__<REPO>__MEMORY" in out
+
+
+class TestResourceLimitDiagnostic:
+    """The 📐 line is verbose-only, like the preset and harness lines beside
+    it — asserted so the docs' claim about it stays checkable."""
+
+    def _announce(self, verbose):
+        import io
+        import contextlib
+
+        from lmer_cli.cli import _announce_resource_limits
+        from lmer_cli.runtime import ResourceLimit
+
+        env = {"LMER_VERBOSE": "1"} if verbose else {}
+        plan = [ResourceLimit("--memory", "4g", "LMER_DEVELOP_MEMORY")]
+        buffer = io.StringIO()
+        with patch.dict(os.environ, env, clear=False):
+            if not verbose:
+                os.environ.pop("LMER_VERBOSE", None)
+            with contextlib.redirect_stdout(buffer):
+                _announce_resource_limits(plan)
+        return buffer.getvalue()
+
+    def test_verbose_names_the_value_and_its_source(self):
+        out = self._announce(verbose=True)
+        assert "memory=4g (LMER_DEVELOP_MEMORY)" in out
+
+    def test_without_verbose_it_says_nothing(self):
+        assert self._announce(verbose=False) == ""
+
+    def test_an_empty_plan_prints_no_header(self):
+        from lmer_cli.cli import _announce_resource_limits
+        import io
+        import contextlib
+
+        buffer = io.StringIO()
+        with patch.dict(os.environ, {"LMER_VERBOSE": "1"}):
+            with contextlib.redirect_stdout(buffer):
+                _announce_resource_limits([])
+        assert buffer.getvalue() == ""

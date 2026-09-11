@@ -523,6 +523,18 @@ for name in $(compgen -e | sort || true); do
         # the name carries the host and cannot be enumerated (tokens.get_token).
         GITLAB_TOKEN_*) add_env "$name"; continue ;;
         LMER_PLATFORM_*) ;;
+        # Container resource limits (issue #453). Matched as a pattern for
+        # GITLAB_TOKEN_*'s reason: the scoped spellings carry a taskdef id and
+        # a repository path (LMER_DEVELOP__AGENTS_GLOBAL__MEMORY), so they
+        # cannot be enumerated here. Without this the feature is inert for
+        # exactly the sessions it was written for — a develop run the
+        # supervising assistant spawns resolves its ladder inside THIS
+        # container, so a limit exported on the host reaches nothing, while
+        # LMER_PLATFORM_ASSISTANT_MEMORY beside it forwards on the prefix
+        # above. Listed after LMER_PLATFORM_* so those keep the blocked and
+        # path-checked handling below. ~/.lmer/.env remains the alternative:
+        # the daemon loads it and it rides the state mount.
+        LMER_MEMORY|LMER_CPUS|LMER_*_MEMORY|LMER_*_CPUS) add_env "$name"; continue ;;
         *) continue ;;
     esac
     blocked=0
