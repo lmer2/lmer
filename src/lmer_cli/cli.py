@@ -41,6 +41,7 @@ from .container_home import ensure_container_home
 from .log import error, info, success, warning
 from .mounts import (
     CONTAINER_CLONE_CACHE_DIR,
+    CONTAINER_GPG_AGENT_SOCKET_PATH,
     CONTAINER_RELEASE_SIGNING_KEY_PATH,
     MOUNT_LINKS_ENV,
     DirMountSpec,
@@ -50,6 +51,7 @@ from .mounts import (
     format_mount_links,
     build_checkout_mount,
     build_clone_cache_mounts,
+    build_gpg_agent_mounts,
     build_release_signing_key_mount,
     build_container_home_mounts,
     build_dir_mounts,
@@ -62,7 +64,10 @@ from .mounts import (
     build_user_harness_mounts,
     build_user_mounts,
     build_workspace_mount,
+    container_gpg_pubring_path,
     plan_credential_mounts,
+    resolve_gpg_extra_socket,
+    resolve_gpg_pubring,
     build_service_mode_mounts,
     resolve_host_clone_cache_dir,
     resolve_host_uv_cache_dir,
@@ -195,6 +200,27 @@ RELEASE_TASK_ID = "release"
 RELEASE_GITHUB_TOKEN_ENV = "LMER_RELEASE_GITHUB_TOKEN"
 RELEASE_SIGNING_KEY_ENV = "LMER_RELEASE_SIGNING_KEY"
 
+
+# --- gpg-agent forwarding (issue #355) -------------------------------------
+#
+# Same gate mechanism as the release credentials above, for the same reason:
+# the resolved task id is the value the operator selected at launch, is
+# available host-side unconditionally, and is the scoping unit the operator
+# chose ("gpg access is gated by taskdef"). It keys on the id, NOT on the
+# taskdef resolving host-side — the `ansible` taskdef ships from the work
+# repo, which is invisible from here, so an unresolved `ansible` session
+# still gets gpg while a `develop` session never does.
+ANSIBLE_TASK_ID = "ansible"
+
+# - LMER_ANSIBLE_GPG_AGENT — host side: `auto` (ask gpgconf for the
+#   agent-extra-socket) or the socket path; container side: the fixed
+#   read-only bind path CONTAINER_GPG_AGENT_SOCKET_PATH. Unset = off.
+# - LMER_ANSIBLE_GPG_PUBRING — host side: optional explicit public keyring,
+#   otherwise derived from the host gpg home; container side: the remapped
+#   bind path. Both are path remaps, so no host location enters the
+#   container env.
+ANSIBLE_GPG_AGENT_ENV = "LMER_ANSIBLE_GPG_AGENT"
+ANSIBLE_GPG_PUBRING_ENV = "LMER_ANSIBLE_GPG_PUBRING"
 
 
 def _resolve_requested_ports(
@@ -1590,6 +1616,49 @@ def _release_credential_env(
     return entries, mount_args, None
 
 
+def _ansible_gpg_env(
+    runtime: str, task_id: str | None
+) -> tuple[dict[str, str | None], list[str], str | None]:
+    """The gpg-agent forwarding gate: env entries + socket/keyring mounts.
+
+    Returns ``(env_entries, mount_args, fatal)`` — the shape
+    :func:`_release_credential_env` established, for the same reasons.
+
+    ``env_entries`` ALWAYS carries both keys. For an ansible session with
+    the feature configured they hold the **container** paths; everywhere
+    else they are seeded ``None``, which is what blocks the leak: a key
+    already in the container env dict is skipped by both the .env merge and
+    the preset seeding loop in main(), so neither a ``.env`` nor a preset
+    can hand another taskdef a socket to sign with.
+
+    ``fatal`` is a reason string when the feature is *configured* but
+    unusable. Aborting is the point: a vault session that cannot decrypt
+    must not start, and a gpg failure deep inside a playbook run is worse
+    to diagnose than a refusal at the door (the release signing key's
+    fail-fast precedent). An unset variable is not an error — the ansible
+    session simply launches without gpg — and no other taskdef ever
+    evaluates the guard.
+    """
+    entries: dict[str, str | None] = {
+        ANSIBLE_GPG_AGENT_ENV: None,
+        ANSIBLE_GPG_PUBRING_ENV: None,
+    }
+    if task_id != ANSIBLE_TASK_ID:
+        return entries, [], None
+    configured = (os.environ.get(ANSIBLE_GPG_AGENT_ENV) or "").strip()
+    if not configured:
+        return entries, [], None
+    socket_path, reason = resolve_gpg_extra_socket(configured)
+    if reason:
+        return entries, [], reason
+    pubring_path, reason = resolve_gpg_pubring(os.environ.get(ANSIBLE_GPG_PUBRING_ENV))
+    if reason:
+        return entries, [], reason
+    entries[ANSIBLE_GPG_AGENT_ENV] = CONTAINER_GPG_AGENT_SOCKET_PATH
+    entries[ANSIBLE_GPG_PUBRING_ENV] = container_gpg_pubring_path(pubring_path)
+    return entries, build_gpg_agent_mounts(runtime, socket_path, pubring_path), None
+
+
 def _warn_on_scoped_preset_tier_override(
     preset_source: str | None,
     task_id: str | None,
@@ -2626,6 +2695,23 @@ def main(argv: list[str] | None = None) -> int:
     if release_env_entries.get(RELEASE_GITHUB_TOKEN_ENV):
         success("🔑 Release GitHub PAT provisioned (release-taskdef session)")
 
+    # gpg-agent forwarding (#355): the host agent's EXTRA socket — the one
+    # designed for forwarding, where a client can sign and decrypt but never
+    # export or reconfigure a key — reaches ansible-taskdef sessions only,
+    # keyed on the resolved task id exactly like the release credentials.
+    # Configured-but-unusable is fatal for that session and only that one: a
+    # vault session that cannot decrypt must not start.
+    gpg_env_entries, gpg_mounts, gpg_fatal = _ansible_gpg_env(runtime, task_id)
+    if gpg_fatal:
+        error(f"❌ {gpg_fatal}")
+        return 1
+    if gpg_mounts:
+        run += gpg_mounts
+        success(
+            f"✅ Forwarding gpg-agent → {CONTAINER_GPG_AGENT_SOCKET_PATH} (ro), "
+            f"public keyring → {gpg_env_entries[ANSIBLE_GPG_PUBRING_ENV]} (ro)"
+        )
+
     # Optional: mount the host's uv cache so target-repo `uv sync` reuses
     # already-downloaded packages instead of re-fetching them each session.
     # Off by default; opt-in via LMER_MOUNT_UV_CACHE.
@@ -2997,6 +3083,12 @@ def main(argv: list[str] | None = None) -> int:
         # seeding loop can forward them (the LMER_NAPKIN_TOKEN precedent
         # above).
         **release_env_entries,
+        # gpg-agent forwarding (#355), resolved by the ansible gate above.
+        # Container paths only — the host socket/keyring locations never
+        # enter the container env. Every non-ansible session carries None
+        # seeds, so neither the .env merge below nor the preset seeding loop
+        # can forward them (the release pair's precedent, same mechanism).
+        **gpg_env_entries,
         # Task routing env
         "LMER_TASK": task_id if not ns.no_task else None,
         "LMER_TASK_TARGET": primary_target if not ns.no_task else None,
