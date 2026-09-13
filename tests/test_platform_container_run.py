@@ -331,9 +331,12 @@ def test_container_resource_limits_are_forwarded_including_scoped_spellings(host
     values = {
         "LMER_MEMORY": "4g",
         "LMER_CPUS": "4",
+        "LMER_GPU": "all",
         "LMER_DEVELOP_MEMORY": "8g",
         "LMER_DEVELOP__AGENTS_GLOBAL__MEMORY": "16g",
         "LMER_CODE_REVIEW__OWNER_REPO__CPUS": "2",
+        "LMER_DEVELOP_GPU": "0",
+        "LMER_DEVELOP__AGENTS_GLOBAL__GPU": "0,1",
     }
     run = host.run(env=values)
     for name in values:
@@ -355,8 +358,13 @@ def test_the_assistants_own_allocation_still_forwards_on_the_platform_prefix(hos
 
 
 def test_an_unrelated_lmer_variable_is_still_not_forwarded(host):
-    """The pattern is the two resource knobs, not LMER_* at large: forwarding
+    """The pattern is the resource knobs, not LMER_* at large: forwarding
     by prefix would carry names this allowlist exists to withhold."""
-    run = host.run(env={"LMER_SOMETHING_ELSE": "x", "LMER_MEMORY_LIMIT_NOTES": "y"})
+    run = host.run(env={
+        "LMER_SOMETHING_ELSE": "x",
+        "LMER_MEMORY_LIMIT_NOTES": "y",
+        "LMER_GPU_NOTES": "z",
+    })
     assert "LMER_SOMETHING_ELSE" not in run.env_names
     assert "LMER_MEMORY_LIMIT_NOTES" not in run.env_names
+    assert "LMER_GPU_NOTES" not in run.env_names

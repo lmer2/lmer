@@ -412,7 +412,9 @@ _EXPECTED_CHANNEL = "C0123ABCDEF"
 _EXPECTED_THREAD_TS = "1700000000.123456"
 
 
-def _make_main_mocks(captured_env: dict | None = None, *, registry_dir=None):
+def _make_main_mocks(
+    captured_env: dict | None = None, *, registry_dir=None, runtime_rc=0
+):
     """Return a context-manager stack of patches sufficient to let main() run
     without a real container runtime.  Patches are applied in the caller via
     ``unittest.mock.patch`` calls so the test controls what is returned.
@@ -530,7 +532,7 @@ def _make_main_mocks(captured_env: dict | None = None, *, registry_dir=None):
 
     # --- subprocess.call: prevent actually launching a container ---
     stack.enter_context(
-        patch("lmer_cli.cli.subprocess.call", return_value=0)
+        patch("lmer_cli.cli.subprocess.call", return_value=runtime_rc)
     )
 
     return stack
@@ -835,14 +837,20 @@ class TestSlackTokenRedaction:
 # ---------------------------------------------------------------------------
 
 
-def _run_main_repoless(argv, captured_env=None, resolve_fails=True):
+def _run_main_repoless(
+    argv, captured_env=None, resolve_fails=True, runtime_rc=0, extra_env=None
+):
     """Run main() with the standard mock stack; optionally make repo
     resolution raise ResolveError (simulating a non-git cwd)."""
     from lmer_cli import resolve as resolve_mod
 
-    env_in = {**_BASE_ENV, "SLACK_BOT_TOKEN": "xoxb-test-bot-token"}
+    env_in = {
+        **_BASE_ENV,
+        "SLACK_BOT_TOKEN": "xoxb-test-bot-token",
+        **(extra_env or {}),
+    }
     with patch.dict(os.environ, env_in, clear=True):
-        with _make_main_mocks(captured_env=captured_env):
+        with _make_main_mocks(captured_env=captured_env, runtime_rc=runtime_rc):
             ctx = (
                 patch(
                     "lmer_cli.cli.resolve.normalize_repo_url",
@@ -858,6 +866,43 @@ def _run_main_repoless(argv, captured_env=None, resolve_fails=True):
                 from lmer_cli.cli import main
 
                 return main(argv)
+
+
+class TestGpuLaunchWiring:
+    """The effective grant controls both the marker and runtime-failure posture."""
+
+    def test_granted_value_is_forwarded_as_the_container_marker(self):
+        from lmer_cli.runtime import GPUGrant
+
+        captured: dict = {}
+        grant = GPUGrant("0,1", "LMER_GPU", ("--device", "nvidia.com/gpu=0"))
+        with patch("lmer_cli.cli.gpu_grant_plan", return_value=grant):
+            assert _run_main_repoless(["chat", _SLACK_URL], captured_env=captured) == 0
+        assert captured["LMER_GPU_GRANTED"] == "0,1"
+
+    def test_disabled_plan_blocks_an_ambient_marker(self):
+        from lmer_cli.runtime import GPUGrant
+
+        captured: dict = {}
+        with patch("lmer_cli.cli.gpu_grant_plan", return_value=GPUGrant(None, "default")):
+            assert _run_main_repoless(
+                ["chat", _SLACK_URL],
+                captured_env=captured,
+                extra_env={"LMER_GPU_GRANTED": "all"},
+            ) == 0
+        assert captured["LMER_GPU_GRANTED"] is None
+
+    def test_runtime_start_rejection_is_not_retried_without_gpu(self, capsys):
+        from lmer_cli.runtime import GPUGrant
+
+        grant = GPUGrant("all", "LMER_GPU", ("--device", "nvidia.com/gpu=all"))
+        with patch("lmer_cli.cli.gpu_grant_plan", return_value=grant):
+            rc = _run_main_repoless(["chat", _SLACK_URL], runtime_rc=125)
+        assert rc == 125
+        out = capsys.readouterr().out
+        assert "will not retry without the requested GPU" in out
+        assert "NVIDIA driver and Container Toolkit" in out
+        assert "CDI specification" in out
 
 
 class TestSlackOnlyNoRepo:

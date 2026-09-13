@@ -279,6 +279,7 @@ The container runs with:
   - CPU: 1 core (`LMER_CPUS`, or per taskdef/repo: `LMER_<TASK>_CPUS`, `LMER_<TASK>__<REPO>__CPUS`; `--cpus` overrides all three)
   - Memory: 2GB (`LMER_MEMORY`, or per taskdef/repo: `LMER_<TASK>_MEMORY`, `LMER_<TASK>__<REPO>__MEMORY`; `--memory` overrides all three)
   - Process limit: 512 (`LMER_PIDS_LIMIT`, global only)
+  - GPU: off by default (`LMER_GPU`, or per taskdef/repo: `LMER_<TASK>_GPU`, `LMER_<TASK>__<REPO>__GPU`; requires NVIDIA runtime support)
 
 ## Makefile Commands
 

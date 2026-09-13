@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Tests for lmer_cli.runtime module"""
 
+import csv
 import os
 import pytest
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -23,7 +25,10 @@ from lmer_cli.runtime import (
     _resolve_cpus,
     _resolve_limit_env,
     _resolve_memory,
+    _resolve_gpu,
     _resolve_pids_limit,
+    GPUGrant,
+    gpu_grant_plan,
     LaunchScope,
     resource_env_names,
     resource_limit_plan,
@@ -285,6 +290,11 @@ class TestBaseRunArgs:
         with patch.dict(os.environ, {"LMER_MEMORY": "lots"}):
             args = base_run_args("docker", False, "developer")
             assert args[args.index("--memory") + 1] == DEFAULT_MEMORY
+
+    def test_base_args_use_the_announced_gpu_plan(self):
+        grant = GPUGrant("0", "LMER_GPU", ("--gpus", "device=0"))
+        args = base_run_args("docker", False, "developer", gpu=grant)
+        assert args[args.index("--gpus") + 1] == "device=0"
 
 
 class TestResolvePidsLimit:
@@ -550,6 +560,178 @@ class TestResolveMemory:
         out = capsys.readouterr().out
         assert "LMER_MEMORY" in out
         assert DEFAULT_MEMORY in out
+
+
+class TestResolveGpu:
+    """GPU access is absent by default and uses the scoped resource ladder."""
+
+    def test_unset_and_blank_disable_gpu_access(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert _resolve_gpu() == ("", "default")
+        with patch.dict(os.environ, {"LMER_GPU": "   "}, clear=True):
+            assert _resolve_gpu() == ("", "default")
+
+    @pytest.mark.parametrize("value", ["all", "0", "0,1", "12,3,400"])
+    def test_supported_spellings_are_accepted(self, value):
+        with patch.dict(os.environ, {"LMER_GPU": value}, clear=True):
+            assert _resolve_gpu() == (value, "LMER_GPU")
+
+    @pytest.mark.parametrize(
+        "value", ["ALL", "gpu0", "0-1", "0,", ",0", "0,,1", "٣"]
+    )
+    def test_other_spellings_warn_and_disable(self, value, capsys):
+        with patch.dict(os.environ, {"LMER_GPU": value}, clear=True):
+            assert _resolve_gpu() == ("", "default")
+        out = capsys.readouterr().out
+        assert "LMER_GPU" in out
+        assert "leaving the resource disabled" in out
+
+    def test_invalid_specific_value_falls_through_to_general(self, capsys):
+        scope = LaunchScope("develop", "group/project")
+        with patch.dict(
+            os.environ,
+            {"LMER_DEVELOP__GROUP_PROJECT__GPU": "many", "LMER_GPU": "0"},
+            clear=True,
+        ):
+            assert _resolve_gpu(scope) == ("0", "LMER_GPU")
+        assert "using LMER_GPU (0)" in capsys.readouterr().out
+
+    def test_repo_value_beats_task_and_general_values(self):
+        scope = LaunchScope("develop", "group/project")
+        with patch.dict(
+            os.environ,
+            {
+                "LMER_GPU": "0",
+                "LMER_DEVELOP_GPU": "1",
+                "LMER_DEVELOP__GROUP_PROJECT__GPU": "0,1",
+            },
+            clear=True,
+        ):
+            assert _resolve_gpu(scope) == (
+                "0,1",
+                "LMER_DEVELOP__GROUP_PROJECT__GPU",
+            )
+
+
+class TestGpuGrantPlan:
+    """Runtime metadata decides whether an accepted request becomes a grant."""
+
+    def test_disabled_request_never_reads_runtime_metadata(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run") as run:
+                assert gpu_grant_plan("docker") == GPUGrant(None, "default")
+        run.assert_not_called()
+
+    def test_docker_all_uses_the_native_flag(self):
+        info = subprocess.CompletedProcess([], 0, '{"runc": {}, "nvidia": {}}', "")
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info) as run:
+                grant = gpu_grant_plan("docker")
+        assert grant == GPUGrant("all", "LMER_GPU", ("--gpus", "all"))
+        run.assert_called_once_with(
+            ["docker", "info", "--format", "{{json .Runtimes}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_docker_device_list_survives_csv_decoding(self):
+        info = subprocess.CompletedProcess([], 0, '{"nvidia": {}}', "")
+        with patch.dict(os.environ, {"LMER_GPU": "0,1"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("docker")
+        options = next(csv.reader([grant.args[1]]))
+        device_option = next(option for option in options if option.startswith("device="))
+        assert device_option.removeprefix("device=").split(",") == ["0", "1"]
+
+    def test_podman_uses_one_cdi_selector_per_device(self):
+        info = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"host":{"discoveredDevices":['
+            '{"source":"cdi","id":"nvidia.com/gpu=all"},'
+            '{"source":"cdi","id":"nvidia.com/gpu=0"}]}}',
+            "",
+        )
+        with patch.dict(os.environ, {"LMER_GPU": "0,1"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("podman")
+        assert grant.args == (
+            "--device",
+            "nvidia.com/gpu=0",
+            "--device",
+            "nvidia.com/gpu=1",
+        )
+
+    def test_podman_all_uses_the_cdi_all_selector(self):
+        info = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"host":{"discoveredDevices":['
+            '{"source":"cdi","id":"nvidia.com/gpu=all"}]}}',
+            "",
+        )
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info) as run:
+                grant = gpu_grant_plan("podman")
+        assert grant.args == ("--device", "nvidia.com/gpu=all")
+        run.assert_called_once_with(
+            ["podman", "info", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_podman_requires_a_cdi_discovered_device(self, capsys):
+        info = subprocess.CompletedProcess(
+            [],
+            0,
+            '{"host":{"discoveredDevices":['
+            '{"source":"other","id":"nvidia.com/gpu=all"}]}}',
+            "",
+        )
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("podman")
+        assert grant.value is None
+        assert "launching without GPU access" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        ("runtime", "stdout", "expected"),
+        [
+            ("docker", '{"runc": {}}', "nvidia runtime"),
+            ("podman", '{"host":{"discoveredDevices":[]}}', "CDI device"),
+        ],
+    )
+    def test_missing_support_drops_the_grant_with_remediation(
+        self, runtime, stdout, expected, capsys
+    ):
+        info = subprocess.CompletedProcess([], 0, stdout, "")
+        with patch.dict(os.environ, {"LMER_GPU": "0"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan(runtime)
+        assert grant.value is None and grant.args == ()
+        assert grant.source == "LMER_GPU; unsupported"
+        out = capsys.readouterr().out
+        assert expected in out
+        assert "launching without GPU access" in out
+        assert "NVIDIA" in out
+
+    def test_unreadable_metadata_drops_the_grant(self, capsys):
+        info = subprocess.CompletedProcess([], 1, "", "daemon unavailable")
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("docker")
+        assert grant.value is None
+        assert "docker info exited 1" in capsys.readouterr().out
+
+    def test_malformed_metadata_drops_the_grant(self, capsys):
+        info = subprocess.CompletedProcess([], 0, "not-json", "")
+        with patch.dict(os.environ, {"LMER_GPU": "all"}, clear=True):
+            with patch("lmer_cli.runtime.subprocess.run", return_value=info):
+                grant = gpu_grant_plan("podman")
+        assert grant.value is None
+        assert "podman info returned malformed JSON" in capsys.readouterr().out
 
 
 class TestResolveLimitEnv:

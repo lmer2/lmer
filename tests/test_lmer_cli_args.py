@@ -420,3 +420,33 @@ class TestResourceLimitDiagnostic:
             with contextlib.redirect_stdout(buffer):
                 _announce_resource_limits([])
         assert buffer.getvalue() == ""
+
+    def test_gpu_grant_is_shown_beside_the_limits(self):
+        import contextlib
+        import io
+
+        from lmer_cli.cli import _announce_resource_limits
+        from lmer_cli.runtime import GPUGrant, ResourceLimit
+
+        buffer = io.StringIO()
+        with patch.dict(os.environ, {"LMER_VERBOSE": "1"}):
+            with contextlib.redirect_stdout(buffer):
+                _announce_resource_limits(
+                    [ResourceLimit("--cpus", "2", "LMER_CPUS")],
+                    GPUGrant("0,1", "LMER_DEVELOP_GPU", ()),
+                )
+        out = buffer.getvalue()
+        assert "cpus=2 (LMER_CPUS), gpu=0,1 (LMER_DEVELOP_GPU)" in out
+
+    def test_unsupported_gpu_request_is_shown_as_no_grant(self):
+        import contextlib
+        import io
+
+        from lmer_cli.cli import _announce_resource_limits
+        from lmer_cli.runtime import GPUGrant
+
+        buffer = io.StringIO()
+        with patch.dict(os.environ, {"LMER_VERBOSE": "1"}):
+            with contextlib.redirect_stdout(buffer):
+                _announce_resource_limits([], GPUGrant(None, "LMER_GPU; unsupported"))
+        assert "gpu=none (LMER_GPU; unsupported)" in buffer.getvalue()

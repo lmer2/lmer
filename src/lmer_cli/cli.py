@@ -121,6 +121,8 @@ from .runtime import (
     CPUS_HINT,
     default_env_file_candidates,
     detect_runtime,
+    gpu_grant_plan,
+    gpu_remediation,
     LaunchScope,
     lmer_state_dir,
     MEMORY_HINT,
@@ -1212,7 +1214,7 @@ def _display_env_config_cli(
     print("---")
 
 
-def _announce_resource_limits(limits: "list") -> None:
+def _announce_resource_limits(limits: "list", gpu=None) -> None:
     """Say what bounds this container gets and what set each one (issue #453).
 
     Rendered from the plan the run arguments are built from, so the line and
@@ -1222,12 +1224,14 @@ def _announce_resource_limits(limits: "list") -> None:
     ladder, or ``default``; with three tiers per knob, which one won is the
     thing an operator cannot infer from the value alone.
     """
-    if not limits:
+    if not limits and gpu is None:
         return
-    shown = ", ".join(
+    shown = [
         f"{limit.flag.lstrip('-')}={limit.value} ({limit.source})" for limit in limits
-    )
-    info(f"📐 Limits: {shown}")
+    ]
+    if gpu is not None:
+        shown.append(f"gpu={gpu.value or 'none'} ({gpu.source})")
+    info(f"📐 Limits: {', '.join(shown)}")
 
 
 def _display_sources_config_cli() -> None:
@@ -2551,20 +2555,22 @@ def main(argv: list[str] | None = None) -> int:
     # diagnostic below cannot describe a launch other than the one that
     # happens. The scope is what the ladder reads: this session's taskdef and
     # the repository it works on, with the host dropped.
+    scope = LaunchScope(
+        task_id=task_id,
+        repo_project=_parse_repo_url(repo_url)[1] if repo_url else None,
+    )
     limits = resource_limit_plan(
         runtime,
-        LaunchScope(
-            task_id=task_id,
-            repo_project=_parse_repo_url(repo_url)[1] if repo_url else None,
-        ),
+        scope,
         overrides={
             flag: value
             for flag, value in (("--memory", ns.memory), ("--cpus", ns.cpus))
             if value
         },
     )
-    _announce_resource_limits(limits)
-    run += base_run_args(runtime, exec_mode, container_user, limits)
+    gpu = gpu_grant_plan(runtime, scope)
+    _announce_resource_limits(limits, gpu)
+    run += base_run_args(runtime, exec_mode, container_user, limits, gpu)
 
     # In developer mode, mount local repo dirs into the container to override
     # baked-in assets (for live development). In installed mode, the container
@@ -2916,6 +2922,7 @@ def main(argv: list[str] | None = None) -> int:
 
     env = {
         "HOME": "/home/developer",
+        "LMER_GPU_GRANTED": gpu.value,
         # Which agent harness the container should run (resolved above from
         # --harness/LMER_HARNESS/LMER_LLM_NAME model hint; default claude).
         # Consumed by clone_and_exec.py (runner selection) and lmer-supervisor
@@ -3426,7 +3433,15 @@ def main(argv: list[str] | None = None) -> int:
                 "while podman remaps UIDs for --userns=keep-id)"
             )
         try:
-            return subprocess.call(run, env=container_env.subprocess_env())
+            rc = subprocess.call(run, env=container_env.subprocess_env())
+            if gpu.value and rc == 125:
+                error(
+                    "❌ The GPU-enabled container invocation failed before its "
+                    "command started (runtime exit 125). Lmer will not retry "
+                    "without the requested GPU."
+                )
+                error(f"   To fix GPU support, {gpu_remediation(runtime)}.")
+            return rc
         except KeyboardInterrupt:
             return 130
         finally:
