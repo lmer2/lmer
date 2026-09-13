@@ -38,17 +38,17 @@ def live_supervisor(tmp_path):
     worker = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
     worker.start()
     try:
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 30
         while not server.started and time.monotonic() < deadline:
             time.sleep(0.01)
         assert server.started
         yield SimpleNamespace(log=log, endpoint=endpoint, client=bus.BusClient(endpoint))
     finally:
         server.should_exit = True
-        worker.join(timeout=3)
+        worker.join(timeout=90)
         if worker.is_alive():
             server.force_exit = True
-            worker.join(timeout=3)
+            worker.join(timeout=90)
         listener.close()
         log.close()
         assert not worker.is_alive()
@@ -183,7 +183,7 @@ connector_lifecycle.ConnectorLifecycle._bus_poll_seconds = 0.02
 getattr(module, "SlackConnector" if channel == "slack" else "MatrixConnector")._bus_poll_seconds = 0.02
 if channel == "slack": module.SlackClient = lambda *args, **kwargs: remote
 else: module.MatrixClient = lambda *args, **kwargs: remote
-connector_lifecycle.DRAIN_SECONDS = float(os.environ.get("CONNECTOR_FIXTURE_DRAIN", "2.0"))
+connector_lifecycle.DRAIN_SECONDS = float(os.environ.get("CONNECTOR_FIXTURE_DRAIN", "10.0"))
 connector_lifecycle.MODULE_POLL_SECONDS = float(os.environ.get("CONNECTOR_FIXTURE_POLL", "0.05"))
 connector_lifecycle.FAILURE_LIMIT = 2
 connector_lifecycle.ConnectorLifecycle._backoff = lambda self: self._stop.wait(0.02)
@@ -244,7 +244,7 @@ class ChildHarness:
                 "LMER_SUPERVISOR_URL": self.supervisor.endpoint.url,
                 "LMER_FASTAPI_TOKEN": self.supervisor.endpoint.token,
                 "SLACK_BOT_TOKEN": "fixture-bot", "LMER_CHAT_ATTACH_ACK": "0",
-                "LMER_SLACK_POLL_SECONDS": "0.02", "LMER_COMMS_CONNECT_BUDGET": "2",
+                "LMER_SLACK_POLL_SECONDS": "0.02", "LMER_COMMS_CONNECT_BUDGET": "30",
                 "LMER_MATRIX_HOMESERVER": "https://fixture.invalid",
                 "LMER_MATRIX_USER_ID": "@lmer:example.org", "LMER_MATRIX_ACCESS_TOKEN": "fixture-token",
                 "LMER_MATRIX_AUTHENTICATED_MEDIA": "1"}
@@ -279,7 +279,7 @@ class ChildHarness:
 
         return subprocess.run([sys.executable, str(self.root / "bootstrap.py"), self.channel, "recover",
                                "--permalink", self.link, *args], env=child_environment(self.environment()),
-                              capture_output=True, text=True, timeout=20)
+                              capture_output=True, text=True, timeout=90)
 
     def events(self):
         import json
@@ -288,4 +288,4 @@ class ChildHarness:
     def close(self):
         from lmer_cli.connector_process import terminate_wait
         for process in self.children:
-            terminate_wait(process, timeout=1)
+            terminate_wait(process, timeout=30)

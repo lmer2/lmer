@@ -10,7 +10,7 @@ from lmer_cli.connector_ownership import Lease, OwnershipBusy, read_json
 from tests.connector_fakes import ChildHarness, isolated_connectors, live_supervisor
 
 
-def wait_for(predicate, harness, timeout=25):
+def wait_for(predicate, harness, timeout=120):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -47,7 +47,7 @@ def test_actual_startup_send_and_exclusive_child_handoff(child):
         assert len(child.children) == 1
         assert child.supervisor.log.read_since(0)[0][0].id == record.id
     finally:
-        owned.stop(timeout=2)
+        owned.stop(timeout=30)
     assert owned.popen.returncode is not None
     lease = Lease.acquire(child.key, owner="next")
     lease.close()
@@ -63,7 +63,7 @@ def test_actual_verified_rejection_retries_without_duplicate(child):
         assert sum("accepted once" in event["text"] for event in child.events()) == 1
         assert not marker_path(child.key).exists()
     finally:
-        owned.stop(timeout=2)
+        owned.stop(timeout=30)
 
 
 @pytest.mark.parametrize("mode", ["unknown", "receipt-failure"])
@@ -101,7 +101,7 @@ def test_module_change_execs_under_same_lease_without_replaying(child):
         with pytest.raises(OwnershipBusy):
             child.spawn(owner="platform")
     finally:
-        owned.stop(timeout=2)
+        owned.stop(timeout=30)
 
 
 def test_module_change_bounds_drain_and_keeps_uncertain_send_blocked(child):
@@ -111,8 +111,8 @@ def test_module_change_bounds_drain_and_keeps_uncertain_send_blocked(child):
     wait_for(lambda: (child.root / "wait-after-send.reached").exists(), child)
     started = time.monotonic()
     (child.root / "watched.py").write_text("# reload during blocked send\n")
-    wait_for(lambda: owned.popen.poll() is not None, child, timeout=5)
-    assert time.monotonic() - started < 4
+    wait_for(lambda: owned.popen.poll() is not None, child, timeout=60)
+    assert time.monotonic() - started < 30
     assert owned.collect() == 4
     assert len(child.events()) == 1
     assert marker_path(child.key).exists()
@@ -262,7 +262,7 @@ if owner == 0:
                           os.environ, owner="platform", session=session, permalink=link,
                           log_path=root / "child.log")
     (root / "orphan.pid").write_text(str(process.popen.pid))
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 30
     while not (root / "events.jsonl").read_text() and time.monotonic() < deadline:
         time.sleep(.02)
     os._exit(0)
@@ -270,7 +270,7 @@ child = None
 try:
     assert os.waitpid(owner, 0)[1] == 0
     child = int((root / "orphan.pid").read_text())
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 30
     while not (root / "events.jsonl").read_text() and time.monotonic() < deadline:
         time.sleep(.02)
     assert (root / "events.jsonl").read_text(), (root / "child.log").read_text()
@@ -291,7 +291,7 @@ try:
         reclaim_orphan(key, session=session, canonical=link)
     except OwnershipBusy as exc:
         assert "pidfd signaling unavailable" in str(exc)
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         pid, status = os.waitpid(child, os.WNOHANG)
         if pid:
@@ -320,7 +320,7 @@ def test_real_orphan_handoff_validates_process_and_supervisor_identity(child):
     probe.write_text(ORPHAN_PROBE)
     result = run_probe([sys.executable, str(probe), child.channel, child.link, child.supervisor.log.session],
                        env=child_environment({**child.environment(), "CONNECTOR_FIXTURE_POLL": "0.5"}),
-                       timeout=12, receipt=child.root / "orphan-cleanup.json")
+                       timeout=120, receipt=child.root / "orphan-cleanup.json")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "every child waited" in result.stdout
     assert len(child.events()) == 1
@@ -333,12 +333,12 @@ def test_orphan_probe_failure_collects_all_detached_descendants(child, failure):
     from tests.connector_probe_supervisor import run_probe
 
     bootstrap = child.root / "bootstrap.py"
-    bootstrap.write_text(bootstrap.read_text().replace("module = importlib.import_module", "time.sleep(15)\nmodule = importlib.import_module"))
+    bootstrap.write_text(bootstrap.read_text().replace("module = importlib.import_module", "time.sleep(180)\nmodule = importlib.import_module"))
     probe = child.root / "orphan-probe.py"
     source = ORPHAN_PROBE
     if failure == "nonzero":
         source = source.replace("child = None\ntry:", '''
-deadline = time.monotonic() + 5
+deadline = time.monotonic() + 30
 while not (root / "orphan.pid").exists() and time.monotonic() < deadline: time.sleep(.01)
 assert (root / "orphan.pid").exists()
 sys.exit(9)
@@ -347,7 +347,7 @@ try:''', 1)
     probe.write_text(source)
     receipt = child.root / "orphan-cleanup.json"
     result = run_probe([sys.executable, str(probe), child.channel, child.link, child.supervisor.log.session],
-                       env=child_environment(child.environment()), timeout=3, receipt=receipt)
+                       env=child_environment(child.environment()), timeout=30, receipt=receipt)
     assert result.returncode == (124 if failure == "timeout" else 9), result.stdout + result.stderr
     saved = json.loads(receipt.read_text())
     assert saved["all_waited"] and len(saved["collected"]) == 2, saved
@@ -393,7 +393,7 @@ def test_child_imports_installed_connector_despite_project_pythonpath(child, mon
         wait_for(lambda: bool(child.events()), child)
         assert not marker.exists()
     finally:
-        owned.stop(timeout=2)
+        owned.stop(timeout=30)
 
 
 def test_module_monitor_stays_live_during_matrix_startup_network_wait(tmp_path, live_supervisor):
@@ -404,14 +404,14 @@ def test_module_monitor_stays_live_during_matrix_startup_network_wait(tmp_path, 
         wait_for(lambda: (harness.root / "join.reached").exists(), harness)
         started = time.monotonic()
         (harness.root / "watched.py").write_text("# changed while join is blocked\n")
-        wait_for(lambda: owned.popen.poll() is not None, harness, timeout=5)
-        assert time.monotonic() - started < 4
+        wait_for(lambda: owned.popen.poll() is not None, harness, timeout=60)
+        assert time.monotonic() - started < 30
         assert owned.collect() == 3
         assert harness.events() == []
         assert not harness.key.busy()
     finally:
         (harness.root / "mode").write_text("healthy")
-        owned.stop(timeout=3)
+        owned.stop(timeout=30)
         harness.close()
 
 

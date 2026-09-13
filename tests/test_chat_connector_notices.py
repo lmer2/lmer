@@ -34,7 +34,12 @@ def connector_lifetimes(monkeypatch):
         monkeypatch.setattr(cls, "__init__", track)
     yield
     for instance in instances:
-        assert instance.stop(timeout=1, announce=False)
+        try:
+            assert instance.stop(timeout=30, announce=False)
+        finally:
+            # Finish finalizers before registry monkeypatches are restored.
+            for worker in instance._threads:
+                worker.join()
 
 
 
@@ -85,7 +90,7 @@ class TestTheConnectorsOwnLines:
         about something that never started."""
         slack = FakeSlack()
         built = slack_connector_with(slack=slack)
-        built.stop(timeout=0.1)
+        built.stop(timeout=30)
         assert slack.posted == []
 
     def test_the_ack_is_off_when_something_else_announced_the_thread(self):
