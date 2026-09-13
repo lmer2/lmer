@@ -1,0 +1,2 @@
+added:
+- "Added opt-in, task- and repository-scoped NVIDIA GPU passthrough for Docker and Podman session containers"

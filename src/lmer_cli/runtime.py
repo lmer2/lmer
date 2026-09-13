@@ -9,6 +9,7 @@ This module handles:
 - TTY configuration for interactive sessions
 """
 
+import json
 import os
 import re
 import shutil
@@ -389,7 +390,12 @@ def _resolve_limit_env(
             continue
         value, source = accepted, name
         break
-    outcome = f"using {source} ({value})" if source != "default" else f"using the default {value}"
+    if source != "default":
+        outcome = f"using {source} ({value})"
+    elif value:
+        outcome = f"using the default {value}"
+    else:
+        outcome = "leaving the resource disabled"
     for name, raw in rejected:
         warning(f"⚠️  Ignoring invalid {name}={raw!r} ({hint}); {outcome}")
     return value, source
@@ -551,6 +557,119 @@ def _resolve_memory(scope: "LaunchScope | None" = None) -> "tuple[str, str]":
     )
 
 
+_GPU_RE = re.compile(r"^\d+(,\d+)*$", re.ASCII)
+GPU_HINT = "must be 'all' or a comma-separated list of GPU indexes, e.g. 0 or 0,1"
+_GPU_INFO_TIMEOUT_SECONDS = 10
+
+
+def _valid_gpu(raw: str) -> str | None:
+    """Accept ``all`` or a comma-separated list of ASCII device indexes."""
+    return raw if raw == "all" or _GPU_RE.match(raw) else None
+
+
+def _resolve_gpu(scope: "LaunchScope | None" = None) -> "tuple[str, str]":
+    """The requested GPU grant, or an empty value when this launch opts out."""
+    return _resolve_limit_env(
+        resource_env_names("GPU", scope),
+        "",
+        _valid_gpu,
+        GPU_HINT,
+    )
+
+
+def gpu_remediation(runtime: str) -> str:
+    """Operator action for enabling NVIDIA GPU support on ``runtime``."""
+    if runtime == "docker":
+        return (
+            "install the NVIDIA driver and Container Toolkit, run "
+            "'nvidia-ctk runtime configure --runtime=docker', and restart Docker"
+        )
+    return (
+        "install the NVIDIA driver and Container Toolkit, generate or refresh the "
+        "NVIDIA CDI specification, and ensure Podman can read it"
+    )
+
+
+def _runtime_gpu_support(runtime: str) -> "tuple[bool, str]":
+    """Read the runtime's structured metadata for configured NVIDIA support."""
+    if runtime == "docker":
+        command = [runtime, "info", "--format", "{{json .Runtimes}}"]
+    elif runtime == "podman":
+        command = [runtime, "info", "--format", "json"]
+    else:
+        return False, f"runtime {runtime!r} has no GPU mapping"
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=_GPU_INFO_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"{runtime} info timed out"
+    except (OSError, subprocess.SubprocessError):
+        return False, f"{runtime} info could not be read"
+    if result.returncode != 0:
+        return False, f"{runtime} info exited {result.returncode}"
+
+    try:
+        metadata = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return False, f"{runtime} info returned malformed JSON"
+
+    if runtime == "docker":
+        supported = isinstance(metadata, dict) and "nvidia" in metadata
+        return supported, "docker info does not report the nvidia runtime"
+
+    host = metadata.get("host", {}) if isinstance(metadata, dict) else {}
+    devices = host.get("discoveredDevices", []) if isinstance(host, dict) else []
+    supported = isinstance(devices, list) and any(
+        isinstance(device, dict)
+        and device.get("source") == "cdi"
+        and str(device.get("id", "")).startswith("nvidia.com/gpu=")
+        for device in devices
+    )
+    return supported, "podman info does not report an nvidia.com/gpu CDI device"
+
+
+@dataclass(frozen=True)
+class GPUGrant:
+    """The effective GPU access and runtime arguments for one launch."""
+
+    value: "str | None"
+    source: str
+    args: "tuple[str, ...]" = ()
+
+
+def gpu_grant_plan(runtime: str, scope: "LaunchScope | None" = None) -> GPUGrant:
+    """Resolve, verify, and render the optional GPU grant for one launch."""
+    value, source = _resolve_gpu(scope)
+    if not value:
+        return GPUGrant(None, source)
+
+    supported, reason = _runtime_gpu_support(runtime)
+    if not supported:
+        warning(
+            f"⚠️  {source} requested GPU access ({value}), but {reason}; "
+            "launching without GPU access"
+        )
+        warning(f"   To enable it, {gpu_remediation(runtime)}.")
+        return GPUGrant(None, f"{source}; unsupported")
+
+    if runtime == "docker":
+        # Docker CSV-parses this argv element; literal quotes preserve a comma list.
+        argument = value if value == "all" else f'"device={value}"'
+        return GPUGrant(value, source, ("--gpus", argument))
+
+    args = tuple(
+        part
+        for device in (["all"] if value == "all" else value.split(","))
+        for part in ("--device", f"nvidia.com/gpu={device}")
+    )
+    return GPUGrant(value, source, args)
+
+
 @dataclass(frozen=True)
 class ResourceLimit:
     """One resource bound as the launch actually settled it (issue #453).
@@ -646,6 +765,7 @@ def base_run_args(
     exec_mode: bool,
     user: str,
     limits: "List[ResourceLimit] | None" = None,
+    gpu: "GPUGrant | None" = None,
 ) -> List[str]:
     """
     Build base container run arguments.
@@ -664,6 +784,7 @@ def base_run_args(
         limits: The resource plan from :func:`resource_limit_plan`, so the
             caller that announced it passes exactly what it announced.
             Omitted, an unscoped plan is resolved here.
+        gpu: The optional GPU grant plan announced by the caller.
 
     Returns:
         List of base Docker/Podman arguments
@@ -686,6 +807,8 @@ def base_run_args(
     args += _resource_limit_args(
         resource_limit_plan(runtime) if limits is None else limits
     )
+    if gpu is not None:
+        args += list(gpu.args)
     if runtime == "podman":
         # Podman-specific: maintain user ID mapping for SSH agent and file permissions
         args += ["--userns=keep-id"]

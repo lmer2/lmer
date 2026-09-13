@@ -460,7 +460,9 @@ class TestContainerUserFromDotenv:
     def _run_capturing_user(self, argv, env_in=None, home=None):
         captured_users: list = []
 
-        def _capture_base_run_args(runtime, exec_mode, container_user, limits=None):
+        def _capture_base_run_args(
+            runtime, exec_mode, container_user, limits=None, gpu=None
+        ):
             captured_users.append(container_user)
             return []
 
@@ -1140,7 +1142,7 @@ class TestScopedResourceLimitsAgainstPresets:
         """The resource plan main() hands to base_run_args."""
         captured: list = []
 
-        def _capture(runtime, exec_mode, container_user, limits=None):
+        def _capture(runtime, exec_mode, container_user, limits=None, gpu=None):
             captured.append(limits)
             return []
 
