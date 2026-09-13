@@ -252,6 +252,9 @@ normally. Override that directory with `LMER_PRECOMMIT_CACHE_DIR`.
 
 Parallel execution is an operator-owned, work-repo-only opt-in for the **test
 runner step**. Lint, secrets, permissions and the other gate checks still run.
+Activation is per project: shipping a runner helper does not activate it. The
+operator enables the work-repo policy after validating that project's suite
+under its allocated CPU and memory limits.
 Third-party projects need no source-repo configuration, helper or dependency
 change: their work override invokes what their environment already supports.
 
@@ -379,3 +382,16 @@ included in gate time and external cleanup is reported separately.
 
 Collection, outcome, timing, cgroup and cleanup evidence is retained with the
 change review and benchmark report.
+
+### Isolating tests from runner policy
+
+Gate unit tests must use a test-owned work-repo root, including tests that mock
+subprocess execution. Reading live task or project policy can add a runner
+description subprocess that a serial-runner mock never expected. Policy tests
+create their own configuration and executable scripts under that isolated root.
+
+Connector integration tests use generous wall-clock budgets for scheduling and
+filesystem work under four-worker load. Polling intervals stay short; deadline
+tests keep the injected stall longer than the asserted shutdown bound. Fixture
+teardown joins finalizer threads before restoring registry monkeypatches, so
+late persistence cannot reach the operator's real registry.

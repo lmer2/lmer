@@ -47,8 +47,10 @@ def enable_precommit_reuse(monkeypatch, tmp_path):
 class TestGateSystem:
     """Test the GateSystem class functionality"""
 
-    def setup_method(self):
+    @pytest.fixture(autouse=True)
+    def setup_method(self, monkeypatch, tmp_path):
         """Set up test environment"""
+        monkeypatch.setenv("LMER_WORK_REPO_PATH", str(tmp_path / "work"))
         self.gate = GateSystem(verbose=True)
 
     def test_init(self):

@@ -1,0 +1,2 @@
+fixed:
+  - Isolated gate unit tests from operator policy and increased connector test timing budgets for parallel test runs.

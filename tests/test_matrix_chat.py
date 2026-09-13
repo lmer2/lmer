@@ -41,7 +41,12 @@ def _clean_lmer_env(monkeypatch, tmp_path):
     monkeypatch.setattr(connector.MatrixConnector, "__init__", tracked_init)
     yield
     for built in instances:
-        assert built.stop(timeout=2), "test connector did not drain"
+        try:
+            assert built.stop(timeout=30), "test connector did not drain"
+        finally:
+            # Finish finalizers before registry monkeypatches are restored.
+            for worker in built._threads:
+                worker.join()
 
 
 ROOM = "!room:example.org"
@@ -243,7 +248,7 @@ class Rig:
     def agent(self, kind, text, **kw):
         return self.log.append(kind=kind, text=text, source=comms.Source("agent"), **kw)[0]
 
-    def wait_until(self, predicate, timeout=5.0):
+    def wait_until(self, predicate, timeout=30.0):
         deadline = time.monotonic() + timeout
         while not predicate() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -925,6 +930,6 @@ def test_matrix_attachment_notice_waits_for_supervisor_identity(tmp_path, monkey
         rig.connector._announce_attached()
         assert rig.matrix.sent == [(ROOM, ROOT, connector.ATTACH_ACK, "m.notice")]
     finally:
-        rig.connector.stop(timeout=1)
+        rig.connector.stop(timeout=30)
         rig.bus._session._http.close()
         rig.log.close()
