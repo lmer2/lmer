@@ -343,6 +343,7 @@ export function driverLabel(run) {
 // there is no meter to draw.
 export function statusSegments(status) {
   if (!status) return []
+  if (status.harness === 'codex') return codexSegments(status.codex)
   const segments = []
   const context = proportion(status.context?.percent)
   if (context !== null) segments.push(segment('ctx', 'ctx', context))
@@ -389,12 +390,55 @@ const STATUS_FRESH_SECONDS = 60
 // the rest of it and the error banner is what says so.
 export function statusAge(status) {
   if (!status) return null
+  if (status.harness === 'codex') return null // Each source has its own observation date.
   const seconds = status.age_seconds
   if (typeof seconds !== 'number' || !Number.isFinite(seconds)) {
     return 'age unknown'
   }
   if (seconds < STATUS_FRESH_SECONDS) return null
   return `as of ${duration(seconds)} ago`
+}
+
+function codexSegments(usage) {
+  if (!usage) return []
+  const segments = []
+  function add(key, label, value, reading, extra = {}) {
+    const seconds = reading.age_seconds
+    const sourceAge = typeof seconds !== 'number' || !Number.isFinite(seconds)
+      ? 'age unknown' : seconds < 0 ? 'clock ahead'
+        : seconds >= STATUS_FRESH_SECONDS ? `as of ${duration(seconds)} ago` : null
+    const age = [sourceAge, extra.note].filter(Boolean).join('; ') || null
+    const text = `${label} ${value}${age ? ` (${age})` : ''}`
+    segments.push({ key, label, value, text, age, updated: reading.updated,
+      provenance: `${reading.scope || 'session metadata'}; ${reading.source}; thread ${usage.thread_id}; thread CLI ${usage.version || 'version unknown'}`,
+      ...extra })
+  }
+  const tokens = usage.tokens
+  if (tokens) {
+    const breakdown = (value) => Object.entries(value || {}).map(([key, count]) => `${key}: ${count}`).join('; ')
+    const count = (value) => Number.isSafeInteger(value) && value >= 0
+    if (count(tokens.last?.total_tokens)) add('last-tokens', 'last response', `${tokens.last.total_tokens.toLocaleString('en-US')} tokens`, tokens,
+      { detail: breakdown(tokens.last) })
+    if (count(tokens.total?.total_tokens)) add('total-tokens', 'thread total', `${tokens.total.total_tokens.toLocaleString('en-US')} tokens`, tokens,
+      { detail: breakdown(tokens.total) })
+    if (count(tokens.context_window)) add('capacity', 'context capacity', `${tokens.context_window.toLocaleString('en-US')} tokens`, tokens)
+  }
+  const account = usage.account
+  if (account) {
+    for (const window of account.limits || []) {
+      const percent = proportion(window.percent)
+      if (percent === null) continue
+      const minutes = window.minutes
+      const period = !Number.isSafeInteger(minutes) || minutes <= 0 ? 'window unknown'
+        : minutes % 1440 === 0 ? `${minutes / 1440}d` : minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`
+      add(`account:${window.key}`, `account ${window.label} ${period}`, `${percent}% used`, account,
+        { percent, resets_at: window.resets_at, note: window.reset_passed ? 'reset passed; awaiting new snapshot' : null })
+    }
+  }
+  const runtime = usage.runtime
+  if (runtime?.model) add('model', 'model', runtime.model, runtime)
+  if (runtime?.effort) add('effort', 'eff', runtime.effort, runtime)
+  return segments
 }
 
 // When a usage window comes back, phrased forwards. `duration()`'s thresholds,

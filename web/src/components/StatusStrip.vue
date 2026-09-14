@@ -30,10 +30,13 @@ const printed = computed(() => {
 
 // When the reading was taken, on every density: the row shows no timestamp of
 // its own, and a percentage with no date behind it cannot be checked.
-const reading = computed(() => props.status?.updated || '')
+const reading = computed(() => props.status?.harness === 'codex'
+  ? segments.value.map((segment) => title(segment)).join(' · ')
+  : props.status?.updated || '')
 
 function title(segment) {
-  return [resetsLabel(segment.resets_at, props.now), reading.value]
+  return [resetsLabel(segment.resets_at, props.now), segment.updated || props.status?.updated,
+    segment.provenance, segment.detail]
     .filter(Boolean).join(' — ')
 }
 </script>
@@ -58,6 +61,7 @@ function title(segment) {
         <span class="text-medium-emphasis">{{ segment.label }}</span>
         <span class="font-weight-medium">{{ segment.value }}</span>
       </div>
+      <div v-if="segment.age" class="text-body-small text-medium-emphasis">{{ segment.age }}</div>
       <!-- `tone-idle` is this app's own neutral, so a meter cannot be mistaken
            for the urgency ramp. A segment that is not a proportion (effort)
            draws no meter at all rather than a full one. -->

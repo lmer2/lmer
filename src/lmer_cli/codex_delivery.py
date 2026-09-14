@@ -19,6 +19,8 @@ import threading
 import time
 import uuid
 
+from .codex_usage import CodexUsage
+
 logger = logging.getLogger(__name__)
 START_TIMEOUT = 120.0
 RPC_TIMEOUT = 3.0
@@ -49,6 +51,7 @@ class CodexDelivery:
         self._warnings = set()
         self._closed = False
         self._startup_failed = False
+        self._usage = CodexUsage()
 
     def __enter__(self):
         return self
@@ -246,6 +249,7 @@ class CodexDelivery:
             try:
                 self._connect()
                 thread = self._thread(include_turns=bool(pending))
+                self._usage.refresh(thread, self._runtime, self._request)
                 if not pending:
                     return
                 items = {item.get('clientId'): item for turn in thread['turns'] for item in turn['items']
