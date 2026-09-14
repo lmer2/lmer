@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import stat
 from datetime import datetime, timezone
@@ -334,6 +335,11 @@ def read_document(path: Path, *, now=None) -> Optional[dict]:
         "updated": updated,
         "age_seconds": age_seconds(updated, now=now),
     }
+    if served['harness'] == 'codex':
+        usage = _codex(document.get('codex'), now=now)
+        if usage is not None:
+            served['codex'] = usage
+        return served
     context = document.get("context")
     if isinstance(context, dict):
         percent = _percent(context.get("percent"))
@@ -348,6 +354,78 @@ def read_document(path: Path, *, now=None) -> Optional[dict]:
         if level is not None:
             served["effort"] = {"level": level}
     return served
+
+
+def _count(value):
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2 ** 53 - 1:
+        return value
+    return None
+
+
+def _dated(value, source, *, now):
+    if not isinstance(value, dict) or value.get('source') != source:
+        return None
+    updated = _updated(value.get('updated'))
+    if updated is None:
+        return None
+    return {'updated': updated, 'age_seconds': age_seconds(updated, now=now), 'source': source}
+
+
+def _codex(value, *, now):
+    if not isinstance(value, dict):
+        return None
+    ident = value.get('thread_id')
+    if not isinstance(ident, str) or not ident or len(ident) > 128:
+        return None
+    result = {'thread_id': ident, 'version': _clamped_name(value.get('version'))}
+    tokens = value.get('tokens')
+    observed = _dated(tokens, 'rollout/token_count', now=now)
+    if observed and tokens.get('thread_id') == ident:
+        observed.update(scope='thread', thread_id=ident)
+        fields = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
+                  'output_tokens', 'reasoning_output_tokens', 'total_tokens')
+        for key in ('last', 'total'):
+            counters = tokens.get(key)
+            if isinstance(counters, dict):
+                observed[key] = {name: counters[name] for name in fields
+                                 if _count(counters.get(name)) is not None}
+        capacity = _count(tokens.get('context_window'))
+        if capacity:
+            observed['context_window'] = capacity
+        if observed.get('last') or observed.get('total') or capacity:
+            result['tokens'] = observed
+    account = value.get('account')
+    observed = _dated(account, 'account/rateLimits/read', now=now)
+    if observed:
+        observed.update(scope='account', limits=[])
+        windows = account.get('limits')
+        seen = set()
+        for window in (windows[:MAX_LIMITS] if isinstance(windows, list) else []):
+            if not isinstance(window, dict):
+                continue
+            key = _clamped_name(window.get('key'))
+            percent = window.get('percent')
+            if (not key or key in seen or isinstance(percent, bool)
+                    or not isinstance(percent, (int, float)) or not 0 <= percent <= 2 ** 31 - 1
+                    or not math.isfinite(percent)):
+                continue
+            seen.add(key)
+            reset = _resets_at(window.get('resets_at'))
+            observed['limits'].append({
+                'key': key, 'bucket': _clamped_name(window.get('bucket')),
+                'label': _clamped_name(window.get('label')) or key,
+                'percent': percent, 'minutes': _count(window.get('minutes')),
+                'resets_at': reset,
+                'reset_passed': reset is not None and age_seconds(reset, now=now) >= 0,
+            })
+        result['account'] = observed
+    runtime = value.get('runtime')
+    observed = _dated(runtime, 'thread/read', now=now)
+    if observed:
+        observed.update(model=_clamped_name(runtime.get('model')),
+                        effort=_clamped_name(runtime.get('effort')))
+        result['runtime'] = observed
+    return result
 
 
 def for_session(session_id: str, *, now=None) -> Optional[dict]:

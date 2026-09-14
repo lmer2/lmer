@@ -2328,6 +2328,7 @@ HARNESS_SESSION_DIRS = {
 #: as a set rather than a count so a test that adds a mount has to say which one,
 #: and so "the mounts do not collide" keeps meaning all of them.
 PLATFORM_MOUNT_DESTINATIONS = {
+    '/home/developer/.codex',
     *HARNESS_SESSION_DIRS.values(),
     ask.CONTAINER_ASK_DIR,
     uploads.CONTAINER_UPLOADS_DIR,

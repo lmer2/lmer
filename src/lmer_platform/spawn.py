@@ -128,8 +128,10 @@ import os
 import pty
 import secrets
 import shutil
+import signal
 import subprocess
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -159,7 +161,7 @@ from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
 from work_repo import run_state
 
 from . import (
-    ask, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
+    ask, codex_config, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
 )
 from .config import (
     assistant_resource_settings,
@@ -1459,6 +1461,7 @@ def _reserved_session_destinations() -> dict:
         if harness.session_dir
     }
     reserved.update({
+        _container_dir_key(codex_config.CONTAINER_DIR): "the run's Codex configuration",
         _container_dir_key("/workspace"): "the session's workspace",
         _container_dir_key("/Agents/global"): "the agent-files tree",
         _container_dir_key(ask.CONTAINER_ASK_DIR): "the session's ask channel",
@@ -2259,6 +2262,7 @@ def _protected_mount_destinations() -> dict:
         for session_dir in _harness_session_dirs().values()
     }
     protected.update({
+        codex_config.CONTAINER_DIR: "the platform persists the run's Codex configuration there",
         ask.CONTAINER_ASK_DIR: (
             "the platform mounts the session's ask channel there, so redirecting "
             "it would send the session's questions somewhere no operator is "
@@ -2349,6 +2353,8 @@ def _reject_mount_hijack(name: str, arg: str, following: list) -> None:
     if len(parts) < 2:
         return
     destination = _container_dir_key(parts[1])
+    if destination == codex_config.CONTAINER_DIR + '/config.toml':
+        raise SpawnError(f"{name} may not redirect the run's persistent Codex configuration")
     if _within_staging_area(destination):
         raise SpawnError(
             f"{name} may not target {CONTAINER_MOUNT_STAGING_DIR} or anything "
@@ -2863,15 +2869,8 @@ def _claim_slot(
     The probe is uncached here: a poll can afford a stale answer, an action
     taken on one cannot.
 
-    This does **not** make the claim atomic. The occupancy read and the
-    ``registry.register`` that records it are separated by the process start, so
-    two spawns racing for one free slot can both get past — the same
-    read-then-act window :func:`_refuse_if_run_is_live` and the concurrency cap
-    already have, and left open the same way, because closing it means holding a
-    lock across every spawn rather than changing anything about slots. The cost
-    is therefore reported and not prevented:
-    :func:`lmer_platform.slots._held` returns *every* holder, the row says how
-    many there are, and the daemon logs ``slot_double_occupancy``.
+    The caller holds the daemon's launch lock through registration, so another
+    launch cannot pass this occupancy check before the claim becomes visible.
     """
     if request.slot is None:
         return request, None, None, None
@@ -2944,6 +2943,59 @@ def _claim_slot(
     )
 
 
+_LAUNCH_LOCK = threading.Lock()
+_UNPUBLISHED_TERM_GRACE = 5.0
+
+
+@dataclass
+class _UnpublishedLaunch:
+    process: subprocess.Popen
+    master_fd: Optional[int]
+    token_file: Path
+    session_id: str
+    stopped: bool = False
+
+    def discard(self) -> None:
+        if not self.stopped:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            # The launcher can exit before its runtime child forwards TERM.
+            time.sleep(_UNPUBLISHED_TERM_GRACE)
+            # Keep the leader unreaped until the final group signal: its PID
+            # cannot be reused while we stop descendants that ignored TERM.
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.process.wait()
+            self.stopped = True
+        if self.master_fd is not None:
+            os.close(self.master_fd)
+            self.master_fd = None
+        self.token_file.unlink(missing_ok=True)
+        registry.remove(self.session_id)
+        if registry.session_path(self.session_id).exists():
+            raise StoreError(f"cannot remove unpublished session {self.session_id}")
+        _exit_event(self.session_id).set()
+
+
+_FAILED_PUBLICATIONS: dict[str, _UnpublishedLaunch] = {}
+
+
+def _cleanup_failed_publications() -> None:
+    for session_id, launch in list(_FAILED_PUBLICATIONS.items()):
+        try:
+            launch.discard()
+        except Exception as exc:
+            raise SpawnError(
+                f"cannot clean up unpublished session {session_id} "
+                f"(pid {launch.process.pid}): {exc}; new launches are blocked"
+            ) from exc
+        del _FAILED_PUBLICATIONS[session_id]
+
+
 def spawn_session(
     config: PlatformConfig,
     request: SpawnRequest,
@@ -2980,6 +3032,23 @@ def spawn_session(
     and a standing thread that is held defers rather than refusing, so uber lmer
     still comes up (:func:`lmer_platform.assistant.start`).
     """
+    # Launch checks and publication must be exclusive, including the Popen gap.
+    with _LAUNCH_LOCK:
+        _cleanup_failed_publications()
+        return _spawn_session(
+            config, request, kind=kind, publish_registration=publish_registration,
+            refuse_held_targets=refuse_held_targets,
+        )
+
+
+def _spawn_session(
+    config: PlatformConfig,
+    request: SpawnRequest,
+    *,
+    kind: str,
+    publish_registration: Optional[Callable[[Callable[[], None], str, int], None]],
+    refuse_held_targets: bool,
+) -> SpawnResult:
     request = request.validate()
     if kind not in registry.SESSION_KINDS:
         raise SpawnError(f"invalid session kind {kind!r}")
@@ -3020,10 +3089,14 @@ def spawn_session(
     except OSError as exc:
         raise SpawnError(f"cannot create log directory {log_file.parent} ({exc})")
 
+    try:
+        config_flags = codex_config.mount_flags(host, project, slug, kind, session_id)
+    except OSError as exc:
+        raise SpawnError(f"cannot prepare persistent Codex configuration: {exc}") from exc
     channels = _prepare_session_channels(session_id, kind)
     # One call, because _with_host_flags inserts at a fixed anchor and two
     # would interleave in reverse.
-    host_flags = channels.host_flags + _assistant_resource_flags(kind)
+    host_flags = config_flags + channels.host_flags + _assistant_resource_flags(kind)
     if host_flags:
         command = _with_host_flags(command, host_flags)
 
@@ -3158,10 +3231,17 @@ def spawn_session(
     # supplies a tiny publication wrapper. It runs only after process startup and
     # receives registration as a thunk, keeping its lock around the two writes
     # rather than around the whole spawn.
-    if publish_registration is None:
-        register()
-    else:
-        publish_registration(register, session_id, process.pid)
+    try:
+        if publish_registration is None:
+            register()
+        else:
+            publish_registration(register, session_id, process.pid)
+    except BaseException:
+        _FAILED_PUBLICATIONS[session_id] = _UnpublishedLaunch(
+            process, master_fd, token_file, session_id,
+        )
+        _cleanup_failed_publications()
+        raise
 
     # The launch's thread targets become connections like any other, so the fleet
     # payload, the routes and the UI see one kind of thing and the reconcile loop

@@ -97,6 +97,8 @@ GH_TOKEN=your-github-token
 
 #### LMER-Specific Environment Variables
 
+- **`LMER_CODEX_CONFIG_SEED`** - Optional host-readable TOML seed in the platform daemon's environment. Copied only into new run-scoped Codex homes; existing preferences win. Host-only, not forwarded to containers. See [CODEX-CONFIG.md](./CODEX-CONFIG.md) for durable locations, scope, and upgrade behavior.
+
 The following environment variables control LMER behavior:
 
 - **`LMER_WORK_REPO`** - **Required.** Git URL of the work repo where lmer persists worklogs, gate-check results, and per-project notes across sessions. Must be a remote URL (SSH or HTTPS) the container can clone, pull from, and push to — a local-filesystem path won't work because the in-container `work` CLI actively syncs via `git fetch`/`pull`/`push`. Typically a small private repo on whatever git host you're already using.
