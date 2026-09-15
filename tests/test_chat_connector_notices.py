@@ -16,6 +16,7 @@ from matrix_chat import connector as matrix_connector
 from slack_chat import connector as slack_connector
 from slack_chat import sessions as slack_sessions
 from slack_chat.client import SlackError
+from tests.conftest import drain_connectors
 from tests.connector_fakes import isolated_connectors
 from tests.test_matrix_chat import FakeMatrix
 
@@ -33,13 +34,7 @@ def connector_lifetimes(monkeypatch):
             instances.append(instance)
         monkeypatch.setattr(cls, "__init__", track)
     yield
-    for instance in instances:
-        try:
-            assert instance.stop(timeout=30, announce=False)
-        finally:
-            # Finish finalizers before registry monkeypatches are restored.
-            for worker in instance._threads:
-                worker.join()
+    drain_connectors(instances, 30.0, announce=False)
 
 
 

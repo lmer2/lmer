@@ -19,7 +19,7 @@ from lmer_cli import comms, supervisor, targets, thread_posts
 from matrix_chat import connector, listener, permalink
 from matrix_chat.client import MatrixError
 from slack_chat import registry
-from tests.conftest import strip_lmer_env
+from tests.conftest import drain_connectors, strip_lmer_env
 from tests.test_lmer_signal_cli import _Session
 
 
@@ -40,13 +40,7 @@ def _clean_lmer_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(connector.MatrixConnector, "__init__", tracked_init)
     yield
-    for built in instances:
-        try:
-            assert built.stop(timeout=30), "test connector did not drain"
-        finally:
-            # Finish finalizers before registry monkeypatches are restored.
-            for worker in built._threads:
-                worker.join()
+    drain_connectors(instances, 30.0)
 
 
 ROOM = "!room:example.org"
