@@ -669,6 +669,10 @@ def _cmd_spawn(args: argparse.Namespace) -> int:
         return 2
 
     print(f"✅ spawned {result.session_id} (pid {result.pid})")
+    settings = result.launch_settings()
+    driver = " · ".join(value for value in settings.values() if value)
+    if driver:
+        print(f"   model / effort: {driver}")
     # The identity is the host and the project. The slug is derived from the
     # taskdef and the target, so it is *always* set (``run_state.derive_slug``
     # answers for any taskdef) — testing it here printed
@@ -793,8 +797,10 @@ def _load_env_files() -> None:
     inherit the result (they also load ``.env`` themselves, harmlessly).
     """
     from lmer_cli.cli import apply_env_file_defaults, default_env_file_candidates
+    from lmer_cli.env_sources import remember_env_defaults
 
     loaded = apply_env_file_defaults(default_env_file_candidates())
+    remember_env_defaults(loaded)
     if loaded:
         logger.debug("platform_env_files_loaded vars=%d", len(loaded))
 

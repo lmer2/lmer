@@ -233,8 +233,8 @@ echo "LMER_PRESET=my_service" >> .env
 A preset can also be pinned for **one taskdef** with `LMER_<TASK>_PRESET` —
 see [Per-taskdef presets](#per-taskdef-presets-lmer_task_preset) below.
 
-On the CLI the preset supplies **defaults; the explicit invocation always
-wins** (see the merge table below). The combined argument set is re-validated
+On the CLI the preset supplies **defaults; explicit exports and flags
+still win** (see the merge table below). The combined argument set is re-validated
 normally, and `--show-env` attributes preset-applied variables to
 `preset (<name>)`.
 
@@ -420,20 +420,70 @@ invocation details:
 
 ## Merge semantics per consumer
 
+### Environment precedence
+
+For direct CLI and platform launches, precedence is **explicit flags > explicit
+exports and platform-owned invocation values > preset > .env-file defaults**.
+A preset replaces every default-tier key it supplies, including values the
+platform already loaded from its host `.env`. It does not replace a real export:
+`export LMER_REASONING_EFFORT=low` still wins over a preset's `xhigh`, and
+`export LMER_LLM_NAME=sonnet` still wins over a preset's `opus`. Explicit flags,
+such as `--model`, remain highest priority. The platform currently has no
+per-spawn effort field (#354); this change adds no effort levels or defaults.
+
+The daemon records which values its file loader supplied in internal
+`LMER_PLATFORM_ENV_DEFAULTS` metadata and carries it to the child launcher.
+Later replacements and platform-owned controls
+are excluded, including a repository launch's blank `LMER_NO_REPO`. The child
+consumes this metadata before applying the preset; it is not forwarded into the
+container. This applies to spawn, `runs resume`, `runs answer`, service-slot
+spawns and the supervising assistant. Deploy the updated daemon and launcher
+together so file defaults retain their source across the process boundary.
+
+For example, a host `.env` containing `LMER_REASONING_EFFORT=high` and this
+preset launches with `LMER_REASONING_EFFORT=xhigh` and
+`LMER_LLM_NAME=gpt-6-astra`, unless an export or explicit flag overrides them:
+
+```json
+{
+  "astra": {
+    "env": {
+      "LMER_LLM_NAME": "gpt-6-astra",
+      "LMER_REASONING_EFFORT": "xhigh"
+    }
+  }
+}
+```
+
+Explicit flags override preset arguments and environment. Preset selection
+still follows its own specificity order (`--preset`, taskdef selector, generic
+selector). Scope-specific resource settings also retain their existing
+[resource precedence](./LMER-CLI.md): distinct keys such as `LMER_DEVELOP_MEMORY`
+and `LMER_MEMORY` are not an environment-key collision.
+
+The launcher reports its resolved effort beside model. The spawn acknowledgement
+includes nullable `model` and `effort` fields without waiting for startup; `null`
+means that fact has not been reported. `/api/state` run entries and the run view
+fill in from the same report. `effort` is the selected `LMER_REASONING_EFFORT`
+override, using lmer's existing vocabulary (the runners retain their existing
+mapping, such as Codex `max` → `xhigh`). An unnamed harness default remains
+unknown, and older launchers that report no effort leave it `null`.
+
+### Consumer details
+
 How a preset combines with the rest of the invocation is each consumer's
 contract:
 
 | | Slack listener | Direct CLI |
 |---|---|---|
 | **`args`** (and `checkout`/`service` flags) | Appended verbatim to the fixed `lmer chat <permalink>` command, where extra tokens are meaningful | Applied as if typed *before* your own flags, so an explicit flag overrides the preset's value (repeatable flags like `--mount-file` accumulate from both); flags-only, validated up front |
-| **`env`** | Merged over the listener's inherited environment — **the preset wins** on conflict | Defaults only — an **exported environment variable wins** over the preset, while the preset wins over `.env`-file values; applies both host-side and in the container environment, where applied preset entries are forwarded even when the variable has no hardcoded passthrough |
+| **`env`** | Merged over the listener's inherited environment — **the preset wins** on conflict | **Explicit exports win** over preset env; the preset wins over `.env` defaults, including those loaded by the platform. Applies host-side and in the container; applied entries are forwarded even without a hardcoded passthrough |
 | **Unknown name** | Thread reply listing the available presets; no session spawns (a token) / a warning in the ack, and the spawned CLI exits 2 (the env-selected default) | Exit 2 listing the available presets |
 | **Two presets selected at once** | Cannot happen: a `$preset:` token [displaces](#the-listener-wide-default-lmer_chat_preset) the env-selected default whole, so exactly one preset is ever in play | Cannot happen: the selectors are a precedence chain (`--preset` > `LMER_<TASK>_PRESET` > `LMER_PRESET`), and the most specific one wins outright |
 
-The env asymmetry is deliberate: a Slack user has no way to express
-per-invocation intent beyond the message text, so the operator's preset is
-authoritative; a CLI user can type flags and export variables, so their
-explicit invocation always wins.
+Slack-selected presets overlay the listener environment. Direct CLI and
+platform launches preserve explicit exports above presets; both consumers give
+presets priority over file defaults. Explicit CLI flags remain highest priority.
 
 The fan-out consumer ([`--agents`](#fan-out-agents---agents--lmer_agents))
 contributes its `env` overlay plus `--harness`/`--prompt` folded from

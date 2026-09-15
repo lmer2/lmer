@@ -969,6 +969,12 @@ def test_the_driver_chip_stays_silent_until_something_is_actually_known():
       driverLabel({ harness: 'codex', model: 'gpt-5.6-sol' }),
       'codex · gpt-5.6-sol',
     )
+    assert.equal(
+      driverLabel({ harness: 'codex', model: 'gpt-6-astra', effort: 'xhigh' }),
+      'codex · gpt-6-astra · xhigh',
+    )
+    assert.equal(driverLabel({ effort: 'high' }), 'high')
+    assert.equal(driverLabel({ model: 'opus', effort: null }), 'opus')
     """)
 
 
