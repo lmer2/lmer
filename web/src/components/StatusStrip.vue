@@ -1,3 +1,9 @@
+<script>
+import { ref } from 'vue'
+
+const usageDetails = ref()
+</script>
+
 <script setup>
 // The harness's own status line, mirrored into the platform (issue 248). One
 // component for all three surfaces, in two densities; nothing here fetches, so
@@ -7,6 +13,7 @@
 import { computed } from 'vue'
 
 import { resetsLabel, statusAge, statusSegments } from '../format.js'
+import { rememberFlag, storedFlag } from '../preferences.js'
 
 const props = defineProps({
   // The `statusline` block off a run row or the assistant reply. Null is the
@@ -19,8 +26,20 @@ const props = defineProps({
   compact: { type: Boolean, default: false },
 })
 
-const segments = computed(() => statusSegments(props.status))
-const age = computed(() => statusAge(props.status))
+const USAGE_DETAILS_STORAGE_KEY = 'lmer:usage-details'
+const details = usageDetails
+if (details.value === undefined) {
+  details.value = storedFlag(() => window.localStorage.getItem(USAGE_DETAILS_STORAGE_KEY), false)
+}
+const hasDetails = computed(() => props.status?.harness === 'codex'
+  && statusSegments(props.status, { details: true }).some((each) => each.detailOnly))
+const segments = computed(() => statusSegments(props.status, { details: details.value }))
+const age = computed(() => statusAge(props.status, segments.value))
+
+function toggleDetails() {
+  details.value = !details.value
+  rememberFlag((value) => window.localStorage.setItem(USAGE_DETAILS_STORAGE_KEY, value), details.value)
+}
 
 // The compact line: every segment, and its age only when there is one to give.
 const printed = computed(() => {
@@ -36,7 +55,7 @@ const reading = computed(() => props.status?.harness === 'codex'
 
 function title(segment) {
   return [resetsLabel(segment.resets_at, props.now), segment.updated || props.status?.updated,
-    segment.provenance, segment.detail]
+    segment.provenance, segment.detail, segment.sourceAge, segment.note]
     .filter(Boolean).join(' — ')
 }
 </script>
@@ -50,11 +69,12 @@ function title(segment) {
     :title="reading"
   >{{ printed }}</span>
 
-  <div v-else-if="segments.length" class="d-flex flex-wrap align-center ga-2">
+  <div v-else-if="segments.length || (!compact && hasDetails)" class="d-flex flex-wrap align-center ga-2">
     <div
       v-for="segment in segments"
       :key="segment.key"
       class="status-segment"
+      :class="{ 'status-detail': segment.detailOnly }"
       :title="title(segment)"
     >
       <div class="d-flex justify-space-between text-body-small">
@@ -73,6 +93,14 @@ function title(segment) {
         rounded
       />
     </div>
+    <button
+      v-if="hasDetails"
+      type="button"
+      class="text-body-small text-medium-emphasis usage-details"
+      :aria-pressed="details"
+      :aria-label="details ? 'Hide usage details' : 'Show usage details'"
+      @click.stop="toggleDetails"
+    >{{ details ? 'less' : 'details' }}</button>
     <!-- Its own line under the meters, because it qualifies all of them. -->
     <div
       v-if="age"
@@ -80,6 +108,14 @@ function title(segment) {
       :title="reading"
     >{{ age }}</div>
   </div>
+  <button
+    v-if="compact && hasDetails"
+    type="button"
+    class="text-body-small text-medium-emphasis usage-details"
+    :aria-pressed="details"
+    :aria-label="details ? 'Hide usage details' : 'Show usage details'"
+    @click.stop="toggleDetails"
+  >{{ details ? 'less' : 'details' }}</button>
 </template>
 
 <style scoped>
@@ -89,5 +125,21 @@ function title(segment) {
   min-width: 5.5rem;
   flex: 1 1 5.5rem;
   max-width: 12rem;
+}
+.usage-details {
+  margin-inline-start: 0.5rem;
+  background: transparent;
+  border: 0;
+  text-decoration: underline;
+}
+.status-detail {
+  flex-basis: 14rem;
+  min-width: min(100%, 14rem);
+  max-width: 24rem;
+  overflow-wrap: anywhere;
+}
+.status-detail > .d-flex {
+  flex-wrap: wrap;
+  gap: 0.25rem;
 }
 </style>

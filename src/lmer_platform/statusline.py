@@ -339,6 +339,13 @@ def read_document(path: Path, *, now=None) -> Optional[dict]:
         usage = _codex(document.get('codex'), now=now)
         if usage is not None:
             served['codex'] = usage
+            context = document.get('context')
+            observed = _dated(context, 'rollout/token_count', now=now)
+            if observed and context.get('thread_id') == usage['thread_id']:
+                percent = _percent(context.get('percent'))
+                if percent is not None:
+                    served['context'] = {**observed, 'percent': percent,
+                                         'scope': 'thread', 'thread_id': usage['thread_id']}
         return served
     context = document.get("context")
     if isinstance(context, dict):
@@ -398,6 +405,8 @@ def _codex(value, *, now):
     observed = _dated(account, 'account/rateLimits/read', now=now)
     if observed:
         observed.update(scope='account', limits=[])
+        if 'main_bucket' in account:
+            observed['main_bucket'] = _clamped_name(account.get('main_bucket'))
         windows = account.get('limits')
         seen = set()
         for window in (windows[:MAX_LIMITS] if isinstance(windows, list) else []):
@@ -418,6 +427,9 @@ def _codex(value, *, now):
                 'resets_at': reset,
                 'reset_passed': reset is not None and age_seconds(reset, now=now) >= 0,
             })
+            period = _clamped_name(window.get('period_label'))
+            if period:
+                observed['limits'][-1]['period_label'] = period
         result['account'] = observed
     runtime = value.get('runtime')
     observed = _dated(runtime, 'thread/read', now=now)
