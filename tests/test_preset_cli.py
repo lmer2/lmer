@@ -10,8 +10,7 @@ the preset:
 
 - preset args (plus ``--checkout``/``--service`` derived from the preset
   fields) are prepended to argv, so explicit flags override them;
-- preset ``env`` is applied only over keys that are unset or ``.env``-sourced,
-  never over exported environment variables (but it does beat ``.env`` files);
+- explicit exports beat preset ``env``, which beats ``.env`` defaults;
 - the merged argument set is re-validated, so a preset can also fail the
   normal mutual-exclusion checks.
 
@@ -193,29 +192,30 @@ class TestPresetPrecedence:
             f"got {captured.get('LMER_CHECKOUT_BRANCH')!r}"
         )
 
-    def test_exported_env_beats_preset_env(self, presets_file, tmp_path):
-        """An exported LMER_LLM_NAME wins over the preset's env entry."""
+    @pytest.mark.parametrize("key,exported,preset", [
+        ("LMER_LLM_NAME", "sonnet", "opus"),
+        ("LMER_REASONING_EFFORT", "low", "xhigh"),
+    ])
+    def test_exported_env_beats_preset_env(self, presets_file, tmp_path, key, exported, preset):
+        presets_file.write_text(json.dumps({"demo": {"env": {key: preset}}}))
         captured: dict = {}
         rc = _run_main(
             ["--preset", "demo", *_EXEC_ARGS],
             env_in={
                 "LMER_PRESETS_FILE": str(presets_file),
-                "LMER_LLM_NAME": "sonnet",
+                key: exported,
             },
             captured_env=captured,
             home=tmp_path,
         )
         assert rc == 0
-        assert captured.get("LMER_LLM_NAME") == "sonnet", (
-            "Exported environment must win over preset env; "
-            f"got {captured.get('LMER_LLM_NAME')!r}"
-        )
+        assert captured.get(key) == exported
 
     def test_preset_env_beats_dotenv_value(
         self, presets_file, tmp_path, monkeypatch
     ):
         """A preset env entry overrides the same key sourced from a .env file
-        (preset > .env, but < exported env)."""
+        (preset > .env)."""
         monkeypatch.chdir(tmp_path)
         (tmp_path / ".env").write_text("LMER_LLM_NAME=from-dotenv\n")
         captured: dict = {}
@@ -230,6 +230,24 @@ class TestPresetPrecedence:
             "Preset env must win over a .env-file value; "
             f"got {captured.get('LMER_LLM_NAME')!r}"
         )
+
+    def test_explicit_model_flag_beats_preset_and_host(self, presets_file, tmp_path):
+        captured = {}
+        assert _run_main(
+            ["--preset", "demo", "--model", "haiku", *_EXEC_ARGS],
+            env_in={"LMER_PRESETS_FILE": str(presets_file), "LMER_LLM_NAME": "sonnet"},
+            captured_env=captured, home=tmp_path,
+        ) == 0
+        assert captured["LMER_LLM_NAME"] == "haiku"
+
+    def test_no_preset_preserves_host_effort(self, presets_file, tmp_path):
+        captured = {}
+        assert _run_main(
+            _EXEC_ARGS,
+            env_in={"LMER_PRESETS_FILE": str(presets_file), "LMER_REASONING_EFFORT": "high"},
+            captured_env=captured, home=tmp_path,
+        ) == 0
+        assert captured["LMER_REASONING_EFFORT"] == "high"
 
     def test_preset_args_are_revalidated(self, presets_file, tmp_path, capsys):
         """A preset arg that collides with an explicit flag fails the normal
@@ -1160,11 +1178,7 @@ class TestScopedResourceLimitsAgainstPresets:
     def test_a_presets_own_memory_does_not_displace_the_taskdef_value(
         self, resource_presets, tmp_path
     ):
-        """The headline claim: specificity decides, not the layer a value came
-        from. LMER_MEMORY is deliberately NOT exported here — preset env is
-        applied only over keys os.environ lacks, so an exported one would keep
-        the preset's value out of the environment entirely and the case would
-        prove nothing."""
+        """Scope specificity still decides between distinct environment keys."""
         limits = self._limits(
             ["--preset", "astra", "develop", REPO_URL, "--exec", "true"],
             {

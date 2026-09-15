@@ -465,20 +465,13 @@ class RunView:
 
     @property
     def model(self) -> Optional[str]:
-        """The model driving the harness, as the session itself resolved it.
-
-        ``None`` only when the session predates T51 or resolved no model at all —
-        it is no longer the standing answer. The reason this could not simply be
-        read off the daemon still holds and is why the value takes the long way
-        round: the model is resolved *inside* the session, and an exported
-        ``LMER_LLM_NAME`` beats a preset's value host-side (:mod:`lmer_cli.cli`),
-        so inferring it from the daemon's own environment would be wrong for
-        precisely the runs that name a preset — the ones whose model actually
-        varies. So the session reports what it resolved, late, through
-        :func:`lmer_platform.spawn.ports_file_for`, and ``absorb_ports`` folds it
-        in without overwriting a model the spawn request named.
-        """
+        """The requested model, or the launcher's later report when none was named."""
         return self._task.get("model")
+
+    @property
+    def effort(self) -> Optional[str]:
+        """The resolved effort override, or None when the launcher reported none."""
+        return self._task.get("effort")
 
     @property
     def session_for_client(self) -> Optional[dict]:
@@ -576,6 +569,7 @@ class RunView:
             "agents": self.agents,
             "harness": self.harness,
             "model": self.model,
+            "effort": self.effort,
         }
 
 

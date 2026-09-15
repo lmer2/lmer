@@ -220,7 +220,7 @@ class TestModelReportedToThePlatform:
         one) and it is the only thing that makes RunView.model answer."""
         source = CLI_PY.read_text()
         applied = source.index("_apply_model_selection(ns.model")
-        reported = source.index("_record_session_model(session_model, harness.name)")
+        reported = source.index('session_model, harness.name, os.environ.get("LMER_REASONING_EFFORT")')
 
         assert applied < reported, (
             "the model is reported before it is resolved, so a --model flag "

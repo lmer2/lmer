@@ -141,6 +141,7 @@ from urllib.parse import urlparse
 from lmer_cli.cli import _derive_repo_url_from_task_target, _parse_repo_url
 from lmer_cli.container.clone_and_exec import _scrub_credentials
 from lmer_cli.container.sources import url_has_embedded_credential
+from lmer_cli.env_sources import env_with_overrides
 from lmer_cli.harness import HARNESSES, known_harnesses
 from lmer_cli.mounts import (
     # Imported rather than restated: credential staging (there) and the
@@ -813,6 +814,20 @@ class SpawnResult:
     control_host: str = _CONTROL_HOST
     control_port: Optional[int] = None
     warning: Optional[str] = None
+    model: Optional[str] = None
+
+    def launch_settings(self) -> dict:
+        """Read available launch facts without delaying the spawn acknowledgement."""
+        try:
+            payload = json.loads(ports_file_for(self.session_id).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+        return {
+            "model": self.model or _reported_model(payload),
+            "effort": _reported_effort(payload),
+        }
 
     def to_dict(self) -> dict:
         return {
@@ -829,6 +844,7 @@ class SpawnResult:
             # named by the entry's ``control.token_ref`` — see read_control_token.
             "control": {"host": self.control_host, "port": self.control_port},
             "command": self.command,
+            **self.launch_settings(),
         }
 
 
@@ -2114,11 +2130,17 @@ def _reported_harness(payload: dict) -> Optional[str]:
     return harness.strip()
 
 
+def _reported_effort(payload: dict) -> Optional[str]:
+    """The launcher's resolved effort override, absent on older launchers."""
+    effort = payload.get("effort")
+    return effort.strip() if isinstance(effort, str) and effort.strip() else None
+
+
 def absorb_ports(sessions: list) -> list:
     """Fold what running sessions reported about themselves into their entries.
 
-    Three facts today, all from :func:`ports_file_for`: the published port mapping,
-    model and harness the session resolved. Called on the read path because they
+    Facts from :func:`ports_file_for`: the published port mapping, model,
+    harness and effort the session resolved. Called on the read path because they
     appear *after* the spawn returns — ``lmer`` publishes ports while starting the
     container and settles the model just before that, which is strictly later than
     the moment the registry entry is written.
@@ -2149,8 +2171,9 @@ def absorb_ports(sessions: list) -> list:
         # (lmer_platform.inventory), and it stays exactly as its writer left it.
         wants_model = isinstance(task, dict) and not task.get("model")
         wants_harness = isinstance(task, dict) and not task.get("harness")
+        wants_effort = isinstance(task, dict) and not task.get("effort")
         # Nothing left to learn about this session: stop reading its file.
-        if not session_id or not (wants_ports or wants_model or wants_harness):
+        if not session_id or not (wants_ports or wants_model or wants_harness or wants_effort):
             updated.append(entry)
             continue
         path = ports_file_for(session_id)
@@ -2175,7 +2198,8 @@ def absorb_ports(sessions: list) -> list:
             changes["ports"] = ports
         model = _reported_model(payload)
         harness = _reported_harness(payload)
-        if (wants_model and model) or (wants_harness and harness):
+        effort = _reported_effort(payload)
+        if (wants_model and model) or (wants_harness and harness) or (wants_effort and effort):
             # The whole block, because registry.update merges at the top level
             # only; a bare ``{"model": …}`` would drop the taskdef and target the
             # fleet view labels the row with.
@@ -2184,6 +2208,8 @@ def absorb_ports(sessions: list) -> list:
                 resolved["model"] = model
             if wants_harness and harness:
                 resolved["harness"] = harness
+            if wants_effort and effort:
+                resolved["effort"] = effort
             changes["task"] = resolved
         if not changes:
             updated.append(entry)
@@ -3109,8 +3135,7 @@ def _spawn_session(
     # channel. That last one is the flag an agent tests to know it was started by
     # the orchestrator, which is why it is set here and only here: a session
     # spawned without a usable channel directory must not claim to have one.
-    child_env = {
-        **os.environ,
+    invocation_env = {
         "LMER_PLATFORM_PORTS_FILE": str(ports_file_for(session_id)),
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
@@ -3119,13 +3144,13 @@ def _spawn_session(
             terminal_settings()["confirm_seconds"].value
         ),
     }
-    child_env.update(channels.env)
-    child_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
+    invocation_env.update(channels.env)
+    invocation_env[MOUNT_LINKS_ENV] = format_mount_links("", channels.link_pairs)
     if request.no_repo:
         # Spec D17, structurally: `lmer` skips repo resolution on this and the
         # container skips the workspace clone, so the session has nothing to edit
         # rather than instructions not to.
-        child_env[NO_REPO_ENV] = "1"
+        invocation_env[NO_REPO_ENV] = "1"
     else:
         # Also never inherited, and for the sharper version of the same reason: a
         # daemon whose shell exported LMER_NO_REPO would otherwise hand every
@@ -3135,7 +3160,8 @@ def _spawn_session(
         # environment, and the child's own .env seeding would hand it straight
         # back. Blank is falsy to get_bool_env on the host and never equals "1"
         # in the container, so it reads as unset the whole way down.
-        child_env[NO_REPO_ENV] = ""
+        invocation_env[NO_REPO_ENV] = ""
+    child_env = env_with_overrides(invocation_env)
 
     master_fd, slave_fd = pty.openpty()
     try:
@@ -3337,4 +3363,5 @@ def _spawn_session(
         control_host=_CONTROL_HOST,
         control_port=control_port,
         warning=warning,
+        model=request.model,
     )

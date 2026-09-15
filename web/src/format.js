@@ -316,21 +316,9 @@ export function targetRef(target) {
   return { kind: kind.kind, number: rest[1], label: `${kind.word} #${rest[1]}` }
 }
 
-// What is driving a session, as far as the *platform* can know it. Two optional
-// and independent facts, both recorded on the spawn entry
-// (lmer_platform.inventory):
-//
-//   - `harness` is recorded only when the spawn request named one. Left unset,
-//     `lmer` resolves it inside the session and the host never learns which.
-//   - `model` is the resolved LMER_LLM_NAME, and nothing writes it yet (T51
-//     adds the flag). The daemon's own environment is not evidence about a run:
-//     an exported LMER_LLM_NAME beats a preset's value host-side, so guessing
-//     from it would be wrong for exactly the runs that name a preset.
-//
-// Null when neither is known, because a chip reading "unknown" where a model
-// belongs is worse than a row that never raises the question.
+// Missing launch facts stay silent; the harness's own defaults are not known here.
 export function driverLabel(run) {
-  return [run.harness, run.model].filter(Boolean).join(' · ') || null
+  return [run.harness, run.model, run.effort].filter(Boolean).join(' · ') || null
 }
 
 // The harness's own status line, as segments to draw (issue 248). One

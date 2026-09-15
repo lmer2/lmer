@@ -521,30 +521,17 @@ def _record_published_ports(ports: list[int], bind: str) -> None:
     )
 
 
-def _record_session_model(model: str | None, harness: str | None = None) -> None:
-    """Report the model and harness this session resolved inside the container.
-
-    The platform cannot work this out for itself and must not guess: it applies
-    preset environment only over keys its own environment leaves unset, so an
-    exported ``LMER_LLM_NAME`` beats a preset's — meaning a daemon inferring the
-    model from its own environment would be wrong for precisely the runs that
-    named a preset (``lmer_platform.inventory.RunView.model``). Here the value is
-    resolved: flag, then preset env, then the ambient environment.
-
-    The harness is always resolved even when the spawn named neither one nor a
-    model. Reporting it is what lets the host render harness-specific terminal
-    geometry for preset/model-selected sessions instead of treating an absent
-    ``--harness`` as an unknown harness.
-
-    Nothing is written for an absent fact rather than writing ``None``: unset
-    model means the harness ran its own default, and recording that as a model
-    would put a name on a row that never chose one.
-    """
+def _record_session_model(
+    model: str | None, harness: str | None = None, effort: str | None = None,
+) -> None:
+    """Report resolved launch settings; absent values leave harness defaults unnamed."""
     facts = {}
     if model:
         facts["model"] = model
     if harness:
         facts["harness"] = harness
+    if effort:
+        facts["effort"] = effort
     if facts:
         _record_platform_facts(**facts)
 
@@ -631,7 +618,7 @@ def parse_args(
     parser.add_argument("--mount-file", dest="mount_file", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a single host file into the container at an explicit destination (repeatable). HOST supports ~ and $VAR expansion and must be an existing file; CONTAINER must be an absolute path; MODE is ro (default) or rw. Invalid entries abort the run. (env: LMER_MOUNT_FILES, comma-separated entries)")
     parser.add_argument("--mount-dir", dest="mount_dir", action="append", metavar="HOST:CONTAINER[:MODE]", help="Mount a host directory into the container at an explicit destination (repeatable). Same grammar and strictness as --mount-file, but HOST must be an existing directory; MODE is ro (default) or rw. The mount shadows whatever the image has at CONTAINER. Invalid entries abort the run. (env: LMER_MOUNT_DIRS, comma-separated entries)")
     parser.add_argument("--env-file", dest="env_file", help="Additional .env file to load (highest precedence among .env files; below already-exported environment variables). Its variables are forwarded into the container alongside cwd/.env and ~/.lmer/.env, which still load. Useful when lmer is spawned from a directory without the relevant .env (e.g. the Slack listener).")
-    parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_<TASK>_PRESET for one taskdef, e.g. LMER_REVIEW_PRESET, then LMER_PRESET for any task; the flag wins over both). The preset's checkout/service/env/args are applied as defaults: flags and exported environment variables in the actual invocation override them.")
+    parser.add_argument("--preset", dest="preset", help="Named startup preset from LMER_PRESETS_FILE to apply (env: LMER_<TASK>_PRESET for one taskdef, e.g. LMER_REVIEW_PRESET, then LMER_PRESET for any task; the flag wins over both). Flags and explicit exported variables override the preset; preset env overrides .env defaults, including defaults loaded by the platform.")
     parser.add_argument("--list-presets", dest="list_presets", action="store_true", help="List the presets available from LMER_PRESETS_FILE and exit")
     parser.add_argument("--agents", dest="agents", help="Comma-delimited preset names the session's agent may fan a task out to via spawn-harness (env: LMER_AGENTS; the flag wins). Names are resolved against LMER_PRESETS_FILE host-side (unknown names fail fast); each preset contributes its env overlay plus --harness/--prompt folded from its args — the remaining launch-shaping fields (checkout/service/other args) are ignored with a warning — and only that resolved config is forwarded into the container.")
 
@@ -1728,8 +1715,8 @@ def _resolve_and_apply_preset(
     cannot change it (preset args reject positional tokens below), so the
     taskdef id the lookup uses is stable. The explicit invocation always
     wins over the preset: preset tokens are PREPENDED to argv (argparse
-    last-wins), and preset env is only applied over keys that are unset or
-    .env-sourced — never over exported shell environment.
+    last-wins). Preset env replaces only absent or file-default values,
+    including defaults attributed by the platform daemon; exports stay protected.
 
     Returns the (possibly re-parsed) ``(ns, rest, applied_env)`` on success —
     ``applied_env`` being the preset env entries that actually won host-side,
@@ -1953,11 +1940,8 @@ def _apply_model_selection(
     the container env dict all read the variable, so a second channel would be a
     second answer.
 
-    Must therefore run *after* preset application and *before* harness
-    resolution. After, because a preset's env is applied only over keys the
-    environment leaves unset — setting the variable first would make the flag
-    look like an export and silently disable the preset's own model. Before,
-    because a model is allowed to pick the harness that serves it.
+    Runs after preset application so the flag wins, and before harness
+    resolution so the model can select the harness that serves it.
 
     Blank is not a value: ``--model ''`` leaves the environment alone, the same
     way an empty ``--harness`` falls through to ``LMER_HARNESS``. Surrounding
@@ -2218,8 +2202,12 @@ def main(argv: list[str] | None = None) -> int:
 
     ns, rest = parse_args(argv)
 
+    from lmer_cli.env_sources import DEFAULT_SOURCES_ENV, consume_env_defaults
+
+    inherited_env_sources = consume_env_defaults()
     if ns.verbose or ns.debug:
         os.environ["LMER_VERBOSE"] = "1"
+        inherited_env_sources.pop("LMER_VERBOSE", None)
 
     # Discover tasks from filesystem and validate provided task
     repo_root = repo_root_path()  # None in installed mode
@@ -2261,7 +2249,10 @@ def main(argv: list[str] | None = None) -> int:
     env_file_candidates += default_env_file_candidates(
         state_dir=state_dir, cwd=cwd_env_file.parent
     )
-    early_env_file_sources = apply_env_file_defaults(env_file_candidates)
+    early_env_file_sources = {
+        **inherited_env_sources,
+        **apply_env_file_defaults(env_file_candidates),
+    }
 
     # Handle --list-presets: a pure query, so it runs before any preset is
     # resolved or a task is required — but after the early .env load so an
@@ -2303,9 +2294,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         container_user = os.environ.get("LMER_CONTAINER_USER", "developer")
 
-    # Apply --model to LMER_LLM_NAME (after preset application, so the flag beats
-    # a preset's env rather than being mistaken for an export; before harness
-    # resolution, so the model can imply the harness that serves it).
+    # The flag wins over preset env and can select the harness that serves it.
     session_model = _apply_model_selection(ns.model, early_env_file_sources)
     _apply_dispatch_aliases(early_env_file_sources)
 
@@ -2347,7 +2336,9 @@ def main(argv: list[str] | None = None) -> int:
     # rather than anywhere earlier because this is the first point the answer is
     # final: the flag, the preset's env and the ambient environment have all had
     # their say. A plain terminal launch sets no ports file and writes nothing.
-    _record_session_model(session_model, harness.name)
+    _record_session_model(
+        session_model, harness.name, os.environ.get("LMER_REASONING_EFFORT"),
+    )
 
     # Harnesses the --agents fan-out children imply beyond the session's
     # (issue #131): their credential files union into build_user_mounts
@@ -2992,6 +2983,7 @@ def main(argv: list[str] | None = None) -> int:
         # which is exactly the ambient value the scoped pair exists to avoid.
         AGENTS_ENV: None,
         AGENTS_CONFIG_ENV: None,
+        DEFAULT_SOURCES_ENV: None,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         # User-installed harnesses (issue #132): where the host mounted
         # ~/.lmer/harnesses inside the container (consumed by

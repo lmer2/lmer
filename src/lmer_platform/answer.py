@@ -260,6 +260,7 @@ class AnswerResult:
             "session": {
                 "session_id": self.session.session_id,
                 "pid": self.session.pid,
+                **self.session.launch_settings(),
                 "control": {
                     "host": self.session.control_host,
                     "port": self.session.control_port,
