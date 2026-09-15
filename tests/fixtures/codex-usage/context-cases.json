@@ -1,0 +1,57 @@
+[
+  {
+    "total": 12300,
+    "window": 258400,
+    "percent": 0
+  },
+  {
+    "total": 120393,
+    "window": 258400,
+    "percent": 44
+  },
+  {
+    "total": 114645,
+    "window": 258400,
+    "percent": 42
+  },
+  {
+    "total": 93414,
+    "window": 258400,
+    "percent": 33
+  },
+  {
+    "total": 135200,
+    "window": 258400,
+    "percent": 50
+  },
+  {
+    "total": 12001,
+    "window": 12200,
+    "percent": 0
+  },
+  {
+    "total": 12003,
+    "window": 12200,
+    "percent": 1
+  },
+  {
+    "total": 0,
+    "window": 258400,
+    "percent": 0
+  },
+  {
+    "total": 500000,
+    "window": 258400,
+    "percent": 100
+  },
+  {
+    "total": 12000,
+    "window": 12000,
+    "percent": 100
+  },
+  {
+    "total": 12000,
+    "window": 10000,
+    "percent": 100
+  }
+]

@@ -65,6 +65,8 @@ const source = compiled.content
   .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
   .replace(/from ['"]\\.\\.\\/format\\.js['"]/g,
     `from '${pathToFileURL('src/format.js').href}'`)
+  .replace(/from ['"]\\.\\.\\/preferences\\.js['"]/g,
+    `from '${pathToFileURL('src/preferences.js').href}'`)
 const component = (await import(
   `data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`
 )).default
@@ -81,13 +83,14 @@ console.log(JSON.stringify({ html: html.replace(/<!--(?!\\]|\\[|v-if)[\\s\\S]*?-
 """
 
 
-def _render(props):
+def _render(props, *, details=False):
     """*props* rendered by the real component, comments stripped."""
     node = node_binary()
     if not node:
         require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    browser = "globalThis.window = {localStorage: {getItem: () => 'on'}};\n" if details else ""
     result = subprocess.run(
-        [node, "--input-type=module", "-e", _RENDER_PROBE % props],
+        [node, "--input-type=module", "-e", browser + _RENDER_PROBE % props],
         capture_output=True, text=True, timeout=180, cwd=str(WEB),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
@@ -357,3 +360,10 @@ def _status_strip_tag(source):
     match = re.search(r"<StatusStrip\b[^>]*>", source, re.S)
     assert match, "no StatusStrip in this source"
     return match.group(0)
+
+
+def test_claude_markup_matches_the_pre_codex_toggle_render():
+    baseline = json.loads((WEB.parent / 'tests/fixtures/codex-usage/claude-render.json').read_text())
+    for compact in (False, True):
+        without_vue_comments = lambda value: re.sub(r"<!--.*?-->", "", value, flags=re.S)
+        assert without_vue_comments(_render(_props(compact=compact))) == without_vue_comments(baseline[str(compact)])

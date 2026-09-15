@@ -447,6 +447,8 @@ def test_api_client_uses_relative_paths():
 #: Adding one is meant to be a deliberate, reviewed act — the same reason the
 #: dependency set is an exact allowlist rather than a count.
 ALLOWED_STORAGE_KEYS = {
+    # The viewer's choice to expand usage details, never a session setting.
+    "USAGE_DETAILS_STORAGE_KEY",
     # x1/x1.5/x2 terminal height: a property of the operator's screen, not of any
     # session, and re-picking it on every run is the annoyance it exists to remove.
     "HEIGHT_STORAGE_KEY",

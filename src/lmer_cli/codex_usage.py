@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import stat
@@ -13,6 +14,7 @@ import time
 logger = logging.getLogger(__name__)
 TOKEN_READ_BYTES = 1024 * 1024
 ACCOUNT_INTERVAL = 60.0
+CONTEXT_BASELINE = 12000
 TOKEN_FIELDS = ('input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
                 'output_tokens', 'reasoning_output_tokens', 'total_tokens')
 
@@ -74,10 +76,11 @@ def account_snapshot(reply):
         if not isinstance(single, dict):
             return None
         buckets = {single.get('limitId') or 'codex': single}
+    buckets = {key: value for key, value in buckets.items() if isinstance(value, dict)}
+    main = 'codex' if 'codex' in buckets else next(iter(buckets)) if len(buckets) == 1 else None
+    ordered = sorted(buckets.items(), key=lambda item: item[0] != main)
     limits = []
-    for ident, bucket in list(buckets.items())[:8]:
-        if not isinstance(bucket, dict):
-            continue
+    for ident, bucket in ordered[:8]:
         for key in ('primary', 'secondary'):
             window = bucket.get(key)
             if not isinstance(window, dict):
@@ -85,12 +88,41 @@ def account_snapshot(reply):
             limits.append({
                 'key': f'{ident}:{key}', 'bucket': ident,
                 'label': bucket.get('limitName') or ident,
+                'period_label': period_label(window.get('windowDurationMins')),
                 'percent': window.get('usedPercent'),
                 'minutes': window.get('windowDurationMins'),
                 'resets_at': window.get('resetsAt'),
             })
+    limits.sort(key=lambda window: window['minutes']
+                if window['bucket'] == main and type(window['minutes']) is int
+                and window['minutes'] > 0 else math.inf)
     return {'updated': stamp(), 'source': 'account/rateLimits/read',
-            'scope': 'account', 'limits': limits[:8]}
+            'scope': 'account', 'main_bucket': main, 'limits': limits[:8]}
+
+
+def period_label(minutes):
+    if type(minutes) is not int or minutes <= 0:
+        return 'window unknown'
+    for unit, size in (('d', 1440), ('h', 60)):
+        if minutes % size == 0:
+            return f'{minutes // size}{unit}'
+    return f'{minutes}m'
+
+
+def context_snapshot(tokens):
+    """Codex 0.154.0's rounded context-left complement; see SESSION-STATUS.md."""
+    if not isinstance(tokens, dict) or not isinstance(tokens.get('last'), dict):
+        return None
+    total, window = tokens['last'].get('total_tokens'), tokens.get('context_window')
+    if any(type(value) is not int or not 0 <= value <= 2 ** 53 - 1 for value in (total, window)) or not window:
+        return None
+    remaining = 0
+    if window > CONTEXT_BASELINE:
+        effective = window - CONTEXT_BASELINE
+        available = max(0, effective - max(0, total - CONTEXT_BASELINE))
+        remaining = math.floor(available / effective * 100 + 0.5)
+    return {'percent': 100 - remaining, 'updated': tokens.get('updated'),
+            'source': tokens.get('source'), 'thread_id': tokens.get('thread_id')}
 
 
 class CodexUsage:
@@ -136,6 +168,9 @@ class CodexUsage:
                             'effort': runtime.get('effort')},
             },
         }
+        context = context_snapshot(self.tokens)
+        if context is not None:
+            document['context'] = context
         try:
             self._publish(document)
         except OSError:

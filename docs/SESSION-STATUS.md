@@ -135,8 +135,9 @@ adapter as described below; `pi` does not publish a status document.
 ## Codex usage (installed interface: codex-cli 0.154.0)
 
 Codex uses a `codex` extension to schema 1. Claude's document and rendering are
-unchanged. Older readers ignore the extension and show no Codex strip. Update
-both the session image and platform/UI to see it.
+unchanged. Older documents without the new context or account display fields still render.
+Update the session image and platform/UI together to publish and serve context.
+Older platform readers ignore the new fields.
 
 `src/lmer_cli/codex_usage.py` observes the primary native thread already
 identified by the private app-server delivery adapter. It never starts/resumes
@@ -151,16 +152,77 @@ Representative, anonymized shapes are in `tests/fixtures/codex-usage/`.
 | Last response tokens | Latest rollout `event_msg` / `token_count.info.last_token_usage.total_tokens`: the last model response's reported input plus output, not the entire agent turn. |
 | Thread total tokens | `info.total_token_usage.total_tokens`, cumulative in this native thread. Repeated/cached inputs count as Codex reports them; this is not unique context occupancy. |
 | Token breakdown tooltips | Reported `input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, and `total_tokens`. Missing fields are omitted. Cached input and reasoning output are breakdowns, not additions to the total. |
-| Context capacity | `info.model_context_window`, in tokens. This is the reported capacity, not a model catalog lookup and not a context-used percentage. |
+| Context used (`ctx`) | `info.last_token_usage.total_tokens` and `info.model_context_window`, adjusted by Codex's 12,000-token baseline as described below. |
+| Context capacity (details) | `info.model_context_window`, in tokens. This is the reported capacity, not a model catalog lookup and not a context-used percentage. |
 | Account windows | `account/rateLimits/read` → `rateLimitsByLimitId`, falling back to `rateLimits` on older single-bucket replies. Each bucket's `usedPercent`, `windowDurationMins`, and `resetsAt` remain separate. Durations label 300 minutes as 5h and 10080 as 7d; primary does **not** mean 5h. |
 | Model and effort | `thread/read` → `model` and `reasoningEffort`: current configured native-thread metadata. They are not usage metrics or per-response execution attribution. |
 
-Account percentages are explicitly labelled **account**, **used**, and by
-bucket. The same account can appear in several worker strips; neither the
-collector nor platform adds those snapshots together. Bucket names are the
-server's labels; no model-to-bucket association is guessed. At most eight
-windows are served. An absent percentage removes its window; a reported zero
-remains a real `0% used`. An absent duration says `window unknown`.
+The default Codex strip is `ctx NN%`, the main account's reported windows,
+then `eff high` (or the observed effort). Percentages mean **consumed**, exactly
+as for Claude: the same `%` wording and meter filling direction. The earlier
+Codex strip added `account <bucket>` and `% used` and repeated observation ages;
+those were presentation differences, not an inverted platform percentage.
+Codex's own terminal can instead say `% left`; lmer uses its complement.
+
+The **details** toggle reveals last-response and cumulative tokens, capacity,
+model, and other account buckets. The preference is browser-local
+(`lmer:usage-details`), shared by the chat, run detail and fleet strips. It
+persists across reloads; a browser refusing storage still allows toggling.
+Bucket names, model, reset information, source and observation dates remain in
+tooltips. At most eight windows are served, with main windows retained first.
+Neither collector nor platform adds account snapshots across workers. Missing
+percentages remove a window; zero remains `0%`. Missing duration says
+`window unknown`. Period labels are published by the harness (`period_label`);
+only older documents use the existing browser duration-label fallback.
+
+### Main account selection
+
+In [Codex 0.154.0's status surfaces](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/tui/src/chatwidget/status_surfaces.rs#L749),
+`FiveHourLimit` and `WeeklyLimit` explicitly read the `codex` bucket. The
+adapter therefore selects that id, regardless of ordering, model name or how
+many windows it has. If the reply contains exactly one bucket, that bucket is
+the fallback; with multiple buckets and no `codex`, none is guessed as main.
+The adapter publishes the result in `codex.account.main_bucket` (null when
+unknown). Old single-limit replies without an id use `codex`, matching Codex's
+[missing-id normalization](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/tui/src/chatwidget/rate_limits.rs#L256).
+
+Some accounts report `codex` with only a 10080-minute window: they show `7d`
+alone. Others report both 300 and 10080 minutes: they show `5h` and `7d`. A
+special bucket reporting both windows never supplies a missing main-account
+window. Labels follow actual durations, not primary/secondary position. The
+adapter orders main windows by duration, so a weekly primary and five-hour
+secondary still display `5h` then `7d`. Account percentages are bounded to
+0–100 for display and meters, matching Claude; the raw observation is retained.
+
+### Context formula (Codex 0.154.0)
+
+[TokenUsage::percent_of_context_window_remaining](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/protocol/src/protocol.rs#L2393)
+subtracts a baseline of 12,000 tokens (prompts, tools and compaction space).
+The [TUI status line](https://github.com/openai/codex/blob/rust-v0.154.0/codex-rs/tui/src/chatwidget/status_controls.rs#L411)
+uses **last_token_usage**, then complements rounded remaining to get used.
+For last-response total `T`, reported capacity `C` and baseline `B = 12000`:
+
+```text
+if C <= B: remaining_percent = 0
+otherwise:
+    effective = C - B
+    used = max(T - B, 0)
+    remaining_percent = round_half_up(100 * max(effective - used, 0) / effective)
+context.percent = 100 - remaining_percent
+```
+
+For `T = 120393`, `C = 258400`, `ctx` is `44%`, not the unadjusted `47%`.
+Rounding the remaining value before complementing matters at half-percent
+boundaries. Both inputs must be reported non-negative integers, capacity must
+be positive, and counts must fit JavaScript's exact integer range. Missing or
+malformed inputs publish **no context block**; neither cumulative tokens,
+model-catalog capacity nor the TUI's missing-data default is substituted.
+
+The top-level `context` block includes `percent`, the token record's `updated`,
+`source=rollout/token_count` and `thread_id`. The reader validates the date and
+thread identity and adds `age_seconds` and `scope=thread`. This is the same
+`context.percent` API field consumers use for Claude. It is a dated estimate
+of user-controllable context, not an exact live measurement between responses.
 
 ### Cadence, identity, and freshness
 
@@ -179,9 +241,10 @@ timestamp, which the RPC does not supply. Runtime metadata is dated when
 `thread/read` returns. `codex.version` is the thread's reported `cliVersion`,
 not an independently measured installed-binary version.
 
-The strip dates each group separately after 60 seconds and keeps exact dates,
-source, scope, and native thread ID in tooltips in both display densities.
-A quota reset already in the past is captioned `reset passed; awaiting new
+The strip has one age caption after 60 seconds, using the oldest visible
+source; expanding details includes their ages too. Exact dates, individual
+source ages, scope, model and native thread ID stay in both densities' tooltips.
+A quota reset already in the past has the tooltip `reset passed; awaiting new
 snapshot`; the client never clears a quota or reports zero because time passed.
 Missing ages say `age unknown`; future observation timestamps say `clock ahead`.
 
@@ -197,9 +260,8 @@ they cannot adopt an earlier incarnation's counters accidentally.
 
 ### Fields this integration cannot promise
 
-- Exact current TUI context occupancy or its adjusted “context left” percentage:
-  `thread/read` supplies neither. Last-response tokens divided by capacity would
-  be a different metric, so no such percentage is displayed.
+- Exact context occupancy between model responses: the last rollout counter
+  supplies the dated baseline-adjusted estimate above, not a continuous reading.
 - A 5h and 7d window for every account/bucket: only returned windows exist.
 - A server-side quota observation timestamp, quota tokens consumed by this
   worker, monetary cost, or per-model attribution of cumulative thread tokens.
@@ -215,10 +277,22 @@ Assistant generation remains platform lifecycle metadata, unrelated to usage.
 
 The extension stores `codex.thread_id`, optional `version`, and three optional
 objects: `tokens` (`scope=thread`, matching `thread_id`, `last`, `total`,
-`context_window`), `account` (`scope=account`, `limits`), and `runtime` (`model`,
+`context_window`), `account` (`scope=account`, `main_bucket`, `limits`), and `runtime` (`model`,
 `effort`). Sources are respectively `rollout/token_count`,
 `account/rateLimits/read`, and `thread/read`. Counts are non-negative JSON
 integers within JavaScript's exact integer range. Account windows retain their
 key, bucket, label, used percentage, duration in minutes, and epoch-second reset
 before the platform normalizes resets to ISO-8601. An undated or wrong-thread
 block is not served.
+
+### Assistant launch path
+
+Codex uber lmer uses the same publication path as workers:
+`assistant.start` → `spawn.spawn_session` supplies the read-write status mount
+and `LMER_STATUS_DIR` → `supervisor.run_supervisor` constructs `CodexDelivery`
+for Codex → `_run_supervisor` starts its private backend and usage monitor.
+The monitor calls `CodexUsage.refresh` and atomically writes `status.json`.
+`GET /api/assistant` reads that session's document; chat and fleet use the
+shared `StatusStrip` renderer. No assistant-only adapter or mount is needed.
+The launch regression exercises assistant start, the mount/environment, the
+real supervisor/monitor and the API with a read-only native backend fake.
