@@ -6,6 +6,7 @@ import inspect
 import os
 import subprocess
 import textwrap
+import time
 from pathlib import Path
 from unittest import mock
 import pytest
@@ -93,6 +94,24 @@ def strip_lmer_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith("LMER_") and key not in _HARNESS_ENV:
             monkeypatch.delenv(key, raising=False)
+
+
+def drain_connectors(instances, budget, *, announce=True):
+    """Shared teardown for the connector suites' autouse lifetime fixtures.
+
+    Finalizers must finish before the caller's registry monkeypatches are
+    restored, or a late one writes into the operator's real registry (#461).
+    Only a drained connector is waited on: ``_threads`` also holds the
+    connect/inbound/outbound workers, so joining one that will not cancel
+    would hide the failed-drain assertion behind a hung suite (#471).
+    """
+    for built in instances:
+        drained = built.stop(timeout=budget, announce=announce)
+        if drained:
+            deadline = time.monotonic() + budget
+            for worker in built._threads:
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        assert drained, "test connector did not drain"
 
 
 def node_is_expected():
