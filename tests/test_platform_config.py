@@ -1491,6 +1491,58 @@ def test_a_negative_interval_in_the_file_falls_back_to_the_default(platform_root
     assert cfg.load().nudge_after_seconds == 180
 
 
+# The rotation group (issue #446). One knob on the same chain, so what these pin
+# is what is different: it is off by default — the reading it needs is published
+# by the harness and not every harness publishes one — and it has a ceiling,
+# because the figure it is compared against is itself a percentage.
+
+def test_the_rotation_threshold_is_off_until_an_operator_sets_it(platform_root):
+    config = cfg.load()
+    assert config.rotation_context_threshold == 0
+    setting = cfg.rotation_settings()["context_threshold"]
+    assert (setting.value, setting.source) == (0, "default")
+
+
+def test_the_rotation_threshold_resolves_env_over_file_over_default(
+    platform_root, monkeypatch
+):
+    store.write_json(cfg.config_path(), {"rotation_context_threshold": 70})
+    assert cfg.load().rotation_context_threshold == 70
+    assert cfg.rotation_settings()["context_threshold"].source == "config.json"
+
+    monkeypatch.setenv(cfg.ENV_ROTATION_CONTEXT_THRESHOLD, "85")
+    threshold = cfg.rotation_settings()["context_threshold"]
+    assert (threshold.value, threshold.source) == (85, "env")
+    assert threshold.stored == 70, "the screen edits the file, not the export"
+
+
+def test_a_threshold_above_a_hundred_is_refused_as_a_second_off_switch(
+    platform_root, monkeypatch, caplog
+):
+    """The ceiling exists for the reason the nudge threshold's does: a value the
+    reading can never reach would be an off-switch nobody documented, and the one
+    that is documented is 0."""
+    cfg._WARNED_INT_SETTINGS.clear()
+    monkeypatch.setenv(cfg.ENV_ROTATION_CONTEXT_THRESHOLD, "150")
+
+    assert cfg.load().rotation_context_threshold == 0
+    assert cfg.rotation_settings()["context_threshold"].source == "default"
+    assert any(
+        "platform_rotation_threshold_invalid" in record.message
+        for record in caplog.records
+    )
+    with pytest.raises(cfg.ConfigError) as excinfo:
+        cfg.validate_int_setting("rotation_context_threshold", 101)
+    assert "rotation_context_threshold=0" in str(excinfo.value)
+
+
+def test_zero_stays_writable_because_it_is_the_off_switch(platform_root):
+    cfg.update_stored({"rotation_context_threshold": 60})
+    cfg.update_stored({"rotation_context_threshold": 0})
+    assert cfg.load().rotation_context_threshold == 0
+    assert cfg.rotation_settings()["context_threshold"].value == 0
+
+
 def test_integer_settings_warn_under_their_own_log_keys(platform_root):
     """One machinery, one log key each, because a grep for one misconfiguration
     must not turn up the others (:data:`cfg.INT_SETTINGS`)."""
@@ -1504,6 +1556,9 @@ def test_integer_settings_warn_under_their_own_log_keys(platform_root):
         # don't-refuse path: a host that will not boot cannot be reconfigured
         # through its own UI, and this is a number bounding one request.
         "upload_max_bytes",
+        # The context-fullness threshold (issue #446), for the same reason: a
+        # typo in it must cost the reminder, never the daemon.
+        "rotation_context_threshold",
     }
 
 

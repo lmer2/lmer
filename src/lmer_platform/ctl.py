@@ -70,6 +70,8 @@ The assistant's own state::
     handoff get                     GET  /api/assistant/handoff
     handoff set TEXT                POST /api/assistant/handoff
     pending take                    POST /api/assistant/pending
+    rotate                          POST /api/assistant/handoff, then
+                                    POST /api/assistant/rotate
 
 A run is named by one ``host/project/slug`` key — see :func:`_run_fields`.
 
@@ -117,6 +119,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from lmer_cli import runref
@@ -161,6 +164,17 @@ ENV_PLATFORM_UNREACHABLE = "LMER_PLATFORM_UNREACHABLE"
 #: Every failure this CLI reports, whether the daemon refused the request or was
 #: never reached. Argparse's own usage errors still exit 2, as they do everywhere.
 EXIT_FAILURE = 1
+
+#: ``rotate``'s help, shown in both places argparse shows help (issue #446).
+_ROTATE_HELP = (
+    "Rotate YOURSELF: write the handover, then replace this incarnation with a "
+    "fresh context window (POST /api/assistant/handoff, then "
+    "POST /api/assistant/rotate). THIS CALL DOES NOT RETURN — the daemon ends "
+    "this container to start the successor, so a dropped connection is what "
+    "success looks like from here and the receipt is the next incarnation's "
+    "generation on `me`. Rotate at a breakpoint: no question of yours open, no "
+    "digest taken and not yet acted on, no half-finished brief."
+)
 
 #: One number for every verb, sized for the slowest rather than the typical: a
 #: spawn answers only once the container is up, and a fleet view may be served
@@ -586,6 +600,49 @@ def _call_pending_take(args) -> Call:
     return Call("POST", "/api/assistant/pending", body={})
 
 
+def _call_rotate(args) -> list:
+    """The one verb that is two calls, and the order is the point (issue #446).
+
+    The handover is written **first**, through its own route, rather than ridden
+    into the rotate body it would also fit. What that buys is the refusal case: a
+    rotation the daemon declines — a thread the successor's settings ask for is
+    held, say — leaves the note stored anyway, so the operator's own rotate, or
+    the supervisor's respawn after a crash, is as briefed as the planned rotation
+    would have been. A note that travelled in the rotate body would have gone with
+    the refusal.
+
+    Omitting the note is allowed and means "carry the recorded one forward", which
+    is the route's own default; it is what a rotation *after* a separate
+    ``handoff set`` looks like.
+    """
+    calls = []
+    note = _handoff_note(args)
+    if note is not None:
+        calls.append(
+            Call("POST", "/api/assistant/handoff", body={"handoff": note})
+        )
+    calls.append(Call("POST", "/api/assistant/rotate", body={}))
+    return calls
+
+
+def _handoff_note(args) -> Optional[str]:
+    """The note a rotation carries, from whichever source named it.
+
+    Three sources for one value because a handover is the text most likely to
+    contain backticks, ``$`` and quotes: the flag, ``-`` for stdin (this CLI's
+    convention, :func:`_text`), and a file, which is what an agent that composed
+    the note in a scratch file already has.
+    """
+    if args.handoff_file is not None:
+        try:
+            return Path(args.handoff_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CtlError(f"cannot read the handover note ({exc})")
+    if args.handoff is None:
+        return None
+    return _text(args.handoff)
+
+
 # --- arguments ---------------------------------------------------------------
 
 def _add_run_key(parser: argparse.ArgumentParser, name: str = "key") -> None:
@@ -986,6 +1043,31 @@ def create_parser() -> argparse.ArgumentParser:
     )
     take.set_defaults(call=_call_pending_take)
 
+    # The only verb carrying a `description` as well as a `help`: argparse shows
+    # `help` in the parent's listing and `description` in `rotate --help`, and the
+    # fact that the call does not return has to reach whichever one an agent read.
+    rotate = sub.add_parser(
+        "rotate",
+        description=_ROTATE_HELP,
+        help=_ROTATE_HELP,
+    )
+    # Exclusive rather than one silently winning: the two name the same field,
+    # and a note that was quietly ignored is discovered by the successor.
+    note = rotate.add_mutually_exclusive_group()
+    note.add_argument(
+        "--handoff",
+        help=(
+            "The note your successor is told. '-' reads it from stdin, which is "
+            "what to use for anything multi-line or containing backticks, $ or "
+            "quotes. Omit it to carry forward the note already recorded."
+        ),
+    )
+    note.add_argument(
+        "--handoff-file",
+        help="Read the note from this file instead of the command line.",
+    )
+    rotate.set_defaults(call=_call_rotate)
+
     return parser
 
 
@@ -1134,7 +1216,11 @@ def _add_runs(sub) -> None:
 
 
 def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
-    """Parse, issue one request, print the reply. Returns the exit code.
+    """Parse, issue the verb's requests, print the last reply. Returns the exit code.
+
+    One request for every verb but ``rotate``, which is two and says why
+    (:func:`_call_rotate`). A sequence stops at the first refusal, so the reply
+    printed is either the last call's or the one that declined.
 
     *transport* is the injectable HTTP seam — see :func:`lmer_platform.client.request`.
     """
@@ -1154,10 +1240,18 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
 
     try:
         endpoint = resolve_endpoint()
-        call = args.call(args)
-        response = _request(
-            endpoint, call, timeout=args.timeout, transport=transport
-        )
+        calls = args.call(args)
+        if isinstance(calls, Call):
+            calls = [calls]
+        for index, call in enumerate(calls):
+            response = _request(
+                endpoint, call, timeout=args.timeout, transport=transport
+            )
+            # A verb made of several calls stops at the first refusal and reports
+            # it, rather than pressing on with a step whose precondition the
+            # daemon just declined. The last call's reply is the verb's reply.
+            if index < len(calls) - 1 and not 200 <= response.status_code < 300:
+                break
     except CtlError as exc:
         print(json.dumps({"error": exc.error, "detail": str(exc)}), file=sys.stderr)
         return EXIT_FAILURE

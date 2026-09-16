@@ -146,6 +146,8 @@ __all__ = [
     "INT_SETTINGS", "NUDGE_SETTING_KEYS", "DEFAULT_NUDGE_AFTER_SECONDS",
     "DEFAULT_NUDGE_PENDING_THRESHOLD", "ENV_NUDGE_AFTER_SECONDS",
     "ENV_NUDGE_PENDING_THRESHOLD", "nudge_settings", "validate_int_setting",
+    "ROTATION_SETTING_KEYS", "DEFAULT_ROTATION_CONTEXT_THRESHOLD",
+    "ENV_ROTATION_CONTEXT_THRESHOLD", "rotation_settings",
     "UPLOAD_SETTING_KEYS", "ENV_UPLOAD_TYPES", "ENV_UPLOAD_MAX_BYTES",
     "DEFAULT_UPLOAD_TYPES", "DEFAULT_UPLOAD_MAX_BYTES", "MAX_UPLOAD_MAX_BYTES",
     "upload_settings", "upload_types", "chat_settings",
@@ -194,6 +196,13 @@ DEFAULT_NUDGE_AFTER_SECONDS = 180
 #: How many digests have to be waiting. 1 because everything in the spool is
 #: material by construction, so "there is one" is already the condition.
 DEFAULT_NUDGE_PENDING_THRESHOLD = 1
+
+#: How full uber lmer's context window may get before the daemon recommends a
+#: rotation (issue #446), as a percentage of the window. ``0`` turns the reminder
+#: off and is the only off-switch; the default is off, because the reading it
+#: needs is published by the harness and not every harness publishes one.
+#: Full mechanics: ``docs/PLATFORM-QUICKSTART.md``, "Context-fullness reminders".
+DEFAULT_ROTATION_CONTEXT_THRESHOLD = 0
 #: Ceiling on ``nudge_pending_threshold``: the spool it counts is bounded, so a
 #: higher threshold could never be met and would be an undocumented off-switch.
 #: :data:`lmer_platform.assistant.MAX_PENDING`, copied because that module imports
@@ -347,6 +356,18 @@ NUDGE_SETTING_KEYS = {
     ),
 }
 
+#: The context-fullness reminder's one knob, per platform instance (issue #446).
+#: :data:`NUDGE_SETTING_KEYS`' group on the same terms: an integer the daemon
+#: reads on its own tick, never an argv token.
+ENV_ROTATION_CONTEXT_THRESHOLD = "LMER_PLATFORM_ROTATION_CONTEXT_THRESHOLD"
+
+#: setting key -> (PlatformConfig field, env var), as above.
+ROTATION_SETTING_KEYS = {
+    "context_threshold": (
+        "rotation_context_threshold", ENV_ROTATION_CONTEXT_THRESHOLD
+    ),
+}
+
 TERMINAL_SETTING_KEYS = {
     "confirm_seconds": ("terminal_confirm_seconds", TERMINAL_CONFIRM_ENV),
 }
@@ -443,6 +464,23 @@ INT_SETTINGS = {
             f"the digest spool holds at most {MAX_NUDGE_PENDING_THRESHOLD}, so a "
             "higher threshold could never be met — disable the nudge with "
             "nudge_after_seconds=0 instead"
+        ),
+    ),
+    "rotation_context_threshold": _IntSettingRule(
+        default=DEFAULT_ROTATION_CONTEXT_THRESHOLD,
+        minimum=0,
+        floor_reason=(
+            "a percentage of the context window cannot be negative — 0 disables "
+            "the rotation reminder"
+        ),
+        log_key="platform_rotation_threshold_invalid",
+        unit="percent",
+        singular_unit="percent",
+        maximum=100,
+        ceiling_reason=(
+            "the reading it is compared against is a percentage clamped to 100, "
+            "so a higher threshold could never be met — disable the reminder "
+            "with rotation_context_threshold=0 instead"
         ),
     ),
     "upload_max_bytes": _IntSettingRule(
@@ -596,6 +634,10 @@ class PlatformConfig:
     #: digests. See :data:`NUDGE_SETTING_KEYS` and :data:`INT_SETTINGS`.
     nudge_after_seconds: int = DEFAULT_NUDGE_AFTER_SECONDS
     nudge_pending_threshold: int = DEFAULT_NUDGE_PENDING_THRESHOLD
+    #: How full the assistant's context window may get before the daemon types a
+    #: rotation recommendation into its session (issue #446), in percent. ``0``
+    #: disables it. See :data:`ROTATION_SETTING_KEYS` and :data:`INT_SETTINGS`.
+    rotation_context_threshold: int = DEFAULT_ROTATION_CONTEXT_THRESHOLD
     terminal_confirm_seconds: int = DEFAULT_TERMINAL_CONFIRM_SECONDS
     #: What a file attached to a chat may weigh, and which types are accepted
     #: (issue #246). The type list is names, normalised and filtered against
@@ -1431,6 +1473,17 @@ def nudge_settings() -> dict:
     to the next tick rather than the next restart.
     """
     return _int_group_settings(NUDGE_SETTING_KEYS, group="nudge")
+
+
+def rotation_settings() -> dict:
+    """The rotation group's effective settings, one per :data:`ROTATION_SETTING_KEYS`.
+
+    :func:`nudge_settings`' sibling on the same terms: the detector reads it every
+    tick, so a threshold the operator moves applies to the next tick rather than
+    to the next incarnation — which matters more here than anywhere else in this
+    group, since the thing it governs is what ends an incarnation.
+    """
+    return _int_group_settings(ROTATION_SETTING_KEYS, group="rotation")
 
 
 def assistant_resource_settings() -> dict:

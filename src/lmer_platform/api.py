@@ -128,6 +128,7 @@ from .config import (
     configured_repo_url,
     mutate_stored,
     nudge_settings,
+    rotation_settings,
     terminal_settings,
     upload_settings,
     upload_types,
@@ -512,8 +513,9 @@ _CONFIG_SCOPE_NOTE = (
     "launch settings apply to the NEXT incarnation: the running assistant keeps its "
     "context window until it is stopped or rotated. A value whose source is "
     "'env' is an export shadowing config.json — what POST persists here has no "
-    "effect until that export is removed. The daemon reads the checkin and nudge "
-    "groups on its next tick, so a change there takes effect without a rotation. "
+    "effect until that export is removed. The daemon reads the checkin, nudge and "
+    "rotation groups on its next tick, so a change there takes effect without a "
+    "rotation. "
     "chat_keep_last is a browser display setting applied on config refresh; "
     "it does not require an assistant rotation. The resources group is "
     "read-only and environment-only, and like the launch settings it applies "
@@ -550,6 +552,14 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
         "nudge": {
             key: setting.to_dict()
             for key, setting in nudge_settings().items()
+        },
+        # The context-fullness reminder (issue #446). Beside nudge rather than
+        # under it: what it watches is the assistant's own window, not the
+        # spool, and it is the one setting here whose effect is a recommendation
+        # to end the incarnation reading it.
+        "rotation": {
+            key: setting.to_dict()
+            for key, setting in rotation_settings().items()
         },
         "terminal": {
             key: setting.to_dict()
@@ -2002,7 +2012,10 @@ def create_app(
             "  POST /api/assistant/rotate   replace it with a fresh context window,\n"
             "                               carrying {handoff?} over — one call, so\n"
             "                               no start lands in the gap. Takes the\n"
-            "                               same launch overrides as start\n"
+            "                               same launch overrides as start. The\n"
+            "                               assistant may call it for itself; the\n"
+            "                               call does not return, because its own\n"
+            "                               container is what this ends\n"
             "  GET  /api/assistant/config   how the NEXT incarnation will be run —\n"
             "                               model/harness/preset/agents/threads, with\n"
             "                               the layer that decided it (env /\n"
@@ -2012,8 +2025,12 @@ def create_app(
             "                               a patch of the keys named; null clears\n"
             "                               one. Changes nothing about the running\n"
             "                               incarnation: rotate to apply. The\n"
-            "                               checkin/nudge integers are the\n"
-            "                               exception — the next tick reads them\n"
+            "                               checkin/nudge/rotation integers are\n"
+            "                               the exception — the next tick reads\n"
+            "                               them. rotation.context_threshold is\n"
+            "                               the percentage of the context window\n"
+            "                               at which the daemon recommends a\n"
+            "                               rotation; 0 turns that off\n"
             "  GET  /api/assistant/handoff  the note the last incarnation left. A\n"
             "                               null one with a note means nobody left\n"
             "                               you anything, which is not the same as\n"
@@ -4029,7 +4046,8 @@ def create_app(
 
         Keys are the launch-setting names (including ``threads``) plus the integer settings
         (pane-only ``chat_keep_last``, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
-        ``nudge_pending_threshold`` from #317), which are spelled as their config
+        ``nudge_pending_threshold`` from #317, ``rotation_context_threshold`` from
+        #446), which are spelled as their config
         fields because they are not launch flags and do not share their
         short-name vocabulary. Omitted keys
         are left alone, so this is a patch of exactly what the caller named.

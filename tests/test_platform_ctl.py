@@ -36,6 +36,7 @@ session that never existed — are the ones the CLI is seen to pass through.
 """
 
 import argparse
+import io
 import json
 import os
 import re
@@ -811,3 +812,108 @@ def test_spawn_accepts_repeatable_thread_targets():
     call = build("spawn", "develop", "issue", "--target-thread", links[0], "--target-thread", links[1])
     assert call.body == {"taskdef": "develop", "target": "issue", "targets": links}
     assert "targets" not in build("spawn", "develop", "issue").body
+
+
+# --- rotate: the one verb that is two calls (issue #446) -----------------------
+#
+# Self-rotation is the assistant ending its own context window, so what these pin
+# is the order (the note is stored before anything can refuse the rotation), the
+# three ways the note can arrive, and that a refusal stops the sequence rather
+# than being pressed past.
+
+def test_rotate_writes_the_handover_before_it_rotates():
+    calls = build("rotate", "--handoff", "two runs in flight, one merge request open")
+    assert [(call.method, call.path) for call in calls] == [
+        ("POST", "/api/assistant/handoff"),
+        ("POST", "/api/assistant/rotate"),
+    ]
+    assert calls[0].body == {"handoff": "two runs in flight, one merge request open"}
+    assert calls[1].body == {}, (
+        "the note is already stored; sending it twice would make the rotate the "
+        "writer of a document the handoff route already owns"
+    )
+
+
+def test_rotate_without_a_note_carries_the_recorded_one_forward():
+    calls = build("rotate")
+    assert [(call.method, call.path) for call in calls] == [
+        ("POST", "/api/assistant/rotate"),
+    ]
+
+
+def test_rotate_reads_the_note_from_stdin(monkeypatch):
+    monkeypatch.setattr("sys.stdin", io.StringIO("a note with `backticks` and $HOME"))
+    calls = build("rotate", "--handoff", "-")
+    assert calls[0].body == {"handoff": "a note with `backticks` and $HOME"}
+
+
+def test_rotate_reads_the_note_from_a_file(tmp_path):
+    note = tmp_path / "handover.md"
+    note.write_text("what is in flight\nwhat I promised", encoding="utf-8")
+    calls = build("rotate", "--handoff-file", str(note))
+    assert calls[0].body == {"handoff": "what is in flight\nwhat I promised"}
+
+
+def test_rotate_refuses_an_unreadable_note_before_any_request(tmp_path):
+    with pytest.raises(ctl.CtlError) as excinfo:
+        build("rotate", "--handoff-file", str(tmp_path / "missing.md"))
+    assert "handover note" in str(excinfo.value)
+
+
+def test_both_of_rotates_routes_are_served_by_the_app(client):
+    served = {
+        route.path for route in client.app.routes if getattr(route, "path", None)
+    }
+    for call in build("rotate", "--handoff", "x"):
+        assert call.path in served
+
+
+def test_rotate_issues_both_calls_in_order(configured, capsys):
+    recorder = Recorder()
+    ok(["rotate", "--handoff", "the fleet is quiet"], recorder, capsys)
+    assert [(call["method"], call["url"]) for call in recorder.calls] == [
+        ("POST", f"{BASE_URL}/api/assistant/handoff"),
+        ("POST", f"{BASE_URL}/api/assistant/rotate"),
+    ]
+
+
+def test_a_refused_handoff_stops_the_rotation(configured, capsys):
+    """The precondition the daemon just declined is the successor's whole
+    briefing. Rotating anyway would end this context window and leave the next one
+    with a note nobody could write."""
+    recorder = Recorder(reply=Reply(status_code=400, text='{"detail": "too long"}'))
+    body = refused(["rotate", "--handoff", "x" * 10], recorder, capsys)
+    assert len(recorder.calls) == 1, "the rotate must not have been attempted"
+    assert body["status"] == 400
+
+
+def test_a_rotate_that_never_answers_is_reported_as_unreachable(
+    configured, capsys
+):
+    """What a *successful* self-rotation looks like from inside the container the
+    daemon just ended. The CLI claims nothing about it: a dropped connection is
+    equally consistent with a daemon that died, and the receipt an agent is told
+    to read is its successor's generation on `me`."""
+    class _Dropped:
+        def request(self, method, url, **kwargs):
+            if url.endswith("/api/assistant/rotate"):
+                raise ctl.TransportError("connection reset by peer")
+            return Reply()
+
+    body = refused(["rotate", "--handoff", "going now"], _Dropped(), capsys)
+    assert body["error"]
+
+
+def test_the_help_says_the_call_does_not_return():
+    """The one fact an agent cannot discover by experiment: by the time the
+    connection drops there is nobody left in this container to read the error."""
+    parser = ctl.create_parser()
+    help_text = parser.format_help()
+    assert "rotate" in help_text
+    rotate = [
+        action for action in parser._subparsers._group_actions[0].choices.items()
+        if action[0] == "rotate"
+    ][0][1]
+    text = rotate.format_help()
+    assert "DOES NOT RETURN" in text
+    assert "breakpoint" in text

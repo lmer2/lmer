@@ -318,3 +318,63 @@ def test_the_scrub_cannot_reach_a_revoked_credential_and_says_so(
     )
     client = client_for(config)
     assert client.get("/api/state", headers=bearer(minted)).status_code == 401
+
+
+# --- self-rotation (issue #446) -----------------------------------------------
+#
+# The assistant rotating *itself* adds a caller to an existing route rather than a
+# route: the minted credential already opens what the shared secret opens, so what
+# these pin is that it stays that way in both directions — the assistant can, and
+# nothing unauthenticated can.
+
+def test_the_assistant_can_rotate_itself_with_its_own_credential(
+    config, long_lived
+):
+    cfg.ensure_secret(config)
+    with started(config) as status:
+        minted = cfg.active_assistant_credential()
+        client = client_for(config)
+        reply = client.post(
+            "/api/assistant/rotate",
+            headers=bearer(minted),
+            json={"handoff": "two runs in flight; the review on the second is posted"},
+        )
+        try:
+            assert reply.status_code == 200, reply.text
+            body = reply.json()
+            assert body["generation"] == status.generation + 1
+            assert body["handoff"].startswith("two runs in flight")
+            assert body["session_id"] != status.session_id
+        finally:
+            kill(assistant.status().pid)
+
+
+def test_a_rotation_keeps_the_spool_for_the_successor(config, long_lived):
+    """The digests are the successor's inheritance: an incarnation that rotated
+    because its window filled has by definition not drained everything, and a
+    rotation that emptied the spool would lose exactly what it was told last."""
+    cfg.ensure_secret(config)
+    with started(config):
+        assistant.notify("a question opened on develop-446")
+        minted = cfg.active_assistant_credential()
+        reply = client_for(config).post(
+            "/api/assistant/rotate", headers=bearer(minted), json={},
+        )
+        try:
+            assert reply.status_code == 200, reply.text
+            assert reply.json()["pending"] == 1
+            assert len(assistant.read_state().pending) == 1
+        finally:
+            kill(assistant.status().pid)
+
+
+def test_rotate_still_refuses_a_caller_with_no_credential(config, long_lived):
+    """No widening: the route this adds a caller to is the one it always was."""
+    cfg.ensure_secret(config)
+    with started(config):
+        client = client_for(config)
+        assert client.post("/api/assistant/rotate", json={}).status_code == 401
+        assert client.post(
+            "/api/assistant/rotate", headers=bearer("not-a-credential"), json={},
+        ).status_code == 401
+        assert assistant.status().generation == 1, "nothing rotated"

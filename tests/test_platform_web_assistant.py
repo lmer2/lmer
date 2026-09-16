@@ -41,8 +41,12 @@ How any of it looks, and whether the app bar now crowds a phone, are verified by
 building the bundle and by live test LT3 on a real phone.
 """
 
+import json
 import re
+import subprocess
 from pathlib import Path
+
+from tests.conftest import node_binary, require_node_toolchain
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
@@ -989,3 +993,336 @@ console.log(JSON.stringify({ passed: true }))
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout) == {"passed": True}
+
+
+# --- the daemon's reminders on the settings screen (issue #446) ----------------
+
+def test_the_settings_dialog_carries_the_three_reminder_settings():
+    """#446 item 4 asks for the context threshold "next to checkin and nudge".
+    Neither was on this screen, so all four arrive together — and they are the
+    keys the write route already accepts, spelled as the config fields they are
+    rather than as the groups they are served under."""
+    text = _read(WEB / "src" / "components" / "AssistantSettings.vue")
+
+    for key in ("checkin_window_seconds", "nudge_after_seconds",
+                "nudge_pending_threshold", "rotation_context_threshold"):
+        assert key in text, f"{key} is not written by the settings screen"
+
+
+def test_the_threshold_is_a_percent_slider_from_one_to_a_hundred():
+    """The operator's own shape for it: a slider over the usable range, with the
+    off state beside it rather than at the bottom of the scale — a slider whose
+    lowest position means "never" reads as "always"."""
+    text = _read(WEB / "src" / "components" / "AssistantSettings.vue")
+    slider = re.search(r"<v-slider\b.*?</v-slider>", text, re.S)
+    assert slider, "the threshold is not a slider"
+    assert ':min="1"' in slider.group(0)
+    assert ':max="100"' in slider.group(0)
+    assert "<v-switch" in text, "there is no explicit off state beside the slider"
+    assert "fields.rotationOn ? Number(fields.rotationPercent) : 0" in text, (
+        "the off state does not write the 0 the daemon reads as off"
+    )
+
+
+def test_the_reminder_block_says_it_needs_no_restart():
+    """Everything else on this screen applies to the next incarnation. These four
+    apply on the next detection tick, and a screen that let the opening sentence
+    speak for them would have an operator restarting a session for nothing."""
+    words = " ".join(
+        _operator_words(WEB / "src" / "components" / "AssistantSettings.vue").split()
+    )
+    assert "apply on its next check" in words
+    assert "no restart" in words
+
+
+def test_the_off_state_says_what_off_means_and_what_it_depends_on():
+    words = " ".join(
+        _operator_words(WEB / "src" / "components" / "AssistantSettings.vue").split()
+    )
+    assert "never told its context window is filling" in words
+    assert "publishes the reading on its status line" in words, (
+        "nothing tells the operator the reminder needs a harness that reports one"
+    )
+    assert "nothing here ends a session" in words, (
+        "a settings screen that sets a rotation threshold has to say it does not "
+        "rotate anything"
+    )
+
+
+def test_the_reminder_fields_prefill_from_the_stored_layer():
+    """The launch fields' rule, and it matters more here: prefilling an export's
+    value into a widget that writes config.json bakes the export into the file."""
+    text = _read(WEB / "src" / "components" / "AssistantSettings.vue")
+    assert "config[spec.group]?.[spec.key]?.stored" in text
+    assert "config.rotation?.context_threshold?.stored" in text
+    assert "an exported environment variable pins this to" in text
+
+
+# --- the reminder settings, driven (issue #446) -------------------------------
+#
+# Every guard above reads source, and source cannot show what a save *sends*. The
+# round trip is where a settings screen lies: a threshold the operator set that
+# arrives as nothing, an untouched field stamped with its own value, or an
+# export's number written into the file the first time anything is saved. So this
+# drives the component — prefill it from a daemon reply, move the widgets, call
+# save(), and read the body off the wire.
+
+_SAVE_PROBE = """
+import { readFileSync } from 'node:fs'
+import { createRenderer, ref, h, nextTick } from 'vue'
+import { parse, compileScript } from '@vue/compiler-sfc'
+
+const path = 'src/components/AssistantSettings.vue'
+const { descriptor } = parse(readFileSync(path, 'utf8'), { filename: path })
+// Not `inlineTemplate`: that closes the setup bindings over the render function
+// and `save()` becomes unreachable. The template is not what is under test here.
+const compiled = compileScript(descriptor, { id: 'probe' })
+
+const CONFIG = %s
+
+const sent = []
+globalThis.fetch = async (url, options = {}) => {
+  const body = options.body ? JSON.parse(options.body) : null
+  sent.push({ url: String(url), method: options.method || 'GET', body })
+  // A write answers with `changed`, as the daemon's own route does: the banner
+  // branches on it, so a stub that omitted it would make every flag read false.
+  return {
+    ok: true,
+    status: 200,
+    json: async () => (body ? { ...CONFIG, changed: Object.keys(body).sort() } : CONFIG),
+  }
+}
+
+const source = compiled.content
+  .replace(/from ['"]vue['"]/g, `from '${import.meta.resolve('vue')}'`)
+  .replace(/from ['"]@mdi\\/js['"]/g, `from '${import.meta.resolve('@mdi/js')}'`)
+  .replace(/from ['"]\\.\\.\\/(api|format|operatorChat)\\.js['"]/g,
+    (_m, name) => `from '${import.meta.resolve(`./src/${name}.js`)}'`)
+const component = (await import(
+  `data:text/javascript;base64,${Buffer.from(source, 'utf8').toString('base64')}`
+)).default
+component.render = () => null
+
+const noop = () => {}
+const nodeOps = {
+  createElement: (t) => ({ tag: t }), createText: (t) => ({ text: t }),
+  createComment: (t) => ({ comment: t }), setText: noop, setElementText: noop,
+  insert: noop, remove: noop, parentNode: () => null, nextSibling: () => null,
+  patchProp: noop, querySelector: () => null, setScopeId: noop,
+  cloneNode: (n) => n,
+}
+const { createApp } = createRenderer(nodeOps)
+
+const child = ref(null)
+const open = ref(false)
+const app = createApp({
+  render: () => h(component, { modelValue: open.value, ref: child }),
+})
+app.config.warnHandler = noop
+app.mount(nodeOps.createElement('root'))
+// Opened the way the drawer opens it, which is what triggers the read.
+open.value = true
+await nextTick()
+await new Promise((resolve) => setTimeout(resolve, 20))
+
+// `<script setup>` bindings are deliberately private on the public proxy, so the
+// internal instance is how a probe reaches them. Test-only reach-in.
+const state = child.value.$.setupState
+const prefilled = {
+  checkinWindow: state.fields.checkinWindow,
+  nudgeAfter: state.fields.nudgeAfter,
+  nudgePending: state.fields.nudgePending,
+  rotationOn: state.fields.rotationOn,
+  rotationPercent: state.fields.rotationPercent,
+}
+
+%s
+
+sent.length = 0
+await state.save()
+// `setupState` unwraps refs, so these are the booleans the template branches on.
+const flags = {
+  savedTick: state.savedTick === true,
+  savedTickShadowed: state.savedTickShadowed === true,
+  savedShadowed: state.savedShadowed === true,
+  savedLaunch: state.savedLaunch === true,
+}
+console.log(JSON.stringify({ sent, prefilled, flags }))
+"""
+
+
+def _settings_reply(**overrides):
+    """A daemon config reply with every group the dialog reads."""
+    def setting(value, stored=None, source="default"):
+        return {"value": value, "source": source, "stored": stored}
+
+    reply = {
+        "settings": {
+            key: setting(None) for key in
+            ("model", "harness", "preset", "agents", "threads")
+        },
+        "chat": {"keep_last": setting(0, 0)},
+        "checkin": {"window_seconds": setting(3600)},
+        "nudge": {
+            "after_seconds": setting(180),
+            "pending_threshold": setting(1),
+        },
+        "rotation": {"context_threshold": setting(0)},
+        "changed": [],
+    }
+    reply.update(overrides)
+    return reply
+
+
+def _drive(script, reply=None):
+    node = node_binary()
+    if not node:
+        require_node_toolchain("no Node available (run `lmer platform setup-ui`)")
+    probe = _SAVE_PROBE % (json.dumps(reply or _settings_reply()), script)
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", probe],
+        capture_output=True, text=True, timeout=180, cwd=str(WEB),
+    )
+    assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+    return json.loads(result.stdout)
+
+
+def test_turning_the_reminder_on_sends_the_percent_and_nothing_else():
+    """The acceptance the operator will check by hand: move the slider, save, and
+    the daemon is asked for exactly that threshold. A whole-form write would stamp
+    every other key with its own value and make two browsers overwrite each other."""
+    driven = _drive(
+        "state.fields.rotationOn = true\n"
+        "state.fields.rotationPercent = 70\n"
+        "await nextTick()"
+    )
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert writes, f"the save sent nothing: {driven['sent']}"
+    assert writes[0]["body"] == {"rotation_context_threshold": 70}
+
+
+def test_turning_it_off_sends_the_zero_the_daemon_reads_as_off():
+    reply = _settings_reply(
+        rotation={"context_threshold": {
+            "value": 70, "source": "config.json", "stored": 70,
+        }},
+    )
+    driven = _drive("state.fields.rotationOn = false\nawait nextTick()", reply)
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert writes[0]["body"] == {"rotation_context_threshold": 0}
+    assert driven["prefilled"]["rotationOn"] is True, (
+        "a stored threshold opened the dialog switched off"
+    )
+    assert driven["prefilled"]["rotationPercent"] == 70
+
+
+def test_an_untouched_form_writes_nothing_at_all():
+    """Every field prefills from the stored layer, so a save that changed nothing
+    has nothing to send — including the three reminder fields, which are unset on
+    a host nobody has configured and must not be stamped with the defaults they
+    are showing."""
+    driven = _drive("await nextTick()")
+    assert driven["prefilled"]["checkinWindow"] == ""
+    assert driven["prefilled"]["nudgeAfter"] == ""
+    assert [call for call in driven["sent"] if call["method"] == "POST"] == []
+
+
+def test_an_exported_value_is_not_baked_into_the_file_by_a_save():
+    """The stored-layer rule, in the case that costs: an export pins the interval
+    at 900, the dialog shows 900 as what is in effect, and a save touching
+    something else must not persist 900 into config.json — where it would outlive
+    the export."""
+    reply = _settings_reply(
+        nudge={
+            "after_seconds": {"value": 900, "source": "env", "stored": None},
+            "pending_threshold": {"value": 1, "source": "default", "stored": None},
+        },
+    )
+    driven = _drive(
+        "state.fields.rotationOn = true\n"
+        "state.fields.rotationPercent = 80\n"
+        "await nextTick()",
+        reply,
+    )
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert driven["prefilled"]["nudgeAfter"] == "", (
+        "the export's value was prefilled into a field that writes the file"
+    )
+    assert writes[0]["body"] == {"rotation_context_threshold": 80}
+
+
+def test_a_reminder_field_the_operator_typed_is_sent_as_its_config_key():
+    driven = _drive(
+        "state.fields.nudgeAfter = '600'\n"
+        "state.fields.checkinWindow = '0'\n"
+        "await nextTick()"
+    )
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert writes[0]["body"] == {
+        "nudge_after_seconds": 600, "checkin_window_seconds": 0,
+    }
+
+
+def test_a_shadowed_reminder_save_does_not_promise_the_next_tick():
+    """Round 1: with `LMER_PLATFORM_ROTATION_CONTEXT_THRESHOLD=85` exported,
+    switching the reminder off persists `0` correctly — and the success banner
+    said it applies on the daemon's next check, which still reads 85. The field
+    caption already exposed the shadow; the banner contradicted it."""
+    reply = _settings_reply(
+        rotation={"context_threshold": {
+            "value": 85, "source": "env", "stored": 70,
+        }},
+    )
+    driven = _drive("state.fields.rotationOn = false\nawait nextTick()", reply)
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+
+    assert writes[0]["body"] == {"rotation_context_threshold": 0}, (
+        "the stored-only write is unchanged"
+    )
+    assert driven["flags"]["savedTickShadowed"] is True
+    assert driven["flags"]["savedTick"] is False, (
+        "the banner promised a next-tick effect the export will not allow"
+    )
+
+
+def test_an_effective_reminder_save_still_says_it_applies_next_tick():
+    driven = _drive(
+        "state.fields.nudgeAfter = '600'\nawait nextTick()"
+    )
+    assert driven["flags"]["savedTick"] is True
+    assert driven["flags"]["savedTickShadowed"] is False
+
+
+def test_a_half_shadowed_save_says_both_things():
+    """One save can change an effective field and a pinned one; the operator
+    needs the true half as well as the warning."""
+    reply = _settings_reply(
+        nudge={
+            "after_seconds": {"value": 900, "source": "env", "stored": None},
+            "pending_threshold": {"value": 1, "source": "default", "stored": None},
+        },
+    )
+    driven = _drive(
+        "state.fields.nudgeAfter = '600'\n"
+        "state.fields.nudgePending = '3'\n"
+        "await nextTick()",
+        reply,
+    )
+    assert driven["flags"]["savedTick"] is True
+    assert driven["flags"]["savedTickShadowed"] is True
+
+
+def test_clearing_a_reminder_field_clears_the_stored_key():
+    reply = _settings_reply(
+        nudge={
+            "after_seconds": {
+                "value": 600, "source": "config.json", "stored": 600,
+            },
+            "pending_threshold": {
+                "value": 1, "source": "default", "stored": None,
+            },
+        },
+    )
+    driven = _drive("state.fields.nudgeAfter = ''\nawait nextTick()", reply)
+    writes = [call for call in driven["sent"] if call["method"] == "POST"]
+    assert writes[0]["body"] == {"nudge_after_seconds": None}

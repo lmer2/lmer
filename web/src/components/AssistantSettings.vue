@@ -54,6 +54,59 @@ const open = computed({
 })
 
 const SETTING_KEYS = ['model', 'harness', 'preset', 'agents', 'threads']
+
+// The daemon's own reminder intervals (#244, #317, #446). A different kind of
+// setting from the five above and captioned as one: they are read on the next
+// detection tick rather than at the next launch, so nothing here is waiting on a
+// restart. Each names the group it is served under and the config key it writes,
+// because the two spellings differ on purpose — the group is the operator's
+// vocabulary and the key is the file's.
+const TICK_FIELDS = [
+  {
+    field: 'checkinWindow',
+    group: 'checkin',
+    key: 'window_seconds',
+    api: 'checkin_window_seconds',
+    min: 0,
+    label: 'Check-in window (seconds)',
+    hint: 'How long a run may go unlooked-at before it is named in a digest. 0 turns check-ins off.',
+  },
+  {
+    field: 'nudgeAfter',
+    group: 'nudge',
+    key: 'after_seconds',
+    api: 'nudge_after_seconds',
+    min: 0,
+    label: 'Digest reminder after (seconds)',
+    hint: 'How long unretrieved digests wait, beside a quiet session, before one reminder is typed into it. 0 turns reminders off.',
+  },
+  {
+    field: 'nudgePending',
+    group: 'nudge',
+    key: 'pending_threshold',
+    api: 'nudge_pending_threshold',
+    min: 1,
+    label: 'Digest reminder threshold',
+    hint: 'How many digests it takes. At least 1 — use the interval above to turn reminders off.',
+  },
+]
+
+// What a blank number field means here, and it is the same thing a blank launch
+// field means: unset this layer and let the one below show through. Sent as null,
+// which is what the write route reads as "clear".
+const UNSET = ''
+
+//: The percent the slider starts at when nothing is stored. Not a claim about
+//  anything — the switch beside it is off, so no value is in effect.
+const DEFAULT_ROTATION_PERCENT = 70
+
+//: config key -> where the reply reports it, for the saved banner's branch. The
+//  threshold rides the same table: what the banner has to know about all four is
+//  identical, and it is the provenance rather than the widget.
+const TICK_SOURCES = {
+  ...Object.fromEntries(TICK_FIELDS.map((spec) => [spec.api, [spec.group, spec.key]])),
+  rotation_context_threshold: ['rotation', 'context_threshold'],
+}
 const SETTING_HINTS = {
   model: 'the model the session runs, handed to the harness verbatim',
   harness: 'agent harness (e.g. claude, codex, pi)',
@@ -69,13 +122,24 @@ const saving = ref(false)
 const saved = ref(false)
 const savedLaunch = ref(false)
 const savedDisplay = ref(false)
+// True when the save touched a setting the daemon re-reads on its next tick and
+// the value it will read is the one that was saved. Its own flag because the
+// banner beside it offers a restart, and offering one for a change that needs
+// none is the same lie as withholding one that does.
+const savedTick = ref(false)
+// True when a reminder setting was persisted under an export that still wins.
+const savedTickShadowed = ref(false)
 // True when every key the save changed came back still pinned by an export —
 // the one case the offered restart provably does nothing: the incumbent's
 // context window would be paid and the exported value would run again. The
 // reply carries everything needed to tell (`changed` + per-key `source`), so
 // the banner can be as honest as the field captions above it.
 const savedShadowed = ref(false)
-const fields = reactive({ model: '', harness: '', preset: '', agents: '', threads: '', chatKeepLast: '0' })
+const fields = reactive({
+  model: '', harness: '', preset: '', agents: '', threads: '', chatKeepLast: '0',
+  checkinWindow: UNSET, nudgeAfter: UNSET, nudgePending: UNSET,
+  rotationOn: false, rotationPercent: DEFAULT_ROTATION_PERCENT,
+})
 
 let seq = 0
 let disposed = false
@@ -123,6 +187,16 @@ async function load() {
 function prefill(config) {
   fields.chatKeepLast = String(config.chat?.keep_last?.stored ?? 0)
   applyChatSettings(config)
+  for (const spec of TICK_FIELDS) {
+    const stored = config[spec.group]?.[spec.key]?.stored
+    fields[spec.field] = stored === null || stored === undefined ? UNSET : String(stored)
+  }
+  // Stored, never effective — for the launch fields' reason: an export's value
+  // prefilled into a widget that writes config.json bakes the export into the
+  // file the first time anything is saved.
+  const threshold = config.rotation?.context_threshold?.stored ?? 0
+  fields.rotationOn = threshold > 0
+  fields.rotationPercent = threshold > 0 ? threshold : DEFAULT_ROTATION_PERCENT
   for (const key of SETTING_KEYS) {
     const stored = config.settings?.[key]?.stored
     fields[key] = key === 'threads' && Array.isArray(stored) ? stored.join('\n') : stored || ''
@@ -151,6 +225,29 @@ function changes() {
     return null
   }
   if (keepLast !== (reply.value?.chat?.keep_last?.stored ?? 0)) named.chat_keep_last = keepLast
+  for (const spec of TICK_FIELDS) {
+    const stored = reply.value?.[spec.group]?.[spec.key]?.stored ?? null
+    const edited = String(fields[spec.field] ?? '').trim()
+    if (edited === UNSET) {
+      if (stored !== null) named[spec.api] = null
+      continue
+    }
+    const value = Number(edited)
+    // The daemon's own floor, per field, so a 0 in the threshold is refused here
+    // rather than coming back as a 400 the operator has to read to discover.
+    if (!Number.isSafeInteger(value) || value < spec.min) {
+      problem.value = `${spec.label} must be a whole number of ${spec.min} or more.`
+      return null
+    }
+    if (value !== stored) named[spec.api] = value
+  }
+  // The switch is the off state and 0 is how the daemon spells it, so an
+  // operator who turned it off writes 0 rather than clearing the key: the two
+  // have the same effect today and only one of them says what was meant.
+  const threshold = fields.rotationOn ? Number(fields.rotationPercent) : 0
+  if (threshold !== (reply.value?.rotation?.context_threshold?.stored ?? 0)) {
+    named.rotation_context_threshold = threshold
+  }
   return named
 }
 
@@ -175,6 +272,17 @@ async function save() {
     const launchChanges = changed.filter((key) => SETTING_KEYS.includes(key))
     savedLaunch.value = launchChanges.length > 0
     savedDisplay.value = changed.includes('chat_keep_last')
+    // Split by provenance, not by which fields moved: a reminder setting an
+    // export still pins is persisted and has no effect, so promising it "applies
+    // on the next check" is the same lie the launch banner already refuses to
+    // tell. The caption under the field says so; the banner has to agree.
+    const tickChanges = changed.filter((key) => key in TICK_SOURCES)
+    const shadowed = tickChanges.filter((key) => {
+      const [group, name] = TICK_SOURCES[key]
+      return config[group]?.[name]?.source === 'env'
+    })
+    savedTick.value = tickChanges.length > shadowed.length
+    savedTickShadowed.value = shadowed.length > 0
     savedShadowed.value =
       launchChanges.length > 0 &&
       launchChanges.every((key) => config.settings?.[key]?.source === 'env')
@@ -193,6 +301,10 @@ async function save() {
 function restartNow() {
   open.value = false
   emit('restart')
+}
+
+function tickSetting(spec) {
+  return reply.value?.[spec.group]?.[spec.key] || null
 }
 
 function runningDiffers(key) {
@@ -299,6 +411,91 @@ onBeforeUnmount(() => {
             :disabled="saving"
           />
 
+          <!-- The daemon's own reminders. Their own block with their own scope
+               line: everything above applies to the next incarnation, and every
+               one of these applies on the next detection tick — so an operator
+               reading the dialog's opening sentence would otherwise expect a
+               restart these do not need. -->
+          <div class="mt-4 mb-2">
+            <p class="text-body-small text-medium-emphasis mb-2">
+              Reminders the daemon types into the chat. These apply on its next
+              check, in about half a minute — no restart, and the running session
+              keeps its context window.
+            </p>
+
+            <div v-for="spec in TICK_FIELDS" :key="spec.api" class="mb-2">
+              <v-text-field
+                v-model="fields[spec.field]"
+                :label="spec.label"
+                type="number"
+                :min="spec.min"
+                step="1"
+                :hint="spec.hint"
+                persistent-hint
+                density="compact"
+                variant="outlined"
+                clearable
+                :disabled="saving"
+              />
+              <p class="text-body-small text-medium-emphasis mt-n2 mb-0">
+                <template v-if="tickSetting(spec)?.source === 'env'">
+                  ⚠️ an exported environment variable pins this to
+                  “{{ tickSetting(spec).value }}” — what you save here is
+                  persisted but has no effect until that export is removed.
+                </template>
+                <template v-else>
+                  in effect now: {{ tickSetting(spec)?.value }}
+                  (from {{ tickSetting(spec)?.source }})
+                </template>
+              </p>
+            </div>
+
+            <!-- The context reminder. A switch beside the slider rather than a
+                 0 on it: the API's off-switch is the value 0, and a slider whose
+                 lowest position means "never" reads as "always" to everyone who
+                 has ever used one. -->
+            <v-switch
+              v-model="fields.rotationOn"
+              color="primary"
+              density="compact"
+              hide-details
+              :disabled="saving"
+              label="Recommend a rotation when the context window fills"
+            />
+            <v-slider
+              v-model="fields.rotationPercent"
+              :min="1"
+              :max="100"
+              :step="1"
+              :disabled="saving || !fields.rotationOn"
+              thumb-label
+              density="compact"
+              class="mt-2"
+            >
+              <template #append>
+                <span class="text-body-small">{{ fields.rotationPercent }}%</span>
+              </template>
+            </v-slider>
+            <p class="text-body-small text-medium-emphasis mt-n2 mb-0">
+              <template v-if="reply.rotation?.context_threshold?.source === 'env'">
+                ⚠️ an exported environment variable pins this to
+                “{{ reply.rotation.context_threshold.value }}” — what you save
+                here is persisted but has no effect until that export is removed.
+              </template>
+              <template v-else-if="reply.rotation?.context_threshold?.value">
+                in effect now: at
+                {{ reply.rotation.context_threshold.value }}% of the context
+                window used, uber lmer is told once — and again at most every
+                fifteen minutes while it stays there — to rotate itself at its
+                next breakpoint. It decides when; nothing here ends a session.
+              </template>
+              <template v-else>
+                off — uber lmer is never told its context window is filling.
+                Needs a harness that publishes the reading on its status line.
+              </template>
+            </p>
+          </div>
+
           <!-- Two banners, because a save has two truths: the shadowed one must
                not offer a restart that provably runs the exported value again —
                the operator would pay a context window for nothing. -->
@@ -311,14 +508,33 @@ onBeforeUnmount(() => {
             an exported environment variable — a restart would run the export,
             not what you saved. Remove the export first.
             <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
+            <p v-if="savedTickShadowed">
+              ⚠️ a reminder setting you changed is still pinned by an exported
+              environment variable — it is saved, but the daemon goes on reading
+              the export.
+            </p>
           </v-alert>
           <v-alert v-else-if="saved && !savedLaunch" type="success" density="compact">
-            Saved. Operator chat display applies now. No session restart is needed.
+            Saved. No session restart is needed.
+            <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
+            <p v-if="savedTickShadowed">
+              ⚠️ a reminder setting you changed is still pinned by an exported
+              environment variable — it is saved, but the daemon goes on reading
+              the export.
+            </p>
           </v-alert>
           <v-alert v-else-if="saved" type="success" density="compact">
             Saved. It applies when a fresh uber lmer starts — restart to apply it
             now, or let the change wait for the next incarnation.
             <p v-if="savedDisplay">Operator chat display applies now.</p>
+            <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
+            <p v-if="savedTickShadowed">
+              ⚠️ a reminder setting you changed is still pinned by an exported
+              environment variable — it is saved, but the daemon goes on reading
+              the export.
+            </p>
             <template #append>
               <v-btn
                 size="small"
