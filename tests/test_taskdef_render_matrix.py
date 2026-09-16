@@ -80,6 +80,14 @@ def _prose(out):
     return " ".join(out.split())
 
 
+def _assert_thread_policy(out):
+    prose = _prose(out)
+    assert "at least every few minutes" not in prose
+    assert "a silent session is indistinguishable from a dead one" not in prose
+    policy = (REPO_TASKDEF / "thread-updates.jinja2").read_text()
+    assert prose.count(_prose(policy)) == 1
+
+
 def _assert_mode(out, work_mode, has_phasic_include=True):
     if not has_phasic_include:
         return
@@ -176,21 +184,43 @@ class TestRenderMatrix:
     @pytest.mark.parametrize("provider", sorted(PROVIDERS))
     @pytest.mark.parametrize("work_mode", WORK_MODES)
     @pytest.mark.parametrize("repo_backed", (True, False))
+    @pytest.mark.parametrize("channel", (None, "slack", "matrix", "legacy-slack"))
     def test_builtin_only_chat_renders_with_zero_config(
-        self, repo_backed, work_mode, provider, monkeypatch, capsys
+        self, channel, repo_backed, work_mode, provider, monkeypatch, capsys
     ):
         """chat must work out of the box: no work repo, no external paths."""
         host = PROVIDERS[provider]
         monkeypatch.setenv("LMER_REPO_HOST", host)
+        if channel == "legacy-slack":
+            monkeypatch.setenv("LMER_SLACK_CHANNEL", "C123")
+        elif channel:
+            monkeypatch.setenv("LMER_CHAT_CHANNEL", channel)
         if repo_backed:
             monkeypatch.setenv(
                 "LMER_REPO_URL", f"https://{host}/acme/widget.git"
             )
         out = _render(REPO_TASKDEF / "chat" / "instructions.txt", work_mode)
         _assert_fully_rendered(out)
+        _assert_thread_policy(out)
         assert "no fixed script" in out
         banner = capsys.readouterr().out
         assert f"taskdef source: {REPO_TASKDEF} (schema 1)" in banner
+
+    @pytest.mark.parametrize("task", ("develop", "review"))
+    @pytest.mark.parametrize("config", ("workrepo", "dedicated"))
+    @pytest.mark.parametrize("work_mode", WORK_MODES)
+    def test_external_tasks_share_the_builtin_thread_policy(
+        self, task, config, work_mode, tmp_path, monkeypatch
+    ):
+        _, root = _configure_source(config, "schema1", tmp_path, monkeypatch)
+        template = root / task / "instructions.txt"
+        template.parent.mkdir()
+        template.write_text("{% include 'thread-updates.jinja2' ignore missing %}")
+
+        out = _render(template, work_mode)
+
+        _assert_fully_rendered(out)
+        _assert_thread_policy(out)
 
     @pytest.mark.parametrize("provider", sorted(PROVIDERS))
     def test_repo_backed_chat_carries_the_provider_tooling_block(
@@ -366,6 +396,9 @@ class TestExternalSourceMatrix:
                         monkeypatch.setenv("LMER_REPO_HOST", host)
                         out = _render(template_file, work_mode)
                         _assert_fully_rendered(out)
+                        assert "at least every few minutes" not in _prose(out)
+                        if "thread-updates.jinja2" in template_file.read_text():
+                            _assert_thread_policy(out)
                         rendered += 1
         print(
             f"external-source matrix: {len(taskdef_dirs)} taskdef(s), "

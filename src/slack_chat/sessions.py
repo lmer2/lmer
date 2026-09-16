@@ -6,11 +6,10 @@ module owns the lifecycle of those processes:
 
 - Spawning ``lmer chat <thread-permalink>`` as a host-side subprocess.
 - Tracking one session per ``(channel, thread_ts)`` pair.
-- Resetting an idle timer on any activity in a tracked thread (human
-  messages and the agent's own posts both count - the spawned agent is
-  expected to post progress notes during long autonomous work).
+- Resetting an idle timer on thread messages and new session bus activity,
+  including quiet progress notes.
 - Reaping sessions whose process exited, and disconnecting sessions whose
-  thread has been silent for longer than the idle timeout.
+  thread and session bus have been idle longer than the configured timeout.
 
 The lmer process is spawned under a dedicated PTY. lmer only passes
 ``-it`` to ``docker``/``podman`` when its stdin is a TTY, and the
@@ -29,6 +28,7 @@ escalating to signals.
 import asyncio
 import errno
 import logging
+import math
 import os
 import pty
 import signal
@@ -207,8 +207,8 @@ class SessionManager:
     configuration.
 
     Args:
-        idle_timeout_minutes: Minutes of total thread silence (no human or
-            agent messages) before a session is disconnected.
+        idle_timeout_minutes: Minutes without thread messages or new session
+            bus activity before a session is disconnected.
         max_sessions: Maximum number of concurrently running sessions.
         lmer_bin: Executable used to spawn sessions (default ``lmer``).
         spawn_cwd: Working directory for spawned processes. Must NOT be a
@@ -234,7 +234,11 @@ class SessionManager:
         spawn_cwd: str | None = None,
         log_dir: str | None = None,
         lmer_env_file: str | None = None,
+        transport: str = "slack",
     ):
+        if transport not in ("slack", "matrix"):
+            raise ValueError("listener transport must be slack or matrix")
+        self.transport = transport
         self.idle_timeout_minutes = (
             idle_timeout_minutes
             if idle_timeout_minutes is not None
@@ -736,6 +740,7 @@ class SessionManager:
                     await on_crash(session)
                 continue
 
+            self._refresh_bus_activity(session)
             if session.idle_seconds() >= idle_cutoff:
                 logger.info(
                     "lmer_session_idle_disconnect %s",
@@ -748,6 +753,22 @@ class SessionManager:
                 await self.terminate(session)
                 if on_idle_disconnect is not None:
                     await on_idle_disconnect(session)
+
+    def _refresh_bus_activity(self, session: Session) -> None:
+        from lmer_cli.connector_ownership import same_process
+        from .registry import thread_holder
+
+        owner = thread_holder(*session.key, kind=self.transport) or {}
+        activity = owner.get("activity_at")
+        if (type(activity) not in (int, float) or not math.isfinite(activity)
+                or not session.last_activity < activity <= time.monotonic()
+                or owner.get("parent_pid") != session.process.pid):
+            return
+        try:
+            if same_process(session.process.pid, owner.get("parent_start")):
+                session.last_activity = activity
+        except (OSError, RuntimeError) as exc:
+            logger.warning("lmer_session_activity_unavailable %s", _kv(error=exc))
 
     async def run_reaper(self, on_idle_disconnect=None, on_crash=None) -> None:
         """Run the reaper loop forever (intended as a background task)."""

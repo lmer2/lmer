@@ -12,6 +12,7 @@ import time
 from ask_channel import bus
 from .connector_delivery import DeliveryState, IdentityUnavailable, RecoveryRequired
 from .connector_ownership import Lease, same_process
+from .connector_receipts import ReceiptReactions
 
 logger = logging.getLogger(__name__)
 MODULE_POLL_SECONDS = 1.0
@@ -36,6 +37,9 @@ class ConnectorLifecycle:
         self._pending_inbound = {}
         self._replayed = False
         self._direction_failures = {}
+        self._activity_seq = None
+        self._receipt_pending = {}
+        self._receipts = ReceiptReactions(self)
         self.exit_code = 0
         self.status = "starting"
 
@@ -47,7 +51,7 @@ class ConnectorLifecycle:
 
     def _snapshot(self):
         fields = ["_bus_cursor", "_answered_freely", "_announced", "_questions",
-                  "_pending_inbound", "_replayed", *self._transport_fields]
+                  "_pending_inbound", "_replayed", "_receipt_pending", *self._transport_fields]
         return {
             **{field: sorted(getattr(self, field)) if isinstance(getattr(self, field), set)
                else copy.deepcopy(getattr(self, field)) for field in fields},
@@ -70,6 +74,7 @@ class ConnectorLifecycle:
         if self._seeded:
             return
         with self._state.lock:
+            self._activity_seq = int(health.get("seq") or 0)
             self._posters._session = self._state.session
             launch = health.get("launch")
             self._launch_settings = launch if isinstance(launch, dict) else None
@@ -128,6 +133,10 @@ class ConnectorLifecycle:
                                               name=f"lmer-connector-{direction}", daemon=True)
                     self._threads.append(worker)
                     worker.start()
+                worker = threading.Thread(target=self._receipts.run,
+                                          name="lmer-connector-receipts", daemon=True)
+                self._threads.append(worker)
+                worker.start()
                 self._connected = True
                 self.status = "running"
         except Exception as exc:
@@ -194,6 +203,13 @@ class ConnectorLifecycle:
     def _outbound_loop(self):
         self._loop("outbound", self._outbound_once)
 
+    def _record_activity(self, record):
+        with self._state.lock:
+            seq = int(record.get("seq") or 0)
+            if self._activity_seq is not None and seq > self._activity_seq:
+                self._lease.mark_activity()
+                self._activity_seq = seq
+
     def _outbound_once(self):
         records, cursor = self.bus.messages(self._bus_cursor, timeout=self._bus_poll_seconds)
         pending = self._state.data.get("pending")
@@ -205,6 +221,9 @@ class ConnectorLifecycle:
         for record in records:
             if self._stop.is_set():
                 return
+            if ((record.get("source") or {}).get("channel") in (None, "agent")
+                    or (record.get("meta") or {}).get("session_origin") is True):
+                self._record_activity(record)
             with self._state.lock:
                 if record.get("kind") == "question" and record.get("id"):
                     self._questions[record["id"]] = record
@@ -230,9 +249,12 @@ class ConnectorLifecycle:
         message = result.get("message") if isinstance(result, dict) else None
         if not isinstance(message, dict) or not message.get("id"):
             raise bus.BusError("supervisor returned no accepted message receipt")
+        self._record_activity(message)
         with self._state.lock:
             if pending.get("question"):
                 self._answered_freely.add(pending["question"])
+            if pending.get("human_receipt"):
+                self._receipts.accepted(ref, message)
             accepted()
             self._posters.ack_ref(ref)
             self._pending_inbound.pop(ref, None)
@@ -320,7 +342,7 @@ class ConnectorLifecycle:
 
     def _module_versions(self):
         names = [self.__class__.__module__, __name__, "lmer_cli.connector_delivery",
-                 "lmer_cli.connector_ownership", "lmer_cli.thread_posts"]
+                 "lmer_cli.connector_ownership", "lmer_cli.thread_posts", "lmer_cli.connector_receipts"]
         versions = []
         for name in names:
             path = getattr(sys.modules.get(name), "__file__", None)

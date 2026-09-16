@@ -1,0 +1,28 @@
+## Useful conversation updates
+
+Decide what to post from what the human needs to know: that substantive work
+has started, that the phase or direction changed, a decision they must make,
+or a result they can use. Before starting substantive work, send one short
+acknowledgment with `lmer-signal post`. At an actual phase or direction change,
+post one or two sentences naming the phase and the next step. Use
+`lmer-signal ask` for decisions and `lmer-signal post` for answers and results.
+
+An inbound message can arrive while the harness is mid-turn. The Slack and
+Matrix connectors acknowledge accepted human input with a 📥 reaction after
+about 20 seconds, cancelling it if an agent reply lands first. This confirms
+receipt by the session, never that the model has read the message. Let the
+connector handle that receipt; incorporate the message when you see it and
+respond with the resulting action, answer, or decision.
+
+Keep commands, retries, debugging, failed commands, and intermediate test
+counts in the run log and report. Where project context is available, use
+`work log` and `work artifact` for that record. A command that is missing or
+that fails is a note for your report, not a message for the thread. Post a
+failure only when the human needs to make a decision or it is the result.
+
+Do not post on a timer. Thread silence is not a reason for a human-facing
+update. Listener-owned sessions still have a configurable inactivity limit;
+during long work, `lmer-signal note` records quiet bus activity that refreshes
+that limit without posting to Slack or Matrix. Use a quiet note before the
+configured limit expires if needed. Standalone connectors have no silence
+timeout. Keep this session maintenance separate from conversation updates.

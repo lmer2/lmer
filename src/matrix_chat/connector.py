@@ -148,7 +148,7 @@ class ConnectorConfig:
 
 
 def render_outbound(record: dict, questions: Optional[dict] = None) -> Optional[str]:
-    """The thread text for one bus record, or ``None`` when it is matrix's own.
+    """Thread text, or ``None`` for quiet notes and matrix's own records.
 
     The same rendering the Slack connector uses (numbered options, who answered
     from where, kind glyphs) keyed on *this* channel — a Slack record belongs in
@@ -564,6 +564,7 @@ class MatrixConnector(ConnectorLifecycle):
                 if bound is not None:
                     kind, in_reply_to, text = "answer", question["id"], bound
             return {"question": question["id"] if question else None,
+                    "human_receipt": poster is None and event.get("sender") != self.config.user_id,
                     "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
                                 "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
         return bool(self._post_prepared(event_id, prepare, lambda: self._accept_inbound(event_id)))
@@ -648,6 +649,9 @@ class MatrixConnector(ConnectorLifecycle):
 
     def _send_record(self, record):
         self._post_outbound(record, self._questions)
+
+    def _send_receipt(self, ref, transaction):
+        self.matrix.send_reaction(self.room_id, ref, "📥", transaction=transaction)
 
     def _inbound_once(self):
         if not self._replayed:

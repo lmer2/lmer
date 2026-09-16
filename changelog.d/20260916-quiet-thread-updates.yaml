@@ -1,0 +1,4 @@
+fixed:
+  - Quiet progress notes no longer clutter connected threads and keep listener-owned sessions alive during long work.
+  - Connected threads acknowledge unanswered human messages with a delayed receipt reaction instead of an extra message.
+  - Slack receipts bound DNS, I/O, and cleanup, preserve trusted CA files and directories, and cancel correctly after slow sends or replies addressed to the same thread.

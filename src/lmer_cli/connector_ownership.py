@@ -8,6 +8,7 @@ import json
 import os
 import select
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -241,6 +242,15 @@ class Lease:
             if entry.get("session") is None:
                 entry["session"] = session
                 write_json(self.key.owner_path, entry)
+
+    def mark_activity(self) -> None:
+        """Publish new bus activity for the listener that owns this process."""
+        with self.key.metadata_lock():
+            entry = read_json(self.key.owner_path) or {}
+            if entry.get("token") != self.token:
+                raise OwnershipError("connector owner changed before activity update")
+            entry["activity_at"] = time.monotonic()
+            write_json(self.key.owner_path, entry)
 
     def environment(self, ready_fd: int | None = None) -> dict[str, str]:
         result = {LEASE_FD_ENV: str(self.fd), LEASE_TOKEN_ENV: self.token,

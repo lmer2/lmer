@@ -455,8 +455,7 @@ async def handle_message_event(event, say):
 
     1. Any message in a thread with a running session (human replies and
        the session agent's own posts alike) resets that session's idle
-       timer. The spawned agent is expected to post progress notes during
-       long autonomous work, so a working session keeps itself alive.
+       timer. The reaper also reads quiet session activity from its connector.
     2. In DMs, Slack sends regular 'message' events instead of
        'app_mention'. Non-bot DM messages connect an lmer session to the
        DM thread, mirroring the channel-mention behavior.

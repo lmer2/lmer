@@ -62,10 +62,16 @@ class FakeSlack:
         self.bot_user_id = "UBOT"
         self.fail_post = False
         self.attempts = 0
+        self.reactions = []
         self.names = {"U1": {"display_name": "vegu"}}
 
     def workspace(self):
         return {"host": "20c.slack.com"}
+
+    def add_reaction(self, channel, timestamp, name):
+        reaction = (channel, timestamp, name)
+        if reaction not in self.reactions:
+            self.reactions.append(reaction)
 
     def auth_test(self):
         return self.bot_user_id
@@ -227,7 +233,7 @@ class TestRendering:
         assert connector.render_outbound(self._record("message", "done")) == "done"
         assert connector.render_outbound(self._record("message", "go", channel="uber-lmer")) == "💬 [uber lmer] go"
         assert connector.render_outbound(self._record("message", "ok", channel="terminal")) == "💬 [terminal] ok"
-        assert connector.render_outbound(self._record("note", "working")) == "📝 working"
+        assert connector.render_outbound(self._record("note", "working")) is None
         assert connector.render_outbound(self._record("milestone", "pushed")) == "🏁 pushed"
         assert connector.render_outbound(self._record("command", "/followup", channel="uber-lmer")) == "⌨️ [uber lmer] /followup"
 
@@ -270,9 +276,8 @@ class TestOutbound:
         rig.connector.start()
         rig.agent("note", "working on it")
         rig.agent("question", "branch?", options=["main", "prep"])
-        rig.wait_until(lambda: len(rig.slack.posted) >= 2)
-        assert rig.slack.posted[0][2] == "📝 working on it"
-        assert rig.slack.posted[1][2].startswith("❓ branch?\n1. main\n2. prep")
+        rig.wait_until(lambda: len(rig.slack.posted) >= 1)
+        assert rig.slack.posted[0][2].startswith("❓ branch?\n1. main\n2. prep")
         assert rig.slack.posted[0][:2] == ("C1", "1699999999.000000")
         # The inbound loop also replayed the thread root onto the bus, so the
         # acked position is whatever the log has grown to, not a fixed number.
@@ -281,21 +286,21 @@ class TestOutbound:
     def test_a_slack_record_is_not_posted_back(self, rig):
         rig.connector.start()
         rig.log.append(kind="message", text="from slack", source=comms.Source("slack", author="vegu", ref="t9"))
-        rig.agent("note", "after")
+        rig.agent("message", "after")
         rig.wait_until(lambda: len(rig.slack.posted) >= 1)
-        assert [p[2] for p in rig.slack.posted] == ["📝 after"]
+        assert [p[2] for p in rig.slack.posted] == ["after"]
 
     def test_a_verified_rejection_is_held_and_retried(self, rig):
         """A structured rejection establishes that Slack did not accept the post."""
         rig.slack.fail_post = True
         rig.connector.start()
-        rig.agent("note", "one")
+        rig.agent("message", "one")
         rig.wait_until(lambda: rig.slack.attempts >= 1)
         assert rig.log.subscribers().get(rig.connector.subscriber) in (None, 0), "nothing was delivered to ack"
         rig.slack.fail_post = False
-        rig.agent("note", "two")
+        rig.agent("message", "two")
         rig.wait_until(lambda: len(rig.slack.posted) == 2)
-        assert [text for _, _, text in rig.slack.posted] == ["📝 one", "📝 two"]
+        assert [text for _, _, text in rig.slack.posted] == ["one", "two"]
         rig.wait_until(lambda: rig.log.subscribers().get(rig.connector.subscriber) == rig.log.seq)
 
 
@@ -624,8 +629,8 @@ class TestPostsFromOtherRuns:
         rig.wait_until(lambda: any(
             "have a look" in record.text for record in rig.log.read_since(0)[0]
         ))
-        rig.agent("note", "after")
-        rig.wait_until(lambda: any(text == "\U0001f4dd after" for _c, _t, text in rig.slack.posted))
+        rig.agent("message", "after")
+        rig.wait_until(lambda: any(text == "after" for _c, _t, text in rig.slack.posted))
         assert not any("have a look" in text for _c, _t, text in rig.slack.posted)
 
     def test_another_runs_post_can_answer_an_open_question(self, rig):
