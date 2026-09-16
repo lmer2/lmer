@@ -185,7 +185,7 @@ _MILESTONE_PATTERNS = (
 # in #429) with nothing holding this string against the CLI. Now
 # tests/test_signal_guard.py does. Spelled out rather than imported from
 # `ask_channel.signal_cli`: a hook needing the package on its path fails closed.
-_NON_MILESTONE_VERBS = r"(?:note|post|read|thread|ask|wait|close|list|end-session)"
+_NON_MILESTONE_VERBS = r"(?:note|post|read|dm|thread|ask|wait|close|list|end-session)"
 _SIGNAL_RE = re.compile(
     _BOUNDARY + r"lmer-signal" + r"(?!\s+" + _NON_MILESTONE_VERBS + _TRAIL + r")" + _TRAIL
 )

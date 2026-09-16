@@ -585,6 +585,47 @@ class TestConfigAndTargets:
         found = watcher.sync_once()
         assert [(room, event["event_id"]) for room, event in found] == [(ROOM, "$m1")]
 
+    def test_listener_unset_list_and_case_variant_are_refused(self, caplog):
+        account = {
+            "LMER_MATRIX_HOMESERVER": "https://hs", "LMER_MATRIX_USER_ID": BOT,
+            "LMER_MATRIX_ACCESS_TOKEN": "syt",
+        }
+
+        class Sessions:
+            max_sessions = 5
+
+        for allowed in (None, "@vegu:example.org"):
+            config = listener.ListenerConfig({
+                **account, **({} if allowed is None else {"LMER_MATRIX_ALLOWED_USERS": allowed}),
+            })
+            fake = FakeMatrix()
+            watcher = listener.Listener(config, Sessions(), matrix=fake)
+            assert watcher.sync_once() == []
+            fake.pending.append({
+                "event_id": "$m1", "sender": "@Vegu:example.org",
+                "type": "m.room.message",
+                "content": {"body": "@lmer start", "msgtype": "m.text"},
+            })
+            with caplog.at_level("INFO", logger="matrix_chat.listener"):
+                assert watcher.sync_once() == []
+        assert "LMER_MATRIX_ALLOWED_USERS" in caplog.text
+
+    def test_empty_list_startup_explains_fatal_exit_at_error_log_level(
+        self, monkeypatch, capsys
+    ):
+        from lmer_cli import runtime, tls
+
+        monkeypatch.setattr(runtime, "apply_env_file_defaults", lambda *args, **kwargs: None)
+        monkeypatch.setattr(tls, "ensure_ca_bundle", lambda: None)
+        monkeypatch.setenv("LMER_MATRIX_HOMESERVER", "https://hs")
+        monkeypatch.setenv("LMER_MATRIX_USER_ID", BOT)
+        monkeypatch.setenv("LMER_MATRIX_ACCESS_TOKEN", "syt")
+        monkeypatch.setenv("LMER_MATRIX_ALLOWED_USERS", "")
+
+        assert listener.main(["--log-level", "ERROR"]) == 1
+
+        assert "LMER_MATRIX_ALLOWED_USERS" in capsys.readouterr().err
+
     def test_listener_config_requires_the_account(self):
         with pytest.raises(ValueError, match="LMER_MATRIX_HOMESERVER"):
             listener.ListenerConfig({})

@@ -11,8 +11,7 @@ listener relays no content.
 The allowlist (``LMER_MATRIX_ALLOWED_USERS``) is explicit MXIDs, never a
 server, a glob or room membership: the homeserver federates and its
 providers may be open-signup, so being in the room authorises nothing. Empty
-means nobody, not everybody — the opposite of the Slack DM default, on
-purpose.
+means nobody, on both transports.
 
 Capacity, per-thread dedup and the idle reaper are
 :class:`slack_chat.sessions.SessionManager`, keyed on ``(room_id,
@@ -120,7 +119,10 @@ class Listener:
                 if sender == self.config.user_id or not is_mention(event, self.config.user_id):
                     continue
                 if sender not in self.config.allowed:
-                    logger.info("matrix_listener_denied room=%s sender=%s", room_id, sender)
+                    logger.info(
+                        "matrix_listener_denied room=%s sender=%s allow_list=%s",
+                        room_id, sender, ALLOWED_USERS_ENV,
+                    )
                     continue
                 found.append((room_id, event))
         return found
@@ -220,8 +222,8 @@ def main(argv=None) -> int:
         return 1
     if not config.allowed:
         print(
-            f"lmer-matrix-listener: {ALLOWED_USERS_ENV} is empty — nobody may start a session, "
-            "so there is nothing to listen for. Name the MXIDs allowed to mention the bot.",
+            f"lmer-matrix-listener: {ALLOWED_USERS_ENV} is unset or empty — "
+            "refusing inbound messages; name the MXIDs allowed to mention the bot",
             file=sys.stderr,
         )
         return 1

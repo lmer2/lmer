@@ -235,6 +235,34 @@ class SessionThreads:
             )
         }
 
+    def conversation_ids(self) -> list:
+        """Conversations a DM may be sent into without consulting the allow list.
+
+        The transport-side id of each thread this session is connected to — the
+        Slack channel or matrix room it resolved to — but **only those somebody
+        other than the run connected**. Every record carries who made it, and
+        the run's own `lmer-signal thread connect` is the one stamped
+        :data:`BY_AGENT`.
+
+        The filter is the whole safety of the exemption (MR !315, review round
+        1). `thread open` takes any Slack channel string with no `:` or `/`,
+        which includes a bare user id, and Slack resolves that to the user's IM
+        — so without this a run could connect a DM with an unlisted person
+        itself and then message them, with the transport allow list never
+        consulted. #441 grants the exemption to threads *the human* opened, and
+        `by` is the record of which those are.
+        """
+        records = connectors.ensure_connectors().records(self.session_id)
+        found = []
+        for record in records:
+            if record.get("by") == BY_AGENT:
+                continue
+            key = record.get("key") or {}
+            value = key.get("channel") or key.get("room")
+            if value:
+                found.append(value)
+        return found
+
     def connect(self, permalink: object) -> dict:
         return {"thread": connect(self.session_id, permalink, by=self.by)}
 

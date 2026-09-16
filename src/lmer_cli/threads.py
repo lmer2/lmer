@@ -29,8 +29,8 @@ from .comms import CHANNEL_MATRIX, CHANNEL_SLACK
 
 __all__ = [
     "CHANNEL_SLACK", "CHANNEL_MATRIX", "MAX_THREAD_TARGETS", "MAX_PERMALINK_CHARS",
-    "MAX_CHANNEL_CHARS", "ThreadError", "ThreadRef", "ChannelRef", "parse_thread",
-    "parse_channel", "validate_thread_targets",
+    "MAX_CHANNEL_CHARS", "MAX_RECIPIENT_CHARS", "ThreadError", "ThreadRef",
+    "ChannelRef", "parse_thread", "parse_channel", "validate_thread_targets",
 ]
 
 #: How many threads one launch list may carry.
@@ -42,6 +42,11 @@ MAX_PERMALINK_CHARS = 4096
 #: channel name (80) and over a matrix room id or alias (255 bytes), and far
 #: short of a permalink, which is the mistake this bound is here to catch.
 MAX_CHANNEL_CHARS = 256
+
+#: How long the name of a person to direct-message may be (issue #441). Over a
+#: Slack user id (11) and username (21) and over an MXID (255 bytes), and short
+#: enough that a pasted permalink is refused rather than sent to a transport.
+MAX_RECIPIENT_CHARS = 256
 
 
 class ThreadError(RuntimeError):

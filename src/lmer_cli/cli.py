@@ -2983,6 +2983,10 @@ def main(argv: list[str] | None = None) -> int:
         # which is exactly the ambient value the scoped pair exists to avoid.
         AGENTS_ENV: None,
         AGENTS_CONFIG_ENV: None,
+        # DM permissions are decided by host-side listeners and servicers.
+        # Block .env and preset seeding from carrying these lists into a run.
+        "LMER_SLACK_DM_ALLOWED_USERS": None,
+        "LMER_MATRIX_ALLOWED_USERS": None,
         DEFAULT_SOURCES_ENV: None,
         "LMER_QUICK_GATE_COMMIT": os.environ.get("LMER_QUICK_GATE_COMMIT"),
         # User-installed harnesses (issue #132): where the host mounted

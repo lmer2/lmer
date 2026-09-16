@@ -16,7 +16,8 @@ import pytest
 from lmer_cli import supervisor, thread_requests
 from lmer_cli.comms import MessageLog
 from lmer_cli.thread_requests import (
-    MAX_IN_FLIGHT, OP_POST, OP_READ, STATE_DONE, ThreadRequestError, ThreadRequests,
+    MAX_IN_FLIGHT, MAX_RECIPIENT_CHARS, OP_DM, OP_POST, OP_READ, STATE_DONE,
+    ThreadRequestError, ThreadRequests,
 )
 from tests.conftest import strip_lmer_env
 
@@ -191,6 +192,62 @@ class TestTheQueue:
 # ---------------------------------------------------------------------------
 
 
+class TestDirectMessages:
+    """`dm` on the queue (issue #441): addressed by person, never by thread."""
+
+    def test_a_dm_carries_its_recipient_to_the_servicer(self, queue):
+        request = queue.submit(OP_DM, recipient="U0123ABC", text="the password is in your DMs")
+        assert request.op == OP_DM
+        assert request.recipient == "U0123ABC"
+        assert request.permalink == ""
+        # The servicer reads the request as a dict, so the field has to survive
+        # that crossing — it is the only thing saying who the message is for.
+        assert request.to_dict()["recipient"] == "U0123ABC"
+
+    def test_a_dm_without_a_recipient_is_refused(self, queue):
+        for missing in ("", "   "):
+            with pytest.raises(ThreadRequestError) as caught:
+                queue.submit(OP_DM, recipient=missing, text="hi")
+            assert "needs a recipient" in str(caught.value)
+
+    @pytest.mark.parametrize("field", ["permalink", "channel"])
+    def test_a_dm_that_also_names_a_thread_or_channel_is_refused(self, queue, field):
+        """Two addresses is not a detail to resolve: one of the answers is a
+        room other people can read, and this message is the one that must not
+        go there."""
+        kwargs = {"recipient": "U0123ABC", "text": "hi"}
+        if field == "permalink":
+            kwargs["permalink"] = "https://example.slack.com/archives/C1/p1700000000123456"
+        else:
+            kwargs["channel"] = "#general"
+        with pytest.raises(ThreadRequestError) as caught:
+            queue.submit(OP_DM, **kwargs)
+        assert "not a thread or a channel" in str(caught.value)
+
+    @pytest.mark.parametrize("recipient", [
+        "U0123 ABC", "U0123\tABC", "U0123\x00ABC", "U0123\nABC",
+    ])
+    def test_a_recipient_carrying_whitespace_or_control_characters_is_refused(self, queue, recipient):
+        with pytest.raises(ThreadRequestError) as caught:
+            queue.submit(OP_DM, recipient=recipient, text="hi")
+        assert "whitespace or control characters" in str(caught.value)
+
+    def test_a_recipient_is_bounded(self, queue):
+        with pytest.raises(ThreadRequestError) as caught:
+            queue.submit(OP_DM, recipient="U" * (MAX_RECIPIENT_CHARS + 1), text="hi")
+        assert str(MAX_RECIPIENT_CHARS) in str(caught.value)
+
+    def test_a_recipient_on_another_op_is_dropped(self, queue):
+        """Only `dm` is addressed by person. A recipient riding on a post would
+        be a field the servicer could read and act on for an op whose address is
+        its permalink."""
+        request = queue.submit(
+            OP_POST, "https://example.slack.com/archives/C1/p1700000000123456",
+            recipient="U0123ABC", text="hi",
+        )
+        assert request.recipient == ""
+
+
 class TestRoutes:
     def _build(self, tmp_path):
         """A plane built the way `run_supervisor` builds one: the control
@@ -219,6 +276,35 @@ class TestRoutes:
         )
         assert refused.status_code == 503
         assert "no host-side servicer" in refused.json()["detail"]
+
+    def test_a_dm_recipient_survives_the_route_to_the_servicer(self, tmp_path):
+        """The field is new on this body (#441), and the servicer reads the
+        request the route stored — so a body field the model drops would leave
+        the host side with a message and nobody to send it to."""
+        client, control, agent = self._build(tmp_path)
+        assert client.get("/thread/requests", params={"since": 0}, headers=control).status_code == 200
+        queued = client.post(
+            "/thread/requests",
+            json={"op": OP_DM, "recipient": "@someone:example.org", "text": "the credential"},
+            headers=agent,
+        )
+        assert queued.status_code == 200
+        assert queued.json()["request"]["recipient"] == "@someone:example.org"
+        claimed = client.get("/thread/requests", params={"since": 0}, headers=control).json()
+        assert [item["recipient"] for item in claimed["requests"]] == ["@someone:example.org"]
+
+    def test_a_dm_naming_a_thread_is_refused_by_the_route(self, tmp_path):
+        client, control, agent = self._build(tmp_path)
+        client.get("/thread/requests", params={"since": 0}, headers=control)
+        refused = client.post(
+            "/thread/requests",
+            json={"op": OP_DM, "recipient": "U0123ABC",
+                  "permalink": "https://example.slack.com/archives/C1/p1700000000123456",
+                  "text": "hi"},
+            headers=agent,
+        )
+        assert refused.status_code == 400
+        assert "not a thread or a channel" in refused.json()["detail"]
 
     def test_the_session_may_ask_and_collect_but_never_poll_or_answer(self, tmp_path):
         client, control, agent = self._build(tmp_path)

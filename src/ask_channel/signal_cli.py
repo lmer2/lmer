@@ -9,6 +9,7 @@ Verbs
     lmer-signal note "<text>"            progress, no reply wanted
     lmer-signal post "<text>"            a message to the humans in the conversation
     lmer-signal read <permalink>         read any accessible thread, including this session's own
+    lmer-signal dm <recipient> "<text>"  one private message; allow-listed, body never journalled
     lmer-signal post --thread <link> …   post once into a thread
     lmer-signal thread open <channel>    open a thread in a channel and connect to it
     lmer-signal thread connect <link>    connect this session to a thread that exists
@@ -72,7 +73,7 @@ KIND_CLOSE = "close"
 
 #: The verbs. A first argument that is not one of these is a milestone's text.
 VERBS = (
-    "milestone", "note", "post", "read", "thread", "ask", "wait", "close",
+    "milestone", "note", "post", "read", "dm", "thread", "ask", "wait", "close",
     "list", "end-session",
 )
 
@@ -138,6 +139,20 @@ def create_parser() -> argparse.ArgumentParser:
     )
     read_p.add_argument("--json", action="store_true", help="One JSON record per line instead of prose.")
     _add_thread_timeout(read_p)
+
+    dm_p = sub.add_parser(
+        "dm",
+        help=(
+            "Send one private message to a person. Allow-listed by the operator; "
+            "the body is never recorded on this session's conversation."
+        ),
+    )
+    dm_p.add_argument(
+        "recipient",
+        help="Slack user id or username, or a matrix user id (@name:server).",
+    )
+    add_text_source(dm_p, "message")
+    _add_thread_timeout(dm_p)
 
     thread_p = sub.add_parser(
         "thread",
@@ -393,6 +408,65 @@ def _cmd_read(args: argparse.Namespace, client: bus.BusClient) -> int:
             file=sys.stderr,
         )
     return 0
+
+
+def _cmd_dm(args: argparse.Namespace, client: bus.BusClient) -> int:
+    """One private message to one person (#441).
+
+    Delivery first, then the record — ``_post_into_thread``'s order and its
+    reason. What differs is that the record carries no body: that record fans
+    out to every thread this session is connected to, which is exactly where a
+    DM must not appear. docs/COMMS.md §12 has the rest.
+    """
+    text = resolve_text(args)
+    delivered = _thread_work(
+        client, args, _threads.OP_DM, "",
+        on_timeout=_dm_is_indeterminate(args), recipient=args.recipient, text=text,
+    )
+    conversation = delivered.get("conversation") or {}
+    who = conversation.get("recipient") or args.recipient
+    where = conversation.get("channel") or ""
+    posted = delivered.get("posted") or {}
+    if posted.get("clipped"):
+        print(
+            f"sent to {who}, clipped to what one message carries — and the whole "
+            "text is nowhere else, so send the rest yourself if it mattered",
+            file=sys.stderr,
+        )
+    else:
+        print(f"sent to {who}", file=sys.stderr)
+    try:
+        client.post(
+            KIND_NOTE,
+            f"🔒 direct message sent to {who}" + (f" ({where})" if where else "")
+            + f" — {len(text)} characters, body not recorded",
+        )
+    except (bus.NoChannel, bus.BusError) as exc:
+        raise ArgsError(
+            f"the message IS with {who} — do not send it again. What failed is "
+            f"the note of it on this session's own conversation ({exc}), so "
+            "nothing here will show that a direct message went out"
+        ) from None
+    if conversation.get("permalink"):
+        print(conversation["permalink"])
+    return 0
+
+
+def _dm_is_indeterminate(args: argparse.Namespace) -> str:
+    """What a timed-out ``dm`` says instead of "it failed".
+
+    ``open``'s reason exactly (:func:`_open_is_indeterminate`): the request is
+    already claimed, so the host may finish after this process stops waiting,
+    and an agent told "failed" sends somebody a second copy of something
+    private. There is no `connect`-shaped way out here — a conversation cannot
+    be re-opened to find out — so the answer is the operator.
+    """
+    return (
+        f"INDETERMINATE, not failed: the message may already be with "
+        f"{args.recipient}, or nothing may have happened. Do NOT run this again "
+        "— a second attempt sends them a second copy. Ask the operator, who can "
+        "see whether it arrived"
+    )
 
 
 def _cmd_thread(args: argparse.Namespace, client: bus.BusClient) -> int:
@@ -712,6 +786,7 @@ _COMMANDS = {
     "note": _cmd_note,
     "post": _cmd_post,
     "read": _cmd_read,
+    "dm": _cmd_dm,
     "thread": _cmd_thread,
     "ask": _cmd_ask,
     "wait": _cmd_wait,

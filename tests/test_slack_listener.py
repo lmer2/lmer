@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 from slack_chat import listener
 from slack_chat import sessions
@@ -22,6 +23,15 @@ from slack_chat.sessions import CHAT_TASK_ID, SessionManager, listener_default_p
 from lmer_cli.presets import Preset, load_presets, select_preset_name
 
 PERMALINK = "https://x.slack.com/archives/C1/p1112220000000000"
+
+
+def sdk_user_response(user_id="U0123ABCD", handle="vegu"):
+    return AsyncSlackResponse(
+        client=None, http_verb="GET", api_url="https://slack.com/api/users.info",
+        req_args={"user": user_id},
+        data={"ok": True, "user": {"id": user_id, "name": handle}},
+        headers={}, status_code=200,
+    )
 
 
 def _write_presets(path: Path, *names: str) -> Path:
@@ -75,6 +85,7 @@ def slack_app(monkeypatch) -> types.SimpleNamespace:
         ),
         chat_postMessage=AsyncMock(return_value={"ok": True}),
         auth_test=AsyncMock(return_value={"ok": True, "user_id": "U_BOT"}),
+        users_info=AsyncMock(return_value=sdk_user_response()),
     )
     fake_app = types.SimpleNamespace(client=client)
     monkeypatch.setattr(listener, "app", fake_app)
@@ -90,10 +101,10 @@ def isolate_dm_allowlist(monkeypatch):
     time. When the suite runs inside a live Slack session that variable is
     populated (e.g. the operator's own user id), which gates the synthetic test
     users out of the DM-connect paths and fails the tests that assume the CI
-    default (empty allowlist = allow all). Reset it to empty before each test;
+    default. Give the synthetic DM sender U00000001 permission before each test;
     tests that exercise gating override it explicitly.
     """
-    monkeypatch.setattr(listener, "DM_ALLOWED_USERS", set())
+    monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U00000001"})
 
 
 @pytest.fixture(autouse=True)
@@ -133,16 +144,21 @@ class TestCsvEnvSet:
 
 
 class TestDmUserAllowed:
-    def test_open_when_allowlist_empty(self, monkeypatch):
+    def test_closed_when_allowlist_empty(self, monkeypatch):
         monkeypatch.setattr(listener, "DM_ALLOWED_USERS", set())
-        assert listener._dm_user_allowed("U_ANYONE") is True
-        assert listener._dm_user_allowed(None) is True
+        assert listener._dm_user_allowed("U_ANYONE") is False
+        assert listener._dm_user_allowed(None) is False
 
     def test_gated_when_allowlist_set(self, monkeypatch):
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U_OK"})
-        assert listener._dm_user_allowed("U_OK") is True
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U000000OK"})
+        assert listener._dm_user_allowed("U000000OK") is True
         assert listener._dm_user_allowed("U_NOPE") is False
         assert listener._dm_user_allowed(None) is False
+
+    def test_a_handle_entry_does_not_match_the_raw_user_id(self, monkeypatch):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"@u000000ok"})
+        assert listener._dm_user_allowed("U000000OK") is False
+        assert listener._dm_user_allowed("U_NOPE") is False
 
 
 class TestConnectLmerSession:
@@ -384,7 +400,7 @@ class TestHandleMention:
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
         say = AsyncMock()
 
-        event = {"user": "U1", "channel": "C1", "ts": "111.222"}
+        event = {"user": "U00000001", "channel": "C1", "ts": "111.222"}
         await listener.handle_mention(event, say)
 
         connect.assert_awaited_once_with(
@@ -400,7 +416,7 @@ class TestHandleMention:
         say = AsyncMock()
 
         event = {
-            "user": "U1",
+            "user": "U00000001",
             "channel": "C1",
             "ts": "333.444",
             "thread_ts": "111.222",
@@ -429,7 +445,7 @@ class TestHandleMention:
         self, manager, slack_app, monkeypatch
     ):
         """A DM mention from a user off the allowlist must not spawn a session."""
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U_OK"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U000000OK"})
         connect = AsyncMock()
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
 
@@ -443,7 +459,7 @@ class TestHandleMention:
         self, manager, slack_app, monkeypatch
     ):
         """The DM allowlist must never gate a mention in a real channel."""
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U_OK"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U000000OK"})
         connect = AsyncMock()
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
         say = AsyncMock()
@@ -465,7 +481,7 @@ class TestHandleMention:
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
         say = AsyncMock()
 
-        event = {"user": "U1", "channel": "D1", "ts": "111.222"}
+        event = {"user": "U00000001", "channel": "D1", "ts": "111.222"}
         await listener.handle_mention(event, say)
 
         connect.assert_awaited_once_with(
@@ -499,7 +515,7 @@ class TestHandleMessageEvent:
         event = {
             "channel": "D1",
             "channel_type": "im",
-            "user": "U1",
+            "user": "U00000001",
             "ts": "111.222",
             "text": "hello there",
         }
@@ -508,6 +524,7 @@ class TestHandleMessageEvent:
         connect.assert_awaited_once_with(
             "D1", "111.222", say, is_dm=True, dedup_channel=True, preset_name=None
         )
+        slack_app.client.users_info.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_threaded_dm_reply_skips_channel_dedup(
@@ -522,7 +539,7 @@ class TestHandleMessageEvent:
         event = {
             "channel": "D1",
             "channel_type": "im",
-            "user": "U1",
+            "user": "U00000001",
             "ts": "333.444",
             "thread_ts": "111.222",
             "text": "continuing here",
@@ -545,7 +562,7 @@ class TestHandleMessageEvent:
         event = {
             "channel": "D1",
             "channel_type": "im",
-            "user": "U1",
+            "user": "U00000001",
             "ts": "111.222",
             "text": "!standup week",
         }
@@ -558,7 +575,7 @@ class TestHandleMessageEvent:
         self, manager, slack_app, monkeypatch
     ):
         """When an allowlist is set, an off-list DM connects nothing and stays silent."""
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U_OK"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U000000OK"})
         connect = AsyncMock()
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
         say = AsyncMock()
@@ -576,11 +593,29 @@ class TestHandleMessageEvent:
         say.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_unset_list_refuses_and_logs_its_variable(
+        self, manager, slack_app, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", set())
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+        say = AsyncMock()
+        event = {"channel": "D1", "channel_type": "im", "user": "U00000001", "ts": "111.222"}
+
+        with caplog.at_level("INFO", logger="lmer_slack.listener"):
+            await listener.handle_message_event(event, say)
+
+        connect.assert_not_awaited()
+        say.assert_not_awaited()
+        assert len([record for record in caplog.records if "dm_refused" in record.message]) == 1
+        assert "LMER_SLACK_DM_ALLOWED_USERS" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_dm_from_allowlisted_user_connects(
         self, manager, slack_app, monkeypatch
     ):
         """A DM from a user on the allowlist connects a session as usual."""
-        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U_OK"})
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"U000000OK"})
         connect = AsyncMock()
         monkeypatch.setattr(listener, "_connect_lmer_session", connect)
         say = AsyncMock()
@@ -588,7 +623,7 @@ class TestHandleMessageEvent:
         event = {
             "channel": "D1",
             "channel_type": "im",
-            "user": "U_OK",
+            "user": "U000000OK",
             "ts": "111.222",
             "text": "hello there",
         }
@@ -597,6 +632,135 @@ class TestHandleMessageEvent:
         connect.assert_awaited_once_with(
             "D1", "111.222", say, is_dm=True, dedup_channel=True, preset_name=None
         )
+
+    @pytest.mark.asyncio
+    async def test_handle_entry_allows_the_same_user_inbound(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"@VEGU"})
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+        event = {
+            "channel": "D1", "channel_type": "im", "user": "U0123ABCD",
+            "ts": "111.222", "text": "hello",
+        }
+
+        await listener.handle_message_event(event, AsyncMock())
+
+        assert isinstance(slack_app.client.users_info.return_value, AsyncSlackResponse)
+        slack_app.client.users_info.assert_awaited_once_with(user="U0123ABCD")
+        connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_sdk_handle_response_allows_dm_mention(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"vegu"})
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+
+        await listener.handle_mention(
+            {"user": "U0123ABCD", "channel": "D1", "ts": "111.222", "text": "<@U_BOT>"},
+            AsyncMock(),
+        )
+
+        assert isinstance(slack_app.client.users_info.return_value, AsyncSlackResponse)
+        slack_app.client.users_info.assert_awaited_once_with(user="U0123ABCD")
+        connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("listed, handle", [
+        ("walter", "walter"), ("user", "user"), ("@walter", "walter"),
+    ])
+    async def test_u_or_w_prefixed_handle_still_gets_confirmed(
+        self, manager, slack_app, monkeypatch, listed, handle
+    ):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {listed})
+        slack_app.client.users_info.return_value = sdk_user_response(handle=handle)
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+
+        await listener.handle_message_event(
+            {"channel": "D1", "channel_type": "im", "user": "U0123ABCD", "ts": "111.222"},
+            AsyncMock(),
+        )
+
+        slack_app.client.users_info.assert_awaited_once_with(user="U0123ABCD")
+        connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("listed, admitted", [
+        ("U0123ABCD", False), ("u0123abcd", True),
+    ])
+    async def test_confirmed_handle_cannot_satisfy_another_users_id_entry(
+        self, manager, slack_app, monkeypatch, listed, admitted
+    ):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {listed})
+        slack_app.client.users_info.return_value = sdk_user_response(
+            user_id="UOTHER999", handle="u0123abcd"
+        )
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+
+        await listener.handle_message_event(
+            {"channel": "D1", "channel_type": "im", "user": "UOTHER999", "ts": "111.222"},
+            AsyncMock(),
+        )
+
+        slack_app.client.users_info.assert_awaited_once_with(user="UOTHER999")
+        assert connect.await_count == int(admitted)
+
+    @pytest.mark.asyncio
+    async def test_handle_entry_refuses_a_different_account(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"@VEGU"})
+        slack_app.client.users_info.return_value = {
+            "ok": True, "user": {"id": "USTRANGER", "name": "stranger"},
+        }
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+        event = {
+            "channel": "D1", "channel_type": "im", "user": "USTRANGER",
+            "ts": "111.222", "text": "hello",
+        }
+
+        await listener.handle_message_event(event, AsyncMock())
+
+        connect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sdk_handle_response_refuses_a_mismatched_id(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"vegu"})
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+
+        await listener.handle_message_event(
+            {"channel": "D1", "channel_type": "im", "user": "USTRANGER", "ts": "111.222"},
+            AsyncMock(),
+        )
+
+        slack_app.client.users_info.assert_awaited_once_with(user="USTRANGER")
+        connect.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_handle_entry_refuses_when_slack_cannot_confirm_it(
+        self, manager, slack_app, monkeypatch
+    ):
+        monkeypatch.setattr(listener, "DM_ALLOWED_USERS", {"vegu"})
+        slack_app.client.users_info.side_effect = RuntimeError("missing_scope")
+        connect = AsyncMock()
+        monkeypatch.setattr(listener, "_connect_lmer_session", connect)
+        event = {
+            "channel": "D1", "channel_type": "im", "user": "U0123ABCD",
+            "ts": "111.222", "text": "hello",
+        }
+
+        await listener.handle_message_event(event, AsyncMock())
+
+        connect.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_dm_bot_message_is_skipped(self, manager, slack_app, monkeypatch):
@@ -626,7 +790,7 @@ class TestHandleMessageEvent:
             "channel": "D1",
             "channel_type": "im",
             "subtype": "message_changed",
-            "user": "U1",
+            "user": "U00000001",
             "ts": "111.222",
             "text": "edited",
         }
@@ -904,7 +1068,7 @@ class TestPresetSelection:
         say = AsyncMock()
 
         event = {
-            "user": "U1",
+            "user": "U00000001",
             "channel": "C1",
             "ts": "111.222",
             "text": "<@U_BOT> $preset:my_service please do X",
@@ -926,7 +1090,7 @@ class TestPresetSelection:
         event = {
             "channel": "D1",
             "channel_type": "im",
-            "user": "U1",
+            "user": "U00000001",
             "ts": "111.222",
             "text": "$preset:my_service hello",
         }
