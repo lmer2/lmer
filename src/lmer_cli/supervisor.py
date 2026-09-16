@@ -573,14 +573,16 @@ class _MessageBody(BaseModel):
 class _ThreadRequestBody(BaseModel):
     """``POST /thread/requests``: work for the host side (issue #414).
 
-    ``permalink`` names a thread and ``channel`` a place to open one in (#429);
-    which of the two a request needs is its ``op``'s to say, and
+    ``permalink`` names a thread, ``channel`` a place to open one in (#429) and
+    ``recipient`` a person to direct-message (#441); which of the three a
+    request needs is its ``op``'s to say, and
     :meth:`lmer_cli.thread_requests.ThreadRequests.submit` says it.
     """
 
     op: str
     permalink: str = ""
     channel: str = ""
+    recipient: str = ""
     limit: int = Field(default=_threads.DEFAULT_READ_LIMIT, ge=1, le=_threads.MAX_READ_LIMIT)
     text: str = ""
     attachments: list = Field(default_factory=list)
@@ -1857,7 +1859,8 @@ def _build_fastapi_app(
         _check_auth(authorization)
         try:
             request = thread_queue.submit(
-                body.op, body.permalink, channel=body.channel, limit=body.limit,
+                body.op, body.permalink, channel=body.channel,
+                recipient=body.recipient, limit=body.limit,
                 text=body.text, attachments=body.attachments,
             )
         except _threads.ThreadRequestError as exc:

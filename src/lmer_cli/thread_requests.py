@@ -23,10 +23,11 @@ from typing import Optional
 from . import threads as _threads
 
 __all__ = [
-    "OP_READ", "OP_POST", "OP_OPEN", "OP_CONNECT", "OP_DISCONNECT", "OPS",
-    "CONNECTION_OPS", "STATE_PENDING", "STATE_CLAIMED", "STATE_DONE",
+    "OP_READ", "OP_POST", "OP_OPEN", "OP_CONNECT", "OP_DISCONNECT", "OP_DM",
+    "OPS", "CONNECTION_OPS", "STATE_PENDING", "STATE_CLAIMED", "STATE_DONE",
     "SERVICER_TTL", "MAX_IN_FLIGHT", "RESULT_TTL", "MAX_READ_LIMIT",
-    "DEFAULT_READ_LIMIT", "MAX_CHANNEL_CHARS", "ThreadRequestError",
+    "DEFAULT_READ_LIMIT", "MAX_CHANNEL_CHARS", "MAX_RECIPIENT_CHARS",
+    "ThreadRequestError",
     "ThreadRequest", "ThreadRequests",
 ]
 
@@ -42,7 +43,13 @@ OP_OPEN = "open"
 OP_CONNECT = "connect"
 OP_DISCONNECT = "disconnect"
 CONNECTION_OPS = (OP_OPEN, OP_CONNECT, OP_DISCONNECT)
-OPS = (OP_READ, OP_POST, *CONNECTION_OPS)
+
+#: One private message to one person (issue #441). Like the three above it
+#: reaches the host because the credentials are there, and like ``open`` it
+#: *creates* — a conversation that did not exist — so nothing retries it.
+#: Unlike all of them it names no thread at all: the recipient is the address.
+OP_DM = "dm"
+OPS = (OP_READ, OP_POST, *CONNECTION_OPS, OP_DM)
 
 STATE_PENDING = "pending"
 STATE_CLAIMED = "claimed"
@@ -78,6 +85,9 @@ MAX_NAME_CHARS = 200
 #: (:mod:`lmer_cli.threads`), not a second number that could diverge from it.
 MAX_CHANNEL_CHARS = _threads.MAX_CHANNEL_CHARS
 
+#: A person to direct-message, bounded from the same place and for the reason.
+MAX_RECIPIENT_CHARS = _threads.MAX_RECIPIENT_CHARS
+
 #: A media type rides in an HTTP header and in a matrix event's ``info``; it is
 #: the shape RFC 6838 allows and nothing else.
 _MEDIA_TYPE_RE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]{1,127}/[A-Za-z0-9!#$&^_.+-]{1,127}$")
@@ -105,6 +115,7 @@ class ThreadRequest:
     op: str
     permalink: str
     channel: str = ""
+    recipient: str = ""
     limit: int = DEFAULT_READ_LIMIT
     text: str = ""
     attachments: list = field(default_factory=list)
@@ -119,6 +130,7 @@ class ThreadRequest:
             "op": self.op,
             "permalink": self.permalink,
             "channel": self.channel,
+            "recipient": self.recipient,
             "limit": self.limit,
             "text": self.text,
             "attachments": list(self.attachments),
@@ -199,6 +211,26 @@ def _checked_channel(value: object) -> str:
     return channel
 
 
+def _checked_recipient(value: object) -> str:
+    """Bounds and shape only, for :func:`_checked_channel`'s reason: whether a
+    person exists, and whether this run may write to them, are questions for the
+    transport and the operator's allow list, and neither is readable here."""
+    if not isinstance(value, str) or not value.strip():
+        raise ThreadRequestError(
+            "a direct message needs a recipient — a Slack user id or username, "
+            "or a matrix user id (@name:server)"
+        )
+    recipient = value.strip()
+    if len(recipient) > MAX_RECIPIENT_CHARS:
+        raise ThreadRequestError(
+            f"the recipient is {len(recipient)} characters; the limit is "
+            f"{MAX_RECIPIENT_CHARS}"
+        )
+    if any(char.isspace() or ord(char) < 32 for char in recipient):
+        raise ThreadRequestError("a recipient carries no whitespace or control characters")
+    return recipient
+
+
 def _checked_permalink(value: object) -> str:
     """Bounds only. Which links name a thread is the servicer's question — it
     has the transports — and the supervisor holds no credential to ask with."""
@@ -265,12 +297,22 @@ class ThreadRequests:
 
     def submit(
         self, op: str, permalink: str = "", *, channel: str = "",
-        limit: int = DEFAULT_READ_LIMIT, text: str = "",
+        recipient: str = "", limit: int = DEFAULT_READ_LIMIT, text: str = "",
         attachments: Optional[list] = None,
     ) -> ThreadRequest:
         if op not in OPS:
             raise ThreadRequestError(f"unknown thread operation {op!r}")
-        if op == OP_OPEN:
+        if op == OP_DM:
+            # A recipient and nothing else that addresses: a request naming a
+            # person *and* a thread says nothing about where the message was
+            # meant to go, and one of the two answers is somebody else's channel.
+            recipient = _checked_recipient(recipient)
+            if permalink or channel:
+                raise ThreadRequestError(
+                    "a direct message takes a recipient, not a thread or a "
+                    "channel — post into a thread if that is what you meant"
+                )
+        elif op == OP_OPEN:
             # A channel *or* a permalink, never both: one names a place to make a
             # thread and the other a thread that exists, and a request carrying
             # the two says nothing about which was meant.
@@ -283,6 +325,8 @@ class ThreadRequests:
         else:
             permalink = _checked_permalink(permalink)
             channel = ""
+        if op != OP_DM:
+            recipient = ""
         if len(text) > MAX_TEXT_CHARS:
             raise ThreadRequestError(
                 f"the text is {len(text)} characters; the limit is {MAX_TEXT_CHARS}"
@@ -317,6 +361,7 @@ class ThreadRequests:
                 op=op,
                 permalink=permalink,
                 channel=channel,
+                recipient=recipient,
                 limit=limit,
                 text=text,
                 attachments=list(attachments or []),

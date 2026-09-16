@@ -124,6 +124,14 @@ directions: the session's bus.
   metacharacters: backticks, `$` and quotes go through the shell first and are
   silently mangled. Write the reply to a temp file and run
   `lmer-signal post --message-file /tmp/reply.md`.
+- **Anything private is `lmer-signal dm <recipient> "<text>"`.** A credential,
+  a personal detail, anything the person asked you to send them rather than
+  say in the room: it goes to them directly, never to the thread, and never
+  "just this once because the DM route looked unavailable". The operator keeps
+  the list of who may be reached this way, so an unlisted recipient is refused
+  by name — that refusal is the answer, not a reason to post it publicly. The
+  body is not written to this session's journal; the journal records only that
+  a message of that length went to that person.
 - **Questions are `lmer-signal ask`**, never an interactive terminal prompt
   (an interactive question tool, a permission prompt aimed at the terminal,
   a "press y" input) — those block forever with nobody to answer. `ask` posts

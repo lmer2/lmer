@@ -1305,7 +1305,8 @@ ask-directory readers and the steering form of `POST /api/sessions/{id}/input`.
 | `LMER_SLACK_POLL_SECONDS` | host | the Slack connector's `conversations.replies` interval (default 3) |
 | `LMER_MATRIX_HOMESERVER`, `LMER_MATRIX_USER_ID`, `LMER_MATRIX_ACCESS_TOKEN` | host | the bot account the matrix connector and listener act as; required for a matrix thread target, never forwarded |
 | `LMER_MATRIX_AUTHENTICATED_MEDIA` | host, bool | the operator's assertion that the homeserver requires authentication for media; the agent's attachments are withheld until set |
-| `LMER_MATRIX_ALLOWED_USERS` | host, listener | MXIDs allowed to start a session by mentioning the bot; empty means nobody |
+| `LMER_MATRIX_ALLOWED_USERS` | host | comma-separated MXIDs allowed to mention the bot and receive `lmer-signal dm` messages; exact match, unset or empty means nobody |
+| `LMER_SLACK_DM_ALLOWED_USERS` | host | comma-separated Slack user IDs or handles allowed to DM the listener and receive `lmer-signal dm` messages; entries matching `^[UW][A-Z0-9]{8,}$` are exact, case-sensitive IDs, while all others are case-insensitive, confirmed handles with a leading `@` ignored; unset or empty means nobody |
 | `LMER_MATRIX_ROOMS` | host, listener | optional room ids to watch; default every joined room |
 | `LMER_MATRIX_ROOM_ID`, `LMER_MATRIX_THREAD_EVENT`, `LMER_MATRIX_PERMALINK` | container, set by the target handler | the thread this session serves — context, not a credential |
 | `LMER_CHAT_ATTACH_ACK` | host / a connector, bool (default on) | whether a connector announces its own attachment in the thread. Both listeners set it to `0` on the `lmer` they spawn, because they announce that thread themselves. It gates the **ack** only — the note a connector posts when it stops listening is unconditional |
@@ -1382,6 +1383,91 @@ reference (#246). `post --thread` posts once, and records the post on the
 session's own bus as a `message` carrying `meta.thread`, so the run's connected
 threads show where it went.
 
+### Direct messages
+
+A run can send one **private** message to a person, on whichever transport this
+session is connected to:
+
+```
+lmer-signal dm <recipient> "<text>" [--message-file PATH | --stdin] [--timeout S]
+```
+
+`<recipient>` is a Slack user id or username, or a matrix user id — told apart
+by the `:server` half a matrix id carries and a Slack one does not, the same
+reading that separates a room from a channel above. It opens the 1:1
+conversation, or reuses the one that already exists, posts once, and prints the
+conversation's permalink on stdout.
+
+It is **one-shot**. The session is not connected to that conversation, so a
+reply the person types goes nowhere and they hear nothing back. Connect it
+deliberately with `lmer-signal thread connect <permalink>` if a conversation is
+wanted.
+
+**The body is never recorded on the bus.** What the run's own conversation gets
+is one note — who it went to, on which transport, and how many characters —
+never the text. That is by construction rather than by a flag: `post --thread`
+writes its text to the bus with `meta.thread`, and every connector renders that
+into every connected thread as `↗️ posted into …` followed by the body, which is
+exactly the mirror a DM must not take. The cost is that **the body is not
+recoverable from the run's journal**; the recipient has it, and so does the
+host's transport.
+
+**Who may exchange DMs is the operator's decision**, held in one host-side list
+per transport: `LMER_SLACK_DM_ALLOWED_USERS` for Slack ids or handles, and
+`LMER_MATRIX_ALLOWED_USERS` for matrix MXIDs. Both govern inbound messages to
+the listener and outbound `lmer-signal dm` messages. **Unset or empty means
+nobody**: every new outbound DM is refused on stderr naming the relevant
+variable, with no fallback to a public thread or prompt. With no established
+conversations, an empty list is refused before any transport is called. Slack
+ID entries match the confirmed ID exactly; handle entries match only a
+confirmed handle, case-insensitively with a leading `@` dropped. Matrix entries match exactly,
+because two MXIDs differing only in case are two people. Only what the transport
+confirms about an account is compared — its user id and the handle Slack holds
+for it — never a **display name**, which is self-set and not unique, and which
+any member could otherwise set to match an entry naming somebody else. The
+listener gets an inbound sender's handle from Slack by ID when a handle entry
+needs comparing; that lookup requires `users:read`.
+
+A conversation this session is **already connected to** needs no entry: a DM the
+human opened with the run is an ordinary connected thread, and they chose that
+channel. Only connections somebody *else* made count — a launch target, an
+operator connect, the platform — never one the run made itself with
+`lmer-signal thread connect`. Each connection records who made it, and the
+filter is load-bearing: `thread open` accepts any Slack channel string, a bare
+user id included, and Slack resolves that to the user's IM, so without it a run
+could establish its own exemption. Where the host side keeps no connections —
+the shell `lmer` process, whose threads are launch arguments — it knows of none,
+and the list is then the only door.
+
+**Resolving the recipient.** A Slack user id needs no scope. A username needs
+`users:read`, so the scopes `auth.test` already reported decide whether to look
+at all: known and missing is refused by name before any lookup, and scopes that
+could not be read (a proxy that strips the header) are *not knowing* rather than
+absence, so the lookup runs and Slack's own `missing_scope` answers. Granting
+`users:read` is what would let a run name people by handle; without it, name
+them by user id, and list ids rather than usernames in the allow list, since a
+username entry can then never match. A name two people answer to is **refused
+naming both** — the one case where a guess delivers a private message to a
+stranger and nothing can take it back.
+
+**Refusals**, all of them before anything is sent: no allow list, not on the
+allow list, a username without the scope, a username matching none or several,
+an encrypted matrix DM room (the message would arrive unreadable), and the
+existing 503 when no host side is attached. Transport errors keep their own
+names — `cannot_dm_bot`, `user_not_found`, `im_disabled`. An **empty** list is
+refused before any call; a non-empty one has to resolve the recipient first,
+since comparing against it needs the id, but the mutating `conversations.open`
+is not reached for somebody no exemption could rescue.
+
+The Slack app needs **`im:write`** for any of this to work, and `users:read`
+only to name people by handle; both are in the setup scope list in
+docs/LMER-CLI.md and both need a re-install to take effect.
+
+**A timed-out `dm` is indeterminate, not failed.** Its request is already
+claimed, so the host may finish after the CLI stops waiting; the message says so
+and says not to retry, because a second attempt sends a second copy. Unlike
+`thread open` there is no way to look and find out — ask the operator.
+
 ### Who actually does it
 
 The container holds no Slack or matrix credential and neither does the
@@ -1413,10 +1499,14 @@ holds nothing between requests.
 
 The same queue carries the three verbs for a run's **own** threads —
 `lmer-signal thread open | connect | disconnect`, §9 — for the same reason: the
-credentials are on the host, and so are the connections. `open` is the one op
-that names a `channel` instead of a `permalink`. A servicer whose host side
-keeps no connections (the shell `lmer` process, whose threads are launch
+credentials are on the host, and so are the connections. `open` is the one of
+those that names a `channel` instead of a `permalink`. A servicer whose host
+side keeps no connections (the shell `lmer` process, whose threads are launch
 arguments) refuses those three by name and serves `read` and `post` as before.
+
+`dm` is a sixth op and names neither: a `recipient` addresses it. A
+connectionless host side **serves** it rather than refusing it — it simply sees
+no established conversations, so the recipient's transport list is the only door.
 
 The queue is **not** the message bus: a request to go and read somebody else's
 thread is not part of this session's conversation, so it is neither journaled
@@ -1424,7 +1514,7 @@ nor replayed. What the run *says* still is.
 
 | route | caller | what |
 |---|---|---|
-| `POST /thread/requests {op, permalink, channel?, limit?, text?, attachments?}` | session or control | queue one request; **503** when no servicer has polled in the last 90 s |
+| `POST /thread/requests {op, permalink, channel?, recipient?, limit?, text?, attachments?}` | session or control | queue one request; **503** when no servicer has polled in the last 90 s |
 | `GET /thread/requests/{id}?timeout=<0..30>` | session or control | the request, long-polling for its result; a collected result is dropped, and a **410** says so |
 | `GET /thread/requests?since=&timeout=<0..30>` | **control only** | the servicer's poll — a request handed out here is *claimed* and never offered again, because a post delivered twice is two messages in a stranger's thread and nothing downstream could tell them apart |
 | `POST /thread/requests/{id}/result {result}` | **control only** | the answer, handed back to the asker unread |

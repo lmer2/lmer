@@ -26,6 +26,7 @@ import logging
 import os
 import sys
 
+from lmer_cli import dm_access
 from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.tls import ensure_ca_bundle
 
@@ -96,10 +97,9 @@ def _csv_env_set(name: str, default: str = "") -> set[str]:
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 
-# Slack user IDs allowed to hold conversational DM sessions. When empty (the
-# default) DMs are open to everyone; when set, a DM from anyone not on the
-# list is silently ignored. Repopulated from env in main() after .env load.
-DM_ALLOWED_USERS: set[str] = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
+# Slack users allowed to hold conversational DM sessions. Repopulated from env
+# in main() after .env load.
+DM_ALLOWED_USERS: set[str] = _csv_env_set(dm_access.SLACK_ALLOW_LIST_ENV)
 
 # Operator-defined startup presets a user can select with the ``$preset:<name>``
 # token (see :mod:`lmer_cli.presets`). Empty when LMER_PRESETS_FILE is
@@ -371,15 +371,29 @@ async def _connect_lmer_session(
 
 
 def _dm_user_allowed(user_id: str | None) -> bool:
-    """Whether *user_id* may hold a conversational DM session.
+    """Whether *user_id* may hold a conversational DM session."""
+    return bool(user_id) and dm_access.permits(user_id, entries=DM_ALLOWED_USERS)
 
-    Returns True when the allowlist (``LMER_SLACK_DM_ALLOWED_USERS``) is empty -
-    i.e. unset, so DMs are open to everyone - or when the user is on it. A
-    missing ``user_id`` is never allowed once a list is configured.
-    """
-    if not DM_ALLOWED_USERS:
+
+async def _dm_user_allowed_with_handle(user_id: str | None) -> bool:
+    if _dm_user_allowed(user_id):
         return True
-    return user_id in DM_ALLOWED_USERS
+    if not user_id or not DM_ALLOWED_USERS:
+        return False
+    try:
+        reply = await app.client.users_info(user=user_id)
+    except Exception as exc:
+        logger.warning("dm_handle_lookup_failed user_id=%s error=%s", user_id, exc)
+        return False
+    try:
+        ok = reply.get("ok")
+        member = reply.get("user")
+    except (AttributeError, ValueError):
+        return False
+    if not ok or not isinstance(member, dict) or member.get("id") != user_id:
+        return False
+    handle = member.get("name")
+    return dm_access.permits(user_id, spellings=(handle,), entries=DM_ALLOWED_USERS)
 
 
 async def handle_mention(event, say):
@@ -412,8 +426,11 @@ async def handle_mention(event, say):
 
     # A mention inside a DM is a conversational DM, so it is subject to the DM
     # allowlist. Channel mentions are never gated - the allowlist is DM-scoped.
-    if is_dm and not _dm_user_allowed(user_id):
-        logger.info("dm_mention_not_allowlisted user_id=%s channel=%s", user_id, channel)
+    if is_dm and not await _dm_user_allowed_with_handle(user_id):
+        logger.info(
+            "dm_mention_refused user_id=%s channel=%s allow_list=%s",
+            user_id, channel, dm_access.SLACK_ALLOW_LIST_ENV,
+        )
         return
 
     logger.info(
@@ -466,11 +483,11 @@ async def handle_message_event(event, say):
 
     user_id = event.get("user")
 
-    # DM allowlist: when LMER_SLACK_DM_ALLOWED_USERS is set, only listed users
-    # may hold conversational DM sessions. Anyone else is silently ignored (no
-    # session, no reply). Unset = open to everyone.
-    if not _dm_user_allowed(user_id):
-        logger.info("dm_not_allowlisted user_id=%s channel=%s", user_id, channel)
+    if not await _dm_user_allowed_with_handle(user_id):
+        logger.info(
+            "dm_refused user_id=%s channel=%s allow_list=%s",
+            user_id, channel, dm_access.SLACK_ALLOW_LIST_ENV,
+        )
         return
 
     logger.info("received_dm_message user_id=%s thread_ts=%s", user_id, thread_ts)
@@ -574,7 +591,7 @@ def main(argv=None) -> int:
 
     global session_manager, DM_ALLOWED_USERS, PRESETS
     session_manager = SessionManager(lmer_env_file=args.lmer_env_file)
-    DM_ALLOWED_USERS = _csv_env_set("LMER_SLACK_DM_ALLOWED_USERS")
+    DM_ALLOWED_USERS = _csv_env_set(dm_access.SLACK_ALLOW_LIST_ENV)
     PRESETS = load_presets()
 
     if not os.environ.get("SLACK_BOT_TOKEN"):

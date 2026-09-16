@@ -38,6 +38,7 @@ from ask_channel import bus
 from matrix_chat.permalink import matrix_to_link
 from slack_chat.permalink import slack_thread_link
 
+from . import dm_access
 from .thread_posts import Poster
 from .threads import (
     CHANNEL_MATRIX, CHANNEL_SLACK, ChannelRef, ThreadError, ThreadRef,
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "UploadStore", "ThreadServicer", "resolve_thread", "read_thread",
-    "post_thread", "open_thread", "render_record", "stage_upload",
+    "post_thread", "open_thread", "send_dm", "render_record", "stage_upload",
     "read_from_store", "stored_name_of",
     "slack_token", "matrix_account", "DAEMON_ENVIRONMENT", "CLI_ENVIRONMENT",
 ]
@@ -73,6 +74,10 @@ MAX_FILE_BYTES = 25 * 1024 * 1024
 #: The supervisor caps a long-poll at 30 s; the connectors use the same figure.
 POLL_SECONDS = 25.0
 
+#: The scope a username lookup needs. Named in the refusal so an operator can
+#: see what would be required, without being told to grant it.
+SLACK_USERS_READ = "users:read"
+
 BACKOFF_MAX = 30.0
 
 #: Slack error codes that mean the bot cannot see the conversation, and what to
@@ -94,6 +99,12 @@ _SLACK_HINTS = {
     "missing_scope": "the host's bot token lacks a scope this needs",
     "thread_not_found": "that thread no longer exists",
     "is_archived": "that channel is archived",
+    # Direct messages (#441): both mean "this person cannot be reached this
+    # way", which is an operator's problem rather than a transient one.
+    "cannot_dm_bot": "that user is another app, and Slack does not deliver direct messages to apps",
+    "user_not_found": "no user in this workspace has that id",
+    "user_disabled": "that account is deactivated",
+    "im_disabled": "direct messages are disabled in this workspace",
 }
 
 #: Of those, the answers that make a **connect** refuse (issue #429 round 3):
@@ -933,6 +944,189 @@ def open_thread(
     )
 
 
+def send_dm(
+    recipient: object,
+    text: str,
+    *,
+    env: Optional[dict] = None,
+    where: str = DAEMON_ENVIRONMENT,
+    client=None,
+    poster: Optional[Poster] = None,
+    established=(),
+) -> dict:
+    """Send *text* privately to *recipient*, and name the conversation (#441).
+
+    Refusals come as early as each can be known: an **empty** list with nothing
+    established can never be talked round, so it costs no transport call, while
+    a non-empty one has to resolve the recipient first because comparing against
+    it needs the id.
+
+    *established* are conversations somebody other than the run connected — see
+    :meth:`lmer_platform.session_threads.SessionThreads.conversation_ids`, which
+    is where that filter and its reason live. Empty when the host side keeps no
+    connections, and then the list is the only door.
+    """
+    body = (text or "").strip()
+    if not body:
+        raise ThreadError("a direct message needs text", status=400)
+    who = dm_access.checked_recipient(recipient)
+    if not established and not dm_access.allowed_recipients(who, env):
+        # Knowable without asking anyone, and the case where asking would open
+        # an IM with somebody the operator forbade and let a run that may
+        # message nobody enumerate the directory (MR !315, review round 1).
+        dm_access.check_recipient(who, env=env)
+    if dm_access.recipient_channel(who) == CHANNEL_MATRIX:
+        return _dm_matrix(
+            who, body, env=env, where=where, client=client, poster=poster,
+            established=established,
+        )
+    return _dm_slack(
+        who, body, env=env, where=where, client=client, poster=poster,
+        established=established,
+    )
+
+
+def _dm_slack(
+    recipient: str, text: str, *, env, where, client, poster, established,
+) -> dict:
+    client = client or _slack_client(slack_token(env, where=where))
+    try:
+        workspace = client.workspace()
+    except Exception as exc:
+        raise _slack_failure(exc, recipient) from None
+    user_id, spellings = _resolve_slack_user(client, recipient, workspace.get("scopes"))
+    # Only what Slack confirmed about this account — its id and the handle it
+    # holds — never the spelling the run typed, which may be a display name the
+    # recipient chose for themselves and which any member could set to match an
+    # entry naming somebody else.
+    allowed = dm_access.permits(user_id, spellings=spellings, env=env)
+    if not allowed and not established:
+        # `conversations.open` mutates, so it is not reached for a person no
+        # exemption could rescue.
+        dm_access.check_recipient(user_id, spellings=spellings, env=env, shown=recipient)
+    conversation = _dm_conversation_id(client, user_id, recipient)
+    if not allowed and conversation not in established:
+        dm_access.check_recipient(user_id, spellings=spellings, env=env, shown=recipient)
+    body, clipped = _clip(text)
+    try:
+        posted = client.post_root(conversation, body)
+    except Exception as exc:
+        raise _slack_failure(exc, recipient) from None
+    if poster is not None:
+        thread_posts.record(posted["channel"], posted["ts"], poster)
+    return {
+        "conversation": {
+            "channel": CHANNEL_SLACK,
+            "recipient": recipient,
+            "id": posted["channel"],
+            "permalink": slack_thread_link(workspace["host"], posted["channel"], posted["ts"]),
+        },
+        "posted": {
+            "ref": f"{posted['channel']}:{posted['ts']}:{posted['ts']}",
+            "at": _iso_from_slack_ts(posted["ts"]),
+            "clipped": clipped,
+        },
+    }
+
+
+def _dm_conversation_id(client, user_id: str, recipient: str) -> str:
+    try:
+        return client.open_dm(user_id)
+    except Exception as exc:
+        raise _slack_failure(exc, recipient) from None
+
+
+def _resolve_slack_user(client, recipient: str, scopes) -> tuple:
+    """``(user id, other spellings)`` for *recipient*, or a refusal.
+
+    A Slack id needs nothing and is used as given. A username needs
+    ``users:read``, so the scopes the ``auth.test`` already reported decide
+    whether to look at all: known and missing means refuse here, before a call
+    that would fail anyway. Scopes that could not be read are *not knowing*
+    rather than evidence — the same reading `_refuse_unverifiable_membership`
+    takes — so the lookup is attempted and Slack's own ``missing_scope`` answers
+    it.
+    """
+    if dm_access.slack_user_id(recipient):
+        return recipient, ()
+    if scopes is not None and SLACK_USERS_READ not in scopes:
+        raise ThreadError(_no_username_lookup(recipient), status=403)
+    try:
+        found = client.find_user(recipient)
+    except Exception as exc:
+        if getattr(exc, "code", None) == "missing_scope":
+            raise ThreadError(_no_username_lookup(recipient), status=403) from None
+        raise _slack_failure(exc, recipient) from None
+    if not found:
+        raise ThreadError(
+            f"no Slack user is called {recipient} — name them by user id (U…) or "
+            "check the spelling",
+            status=404,
+        )
+    if len(found) > 1:
+        named = ", ".join(f"{item['name']} ({item['id']})" for item in found[:5])
+        raise ThreadError(
+            f"{recipient} names {len(found)} people in this workspace ({named}) — "
+            "say which by user id, because the wrong one cannot be unsent",
+            status=409,
+        )
+    return found[0]["id"], (found[0].get("name") or "",)
+
+
+def _no_username_lookup(recipient: str) -> str:
+    return (
+        f"this host's Slack app cannot look up the username {recipient}: that "
+        f"needs the {SLACK_USERS_READ} scope, which it does not carry. Name the "
+        "person by user id (U…) instead"
+    )
+
+
+def _dm_matrix(
+    recipient: str, text: str, *, env, where, client, poster, established,
+) -> dict:
+    client = client or _matrix_client(matrix_account(env, where=where))
+    try:
+        room = client.direct_room(recipient)
+    except Exception as exc:
+        raise _matrix_failure(exc, recipient) from None
+    if room is None or room not in established:
+        dm_access.check_recipient(recipient, env=env)
+    if room is None:
+        try:
+            room = client.create_direct_room(recipient)
+        except Exception as exc:
+            raise _matrix_failure(exc, recipient) from None
+    # Before the send and not after: an encrypted room takes the message and
+    # renders it unreadable to everyone, which looks like delivery and is not.
+    try:
+        encrypted = client.room_is_encrypted(room)
+    except Exception as exc:
+        raise _matrix_failure(exc, recipient) from None
+    if encrypted:
+        raise ThreadError(
+            f"the direct room with {recipient} ({room}) is encrypted, and this "
+            "host's bot account holds no keys for it — the message would arrive "
+            "unreadable. Nothing was sent",
+            status=409,
+        )
+    body, clipped = _clip(text)
+    try:
+        event = client.send_message(room, {"msgtype": "m.text", "body": body})
+    except Exception as exc:
+        raise _matrix_failure(exc, recipient) from None
+    if poster is not None:
+        thread_posts.record(room, event, poster)
+    return {
+        "conversation": {
+            "channel": CHANNEL_MATRIX,
+            "recipient": recipient,
+            "id": room,
+            "permalink": matrix_to_link(room, event),
+        },
+        "posted": {"ref": f"{room}:{event}", "at": None, "clipped": clipped},
+    }
+
+
 def _open_slack(
     ref: ChannelRef, client, text: str, *, poster: Optional[Poster] = None,
 ) -> dict:
@@ -1189,6 +1383,12 @@ class ThreadServicer(threading.Thread):
                 permalink, env=self.env, limit=request.get("limit") or _requests.DEFAULT_READ_LIMIT,
                 store=self.store, where=self.where,
             )
+        elif op == _requests.OP_DM:
+            payload = send_dm(
+                request.get("recipient"), request.get("text") or "",
+                env=self.env, where=self.where, poster=self.poster(),
+                established=self.established_conversations(),
+            )
         elif op == _requests.OP_POST:
             payload = post_thread(
                 permalink, request.get("text") or "", label=self.resolved_label(),
@@ -1220,6 +1420,25 @@ class ThreadServicer(threading.Thread):
         if op == _requests.OP_CONNECT:
             return self.connections.connect(request.get("permalink"))
         return self.connections.disconnect(request.get("permalink"))
+
+    def established_conversations(self) -> tuple:
+        """Conversation ids this session is already connected to (#441).
+
+        The exemption's evidence: a DM the human opened with this run is an
+        ordinary connected thread, and a run answering in it needs no entry on
+        the operator's list, because the human chose that channel. A host side
+        that keeps no connections — the shell `lmer` process, whose threads are
+        launch arguments — knows of none, and the allow list is then the only
+        door rather than a check that silently passed.
+        """
+        if self.connections is None:
+            return ()
+        try:
+            records = self.connections.conversation_ids()
+        except Exception as exc:  # a refusal here must not cost the refusal below
+            logger.debug("dm_established_unknown error=%s", exc)
+            return ()
+        return tuple(records)
 
     def resolved_label(self) -> str:
         """How the thread is told who wrote this. Called per post, because a run

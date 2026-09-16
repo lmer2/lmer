@@ -9,6 +9,7 @@ follow-up this module's docstring in :mod:`matrix_chat` names.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -16,6 +17,8 @@ from typing import Optional
 from urllib.parse import quote
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["MatrixError", "MatrixAccount", "MatrixClient", "DEFAULT_SYNC_TIMEOUT_MS"]
 
@@ -125,6 +128,103 @@ class MatrixClient:
                 return False
             raise
         return True
+
+    def direct_room(self, user_id: str) -> Optional[str]:
+        """The room this account already uses to talk to *user_id*, or ``None``.
+
+        Read from ``m.direct`` in the account's own data, which is where every
+        matrix client records its DMs — so a message sent here lands in the
+        conversation the person already has open rather than in a second room
+        beside it. A room named there that this account has since left does not
+        count: the id would still be a valid address and nothing would arrive.
+        """
+        try:
+            body = self._call(
+                "GET", f"/_matrix/client/v3/user/{_q(self.account.user_id)}/account_data/m.direct")
+        except MatrixError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        rooms = body.get(user_id)
+        if not isinstance(rooms, list):
+            return None
+        joined = set(self.joined_rooms())
+        for room in rooms:
+            if not isinstance(room, str) or room not in joined:
+                continue
+            # That this account is in the room says nothing about whether the
+            # recipient still is: a direct room may carry other members, and the
+            # m.direct entry outlives the person leaving. Sending anyway would
+            # deliver to whoever remains and report it as delivery to them
+            # (MR !315, review round 1).
+            if self.membership(room, user_id) in ("join", "invite"):
+                return room
+        return None
+
+    def membership(self, room_id: str, user_id: str) -> Optional[str]:
+        """*user_id*'s membership in *room_id* — ``join``, ``invite``, ``leave``
+        — or ``None`` when this account cannot read that state."""
+        try:
+            body = self._call(
+                "GET",
+                f"/_matrix/client/v3/rooms/{_q(room_id)}/state/m.room.member/{_q(user_id)}")
+        except MatrixError as exc:
+            if exc.status in (403, 404):
+                return None
+            raise
+        membership = body.get("membership")
+        return membership if isinstance(membership, str) else None
+
+    def create_direct_room(self, user_id: str) -> str:
+        """A fresh DM room with *user_id*, invited and flagged ``is_direct``.
+
+        ``trusted_private_chat`` is the preset matrix clients use for a DM, and
+        the flag is what makes the other side file it as one rather than as a
+        room invitation. The invite is not waited on — a message can be sent to
+        a room the person has not accepted yet, and it appears when they do.
+        """
+        body = self._call("POST", "/_matrix/client/v3/createRoom", json_body={
+            "preset": "trusted_private_chat",
+            "is_direct": True,
+            "invite": [user_id],
+        })
+        room_id = body.get("room_id")
+        if not isinstance(room_id, str) or not room_id:
+            raise MatrixError("createRoom returned no room id")
+        self._record_direct(user_id, room_id)
+        return room_id
+
+    def _record_direct(self, user_id: str, room_id: str) -> None:
+        """File *room_id* under *user_id* in this account's own ``m.direct``.
+
+        The spec puts this on the inviting client rather than the homeserver,
+        which is why a DM a person opens with the bot is findable and one the
+        bot opens is not. Without it :meth:`direct_room` never sees the room
+        again and every send makes another one, each a fresh invite the
+        recipient has to accept (MR !315, review round 1).
+
+        A failure here costs reuse, not the message: the room exists and the
+        caller is about to write to it, so this is logged rather than raised.
+        """
+        path = f"/_matrix/client/v3/user/{_q(self.account.user_id)}/account_data/m.direct"
+        try:
+            current = self._call("GET", path)
+        except MatrixError as exc:
+            if exc.status != 404:
+                logger.warning("matrix_direct_read_failed error=%s", exc)
+                return
+            current = {}
+        if not isinstance(current, dict):
+            current = {}
+        rooms = current.get(user_id)
+        rooms = [room for room in rooms if isinstance(room, str)] if isinstance(rooms, list) else []
+        if room_id in rooms:
+            return
+        current[user_id] = rooms + [room_id]
+        try:
+            self._call("PUT", path, json_body=current)
+        except MatrixError as exc:
+            logger.warning("matrix_direct_write_failed room=%s error=%s", room_id, exc)
 
     def display_name(self, user_id: str) -> str:
         try:

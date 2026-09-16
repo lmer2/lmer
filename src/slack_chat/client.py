@@ -212,6 +212,50 @@ class SlackClient:
             )
         return {"channel": resolved, "ts": ts}
 
+    def open_dm(self, user_id: str) -> str:
+        """The id of the 1:1 conversation with *user_id*, opening it if needed.
+
+        ``conversations.open`` is idempotent: asked twice for the same person it
+        returns the same channel, so a DM never stacks up conversations. Needs
+        ``im:write``; Slack answers ``cannot_dm_bot`` for another app and
+        ``user_not_found`` for an id nobody holds, and both are passed through
+        by code (issue #441).
+        """
+        data = self._request("POST", "conversations.open", json={"users": user_id})
+        channel = (data.get("channel") or {}).get("id")
+        if not isinstance(channel, str) or not channel:
+            raise SlackError("Slack conversations.open response carries no channel id")
+        return channel
+
+    def find_user(self, name: str) -> list:
+        """Every user whose handle or display name is *name*, case-insensitively.
+
+        A list rather than one user because the caller has to be able to tell
+        "nobody" from "two people" — a DM sent to the wrong one of two matches is
+        not recoverable. Needs ``users:read``; Slack answers ``missing_scope``
+        without it, which the caller translates rather than swallows.
+        """
+        wanted = name.lstrip("@").casefold()
+        found, cursor = [], None
+        while True:
+            params = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._request("GET", "users.list", params=params)
+            for member in data.get("members") or []:
+                if member.get("deleted"):
+                    continue
+                profile = member.get("profile") or {}
+                names = {
+                    str(member.get("name") or "").casefold(),
+                    str(profile.get("display_name") or "").casefold(),
+                }
+                if wanted in names - {""}:
+                    found.append({"id": member.get("id"), "name": member.get("name")})
+            cursor = ((data.get("response_metadata") or {}).get("next_cursor") or "").strip()
+            if not cursor:
+                return found
+
     def workspace(self) -> Dict[str, Any]:
         """``{"host": …, "scopes": [...]}`` — the workspace, and what this token may do.
 

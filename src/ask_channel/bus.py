@@ -313,12 +313,12 @@ class BusClient:
 
     def thread_request(
         self, op: str, permalink: str = "", *, channel: str = "",
-        limit: Optional[int] = None, text: str = "",
+        recipient: str = "", limit: Optional[int] = None, text: str = "",
         attachments: Iterable[Mapping] = (),
     ) -> dict:
         """``POST /thread/requests``: queue one piece of thread work for the host."""
         body: dict = {"op": op, "permalink": permalink, "channel": channel,
-                      "text": text,
+                      "recipient": recipient, "text": text,
                       "attachments": [dict(item) for item in attachments]}
         if limit is not None:
             body["limit"] = int(limit)
