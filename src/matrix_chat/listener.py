@@ -227,7 +227,7 @@ def main(argv=None) -> int:
             file=sys.stderr,
         )
         return 1
-    listener = Listener(config, SessionManager(lmer_env_file=args.lmer_env_file))
+    listener = Listener(config, SessionManager(lmer_env_file=args.lmer_env_file, transport="matrix"))
     try:
         asyncio.run(listener.run())
     except MatrixError as exc:

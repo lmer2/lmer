@@ -198,15 +198,14 @@ def render_outbound(
     record: dict, questions: Optional[dict] = None, *, own_channel: str = CHANNEL,
 ) -> Optional[str]:
     """The thread text for one bus record, or ``None`` when the record came from
-    the thread this render is for (§6 rule 2: nothing goes back where it came
-    from).
+    the thread this render is for, or is a quiet progress note.
 
     *questions* maps question id → record, for the answer lines. *own_channel*
     is whose thread is being rendered: the matrix connector renders with the
     same code and must skip matrix's records, not Slack's.
     """
     source = record.get("source") or {}
-    if source.get("channel") == own_channel:
+    if source.get("channel") == own_channel or record.get("kind") == "note":
         return None
     kind = record.get("kind")
     text = str(record.get("text") or "")
@@ -234,8 +233,6 @@ def render_outbound(
         body = "⏹ the session stopped waiting for an answer" + (f" — {text}" if text else "")
     elif kind == "milestone":
         body = f"🏁 {text}"
-    elif kind == "note":
-        body = f"📝 {text}"
     elif kind == "command":
         body = f"⌨️ [{_who(source)}] {text}"
     elif kind == "message":
@@ -558,6 +555,7 @@ class SlackConnector(ConnectorLifecycle):
                 if bound is not None:
                     kind, in_reply_to, text = "answer", oldest.get("id"), bound
             return {"question": oldest.get("id") if oldest else None,
+                    "human_receipt": poster is None and self._is_human(message),
                     "request": {"kind": kind, "text": text, "source": source, "in_reply_to": in_reply_to,
                                 "attachments": [{k: v for k, v in item.items() if k != "reference"} for item in attachments]}}
         return self._post_prepared(ts, prepare, lambda: self._accept_inbound(ts)) or {}
@@ -634,6 +632,9 @@ class SlackConnector(ConnectorLifecycle):
             self._deliver_part(record, "text", {"text": text},
                                lambda: self.slack.post_message(self.config.channel, self.config.thread_ts, text),
                                self._mirrored)
+
+    def _send_receipt(self, ref, transaction):
+        self.slack.add_reaction(self.config.channel, ref, "inbox_tray")
 
     def _inbound_once(self):
         self._poll_thread(replay=not self._replayed)

@@ -271,6 +271,17 @@ class MatrixClient:
 
     # -- writing ---------------------------------------------------------------
 
+    def send_reaction(self, room_id: str, event_id: str, key: str, *, transaction: str) -> str:
+        """Annotate a message using a stable transaction ID for retries."""
+        body = self._call(
+            "PUT", f"/_matrix/client/v3/rooms/{_q(room_id)}/send/m.reaction/{_q(transaction)}",
+            json_body={"m.relates_to": {"rel_type": "m.annotation", "event_id": event_id, "key": key}},
+        )
+        reaction = body.get("event_id")
+        if not isinstance(reaction, str):
+            raise MatrixError("reaction returned no event_id")
+        return reaction
+
     def send_message(self, room_id: str, content: dict) -> str:
         txn = f"lmer-{uuid.uuid4().hex}"
         body = self._call(

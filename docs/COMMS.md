@@ -3,8 +3,8 @@
 One channel, in both directions, with the supervisor as the single port.
 
 An agent in an lmer session has one command to talk to the world,
-`lmer-signal`, and does not know or care who is listening. Everything it says
-reaches every connected party — the platform's chat pane, uber lmer, a Slack
+`lmer-signal`, and does not know or care who is listening. Conversational messages
+reach every connected party — the platform's chat pane, uber lmer, a Slack
 thread, a matrix thread, a human at the terminal — and everything any of them
 says arrives in the harness as an ordinary message tagged with where it came
 from. The supervisor inside the container (`lmer-supervisor`) keeps the one
@@ -12,6 +12,52 @@ record of that conversation and serves it over its control plane. Nothing
 outside the container talks to the supervisor except the process that holds
 the session's control-plane token; no Slack, matrix or platform credential
 ever enters the container.
+
+Progress `note` records stay on the session bus and reach the platform and
+orchestrator; Slack and Matrix connectors consume them without posting them
+into threads. Use `post` for human-facing updates, decisions, and results.
+
+Standalone and platform-attached connectors have no thread-silence timeout.
+Listener-owned sessions retain their configured inactivity timeout (300
+minutes by default). A new agent bus record, including a quiet note, or a
+new live inbound record refreshes activity through the connector's host-side
+lease. The listener accepts that timestamp only from its own child process
+identity. Replayed records, empty polls, and connector restarts alone do not
+refresh it. A genuinely idle listener-owned session still expires.
+
+A live human message accepted by the bus gets a **📥 receipt reaction** after
+about 20 seconds if the agent has not posted a conversational response first.
+The connector owns this timer, so a long model turn or tool call does not
+delay it. An agent `message`, `question`, or `milestone` after the input
+cancels pending receipts for preceding messages. Quiet notes, other people's
+messages, and posts addressed to another thread do not cancel them. This
+rule uses bus order, without guessing which words answer which question.
+For assistant sessions, the bus's authenticated `session_origin` marker
+distinguishes the session's own output from external supervisor steering.
+The reaction confirms session acceptance, **not model consumption**.
+
+Receipts attach to each human message, never add a thread bubble, and do not
+apply to history replay or cross-session bot traffic. Pending deadlines
+survive connector reloads. Reactions already emitted remain as receipts.
+Slack uses [`reactions.add`](https://docs.slack.dev/reference/methods/reactions.add/)
+with `inbox_tray`; the app needs `reactions:write` and must be reinstalled
+after that scope is added. Matrix sends an
+[`m.reaction`](https://spec.matrix.org/v1.15/client-server-api/#mreaction)
+with an `m.annotation` relation and a stable transaction ID. A reaction
+failure is logged by the connector and does not block conversation delivery
+or fall back to a message bubble.
+
+Slack receipts run in a short-lived process with a five-second deadline.
+On expiry the connector kills and reaps that process, so stalled DNS,
+TLS, response bodies, or interpreter cleanup cannot hold up its 45-second
+drain. Credentials travel over stdin, and the child inherits no connector
+lease descriptors. The request uses Requests' normal certificate verification:
+`REQUESTS_CA_BUNDLE` (or fallback `CURL_CA_BUNDLE`) accepts a CA file or an
+OpenSSL-hashed CA directory. Rate limits fail immediately without retrying
+or waiting for `Retry-After`. The receipt worker rechecks replies
+between sends; a slow reaction cannot hide a reply to a later message.
+An explicitly addressed post to the same canonical thread also cancels its
+pending receipts.
 
 This page is the contract connectors and tools ship against. The record shape
 and the routes are versioned by `schema` (currently **1**), which moves only
@@ -65,7 +111,7 @@ line in the log and the same object on the wire.
 | kind | who posts it | typed into the harness? | meaning |
 |---|---|---|---|
 | `message` | any channel; the agent via `lmer-signal post` | inbound yes, agent-origin no | conversational text |
-| `note` | agent or supervisor | no | progress or lifecycle status, no reply wanted |
+| `note` | agent or supervisor | no | progress or lifecycle status, retained on bus/platform; omitted from Slack/Matrix threads |
 | `milestone` | agent | no | reportable work happened (what a bare `lmer-signal "…"` means) |
 | `question` | agent | no | blocks the asker until an `answer`; carries `options` |
 | `answer` | any channel | to the waiting CLI if one is attached, else into the PTY | reply to a `question` |
@@ -623,7 +669,7 @@ back by a human is just text.
 ```
 lmer-signal "<what happened>"                       milestone (the historical spelling)
 lmer-signal milestone "<text>"                      the same, explicit
-lmer-signal note "<text>"                           progress, no reply wanted
+lmer-signal note "<text>"                           quiet bus/platform progress
 lmer-signal post "<text>"                           a message to the humans
 lmer-signal thread open <channel> ["<text>"]        open a thread there and connect to it
 lmer-signal thread connect <permalink>              connect to a thread that exists
@@ -767,11 +813,11 @@ loopback), the supervisor token, the thread, and the channel's credentials.
 Both the CLI and platform supervise connector children. Ownership, durable
 receipts, module reload and explicit per-operation recovery are described in
 [CONNECTOR-RECOVERY.md](CONNECTOR-RECOVERY.md). A failed or uncertain remote send
-is never blindly replayed. The connector does two things until stopped:
+is never blindly replayed. The connector runs until stopped:
 
-- **outbound**: long-polls the supervisor's `GET /messages`, posts every record
-  not from its own channel into the thread (a question with numbered options,
-  an answer from another channel with who gave it, notes and milestones with a
+- **outbound**: long-polls the supervisor's `GET /messages`, omits quiet notes
+  and records from its own channel, and posts the rest (a question with numbered options,
+  an answer from another channel with who gave it, milestones with a
   glyph, other channels' messages tagged `[uber lmer] …`), and acks its
   position under a per-thread subscriber name (`slack:<hash>` / `matrix:<hash>`);
 - **inbound**: Slack polls `conversations.replies` every

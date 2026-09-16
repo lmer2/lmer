@@ -1201,7 +1201,7 @@ def test_chat_launch_starts_connector_with_digest_only_container(
         servers.append(supervisor._start_fastapi_server(app, "127.0.0.1", int(captured["LMER_FASTAPI_PORT"])))
         client = BusClient(Endpoint(f"http://127.0.0.1:{captured['LMER_FASTAPI_PORT']}", "agent-fixture"))
         assert client.wait_ready(budget=5, interval=.01)
-        outgoing = client.post("note", "outbound seam")["message"]
+        outgoing = client.post("message", "outbound seam")["message"]
         assert outgoing["source"]["channel"] == ("uber-lmer" if session_kind == "assistant" else "agent")
         wait_for(lambda: any("outbound seam" in item["text"] for item in harness.events()), harness)
         wait_for(lambda: any(item.text.startswith("[replay notice]") for item in log.read_since(0)[0]), harness)

@@ -120,8 +120,8 @@ class TestRules:
         assert listener.is_mention({"content": content}, BOT) is expected
 
     def test_slack_style_rendering_is_reused_and_scrubbed(self):
-        text = connector.render_outbound({"kind": "note", "text": "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789", "source": {"channel": "agent"}, "meta": {}})
-        assert text.startswith("📝 ") and "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in text
+        text = connector.render_outbound({"kind": "message", "text": "token=ghp_abcdefghijklmnopqrstuvwxyz0123456789", "source": {"channel": "agent"}, "meta": {}})
+        assert text and "ghp_abcdefghijklmnopqrstuvwxyz0123456789" not in text
         assert connector.render_outbound({"kind": "message", "text": "x", "source": {"channel": "matrix"}, "meta": {}}) is None
 
 
@@ -141,11 +141,18 @@ class FakeMatrix:
         self.next_batch = 0
         self.media = {}
         self.counter = 0
+        self.reactions = []
         self.root = {"event_id": ROOT, "sender": "@vegu:example.org", "type": "m.room.message",
                      "content": {"msgtype": "m.text", "body": "@lmer help me"}, "origin_server_ts": 1}
 
     def resolve_room(self, room):
         return ROOM
+
+    def send_reaction(self, room, event, key, *, transaction):
+        reaction = (room, event, key, transaction)
+        if reaction not in self.reactions:
+            self.reactions.append(reaction)
+        return "$reaction"
 
     def join(self, room):
         return ROOM
@@ -370,18 +377,18 @@ class TestConnector:
         rig.connector.start()
         rig.agent("note", "working")
         rig.agent("question", "branch?", options=["main"])
-        rig.wait_until(lambda: len([s for s in rig.matrix.sent if s[3] == "m.text"]) >= 2)
+        rig.wait_until(lambda: len([s for s in rig.matrix.sent if s[3] == "m.text"]) >= 1)
         texts = [s[2] for s in rig.matrix.sent if s[3] == "m.text"]
-        assert texts[0] == "📝 working" and texts[1].startswith("❓ branch?\n1. main")
+        assert texts == ["❓ branch?\n1. main\n_reply in this thread with a number or your own words — the first answer from any channel wins_"]
         assert all(s[:2] == (ROOM, ROOT) for s in rig.matrix.sent)
         rig.wait_until(lambda: rig.log.subscribers().get(rig.connector.subscriber) == rig.log.seq)
 
     def test_matrix_records_are_not_posted_back(self, rig):
         rig.connector.start()
         rig.log.append(kind="message", text="from matrix", source=comms.Source("matrix", author="@a:x", ref="$e"))
-        rig.agent("note", "after")
-        rig.wait_until(lambda: any(s[2] == "📝 after" for s in rig.matrix.sent))
-        assert [s[2] for s in rig.matrix.sent if s[3] == "m.text"] == ["📝 after"]
+        rig.agent("message", "after")
+        rig.wait_until(lambda: any(s[2] == "after" for s in rig.matrix.sent))
+        assert [s[2] for s in rig.matrix.sent if s[3] == "m.text"] == ["after"]
 
     def test_an_inbound_image_lands_in_the_upload_store(self, tmp_path):
         store = tmp_path / "uploads"
@@ -849,8 +856,8 @@ class TestPostsFromOtherRuns:
         rig.wait_until(lambda: any(
             "have a look" in record.text for record in rig.log.read_since(0)[0]
         ))
-        rig.agent("note", "after")
-        rig.wait_until(lambda: any(sent[2] == "\U0001f4dd after" for sent in rig.matrix.sent))
+        rig.agent("message", "after")
+        rig.wait_until(lambda: any(sent[2] == "after" for sent in rig.matrix.sent))
         assert not any("have a look" in sent[2] for sent in rig.matrix.sent)
 
     def test_another_runs_post_can_answer_an_open_question(self, rig):
@@ -885,7 +892,7 @@ class TestPostsFromOtherRuns:
     def test_the_mirror_carries_the_session_stamp_for_live_attribution(self, rig):
         """The criterion's third stamping site — see the Slack twin."""
         rig.connector.replay()
-        record = rig.agent("note", "working on it")
+        record = rig.agent("message", "working on it")
         assert rig.connector._post_outbound(record.to_dict(), {})
         assert thread_posts.poster_from_matrix(
             rig.matrix.stamps[-1]

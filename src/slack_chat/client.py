@@ -1,8 +1,12 @@
 """Slack Web API client for chat operations."""
 
+import json
 import os
+import subprocess
+import sys
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -13,6 +17,8 @@ from lmer_cli import runref
 
 # Maximum number of times to retry after an HTTP 429 response.
 _MAX_RETRIES = 3
+REACTION_BUDGET_SECONDS = 5.0
+_REACTION_WORKER = Path(__file__).with_name("_reaction_request.py")
 # Slack's replies response schema includes messages[].blocks[].block_id;
 # the upstream references for this transport marker are in docs/COMMS.md §9.
 CONNECTION_NOTICE_BLOCK_PREFIX = "lmer-connection-status:"
@@ -144,6 +150,28 @@ class SlackClient:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def add_reaction(self, channel: str, timestamp: str, name: str) -> None:
+        """Best-effort reaction with a killable deadline, including DNS and cleanup."""
+        try:
+            result = subprocess.run(
+                [sys.executable, "-I", str(_REACTION_WORKER)],
+                input=json.dumps({"url": f"{self.BASE_URL}/reactions.add",
+                                  "headers": dict(self.session.headers),
+                                  "payload": {"channel": channel, "timestamp": timestamp, "name": name},
+                                  "timeout": REACTION_BUDGET_SECONDS}),
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                timeout=REACTION_BUDGET_SECONDS, check=True, close_fds=True,
+            )
+            result = json.loads(result.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise SlackError(f"Reaction request failed: {exc.__class__.__name__}") from exc
+        if "failure" in result:
+            raise SlackError(f"Reaction request failed: {result['failure']}")
+        data = result["data"]
+        if not data.get("ok") and data.get("error") != "already_reacted":
+            error = data.get("error", "unknown_error")
+            raise SlackError(f"Slack API error: {error}", code=error)
 
     def post_message(
         self,
