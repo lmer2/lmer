@@ -1,0 +1,3 @@
+added:
+  - "uber lmer can rotate itself with `lmer-ctl rotate`, writing its successor's handover in the same command."
+  - "A context-fullness threshold, off by default, that has the daemon recommend a rotation before uber lmer's window fills."

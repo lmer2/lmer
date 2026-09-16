@@ -1454,6 +1454,73 @@ def test_config_write_clears_a_nudge_knob_back_to_the_default(
     assert threshold["stored"] is None
 
 
+# --- the rotation threshold rides the same routes (issue #446) -----------------
+#
+# A group of one, so what these pin is that it is *its own* group — an operator
+# reading `nudge` must not find a setting about their own context window in it —
+# and that the surface takes the two values the issue's acceptance names: the
+# threshold, and 0 for off.
+
+def test_config_serves_the_rotation_threshold_in_its_own_group(
+    client, platform_root
+):
+    reply = client.get("/api/assistant/config", headers=bearer_header())
+    assert reply.status_code == 200
+    body = reply.json()
+    assert body["rotation"]["context_threshold"] == {
+        "value": cfg.DEFAULT_ROTATION_CONTEXT_THRESHOLD,
+        "source": "default",
+        "stored": None,
+    }
+    assert "context_threshold" not in body["nudge"]
+    assert "context_threshold" not in body["settings"]
+
+
+def test_config_write_persists_the_rotation_threshold(client, platform_root):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"rotation_context_threshold": 70},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["rotation"]["context_threshold"]["value"] == 70
+    assert reply.json()["changed"] == ["rotation_context_threshold"]
+    assert cfg.load().rotation_context_threshold == 70
+
+
+def test_config_write_accepts_zero_to_turn_the_reminder_off(
+    client, platform_root
+):
+    cfg.update_stored({"rotation_context_threshold": 70})
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"rotation_context_threshold": 0},
+    )
+    assert reply.status_code == 200, reply.text
+    assert reply.json()["rotation"]["context_threshold"]["value"] == 0
+
+
+@pytest.mark.parametrize("bad", [-1, 101, "soon", 3.5, True])
+def test_config_write_refuses_an_unusable_rotation_threshold(
+    client, platform_root, bad
+):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(),
+        json={"rotation_context_threshold": bad},
+    )
+    assert reply.status_code == 400, reply.text
+    assert "rotation_context_threshold" in reply.json()["detail"]
+
+
+def test_the_scope_note_says_the_rotation_group_needs_no_rotation(
+    client, platform_root
+):
+    """The group whose name most invites the wrong inference: changing it does
+    not rotate anything, and the next tick is when it starts being read."""
+    reply = client.get("/api/assistant/config", headers=bearer_header())
+    note = reply.json()["note"]
+    assert "rotation groups on its next tick" in note
+
+
 def test_an_unknown_setting_refusal_names_every_accepted_key(
     client, platform_root
 ):

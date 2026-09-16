@@ -60,6 +60,10 @@ tests:
     # an idiom the scanner does not model — found by hand-audit during #353,
     # exactly the case the header above warns this list is a floor for.
     - tests/test_platform_nudge.py
+    # Reads docs/PLATFORM-QUICKSTART.md and docs/LMER-CLI.md through
+    # `Path(__file__).resolve().parents[1]` — the same unmodelled idiom as its
+    # sibling above, listed by hand for the same reason.
+    - tests/test_platform_rotation.py
     # Reads docs/LMER-CLI.md (the LMER_STATUS_DIR bullet) through
     # `Path(__file__).parent.parent`, an idiom the scanner does not model —
     # listed by hand, as the header above says such a test must be.

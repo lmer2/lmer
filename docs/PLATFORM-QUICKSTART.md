@@ -315,6 +315,11 @@ conversation window is lost.
   is quiet, the daemon types one reminder into it. Defaults: one digest, three
   minutes. Full behaviour in the section below.
 
+- **Context-fullness reminders** — when uber lmer's own status line reports that
+  its context window has reached a threshold the operator set, the daemon
+  recommends a rotation at its next breakpoint. Off by default; it never rotates
+  anything itself. Full behaviour in the section below.
+
 ## Digest nudges
 
 The digest spool is pull-only: the daemon detects questions, crashes, finished
@@ -454,6 +459,180 @@ through the API is refused with a 400 naming the field.
 no migration — the three state fields are additive and tolerate absence — and no
 image rebuild or container passthrough, since the daemon reads both settings
 itself. A host that does not want the feature sets the interval to `0`.
+
+## Context-fullness reminders
+
+uber lmer fills its context window over a working day, and it cannot see its own
+fullness as a threshold — the figure exists, but reading it means asking the
+platform about itself on a schedule, which is the polling the whole design keeps
+out of the assistant's turns. So the daemon holds the number.
+
+Set `rotation.context_threshold` (a percentage, `0` is off and is the default)
+and on each detection tick the daemon compares it against what uber lmer's own
+harness publishes on its status line. When the reading reaches the threshold it
+types **one sentence** into that session, over the same input path the digest
+nudge uses — including that path's harness-specific delivery: on a codex
+assistant a reminder the native adapter refuses is not marked as sent, and the
+next tick asks again under the same delivery id, which the adapter replays only
+if it never submitted the first one:
+
+```
+[lmer platform] Your context window is at 71 percent and this host's rotation
+threshold is 70 percent. This is an automatic reminder from the daemon, not the
+operator, and it is not a new task: nothing has been rotated and nothing will be
+without you. Finish what is in front of you, then rotate yourself at the next
+clean breakpoint ...
+```
+
+**Nothing here rotates anything.** The daemon recommends; uber lmer decides, and
+what a good breakpoint is lives in the `orchestrate` taskdef — no open question of
+its own, no digest taken and not yet acted on, no half-finished brief, and never
+mid-decision. A daemon that rotated on a number would end a context window in the
+middle of the operator's sentence.
+
+### When a reminder fires
+
+All six, or nothing is typed:
+
+| condition | why it is there |
+|---|---|
+| the threshold is non-zero | `0` is the off-switch, and the only one |
+| an assistant is running | there is otherwise no session to type into |
+| its harness published a `context.percent` | the reading is the harness's, and not every harness has one |
+| the reading is not older than 10 minutes | a reading is a fact about a moment, and a publisher that has stopped must not keep recommending on an hour-old figure |
+| the reading is **at or above** the threshold | 70 is the number the operator asked to hear about, so reaching it is reaching it |
+| no reminder went to this session in the last 15 minutes | the repeat window |
+
+The reading is `context.percent` from [SESSION-STATUS.md](./SESSION-STATUS.md):
+the percentage of the window **used**, `0`–`100`. Its age is the reading's own
+where the harness dates it and the document's otherwise — a status line that
+re-publishes a figure it can no longer refresh would otherwise look permanently
+fresh.
+
+**The age bound is also why a reminder lands while uber lmer is working.** A
+status line is published when the harness renders one, which does not happen
+while a session sits idle at its prompt — so an assistant that has been idle for
+longer than the bound has no usable reading and is told nothing until it is
+active again, and then within a tick. That is the opposite of the digest nudge,
+which exists to reach an idle session, and it is the right way round for this
+one: what the reminder asks for is a decision at a breakpoint, and a session with
+no turn in progress has no breakpoint to take it at. Where a harness publishes none
+the daemon says so **once per incarnation** — one
+`platform_assistant_rotation_unreadable` log line and one
+`assistant_rotation_unreadable` record in `events.jsonl` — and then stays quiet,
+rather than alerting on a figure it does not have. Codex and pi status-line parity
+is tracked separately.
+
+### Delivery, and why a reminder can be attempted more than once
+
+The line travels the same input path as the digest nudge, which means it inherits
+that path's harness-specific delivery. On a **codex** assistant the native
+adapter is the transport, and three of its properties decide what the daemon may
+record:
+
+- A refusal is not an exception. The adapter answers 200 carrying
+  `state: rejected` or `uncertain` and there is no fallback to terminal
+  submission, so a reminder is only ever marked once the adapter reports the
+  model actually took it.
+- `uncertain` means the submission may have landed. It is never replayed and
+  never recorded as a recommendation — an unknown outcome is not evidence that
+  anyone was told.
+- Receipts are keyed on a delivery id, and **reusing an id with different text is
+  refused outright**. So one reminder attempt is one id and one frozen sentence:
+  a retry after a refusal re-offers byte-identical prose under the same id, and a
+  new crossing or a new repeat window gets an id of its own.
+
+A consequence worth knowing when reading a reminder that arrives late: it reports
+the percentage that *triggered* it, which may be a point or two below the reading
+by the time it lands.
+
+### One reminder per crossing, and the window
+
+The reminder repeats at most every 15 minutes while the reading stays at or above
+the threshold, for the digest nudge's reason: the input path proves the bytes
+reached the control plane and cannot prove the harness registered the Enter that
+submits them, so the remedy for a lost reminder is the repeat rather than a claim
+that it landed.
+
+The 15 minutes is **not** configurable. The group has one knob deliberately: what
+an operator tunes is the percentage they want to hear about, and the interval is a
+property of what the reminder is — a recommendation about a decision taken at a
+breakpoint, not a wake-up about work waiting.
+
+If the reading falls back below the threshold — a compaction, a fresh
+incarnation — the window ends with it, so the *next* crossing is announced
+immediately instead of a quarter of an hour later. The bookkeeping is the daemon's
+own memory, keyed on the session it typed into, so a rotation never inherits a
+window and a successor is never held quiet by a reminder its predecessor received.
+A daemon restart while a reading sits above the threshold costs one extra
+reminder, which is the whole price of not storing it.
+
+### Rotating uber lmer, and who may
+
+uber lmer can rotate **itself**:
+
+```sh
+lmer-ctl rotate --handoff -     # or --handoff-file PATH
+```
+
+That writes the handover through `POST /api/assistant/handoff` and then calls
+`POST /api/assistant/rotate`. The handover goes first on purpose: a rotation the
+daemon declines still leaves the note stored, so the operator's own rotate — or
+the supervisor's respawn after a crash — is as briefed as the planned rotation
+would have been.
+
+**The rotate call does not return.** The daemon ends that container to start the
+successor, so from inside it a dropped connection is what success looks like; the
+CLI reports it as a transport error and claims nothing, because a dropped
+connection is equally consistent with a daemon that died. The receipt is the
+successor: a fresh `generation` on `GET /api/assistant`, with `handoff` the note
+its predecessor wrote and the digest spool preserved for it.
+
+**Who may rotate is unchanged.** This adds a caller to an existing route, not a
+route and not a caller class: uber lmer's minted credential (#244) already opens
+what the operator's shared secret opens, and an unauthenticated rotate is still a
+401. The operator-initiated rotate — the chat drawer's restart, or the route by
+hand — is untouched.
+
+### Configuration
+
+| variable | default | what it sets |
+|---|---|---|
+| `LMER_PLATFORM_ROTATION_CONTEXT_THRESHOLD` | `0` (off) | the percentage of the context window at which a rotation is recommended |
+
+It also lives in `config.json` as `rotation_context_threshold` and on
+`GET`/`POST /api/assistant/config` under `rotation`, beside `checkin` and
+`nudge` — all three are re-read on every tick, so a change applies without a
+daemon restart and without a rotation. Precedence is the platform's usual chain:
+the export beats the file beats the default, and the value reports which layer
+decided it. The settings screen in the chat drawer edits all four numbers.
+
+`0` disables the reminder and is the only off-switch. The ceiling is `100`,
+because the figure it is compared against is itself a percentage clamped to 100 —
+a higher threshold could never be met and would be a second off-switch nobody
+documented. An unusable value costs its own layer with a warning and falls through
+to the next, rather than stopping the daemon over a reminder; an explicit write
+through the API is refused with a 400 naming the field.
+
+**On upgrade**, in this order, because three of the four moving parts live in
+different places:
+
+1. **Build or pull the matching session image.** `lmer-ctl` and the `orchestrate`
+   taskdef are baked into it (the repo is copied in at image build). The source
+   and taskdef mounts that make edits live are *developer mode only*, so on an
+   installed host an assistant from the old image has neither the `rotate` verb
+   nor the breakpoint instructions — however new the daemon is.
+2. **Restart the platform daemon** to run the new tick stage.
+3. **Rebuild the UI bundle** for the settings screen.
+4. **Replace the incumbent assistant.** A new image does not touch a running
+   session, and `ensure_running` deliberately keeps a live one — so rotate or
+   restart it through the usual operator path (the chat drawer's restart, or
+   `POST /api/assistant/rotate`) before relying on the reminder. Until then the
+   daemon can recommend a rotation to a session that cannot perform one.
+
+Then set a threshold: the feature is off until an operator does. There is no
+migration — nothing new is stored — and no container passthrough, since the
+daemon reads the setting itself.
 
 ## uber lmer's memory
 

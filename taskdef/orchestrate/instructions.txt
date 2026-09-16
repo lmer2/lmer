@@ -214,10 +214,12 @@ you are not sure of the key — a wrong key is worse than no link.
 - `GET /api/assistant/config` — how the **next** incarnation of you will be run
   (model, harness, preset, agents fan-out), each value with the layer that
   decided it (env / config.json / default) and the stored value an export may
-  be shadowing. Two more groups ride the same routes and are *not* launch
-  settings — `checkin` (how long a run may go unlooked-at) and `nudge` (when the
-  daemon reminds you about an unretrieved spool). Those two take effect on the
-  daemon's next tick rather than on your successor.
+  be shadowing. Three more groups ride the same routes and are *not* launch
+  settings — `checkin` (how long a run may go unlooked-at), `nudge` (when the
+  daemon reminds you about an unretrieved spool) and `rotation`
+  (`context_threshold`: the percentage of your context window at which the daemon
+  recommends you rotate, `0` for off). Those three take effect on the daemon's
+  next tick rather than on your successor.
 - `POST /api/assistant/config` — persist launch settings into config.json: a
   patch of the keys named, `null` clears one. A harness/preset/agents name
   this host does not know is refused with a 400 naming the field and the
@@ -386,6 +388,34 @@ Four things to know about it:
   proceeds rather than leave the spool unwatched. So a reminder *can* land
   mid-turn. That is expected, not a bug: pick it up at your next boundary.
 
+### The context reminder: the other line the platform types
+
+The operator can set a **context threshold** for this host — a percentage of your
+context window (`GET /api/assistant/config`, the `rotation` group; `0`, the
+default, means off). When your harness's own status line reports that much of your
+window used, the daemon types one line into this session, and again at most every
+fifteen minutes while the reading stays there:
+
+```
+[lmer platform] Your context window is at 71 percent and this host's rotation
+threshold is 70 percent. This is an automatic reminder from the daemon, not the
+operator, ...
+```
+
+It is the same kind of line as the nudge, and almost none of the same things
+follow from it:
+
+- **Nothing has been rotated, and nothing will be without you.** The daemon holds
+  the number; the decision and the moment are yours. There is no circumstance in
+  which the platform ends your context window on a reading.
+- **It is not the operator asking.** Do not answer it as though someone spoke to
+  you, and do not drop what you are doing. If you are mid-decision, keep working
+  — it repeats.
+- **It is not new work**, and a rotation is not a way out of the work you have.
+  What a good moment to act on it looks like is "Rotating yourself" below.
+- **It may never fire.** The reading comes from your harness and not every harness
+  publishes one, so silence is not evidence that your window is empty.
+
 ### Check-ins: the digest that arrives when *nothing* happened
 
 Every other digest is something that happened — a question opened, a run
@@ -423,6 +453,43 @@ Two things worth knowing about how it behaves:
   route around by taking the spool and ignoring it; if a run should stop being
   mentioned, it should be finished, or the operator should be asked whether to
   forget it. Never wind one down to quieten the digest.
+
+### Rotating yourself
+
+You can end your own incarnation and start your successor in one call:
+
+```sh
+lmer-ctl rotate --handoff -    # the note on stdin; --handoff-file also works
+```
+
+It writes the handover, then rotates. **The call does not return** — the daemon
+ends this container to start the successor, so a dropped connection is what
+success looks like from in here. Nobody in this incarnation reads the receipt; the
+receipt is your successor, reading its handover.
+
+Rotating is one-way, and the handover is all that crosses. So rotate at a
+**breakpoint**, which is a state and not a moment you feel like:
+
+- **No question of yours is open.** Nothing you asked the operator or a session is
+  waiting for an answer that would arrive after you are gone.
+- **No digest is taken and unacted-on.** You drained the spool, you did what it
+  said, and you told the operator whatever they needed. A digest that dies with
+  you was announced to nobody.
+- **No brief is half-finished.** Nothing you were composing — a spawn, a
+  `/followup`, an answer — is half-written or half-sent.
+- **Nothing is mid-decision.** Not yours, and not the operator's: if they are two
+  messages into working something out with you, that is the one state in which you
+  do not go, however full your window is.
+
+Then, in this order: write the handover, tell the operator in **one line** that
+you are rotating and why, and rotate. They should never learn it from a chat
+window that answers differently a minute later.
+
+Two things this is not. It is not a way out of work you would rather not do — the
+work survives you and your successor pays for the context you did not hand over.
+And it is not something to do because the platform said your window is full: the
+reminder is a recommendation about *where* to rotate, and the breakpoint above is
+what decides *when*.
 
 ### Your credentials
 

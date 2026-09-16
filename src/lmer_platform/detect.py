@@ -308,6 +308,7 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import uuid
 import threading
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -317,10 +318,14 @@ from work_repo import run_state
 
 from lmer_cli import runref
 
-from . import ask, assistant, checkin, nudge, registry, teardown, transcripts
+from . import (
+    ask, assistant, checkin, nudge, registry, rotation, teardown, transcripts,
+)
 from .api import build_state
 from . import config as config_module
-from .config import PlatformConfig, checkin_settings, nudge_settings
+from .config import (
+    PlatformConfig, checkin_settings, nudge_settings, rotation_settings,
+)
 from .session_io import SessionIOError, send_input, session_output_state, quiet_health
 from .inventory import _TERMINAL_STATUSES, _observed_bad_exit, _was_wound_down
 from .spawn import ports_file_for
@@ -442,6 +447,19 @@ MAX_SEND_ERROR_CHARS = 500
 #: wrote into a session unasked, and "who typed that" must stay answerable from
 #: the same history that records a wind-down.
 ASSISTANT_NUDGED = "assistant_nudged"
+
+#: What the platform records when it has recommended a rotation to the
+#: assistant (issue #446). An event for :data:`ASSISTANT_NUDGED`'s reason —
+#: the platform typed into a session unasked — and the only durable trace of
+#: why an incarnation ended, since the rotation that follows is the
+#: assistant's own decision and records nothing about what prompted it.
+ASSISTANT_ROTATION_RECOMMENDED = "assistant_rotation_recommended"
+
+#: What the platform records when the threshold is set and the assistant's
+#: harness publishes no context figure to compare it against (issue #446).
+#: Once per incarnation: an operator who set a threshold and hears nothing
+#: has no other way to tell a quiet window from a reading that never arrives.
+ASSISTANT_ROTATION_UNREADABLE = "assistant_rotation_unreadable"
 
 #: Run states whose *arrival* is material even though nothing needs a human.
 #: ``complete`` only: §8.3's "a task finished", read off the state axis because a
@@ -1170,6 +1188,29 @@ def record_ingested_signals(signals: list) -> None:
         )
 
 
+def _reading_age(status, reading) -> "Optional[float]":
+    """How old the context figure is, preferring the figure's own stamp.
+
+    The document's ``updated`` is not the reading's: a codex status line carries
+    a dated ``context`` block of its own, refreshed from the rollout counter,
+    while the document around it is rewritten on every adapter poll — including
+    the polls that re-publish the last reading because the counter has stopped
+    being readable (``lmer_cli.codex_usage.CodexUsage.refresh``). Measuring the
+    wrapper there would age-check a stamp that is always fresh and let an
+    hours-old figure recommend ending a context window, which is the one thing
+    :data:`lmer_platform.rotation.MAX_READING_AGE_SECONDS` exists to refuse.
+
+    The document's age is the fallback, and it is the right one for a claude
+    status line, whose ``context`` block is ``{"percent": N}`` and is exactly as
+    old as the document that carries it.
+    """
+    if isinstance(reading, dict):
+        own = reading.get("age_seconds")
+        if isinstance(own, (int, float)) and not isinstance(own, bool):
+            return float(own)
+    return (status.statusline or {}).get("age_seconds")
+
+
 class Detector:
     """Ticks, diffs, and notifies the assistant of what is new (§8.3).
 
@@ -1219,6 +1260,10 @@ class Detector:
         #: Nudges typed into the assistant's session (issue #317). Counted
         #: apart because it is the only stage that writes *into* a session.
         self.nudged = 0
+        #: Rotations recommended to the assistant (issue #446), counted apart
+        #: from ``nudged`` because the two say opposite things about the session:
+        #: one asks it to do something, the other to finish and go.
+        self.recommended = 0
         #: Absence claims a forced pull withdrew before anyone was told (#324).
         #: A climbing number is a tuning fact — the mirror throttle and the rate
         #: runs finish are out of step — rather than a fault.
@@ -1246,6 +1291,25 @@ class Detector:
         #: rather than the accumulation's stamp, which two accumulations a second
         #: apart share. Per process: a restart re-nudges once.
         self._nudged: Optional[tuple] = None
+        #: ``(session_id, stamp)`` for the rotation reminder this process last
+        #: typed, or ``None`` while the reading is below the threshold — which is
+        #: what makes the *next* crossing announce itself immediately instead of
+        #: waiting out the window. One slot rather than a map: there is one
+        #: assistant (D11), and a new session id replaces what the last one left.
+        #:
+        #: In memory rather than in ``assistant.json``, unlike the nudge's stamp.
+        #: A spool outlives incarnations and drains rarely, so its bound has to
+        #: survive a restart; a context reading is a fact about *this* live
+        #: session, a rotation resets it to nothing, and a daemon restart while
+        #: the window is full costs one extra reminder.
+        self._rotation: Optional[tuple] = None
+        #: The session already reported as publishing no context figure, so the
+        #: notice is once per incarnation rather than once per tick.
+        self._context_unreadable: Optional[str] = None
+        #: ``(session_id, window, delivery_id, text)`` for the reminder being
+        #: attempted — held across retries so the id and its prose stay one pair
+        #: (:meth:`_rotation_text`), and dropped the moment one is marked.
+        self._rotation_attempt: Optional[tuple] = None
         self._warned_unattributed = False
 
     def stop(self) -> None:
@@ -1278,7 +1342,31 @@ class Detector:
             "lmer-signal (an MR pushed, a review finished), which reach the "
             "assistant and not your attention list.\n"
             f"   — {self._checkin_notice()}\n"
-            f"   — {self._nudge_notice()}"
+            f"   — {self._nudge_notice()}\n"
+            f"   — {self._rotation_notice()}"
+        )
+
+    def _rotation_notice(self) -> str:
+        """The rotation half of :attr:`notice`, in one sentence (issue #446).
+
+        Worth a line for :meth:`_nudge_notice`'s reason, and worth saying when it
+        is off: this one is off by *default*, so an operator who has heard nothing
+        cannot otherwise tell the feature apart from a quiet context window.
+        """
+        threshold = rotation_settings()["context_threshold"].value
+        if not threshold:
+            return (
+                "context-fullness reminders are OFF on this host "
+                "(rotation_context_threshold is 0): uber lmer is never told its "
+                "window is filling. POST /api/assistant/config to set a percent."
+            )
+        return (
+            f"context-fullness reminder ON: when uber lmer's own status line "
+            f"reports {threshold}% of its context window used, it is told once "
+            f"— and again at most every "
+            f"{rotation.REMINDER_INTERVAL_SECONDS // 60}m while it stays there — "
+            "to rotate itself at its next breakpoint. The daemon never rotates "
+            "it; a harness publishing no context figure is reported once instead."
         )
 
     def _nudge_notice(self) -> str:
@@ -1367,7 +1455,10 @@ class Detector:
         baseline-establishing one, and the absorbed-scan one — because it depends
         on none of what they have or lack: a first tick and an unreadable mirror
         are both states in which a spool can already be sitting unread, and the
-        second is the host least able to notice.
+        second is the host least able to notice. The rotation reminder
+        (:meth:`_rotation_stage`, issue #446) rides beside it on all three for the
+        same reason and is absent for the same one: what it reads is the
+        assistant's own context window, not the fleet.
 
         Signal ingestion is a third stage on the same terms, and it is *not* in the
         return value: what comes back is the diff's own fresh conditions, because
@@ -1404,6 +1495,7 @@ class Detector:
             # The nudge stage depends on nothing this read provides, and a host
             # whose mirror will not read is where a spool sits unnoticed.
             self._nudge_stage()
+            self._rotation_stage()
             return []
         self._clear("scan")
         current = _signals(payload)
@@ -1436,6 +1528,7 @@ class Detector:
             # re-announcing conditions, and a spool inherited across a restart is
             # the one that has waited longest.
             self._nudge_stage()
+            self._rotation_stage()
             return fresh
 
         fresh = [signal for key, signal in current.items() if key not in baseline]
@@ -1454,6 +1547,7 @@ class Detector:
 
         # Last on purpose, so it counts what this tick spooled.
         self._nudge_stage()
+        self._rotation_stage()
         return fresh
 
     def _confirmed(self, fresh: list) -> list:
@@ -1517,6 +1611,176 @@ class Detector:
             self.nudge_once()
         except Exception as exc:  # noqa: BLE001 - one reminder, not the tick
             self._absorb("nudge", exc)
+
+    def _rotation_stage(self) -> None:
+        """:meth:`rotation_once` with its failures absorbed, as a tick stage.
+
+        Its own stage beside the nudge's: the two read different things, and one
+        must not be able to cost the other. Called from all three tick exits.
+        """
+        try:
+            self.rotation_once()
+        except Exception as exc:  # noqa: BLE001 - one reminder, not the tick
+            self._absorb("rotation", exc)
+
+    def rotation_once(self) -> Optional[rotation.Alert]:
+        """Recommend a rotation when the reading has reached the threshold.
+
+        The reading comes from :func:`lmer_platform.assistant.status`, which
+        resolves the document for the *live* session id — so a successor is never
+        alerted on the reading its predecessor left behind. Nothing here rotates
+        anything. Conditions and delivery rules:
+        ``docs/PLATFORM-QUICKSTART.md``, "Context-fullness reminders".
+        """
+        threshold = rotation_settings()["context_threshold"].value
+        if not threshold:
+            return None
+        status = assistant.status()
+        if not status.running or not status.session_id:
+            return None
+        reading = (status.statusline or {}).get("context")
+        percent = reading.get("percent") if isinstance(reading, dict) else None
+        if percent is None:
+            self._report_unreadable_context(status, threshold)
+            return None
+        # A figure arrived, so a publisher that comes back re-arms the notice.
+        if self._context_unreadable == status.session_id:
+            self._context_unreadable = None
+        alerted_at = None
+        if self._rotation and self._rotation[0] == status.session_id:
+            alerted_at = self._rotation[1]
+        reading_age = _reading_age(status, reading)
+        due = rotation.due(
+            threshold=threshold,
+            percent=percent,
+            reading_age=reading_age,
+            alerted_at=alerted_at,
+        )
+        if due is None:
+            if percent < threshold:
+                # The stay above the threshold ended, so the next crossing is
+                # announced when it happens rather than a window later — and it
+                # is a *new* reminder, which is why the attempt goes too.
+                self._rotation = None
+                self._rotation_attempt = None
+            return None
+        ident, text = self._rotation_text(status.session_id, alerted_at, due)
+        adapter = (quiet_health(status.session_id) or {}).get("codex_delivery")
+        codex = isinstance(adapter, dict) or (
+            getattr(status, "settings", None) or {}
+        ).get("harness") == "codex"
+        sent_error: Optional[str] = None
+        try:
+            if codex:
+                # Submits only what the adapter has not seen; a state short of
+                # confirmed comes back False rather than as a send to mark.
+                if not self._codex_notice(status.session_id, adapter, ident, text):
+                    return None
+            else:
+                self._send(status.session_id, text, append_newline=True)
+        except SessionIOError as exc:
+            self._absorb("rotation", exc)
+            # `send_input` reports a native `uncertain` as a *delivered* error,
+            # so codex must not read `delivered` as a send: an unknown submission
+            # is not a recommendation anyone can be shown to have received.
+            # Legacy transports keep their byte-delivery bound.
+            if codex or not getattr(exc, "delivered", False):
+                return None
+            sent_error = _clamp(f"{type(exc).__name__}: {exc}", MAX_SEND_ERROR_CHARS)
+        else:
+            self._clear("rotation")
+        self.recommended += 1
+        self._rotation = (status.session_id, utc_now_iso())
+        self._rotation_attempt = None
+        append_event(
+            ASSISTANT_ROTATION_RECOMMENDED,
+            note=status.session_id,
+            data={
+                "session": status.session_id,
+                "generation": status.generation,
+                "percent": due.percent,
+                "threshold": due.threshold,
+                "repeat": due.repeat,
+                # The age the decision was taken on, which on codex is the
+                # reading's own rather than the document's (:func:`_reading_age`).
+                "reading_age_seconds": reading_age,
+                "delivery_id": ident,
+                "send_error": sent_error,
+            },
+        )
+        logger.info(
+            "platform_assistant_rotation_recommended session=%s generation=%s "
+            "percent=%d threshold=%d repeat=%s delivery=%s — the reminder "
+            "recommends a rotation at the assistant's next breakpoint; nothing "
+            "here ends an incarnation",
+            status.session_id, status.generation, due.percent, due.threshold,
+            due.repeat, ident,
+        )
+        return due
+
+    def _rotation_text(self, session_id: str, alerted_at, due) -> tuple:
+        """The delivery id and the frozen prose of the attempt in flight.
+
+        One attempt is one id and one immutable text, because
+        :class:`lmer_cli.codex_delivery.CodexDelivery` refuses a reused id
+        carrying different text and answers a repeated one from its own receipt.
+        A fresh identity is random rather than derived: a detector that restarted
+        mid-attempt must not be able to mint the id of an attempt whose text it
+        no longer has.
+        """
+        attempt = self._rotation_attempt
+        if attempt and attempt[0] == session_id and attempt[1] == (alerted_at or ""):
+            return attempt[2], attempt[3]
+        ident = "rotation-" + uuid.uuid4().hex
+        text = rotation.prompt(due)
+        self._rotation_attempt = (session_id, alerted_at or "", ident, text)
+        return ident, text
+
+    def _report_unreadable_context(self, status, threshold: int) -> None:
+        """Say once that the threshold has nothing to be compared against.
+
+        The issue's own rule (#446): "when a harness publishes no context figure
+        the daemon says so once and does not alert". It says it in the log and in
+        ``events.jsonl`` rather than in the session, because the fact is about the
+        *host* — an operator who set a threshold and hears nothing needs to know
+        it can never fire here, while the assistant can do nothing with it.
+        Harness parity for the figure itself is issue #122.
+
+        **Young sessions are exempt.** Every incarnation has a window between its
+        container starting and its harness first rendering a status line, and the
+        tick lands in it routinely — so below
+        :data:`lmer_platform.rotation.MAX_READING_AGE_SECONDS` absence is not yet
+        evidence. "Once" means once per *stretch without a reading*: a figure
+        arriving re-arms it.
+        """
+        session_id = status.session_id
+        if self._context_unreadable == session_id:
+            return
+        age = status.age_seconds
+        if age is not None and age < rotation.MAX_READING_AGE_SECONDS:
+            return
+        self._context_unreadable = session_id
+        append_event(
+            ASSISTANT_ROTATION_UNREADABLE,
+            note=session_id,
+            data={
+                "session": session_id,
+                "threshold": threshold,
+                # Which of the two absences this was: no document at all, or a
+                # document carrying no context block. They are different faults —
+                # one is a harness that publishes nothing, the other a harness
+                # that publishes without the figure — and only the event can keep
+                # them apart afterwards.
+                "document": status.statusline is not None,
+                "session_age_seconds": age,
+            },
+        )
+        logger.warning(
+            "platform_assistant_rotation_unreadable session=%s threshold=%d "
+            "document=%s — no context figure to compare the threshold against, "
+            "so the rotation reminder cannot fire; said once until one arrives",
+            session_id, threshold, status.statusline is not None,
+        )
 
     def codex_wake_once(self) -> None:
         """Use the existing daemon tick to wake Codex even during conversation."""
