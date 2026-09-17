@@ -706,6 +706,7 @@ class AssistantState:
     #: time by :func:`clamp_future_nudged_at` before the detector reads it.
     nudged_at: Optional[str] = None
     codex_wake: Optional[str] = None
+    conversation_seen: tuple = ()
 
     def to_dict(self) -> dict:
         return {
@@ -723,6 +724,7 @@ class AssistantState:
             "pending_seq": self.pending_seq,
             "nudged_at": self.nudged_at,
             "codex_wake": self.codex_wake,
+            "conversation_seen": list(self.conversation_seen),
         }
 
     @classmethod
@@ -783,6 +785,11 @@ class AssistantState:
             pending_seq=pending_seq,
             nudged_at=_opt_str(payload.get("nudged_at")),
             codex_wake=_opt_str(payload.get("codex_wake")),
+            conversation_seen=tuple(
+                item for item in (payload.get("conversation_seen")
+                                  if isinstance(payload.get("conversation_seen"), list) else [])
+                if isinstance(item, str) and len(item) == 64
+            ),
         )
 
 
@@ -2563,11 +2570,16 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
             note=text,
             data=payload,
         )
-        dropped = max(0, len(state.pending) + 1 - MAX_PENDING)
+        pending = list(state.pending) + [entry]
+        dropped = max(0, len(pending) - MAX_PENDING)
+        if dropped:
+            discard = next((i for i, item in enumerate(pending)
+                            if item.kind != "conversation_request"), len(pending) - 1)
+            pending.pop(discard)
         starting = not state.pending
         _write_state(replace(
             state,
-            pending=(*state.pending, entry)[-MAX_PENDING:],
+            pending=tuple(pending),
             # One predicate for both, because they answer one question: is this a
             # new accumulation? Two predicates re-dated a spool *inherited* from a
             # build without the stamp, so on upgrade the next digest made an
@@ -2589,6 +2601,29 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
             "assistant_notified", note=label, data={"kind": label, "note": text}
         )
         return _live_assistant() is not None
+
+
+def notify_conversation(identity: str, data: dict) -> bool:
+    """Atomically accept one request and its permanent, content-free replay key."""
+    with _LOCK:
+        state = read_state()
+        if identity in state.conversation_seen:
+            return False
+        if len(state.pending) >= MAX_PENDING:
+            raise AssistantCapacityError("the assistant inbox is full; retry after it is drained")
+        now = utc_now_iso()
+        entry = PendingNote(at=now, kind="conversation_request",
+                            note="A conversation request is waiting; reply to its explicit destination.",
+                            data=_scrubbed_data(data))
+        updated = replace(
+            state, pending=(*state.pending, entry),
+            conversation_seen=(*state.conversation_seen, identity),
+            pending_since=state.pending_since or _oldest_at(state.pending) or now,
+            pending_seq=state.pending_seq + (not state.pending),
+        )
+        if not _write_state(updated):
+            raise AssistantError("could not persist the assistant request; retry delivery")
+        return True
 
 
 def mark_codex_wake(session_id: str, pending_seq: int, delivery_id: str) -> bool:

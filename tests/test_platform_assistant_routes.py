@@ -63,6 +63,7 @@ ASSISTANT_ROUTES = (
     ("GET", "/api/assistant/instructions"),
     ("POST", "/api/assistant/instructions"),
     ("POST", "/api/assistant/pending"),
+    ("POST", "/api/assistant/requests"),
     ("GET", "/api/assistant/config"),
     ("POST", "/api/assistant/config"),
 )

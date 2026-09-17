@@ -1,4 +1,7 @@
-"""``lmer-matrix-listener``: spawn an ``lmer chat`` session per matrix thread.
+"""``lmer-matrix-listener``: route mentions or spawn a chat session per thread.
+
+``LMER_ASSISTANT_MENTION_ROUTING`` selects the assistant's private inbox;
+``docs/ASSISTANT-MENTIONS.md`` describes that mode. The default is below.
 
 The mirror of :mod:`slack_chat.listener`. One host-side process logged in as
 the bot account syncs the rooms it is joined to (or the ones
@@ -27,6 +30,8 @@ import os
 import sys
 from typing import Optional
 
+from lmer_cli import assistant_mentions
+
 from slack_chat.registry import is_thread_connected
 from slack_chat.sessions import SessionManager, preset_ack_parts
 
@@ -36,7 +41,7 @@ from .permalink import matrix_to_link
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Listener", "ListenerConfig", "is_mention", "main"]
+__all__ = ["Listener", "ListenerConfig", "is_mention", "is_assistant_mention", "main"]
 
 ALLOWED_USERS_ENV = "LMER_MATRIX_ALLOWED_USERS"
 ROOMS_ENV = "LMER_MATRIX_ROOMS"
@@ -55,6 +60,7 @@ class ListenerConfig:
         self.access_token = (environ.get(ACCESS_TOKEN_ENV) or "").strip()
         self.allowed = _csv(environ.get(ALLOWED_USERS_ENV))
         self.rooms = _csv(environ.get(ROOMS_ENV))
+        self.mentions = assistant_mentions.Settings.from_env(environ)
         missing = [name for name, value in (
             (HOMESERVER_ENV, self.homeserver), (USER_ID_ENV, self.user_id), (ACCESS_TOKEN_ENV, self.access_token),
         ) if not value]
@@ -76,6 +82,14 @@ def is_mention(event: dict, user_id: str) -> bool:
     body = str(content.get("body") or "")
     localpart = user_id[1:].split(":", 1)[0]
     return user_id in body or f"@{localpart}" in body
+
+
+def is_assistant_mention(event: dict, user_id: str) -> bool:
+    """Require an explicit Matrix mention identity for assistant admission."""
+    content = event.get("content")
+    mentions = content.get("m.mentions") if isinstance(content, dict) else None
+    users = mentions.get("user_ids") if isinstance(mentions, dict) else None
+    return isinstance(users, list) and user_id in users
 
 
 class Listener:
@@ -116,7 +130,13 @@ class Listener:
                 if not isinstance(event, dict) or event.get("type") != "m.room.message":
                     continue
                 sender = event.get("sender")
-                if sender == self.config.user_id or not is_mention(event, self.config.user_id):
+                if sender == self.config.user_id:
+                    continue
+                threaded = resolve_thread_root(event) != event.get("event_id")
+                mentioned = (is_assistant_mention if self.config.mentions.enabled else is_mention)(
+                    event, self.config.user_id,
+                )
+                if not mentioned and not (self.config.mentions.enabled and threaded):
                     continue
                 if sender not in self.config.allowed:
                     logger.info(
@@ -134,6 +154,12 @@ class Listener:
             if self.sessions.touch(room_id, root):
                 return
             if is_thread_connected(room_id, root, kind="matrix"):
+                return
+            if self.config.mentions.enabled:
+                try:
+                    await asyncio.to_thread(assistant_mentions.forward, "matrix", room_id, event)
+                except Exception as exc:
+                    logger.error("assistant_routing_failed transport=matrix error=%s", exc)
                 return
             if self.sessions.at_capacity():
                 await self._say(room_id, root, "I can't take on another conversation right now — all session slots are busy.")

@@ -397,6 +397,7 @@ def _start_thread_servicer(
                 str(uploads_host) if uploads_host else None, uploads_container
             ),
             where=CLI_ENVIRONMENT,
+            assistant_session=os.environ.get("LMER_SESSION_KIND") == "assistant",
         )
         servicer.start()
         return servicer

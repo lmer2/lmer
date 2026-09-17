@@ -38,7 +38,7 @@ from ask_channel import bus
 from matrix_chat.permalink import matrix_to_link
 from slack_chat.permalink import slack_thread_link
 
-from . import dm_access
+from . import dm_access, dm_parents
 from .thread_posts import Poster
 from .threads import (
     CHANNEL_MATRIX, CHANNEL_SLACK, ChannelRef, ThreadError, ThreadRef,
@@ -1096,6 +1096,13 @@ def _dm_matrix(
             room = client.create_direct_room(recipient)
         except Exception as exc:
             raise _matrix_failure(exc, recipient) from None
+    try:
+        dm_parents.remember_conversation(CHANNEL_MATRIX, room)
+    except OSError as exc:
+        raise ThreadError(
+            "the host could not save the DM room's identity; no direct message was sent",
+            status=503,
+        ) from exc
     # Before the send and not after: an encrypted room takes the message and
     # renders it unreadable to everyone, which looks like delivery and is not.
     try:
@@ -1296,6 +1303,7 @@ class ThreadServicer(threading.Thread):
         store: Optional[UploadStore] = None,
         where: str = DAEMON_ENVIRONMENT,
         connections=None,
+        assistant_session: bool = False,
         name: str = "lmer-thread-servicer",
         connect_budget: Optional[float] = None,
         poll_seconds: float = POLL_SECONDS,
@@ -1311,6 +1319,7 @@ class ThreadServicer(threading.Thread):
         self.store = store
         self.where = where
         self.connections = connections
+        self.assistant_session = assistant_session
         self.stop_event = threading.Event()
         self.poll_seconds = poll_seconds
         self.failures = 0
@@ -1384,11 +1393,23 @@ class ThreadServicer(threading.Thread):
                 store=self.store, where=self.where,
             )
         elif op == _requests.OP_DM:
+            session = self.resolved_session() if self.assistant_session else None
+            if self.assistant_session and not session:
+                raise ThreadError("the host cannot identify this assistant; no direct message was sent", status=503)
             payload = send_dm(
                 request.get("recipient"), request.get("text") or "",
                 env=self.env, where=self.where, poster=self.poster(),
                 established=self.established_conversations(),
             )
+            if self.assistant_session:
+                try:
+                    dm_parents.remember(payload, session)
+                except OSError as exc:
+                    raise ThreadError(
+                        "the direct message was sent, but its reply receipt could not be saved; "
+                        "do not resend it solely because of this error",
+                        status=500,
+                    ) from exc
         elif op == _requests.OP_POST:
             payload = post_thread(
                 permalink, request.get("text") or "", label=self.resolved_label(),

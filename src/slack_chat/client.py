@@ -349,6 +349,29 @@ class SlackClient:
 
         return messages
 
+    def history_before(self, channel: str, before: str, limit: int) -> list:
+        """Up to *limit* messages strictly before *before*, oldest first."""
+        if limit == 0:
+            return []
+        found: list = []
+        cursor = ""
+        seen: set = set()
+        while len(found) < limit:
+            params = {"channel": channel, "latest": before, "inclusive": False,
+                      "limit": limit - len(found)}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._request("GET", "conversations.history", params=params)
+            found.extend(item for item in data.get("messages", [])
+                         if isinstance(item, dict) and item.get("ts", "") < before)
+            cursor = (data.get("response_metadata") or {}).get("next_cursor")
+            if not cursor:
+                break
+            if cursor in seen:
+                raise SlackError("history pagination repeated a cursor")
+            seen.add(cursor)
+        return list(reversed(found[:limit]))
+
     def auth_test(self) -> str:
         """Verify the bot token and return the bot's user ID.
 
