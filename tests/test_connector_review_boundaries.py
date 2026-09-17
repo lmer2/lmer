@@ -12,8 +12,14 @@ from lmer_cli import comms
 from lmer_cli.connector_delivery import checkpoint_path, marker_path
 from lmer_cli.connector_ownership import read_json
 from tests.connector_fakes import CHILD_SOURCE, isolated_connectors, live_supervisor
+from tests.timing_budgets import (
+    BACKLOG, CHILD_DRAIN, CHILD_DRAIN_EXPIRED, DRAIN_DEADLINE, FIXTURE_RELEASE,
+    RELOAD_LATENCY, SETTLE, SHUTDOWN, STOP, XDIST_GROUP, outlast,
+)
 from tests.test_connector_process import child, wait_for
 from tests.test_connector_recovery import block
+
+pytestmark = pytest.mark.xdist_group(XDIST_GROUP)
 
 
 def instrument(child, code):
@@ -45,24 +51,24 @@ connector_lifecycle.ConnectorLifecycle.run_forever = run
     try:
         wait_for(lambda: bool(child.events()) and (read_json(checkpoint_path(child.key, child.supervisor.log.session)) or {}).get("pending") is None, child)
         (child.root / "signal-now").touch()
-        wait_for(lambda: (child.root / "signal-returned").exists(), child, timeout=60)
-        wait_for(lambda: owned.popen.poll() is not None, child, timeout=60)
+        wait_for(lambda: (child.root / "signal-returned").exists(), child, SHUTDOWN)
+        wait_for(lambda: owned.popen.poll() is not None, child, SHUTDOWN)
         assert owned.collect() == 0
         assert not child.key.busy()
         assert len(child.events()) == 1
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
-        owned.stop(timeout=30)
+        owned.stop(timeout=STOP)
 
 
 def test_sigterm_during_reload_finalization_exits_without_exec(child):
     instrument(child, '''
-connector_lifecycle.DRAIN_SECONDS = 60
+connector_lifecycle.DRAIN_SECONDS = ''' + repr(outlast(FIXTURE_RELEASE)) + '''
 original_close = connector_delivery.DeliveryState.close
 def close(self):
     if (root / "pause-finalize").exists():
         (root / "finalize-entered").touch()
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + ''' + repr(FIXTURE_RELEASE) + '''
         while not (root / "resume-finalize").exists():
             if time.monotonic() >= deadline: raise RuntimeError("finalization fixture was not released")
             time.sleep(.01)
@@ -75,10 +81,10 @@ connector_delivery.DeliveryState.close = close
         wait_for(lambda: bool(child.events()) and (read_json(checkpoint_path(child.key, child.supervisor.log.session)) or {}).get("pending") is None, child)
         (child.root / "pause-finalize").touch()
         (child.root / "watched.py").write_text("# request reload\n")
-        wait_for(lambda: (child.root / "finalize-entered").exists(), child, timeout=60)
+        wait_for(lambda: (child.root / "finalize-entered").exists(), child, SHUTDOWN)
         owned.popen.terminate()
         (child.root / "resume-finalize").touch()
-        wait_for(lambda: owned.popen.poll() is not None or (child.root / "execs").exists(), child, timeout=60)
+        wait_for(lambda: owned.popen.poll() is not None or (child.root / "execs").exists(), child, SHUTDOWN)
         assert not (child.root / "execs").exists(), "SIGTERM was followed by reload exec"
         assert owned.collect() == 0
         assert not child.key.busy()
@@ -86,7 +92,7 @@ connector_delivery.DeliveryState.close = close
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
         (child.root / "resume-finalize").touch()
-        owned.stop(timeout=30)
+        owned.stop(timeout=STOP)
 
 
 def test_native_module_reload_preserves_entrypoint_and_lease(child):
@@ -107,7 +113,7 @@ slack_client.SlackClient = lambda *args, **kwargs: remote
 matrix_client.MatrixClient = lambda *args, **kwargs: remote
 assert connector_lifecycle.MODULE_POLL_SECONDS == 1
 assert connector_lifecycle.DRAIN_SECONDS == 45
-connector_lifecycle.DRAIN_SECONDS = 30
+connector_lifecycle.DRAIN_SECONDS = ''' + repr(CHILD_DRAIN) + '''
 original_messages = bus.BusClient.messages
 def messages(self, cursor, **kwargs):
     return original_messages(self, cursor, timeout=.02)
@@ -154,7 +160,7 @@ sys.addaudithook(audit)
         argv = json.loads((child.root / "exec-argv").read_text())
         assert argv[1:3] == ["-m", package + ".connector"], (argv, (child.root / "native.log").read_text())
         assert owned.popen.poll() is None, (child.root / "native.log").read_text()
-        assert float((child.root / "stop-start").read_text()) - changed_at < 10
+        assert float((child.root / "stop-start").read_text()) - changed_at < RELOAD_LATENCY
         boots = [json.loads(line) for line in (child.root / "boots").read_text().splitlines()]
         assert boots == [{"pid": owned.popen.pid, "module": "__main__"}] * 2
         assert read_json(child.key.owner_path)["token"] == token
@@ -162,11 +168,12 @@ sys.addaudithook(audit)
         wait_for(lambda: len(child.events()) == 2, child)
         assert sum("native before" in item["text"] for item in child.events()) == 1
     finally:
-        owned.stop(timeout=30)
+        owned.stop(timeout=STOP)
 
 
 @pytest.mark.parametrize("stage", ["checkpoint", "final-ack", "lease", "lease-close"])
 def test_finalization_is_inside_total_reload_deadline(child, stage):
+    child.bounds["CONNECTOR_FIXTURE_DRAIN"] = str(CHILD_DRAIN_EXPIRED)
     instrument(child, '''
 from ask_channel import bus
 from lmer_cli.connector_ownership import Lease
@@ -174,7 +181,10 @@ stage = ''' + repr(stage) + '''
 def delay():
     if (root / "finalize").exists():
         (root / "finalize.reached").write_text(stage)
-        time.sleep(60)
+        # Release after observing drain expiry; the deadline only bounds a broken test.
+        deadline = time.monotonic() + ''' + repr(outlast(DRAIN_DEADLINE)) + '''
+        while not (root / "release-finalize").exists() and time.monotonic() < deadline:
+            time.sleep(.01)
 if stage == "checkpoint":
     original = connector_delivery.DeliveryState.close
     def delayed(self):
@@ -221,24 +231,26 @@ connector_lifecycle.ConnectorLifecycle.stop = stop
             owned.popen.terminate()
         else:
             (child.root / "watched.py").write_text("# finalize under total deadline\n")
-        wait_for(lambda: (child.root / "stop-result").exists() and (child.root / "finalize.reached").exists(), child, timeout=60)
+        wait_for(lambda: (child.root / "stop-result").exists() and (child.root / "finalize.reached").exists(), child, SHUTDOWN)
         result = json.loads((child.root / "stop-result").read_text())
         assert not result["ok"], result
-        assert result["elapsed"] < 30, result
+        assert result["elapsed"] < DRAIN_DEADLINE, result
         assert (child.root / "finalize.reached").read_text() == stage
         if stage == "lease-close":
-            wait_for(lambda: (child.root / "lease-closed").exists(), child, timeout=120)
+            (child.root / "release-finalize").touch()
+            wait_for(lambda: (child.root / "lease-closed").exists(), child, SETTLE)
         assert child.key.busy()
         assert not (child.root / "execs").exists()
         assert len(child.events()) == 1
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
         (child.root / "exit").touch()
-        wait_for(lambda: owned.popen.poll() is not None, child, timeout=60)
+        wait_for(lambda: owned.popen.poll() is not None, child, SHUTDOWN)
         assert owned.collect() == 3
         assert not child.key.busy()
     finally:
+        (child.root / "release-finalize").touch()
         (child.root / "exit").touch()
-        owned.stop(timeout=30)
+        owned.stop(timeout=STOP)
 
 
 @pytest.mark.parametrize("boundary", ["open", "published"])
@@ -276,7 +288,7 @@ connector_delivery.sync_directory = synced
         wait_for(lambda: len(child.events()) == 1 and read_json(checkpoint_path(child.key, child.supervisor.log.session))["pending"] is None, child)
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
-        resumed.stop(timeout=30)
+        resumed.stop(timeout=STOP)
 
 
 def test_interrupted_retry_then_receipt_resumes_exact_selection(child):
@@ -312,7 +324,7 @@ def test_interrupted_retry_then_receipt_resumes_exact_selection(child):
         assert len(child.events()) == 1
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
-        resumed.stop(timeout=30)
+        resumed.stop(timeout=STOP)
 
 
 def test_completed_receipt_identity_outlives_echo_eviction(child):
@@ -320,9 +332,9 @@ def test_completed_receipt_identity_outlives_echo_eviction(child):
         child.supervisor.log.append(kind="milestone", text="identical content", source=comms.Source("agent"))
     first = child.spawn()
     try:
-        wait_for(lambda: len(child.events()) == 257 and read_json(checkpoint_path(child.key, child.supervisor.log.session))["pending"] is None, child, timeout=900)
+        wait_for(lambda: len(child.events()) == 257 and read_json(checkpoint_path(child.key, child.supervisor.log.session))["pending"] is None, child, BACKLOG)
     finally:
-        first.stop(timeout=30)
+        first.stop(timeout=STOP)
     old = child.events()[0]["ref"]
     saved = read_json(checkpoint_path(child.key, child.supervisor.log.session))
     assert old not in saved["transport"]["posters"]["wrote"]
@@ -346,4 +358,4 @@ def test_completed_receipt_identity_outlives_echo_eviction(child):
         assert len(child.events()) == 258
         assert any(item.id == source.id for item in child.supervisor.log.read_since(0)[0])
     finally:
-        resumed.stop(timeout=30)
+        resumed.stop(timeout=STOP)

@@ -59,6 +59,9 @@ REQUIRE_NODE_ENV = "LMER_TESTS_REQUIRE_NODE"
 #: not arm the strict mode by accident.
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+#: Harness policy, preserved when tests strip session context from the environment.
+WAIT_SCALE_ENV = "LMER_TESTS_WAIT_SCALE"
+
 #: LMER_* vars :func:`strip_lmer_env` leaves alone: switches that tell the *test
 #: harness* how strict to be, which are not run context. Stripping one would let
 #: any module that isolates its environment silently disarm a guard.
@@ -73,6 +76,7 @@ _TRUTHY = frozenset({"1", "true", "yes", "on"})
 #: operational cache merely because this project is opted in.
 _HARNESS_ENV = frozenset({
     REQUIRE_NODE_ENV,
+    WAIT_SCALE_ENV,
     gate_lock.LOCK_DIR_ENV,
     precommit_cache.CACHE_DIR_ENV,
 })

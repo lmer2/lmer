@@ -6,6 +6,7 @@ import pytest
 
 from lmer_cli import thread_posts
 from tests.connector_fakes import MatrixRig, ROOM, SlackRig, isolated_connectors
+from tests.timing_budgets import DRAIN, JOIN
 
 @pytest.mark.parametrize("channel", ["slack", "matrix"])
 def test_confirmed_send_survives_actual_bookkeeping_failure(channel, tmp_path, monkeypatch):
@@ -43,8 +44,8 @@ def test_confirmed_send_survives_actual_bookkeeping_failure(channel, tmp_path, m
     worker = threading.Thread(target=connector._outbound_loop, daemon=True)
     try:
         worker.start()
-        assert reached.wait(90), "actual successful send did not reach bookkeeping fault"
-        deadline = time.monotonic() + 30
+        assert reached.wait(JOIN), "actual successful send did not reach bookkeeping fault"
+        deadline = time.monotonic() + JOIN
         while len(polls) < 3 and time.monotonic() < deadline:
             time.sleep(0.01)
         assert len(polls) >= 3, "outbound loop must continue after bookkeeping failure"
@@ -52,8 +53,8 @@ def test_confirmed_send_survives_actual_bookkeeping_failure(channel, tmp_path, m
         assert [item[2] for item in sent].count("keep this source record") == 1
     finally:
         connector._stop.set()
-        worker.join(timeout=90)
-        connector.stop(timeout=30)
+        worker.join(timeout=JOIN)
+        connector.stop(timeout=DRAIN)
         assert not worker.is_alive()
         rig.bus._session._http.close()
         rig.log.close()
@@ -122,7 +123,7 @@ def test_confirmed_receipt_filesystem_failure_blocks_reconstructed_connector(cha
             with pytest.raises(RecoveryRequired, match="receipt"):
                 conn._outbound_once()
         assert reached and len(sent) == 1
-        conn.stop(timeout=30, announce=False)
+        conn.stop(timeout=DRAIN, announce=False)
         assert marker_path(conn._lease.key).exists()
         kwargs = {"slack": remote} if channel == "slack" else {"matrix": remote}
         fresh = type(conn)(conn.config, bus_client=rig.bus, **kwargs)
@@ -132,9 +133,9 @@ def test_confirmed_receipt_filesystem_failure_blocks_reconstructed_connector(cha
             assert len(sent) == 1
             assert any(item.id == record.id for item in rig.log.read_since(0)[0])
         finally:
-            fresh.stop(timeout=30, announce=False)
+            fresh.stop(timeout=DRAIN, announce=False)
     finally:
-        conn.stop(timeout=30, announce=False)
+        conn.stop(timeout=DRAIN, announce=False)
         rig.bus._session._http.close()
         rig.log.close()
 
@@ -167,6 +168,6 @@ def test_verified_pre_send_marker_sync_failure_can_retry_without_manual_uncertai
         assert len(sent) == 1
         assert any(item.id == record.id for item in rig.log.read_since(0)[0])
     finally:
-        conn.stop(timeout=30, announce=False)
+        conn.stop(timeout=DRAIN, announce=False)
         rig.bus._session._http.close()
         rig.log.close()

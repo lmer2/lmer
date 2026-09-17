@@ -34,6 +34,8 @@ tests:
     # must run them.
     - tests/test_browser_automation_wiring.py
     - tests/test_codex_usage.py
+    # Reads docs/GATE-FASTPATH.md and docs/LMER-CLI.md.
+    - tests/test_timing_budgets.py
     - tests/test_consistency.py
     - tests/test_containerfile.py
     - tests/test_doctor_sources.py

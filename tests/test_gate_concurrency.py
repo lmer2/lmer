@@ -383,7 +383,8 @@ def test_project_worker_cap_and_dependency_fallback(project_helper, monkeypatch,
     monkeypatch.setattr(helper, "read_limits", lambda: resources.Limits(cpus, 4 * GIB))
     monkeypatch.setattr(helper.subprocess, "run", Mock(return_value=subprocess.CompletedProcess([], 0 if present else 1)))
     argv = [sys.executable, "-m", "pytest", "tests/test_example.py", "-x"]
-    assert helper.test_command(argv) == argv + (["-n", str(expected)] if expected else [])
+    assert helper.test_command(argv) == argv + (
+        ["-n", str(expected), "--dist", "loadgroup"] if expected else [])
 
 
 def test_documented_work_only_contract():
@@ -459,6 +460,7 @@ def test_project_wrapper_isolates_nested_selection(project_helper, monkeypatch):
     helper = project_helper
     monkeypatch.setenv(resources.SERIAL_ENV, "0")
     monkeypatch.setattr(sys, "argv", ["gate-tests.py", "--run", "python3", "-m", "pytest", "-n", "4"])
+    monkeypatch.delenv("LMER_TESTS_WAIT_SCALE", raising=False)
     calls = []
 
     def execute(program, argv, environment):
@@ -470,6 +472,24 @@ def test_project_wrapper_isolates_nested_selection(project_helper, monkeypatch):
     assert stopped.value.code == 0
     assert calls[0][1][-2:] == ["-n", "4"]
     assert calls[0][2][resources.SERIAL_ENV] == "1"
+    assert calls[0][2]["LMER_TESTS_WAIT_SCALE"] == "4"
+
+
+def test_project_wrapper_keeps_a_hand_set_scale(project_helper, monkeypatch):
+    helper = project_helper
+    monkeypatch.setenv(resources.SERIAL_ENV, "0")
+    monkeypatch.setenv("LMER_TESTS_WAIT_SCALE", "8")
+    monkeypatch.setattr(sys, "argv", ["gate-tests.py", "--run", "python3", "-m", "pytest", "-n", "2"])
+    calls = []
+
+    def execute(program, argv, environment):
+        calls.append((program, argv, dict(environment)))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(helper.os, "execvpe", execute)
+    with pytest.raises(SystemExit):
+        helper.main()
+    assert calls[0][2]["LMER_TESTS_WAIT_SCALE"] == "8"
 
 
 @pytest.mark.parametrize("error", [

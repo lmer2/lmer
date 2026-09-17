@@ -325,8 +325,9 @@ exec python3 ci/gate-tests.py "$@"
 interpreter and exact targets, checks xdist in that interpreter, and adds at most
 four workers, bounded again by quota and affinity. Missing xdist or unknown
 resources keeps serial pytest. Its tracked execution wrapper disables override
-discovery in nested gates under test, then execs the already selected pytest
-command, including its explicit workers. Dedicated policy tests clear that
+discovery in nested gates under test and publishes the worker count as
+`LMER_TESTS_WAIT_SCALE` (see the connector family below), then execs the already
+selected pytest command, including its explicit workers. Dedicated policy tests clear that
 inherited switch and exercise selection directly. The cache records the wrapper
 and child argv together; no default-pytest receipt is fabricated. pytest-xdist is a development
 dependency of lmer only. Install its locked development environment
@@ -390,8 +391,91 @@ subprocess execution. Reading live task or project policy can add a runner
 description subprocess that a serial-runner mock never expected. Policy tests
 create their own configuration and executable scripts under that isolated root.
 
-Connector integration tests use generous wall-clock budgets for scheduling and
-filesystem work under four-worker load. Polling intervals stay short; deadline
-tests keep the injected stall longer than the asserted shutdown bound. Fixture
-teardown joins finalizer threads before restoring registry monkeypatches, so
-late persistence cannot reach the operator's real registry.
+### Tests that wait on real processes
+
+The connector suites and the supervisor teardown tests start real child
+processes, real sockets and real threads, so every one of them waits on
+wall-clock time. Under four workers, with other gates sharing the host,
+whichever bound is tightest trips first — a different test each day through
+September 2026. They are held to three rules (issue #480).
+
+**Every bound is a named budget.** `tests/timing_budgets.py` owns them:
+`SETTLE` for a child reaching an observable state, `SHUTDOWN` for one reacting
+to a signal, `DRAIN` for an in-process connector draining itself, `STOP` for
+terminating a child that should already be finished, `CHILD_DRAIN` for what a
+child gives its own drain, `TEARDOWN_BOUND` for how fast the supervisor is done
+with its child, and so on. No test writes a number. `outlast(budget)` derives an
+injected stall from the bound it has to outlive, so the two cannot drift apart. Poll
+intervals are the deliberate exception: they stay short and unscaled, because
+they decide how quickly a satisfied condition is noticed, not how long a test is
+willing to wait. A test that reintroduces a literal fails
+`tests/test_timing_budgets.py`.
+
+**One factor scales them together.** `LMER_TESTS_WAIT_SCALE` multiplies every
+budget. `ci/gate-tests.py` derives it from the worker count it chose: the
+description step adds `-n <workers>`, and the `--run` wrapper that execs that
+command publishes the same number as the factor. So the parallel gate runs with
+four times the base bounds and a serial run with one. A value already in the
+environment is never overwritten.
+
+**Process-spawning modules share one worker.** The five modules that fork
+children (`test_connector_process.py`, `test_connector_recovery.py`,
+`test_connector_review_boundaries.py`, `test_connector_ingestion.py`,
+`test_supervisor_teardown.py`) carry
+`pytest.mark.xdist_group(XDIST_GROUP)` — the group name is `process_spawning`.
+So does the one test outside them that forks connector children,
+`test_lmer_cli_slack_target.py::test_chat_launch_starts_connector_with_digest_only_container`;
+the guard finds anything that builds a `ChildHarness` and fails if it is not in
+the group, because a hand-kept list is how that one was missed. The marker does
+nothing under xdist's default distribution, so the parallel invocation passes
+`--dist loadgroup` alongside `-n`. The in-process connector suites stay spread
+across the other workers.
+
+#### Running them serially, and reproducing a loaded host
+
+Serially, in the container, from the repository root:
+
+```sh
+PYTHONPATH=src python -m pytest tests/test_connector_process.py \
+    tests/test_connector_recovery.py tests/test_connector_review_boundaries.py \
+    tests/test_connector_ingestion.py tests/test_connector_delivery.py \
+    tests/test_connector_lifecycle.py tests/test_connector_ownership.py \
+    tests/test_slack_connector.py tests/test_matrix_chat.py \
+    tests/test_chat_connector_notices.py tests/test_supervisor_teardown.py \
+    "tests/test_lmer_cli_slack_target.py::test_chat_launch_starts_connector_with_digest_only_container" -q
+```
+
+That is the run every one of these tests passes in isolation, which is exactly
+why a green result there proves nothing about the parallel gate. To reproduce
+the conditions that fail, recreate both halves of them:
+
+```sh
+# four workers, the group honoured, and the bounds the gate would use
+LMER_TESTS_WAIT_SCALE=4 PYTHONPATH=src python -m pytest tests/test_connector_process.py \
+    -n 4 --dist loadgroup -q
+```
+
+and load the host while it runs — a second full `gate-check`, or
+`for i in $(seq "$(nproc)"); do (while :; do :; done) & done` and `kill %1 %2 …`
+afterwards. Raising `LMER_TESTS_WAIT_SCALE` alone does not reproduce a flake; it
+is the cushion, not the load. Lowering it to `1` under load is the way to make
+the family fail on demand and see what the failure now says.
+
+#### What a failure says
+
+A failing wait names each child's pid and exit status, then quotes every log the
+harness collected, including a line for a log that really is empty. The fixture
+children write a start line, an exit line with the code, and a line for a reload
+exec; their logging goes to stderr with timestamps, and they run unbuffered, so
+the log is populated even when the child dies before its own `main()`. An empty
+child log — the only evidence either 2026-09-16 occurrence left — now means the
+child never started, and says so. The recovery CLI is the one child whose output
+does not go there: the harness captures it, so it reaches the assertion through
+the completed process rather than through the log.
+
+The supervisor teardown tests do the same through their own fixture: a wait that
+runs out prints the supervised child's pid, its exit code and everything it
+wrote to the supervisor's output buffer.
+
+Fixture teardown joins finalizer threads before restoring registry
+monkeypatches, so late persistence cannot reach the operator's real registry.

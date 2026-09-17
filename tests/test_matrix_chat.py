@@ -20,6 +20,7 @@ from matrix_chat import connector, listener, permalink
 from matrix_chat.client import MatrixError
 from slack_chat import registry
 from tests.conftest import drain_connectors, strip_lmer_env
+from tests.timing_budgets import DRAIN, JOIN
 from tests.test_lmer_signal_cli import _Session
 
 
@@ -40,7 +41,7 @@ def _clean_lmer_env(monkeypatch, tmp_path):
 
     monkeypatch.setattr(connector.MatrixConnector, "__init__", tracked_init)
     yield
-    drain_connectors(instances, 30.0)
+    drain_connectors(instances, DRAIN)
 
 
 ROOM = "!room:example.org"
@@ -249,7 +250,7 @@ class Rig:
     def agent(self, kind, text, **kw):
         return self.log.append(kind=kind, text=text, source=comms.Source("agent"), **kw)[0]
 
-    def wait_until(self, predicate, timeout=30.0):
+    def wait_until(self, predicate, timeout=JOIN):
         deadline = time.monotonic() + timeout
         while not predicate() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -972,6 +973,6 @@ def test_matrix_attachment_notice_waits_for_supervisor_identity(tmp_path, monkey
         rig.connector._announce_attached()
         assert rig.matrix.sent == [(ROOM, ROOT, connector.ATTACH_ACK, "m.notice")]
     finally:
-        rig.connector.stop(timeout=30)
+        rig.connector.stop(timeout=DRAIN)
         rig.bus._session._http.close()
         rig.log.close()

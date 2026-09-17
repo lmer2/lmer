@@ -148,6 +148,8 @@ addopts = "-v --strict-markers"
 asyncio_mode = "auto"
 markers = [
     "slow: marks tests that build/run containers (deselect with '-m \"not slow\"')",
+    # Keep --strict-markers collection working without pytest-xdist installed.
+    "xdist_group(name): run these tests on the same xdist worker",
 ]
 
 [tool.coverage.run]

@@ -20,14 +20,8 @@ from lmer_cli import comms, supervisor, targets, thread_posts
 from slack_chat import connector, registry
 from slack_chat.client import SlackError
 from tests.conftest import drain_connectors, strip_lmer_env
+from tests.timing_budgets import CONNECT_EXPIRED, DRAIN, JOIN, QUIET, outlast
 from tests.test_lmer_signal_cli import _Session
-
-# One wall-clock budget for every drain and wait below. Four-worker runs on a
-# four-CPU container stretch scheduling far past the latencies these tests are
-# about, so each bound is a ballpark ceiling rather than a timing assertion
-# (issue #471, the same cushion #461 gave the other connector suites). A green
-# run never spends it: every wait returns as soon as its condition holds.
-BUDGET = 60.0
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +44,7 @@ def registry_dir(tmp_path, monkeypatch):
 
     monkeypatch.setattr(connector.SlackConnector, "__init__", tracked_init)
     yield
-    drain_connectors(instances, BUDGET)
+    drain_connectors(instances, DRAIN)
 
 
 class FakeSlack:
@@ -155,7 +149,7 @@ class Rig:
     def agent(self, kind, text, **kw):
         return self.log.append(kind=kind, text=text, source=comms.Source("agent"), session_caller=True, **kw)[0]
 
-    def wait_until(self, predicate, timeout=BUDGET):
+    def wait_until(self, predicate, timeout=JOIN):
         deadline = time.monotonic() + timeout
         while not predicate() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -830,7 +824,7 @@ class TestStartingBeforeTheSupervisor:
 
     # The connect budget outlasts every wait below, so a loaded run measures
     # the behaviour each test names instead of racing the connector's give-up.
-    def _connector(self, tmp_path, port, *, budget=600.0, notify=None):
+    def _connector(self, tmp_path, port, *, budget=outlast(JOIN), notify=None):
         log = comms.MessageLog("sess-late", str(tmp_path / "messages.jsonl"))
         slack = FakeSlack()
         config = connector.ConnectorConfig(
@@ -849,25 +843,25 @@ class TestStartingBeforeTheSupervisor:
         port = _free_port()
         log, slack, conn = self._connector(tmp_path, port)
         conn.start()
-        time.sleep(0.6)  # nothing is listening; the connector must still be alive
+        time.sleep(QUIET)  # nothing is listening; the connector must still be alive
         assert not slack.posted
         thread, shutdown = self._serve(log, port)
         try:
             log.append(kind="milestone", text="pushed", source=comms.Source("agent"))
-            deadline = time.monotonic() + BUDGET
+            deadline = time.monotonic() + JOIN
             while time.monotonic() < deadline and not slack.posted:
                 time.sleep(0.05)
             assert [text for _, _, text in slack.posted] == ["🏁 pushed"]
         finally:
             conn.stop()
             shutdown()
-            thread.join(timeout=BUDGET)
+            thread.join(timeout=JOIN)
 
     def test_a_supervisor_that_answers_without_a_bus_is_a_definite_no(self, tmp_path):
         """Not every refusal is worth waiting on: a pre-#407 image answers, and
         waiting 15 minutes for a bus it will never grow is not the behaviour."""
         port = _free_port()
-        log, slack, conn = self._connector(tmp_path, port, budget=600.0)
+        log, slack, conn = self._connector(tmp_path, port, budget=outlast(JOIN))
         buf = supervisor.OutputBuffer(limit=4096)
         app = supervisor._build_fastapi_app(buf, lambda data: len(data), "tok")  # no comms
         thread, shutdown = supervisor._start_fastapi_server(app, "127.0.0.1", port)
@@ -875,21 +869,21 @@ class TestStartingBeforeTheSupervisor:
         conn._notify = said.append
         try:
             conn.start()
-            deadline = time.monotonic() + BUDGET
+            deadline = time.monotonic() + JOIN
             while time.monotonic() < deadline and not said:
                 time.sleep(0.05)
             assert said and "never came up" in said[0], "a definite no must not wait out the budget"
         finally:
             conn.stop()
             shutdown()
-            thread.join(timeout=BUDGET)
+            thread.join(timeout=JOIN)
 
     def test_the_give_up_is_said_out_loud(self, tmp_path):
         port = _free_port()
         said: list = []
-        log, slack, conn = self._connector(tmp_path, port, budget=0.3, notify=said.append)
+        log, slack, conn = self._connector(tmp_path, port, budget=CONNECT_EXPIRED, notify=said.append)
         conn.start()
-        deadline = time.monotonic() + BUDGET
+        deadline = time.monotonic() + JOIN
         while time.monotonic() < deadline and not said:
             time.sleep(0.05)
         conn.stop()
@@ -902,9 +896,9 @@ class TestStartingBeforeTheSupervisor:
         said: list = []
         log, slack, conn = self._connector(tmp_path, port, notify=said.append)
         conn.start()
-        time.sleep(0.3)
+        time.sleep(QUIET)
         conn.stop()
-        time.sleep(0.3)
+        time.sleep(QUIET)
         assert said == []
 
 

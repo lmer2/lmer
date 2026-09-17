@@ -3043,6 +3043,7 @@ def main(argv: list[str] | None = None) -> int:
         # live in. Both are read where the gates run — in the container.
         "LMER_GATE_NO_CACHE": os.environ.get("LMER_GATE_NO_CACHE"),
         "LMER_GATE_NO_PARALLEL": os.environ.get("LMER_GATE_NO_PARALLEL"),
+        "LMER_TESTS_WAIT_SCALE": os.environ.get("LMER_TESTS_WAIT_SCALE"),
         "LMER_GATE_CACHE_DIR": os.environ.get("LMER_GATE_CACHE_DIR"),
         "LMER_PRECOMMIT_CACHE_DIR": os.environ.get("LMER_PRECOMMIT_CACHE_DIR"),
         # Opt-in to the masterplan workflow. Truthy (get_bool_env) turns on the

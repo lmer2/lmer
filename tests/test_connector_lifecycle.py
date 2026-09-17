@@ -6,6 +6,7 @@ import pytest
 
 from lmer_cli import thread_posts
 from tests.connector_fakes import MatrixRig, ROOM, SlackRig, isolated_connectors
+from tests.timing_budgets import DRAIN, JOIN
 
 @pytest.mark.parametrize("channel", ["slack", "matrix"])
 def test_real_startup_retries_plain_inbound_exception(channel, tmp_path, monkeypatch):
@@ -32,15 +33,15 @@ def test_real_startup_retries_plain_inbound_exception(channel, tmp_path, monkeyp
     workers = []
     try:
         connector.start()
-        retried = next_poll.wait(20)
+        retried = next_poll.wait(JOIN)
         assert calls, "the real startup did not reach the injected transport"
         assert retried, f"real startup stopped polling after {len(calls)} transport call(s)"
     finally:
         with connector._threads_lock:
             workers = list(connector._threads)
-        connector.stop(timeout=20)
+        connector.stop(timeout=DRAIN)
         for worker in workers:
-            worker.join(timeout=20)
+            worker.join(timeout=JOIN)
         assert all(not worker.is_alive() for worker in workers)
         rig.bus._session._http.close()
         rig.log.close()
@@ -58,7 +59,7 @@ def test_real_startup_validates_identity_before_restoring_cursor(channel, deferr
     old._bus_cursor = 42
     old._state.save()
     path = checkpoint_path(old._lease.key, old._state.session)
-    old.stop(timeout=20, announce=False)
+    old.stop(timeout=DRAIN, announce=False)
     cls = type(old)
     remote_kw = {"slack": rig.slack} if channel == "slack" else {"matrix": rig.matrix}
     fresh = cls(old.config, bus_client=rig.bus, **remote_kw)
@@ -78,12 +79,12 @@ def test_real_startup_validates_identity_before_restoring_cursor(channel, deferr
     try:
         fresh.start()
         if deferred:
-            assert attempted.wait(20)
+            assert attempted.wait(JOIN)
             time.sleep(.05)
             assert path.read_bytes() == before
             assert fresh._state.session is None
             allow.set()
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + JOIN
         while not fresh._connected and time.monotonic() < deadline:
             time.sleep(.01)
         assert fresh._connected
@@ -91,7 +92,7 @@ def test_real_startup_validates_identity_before_restoring_cursor(channel, deferr
         assert fresh._state.session == rig.log.session
     finally:
         allow.set()
-        assert fresh.stop(timeout=20, announce=False)
+        assert fresh.stop(timeout=DRAIN, announce=False)
         rig.bus._session._http.close()
         rig.log.close()
 
@@ -106,7 +107,7 @@ def test_other_supervisor_checkpoint_is_preserved_without_import(channel, tmp_pa
     first._bus_cursor = 42
     first._state.save()
     path = checkpoint_path(first._lease.key, first._state.session)
-    first.stop(timeout=20, announce=False)
+    first.stop(timeout=DRAIN, announce=False)
     before = path.read_bytes()
     other_dir = tmp_path / "other"
     other_dir.mkdir()
@@ -119,7 +120,7 @@ def test_other_supervisor_checkpoint_is_preserved_without_import(channel, tmp_pa
         assert other.connector._bus_cursor == 0
         assert path.read_bytes() == before
     finally:
-        other.connector.stop(timeout=20, announce=False)
+        other.connector.stop(timeout=DRAIN, announce=False)
         for item in (rig, other):
             item.bus._session._http.close()
             item.log.close()

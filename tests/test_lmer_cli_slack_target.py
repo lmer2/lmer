@@ -34,6 +34,8 @@ import pytest
 
 from slack_chat.permalink import is_slack_thread_url
 
+from tests.timing_budgets import XDIST_GROUP
+
 from lmer_cli import targets as targets_mod
 from lmer_cli.targets import (
     SlackThreadTargets,
@@ -1142,6 +1144,7 @@ class TestSlackSessionRegistration:
         dereg.assert_not_called()
 
 
+@pytest.mark.xdist_group(XDIST_GROUP)
 @pytest.mark.parametrize("channel", ["slack", "matrix"])
 @pytest.mark.parametrize("supplied_control", [False, True])
 @pytest.mark.parametrize("session_kind", ["worker", "assistant"])
@@ -1156,6 +1159,7 @@ def test_chat_launch_starts_connector_with_digest_only_container(
     from lmer_cli.connector_ownership import ThreadKey
     from lmer_cli.threads import parse_thread
     from tests.connector_fakes import ChildHarness
+    from tests.timing_budgets import JOIN, LINK
     from tests.test_connector_process import wait_for
     from tests.test_platform_thread_connectors import FakeSlack, FakeMatrix
     from ask_channel.bus import BusClient, Endpoint
@@ -1200,7 +1204,7 @@ def test_chat_launch_starts_connector_with_digest_only_container(
         )
         servers.append(supervisor._start_fastapi_server(app, "127.0.0.1", int(captured["LMER_FASTAPI_PORT"])))
         client = BusClient(Endpoint(f"http://127.0.0.1:{captured['LMER_FASTAPI_PORT']}", "agent-fixture"))
-        assert client.wait_ready(budget=5, interval=.01)
+        assert client.wait_ready(budget=LINK, interval=.01)
         outgoing = client.post("message", "outbound seam")["message"]
         assert outgoing["source"]["channel"] == ("uber-lmer" if session_kind == "assistant" else "agent")
         wait_for(lambda: any("outbound seam" in item["text"] for item in harness.events()), harness)
@@ -1225,7 +1229,7 @@ def test_chat_launch_starts_connector_with_digest_only_container(
         harness.close()
         for thread, shutdown in servers:
             shutdown()
-            thread.join(timeout=3)
+            thread.join(timeout=JOIN)
             assert not thread.is_alive()
         if log is not None:
             log.close()
