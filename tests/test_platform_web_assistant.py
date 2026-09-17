@@ -911,15 +911,30 @@ def test_the_drawer_remembers_nothing_in_a_browser_store():
     lands on the fleet, which is what a glance would otherwise pay for.
 
     The width is still the theme's, not a preference.
+
+    The third key is the same shape of decision and not this rule bending either:
+    ``lmer.fleet.view`` is whether this operator reads the fleet as the list or as
+    the constellation map (#141 fleet map) — again a property of how somebody
+    reads a fleet rather than a fact about any run, and again not the drawer. It
+    cannot cost a glance what a remembered-open drawer would: both views render
+    from the fleet payload the screen already fetches, the map opens no
+    connection of its own, and ``list`` is the first mode and therefore the
+    default, so an operator who never touches the switch lands exactly where they
+    did before.
+
+    What stays true is the actual rule: nothing writes the drawer's own open
+    state, so closing it is still forgotten by the next load.
     """
     assert "localStorage" not in _read(DRAWER), (
         "the drawer stores something; if it is a preference it belongs in "
         "preferences.js and in ALLOWED_STORAGE_KEYS with a reason"
     )
     keys = re.findall(r"localStorage\.\w+\(\s*([A-Za-z0-9_.]+)", _read(APP))
-    assert set(keys) == {"THEME_STORAGE_KEY", "NARROW_STORAGE_KEY"}, (
+    assert set(keys) == {
+        "THEME_STORAGE_KEY", "NARROW_STORAGE_KEY", "FLEET_VIEW_STORAGE_KEY",
+    }, (
         f"the shell now stores {sorted(set(keys))}; the drawer's open state is "
-        "deliberately not remembered, and a third key here is a decision"
+        "deliberately not remembered, and a further key here is a decision"
     )
 
 

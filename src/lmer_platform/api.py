@@ -778,6 +778,41 @@ def _fold_threads(payload: dict) -> None:
         row["threads"] = component.listing(session_id) if session_id else []
 
 
+def _fold_relations(payload: dict) -> None:
+    """Put every related pair in the fleet on the payload, once.
+
+    On the payload for the reason the open questions and the statusline are: the
+    view that wants these renders the *whole* fleet at once, so one relation
+    request per run per poll is the wrong shape rather than a constant factor to
+    accept. :func:`lmer_platform.relations.all_pairs` is a single file read and
+    already yields each pair once, so nothing here de-duplicates.
+
+    An edge is kept only when both of its runs are rows on this payload. An
+    endpoint with no row is an edge attached to nothing — and dropping it here
+    keeps the two lists honest with each other, so a consumer can join on
+    ``run_key`` without checking. Relations naming an untracked run are not
+    lost: they stay where they have always been shown and named, on that run's
+    own detail view (``GET /api/runs/relations``), which this does not touch.
+    """
+    keys = set()
+    for row in payload.get("runs") or []:
+        if not isinstance(row, dict):
+            continue
+        # The row names its run in full at the top level
+        # (:class:`lmer_platform.inventory.RunView`), which is the same shape
+        # ``runKey()`` composes from in the browser — so the client joins these
+        # edges to its nodes without parsing anything.
+        try:
+            keys.add(run_key(row.get("host"), row.get("project"), row.get("slug")))
+        except Exception:
+            continue
+    payload["relations"] = [
+        {"a": first, "b": second}
+        for first, second in relations.all_pairs()
+        if first in keys and second in keys
+    ]
+
+
 def _fold_references(payload: dict) -> None:
     """Put each row's reference threads on the row, in place (issue #414).
 
@@ -883,6 +918,7 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     _fold_checkins(payload)
     _fold_threads(payload)
     _fold_references(payload)
+    _fold_relations(payload)
     if not tracked:
         payload["hint"] = (
             "No runs are tracked yet. The view is scoped to runs this "
