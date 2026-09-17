@@ -879,7 +879,8 @@ never an `answer`, whatever questions are open. It does not spend the first
 free-text message slot after an option-less question: the next live human
 message can still answer it.
 
-**The listeners** spawn sessions: `lmer-slack-listener` on a mention or DM
+**The listeners** default to spawning sessions: `lmer-slack-listener` on a
+mention or DM
 (socket mode, as before — it relays no content), `lmer-matrix-listener` on a
 mention of the bot's MXID or `m.mentions` entry from an MXID in
 `LMER_MATRIX_ALLOWED_USERS` (explicit MXIDs only; empty means nobody — the
@@ -888,12 +889,18 @@ share the session manager's capacity gate, per-thread dedup (the thread
 registry, keyed by channel kind) and idle reaper; the `LMER_SLACK_CHAT_*`
 tunables apply to both.
 
+With `LMER_ASSISTANT_MENTION_ROUTING=true`, both listeners instead send eligible
+mentions and replies beneath assistant-sent DMs to Uber Lmer's private pending
+inbox. Existing connected threads keep their normal delivery. See
+[assistant mention routing](ASSISTANT-MENTIONS.md) for configuration, context,
+replay protection and explicit replies to the originating conversation.
+
 **Limits stated plainly.** The matrix connector speaks the client-server API
 as a bot account and handles plaintext rooms; an end-to-end encrypted room is
 refused at connect time with its own name, and an encrypted event in a plain
 room is logged and skipped. Encryption for this connector is a follow-up.
-Both listeners spawn subprocesses; spawning through a platform daemon is not
-wired.
+In the default mode, both listeners spawn subprocesses; spawning through a
+platform daemon is not wired.
 
 The matrix chat connector is not the fleet bridge (`lmer-matrix-bridge`,
 `docs/MATRIX-CHAT.md`), which announces runs wanting a human into one room per
@@ -1354,6 +1361,8 @@ ask-directory readers and the steering form of `POST /api/sessions/{id}/input`.
 | `LMER_MATRIX_ALLOWED_USERS` | host | comma-separated MXIDs allowed to mention the bot and receive `lmer-signal dm` messages; exact match, unset or empty means nobody |
 | `LMER_SLACK_DM_ALLOWED_USERS` | host | comma-separated Slack user IDs or handles allowed to DM the listener and receive `lmer-signal dm` messages; entries matching `^[UW][A-Z0-9]{8,}$` are exact, case-sensitive IDs, while all others are case-insensitive, confirmed handles with a leading `@` ignored; unset or empty means nobody |
 | `LMER_MATRIX_ROOMS` | host, listener | optional room ids to watch; default every joined room |
+| `LMER_ASSISTANT_MENTION_ROUTING` | host, platform and listeners | default false; route mentions and replies beneath assistant DM parents to UL; see [assistant mention routing](ASSISTANT-MENTIONS.md) |
+| `LMER_ASSISTANT_MENTION_BACKLOG` | host, platform and listeners | default 10, integer 0–100; messages preceding a top-level mention |
 | `LMER_MATRIX_ROOM_ID`, `LMER_MATRIX_THREAD_EVENT`, `LMER_MATRIX_PERMALINK` | container, set by the target handler | the thread this session serves — context, not a credential |
 | `LMER_CHAT_ATTACH_ACK` | host / a connector, bool (default on) | whether a connector announces its own attachment in the thread. Both listeners set it to `0` on the `lmer` they spawn, because they announce that thread themselves. It gates the **ack** only — the note a connector posts when it stops listening is unconditional |
 | `LMER_CHAT_ATTACH_FROM_NOW` | a connector, bool (default off) | whether a **fresh** attachment starts reading the bus at its current position rather than at the beginning. The daemon sets it for a connection made while the session is already running; without it such a connector posts the run's whole journal into the thread. A connector resuming after its own death continues from its acked position either way |

@@ -1,4 +1,8 @@
-"""Host-side Slack listener that spawns one ``lmer chat`` session per thread.
+"""Host-side Slack listener with optional assistant routing.
+
+``LMER_ASSISTANT_MENTION_ROUTING`` selects the assistant's private inbox;
+``docs/ASSISTANT-MENTIONS.md`` describes admission and reply destinations.
+The default mode below spawns one ``lmer chat`` session per thread.
 
 ``lmer-slack-listener`` is a long-lived process that runs **on the host**,
 not inside a container. It holds a Slack socket-mode connection and, when
@@ -27,6 +31,7 @@ import os
 import sys
 
 from lmer_cli import dm_access
+from lmer_cli import assistant_mentions
 from lmer_cli.presets import Preset, load_presets, parse_preset_token
 from lmer_cli.tls import ensure_ca_bundle
 
@@ -109,6 +114,7 @@ DM_ALLOWED_USERS: set[str] = _csv_env_set(dm_access.SLACK_ALLOW_LIST_ENV)
 # Whether a listener-wide default is defined is a question about the spawned
 # CLI's environment instead — see SessionManager.child_presets (issue #279).
 PRESETS: dict[str, Preset] = load_presets()
+MENTIONS = assistant_mentions.Settings()
 
 
 def build_app(token: str | None = None):
@@ -417,6 +423,12 @@ async def handle_mention(event, say):
     channel = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
 
+    if MENTIONS.enabled:
+        if session_manager.touch(channel, thread_ts) or is_thread_connected(channel, thread_ts):
+            return
+        await _forward_assistant(channel, event)
+        return
+
     # DM detection here uses the channel-ID prefix rather than the
     # ``channel_type == "im"`` test used elsewhere: app_mention payloads don't
     # reliably carry ``channel_type``, whereas Slack DM channel IDs always
@@ -469,8 +481,7 @@ async def handle_message_event(event, say):
 
     # Activity tracking: every message in a tracked thread resets the idle
     # timer, including bot posts from the session's own agent.
-    if channel and thread_ts:
-        session_manager.touch(channel, thread_ts)
+    tracked = session_manager.touch(channel, thread_ts) if channel and thread_ts else False
 
     # The rest is DM session routing only
     if event.get("channel_type") != "im":
@@ -478,6 +489,12 @@ async def handle_message_event(event, say):
 
     # Skip bot messages and message subtypes (edits, deletes, etc.)
     if event.get("bot_id") or event.get("subtype"):
+        return
+
+    if MENTIONS.enabled:
+        if not event.get("thread_ts") or tracked or is_thread_connected(channel, thread_ts):
+            return
+        await _forward_assistant(channel, event)
         return
 
     user_id = event.get("user")
@@ -507,6 +524,13 @@ async def handle_message_event(event, say):
         dedup_channel=dedup_channel,
         preset_name=preset_name,
     )
+
+
+async def _forward_assistant(channel: str, event: dict) -> None:
+    try:
+        await asyncio.to_thread(assistant_mentions.forward, "slack", channel, event)
+    except Exception as exc:
+        logger.error("assistant_routing_failed transport=slack error=%s", exc)
 
 
 async def _run() -> None:
@@ -588,10 +612,14 @@ def main(argv=None) -> int:
     # SSL_CERT_FILE override is honored.
     _ensure_ca_bundle()
 
-    global session_manager, DM_ALLOWED_USERS, PRESETS
+    global session_manager, DM_ALLOWED_USERS, PRESETS, MENTIONS
     session_manager = SessionManager(lmer_env_file=args.lmer_env_file)
     DM_ALLOWED_USERS = _csv_env_set(dm_access.SLACK_ALLOW_LIST_ENV)
     PRESETS = load_presets()
+    try:
+        MENTIONS = assistant_mentions.Settings.from_env()
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if not os.environ.get("SLACK_BOT_TOKEN"):
         logger.error("slack_bot_token_missing")

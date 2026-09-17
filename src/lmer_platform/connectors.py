@@ -478,6 +478,11 @@ class ThreadConnectors:
     def _require_matrix_credentials(self):
         return thread_access.matrix_account(self._environ)
 
+    def live_holder(self, ref: ThreadRef) -> Optional[str]:
+        """Observe a recorded live connection before its connector has started."""
+        with self._lock:
+            return self._live_holder(ref)
+
     def _live_holder(self, ref: ThreadRef, *, besides: Optional[str] = None) -> Optional[str]:
         """The live session whose records claim *ref*, or ``None``.
 

@@ -28,6 +28,7 @@
 # nothing will ask for it.
 tests:
   text_diff_subset:
+    - tests/test_assistant_mentions_review.py
     - tests/test_agent_defs.py
     # Reads agent-files/claude/skills/chrome-agent/SKILL.md: the skill's
     # hazard and ladder assertions live there, so a prose-only edit to it

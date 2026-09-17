@@ -161,6 +161,22 @@ class MatrixClient:
                 return room
         return None
 
+    def is_direct_room(self, room_id: str) -> bool:
+        """Whether this account's m.direct directory identifies *room_id* as a DM."""
+        try:
+            body = self._call(
+                "GET", f"/_matrix/client/v3/user/{_q(self.account.user_id)}/account_data/m.direct")
+        except MatrixError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        if not isinstance(body, dict) or any(
+            not isinstance(rooms, list) or any(not isinstance(room, str) for room in rooms)
+            for rooms in body.values()
+        ):
+            raise MatrixError("m.direct returned invalid room lists")
+        return any(room_id in rooms for rooms in body.values())
+
     def membership(self, room_id: str, user_id: str) -> Optional[str]:
         """*user_id*'s membership in *room_id* — ``join``, ``invite``, ``leave``
         — or ``None`` when this account cannot read that state."""
@@ -250,6 +266,31 @@ class MatrixClient:
 
     def get_event(self, room_id: str, event_id: str) -> dict:
         return self._call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/event/{_q(event_id)}")
+
+    def history_before(self, room_id: str, event_id: str, limit: int) -> list:
+        """Up to *limit* room messages before the event, in timeline order."""
+        if limit == 0:
+            return []
+        prefix = f"/_matrix/client/v3/rooms/{_q(room_id)}"
+        context = self._call("GET", f"{prefix}/context/{_q(event_id)}", params={"limit": 0})
+        cursor = context.get("start")
+        if not cursor:
+            raise MatrixError("event context returned no backwards pagination token")
+        found: list = []
+        seen: set = set()
+        while cursor and len(found) < limit:
+            if cursor in seen:
+                raise MatrixError("room history pagination repeated a token")
+            seen.add(cursor)
+            page = self._call("GET", f"{prefix}/messages", params={
+                "from": cursor, "dir": "b", "limit": limit - len(found),
+                "filter": json.dumps({"types": ["m.room.message"]}),
+            })
+            found.extend(item for item in page.get("chunk", [])
+                         if isinstance(item, dict) and item.get("type") == "m.room.message"
+                         and item.get("event_id") != event_id)
+            cursor = page.get("end")
+        return list(reversed(found[:limit]))
 
     def thread_events(self, room_id: str, root_event_id: str, *, limit: Optional[int] = 100) -> list:
         """Thread replies, oldest first; ``limit=None`` follows every page."""

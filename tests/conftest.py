@@ -800,6 +800,17 @@ def _isolate_user_harnesses(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _isolate_dm_registry(tmp_path_factory):
+    """Keep shared DM sends out of the operator's durable room registry."""
+    from lmer_cli import dm_parents
+
+    original = dm_parents.REGISTRY_DIR
+    dm_parents.REGISTRY_DIR = str(tmp_path_factory.mktemp("dm-registry"))
+    yield
+    dm_parents.REGISTRY_DIR = original
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _isolate_platform_state(tmp_path_factory):
     """Point platform state away from the real ~/.lmer/platform (issue #141).
 

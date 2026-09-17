@@ -97,9 +97,11 @@ from lmer_cli import comms as bus_comms
 from lmer_cli import thread_access
 from lmer_cli import thread_posts
 from lmer_cli import thread_requests as thread_queue
+from lmer_cli.assistant_mentions import Settings as MentionSettings
 from lmer_cli.threads import ThreadError
 
 from . import meta
+from . import mention_routing
 from . import references
 from . import reattach
 from . import relations
@@ -1738,6 +1740,7 @@ def create_app(
 
     builder = state_builder or build_state
     app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION))
+    mention_settings = MentionSettings.from_env()
 
     # The UI bundle is ~550 kB uncompressed and ~130 kB gzipped, almost all of it
     # Vuetify's precompiled utilities sheet, which does not tree-shake. That
@@ -2046,6 +2049,7 @@ def create_app(
             "                               writes after the operator states a\n"
             "                               standing preference in chat. Re-read\n"
             "                               first; this is not a patch\n"
+            "  POST /api/assistant/requests  admit a host listener mention or DM reply\n"
             "  POST /api/assistant/pending  take the digests the daemon spooled and\n"
             "                               clear them. DESTRUCTIVE, hence not a\n"
             "                               GET; the status carries the count, so\n"
@@ -3981,6 +3985,16 @@ def create_app(
         except AssistantError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return _instructions_reply(state)
+
+    @app.post("/api/assistant/requests", dependencies=guard)
+    def assistant_request(body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Admit an authenticated host listener event to the assistant inbox."""
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(status_code=403, detail="only a host listener may submit transport events")
+        try:
+            return mention_routing.receive(body, mention_settings)
+        except (ThreadError, AssistantError) as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
 
     @app.post("/api/assistant/pending", dependencies=guard)
     def assistant_pending() -> dict:

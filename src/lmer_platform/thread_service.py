@@ -161,6 +161,7 @@ class ThreadServices:
             label=_run_label_of(session_id),
             run_name=_run_name_of(session_id),
             env=self._environ,
+            assistant_session=(registry.read_session(session_id) or {}).get("kind") == registry.ASSISTANT_KIND,
             store=self._store(session_id),
             # A run asking about its *own* threads: the daemon keeps them, so
             # only its servicers carry this (issue #429).
