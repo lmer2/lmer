@@ -5,6 +5,7 @@ from lmer_cli import thread_posts
 from lmer_platform import store
 from slack_chat import registry
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import CLI, JOIN, LINK, STOP, child_bounds
 from tests.test_matrix_chat import Rig as MatrixRig, ROOM
 from tests.test_slack_connector import Rig as SlackRig
 
@@ -38,17 +39,17 @@ def live_supervisor(tmp_path):
     worker = threading.Thread(target=lambda: server.run(sockets=[listener]), daemon=True)
     worker.start()
     try:
-        deadline = time.monotonic() + 30
+        deadline = time.monotonic() + LINK
         while not server.started and time.monotonic() < deadline:
             time.sleep(0.01)
         assert server.started
         yield SimpleNamespace(log=log, endpoint=endpoint, client=bus.BusClient(endpoint))
     finally:
         server.should_exit = True
-        worker.join(timeout=90)
+        worker.join(timeout=JOIN)
         if worker.is_alive():
             server.force_exit = True
-            worker.join(timeout=90)
+            worker.join(timeout=JOIN)
         listener.close()
         log.close()
         assert not worker.is_alive()
@@ -60,6 +61,7 @@ import fcntl
 import hashlib
 import importlib
 import json
+import logging
 import os
 import signal
 from pathlib import Path
@@ -68,7 +70,14 @@ import threading
 import time
 import uuid
 
+faulthandler.enable()
 faulthandler.register(signal.SIGUSR1, all_threads=True)
+
+# Log before imports so an import failure still leaves child evidence.
+def say(text):
+    print("[fixture-child %d] %s" % (os.getpid(), text), file=sys.stderr, flush=True)
+
+say("start argv=%r" % (sys.argv[1:],))
 
 from lmer_cli import connector_delivery, connector_lifecycle, thread_posts
 from slack_chat import registry
@@ -84,6 +93,12 @@ thread_root = os.environ["CONNECTOR_FIXTURE_ROOT"]
 
 def mode():
     return (root / "mode").read_text().strip()
+
+def current_mode():
+    try:
+        return mode()
+    except OSError as exc:
+        return "unreadable (%s)" % exc
 
 def events():
     return [json.loads(line) for line in (root / "events.jsonl").read_text().splitlines()]
@@ -175,7 +190,13 @@ if sys.argv[2] == "recover":
             (root / "recovery.reached").write_text("reached")
             os._exit(71)
     connector_recovery.write_json = interrupt_recovery
-    sys.exit(connector_recovery.main(sys.argv[3:]))
+    recovery_code = connector_recovery.main(sys.argv[3:])
+    say("recovery exit code=%r" % (recovery_code,))
+    sys.exit(recovery_code)
+
+# Leave the recovery CLI's logging configuration intact.
+logging.basicConfig(level=logging.INFO, stream=sys.stderr, force=True,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 module = importlib.import_module(channel + "_chat.connector")
 module.__file__ = str(root / "watched.py")
@@ -183,8 +204,8 @@ connector_lifecycle.ConnectorLifecycle._bus_poll_seconds = 0.02
 getattr(module, "SlackConnector" if channel == "slack" else "MatrixConnector")._bus_poll_seconds = 0.02
 if channel == "slack": module.SlackClient = lambda *args, **kwargs: remote
 else: module.MatrixClient = lambda *args, **kwargs: remote
-connector_lifecycle.DRAIN_SECONDS = float(os.environ.get("CONNECTOR_FIXTURE_DRAIN", "10.0"))
-connector_lifecycle.MODULE_POLL_SECONDS = float(os.environ.get("CONNECTOR_FIXTURE_POLL", "0.05"))
+connector_lifecycle.DRAIN_SECONDS = float(os.environ["CONNECTOR_FIXTURE_DRAIN"])
+connector_lifecycle.MODULE_POLL_SECONDS = float(os.environ["CONNECTOR_FIXTURE_POLL"])
 connector_lifecycle.FAILURE_LIMIT = 2
 connector_lifecycle.ConnectorLifecycle._backoff = lambda self: self._stop.wait(0.02)
 original_write = connector_delivery.write_json
@@ -206,12 +227,21 @@ real_exec = os.execv
 original_args = list(sys.argv)
 def reexec(executable, argv):
     with (root / "execs").open("a") as stream: stream.write(str(os.getpid()) + "\n")
+    say("reload exec")
     real_exec(executable, [executable, *original_args])
 os.execv = reexec
 args = sys.argv[2:]
 if args[:1] == ["-m"]: args = args[2:]
 sys.argv = [module.__name__, *args]
-sys.exit(module.main(args))
+code = None
+try:
+    code = module.main(args)
+except BaseException as exc:
+    say("raised %s: %s" % (type(exc).__name__, exc))
+    raise
+finally:
+    say("exit code=%r mode=%s" % (code, current_mode()))
+sys.exit(code)
 '''
 
 
@@ -234,6 +264,7 @@ class ChildHarness:
         (self.root / "mode").write_text("healthy")
         self.children = []
         self.log_paths = []
+        self.bounds = child_bounds()
 
     def environment(self):
         import os
@@ -244,10 +275,12 @@ class ChildHarness:
                 "LMER_SUPERVISOR_URL": self.supervisor.endpoint.url,
                 "LMER_FASTAPI_TOKEN": self.supervisor.endpoint.token,
                 "SLACK_BOT_TOKEN": "fixture-bot", "LMER_CHAT_ATTACH_ACK": "0",
-                "LMER_SLACK_POLL_SECONDS": "0.02", "LMER_COMMS_CONNECT_BUDGET": "30",
+                "LMER_SLACK_POLL_SECONDS": "0.02",
                 "LMER_MATRIX_HOMESERVER": "https://fixture.invalid",
                 "LMER_MATRIX_USER_ID": "@lmer:example.org", "LMER_MATRIX_ACCESS_TOKEN": "fixture-token",
-                "LMER_MATRIX_AUTHENTICATED_MEDIA": "1"}
+                "LMER_MATRIX_AUTHENTICATED_MEDIA": "1",
+                # Survives reload execv; a -u flag is lost when argv is rebuilt.
+                "PYTHONUNBUFFERED": "1", **self.bounds}
 
     def runner(self, argv, env, log_path=None, *, pass_fds=()):
         import sys
@@ -279,7 +312,7 @@ class ChildHarness:
 
         return subprocess.run([sys.executable, str(self.root / "bootstrap.py"), self.channel, "recover",
                                "--permalink", self.link, *args], env=child_environment(self.environment()),
-                              capture_output=True, text=True, timeout=90)
+                              capture_output=True, text=True, timeout=CLI)
 
     def events(self):
         import json
@@ -288,4 +321,4 @@ class ChildHarness:
     def close(self):
         from lmer_cli.connector_process import terminate_wait
         for process in self.children:
-            terminate_wait(process, timeout=30)
+            terminate_wait(process, timeout=STOP)

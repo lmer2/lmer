@@ -6,8 +6,11 @@ import pytest
 from lmer_cli import comms
 from lmer_cli.connector_delivery import checkpoint_path, marker_path, receipt_path
 from lmer_cli.connector_ownership import read_json
+from tests.timing_budgets import SETTLE, STOP, XDIST_GROUP
 from tests.test_connector_process import child, wait_for
 from tests.connector_fakes import isolated_connectors, live_supervisor
+
+pytestmark = pytest.mark.xdist_group(XDIST_GROUP)
 
 
 def block(child, mode="unknown"):
@@ -45,7 +48,7 @@ def test_explicit_retry_cli_selects_one_operation_and_retains_source(child):
         assert all("choose next step" in event["text"] for event in child.events())
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
-        owned.stop(timeout=30)
+        owned.stop(timeout=STOP)
 
 
 @pytest.mark.parametrize("mode", ["receipt-failure", "receipt-saved"])
@@ -65,7 +68,7 @@ def test_verified_receipt_cli_finishes_bookkeeping_without_resend(child, mode):
         assert len(child.events()) == 1
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
-        owned.stop(timeout=30)
+        owned.stop(timeout=STOP)
 
 
 @pytest.mark.parametrize("interrupted", [False, True])
@@ -113,7 +116,7 @@ def test_ledger_confirmation_blocks_retry_after_checkpoint_failure(child, interr
         assert len(child.events()) == 1
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
-        owned.stop(timeout=30)
+        owned.stop(timeout=STOP)
 
 
 @pytest.mark.parametrize("conflict", ["identity", "second-receipt"])
@@ -172,12 +175,12 @@ def test_recovery_cli_cannot_take_lease_from_live_child(child):
         wait_for(lambda: bool(child.events()), child)
         before = read_json(child.key.owner_path)["token"]
         result = child.cli("inspect")
-        assert result.returncode == 2
+        assert result.returncode == 2, result.stderr
         assert read_json(child.key.owner_path)["token"] == before
         assert owned.popen.poll() is None
     finally:
         (child.root / "mode").write_text("healthy")
-        owned.stop(timeout=30)
+        owned.stop(timeout=STOP)
 
 
 def test_matrix_retry_preserves_confirmed_parts_same_name_indices_and_question(tmp_path, live_supervisor):
@@ -212,14 +215,14 @@ def test_matrix_retry_preserves_confirmed_parts_same_name_indices_and_question(t
         (harness.root / "mode").write_text("healthy")
         resumed = harness.spawn()
         try:
-            wait_for(lambda: read_json(checkpoint_path(harness.key, live_supervisor.log.session))["pending"] is None, harness, timeout=120)
+            wait_for(lambda: read_json(checkpoint_path(harness.key, live_supervisor.log.session))["pending"] is None, harness, SETTLE)
             events = harness.events()
             assert len(events) == 5  # one question, three files, one explicitly accepted duplicate
             assert sum("check all files" in event["text"] for event in events) == 1
             assert len({event["file"]["url"] for event in events if event["kind"] == "m.file"}) == 3
             assert live_supervisor.log.read_since(0)[0][0].id == source.id
         finally:
-            resumed.stop(timeout=30)
+            resumed.stop(timeout=STOP)
     finally:
         harness.close()
 
@@ -231,7 +234,7 @@ def test_receipt_cli_rejects_receipt_from_earlier_completed_identical_send(child
         wait_for(lambda: bool(child.events()), child)
         wait_for(lambda: read_json(checkpoint_path(child.key, child.supervisor.log.session))["pending"] is None, child)
     finally:
-        first.stop(timeout=30)
+        first.stop(timeout=STOP)
     old_ref = child.events()[0]["ref"]
     (child.root / "mode").write_text("unknown")
     child.supervisor.log.append(kind="milestone", text="identical text", source=comms.Source("agent"))
@@ -286,4 +289,4 @@ def test_interrupted_receipt_cli_resumes_saved_confirmation_without_send(child):
         assert len(child.events()) == 1
         assert child.supervisor.log.read_since(0)[0][0].id == source.id
     finally:
-        resumed.stop(timeout=30)
+        resumed.stop(timeout=STOP)

@@ -1,0 +1,2 @@
+fixed:
+- "Tests that spawn real processes now scale every wall-clock wait by one factor and run on a single parallel worker."

@@ -9,6 +9,9 @@ import sys
 
 from lmer_cli.test_resources import SERIAL_ENV, read_limits
 
+#: Consumed by tests/timing_budgets.py; unset defaults to 1.
+WAIT_SCALE_ENV = "LMER_TESTS_WAIT_SCALE"
+
 
 def test_command(argv: list[str]) -> list[str]:
     """Keep the gate's interpreter and targets; cap this project's workers at four."""
@@ -26,7 +29,16 @@ def test_command(argv: list[str]) -> list[str]:
         )
     except (OSError, subprocess.SubprocessError):
         return argv
-    return argv + ["-n", str(workers)] if probe.returncode == 0 else argv
+    # xdist_group is inert without loadgroup.
+    return argv + ["-n", str(workers), "--dist", "loadgroup"] if probe.returncode == 0 else argv
+
+
+def set_wait_scale(argv: list[str]) -> None:
+    """Set the wait scale from the worker count unless explicitly configured."""
+    if os.environ.get(WAIT_SCALE_ENV, "").strip():
+        return
+    if "-n" in argv[:-1]:
+        os.environ[WAIT_SCALE_ENV] = argv[argv.index("-n") + 1]
 
 
 def main() -> None:
@@ -34,6 +46,7 @@ def main() -> None:
         # A gate under test must not rediscover the enclosing suite's override.
         os.environ[SERIAL_ENV] = "1"
         argv = sys.argv[2:]
+        set_wait_scale(argv)
         os.execvpe(argv[0], argv, os.environ)
     if sys.argv[1:] != ["--lmer-command"]:
         raise SystemExit("Use the work-repo argv-v1 parallel test runner contract")

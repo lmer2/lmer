@@ -17,6 +17,7 @@ from slack_chat import connector as slack_connector
 from slack_chat import sessions as slack_sessions
 from slack_chat.client import SlackError
 from tests.conftest import drain_connectors
+from tests.timing_budgets import DRAIN
 from tests.connector_fakes import isolated_connectors
 from tests.test_matrix_chat import FakeMatrix
 
@@ -34,7 +35,7 @@ def connector_lifetimes(monkeypatch):
             instances.append(instance)
         monkeypatch.setattr(cls, "__init__", track)
     yield
-    drain_connectors(instances, 30.0, announce=False)
+    drain_connectors(instances, DRAIN, announce=False)
 
 
 
@@ -85,7 +86,7 @@ class TestTheConnectorsOwnLines:
         about something that never started."""
         slack = FakeSlack()
         built = slack_connector_with(slack=slack)
-        built.stop(timeout=30)
+        built.stop(timeout=DRAIN)
         assert slack.posted == []
 
     def test_the_ack_is_off_when_something_else_announced_the_thread(self):

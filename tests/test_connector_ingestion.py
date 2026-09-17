@@ -6,6 +6,9 @@ import pytest
 
 from lmer_cli import thread_posts
 from tests.connector_fakes import MatrixRig, ROOM, SlackRig, isolated_connectors
+from tests.timing_budgets import DRAIN, JOIN, SCRIPT, XDIST_GROUP
+
+pytestmark = pytest.mark.xdist_group(XDIST_GROUP)
 
 @pytest.mark.parametrize("channel", ["slack", "matrix"])
 def test_actual_raised_ingestion_retains_whole_held_batch(channel, tmp_path, monkeypatch):
@@ -47,7 +50,7 @@ def test_actual_raised_ingestion_retains_whole_held_batch(channel, tmp_path, mon
         assert len(source) == 2, "source records must remain available"
         assert accepted == ["held-one", "held-two"]
     finally:
-        connector.stop(timeout=30)
+        connector.stop(timeout=DRAIN)
         rig.bus._session._http.close()
         rig.log.close()
 
@@ -79,7 +82,7 @@ def test_pending_answer_and_known_attribution_survive_reconstruction(channel, tm
         assert original._pending_inbound
         bound = next(iter(original._pending_inbound.values()))
         assert bound["question"] == question.id
-        original.stop(timeout=30, announce=False)
+        original.stop(timeout=DRAIN, announce=False)
         # The original question is now closed; a freshly computed answer would bind the new one.
         rig.bus.post("answer", "already decided", in_reply_to=question.id, source={"channel": "terminal"})
         newer = rig.agent("question", "new question")
@@ -97,9 +100,9 @@ def test_pending_answer_and_known_attribution_survive_reconstruction(channel, tm
             assert not fresh._pending_inbound
             assert not fresh._posters._held
         finally:
-            fresh.stop(timeout=30, announce=False)
+            fresh.stop(timeout=DRAIN, announce=False)
     finally:
-        original.stop(timeout=30, announce=False)
+        original.stop(timeout=DRAIN, announce=False)
         rig.bus._session._http.close()
         rig.log.close()
 
@@ -120,7 +123,7 @@ def test_simultaneous_inbound_and_receipt_bookkeeping_never_persist_torn_context
     result = subprocess.run(
         [sys.executable, "-c", script, channel, str(tmp_path)],
         env={**os.environ, "PYTHONPATH": str(root) + os.pathsep + str(root / "src")},
-        capture_output=True, text=True, timeout=360,
+        capture_output=True, text=True, timeout=SCRIPT,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -159,7 +162,7 @@ def _exercise_interleaving(channel, tmp_path, monkeypatch):
     wrote = conn._posters.wrote
     def pause(receipt):
         entered.set()
-        assert release.wait(90), "test bookkeeping barrier was not released"
+        assert release.wait(JOIN), "test bookkeeping barrier was not released"
         wrote(receipt)
     monkeypatch.setattr(conn._posters, "wrote", pause)
     def run(action):
@@ -174,19 +177,19 @@ def _exercise_interleaving(channel, tmp_path, monkeypatch):
     incoming = threading.Thread(target=run, args=(inbound,))
     try:
         outbound.start()
-        assert entered.wait(90)
+        assert entered.wait(JOIN)
         count = len(snapshots)
         incoming.start()
-        assert inbound_attempt.wait(90)
+        assert inbound_attempt.wait(JOIN)
         time.sleep(.05)
         assert len(snapshots) == count, "inbound persisted while receipt bookkeeping held the state lock"
     finally:
         release.set()
-        outbound.join(timeout=90)
+        outbound.join(timeout=JOIN)
         if incoming.ident is not None:
-            incoming.join(timeout=90)
+            incoming.join(timeout=JOIN)
         assert not outbound.is_alive() and not incoming.is_alive()
-        conn.stop(timeout=30, announce=False)
+        conn.stop(timeout=DRAIN, announce=False)
         rig.bus._session._http.close()
         rig.log.close()
     assert errors == []
@@ -228,7 +231,7 @@ def test_supervisor_acceptance_followed_by_lost_response_retries_original_answer
         assert rig.log.question(newer.id).open
         assert not conn._pending_inbound
     finally:
-        conn.stop(timeout=30, announce=False)
+        conn.stop(timeout=DRAIN, announce=False)
         rig.bus._session._http.close()
         rig.log.close()
 
@@ -258,7 +261,7 @@ def test_attributed_batch_exceeding_hold_limit_drains(channel, reconstruct, tmp_
                 with pytest.raises(RuntimeError, match="known backlog"):
                     poll()
             assert len(connector._posters._held) == len(source)
-            connector.stop(timeout=30, announce=False)
+            connector.stop(timeout=DRAIN, announce=False)
             kwargs = {"slack": remote} if channel == "slack" else {"matrix": remote}
             connector = type(connector)(connector.config, bus_client=rig.bus, **kwargs)
             monkeypatch.setattr(connector._posters, "_poster_of", lambda message: None)
@@ -268,6 +271,6 @@ def test_attributed_batch_exceeding_hold_limit_drains(channel, reconstruct, tmp_
         assert actual == source
         assert not connector._posters._held
     finally:
-        connector.stop(timeout=30, announce=False)
+        connector.stop(timeout=DRAIN, announce=False)
         rig.bus._session._http.close()
         rig.log.close()

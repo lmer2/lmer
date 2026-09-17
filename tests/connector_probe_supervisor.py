@@ -9,17 +9,18 @@ import sys
 import time
 
 
-def run_probe(argv, *, env, timeout, receipt):
+def run_probe(argv, *, env, timeout, reap, receipt):
+    """Run a contained probe with caller-supplied budgets; its isolated script cannot import tests."""
     return subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), str(timeout), str(receipt), *argv],
+        [sys.executable, str(Path(__file__).resolve()), str(timeout), str(reap), str(receipt), *argv],
         env=env, capture_output=True, text=True, check=False,
     )
 
 
 def main():
     assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
-    timeout, receipt = float(sys.argv[1]), Path(sys.argv[2])
-    process = subprocess.Popen(sys.argv[3:], start_new_session=True)
+    timeout, reap, receipt = float(sys.argv[1]), float(sys.argv[2]), Path(sys.argv[3])
+    process = subprocess.Popen(sys.argv[4:], start_new_session=True)
     result = {"probe_pid": process.pid, "timed_out": False, "collected": []}
     try:
         try:
@@ -29,7 +30,7 @@ def main():
             process.kill()
             result["returncode"] = process.wait()
     finally:
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + reap
         while True:
             children = Path(f"/proc/self/task/{os.getpid()}/children").read_text().split()
             for pid in map(int, children):

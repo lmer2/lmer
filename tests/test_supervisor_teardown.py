@@ -12,9 +12,15 @@ from fastapi.testclient import TestClient
 
 from lmer_cli import comms, supervisor
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import (
+    BUSY_BOUND, CHILD_ALIVE, HANDOFF, JOIN, LATE_HANDOFF, SHORT_CHILD,
+    TEARDOWN_BOUND, XDIST_GROUP, outlast,
+)
+
+pytestmark = pytest.mark.xdist_group(XDIST_GROUP)
 
 
-NATURAL_EXIT_CHILD = r"""
+NATURAL_EXIT_CHILD = f"""
 import os, signal, time
 go = False
 def begin_exit(*args):
@@ -22,10 +28,10 @@ def begin_exit(*args):
     go = True
 signal.signal(signal.SIGINT, signal.SIG_IGN)
 signal.signal(signal.SIGUSR2, begin_exit)
-os.write(1, b'ready\n')
+os.write(1, b'ready\\n')
 while not go:
     time.sleep(.005)
-time.sleep(.3)
+time.sleep({SHORT_CHILD})
 """
 
 
@@ -43,7 +49,7 @@ def supervised(monkeypatch, tmp_path):
     fork = os.fork
     openpty = os.openpty
     build = supervisor._build_fastapi_app
-    monkeypatch.setattr(supervisor, "END_REQUEST_HANDOFF_SECONDS", .2, raising=False)
+    monkeypatch.setattr(supervisor, "END_REQUEST_HANDOFF_SECONDS", HANDOFF, raising=False)
 
     def track_fork():
         pid = fork()
@@ -79,6 +85,15 @@ def supervised(monkeypatch, tmp_path):
 
         return None, stop_server
 
+    def evidence():
+        """Render the supervised child state and captured output for a failed wait."""
+        buffer = observed.get("output")
+        output = buffer.read_since(0, timeout=0)[0] if buffer is not None else b""
+        return "child pid=%s exit=%s running_at_stop=%s\n%s" % (
+            observed.get("child_pid"), observed.get("exit_code"),
+            observed.get("child_running_at_stop"), output.decode(errors="replace"))
+
+    observed["evidence"] = evidence
     monkeypatch.setattr(supervisor.os, "fork", track_fork)
     monkeypatch.setattr(supervisor.os, "openpty", track_pty)
     monkeypatch.setattr(supervisor, "_open_comms_log", lambda: log)
@@ -98,7 +113,7 @@ def supervised(monkeypatch, tmp_path):
 
         def drive():
             try:
-                deadline = time.monotonic() + 2
+                deadline = time.monotonic() + JOIN
                 while signal.getsignal(signal.SIGUSR1) is previous_handler:
                     assert time.monotonic() < deadline, "shutdown handler was never installed"
                     time.sleep(0.005)
@@ -122,14 +137,14 @@ def supervised(monkeypatch, tmp_path):
             return observed, log
         finally:
             if thread:
-                thread.join(timeout=3)
+                thread.join(timeout=JOIN)
                 assert not thread.is_alive()
             # Production exits this process; the fixture reuses its fd table.
             # Finish delayed chords before another test can open a new PTY.
             for name in ("lmer-supervisor-self-shutdown", "lmer-supervisor-quit"):
                 for worker in threading.enumerate():
                     if worker.name == name:
-                        worker.join(timeout=2)
+                        worker.join(timeout=JOIN)
                         assert not worker.is_alive()
             for pid in children:
                 with contextlib.suppress(ProcessLookupError):
@@ -146,7 +161,7 @@ def supervised(monkeypatch, tmp_path):
 
 def test_control_stays_up_after_pty_eof_until_child_exit(supervised):
     result, _ = supervised(
-        "import os,time; os.close(0); os.close(1); os.close(2); time.sleep(.3)"
+        f"import os,time; os.close(0); os.close(1); os.close(2); time.sleep({SHORT_CHILD})"
     )
     assert result["child_running_at_stop"] is False
     assert result["exit_code"] == 0
@@ -155,10 +170,10 @@ def test_control_stays_up_after_pty_eof_until_child_exit(supervised):
 def test_reaps_harness_without_waiting_for_descendants_pty_eof(supervised):
     result, _ = supervised(
         "import os,signal,time; signal.signal(signal.SIGHUP, signal.SIG_IGN); "
-        "child=os.fork(); time.sleep(3) if child == 0 else None; os._exit(0)"
+        f"child=os.fork(); time.sleep({CHILD_ALIVE}) if child == 0 else None; os._exit(0)"
     )
     assert result["child_running_at_stop"] is False
-    assert result["duration"] < 2, "supervisor waited for the descendant's PTY EOF"
+    assert result["duration"] < TEARDOWN_BOUND, "supervisor waited for the descendant's PTY EOF"
 
 
 @pytest.mark.parametrize("size", [(0, 0), (24, 1), (1, 80)])
@@ -167,7 +182,7 @@ def test_transient_host_geometry_preserves_last_valid_size(supervised, size):
         supervisor._set_winsize(fd, *size)
         os.kill(os.getpid(), signal.SIGWINCH)
 
-    result, _ = supervised("import time; time.sleep(.3)", driver=resize, host_size=(24, 80))
+    result, _ = supervised(f"import time; time.sleep({SHORT_CHILD})", driver=resize, host_size=(24, 80))
     assert result["final_geometry"] == (24, 80)
 
 
@@ -178,11 +193,11 @@ def test_headless_child_starts_with_readable_geometry(supervised):
 
 def test_requested_shutdown_publishes_structured_ack_and_reaps(supervised):
     def request(_fd, observed):
-        output, _, _ = observed["output"].read_since(0, timeout=2)
-        assert b"ready" in output, "child did not reach exec before the quit chord"
+        output, _, _ = observed["output"].read_since(0, timeout=JOIN)
+        assert b"ready" in output, "child did not reach exec before the quit chord\n" + observed["evidence"]()
         os.kill(os.getpid(), signal.SIGUSR1)
 
-    result, log = supervised("import time; print('ready', flush=True); time.sleep(3)", driver=request)
+    result, log = supervised(f"import time; print('ready', flush=True); time.sleep({CHILD_ALIVE})", driver=request)
     messages, _ = log.read_since(0)
     acknowledgments = [m for m in messages if m.meta.get("event") == comms.EVENT_SESSION_END_REQUESTED]
     assert len(acknowledgments) == 1
@@ -199,13 +214,13 @@ def test_shutdown_without_daemon_stays_bounded_and_unarmed(supervised, monkeypat
     registry.register(session_id, pid=os.getpid())
 
     def request(_fd, observed):
-        output, _, _ = observed["output"].read_since(0, timeout=2)
-        assert b"ready" in output
+        output, _, _ = observed["output"].read_since(0, timeout=JOIN)
+        assert b"ready" in output, observed["evidence"]()
         os.kill(os.getpid(), signal.SIGUSR1)
 
-    result, log = supervised("import time; print('ready', flush=True); time.sleep(3)", driver=request)
+    result, log = supervised(f"import time; print('ready', flush=True); time.sleep({CHILD_ALIVE})", driver=request)
     assert result["exit_code"] == 0
-    assert .2 <= result["duration"] < 1.5
+    assert HANDOFF <= result["duration"] < TEARDOWN_BOUND
     assert log.subscribers() == {}
     messages, _ = log.read_since(0)
     assert any(m.meta.get("event") == comms.EVENT_SESSION_END_REQUESTED for m in messages)
@@ -244,16 +259,16 @@ def test_delivery_requires_a_specific_authenticated_daemon_ack():
 @pytest.mark.parametrize("confirmed", [False, True])
 def test_handoff_logs_once_only_when_delivery_is_unconfirmed(confirmed, caplog):
     log = comms.MessageLog("handoff-test-session")
-    handoff = supervisor._ShutdownHandoff(log, .1)
+    handoff = supervisor._ShutdownHandoff(log, HANDOFF)
     started = time.monotonic()
     handoff.start()
     if confirmed:
-        messages, _ = log.read_since(0, timeout=1)
+        messages, _ = log.read_since(0, timeout=JOIN)
         log.ack(comms.PLATFORM_SUBSCRIBER, messages[-1].seq)
     handoff.wait()
-    assert handoff.done.wait(1)
+    assert handoff.done.wait(JOIN)
     handoff.wait()
-    assert time.monotonic() - started < .5
+    assert time.monotonic() - started < outlast(HANDOFF)
     records = [r for r in caplog.records if "supervisor_end_handoff_unconfirmed" in r.message]
     assert len(records) == (0 if confirmed else 1)
     if not confirmed:
@@ -269,7 +284,7 @@ def test_stalled_publication_cannot_hold_natural_exit_forever(supervised, monkey
     def stalled(log):
         entered.set()
         try:
-            assert release.wait(3)
+            assert release.wait(JOIN)
             return announce(log)
         finally:
             published.set()
@@ -277,21 +292,21 @@ def test_stalled_publication_cannot_hold_natural_exit_forever(supervised, monkey
     monkeypatch.setattr(supervisor, "_announce_shutdown", stalled)
 
     def request(_fd, observed):
-        output, _, _ = observed["output"].read_since(0, timeout=2)
-        assert b"ready" in output
+        output, _, _ = observed["output"].read_since(0, timeout=JOIN)
+        assert b"ready" in output, observed["evidence"]()
         os.kill(os.getpid(), signal.SIGUSR1)
-        assert entered.wait(1)
+        assert entered.wait(JOIN), observed["evidence"]()
         os.kill(observed["child_pid"], signal.SIGUSR2)
 
     try:
         result, _ = supervised(NATURAL_EXIT_CHILD, driver=request)
         assert result["exit_code"] == 0
-        assert result["duration"] < 1.2
+        assert result["duration"] < TEARDOWN_BOUND
         assert result["api_closed"].is_set()
     finally:
         release.set()
         if entered.is_set():
-            assert published.wait(1)
+            assert published.wait(JOIN)
 
 
 def test_natural_exit_waits_for_authenticated_late_subscriber(supervised, monkeypatch, tmp_path):
@@ -300,7 +315,8 @@ def test_natural_exit_waits_for_authenticated_late_subscriber(supervised, monkey
 
     monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
     store.write_json(config.config_path(), {"nudge_after_seconds": 0, "checkin_window_seconds": 0})
-    monkeypatch.setattr(supervisor, "END_REQUEST_HANDOFF_SECONDS", 1.5, raising=False)
+    # Exceed TEARDOWN_BOUND so waiting out the handoff would fail the duration assertion.
+    monkeypatch.setattr(supervisor, "END_REQUEST_HANDOFF_SECONDS", LATE_HANDOFF, raising=False)
     session_id = registry.new_session_id()
     registry.register(session_id, pid=os.getpid())
     hub = platform_comms.CommsHub()
@@ -312,7 +328,7 @@ def test_natural_exit_waits_for_authenticated_late_subscriber(supervised, monkey
     def delayed_announce(log):
         publish_entered.set()
         try:
-            assert release_publish.wait(2)
+            assert release_publish.wait(JOIN)
             return announce(log)
         finally:
             published.set()
@@ -320,13 +336,13 @@ def test_natural_exit_waits_for_authenticated_late_subscriber(supervised, monkey
     monkeypatch.setattr(supervisor, "_announce_shutdown", delayed_announce)
 
     def request(_fd, observed):
-        output, _, _ = observed["output"].read_since(0, timeout=2)
-        assert b"ready" in output
+        output, _, _ = observed["output"].read_since(0, timeout=JOIN)
+        assert b"ready" in output, observed["evidence"]()
         os.kill(os.getpid(), signal.SIGUSR1)
         try:
-            assert publish_entered.wait(1)
+            assert publish_entered.wait(JOIN), observed["evidence"]()
             os.kill(observed["child_pid"], signal.SIGUSR2)
-            deadline = time.monotonic() + 1
+            deadline = time.monotonic() + JOIN
             while True:
                 try:
                     os.waitid(os.P_PID, observed["child_pid"], os.WEXITED | os.WNOHANG | os.WNOWAIT)
@@ -337,7 +353,7 @@ def test_natural_exit_waits_for_authenticated_late_subscriber(supervised, monkey
             time.sleep(.05)
             assert not observed["api_closed"].is_set(), "API closed before pending acknowledgment delivery"
             release_publish.set()
-            assert published.wait(1)
+            assert published.wait(JOIN)
             with TestClient(observed["app"]) as client:
                 headers = {"Authorization": "Bearer teardown-control-test-key"}
                 response = client.get("/messages", headers=headers)
@@ -353,12 +369,12 @@ def test_natural_exit_waits_for_authenticated_late_subscriber(supervised, monkey
                 assert response.status_code == 200
         finally:
             release_publish.set()
-            assert published.wait(1)
+            assert published.wait(JOIN)
 
     result, _ = supervised(NATURAL_EXIT_CHILD, driver=request)
     assert result["exit_code"] == 0
     assert result["child_running_at_stop"] is False
-    assert result["duration"] < 1.2, "confirmed delivery did not release the handoff"
+    assert result["duration"] < TEARDOWN_BOUND, "confirmed delivery did not release the handoff"
     assert registry.read_session(session_id)["teardown_requested_at"]
     now = {"value": datetime.now(timezone.utc)}
     original_sweep = teardown.sweep
@@ -385,20 +401,20 @@ def test_delivery_wait_bound_includes_a_busy_bus(wait):
     def busy_writer():
         with log._lock:
             held.set()
-            release.wait(.5)
+            release.wait(outlast(BUSY_BOUND))
 
     writer = threading.Thread(target=busy_writer)
     writer.start()
     try:
-        assert held.wait(1)
+        assert held.wait(JOIN)
         started = time.monotonic()
         delivered = (log.wait_drained(.02) if wait == "drained" else
                      log.wait_acknowledged(comms.PLATFORM_SUBSCRIBER, 1, .02))
-        assert time.monotonic() - started < .2
+        assert time.monotonic() - started < BUSY_BOUND
         assert delivered is False
     finally:
         release.set()
-        writer.join(timeout=1)
+        writer.join(timeout=JOIN)
         assert not writer.is_alive()
 
 
@@ -419,13 +435,14 @@ def test_real_child_ignoring_quit_and_term_is_killed_and_reaped(supervised, monk
     monkeypatch.setattr(supervisor.os, "kill", kill)
 
     def request(_fd, observed):
-        output, _, _ = observed["output"].read_since(0, timeout=2)
-        assert b"ready" in output
+        output, _, _ = observed["output"].read_since(0, timeout=JOIN)
+        assert b"ready" in output, observed["evidence"]()
         os.kill(os.getpid(), signal.SIGUSR1)
 
     result, _ = supervised(
         "import signal,time; signal.signal(signal.SIGINT, signal.SIG_IGN); "
-        "signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); time.sleep(3)",
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); print('ready', flush=True); "
+        f"time.sleep({CHILD_ALIVE})",
         driver=request,
     )
     assert signals == [signal.SIGTERM, signal.SIGKILL]
@@ -443,7 +460,7 @@ def test_blocked_quit_write_cannot_hold_escalation(monkeypatch):
     def write(data):
         entered.set()
         try:
-            release.wait(3)
+            release.wait(JOIN)
             return len(data)
         finally:
             writer_done.set()
@@ -458,12 +475,12 @@ def test_blocked_quit_write_cannot_hold_escalation(monkeypatch):
                               kwargs={"quit_sequence": (b"q",), "chord_gap": 0})
     worker.start()
     try:
-        assert entered.wait(1), "test did not reach the blocked writer"
-        escalated_while_blocked = escalated.wait(1)
+        assert entered.wait(JOIN), "test did not reach the blocked writer"
+        escalated_while_blocked = escalated.wait(JOIN)
     finally:
         release.set()
-        worker.join(timeout=2)
-        assert writer_done.wait(1)
+        worker.join(timeout=JOIN)
+        assert writer_done.wait(JOIN)
         assert not worker.is_alive()
     assert escalated_while_blocked
     assert killed == [signal.SIGTERM, signal.SIGKILL]
