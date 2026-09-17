@@ -124,7 +124,7 @@ logger = logging.getLogger("lmer_platform.relations")
 __all__ = [
     "RELATIONS_FILE", "PAIR_SEPARATOR", "MAX_RELATIONS_PER_RUN", "LOCALITY_NOTE",
     "RelationError", "RelatedRun",
-    "load_all", "list_for", "relate", "unrelate",
+    "load_all", "all_pairs", "list_for", "relate", "unrelate",
 ]
 
 RELATIONS_FILE = "relations.json"
@@ -372,6 +372,38 @@ def list_for(host: str, project: str, slug: str) -> list:
         )
         for host_, project_, slug_ in _neighbours(load_all(), key)
     ]
+
+
+def all_pairs() -> list:
+    """Every relation this orchestrator holds, as ``(key_a, key_b)`` tuples.
+
+    The fleet-wide read, for a view that draws the whole fleet at once rather
+    than one run's neighbours — :func:`list_for` answers "what is this run
+    related to", and asking it once per run is the wrong shape for a map.
+
+    Each pair appears **once**, and its two keys come back in the same sorted
+    order :func:`_pair_key` stores them under — so a caller needs no
+    de-duplication and no "which direction" decision. The sort is applied here
+    rather than assumed: the entry's own ``runs`` list preserves the order
+    :func:`relate` was *called* with, so reading it straight through would make
+    the output depend on which run somebody named first. Malformed entries are
+    skipped by :func:`_members`, which logs them — one bad entry must not empty
+    the fleet's edges.
+
+    Says nothing about whether either run is tracked. That is the caller's
+    question, because the answer differs by surface: the run detail view shows
+    an untracked relation and names it, while a map has no node to attach one
+    to.
+    """
+    pairs = []
+    for pair, payload in sorted(load_all().items()):
+        members = _members(pair, payload)
+        if members is None:
+            continue
+        first, second = members
+        keys = sorted((run_key(*first), run_key(*second)))
+        pairs.append((keys[0], keys[1]))
+    return pairs
 
 
 def relate(run, related) -> bool:

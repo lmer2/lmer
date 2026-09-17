@@ -1608,3 +1608,99 @@ def test_reading_the_taskdef_tiers_never_pulls_the_mirror(config, mirror, tmp_pa
         "develop"
     ]
     assert pulls == []
+
+
+# --- fleet-wide relations (the constellation map's edges) --------------------
+#
+# The map draws the whole fleet at once, so its edges ride this payload rather
+# than costing a relation request per node per poll — the same trade the open
+# questions and the statusline already make.
+
+def _register_run(session, slug, *, host="h.example.com", project="p/q"):
+    import os
+
+    registry.register(
+        session, pid=os.getpid(),
+        run={"host": host, "project": project, "slug": slug},
+    )
+    return (host, project, slug)
+
+
+def test_fleet_payload_carries_related_pairs_once(platform_root):
+    """Both endpoints tracked, so the edge has two nodes to attach to."""
+    from lmer_platform import relations, runs
+
+    first = _register_run("s-a", "run-a")
+    second = _register_run("s-b", "run-b")
+    runs.track(*first, source="spawned")
+    runs.track(*second, source="spawned")
+    relations.relate(first, second)
+
+    payload = api.build_state(cfg.load())
+
+    assert payload["relations"] == [
+        {"a": runs.run_key(*first), "b": runs.run_key(*second)}
+    ], "the pair should appear exactly once, keyed the way runKey() composes"
+
+
+def test_fleet_payload_drops_an_edge_whose_run_is_not_on_it(platform_root):
+    """An endpoint with no row is an edge attached to nothing.
+
+    Dropping it here is what lets the client join edges to nodes without
+    checking. The relation itself is not lost — it is still shown, and named as
+    untracked, on the run's own detail view.
+    """
+    from lmer_platform import relations, runs
+
+    present = _register_run("s-a", "run-a")
+    runs.track(*present, source="spawned")
+    absent = ("h.example.com", "p/q", "never-adopted")
+    relations.relate(present, absent)
+
+    payload = api.build_state(cfg.load())
+
+    assert payload["relations"] == [], (
+        "an edge survived to a run that has no node on this payload"
+    )
+    assert relations.list_for(*present), (
+        "the relation itself should still exist — only the fleet edge is dropped"
+    )
+
+
+def test_fleet_payload_always_carries_a_relations_list(platform_root):
+    """Empty is the answer for a fleet with no relations, not a missing key.
+
+    A client that has to branch on whether the daemon sent the field would get
+    it wrong the first time somebody related two runs.
+    """
+    payload = api.build_state(cfg.load())
+
+    assert payload["relations"] == []
+
+
+def test_fleet_payload_keeps_an_edge_on_a_run_that_wants_the_operator(platform_root):
+    """The map's most important nodes must not be the ones that lose their edges.
+
+    ``attention`` holds separate copies of rows that are also in ``runs``, so the
+    tracked-key set is built from ``runs`` alone. If that ever stopped being true,
+    every edge touching a run needing a human would silently vanish — from
+    exactly the view that exists to surface those runs.
+    """
+    from lmer_platform import relations, runs
+
+    live = _register_run("s-live", "run-live")
+    dead = ("h.example.com", "p/q", "run-dead")
+    registry.register("s-dead", pid=2**22, run={
+        "host": dead[0], "project": dead[1], "slug": dead[2],
+    })
+    runs.track(*live, source="spawned")
+    runs.track(*dead, source="spawned")
+    relations.relate(live, dead)
+
+    payload = api.build_state(cfg.load())
+
+    assert payload["attention"], "expected the crashed run to need a human"
+    first, second = sorted((runs.run_key(*live), runs.run_key(*dead)))
+    assert payload["relations"] == [{"a": first, "b": second}], (
+        "an edge touching a run that wants the operator was dropped"
+    )

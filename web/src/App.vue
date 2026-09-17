@@ -9,7 +9,9 @@ import {
   mdiArrowExpandHorizontal,
   mdiBroom,
   mdiMagnify,
+  mdiMapOutline,
   mdiPlus,
+  mdiViewListOutline,
   mdiRefresh,
   mdiThemeLightDark,
   mdiWeatherNight,
@@ -19,14 +21,16 @@ import AddRun from './components/AddRun.vue'
 import ForgetCompleted from './components/ForgetCompleted.vue'
 import { fleetTitle } from './fleetTitle.js'
 import AssistantChat from './components/AssistantChat.vue'
+import FleetMap from './components/FleetMap.vue'
+import { orchestratorOf, pairsFromReplies } from './fleetMap.js'
 import RunCard from './components/RunCard.vue'
 import RunDetail from './components/RunDetail.vue'
 import RunNav from './components/RunNav.vue'
 import SlotEditor from './components/SlotEditor.vue'
 import SlotRow from './components/SlotRow.vue'
-import { fetchState, forgetRun, prune, rescan } from './api.js'
+import { fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import {
-  ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef,
+  ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef, toneColor,
 } from './format.js'
 import {
   rememberChoice, rememberFlag, storedChoice, storedFlag,
@@ -62,6 +66,31 @@ function rememberThemeMode(value) {
   )
 }
 // --- end of theme mode -------------------------------------------------------
+
+// --- fleet view mode ---------------------------------------------------------
+// Map or list, remembered, because it is a property of how this operator reads
+// the fleet rather than of any run — the same reasoning as the theme above.
+//
+// `list` first, which `storedChoice` therefore treats as the default: it is the
+// view that exists today, so an operator who never touches the switch sees no
+// change at all.
+const FLEET_VIEW_MODES = ['list', 'map']
+const FLEET_VIEW_STORAGE_KEY = 'lmer.fleet.view'
+
+function storedFleetView() {
+  return storedChoice(
+    () => window.localStorage.getItem(FLEET_VIEW_STORAGE_KEY), FLEET_VIEW_MODES,
+  )
+}
+
+function rememberFleetView(value) {
+  rememberChoice(
+    (stored) => window.localStorage.setItem(FLEET_VIEW_STORAGE_KEY, stored),
+    FLEET_VIEW_MODES,
+    value,
+  )
+}
+// --- end of fleet view mode --------------------------------------------------
 
 const THEME_ICONS = {
   system: mdiThemeLightDark,
@@ -191,6 +220,91 @@ watch(browserTitle, (value) => { document.title = value }, { immediate: true })
 
 const attention = computed(() => state.value?.attention || [])
 const runs = computed(() => state.value?.runs || [])
+// Every relation in the fleet, carried on the payload so the map draws its edges
+// without a request per run. Empty from a daemon older than this bundle, which
+// renders as a map with no lines rather than as an error.
+const payloadRelations = computed(() => state.value?.relations || null)
+
+// --- back-compat: relations for a daemon that does not send them -------------
+//
+// **This block is temporary and becomes dead code the moment the deployed daemon
+// carries this MR's `build_state` change.** The forward design is the `relations`
+// key on the fleet payload: one read for the whole fleet, already de-duplicated,
+// which is the shape the map wants and the reason that key exists.
+//
+// Until then a demo runs against an older daemon that omits it, and a map with no
+// lines is this feature's headline property missing rather than a graceful
+// degrade. So when the key is absent we ask the per-run route instead — the one
+// the run detail view already uses.
+//
+// The cost is the thing that makes this a fallback and not a design: it is one
+// request per visible run, where the payload key is one for the fleet. It is kept
+// survivable by refetching only when the *set of runs* changes rather than on
+// every poll — a ten-second poll over fourteen runs would otherwise be 84
+// requests a minute for data that changes when somebody relates two runs.
+const fetchedRelations = ref([])
+let relationsFetchedFor = null
+
+async function loadRelationsFallback(keys, rows) {
+  relationsFetchedFor = keys
+  const replies = await Promise.all(rows.map(async (run) => {
+    try {
+      return await fetchRunRelations(run)
+    } catch {
+      // One failed read must not cost the whole edge set: a run the daemon will
+      // not answer for contributes no edges, exactly as it would if it had none.
+      // Caught around the call as well as the promise — this is a fallback for
+      // an older daemon, and "the route is not there at all" is one of the ways
+      // an older daemon says no.
+      return null
+    }
+  }))
+  // A newer poll may have landed while these were in flight; its answer wins.
+  if (relationsFetchedFor !== keys) return
+  fetchedRelations.value = pairsFromReplies(replies.filter(Boolean))
+}
+
+watch([payloadRelations, runs], ([carried, rows]) => {
+  if (carried) {
+    // The daemon grew the key. Drop the fallback and never ask again.
+    fetchedRelations.value = []
+    relationsFetchedFor = null
+    return
+  }
+  const keys = rows.map(runKey).sort().join('\n')
+  if (keys === relationsFetchedFor) return
+  if (!rows.length) {
+    relationsFetchedFor = keys
+    fetchedRelations.value = []
+    return
+  }
+  loadRelationsFallback(keys, rows)
+}, { immediate: true })
+
+// Every relation in the fleet. From the payload when the daemon sends it; from
+// the per-run fallback above while it does not.
+const relations = computed(() => payloadRelations.value || fetchedRelations.value)
+
+// The platform's own session, which the map deliberately does not draw (it is one
+// tap away in the bar instead). The bar control carries its state, so the thing
+// that replaced the node still answers the question the node answered.
+const orchestrator = computed(() => orchestratorOf(runs.value))
+const orchestratorTone = computed(() => (
+  orchestrator.value ? toneColor(stateMeta(orchestrator.value.state).tone) : null
+))
+const orchestratorHint = computed(() => {
+  const run = orchestrator.value
+  if (!run) return 'talk to uber lmer'
+  const meta = stateMeta(run.state)
+  const parts = [`uber lmer — ${meta.label}`]
+  // What it is doing, or what it needs. The attention note is the more urgent of
+  // the two and wins when both are there.
+  const note = run.attention?.note || run.title || run.goal || run.phase
+  if (note) parts.push(note)
+  return parts.join(' · ')
+})
+const fleetView = ref(storedFleetView())
+watch(fleetView, rememberFleetView)
 const calm = computed(() => runs.value.filter((run) => !run.attention))
 const totals = computed(() => state.value?.totals || { runs: 0, live: 0, attention: 0 })
 const mirror = computed(() => state.value?.mirror || null)
@@ -384,6 +498,11 @@ function visible(list) {
   })
 }
 
+// The map draws the rows the list would draw, search included. A search box that
+// quietly does nothing while the map is up would be a control the operator has to
+// learn the exceptions to; and `nothingMatches` then means the same thing in both
+// views, which is what lets one message serve them.
+const mapRows = computed(() => visible(runs.value))
 const attentionRows = computed(() => visible(attention.value))
 const calmRows = computed(() => visible(calm.value))
 // Said out loud, because a tracked fleet with an empty list on screen otherwise
@@ -581,10 +700,17 @@ onUnmounted(() => {
            tap from wherever you noticed. Icon-only because the bar already carries
            four controls on a 390px screen — the words are in the drawer's own
            header, which is what an operator reads before typing. -->
+      <!-- Painted from the orchestrator's own tone, and titled with what it is
+           doing. The map used to draw it as a node; it does not any more, so this
+           control is the only place the fleet says whether its supervisor is
+           running, stuck or waiting on someone. Unpainted when the fleet carries
+           no orchestrator row, which is not the same as one that is fine. -->
       <v-btn
         :icon="mdiRobot"
+        :color="orchestratorTone"
         variant="text"
-        aria-label="talk to uber lmer"
+        :aria-label="orchestratorHint"
+        :title="orchestratorHint"
         @click="uberOpen = !uberOpen"
       />
       <!-- The band (#286), in the bar for the same reason the scheme picker is: it
@@ -629,6 +755,28 @@ onUnmounted(() => {
         </v-list>
       </v-menu>
       <template v-if="view === 'fleet'">
+        <!-- Two ways to read the same fleet. An icon pair rather than a menu:
+             unlike the scheme picker this is a two-state choice whose states
+             are both obvious at a glance, and the fleet is where the operator
+             switches most. -->
+        <v-btn-toggle
+          v-model="fleetView"
+          class="me-1"
+          density="compact"
+          mandatory
+          variant="text"
+        >
+          <v-btn
+            value="list"
+            :icon="mdiViewListOutline"
+            aria-label="read the fleet as a list"
+          />
+          <v-btn
+            value="map"
+            :icon="mdiMapOutline"
+            aria-label="read the fleet as a constellation map"
+          />
+        </v-btn-toggle>
         <v-btn
           :icon="mdiRefresh"
           :loading="busy"
@@ -777,14 +925,44 @@ onUnmounted(() => {
           </v-card>
 
           <template v-else>
-            <!-- Runs needing a human come first, always: it is the one thing this
-                 view exists to tell you. The split is inside the search results
-                 rather than around them, so filtering never buries a run that is
-                 waiting on somebody among the rest. -->
-            <template v-if="attentionRows.length">
-              <div class="section-title">needs you</div>
+            <!-- The map draws the same fleet the cards below do, filtered by the
+                 same search, and hands a click back to the same `open`: it is
+                 another way to choose a run, not another way to read one. -->
+            <FleetMap
+              v-if="fleetView === 'map'"
+              :runs="mapRows"
+              :relations="relations"
+              @open="open"
+            />
+
+            <!-- One branch around the whole list rather than a condition on each
+                 of its three parts: the cards, their headings and the split
+                 between them are one view, and conditioning them separately is
+                 how they drift out of step. -->
+            <template v-if="fleetView === 'list'">
+              <!-- Runs needing a human come first, always: it is the one thing this
+                   view exists to tell you. The split is inside the search results
+                   rather than around them, so filtering never buries a run that is
+                   waiting on somebody among the rest. -->
+              <template v-if="attentionRows.length">
+                <div class="section-title">needs you</div>
+                <RunCard
+                  v-for="run in attentionRows"
+                  :key="keyOf(run)"
+                  :run="run"
+                  :now="now"
+                  @open="open"
+                  @forget="forget"
+                  @open-chat="uberOpen = true"
+                  @threads-changed="load"
+                />
+              </template>
+
+              <div v-if="calmRows.length" class="section-title">
+                {{ attentionRows.length ? 'everything else' : 'runs' }}
+              </div>
               <RunCard
-                v-for="run in attentionRows"
+                v-for="run in calmRows"
                 :key="keyOf(run)"
                 :run="run"
                 :now="now"
@@ -794,20 +972,6 @@ onUnmounted(() => {
                 @threads-changed="load"
               />
             </template>
-
-            <div v-if="calmRows.length" class="section-title">
-              {{ attentionRows.length ? 'everything else' : 'runs' }}
-            </div>
-            <RunCard
-              v-for="run in calmRows"
-              :key="keyOf(run)"
-              :run="run"
-              :now="now"
-              @open="open"
-              @forget="forget"
-              @open-chat="uberOpen = true"
-              @threads-changed="load"
-            />
 
             <p
               v-if="nothingMatches"

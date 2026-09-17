@@ -150,11 +150,19 @@ def test_dependency_set_is_minimal():
       which executes both against hostile input rather than reading the source.
       (T44 moved the renderer out of Chat.vue into one shared component, and the
       executed probes moved with it.)
+    - d3-force — the constellation map's layout, and layout only: it computes
+      node positions and never touches the DOM, so Vue keeps ownership of the
+      SVG and the map themes and reads to a screen reader like any other part of
+      this UI. Four packages, not one — it brings d3-dispatch, d3-quadtree and
+      d3-timer — which is the honest cost and is why the alternative considered
+      was writing the force model by hand. A canvas/WebGL graph library was
+      rejected for the opposite reason: it would own its own rendering surface
+      and take the theming and the accessibility with it.
     """
     payload = json.loads((WEB / "package.json").read_text(encoding="utf-8"))
     assert set(payload["dependencies"]) == {
         "vue", "vuetify", "@mdi/js", "@xterm/xterm", "@xterm/addon-fit",
-        "markdown-it", "dompurify",
+        "markdown-it", "dompurify", "d3-force",
     }
     assert set(payload["devDependencies"]) == {
         "@vitejs/plugin-vue", "vite", "vite-plugin-vuetify",
@@ -475,6 +483,12 @@ ALLOWED_STORAGE_KEYS = {
     # request is made by the answer being "on". The drawer's own open state is still
     # deliberately not stored (tests/test_platform_web_assistant.py).
     "NARROW_STORAGE_KEY",
+    # Whether this operator reads the fleet as the list or as the constellation
+    # map (#141 fleet map). Global and not per run, like the five above: it is a
+    # property of how somebody reads a fleet, not a fact about any run in it.
+    # `list` is the first mode and therefore the default, so an operator who
+    # never touches the switch sees the view they already had.
+    "FLEET_VIEW_STORAGE_KEY",
 }
 
 

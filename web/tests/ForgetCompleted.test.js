@@ -2,10 +2,17 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import App from '../src/App.vue'
 import ForgetCompleted from '../src/components/ForgetCompleted.vue'
-import { fetchState, forgetRun } from '../src/api.js'
+import { fetchRunRelations, fetchState, forgetRun } from '../src/api.js'
 import { mountPane, deferred } from './mount.js'
 
-vi.mock('../src/api.js', () => ({ fetchState: vi.fn(), forgetRun: vi.fn(), prune: vi.fn(), rescan: vi.fn() }))
+vi.mock('../src/api.js', () => ({
+  fetchState: vi.fn(),
+  // The shell reads relations for the map when the payload carries none.
+  fetchRunRelations: vi.fn().mockResolvedValue({ run: {}, relations: [] }),
+  forgetRun: vi.fn(),
+  prune: vi.fn(),
+  rescan: vi.fn(),
+}))
 const run = (slug, extra = {}) => ({
   host: 'gitlab.example.com', project: 'acme/widget', slug, label: slug,
   state: 'complete', live: false, ...extra,
@@ -13,7 +20,11 @@ const run = (slug, extra = {}) => ({
 const dialogButton = (text) => [...document.querySelectorAll('.v-dialog button')]
   .find((button) => button.textContent.trim() === text)
 
-beforeEach(() => { vi.clearAllMocks(); forgetRun.mockResolvedValue({ forgotten: true }) })
+beforeEach(() => {
+  vi.clearAllMocks()
+  forgetRun.mockResolvedValue({ forgotten: true })
+  fetchRunRelations.mockResolvedValue({ run: {}, relations: [] })
+})
 
 async function open(runs) {
   const wrapper = mountPane(ForgetCompleted, { runs })
