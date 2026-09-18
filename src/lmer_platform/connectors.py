@@ -29,15 +29,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from ask_channel import bus
+
 from lmer_cli import thread_access
-from lmer_cli.connector_delivery import RecoveryRequired
+from lmer_cli.connector_delivery import RecoveryRequired, marker_path
 from lmer_cli.connector_lifecycle import EXIT_RECOVERY
-from lmer_cli.connector_ownership import Lease, ThreadKey
+from lmer_cli.connector_ownership import Lease, OwnershipError, ThreadKey
 from lmer_cli.connector_process import OwnedProcess, reclaim_orphan, spawn_child, spawn_owned
+from lmer_cli.connector_recovery import Recovery
 from lmer_cli.threads import ThreadError, ThreadRef, parse_thread
 
 from slack_chat import registry as thread_registry
+from slack_chat.client import SlackError
 from slack_chat.connector import ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV
+from matrix_chat.client import MatrixError
 
 from . import registry, session_io, uploads
 from .comms import comms_dir
@@ -45,6 +50,7 @@ from .store import (
     StoreError, ensure_state_dir, logs_dir, mutating, read_json, utc_now_iso,
     write_json,
 )
+from .transcripts import scrub_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +77,7 @@ RECONCILE_SECONDS = 5.0
 STOP_GRACE_SECONDS = 47.0
 
 BACKOFF_MAX = 30.0
+REMOTE_TIMEOUT_SECONDS = 15.0
 
 #: What this daemon writes into a thread-registry entry it owns, so a later
 #: incarnation can tell its own orphan from somebody else's CLI session.
@@ -140,6 +147,8 @@ class ThreadConnectors:
         self._next_attempt: dict = {}
         self._exits: dict = {}
         self._detail: dict = {}
+        self._recovery: set = set()
+        self._recovering: set = set()
         self._disconnected: set = set()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -536,6 +545,126 @@ class ThreadConnectors:
             status=409,
         )
 
+    # -- recovery --------------------------------------------------------------
+
+    def recover(self, session_id: str, thread_id: str, action: str, *, operation=None,
+                remote_ref=None, acknowledge_duplicate=False, reason=None, by: str) -> dict:
+        """Recover an exact host-side operation on a recorded thread."""
+        if action not in ("inspect", "receipt", "retry", "clear"):
+            raise ThreadError("recovery action must be inspect, receipt, retry or clear")
+        if action != "inspect" and (not isinstance(operation, str) or not operation.strip()):
+            raise ThreadError("select --operation from threads recover inspect")
+        if remote_ref is not None and (not isinstance(remote_ref, str) or not remote_ref.strip()):
+            raise ThreadError("remote_ref must be a nonempty string")
+        if action == "clear" and (acknowledge_duplicate is not True or not isinstance(reason, str)
+                                  or not reason.strip() or len(reason) > 1000):
+            raise ThreadError("clear requires --acknowledge-duplicate and --reason (1–1000 characters)")
+        reason = scrub_credentials(reason) if isinstance(reason, str) else None
+        endpoint = self._require_control_plane(session_id)
+        key = (session_id, thread_id)
+        with self._lock:
+            record = next((r for r in self._sessions.get(session_id, ()) if r["id"] == thread_id), None)
+            if record is None:
+                raise ThreadError(f"this run has no connection {thread_id!r}", status=404)
+            if key in self._recovering:
+                raise ThreadError("this thread already has a recovery in progress", status=409)
+            self._collect_process(key)
+            self._recovering.add(key)
+        try:
+            if action == "clear":
+                logger.warning("platform_thread_clear_requested session=%s thread=%s operation=%s by=%s reason=%r",
+                               session_id, thread_id, operation, by, reason)
+            try:
+                result = self._recover_record(record, endpoint, action, operation=operation,
+                                              remote_ref=remote_ref, acknowledge_duplicate=acknowledge_duplicate)
+            except (RecoveryRequired, OwnershipError, bus.BusError, OSError, ValueError) as exc:
+                raise ThreadError(str(exc), status=409) from None
+            except (SlackError, MatrixError) as exc:
+                raise ThreadError(f"could not verify the remote receipt: {exc}", status=502) from None
+            if action != "inspect":
+                logger.info("platform_thread_recovered session=%s thread=%s action=%s operation=%s by=%s reason=%r",
+                            session_id, thread_id, action, operation, by, reason)
+            with self._lock:
+                if not any(r is record for r in self._sessions.get(session_id, ())):
+                    raise ThreadError("connection changed during recovery; refresh threads before restarting", status=409)
+                if self._require_control_plane(session_id) != endpoint:
+                    raise ThreadError("supervisor changed during recovery; refresh threads before restarting", status=409)
+                if action != "inspect":
+                    self._recovery.discard(key)
+                    self._clear_backoff(key)
+                    self._ensure(key, record, endpoint=endpoint, after_recovery=True)
+                return {**result, "thread": self._with_runtime(session_id, record)}
+        finally:
+            with self._lock:
+                self._recovering.discard(key)
+
+    def _recover_record(self, record, endpoint, action, *, operation=None, remote_ref=None,
+                        acknowledge_duplicate=False):
+        ref = _ref_of(record)
+        lease = Lease.acquire(ThreadKey(ref.channel, *ref.registry_key()), owner="platform-recovery")
+        try:
+            recovery = Recovery(lease)
+            inspection = recovery.inspect()
+            automatic = action == "automatic"
+            if automatic:
+                action = inspection["automatic_action"]
+                operation = inspection["operation"]
+            result = {"inspection": inspection, "action": action, "result": "parked"}
+            if action is None or action == "inspect":
+                return result
+            client = bus.BusClient(bus.Endpoint(f"http://{endpoint.host}:{endpoint.port}", endpoint.token))
+            if action == "retry":
+                if inspection["possible_duplicate"]:
+                    raise RecoveryRequired("outcome is unknown; plain retry is refused")
+                message = recovery.retry(operation, client, automatic=automatic)
+            elif action == "receipt":
+                remote, sender = None, None
+                if remote_ref:
+                    if ref.channel == CHANNEL_SLACK:
+                        remote = self._slack_client(thread_access.slack_token(self._environ))
+                    else:
+                        account = self._require_matrix_credentials()
+                        remote, sender = self._matrix_client(account), account.user_id
+                message = recovery.receipt(operation, client, remote_ref=remote_ref, remote=remote, sender=sender)
+            else:
+                message = recovery.clear(operation, acknowledge_duplicate=acknowledge_duplicate)
+            result["result"] = message
+            return result
+        finally:
+            lease.close()
+
+    def _auto_recover(self, key, record, endpoint) -> bool:
+        try:
+            result = self._recover_record(record, endpoint, "automatic")
+            if result["action"]:
+                logger.info("platform_thread_recovered session=%s thread=%s action=%s operation=%s by=daemon",
+                            *key, result["action"], result["inspection"]["operation"])
+                return True
+            reason = ("pending send outcome is unknown" if result["inspection"]["possible_duplicate"]
+                      else "automatic retry limit reached")
+        except Exception as exc:
+            reason = str(exc)
+        self._park_recovery(key, reason)
+        return False
+
+    def _park_recovery(self, key, reason):
+        from . import assistant
+
+        command = f"lmer-ctl threads recover {key[0]} {key[1]} inspect"
+        detail = f"recovery required: {reason}; use {command}"
+        with self._lock:
+            self._exits[key] = EXIT_RECOVERY
+            self._fail(key, detail)
+            if key in self._recovery:
+                return
+            self._recovery.add(key)
+        try:
+            assistant.notify(detail, kind="thread_recovery_required",
+                             data={"session": key[0], "thread": key[1], "command": command})
+        except Exception as exc:
+            logger.warning("platform_thread_recovery_notify_failed session=%s thread=%s error=%s",
+                           *key, scrub_credentials(str(exc)))
+
     # -- reading ---------------------------------------------------------------
 
     def listing(self, session_id: str) -> list:
@@ -552,6 +681,7 @@ class ThreadConnectors:
             view["since"] = process.since if running else None
             view["last_exit"] = self._exits.get(key)
             view["detail"] = self._detail.get(key)
+            view["attention"] = "recovery-required" if key in self._recovery else None
         return view
 
     # -- the loop --------------------------------------------------------------
@@ -677,21 +807,13 @@ class ThreadConnectors:
 
     # -- processes -------------------------------------------------------------
 
-    def _ensure(self, key: tuple, record: dict, *, endpoint=None) -> None:
+    def _ensure(self, key: tuple, record: dict, *, endpoint=None, after_recovery=False) -> None:
         with self._lock:
-            process = self._procs.get(key)
-            if process is not None:
-                code = process.popen.poll()
-                if code is None:
-                    return
-                code = OwnedProcess(process.popen, process.lease).collect()
-                self._procs.pop(key, None)
-                self._exits[key] = code
-                self._penalise(key)
-                logger.info(
-                    "platform_thread_connector_exited session=%s thread=%s code=%s",
-                    key[0], key[1], code,
-                )
+            if key in self._recovering and not after_recovery:
+                return
+            self._collect_process(key)
+            if key in self._procs:
+                return
             if self._clock() < self._next_attempt.get(key, 0.0):
                 return
             # Inside the lock: a connect calls this too, and outside it a
@@ -702,6 +824,16 @@ class ThreadConnectors:
             held = self._start(key, record, endpoint=endpoint)
         if held:
             self._notify_disconnected(key[0], record)
+
+    def _collect_process(self, key):
+        process = self._procs.get(key)
+        if process is None or process.popen.poll() is None:
+            return
+        code = OwnedProcess(process.popen, process.lease).collect()
+        self._procs.pop(key, None)
+        self._exits[key] = code
+        self._penalise(key)
+        logger.info("platform_thread_connector_exited session=%s thread=%s code=%s", *key, code)
 
     def _start(self, key: tuple, record: dict, *, endpoint=None) -> Optional[str]:
         """Start the connector, returning the reason if another holder blocks it."""
@@ -722,6 +854,9 @@ class ThreadConnectors:
         if held is not None:
             self._fail(key, held)
             return held
+        if marker_path(ThreadKey(ref.channel, *ref.registry_key())).exists():
+            if not self._auto_recover(key, record, endpoint):
+                return
         try:
             argv = self._argv(record, session_id)
             owned = spawn_owned(
@@ -732,8 +867,7 @@ class ThreadConnectors:
             )
             popen = owned.popen
         except RecoveryRequired as exc:
-            self._exits[key] = EXIT_RECOVERY
-            self._fail(key, f"recovery required: {exc}; use lmer_cli.connector_recovery")
+            self._park_recovery(key, str(exc))
             return
         except Exception as exc:
             self._fail(key, f"the connector process would not start: {exc}")
@@ -741,6 +875,7 @@ class ThreadConnectors:
         with self._lock:
             self._procs[key] = _Process(popen=popen, ref=ref, since=utc_now_iso(), lease=owned.lease)
             self._disconnected.discard(key)
+            self._recovery.discard(key)
             self._detail.pop(key, None)
             self._attempts.pop(key, None)
             self._next_attempt.pop(key, None)
@@ -812,6 +947,7 @@ class ThreadConnectors:
         with self._lock:
             self._exits.pop(key, None)
             self._disconnected.discard(key)
+            self._recovery.discard(key)
             self._detail.pop(key, None)
             self._attempts.pop(key, None)
             self._next_attempt.pop(key, None)
@@ -852,12 +988,14 @@ class ThreadConnectors:
 
     def _fail(self, key: tuple, detail: str) -> None:
         with self._lock:
+            changed = self._detail.get(key) != detail
             self._detail[key] = detail
             self._penalise(key)
-        logger.warning(
-            "platform_thread_connector_unavailable session=%s thread=%s reason=%s",
-            key[0], key[1], detail,
-        )
+        if changed:
+            logger.warning(
+                "platform_thread_connector_unavailable session=%s thread=%s reason=%s",
+                key[0], key[1], detail,
+            )
 
     def _penalise(self, key: tuple) -> None:
         attempts = self._attempts.get(key, 0) + 1
@@ -942,13 +1080,13 @@ def _spawn_process(argv: list, env: dict, log_path: Optional[Path] = None, *, pa
 def _slack_client(token: str):
     from slack_chat.client import SlackClient
 
-    return SlackClient(token)
+    return SlackClient(token, timeout=REMOTE_TIMEOUT_SECONDS, retries=0)
 
 
 def _matrix_client(account):
     from matrix_chat.client import MatrixClient
 
-    return MatrixClient(account)
+    return MatrixClient(account, timeout=REMOTE_TIMEOUT_SECONDS)
 
 
 _LOCK = threading.Lock()

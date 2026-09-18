@@ -139,7 +139,8 @@ def test_direct_owner_restarts_only_failed_connector_and_collects_every_child(ch
     assert all(process.returncode is not None for process in child.children)
 
 
-def test_platform_owner_reconstructs_without_replaying_blocked_send(child, monkeypatch):
+@pytest.mark.parametrize("outcome", ["unknown", "receipt-failure"])
+def test_platform_owner_recovers_only_a_confirmed_send(child, monkeypatch, outcome):
     import os
     from lmer_platform import connectors, registry as sessions, spawn
     from tests.test_platform_thread_connectors import FakeSlack, FakeMatrix
@@ -156,7 +157,7 @@ def test_platform_owner_reconstructs_without_replaying_blocked_send(child, monke
                                            matrix_client=lambda *args: FakeMatrix(), clock=lambda: 1000)
     first = component()
     again = None
-    (child.root / "mode").write_text("receipt-failure")
+    (child.root / "mode").write_text(outcome)
     try:
         assert first.connect(session, child.link, by="test operator")["running"]
         wait_for(lambda: checkpoint_path(child.key, supervisor_session).exists(), child)
@@ -164,11 +165,19 @@ def test_platform_owner_reconstructs_without_replaying_blocked_send(child, monke
         wait_for(lambda: child.children[0].poll() is not None, child)
         first.reconcile()
         first.stop()
+        (child.root / "mode").write_text("healthy")
         again = component()
         again.reconcile()
-        assert len(child.children) == 1
-        assert not again.listing(session)[0]["running"]
-        assert "recovery" in again.listing(session)[0]["detail"]
+        if outcome == "receipt-failure":
+            assert len(child.children) == 2
+            assert again.listing(session)[0]["running"]
+            wait_for(lambda: read_json(checkpoint_path(child.key, supervisor_session))["pending"] is None, child)
+            assert not marker_path(child.key).exists()
+        else:
+            assert len(child.children) == 1
+            assert not again.listing(session)[0]["running"]
+            assert "recovery" in again.listing(session)[0]["detail"]
+            assert marker_path(child.key).exists()
         assert len(child.events()) == 1
         assert child.supervisor.client.health()["session"] == supervisor_session
     finally:

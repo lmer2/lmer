@@ -2871,6 +2871,25 @@ def create_app(
         _note_check(caller, session_id=session_id)
         return {"thread": record}
 
+    @app.post("/api/sessions/{session_id}/threads/{thread_id}/recover", dependencies=guard)
+    def session_thread_recover(
+        session_id: str, thread_id: str, body: dict, caller: Caller = Depends(require_secret)
+    ) -> dict:
+        """Inspect or recover the selected operation in the host's connector state."""
+        if caller.kind not in comms.COMMAND_CALLERS:
+            raise HTTPException(status_code=403, detail="thread recovery requires an operator or assistant credential")
+        try:
+            result = _require_connectors().recover(
+                session_id, thread_id, body.get("action"), operation=body.get("operation"),
+                remote_ref=body.get("remote_ref"), reason=body.get("reason"),
+                acknowledge_duplicate=body.get("acknowledge_duplicate", False),
+                by=f"{caller.kind}:{caller.name}" if caller.name else caller.kind,
+            )
+        except connectors.ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        _note_check(caller, session_id=session_id)
+        return result
+
     @app.delete("/api/sessions/{session_id}/threads/{thread_id}", dependencies=guard)
     def session_thread_disconnect(
         session_id: str, thread_id: str, caller: Caller = Depends(require_secret)

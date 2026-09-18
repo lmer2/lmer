@@ -837,7 +837,7 @@ class TestTheRecordShape:
         threads = component(platform_root)
         live = threads.connect("s-1", SLACK_LINK, by="operator")
         launched = threads.adopt_launch_targets("s-2", [SLACK_LINK], by="operator")[0]
-        assert set(live) - {"running", "since", "last_exit", "detail"} == set(launched)
+        assert set(live) - {"running", "since", "last_exit", "detail", "attention"} == set(launched)
         assert live["origin"] == "live" and launched["origin"] == "launch"
 
 

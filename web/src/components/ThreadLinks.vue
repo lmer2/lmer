@@ -15,7 +15,7 @@
 // drawing the icons at all is that it is readable at arm's length.
 import { computed, ref, watch } from 'vue'
 import {
-  mdiBookmarkOutline, mdiBookmarkPlusOutline, mdiClose, mdiLinkOff, mdiMatrix,
+  mdiAlertCircleOutline, mdiBookmarkOutline, mdiBookmarkPlusOutline, mdiClose, mdiLinkOff, mdiMatrix,
   mdiOpenInNew, mdiPlus, mdiSlack,
 } from '@mdi/js'
 import {
@@ -129,9 +129,14 @@ function hasMenu(transport) {
 const connectable = computed(() => !!props.sessionId && props.live)
 
 function ariaLabel(transport) {
+  if (needsAttention(transport)) return `${transport.label} threads: recovery required`
   return byChannel.value[transport.channel].length || referencesByChannel.value[transport.channel].length
     ? `${transport.label} threads`
     : `connect a ${transport.label} thread`
+}
+
+function needsAttention(transport) {
+  return byChannel.value[transport.channel].some((thread) => thread.attention === 'recovery-required')
 }
 
 // The menu already opens itself when there is one; this is the other case.
@@ -298,9 +303,9 @@ async function disconnect(thread) {
   <div class="d-flex align-center ga-1">
     <template v-for="transport in TRANSPORTS" :key="transport.channel">
       <v-badge
-        :model-value="byChannel[transport.channel].length > 1"
-        :content="byChannel[transport.channel].length"
-        color="primary"
+        :model-value="needsAttention(transport) || byChannel[transport.channel].length > 1"
+        :content="needsAttention(transport) ? '!' : byChannel[transport.channel].length"
+        :color="needsAttention(transport) ? 'warning' : 'primary'"
         offset-x="4"
         offset-y="4"
       >
@@ -312,7 +317,7 @@ async function disconnect(thread) {
           variant="text"
           size="small"
           density="comfortable"
-          :color="byChannel[transport.channel].length ? 'primary' : undefined"
+          :color="needsAttention(transport) ? 'warning' : byChannel[transport.channel].length ? 'primary' : undefined"
           :title="hoverText(transport)"
           :aria-label="ariaLabel(transport)"
           :disabled="!hasMenu(transport) && !connectable"
@@ -329,6 +334,7 @@ async function disconnect(thread) {
                 rel="noopener"
                 :title="thread.label || thread.permalink"
                 :subtitle="threadStatus(thread)"
+                :prepend-icon="thread.attention ? mdiAlertCircleOutline : undefined"
                 :append-icon="mdiOpenInNew"
               />
               <v-divider v-if="byChannel[transport.channel].length" />
