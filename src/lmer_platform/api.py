@@ -117,6 +117,7 @@ from .uploads import UploadError
 from .assistant import AssistantError
 from .config import (
     ASSISTANT_SETTING_KEYS,
+    BOOL_SETTINGS,
     INT_SETTINGS,
     ConfigError,
     PlatformConfig,
@@ -137,6 +138,7 @@ from .config import (
     upload_types,
     update_stored,
     validate_assistant_override,
+    validate_bool_setting,
     validate_int_setting,
     stored_slots_or_problem,
     with_stored_slots,
@@ -224,6 +226,9 @@ _WS_REASON_LIMIT = 120
 #: from the table the validator indexes: a hand-written copy admitting a name absent
 #: from :data:`lmer_platform.config.INT_SETTINGS` would 500 on a ``KeyError``.
 _INT_SETTING_KEYS = tuple(sorted(INT_SETTINGS))
+
+#: The boolean settings' keys (issue #488), derived for the same reason.
+_BOOL_SETTING_KEYS = tuple(sorted(BOOL_SETTINGS))
 
 #: What a starting assistant is told when its predecessor left it nothing (T60).
 #: A fact about the host rather than an error, and the ``orchestrate`` taskdef
@@ -519,8 +524,9 @@ _CONFIG_SCOPE_NOTE = (
     "effect until that export is removed. The daemon reads the checkin, nudge and "
     "rotation groups on its next tick, so a change there takes effect without a "
     "rotation. "
-    "chat_keep_last is a browser display setting applied on config refresh; "
-    "it does not require an assistant rotation. The resources group is "
+    "chat_keep_last and chat_show_transcript are browser display settings "
+    "applied on config refresh; neither requires an assistant rotation. The "
+    "resources group is "
     "read-only and environment-only, and like the launch settings it applies "
     "to the next incarnation: changing it does not resize a running container."
 )
@@ -2995,9 +3001,18 @@ def create_app(
     def comms_thread_post(body: dict, caller: Caller = Depends(require_secret)) -> dict:
         """Post once into a thread, attributed to whoever holds the credential."""
         label = _thread_label(caller)
+        from . import assistant_conversation
+        from lmer_cli.routing_receipts import receipt
+
         try:
-            return thread_access.post_thread(
+            ref, client = None, None
+            private = False
+            if caller.is_assistant:
+                ref, client, _ = thread_access.resolve_thread(body.get("permalink"))
+                private = assistant_conversation.private_thread(ref, client)
+            result = thread_access.post_thread(
                 body.get("permalink"), body.get("text") or "", label=label,
+                ref=ref, client=client,
                 # Stamped like a run's own post (#427), so a connector watching
                 # that thread relays this instead of taking it for its own echo.
                 # No session is behind it, so the credential's name is the label.
@@ -3005,6 +3020,21 @@ def create_app(
             )
         except ThreadError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        result.update(receipt("post", result["posted"].get("ref")))
+        if caller.is_assistant:
+            try:
+                text = body.get("text") or ""
+                if private:
+                    text = f"🔒 direct reply sent — {len(text)} characters, body not recorded"
+                assistant_conversation.record(
+                    text, kind="reply",
+                    thread=result["thread"]["permalink"],
+                )
+                result["pane_recorded"] = True
+            except StoreError as exc:
+                logger.warning("assistant_reply_record_failed error=%s", exc)
+                result["pane_recorded"] = False
+        return result
 
     # --- files the operator hands a session (issue #246) ---------------------
     #
@@ -4121,9 +4151,10 @@ def create_app(
         Keys are the launch-setting names (including ``threads``) plus the integer settings
         (pane-only ``chat_keep_last``, ``checkin_window_seconds`` from #244, ``nudge_after_seconds`` and
         ``nudge_pending_threshold`` from #317, ``rotation_context_threshold`` from
-        #446), which are spelled as their config
+        #446) and the boolean ``chat_show_transcript`` (#488), which are spelled as their config
         fields because they are not launch flags and do not share their
-        short-name vocabulary. Omitted keys
+        short-name vocabulary. A boolean takes ``true``/``false`` (the JSON
+        values, or the two words as strings) and nothing looser. Omitted keys
         are left alone, so this is a patch of exactly what the caller named.
         ``null`` — and the emptied text field a browser sends as ``""`` — clears
         the key, letting the layer below show through. Anything else must be a
@@ -4137,7 +4168,9 @@ def create_app(
         one call away when the operator wants the new settings live. The integer
         settings need neither — the daemon's next tick reads them.
         """
-        accepted = sorted(ASSISTANT_SETTING_KEYS) + list(_INT_SETTING_KEYS)
+        accepted = (
+            sorted(ASSISTANT_SETTING_KEYS) + list(_INT_SETTING_KEYS) + list(_BOOL_SETTING_KEYS)
+        )
         if not isinstance(body, dict) or not body:
             raise HTTPException(
                 status_code=400,
@@ -4154,6 +4187,15 @@ def create_app(
                     continue
                 try:
                     changes[key] = validate_int_setting(key, value)
+                except ConfigError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                continue
+            if key in _BOOL_SETTING_KEYS:
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    changes[key] = None
+                    continue
+                try:
+                    changes[key] = validate_bool_setting(key, value)
                 except ConfigError as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
                 continue

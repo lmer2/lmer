@@ -1063,6 +1063,97 @@ def test_a_turn_that_also_called_a_tool_keeps_the_call_and_loses_the_words(platf
     assert said(page).count(("assistant", "running the suite")) == 1
 
 
+# --- what a turn is, and nothing of it is lost (issue #481) --------------------
+#
+# Shaped after a recorded uber lmer session (1,816 records, 2026-09-18): the
+# harness writes prose, tool calls and thinking as separate records, and the
+# read path served every one of its 132 assistant text blocks. These pin the
+# rules that made that so, for both record shapes the harness has been seen to
+# write, so a regression shows up as a test rather than as a screenshot.
+
+
+def tool_row(command, at, text=None):
+    """An assistant record with a tool call — and, optionally, prose in the
+    same record, the combined shape a harness may write."""
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    content.append({
+        "type": "tool_use", "id": f"t-{at}", "name": "Bash",
+        "input": {"command": command},
+    })
+    return {"type": "assistant", "timestamp": at,
+            "message": {"role": "assistant", "content": content}}
+
+
+def test_prose_a_tool_call_more_prose_and_a_post_are_served_once_each(platform_root):
+    session_id = "s-481-turn"
+    plant_rows(session_id, [
+        assistant_row("Saved the note to memory.", at="2026-07-20T09:00:02.000Z"),
+        tool_row("sed -i s/a/b/ memory.md", "2026-07-20T09:00:03.000Z"),
+        assistant_row("The 657 developer pushed round 2; I turn the reviewer now.",
+                      at="2026-07-20T09:00:04.000Z"),
+        tool_row('lmer-signal post "Round 2 is up; reviewer turned."', "2026-07-20T09:00:05.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "Round 2 is up; reviewer turned.",
+                 channel="uber-lmer", at="2026-07-20T09:00:05Z", meta={"session_origin": True})
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert [m.text for m in page.messages if m.text] == [
+        "Saved the note to memory.",
+        "The 657 developer pushed round 2; I turn the reviewer now.",
+        "Round 2 is up; reviewer turned.",
+    ]
+    assert [m.via for m in page.messages if m.text] == [None, None, transcripts.COMMS_VIA]
+    # Both calls are kept: the post's own tool row is the pane's to hide.
+    assert [[t.name for t in m.tools] for m in page.messages if m.tools] == [["Bash"], ["Bash"]]
+
+
+def test_a_post_whose_words_differ_from_the_prose_keeps_both(platform_root):
+    session_id = "s-481-differs"
+    plant_rows(session_id, [assistant_row("I will post the sitrep now.", at="2026-07-20T09:00:02.000Z")])
+    plant_record(session_id, 1, "message", "Three runs up, one waiting on you.",
+                 channel="uber-lmer", at="2026-07-20T09:00:03Z", meta={"session_origin": True})
+
+    assert said(transcripts.read_messages(session_id, limit=100)) == [
+        ("assistant", "I will post the sitrep now."),
+        ("assistant", "Three runs up, one waiting on you."),
+    ]
+
+
+def test_prose_and_a_tool_call_in_one_record_keep_the_prose_nothing_posted(platform_root):
+    """The combined record shape, beside a post of *different* words: the join
+    may only blank a record whose words the bus carries."""
+    session_id = "s-481-combined"
+    plant_rows(session_id, [
+        tool_row("sed -i s/a/b/ memory.md", "2026-07-20T09:00:03.000Z",
+                 text="Noted — saved to persistent memory."),
+    ])
+    plant_record(session_id, 1, "message", "Three runs up, one waiting on you.",
+                 channel="uber-lmer", at="2026-07-20T09:00:04Z", meta={"session_origin": True})
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert page.messages[0].text == "Noted — saved to persistent memory."
+    assert [t.name for t in page.messages[0].tools] == ["Bash"]
+    assert page.messages[1].text == "Three runs up, one waiting on you."
+
+
+def test_a_record_is_spent_on_a_turn_saying_its_own_words_and_never_a_neighbour(platform_root):
+    session_id = "s-481-neighbour"
+    plant_rows(session_id, [
+        assistant_row("Noted — saved.", at="2026-07-20T09:00:02.000Z"),
+        assistant_row("on it", at="2026-07-20T09:00:03.000Z"),
+    ])
+    plant_record(session_id, 1, "message", "on it", channel="uber-lmer",
+                 at="2026-07-20T09:00:03Z", meta={"session_origin": True})
+
+    page = transcripts.read_messages(session_id, limit=100)
+    assert said(page) == [("assistant", "Noted — saved."), ("assistant", "on it")]
+    assert [m.comms_kind for m in page.messages] == [None, "message"], (
+        "the record replaced its own copy; the neighbouring prose is untouched"
+    )
+
+
 def test_the_pane_reads_the_conversation_from_one_route(platform_root):
     """`/messages` is the pane's only source for the conversation, so a record
     that reaches it twice is drawn twice unless the page itself dedupes."""
@@ -1276,3 +1367,62 @@ def test_a_recorded_pointer_is_named_by_its_path_under_the_transcript_root():
     )
     outside = transcripts._source_name("s-x", Path("/elsewhere/abc.jsonl"))
     assert re.fullmatch(r"[0-9a-f]{16}", outside), outside
+
+
+@pytest.mark.parametrize('combined', [False, True])
+def test_late_post_reconciles_through_the_real_reader_and_pane(platform_root, combined):
+    from tests.conftest import node_binary, require_node_toolchain
+    node = node_binary()
+    if node is None:
+        require_node_toolchain("Node is required for the pane reconciliation regression")
+    import subprocess
+
+    session = 'late-post-pane'
+    text = 'The requested review is ready for you.'
+    prose = assistant_row(text)
+    call = {'type': 'tool_use', 'id': 'post', 'name': 'Bash',
+            'input': {'command': 'lmer-signal post --stdin'}}
+    if combined:
+        prose['message']['content'].append(call)
+        rows = [prose]
+    else:
+        command = assistant_row('', at='2026-07-20T09:00:04Z')
+        command['message']['content'] = [call]
+        rows = [prose, command]
+    plant_rows(session, rows)
+    before = transcripts.read_messages(session).to_dict()
+    plant_record(session, 1, 'message', text, at='2026-07-20T09:00:05Z')
+    after = transcripts.read_messages(session).to_dict()
+    script = r'''
+      const fs = require('fs');
+      const { before, after, text } = JSON.parse(fs.readFileSync(0, 'utf8'));
+      const source = fs.readFileSync('web/src/components/Chat.vue', 'utf8');
+      const code = source.slice(source.indexOf('function absorb('), source.indexOf('\nasync function start()'));
+      const factory = new Function('fetchSessionMessages', `
+        const props = { sessionId: 'late-post-pane', view: 'conversation' };
+        const messages = { value: [] }, following = { value: false }, total = {}, sessions = {}, note = {}, live = {}, problem = {};
+        let cursor = 0, generation = 0, polling = false;
+        const PAGE = 40, stale = () => false, settlePending = () => {}, nextTick = () => {}, stickToBottom = () => {};
+        ${code}
+        return { absorb, poll, messages };
+      `);
+      const pane = factory(async (_id, { since, limit }) => {
+        const start = since < 0 ? Math.max(0, after.total + since) : Math.min(since, after.total);
+        const messages = after.messages.slice(start, start + limit);
+        return { ...after, messages, from: start, cursor: start + messages.length };
+      });
+      pane.absorb(before, 'replace');
+      (async () => {
+        await pane.poll();
+        const rows = pane.messages.value;
+        const speech = rows.filter(m => m.via === 'comms');
+        if (speech.length !== 1 || speech[0].text !== text) throw Error('late post missing');
+        if (rows.filter(m => m.text === text).length !== 1) throw Error('prose duplicated');
+        await pane.poll();
+        if (JSON.stringify(rows) !== JSON.stringify(pane.messages.value)) throw Error('repeated poll changed membership');
+      })().catch(error => { console.error(error); process.exitCode = 1; });
+    '''
+    result = subprocess.run([node, '-e', script],
+                            input=json.dumps({'before': before, 'after': after, 'text': text}),
+                            text=True, capture_output=True, timeout=30, cwd=WEB.parent)
+    assert result.returncode == 0, result.stdout + result.stderr

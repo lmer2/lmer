@@ -201,6 +201,13 @@ conversation window is lost.
   you restart it, and the dialog offers the restart. Standing orders are the
   chat's to edit and are deliberately not in this dialog. Thread permalinks go
   one per line; save and rotate to connect. The saved list survives rotations.
+  The dialog also holds the chat pane's **Show uber lmer's working transcript**
+  switch: off (the default) the pane draws the conversation only — your
+  messages, and what uber lmer posted, asked and answered; on, its tool calls,
+  watch events, hook re-prompts and unposted working notes appear muted beside
+  them. Platform state (`chat_show_transcript` in `config.json`): the browser
+  that saved it switches at once, and every other open drawer follows on its
+  next status poll. `docs/COMMS.md` §4 has the table of what each view draws.
   Workers accept the same links through `POST /api/sessions` (`targets`) or
   repeatable `lmer-ctl spawn --target-thread` flags. See
   [thread setup and overrides](COMMS.md#9-chat-thread-connectors-slack-and-matrix).

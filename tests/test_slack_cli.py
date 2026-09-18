@@ -1445,7 +1445,7 @@ class TestBusShims:
     def bus_rig(self, tmp_path, monkeypatch):
         return _BusRig(tmp_path, monkeypatch)
 
-    def test_post_goes_to_the_bus_when_no_token_is_in_the_container(self, bus_rig, monkeypatch, capsys):
+    def test_post_goes_to_the_bus_when_no_token_is_in_the_container(self, bus_rig, monkeypatch, capsys, routing_call):
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
         monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
         monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
@@ -1455,8 +1455,10 @@ class TestBusShims:
         assert "deprecated" in captured.err
         (record,) = bus_rig.records()
         assert (record.kind, record.text, record.source.channel) == ("message", "hello there", "agent")
+        from lmer_cli.routing_receipts import delivered
+        assert delivered('call', 'claude-test')
 
-    def test_post_with_a_legacy_token_also_reaches_slack(self, bus_rig, monkeypatch, capsys):
+    def test_post_with_a_legacy_token_also_reaches_slack(self, bus_rig, monkeypatch, capsys, routing_call):
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-legacy")
         monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
         monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
@@ -1475,13 +1477,17 @@ class TestBusShims:
         assert capsys.readouterr().out.split() == ["000001", "9.9"]
         assert posted == [("C1", "1.2", "hello there")]
         assert len(bus_rig.records()) == 1
+        from lmer_cli.routing_receipts import delivered
+        assert delivered('call', 'claude-test')
 
-    def test_post_with_neither_bus_nor_token_is_no_channel(self, tmp_path, monkeypatch, capsys):
+    def test_post_with_neither_bus_nor_token_is_no_channel(self, tmp_path, monkeypatch, capsys, routing_call):
         _BusRig(tmp_path, monkeypatch, with_bus=False)
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
         monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
         monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
         assert cli.main(["post", "hello"]) == cli.NO_CHANNEL_EXIT_CODE
+        from lmer_cli.routing_receipts import delivered
+        assert not delivered('call', 'claude-test')
 
     def test_history_without_a_token_lists_the_bus(self, bus_rig, monkeypatch, capsys):
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)

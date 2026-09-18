@@ -2687,8 +2687,6 @@ def _comms_messages(session_id: str) -> tuple:
     bus turns and nothing else.
     """
     try:
-        from lmer_cli import comms as bus
-
         from . import comms as hub_module
 
         events, _cursor = hub_module.ensure_hub().feed(
@@ -2700,8 +2698,11 @@ def _comms_messages(session_id: str) -> tuple:
             "conversation is served without the bus's turns", session_id, exc,
         )
         return [], []
-    if not events:
-        return [], []
+    return _comms_turns(events, session_id)
+
+
+def _comms_turns(events: list, session_id: str) -> tuple:
+    from lmer_cli import comms as bus
 
     questions: dict = {}
     turns: list = []
@@ -2715,13 +2716,15 @@ def _comms_messages(session_id: str) -> tuple:
         if kind == "question":
             questions[record.get("id")] = record
         inbound = channel not in (None, "agent") and not meta.get("session_origin")
-        if kind == "command":
+        if kind in ("command", "digest"):
             role = PLATFORM_ROLE
         elif inbound:
             role = "user"
         else:
             role = "assistant"
         label = None if kind == "message" and inbound else kind
+        if kind == "digest":
+            label = f"digest: {meta.get('digest_kind', 'event')}"
         if kind == "answer" and meta.get("late"):
             label = "late answer"
         spoken, truncated = _present(str(record.get("text") or ""), TEXT_LIMIT, keep="tail")
@@ -3129,6 +3132,17 @@ def read_messages(
                 found.append(message)
         channel, copies = _merged_channel(member)
         messages.extend(_interleave(_without_bus_copies(found, copies), channel))
+
+    entry = registry.read_session(session_id)
+    if isinstance(entry, dict) and entry.get("kind") == "assistant":
+        from . import assistant_conversation
+
+        channel, copies = _comms_turns(assistant_conversation.events(), session_id)
+        working = [message for message in messages if not message.via]
+        conversation = [message for message in messages if message.via]
+        messages = _interleave(
+            _without_bus_copies(working, copies), _interleave(conversation, channel),
+        )
 
     for index, message in enumerate(messages):
         message.seq = index

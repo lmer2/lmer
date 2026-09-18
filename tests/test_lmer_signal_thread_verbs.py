@@ -223,7 +223,7 @@ class TestRead:
 
 
 class TestPostIntoAThread:
-    def test_the_post_is_attributed_and_recorded_on_this_sessions_bus(self, rig, capsys):
+    def test_the_post_is_attributed_and_recorded_on_this_sessions_bus(self, rig, capsys, routing_call):
         rig.serve()
         assert run(["post", "the review is posted", "--thread", SLACK_LINK]) == 0
         out = capsys.readouterr()
@@ -235,9 +235,11 @@ class TestPostIntoAThread:
         # read it from here.
         assert record.meta["thread"].startswith("https://20c.slack.com/archives/C0123ABCDEF/")
         assert "posted into" in out.err
+        from lmer_cli.routing_receipts import delivered
+        assert delivered('call', 'claude-test')
 
     def test_a_post_that_never_landed_leaves_no_record_claiming_it_did(
-        self, tmp_path, monkeypatch, capsys
+        self, tmp_path, monkeypatch, capsys, routing_call
     ):
         rig = Rig(tmp_path, monkeypatch, slack=FakeSlack(fail="Slack API error: channel_not_found", code="channel_not_found"))
         rig.serve()
@@ -246,8 +248,10 @@ class TestPostIntoAThread:
         finally:
             rig.stop()
         assert rig.records() == []
+        from lmer_cli.routing_receipts import delivered
+        assert not delivered('call', 'claude-test')
 
-    def test_a_record_that_fails_after_delivery_says_do_not_retry(self, rig, capsys, monkeypatch):
+    def test_a_record_that_fails_after_delivery_says_do_not_retry(self, rig, capsys, monkeypatch, routing_call):
         """The one order this verb can fail in that an agent would make worse.
 
         The message is already in a thread this run does not own; an agent told
@@ -269,6 +273,8 @@ class TestPostIntoAThread:
         # that anything landed.
         assert "posted into" in err
         assert rig.slack.posted[0][2].endswith("the review is posted")
+        from lmer_cli.routing_receipts import delivered
+        assert delivered('call', 'claude-test')
 
     def test_a_post_too_long_for_one_message_says_it_was_clipped(self, rig, capsys):
         """The record keeps the whole text and the thread gets what it takes; a

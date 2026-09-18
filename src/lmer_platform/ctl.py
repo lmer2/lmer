@@ -122,7 +122,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from lmer_cli import runref
+from lmer_cli import routing_receipts, runref
 
 from lmer_platform.client import (
     Call,
@@ -1266,6 +1266,11 @@ def main(argv: Optional[Sequence[str]] = None, *, transport=None) -> int:
             response = _request(
                 endpoint, call, timeout=args.timeout, transport=transport
             )
+            if call.method == "POST" and call.path == "/api/comms/thread" and 200 <= response.status_code < 300:
+                payload = _payload(response.text)
+                posted = payload.get("posted") if isinstance(payload, dict) else None
+                if isinstance(posted, dict):
+                    routing_receipts.record("post", posted.get("ref"))
             # A verb made of several calls stops at the first refusal and reports
             # it, rather than pressing on with a step whose precondition the
             # daemon just declined. The last call's reply is the verb's reply.

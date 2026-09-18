@@ -384,3 +384,35 @@ def test_failed_initial_poll_releases_wait_claim(rig, monkeypatch):
     monkeypatch.setattr(rig.client, "messages", fail)
     assert run(["wait", question["id"], "--timeout", "5"]) == 1
     assert rig.log._claims == {}
+
+
+@pytest.mark.parametrize("argv, routed", [
+    (["post", "Delivered reply"], True),
+    (["ask", "Question?", "--no-wait"], True),
+    (["ask", "Question?", "--timeout", "0.01", "--interval", "0.01"], True),
+    (["note", "Quiet progress"], False),
+    (["milestone", "Finished"], False),
+])
+def test_cli_delivery_receipt_reaches_the_guard(rig, capsys, argv, routed, routing_call):
+    from hooks.slack_reply_guard import evaluate
+    from tests.test_slack_reply_guard import LONG, _assistant_bash, _assistant_text, _tool_result, _user_text
+    result = run(argv)
+    output = capsys.readouterr()
+    records = rig.records()
+    assert len(records) == 1
+    if routed:
+        assert records[0].id in output.err
+    events = [_user_text('request'), _assistant_bash('uninterpreted command', tool_id='call'),
+              _tool_result(output.out + output.err, tool_use_id='call', is_error=result != 0),
+              _assistant_text(LONG)]
+    assert (evaluate(events) is None) == routed
+
+
+def test_real_help_does_not_produce_a_delivery_receipt(rig, capsys, routing_call):
+    from lmer_cli.routing_receipts import delivered
+    with pytest.raises(SystemExit) as exited:
+        run(['ask', '--help'])
+    assert exited.value.code == 0
+    output = capsys.readouterr()
+    assert not delivered('call', 'claude-test')
+    assert rig.records() == []

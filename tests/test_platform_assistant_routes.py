@@ -1534,7 +1534,7 @@ def test_an_unknown_setting_refusal_names_every_accepted_key(
     assert reply.status_code == 400, reply.text
     detail = reply.json()["detail"]
     for key in ("nudge_after_seconds", "nudge_pending_threshold",
-                "checkin_window_seconds", "model"):
+                "checkin_window_seconds", "chat_show_transcript", "model"):
         assert key in detail
 
 
@@ -1704,6 +1704,74 @@ def test_chat_retention_refuses_invalid_values_without_writing(client, platform_
     assert reply.status_code == 400
     assert "chat_keep_last" in reply.json()["detail"]
     assert not cfg.config_path().exists()
+
+
+# The uber lmer pane's transcript toggle (issue #488): a boolean beside
+# ``keep_last`` in the ``chat`` group, stored platform-side so it survives
+# browsers, applied on the pane's next config refresh rather than at a rotate.
+
+
+def test_chat_transcript_toggle_defaults_off_and_round_trips_through_config(client, platform_root):
+    headers = bearer_header()
+    initial = client.get("/api/assistant/config", headers=headers)
+    assert initial.status_code == 200
+    assert initial.json()["chat"]["show_transcript"] == {
+        "value": False, "source": "default", "stored": None,
+    }
+    cfg.update_stored({"assistant_model": "kept"})
+    for value in (True, False, None):
+        reply = client.post(
+            "/api/assistant/config", headers=headers, json={"chat_show_transcript": value},
+        )
+        assert reply.status_code == 200, reply.text
+        expected = {
+            "value": bool(value),
+            "source": "default" if value is None else "config.json",
+            "stored": value,
+        }
+        assert reply.json()["changed"] == ["chat_show_transcript"]
+        assert reply.json()["chat"]["show_transcript"] == expected
+        assert client.get("/api/assistant/config", headers=headers).json()["chat"]["show_transcript"] == expected
+        assert cfg.load().chat_show_transcript is bool(value)
+        stored = store.read_json(cfg.config_path())
+        assert stored["assistant_model"] == "kept"
+        if value is None:
+            assert "chat_show_transcript" not in stored
+        else:
+            assert stored["chat_show_transcript"] is value
+    # The pane's own note about scope names it beside keep_last.
+    assert "chat_show_transcript" in reply.json()["note"]
+
+
+@pytest.mark.parametrize("bad", [1, 0, "yes", "on", 1.5, [], {}])
+def test_chat_transcript_toggle_refuses_non_booleans_without_writing(client, platform_root, bad):
+    reply = client.post(
+        "/api/assistant/config", headers=bearer_header(), json={"chat_show_transcript": bad},
+    )
+    assert reply.status_code == 400, reply.text
+    assert "chat_show_transcript" in reply.json()["detail"]
+    assert not cfg.config_path().exists()
+
+
+def test_a_hand_written_true_in_the_file_reads_as_on_and_junk_reads_as_off(client, platform_root):
+    """The file layer is lenient the way the integer settings' is: a spelled-out
+    ``"true"`` is honoured, anything else costs that layer with a warning rather
+    than a daemon that will not load its config."""
+    cfg.update_stored({"assistant_model": "kept"})
+    path = cfg.config_path()
+    written = store.read_json(path)
+    written["chat_show_transcript"] = "TRUE"
+    store.write_json(path, written)
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"]["show_transcript"] == {
+        "value": True, "source": "config.json", "stored": "TRUE",
+    }
+    assert cfg.load().chat_show_transcript is True
+    written["chat_show_transcript"] = "sometimes"
+    store.write_json(path, written)
+    assert client.get("/api/assistant/config", headers=bearer_header()).json()["chat"]["show_transcript"] == {
+        "value": False, "source": "default", "stored": "sometimes",
+    }
+    assert cfg.load().chat_show_transcript is False
 
 
 # The assistant's own container allocation (issue #453). Read-only and
