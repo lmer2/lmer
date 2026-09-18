@@ -1000,17 +1000,26 @@ lose one without restarting anything.
 
 | route | what |
 |---|---|
-| `GET /api/sessions/{id}/threads` | this session's connections, each with `running`, `since`, `last_exit` and `detail` |
+| `GET /api/sessions/{id}/threads` | this session's connections, each with `running`, `since`, `last_exit`, `detail` and `attention` |
 | `POST /api/sessions/{id}/threads {permalink}` | connect; the channel is read out of the link |
 | `POST /api/sessions/{id}/threads {channel, title?}` | open a new thread there and connect that (below) |
 | `DELETE /api/sessions/{id}/threads/{thread_id}` | disconnect |
+| `POST /api/sessions/{id}/threads/{thread_id}/recover` | inspect or recover the host-side pending send |
 
 ```sh
 lmer-ctl threads list SESSION
 lmer-ctl threads connect SESSION THREAD_PERMALINK
 lmer-ctl threads open SESSION CHANNEL [--title "…"]
 lmer-ctl threads disconnect SESSION THREAD_ID
+lmer-ctl threads recover SESSION THREAD_ID inspect
 ```
+
+The daemon automatically settles saved receipts and permits one safe recovery
+retry. Unknown send outcomes remain parked, with one assistant digest per
+recovery transition and a warning on the thread controls. `receipt`, `retry` and
+acknowledged `clear` are also available through `threads recover`; see
+[Connector recovery](CONNECTOR-RECOVERY.md#platform-recovery) for their arguments,
+duplicate-risk override and API contract.
 
 In the UI the same calls are two icons — Slack and matrix — on every run row, in
 the run view, and in the uber lmer chat pane header. An inactive icon opens a

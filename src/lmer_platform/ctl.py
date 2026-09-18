@@ -497,6 +497,13 @@ def _call_threads_disconnect(args) -> Call:
     return Call("DELETE", f"/api/sessions/{args.session}/threads/{args.thread}")
 
 
+def _call_threads_recover(args) -> Call:
+    return Call("POST", f"/api/sessions/{args.session}/threads/{args.thread}/recover", body={
+        "action": args.action, "operation": args.operation, "remote_ref": args.remote_ref,
+        "acknowledge_duplicate": args.acknowledge_duplicate, "reason": args.reason,
+    })
+
+
 def _call_wind_down(args) -> Call:
     return Call(
         "POST",
@@ -960,6 +967,18 @@ def create_parser() -> argparse.ArgumentParser:
     # matched, so it would 404. `threads list` is where the id comes from.
     threads_disconnect.add_argument("thread", help="Thread id, as `threads list` reports it.")
     threads_disconnect.set_defaults(call=_call_threads_disconnect)
+    threads_recover = threads_sub.add_parser(
+        "recover", help="Inspect or recover a pending send in the host connector state.",
+    )
+    threads_recover.add_argument("session", help="Session id.")
+    threads_recover.add_argument("thread", help="Thread id from threads list.")
+    threads_recover.add_argument("action", choices=("inspect", "receipt", "retry", "clear"))
+    threads_recover.add_argument("--operation", help="Exact pending operation id from inspect.")
+    threads_recover.add_argument("--remote-ref", help="Receipt to verify against the remote thread.")
+    threads_recover.add_argument("--acknowledge-duplicate", action="store_true",
+                                 help="Required for clear: the selected send may be duplicated.")
+    threads_recover.add_argument("--reason", help="Required for clear: why the marker is being removed.")
+    threads_recover.set_defaults(call=_call_threads_recover)
     threads_references = threads_sub.add_parser(
         "references",
         help="The threads this run has been pointed at, connected to none of them.",

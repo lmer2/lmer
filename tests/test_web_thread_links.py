@@ -164,6 +164,18 @@ class TestTheTwoIcons:
 
 
 class TestWhatHoverSays:
+    def test_recovery_marks_transport_and_thread_with_actionable_detail(self):
+        recovering = dict(SLACK, running=False, attention="recovery-required",
+                          detail="recovery required; use lmer-ctl threads recover s-1 slack:9f2c1d inspect")
+        html = _render([recovering])
+        assert 'aria-label="Slack threads: recovery required"' in html
+        assert 'content="!"' in html
+        assert 'color="warning"' in _icon_buttons(html)[0]
+        assert recovering["detail"] in html
+        recovered = _render([SLACK])
+        assert 'content="!"' not in recovered
+        assert 'color="warning"' not in _icon_buttons(recovered)[0]
+
     def test_a_connected_icon_names_its_threads(self):
         assert "example · C0123ABCDEF" in _render([SLACK])
 
