@@ -61,17 +61,22 @@ class SlackClient:
 
     BASE_URL = "https://slack.com/api"
 
-    def __init__(self, bot_token: Optional[str] = None):
+    def __init__(self, bot_token: Optional[str] = None, *, timeout: Optional[float] = None,
+                 retries: int = _MAX_RETRIES):
         """Initialize SlackClient.
 
         Args:
             bot_token: Slack bot token. Defaults to the SLACK_BOT_TOKEN
                        environment variable.
+            timeout: Optional requests timeout for each HTTP call.
+            retries: Number of HTTP 429 retries; zero reports rate limiting immediately.
 
         Raises:
             SlackError: If no token is available.
         """
         self.bot_token = bot_token or os.getenv("SLACK_BOT_TOKEN")
+        self.timeout = timeout
+        self.retries = retries
 
         if not self.bot_token:
             raise SlackError(
@@ -112,14 +117,16 @@ class SlackClient:
         """
         url = f"{self.BASE_URL}/{endpoint}"
 
-        for attempt in range(_MAX_RETRIES + 1):
+        if self.timeout is not None:
+            kwargs.setdefault("timeout", self.timeout)
+        for attempt in range(self.retries + 1):
             try:
                 response = self.session.request(method, url, **kwargs)
                 response.raise_for_status()
             except requests.HTTPError as exc:
                 resp = exc.response
                 if resp is not None and resp.status_code == 429:
-                    if attempt < _MAX_RETRIES:
+                    if attempt < self.retries:
                         # Slack sends integer seconds, but Retry-After may
                         # legally be an HTTP-date — fall back rather than raise.
                         try:
@@ -129,8 +136,8 @@ class SlackClient:
                         time.sleep(retry_after)
                         continue
                     raise SlackError(
-                        f"Slack API rate limited after {_MAX_RETRIES} retries "
-                        f"(HTTP 429)"
+                        f"Slack API rate limited after {self.retries} retries "
+                        f"(HTTP 429)", code="ratelimited",
                     ) from exc
                 raise SlackError(f"Slack API HTTP error: {exc}") from exc
             except requests.RequestException as exc:

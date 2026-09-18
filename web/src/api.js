@@ -45,6 +45,10 @@ export function fetchState() {
   return request('api/state')
 }
 
+export function fetchHealth() {
+  return request('api/health')
+}
+
 export function rescan() {
   return request('api/rescan', { method: 'POST' })
 }

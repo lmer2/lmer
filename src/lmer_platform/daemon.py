@@ -46,6 +46,7 @@ from typing import Optional
 
 from lmer_cli import comms as bus_comms
 from lmer_cli import runref
+from lmer_cli.tls import ensure_ca_bundle
 
 from .api import build_state, create_app
 from .assistant import Supervisor, register_supervisor
@@ -62,6 +63,7 @@ from .config import (
     ConfigError, binding_notice, ensure_secret, load as load_config, read_secret,
 )
 from .detect import Detector
+from .ingress import Ingress
 from .reattach import reattach_all, startup_notice
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import forget, list_tracked, run_key, track
@@ -352,6 +354,10 @@ def _watch_for_attention(config) -> Detector:
 def _cmd_run(args: argparse.Namespace) -> int:
     import uvicorn
 
+    logging.basicConfig(level=logging.DEBUG if args.log_level == "trace" else args.log_level.upper(),
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    ensure_ca_bundle()
+    ingress = Ingress()
     config = load_config(_overrides(args))
     secret = ensure_secret(config)
 
@@ -408,7 +414,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     threads = _run_thread_connectors()
     services = _serve_thread_requests()
 
-    app = create_app(config, secret)
+    app = create_app(config, secret, ingress=ingress)
     uvicorn.run(
         app,
         host=config.bind_address,

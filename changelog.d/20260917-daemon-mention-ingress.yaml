@@ -1,0 +1,2 @@
+added:
+- "The platform daemon receives Slack and Matrix assistant requests without standalone listeners and reports ingress health in the API and UI."
