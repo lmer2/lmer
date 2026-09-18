@@ -320,6 +320,90 @@ conversation window is lost.
   recommends a rotation at its next breakpoint. Off by default; it never rotates
   anything itself. Full behaviour in the section below.
 
+## Assistant mentions and DM replies
+
+The daemon owns Slack and Matrix ingress for the assistant. Enable
+`LMER_ASSISTANT_MENTION_ROUTING=true` in its environment or `~/.lmer/.env`, set
+the transport credentials and sender allow-lists below, and restart the daemon
+once. Stop any standalone `lmer-slack-listener` or `lmer-matrix-listener`: they
+are legacy entry points and are not needed here. Running a second Socket Mode
+consumer can split Slack delivery between processes.
+
+Ingress adds requests to the assistant's private inbox. It never starts an
+`lmer chat` session. The assistant answers or starts a worker under the
+operator's run-start policy. A mention does not automatically start an offline
+assistant. See [admission and reply rules](./ASSISTANT-MENTIONS.md), including
+connected-run ownership and the exact assistant-parent requirement for DMs.
+
+### Slack app requirements
+
+Slack uses [Socket Mode](https://docs.slack.dev/apis/events-api/using-socket-mode/),
+the same transport as the legacy listener. This avoids enumerating and polling
+every channel for mentions and needs no public HTTP endpoint.
+
+- Set `SLACK_BOT_TOKEN` to the installed bot token and `SLACK_APP_TOKEN` to the
+  app-level token with `connections:write`, for the same app/workspace.
+- Enable Socket Mode and subscribe to bot events `app_mention` and `message.im`.
+- Grant `app_mentions:read` and `im:history`, plus the existing history scopes
+  for context reads (`channels:history` for public channels and `groups:history`
+  for private channels). Keep `chat:write` for replies and `im:write` to start
+  assistant DMs. Reinstall the app after changing its granted scopes.
+- Invite the bot to the channels where it should receive mentions. Membership
+  still controls access to history; `not_in_channel` in the daemon log identifies
+  a refused context read.
+- Set `LMER_SLACK_DM_ALLOWED_USERS` to permitted Slack IDs or confirmed handles.
+  Unset or empty admits nobody, including channel mentions. Handle entries need
+  `users:read`; exact IDs avoid that lookup.
+
+### Matrix account requirements
+
+Set `LMER_MATRIX_HOMESERVER`, `LMER_MATRIX_USER_ID` and
+`LMER_MATRIX_ACCESS_TOKEN` for the existing bot account. Set
+`LMER_MATRIX_ALLOWED_USERS` to permitted exact MXIDs; unset or empty admits
+nobody. `LMER_MATRIX_ROOMS` optionally selects rooms to join and sync; otherwise
+the daemon syncs all rooms the bot has joined. Room aliases are resolved by the
+join response before they enter the sync filter. The first sync establishes a
+cursor and ignores historical events; reconnects retain that cursor until the
+daemon restarts. Encrypted rooms retain the existing transport limitations.
+
+A failed selected-room join logs the room and error code and retries after
+30 seconds. Successfully selected rooms continue to sync. If none of the
+selected rooms can be joined, ingress reports `retrying` and waits for a join
+to succeed; it never falls back to syncing all joined rooms.
+The first sync after a selected room joins excludes that room's initial history.
+Other selected rooms keep receiving fresh events, and reconnects retain this
+per-room initialization state along with the cursor.
+
+### Ingress health and failures
+
+`GET /api/health` includes `ingress.slack` and `ingress.matrix`. Each contains
+`up`, `state`, `last_event_at`, and `last_error`. These are local snapshots;
+reading health never calls Slack or Matrix. The fleet UI's **Assistant message
+ingress** panel shows the same state, last event time and last error.
+
+`up` means the Socket Mode connection is live or Matrix sync succeeded.
+`last_event_at` records receipt of an event, including refused events, rather
+than the last empty poll. `last_error` retains the most recent error after
+recovery, and is empty until a failure occurs. Times/errors reset at daemon
+startup; inbox replay receipts remain durable.
+
+Disabled routing reports `disabled`. No credentials reports `unconfigured`;
+partial credentials reports `misconfigured` and names the missing variables.
+One transport failing does not stop the other or the API. Initial failures retry
+with bounded backoff; Socket Mode also reconnects through its SDK. Check the
+app's subscriptions and channel membership when ingress is up but no event
+arrives: connection health cannot verify an event the app never sends.
+
+Every received event that is not admitted produces an `assistant_ingress_dropped`
+daemon log record with its transport, identifiers and reason, such as `denied`,
+`connected`, `unmatched_dm_parent`, `duplicate`, or `not_in_channel`. Message
+bodies are not logged. Disabled submissions through the external API log
+`disabled`. Transport failures also update health; limited Matrix sync timelines
+log `limited_sync` because events may have been omitted by the homeserver.
+There is no durable ingress outbox: after a failed admission, mention again
+once the cause is fixed. External host listeners may still submit authenticated
+`POST /api/assistant/requests` events through the same admission rules.
+
 ## Digest nudges
 
 The digest spool is pull-only: the daemon detects questions, crashes, finished

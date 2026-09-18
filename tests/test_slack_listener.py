@@ -94,6 +94,14 @@ def slack_app(monkeypatch) -> types.SimpleNamespace:
 
 
 @pytest.fixture(autouse=True)
+def isolate_assistant_routing(monkeypatch):
+    """These legacy-mode tests must not inherit the daemon's routing switch."""
+    monkeypatch.delenv("LMER_ASSISTANT_MENTION_ROUTING", raising=False)
+    monkeypatch.delenv("LMER_ASSISTANT_MENTION_BACKLOG", raising=False)
+    monkeypatch.setattr(listener, "MENTIONS", listener.assistant_mentions.Settings())
+
+
+@pytest.fixture(autouse=True)
 def isolate_dm_allowlist(monkeypatch):
     """Isolate the DM allowlist from the ambient environment.
 

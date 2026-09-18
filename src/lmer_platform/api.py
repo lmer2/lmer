@@ -102,6 +102,7 @@ from lmer_cli.threads import ThreadError
 
 from . import meta
 from . import mention_routing
+from .ingress import Ingress
 from . import references
 from . import reattach
 from . import relations
@@ -1758,6 +1759,7 @@ def create_app(
     secret: str,
     *,
     state_builder: Optional[Callable[..., dict]] = None,
+    ingress: Optional[Ingress] = None,
 ):
     """Build the FastAPI app.
 
@@ -1775,8 +1777,10 @@ def create_app(
         raise ValueError("refusing to serve without a shared secret")
 
     builder = state_builder or build_state
-    app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION))
-    mention_settings = MentionSettings.from_env()
+    app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION),
+                  lifespan=ingress.lifespan if ingress else None)
+    mention_settings = ingress.settings if ingress else MentionSettings.from_env()
+    ingress_status = ingress or Ingress(mention_settings)
 
     # The UI bundle is ~550 kB uncompressed and ~130 kB gzipped, almost all of it
     # Vuetify's precompiled utilities sheet, which does not tree-shake. That
@@ -2110,6 +2114,7 @@ def create_app(
             "schema": SCHEMA_VERSION,
             "at": utc_now_iso(),
             "bind": config.base_url,
+            "ingress": ingress_status.snapshot(),
             "mirror": {
                 "present": status.present,
                 "healthy": status.healthy,

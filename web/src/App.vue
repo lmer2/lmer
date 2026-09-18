@@ -28,6 +28,7 @@ import RunDetail from './components/RunDetail.vue'
 import RunNav from './components/RunNav.vue'
 import SlotEditor from './components/SlotEditor.vue'
 import SlotRow from './components/SlotRow.vue'
+import IngressStatus from './components/IngressStatus.vue'
 import { fetchRunRelations, fetchState, forgetRun, prune, rescan } from './api.js'
 import {
   ago, attentionLabel, driverLabel, slotIsFree, stateMeta, targetRef, toneColor,
@@ -856,6 +857,7 @@ onUnmounted(() => {
 
         <template v-else>
           <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+          <IngressStatus :now="now" />
           <v-alert
             v-if="mirrorProblem"
             type="warning"
