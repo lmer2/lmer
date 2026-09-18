@@ -111,6 +111,7 @@ import {
 } from '../api.js'
 import { ago } from '../format.js'
 import { withoutOutboundCopies } from '../outbound.js'
+import { inView, layerOf } from '../conversation.js'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
 // never open, and the fleet view must not pay for it on first paint.
@@ -158,6 +159,20 @@ const props = defineProps({
   // reason `composerLabel` is one — the two conversations must not be tellable
   // apart only by which edge of the screen they are docked to.
   agentLabel: { type: String, default: 'lmer' },
+  // Which turns are drawn (issue 488; conversation.js has the partition).
+  //   'session'       every spoken turn, the harness's internals behind a button
+  //                   — the run chat's rendering, unchanged, and the default.
+  //   'conversation'  bus records, private reply copies and required digests.
+  //   'transcript'    the conversation with the harness's own turns muted beside
+  //                   it — tool calls, watch events, hook re-prompts, unposted
+  //                   prose — for debugging a stuck session.
+  // The drawer picks between the last two from a platform-side setting
+  // (operatorChat.js); RunDetail passes nothing.
+  view: {
+    type: String,
+    default: 'session',
+    validator: (value) => ['session', 'conversation', 'transcript'].includes(value),
+  },
   now: { type: Number, default: () => Date.now() },
 })
 
@@ -475,9 +490,14 @@ function uploadUrl(name, message) {
 }
 
 const presented = computed(() => {
-  const shown = showInjected.value
-    ? messages.value
-    : messages.value.filter((message) => message.kind === 'said')
+  let shown
+  if (props.view === 'session') {
+    shown = showInjected.value
+      ? messages.value
+      : messages.value.filter((message) => message.kind === 'said')
+  } else {
+    shown = messages.value.filter((message) => inView(props.view, message))
+  }
   return withoutOutboundCopies(shown).map((message) => ({
     ...message,
     // Only what you sent: these lines are put in a message by this pane, and an
@@ -498,6 +518,7 @@ const wrappers = computed(() => presented.value.filter(emptyWrapper))
 const hiddenCount = computed(
   () => messages.value.length - messages.value.filter((m) => m.kind === 'said').length,
 )
+
 
 const canLoadEarlier = computed(
   () => messages.value.length > 0 && messages.value[0].seq > 0,
@@ -532,6 +553,26 @@ function ground(message) {
   if (message.kind !== 'said') return 'action'
   if (message.role === 'user') return 'operator'
   return message.role === 'assistant' ? 'agent' : 'action'
+}
+
+// What the conversation view is not drawing, so a header counting more turns
+// than the list holds is explained on the spot: "why did I not see that" was
+// the question behind issue 481, and the answer has to be on the screen.
+// Counted as the transcript view would draw them — after the outbound tool
+// copies and the empty wrappers are gone — so the number is what the switch
+// reveals, not what the route served.
+const transcriptHidden = computed(
+  () => withoutOutboundCopies(messages.value).filter(
+    (message) => layerOf(message) === 'transcript' && !emptyWrapper(message),
+  ).length,
+)
+
+// The transcript view's muting: the harness's own turns, drawn beside the
+// conversation and never as speech. A class on top of the ground, not a fourth
+// ground — the three grounds still say who a turn is from; this says it was
+// not addressed to the reader.
+function muted(message) {
+  return props.view === 'transcript' && layerOf(message) === 'transcript'
 }
 
 // How a bus channel reads in a header (issue 407); anything unlisted is already
@@ -741,9 +782,9 @@ function absorb(page, mode = 'append') {
   // conversation impossible on a phone — and 'prepend' is that read, so it never
   // follows. A fresh list is scrolled down because its tail is the interesting
   // part, which is why it was asked for as a tail.
-  const follow = mode === 'replace' || (mode === 'append' && following.value)
+  const follow = mode === 'replace' || (['append', 'reconcile'].includes(mode) && following.value)
   const arriving = page.messages || []
-  if (mode === 'replace') {
+  if (mode === 'replace' || mode === 'reconcile') {
     messages.value = arriving
     cursor = page.cursor
   } else if (mode === 'prepend') {
@@ -798,6 +839,10 @@ async function poll() {
   const mine = generation
   polling = true
   try {
+    if (props.view !== 'session') {
+      await refreshConversation(mine)
+      return
+    }
     const page = await fetchSessionMessages(props.sessionId, {
       since: cursor,
       limit: PAGE,
@@ -814,6 +859,25 @@ async function poll() {
   } finally {
     polling = false
   }
+}
+
+async function refreshConversation(mine) {
+  // Re-read the loaded window: a late post can replace prose below the cursor.
+  const firstId = messages.value[0]?.id
+  let since = messages.value[0]?.seq || 0
+  let page = await fetchSessionMessages(props.sessionId, { since, limit: 500 })
+  const end = page.total
+  const rows = [...(page.messages || [])]
+  while (page.cursor < end && page.cursor > since) {
+    if (stale(mine)) return
+    since = page.cursor
+    page = await fetchSessionMessages(props.sessionId, { since, limit: 500 })
+    rows.push(...(page.messages || []))
+  }
+  if (stale(mine)) return
+  if (messages.value[0]?.id !== firstId) return
+  absorb({ ...page, messages: rows }, 'reconcile')
+  problem.value = null
 }
 
 async function start() {
@@ -1121,9 +1185,19 @@ watch(rendererLoaded, () => {
           v-else-if="total"
           class="text-body-small text-medium-emphasis"
         >{{ total }} messages<template v-if="spansSessions"> across {{ sessions.length }} sessions</template></span>
+        <!-- The conversation view says what it leaves out and where the switch
+             is; the transcript view says why the muted rows look the way they do. -->
+        <span
+          v-if="view === 'conversation' && transcriptHidden"
+          class="text-body-small text-medium-emphasis transcript-note"
+        >· {{ transcriptHidden }} transcript turns not shown — the working transcript is off in uber lmer settings</span>
+        <span
+          v-else-if="view === 'transcript'"
+          class="text-body-small text-medium-emphasis transcript-note"
+        >· muted rows are the working transcript, not messages to you</span>
         <v-spacer />
         <v-btn
-          v-if="hiddenCount"
+          v-if="view === 'session' && hiddenCount"
           :prepend-icon="mdiCogOutline"
           size="small"
           variant="tonal"
@@ -1172,11 +1246,15 @@ watch(rendererLoaded, () => {
           v-for="message in visible"
           :key="message.id ?? message.seq"
           class="turn"
-          :class="[`turn-${message.role}`, `ground-${ground(message)}`]"
+          :class="[`turn-${message.role}`, `ground-${ground(message)}`, { 'turn-transcript': muted(message) }]"
         >
           <div class="d-flex align-center ga-2 text-body-small text-medium-emphasis">
             <span>{{ speaker(message) }}</span>
             <span v-if="message.kind !== 'said'">· internal</span>
+            <!-- The harness's own turn, in the view that draws them (issue 488):
+                 said so in the header as well as by the muting, because a
+                 phone's contrast does not always survive an opacity. -->
+            <span v-if="muted(message)">· transcript</span>
             <!-- A turn the server merged in from the session's ask channel: your
                  answer really is yours and the question really is the agent's,
                  but neither is in the transcript, so neither is presented as if
@@ -1663,6 +1741,25 @@ watch(rendererLoaded, () => {
    fourth. */
 .watch {
   white-space: pre-wrap;
+}
+
+/* The harness's own turns in the transcript view (issue 488): tool calls, watch
+   events, hook re-prompts, prose nobody posted. Muted rather than recoloured —
+   the ground still says who, and `currentColor` keeps this inside the theme —
+   with a dashed edge so a row reads as "recorded", not "said to you", before
+   any of its words do. */
+.turn-transcript {
+  opacity: 0.72;
+  border-inline-start: 2px dashed currentColor;
+  padding-inline-start: 8px;
+}
+
+.turn-transcript .said {
+  font-size: 0.92em;
+}
+
+.transcript-note {
+  min-width: 0;
 }
 
 /* What you sent, shown as sent. Transcript text carries its own newlines and

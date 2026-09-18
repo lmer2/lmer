@@ -2600,6 +2600,10 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
         append_event(
             "assistant_notified", note=label, data={"kind": label, "note": text}
         )
+        from . import assistant_conversation
+
+        if label in assistant_conversation.DIGEST_KINDS:
+            assistant_conversation.record(text, kind=label)
         return _live_assistant() is not None
 
 

@@ -104,6 +104,7 @@ import {
   stopAssistant,
 } from '../api.js'
 import { ago } from '../format.js'
+import { chatShowTranscript, refreshChatSettings } from '../operatorChat.js'
 import StatusStrip from './StatusStrip.vue'
 
 const props = defineProps({
@@ -172,6 +173,10 @@ function stale(mine) {
 
 async function load() {
   const mine = generation
+  // The pane's view is a platform-side setting (issue 488): re-read on the
+  // same tick as the status, so a switch flipped in another browser reaches
+  // this one within a poll rather than at its next page load.
+  refreshChatSettings()
   try {
     const reply = await fetchAssistant()
     if (stale(mine)) return
@@ -538,9 +543,13 @@ onBeforeUnmount(() => {
              drawer that is deliberately not one of the runs is the one wording
              the whole panel exists to avoid. The label is the last line read
              before a message goes; the title is on every turn above it. -->
+        <!-- The conversation only, by default (issue 488): uber lmer's working
+             transcript is behind the settings dialog's switch, and the switch is
+             platform state rather than this browser's. -->
         <Chat
           :session-id="sessionId"
           :now="now"
+          :view="chatShowTranscript ? 'transcript' : 'conversation'"
           composer-label="say something to uber lmer"
           agent-label="uber lmer"
         />

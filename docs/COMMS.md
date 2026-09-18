@@ -489,9 +489,97 @@ because it is the opposite shape from the other two:
   conversation `canLoadEarlier` is false and the button is not there. The only
   trace is the header counting a turn the list does not hold.
 
-Removing the position from the read path is issue 419; a client that never infers
+These limitations still apply to run chats. The assistant pane re-reads its
+loaded window on each poll, replacing cached membership and content. This makes
+a late bus post replace its cached prose copy without reopening the pane.
+
+Removing the position from the run-chat read path is issue 419; a client that never infers
 a shift can withdraw, replace and insert as well as append. Until then the pane's
 window is also unbounded — it grows as the session runs — which is the same issue.
+
+### What a turn is, and what each view draws
+
+A **turn** is one harness response cycle. It starts when an input lands — an
+operator message relayed from the bus, a watch firing, a task notification, a
+hook's re-prompt, a message queued while the model was working and delivered
+mid-turn — and ends when the model stops and the Stop hooks run. Inside
+it the model alternates prose and tool calls, and Claude Code writes one
+transcript record per content block: a prose block, a tool call and the model's
+thinking are three records, so one turn is usually several. The normaliser turns
+every record that carries something into one served turn; a record that only
+feeds the model (a tool result) is folded into the call it answers and served as
+nothing. Measured on a recorded uber lmer session of 1,816 records: 132 assistant
+prose blocks in the file, 132 served, and a time-ordered replay of the pane's
+polling delivered all 491 served turns once each.
+
+The uber lmer pane has two views, chosen by the **Show uber lmer's working
+transcript** switch in its settings dialog — `chat_show_transcript` on
+`GET`/`POST /api/assistant/config`, stored in `config.json`, applied on the pane's
+next config refresh in every browser. The run chat keeps its older rendering
+(spoken turns, the harness's internals behind a button) and is not in this table.
+
+| what the route serves | recognised by | conversation (default) | transcript |
+|---|---|---|---|
+| a bus record: the operator's message from any channel, the agent's `post`/`note`/`ask`/answer/milestone, a platform `command` | `via: comms` | drawn as speech, with source and kind | drawn as speech |
+| a reply to a conversation request, sent with `lmer-ctl thread post` | assistant credential; platform-only conversation journal, `via: comms` | drawn with destination link; no broadcast to other threads | drawn |
+| a private DM reply | delivery fact only; body never journalled | drawn without body | drawn without body |
+| a question (`question`/`live_question`), crash (`crashed`), or completion (`complete`) digest | structured event kind; platform-only journal, `via: comms`, platform role | drawn even before the assistant drains its spool | drawn |
+| routine check-ins, wake traffic and other digest categories | excluded from the platform-only journal | hidden unless explicitly posted | any harness copy is muted |
+| the legacy ask-channel exchange, on a session with no bus | `via: ask` | drawn | drawn |
+| the agent's unposted prose | `role: assistant`, no `via` | hidden | drawn muted, chipped `transcript` |
+| a tool call | `tools[]` on a transcript turn | hidden | drawn muted, one chip per call |
+| the harness copy of a posted reply, or of a relayed inbound line | its text equals a bus record's (the join above) | not served — the record is the turn | not served |
+| the literal `lmer-signal post`/`note`/`ask` call carrying a loaded record's text | the outbound rule above | hidden | hidden — the record stands for it |
+| a watch firing | `role: monitor` | hidden | drawn muted, titled *the watch fired*, on the action ground |
+| a hook re-prompt, a task notification, a system reminder, the harness's own "previous response had no visible output" re-prompt (a `user` record marked `isMeta`) | `kind: injected` | hidden | drawn muted, chipped `internal` |
+| the harness's `system` prose | `kind: notice` | hidden | drawn muted |
+| the harness's silent-turn reminder and its other non-message attachments | not a served record | not served | not served |
+| a terminal keystroke line as the harness recorded it (§5: not joined); a `[platform]` reminder typed into the PTY | `role: user`/`platform`, no `via` | hidden | drawn muted |
+
+Unposted terminal prose stays out of the conversation. The daemon's PTY nudge
+only announces that digests are waiting; it stays in the transcript. Required
+digests have their own durable records, so draining the spool or restarting the
+assistant does not remove them. The platform-only journal is separate from the
+fleet feed and session buses: neither reply copies nor digests are broadcast to
+connected threads. It retains the same bounded disk generations as the comms
+journal and serves the most recent 2,000 records. The daemon retains one journal
+instance for the resolved platform path, loading retained history once. A path
+change replaces that instance. Run chats do not read it.
+
+Thread posts return `pane_recorded: false` if the provider accepted the reply but
+its pane copy could not be stored. The successful provider receipt still stands:
+retrying the post would send it twice. DM thread replies retain only a delivery
+fact and character count; when a Matrix room's privacy cannot be established,
+its body is also withheld from the journal.
+
+The reply-routing guard (`hooks/slack_reply_guard.py`, §8) reads only the ending
+turn. Its `PreToolUse` hook adds the harness session and tool-call IDs to each
+Bash child's `LMER_ROUTING_CALL` environment. This uses Claude Code's
+[`updatedInput` contract](https://code.claude.com/docs/en/hooks#pretooluse-decision-control),
+preserves the other tool arguments, and returns no permission decision. Each
+child retains its own identity, including parallel and background commands.
+
+After a successful post, ask or DM, the CLI atomically writes a body-free local
+record keyed by the lmer session, harness session and tool-call ID. Records live
+in the container's temporary directory under `lmer-routing/`; only successful
+delivery creates them. The Stop hook checks those records for calls in the ending
+turn. Reading a saved API response, quoting an example or redirecting a CLI's
+output cannot create or transfer delivery evidence. Missing or unreadable records
+supply no exemption. This is correlation for cooperative routing producers, not
+an attestation boundary against a process deliberately rewriting local state.
+
+Routing CLIs still print JSON delivery metadata on stderr, and the platform
+thread-post route includes it in its JSON response. Those output objects are not
+proof to the guard. `lmer-ctl thread post` writes its local record after the live
+POST succeeds. An `ask` records delivery before waiting, so a wait timeout still
+counts. A later failure to store a DM/thread-post pane copy does not undo delivery;
+a local evidence-write failure is logged without changing the successful send's
+exit status. Notes, milestones, help and failed sends create no record.
+
+A turn with substantive prose and no delivery record is nudged once. An empty
+turn owes nothing and may end without a filler line. Roll the session image with
+the PreToolUse/Stop hooks and CLI changes together; older CLIs supply no local
+record. The records disappear with the container and contain no message body.
 
 ---
 
@@ -719,9 +807,12 @@ harness command timeout in the fleet; a longer wait is a chain of waits.
 `hooks/signal_guard.py` counts only the milestone forms of `lmer-signal`
 (bare text, or `milestone`) as signals and reads `LMER_COMMS_LOG` first for
 the newest milestone and the newest open question, falling back to the ask
-directory. `hooks/slack_reply_guard.py` treats `lmer-signal post` and
-`lmer-slack post` alike and is armed by `LMER_SLACK_CHANNEL` or
-`LMER_CHAT_CHANNEL`.
+directory. `hooks/slack_reply_guard.py` is armed by `LMER_SLACK_CHANNEL` or
+`LMER_CHAT_CHANNEL` and reads only the turn that is ending (§4, the turn
+table): `lmer-signal post`, `ask` and `dm` — and the `lmer-slack post` shim —
+count as routing wherever they fall in the turn, a turn that wrote substantive
+prose and routed nothing is re-prompted once, and a turn that wrote nothing may
+stop with an empty response.
 
 ---
 
