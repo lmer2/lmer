@@ -107,8 +107,9 @@ curl -X POST -H "Authorization: Bearer $(lmer platform secret)" \
     http://127.0.0.1:7180/api/assistant/rotate
 ```
 
-Standing orders and the handover note survive a restart; only the
-conversation window is lost.
+Standing orders, the handover note, and the visible conversation survive a
+restart. The replacement assistant starts with a fresh model context and can
+consult relevant prior exchanges when context is missing.
 
 ## Using it
 
@@ -146,7 +147,8 @@ conversation window is lost.
   session milestones (`lmer-signal`), can spawn/answer/wind-down runs on
   request, and keeps operator-taught standing orders across restarts. Teach it
   rules in plain chat ("spawn reviewers with preset X"); restart it from the
-  drawer when needed.
+  drawer when needed. Its [conversation history](./ASSISTANT-HISTORY.md)
+  remains available across rotations, reloads, and daemon restarts.
 - **Run references in chat** — the assistant writes a run's name as a link whose
   href is `lmer://run/<host>/<project>/<slug>`, and tapping it opens that run's
   view. Details worth knowing:

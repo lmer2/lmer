@@ -589,6 +589,10 @@ def require_session(session_id: str) -> Optional[dict]:
         raise SessionNotFound(str(exc)) from exc
     if entry is not None:
         return entry
+    from . import assistant_history
+
+    if assistant_history.generation(session_id):
+        return None
     if session_log_path(session_id).exists() or container_log_path(session_id).exists():
         return None
     raise SessionNotFound(

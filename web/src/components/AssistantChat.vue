@@ -1,87 +1,6 @@
 <script setup>
-// The chat with uber lmer — the one session that supervises the others (spec §8,
-// §10.1), docked in the right-hand drawer.
-//
-// The names first, because they are the safety feature. The UI calls a worker
-// session **lmer** and the supervising one **uber lmer** (operator request,
-// 2026-07-27), and the word "assistant" is shown to an operator nowhere: it is the
-// code's spelling only — the module, the taskdef and every API field keep it. The
-// failure this drawer is shaped around is telling the supervisor to stop something
-// while actually typing at the run itself, and two visibly different names plus two
-// different edges of the screen are what stand between an operator and that
-// mistake. Hence also the accent header rather than the plain surface the run
-// navigator has on the left: the two panels must not be tellable apart by their
-// contents alone.
-//
-// What is reused rather than rebuilt
-// ----------------------------------
-// uber lmer *is* an lmer session with a session id, which the status reports — so
-// the conversation is `Chat.vue` pointed at that id. Same transcript read, same
-// control-plane write, same held-back bubble for a message the transcript has not
-// caught up with, same shared markdown renderer behind it (which Chat defers into
-// its own chunk; nothing about it is duplicated here). None of that machinery is
-// run-scoped — it keys on a session — so a second implementation would only be a
-// second place to get the delay between sending and seeing it wrong.
-//
-// Chat's two run-shaped props are left at their defaults deliberately:
-// `questionPending` is a run that exited on a question and `askPending` is a
-// worker's ask channel. This session has neither a run nor a channel; the
-// supervisor is asked things by being told them here.
-//
-// What this component owns is the *lifecycle*, which a worker chat never has to
-// think about: a run's session exists because you opened the run, while uber lmer
-// may not be running at all. Four states have to be readable — none running,
-// starting, running, and a daemon that did not answer — and the last one is why a
-// failed poll leaves the previous answer on screen instead of emptying the drawer.
-//
-// Standing orders are shown and never edited (T87)
-// ------------------------------------------------
-// The operator can tell uber lmer to always do something, and it keeps that as a
-// document every later incarnation reads. This panel is how they can see what it
-// currently believes, because the chat is a place you say things and not a place you
-// re-read a document. There is deliberately **no editing affordance**: the operator
-// asked for the chat to be the write path rather than "some ux config thing", so a
-// textarea here would be a second writer of the same prose, editing a document
-// stated in their own words, with nothing to confirm the wording back to them.
-//
-// Fetched when the panel is expanded rather than on the status poll, which keeps the
-// drawer's cost where it already was: the fleet view pays nothing until the drawer is
-// opened (App.vue mounts it lazily), and the drawer pays nothing for standing orders
-// until they are asked for. They change a few times a month; the status changes every
-// ten seconds.
-//
-// The lifecycle cluster (T126)
-// ----------------------------
-// Restart, stop and start, in the header, because the alternative was a host-side
-// restart of the daemon: an incarnation that stopped answering could not be cleared
-// from here at all, and clearing it that way takes the whole platform down with it.
-// So the three verbs the daemon already serves are reachable from the panel the
-// operator noticed the problem in (operator request, 2026-07-29).
-//
-// Restart is `POST /api/assistant/rotate` and it is the primary one for one reason:
-// it always leaves something running. It replaces a live incarnation and it starts
-// one when nothing is up, in a single call, so it cannot leave the fleet
-// unsupervised the way a stop that nothing followed would. Stop is behind an
-// overflow because it leaves nothing, and start only exists while nothing is up —
-// against a live one the route answers 409 on purpose, to protect the context
-// window of the incumbent.
-//
-// Both destructive verbs are confirmed, and the copy says what is actually lost:
-// the conversation window, and only that. Standing orders survive a rotation and a
-// stop-and-start alike, because `assistant.start` and `assistant.stop` edit state
-// with `dataclasses.replace` and nothing consumes that document — and the handover
-// note carries forward untouched when no new one is sent, which is what the
-// starting incarnation is told to read before it says anything (the `orchestrate`
-// taskdef). What the confirm does *not* claim is that a stop keeps uber lmer down:
-// the daemon's supervisor respawns anything that is not running, whatever ended it,
-// so a stop holds only for as long as nothing is supervising — which is the case
-// the start button exists for.
-//
-// The conversation follows the replacement with no machinery of its own: each of
-// these routes answers with the reconciled status, the reply becomes the status, the
-// session id changes with it, and `Chat.vue` restarts its transcript when the id it
-// was given changes. A rotation is exactly that — a different session — so nothing
-// here has to reach into the chat, and nothing has to be reloaded.
+// Lifecycle controls and retained history share this drawer; sends still target
+// only the current generation. Transcript visibility is a host preference.
 
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
@@ -155,7 +74,7 @@ let disposed = false
 let generation = 0
 
 const running = computed(() => !!status.value?.running)
-const sessionId = computed(() => (running.value ? status.value.session_id : null))
+const sessionId = computed(() => status.value ? status.value.session_id || status.value.history_session : null)
 
 // One lifecycle call at a time, and the whole cluster goes with it: the three verbs
 // contradict each other, and a stop landing behind a restart would leave nothing
@@ -378,7 +297,8 @@ onBeforeUnmount(() => {
     <v-card>
       <v-card-text class="text-body-medium">
         Restart uber lmer? This ends the incarnation you are talking to and starts a
-        fresh one, so the conversation window is lost. Standing orders survive, and
+        fresh one, so its current context is lost. Your conversation history remains visible.
+        Standing orders survive, and
         the new one starts from the handover note already on record — nothing here
         writes a new one, so it is as recent as the last note uber lmer wrote.
       </v-card-text>
@@ -403,8 +323,8 @@ onBeforeUnmount(() => {
   <v-dialog v-model="confirmingStop" max-width="480">
     <v-card>
       <v-card-text class="text-body-medium">
-        Stop uber lmer? This ends the incarnation and the conversation window goes
-        with it, and nothing in this drawer brings one back. A daemon that is
+        Stop uber lmer? This ends the incarnation and its current context.
+        Your conversation history remains visible. A daemon that is
         supervising puts a fresh one up on its own within moments; if it has given up
         on starting one, or nothing is supervising, none comes back until you start
         one here. Restart is the one to reach for if what you want is a working
@@ -543,16 +463,6 @@ onBeforeUnmount(() => {
              drawer that is deliberately not one of the runs is the one wording
              the whole panel exists to avoid. The label is the last line read
              before a message goes; the title is on every turn above it. -->
-        <!-- The conversation only, by default (issue 488): uber lmer's working
-             transcript is behind the settings dialog's switch, and the switch is
-             platform state rather than this browser's. -->
-        <Chat
-          :session-id="sessionId"
-          :now="now"
-          :view="chatShowTranscript ? 'transcript' : 'conversation'"
-          composer-label="say something to uber lmer"
-          agent-label="uber lmer"
-        />
       </template>
 
       <v-card v-else>
@@ -596,6 +506,15 @@ onBeforeUnmount(() => {
           >start uber lmer</v-btn>
         </v-card-text>
       </v-card>
+      <Chat
+        v-if="sessionId"
+        assistant-history
+        :session-id="sessionId"
+        :now="now"
+        :view="chatShowTranscript ? 'transcript' : 'conversation'"
+        composer-label="say something to uber lmer"
+        agent-label="uber lmer"
+      />
     </template>
   </div>
 </template>

@@ -382,6 +382,7 @@ from .config import (
     ASSISTANT_SETTING_KEYS,
     ConfigError,
     PlatformConfig,
+    active_assistant_credential,
     assistant_settings,
     container_base_url,
     mint_assistant_credential,
@@ -850,9 +851,13 @@ class AssistantStatus:
         return _age_seconds(self.started_at)
 
     def to_dict(self) -> dict:
+        from . import assistant_history
+
+        history = assistant_history.latest()
         return {
             "running": self.running,
             "session_id": self.session_id,
+            "history_session": history["session"] if history else None,
             "pid": self.pid,
             "started_at": self.started_at,
             "age_seconds": self.age_seconds,
@@ -948,6 +953,16 @@ def _write_state(state: AssistantState) -> bool:
         )
         return False
     return True
+
+
+def history_for(session_id: str) -> Optional[dict]:
+    """Resolve a generation, migrating only the explicitly recorded incumbent."""
+    from . import assistant_history
+
+    with _LOCK:
+        known = assistant_history.generation(session_id)
+        state = read_state()
+        return assistant_history.remember(state) if state.session_id == session_id else known
 
 
 def taskdef_dir() -> Optional[Path]:
@@ -1598,7 +1613,7 @@ def _assistant_environment(config: PlatformConfig) -> tuple:
 
 
 def _prepare_environment(config: PlatformConfig) -> tuple:
-    """Write the assistant's ``.env`` 0600. Returns ``(path, reach)``.
+    """Write the assistant's ``.env`` 0600. Returns ``(path, reach, credential)``.
 
     Why a file at all, when :func:`lmer_platform.spawn.spawn_session` already
     hands the child an environment: that environment belongs to the *host*
@@ -1655,7 +1670,7 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
             "starts with no platform URL or secret and cannot drive anything",
             path, exc,
         )
-        return None, reach
+        return None, reach, None
 
     if reach.reachable:
         logger.info(
@@ -1666,7 +1681,31 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
             "platform_assistant_unreachable reason=%s — the session is told so "
             "in its environment rather than handed a URL that fails", reach.reason,
         )
-    return path, reach
+    credential = values.get(ENV_PLATFORM_CREDENTIAL)
+    if credential != active_assistant_credential():
+        credential = None
+    return path, reach, credential
+
+
+def _remember_generation(state) -> None:
+    from . import assistant_history
+
+    assistant_history.remember(state)
+    if state.session_id:
+        assistant_history.bind_credential(state.session_id, active_assistant_credential())
+
+
+def authenticated_generation(credential: str) -> dict | None:
+    """Resolve an authenticated identity; migrate an incumbent under the lifecycle lock."""
+    from . import assistant_history
+
+    owner = assistant_history.credential_owner(credential)
+    if owner:
+        return owner
+    with _LOCK:
+        if active_assistant_credential() == credential:
+            _remember_generation(read_state())
+        return assistant_history.credential_owner(credential)
 
 
 def start(
@@ -1734,7 +1773,8 @@ def start(
         # the spawn below and does rewrite it, which costs nothing: the content is
         # derived rather than accumulated, and the secret in it already sits
         # beside it in the same directory with the same mode.
-        env_file, reach = _prepare_environment(config)
+        _remember_generation(state)
+        env_file, reach, credential = _prepare_environment(config)
 
         # no_repo is the record of D17 in the request itself, and it says more
         # than an absent repo_url can: the session has no repository, so the
@@ -1779,17 +1819,28 @@ def start(
                 ),
                 "invalid_request",
             ) from exc
+        from . import assistant_history
+
+        previous = assistant_history.latest()
         published = False
+        number = state.generation + 1
 
         def publish_registration(register, session_id: str, _pid: int) -> None:
-            nonlocal published
+            nonlocal published, number
             with _PUBLICATION_LOCK:
                 register()
+                record = assistant_history.register(
+                    session_id, number=number, started_at=now,
+                    previous=previous["session"] if previous else None,
+                    entry=registry.read_session(session_id),
+                )
+                assistant_history.bind_credential(session_id, credential)
+                number = record["generation"]
                 _write_state(replace(
                     state,
                     session_id=session_id,
                     started_at=now,
-                    generation=state.generation + 1,
+                    generation=number,
                     handoff=text,
                     handoff_at=stamp,
                     stopped_at=None,
@@ -1830,7 +1881,7 @@ def start(
             data={
                 "session": result.session_id,
                 "pid": result.pid,
-                "generation": state.generation + 1,
+                "generation": number,
                 "taskdef": TASKDEF,
                 "target": TARGET,
                 # Where it was told the platform is, never what it authenticates
@@ -1846,7 +1897,7 @@ def start(
         )
         logger.info(
             "platform_assistant_started id=%s pid=%s generation=%s",
-            result.session_id, result.pid, state.generation + 1,
+            result.session_id, result.pid, number,
         )
         return status()
 
@@ -1874,6 +1925,7 @@ def stop(
         now = utc_now_iso()
         text, stamp = _handoff_update(state, handoff, now)
         live = _live_assistant()
+        _remember_generation(state)
 
         # First, and on both paths: the credential is a file, not a session
         # property, so a stop that left it valid would be a container-spawning

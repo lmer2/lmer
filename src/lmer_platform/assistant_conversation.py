@@ -23,18 +23,27 @@ def _journal() -> comms.Journal:
         return _JOURNAL
 
 
-def record(text: str, *, kind: str, thread: str | None = None) -> None:
+def record(text: str, *, kind: str, thread: str | None = None,
+           session_id: str | None = None) -> None:
     from .transcripts import scrub_credentials
+    from . import assistant, assistant_history
 
     with _LOCK:
-        _journal().append("assistant", {
+        if session_id is None:
+            state = assistant.read_state()
+            latest = assistant_history.latest()
+            session_id = state.session_id or (latest["session"] if latest else None)
+        message = {
             "id": f"assistant:{uuid.uuid4().hex}",
             "at": utc_now_iso(),
             "kind": "message" if thread else "digest",
             "text": scrub_credentials(text),
             "source": {"channel": "agent" if thread else "platform"},
             "meta": {"thread": thread, "digest_kind": kind},
-        }, session_kind="assistant")
+        }
+        if session_id:
+            assistant_history.retain(session_id, message)
+        _journal().append(session_id or "assistant", message, session_kind="assistant")
 
 
 def events() -> list:

@@ -268,6 +268,92 @@ def test_the_minted_credential_is_attributed_to_the_assistant(config, long_lived
     assert not operator.is_assistant
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("boundary", ["credential_read", "after_auth", "during_post"])
+def test_public_reply_keeps_the_authenticated_generation_across_rotation(
+    config, long_lived, monkeypatch, tmp_path, boundary, legacy,
+):
+    from lmer_cli import thread_access, thread_posts
+    from lmer_platform import assistant_history
+    from tests.test_lmer_thread_access import FakeSlack, SLACK_LINK
+
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-test")
+    monkeypatch.setattr(thread_posts, "REGISTRY_DIR", str(tmp_path / "thread-posts"))
+    slack = FakeSlack()
+    monkeypatch.setattr(thread_access, "_slack_client", lambda credential: slack)
+    cfg.ensure_secret(config)
+    client = client_for(config)
+    original = assistant.start(config)
+    minted = cfg.active_assistant_credential()
+    if legacy:
+        with assistant_history._database() as db:
+            db.execute("DELETE FROM credentials")
+    replacements = []
+
+    def rotate():
+        replacements.append(assistant.rotate(config))
+
+    if boundary == "credential_read":
+        active = api.active_assistant_credential
+
+        def read_then_rotate():
+            captured = active()
+            rotate()
+            return captured
+
+        monkeypatch.setattr(api, "active_assistant_credential", read_then_rotate)
+    elif boundary == "after_auth":
+        label = api._thread_label
+
+        def label_after_rotation(caller):
+            rotate()
+            return label(caller)
+
+        monkeypatch.setattr(api, "_thread_label", label_after_rotation)
+    else:
+        post = thread_access.post_thread
+
+        def post_then_rotate(*args, **kwargs):
+            result = post(*args, **kwargs)
+            rotate()
+            return result
+
+        monkeypatch.setattr(thread_access, "post_thread", post_then_rotate)
+
+    try:
+        response = client.post("/api/comms/thread", headers=bearer(minted),
+                               json={"permalink": SLACK_LINK, "text": "original generation reply"})
+        assert response.status_code == 200, response.text
+        assert response.json()["pane_recorded"] is True
+        assert len(slack.posted) == len(replacements) == 1
+        old = assistant_history.page(original.session_id)["messages"]
+        new = assistant_history.page(replacements[0].session_id)["messages"]
+        own = [row for row in old if row["text"] == "original generation reply"]
+        assert len(own) == 1
+        assert own[0]["session"] == original.session_id
+        assert own[0]["generation"] == original.generation
+        assert all(row["text"] != "original generation reply" for row in new)
+    finally:
+        assistant.stop()
+
+
+def test_an_unattributed_launch_does_not_inherit_a_stale_credential(config, long_lived, monkeypatch):
+    from lmer_platform import assistant_history
+
+    cfg.ensure_secret(config)
+    stale = cfg.mint_assistant_credential()
+
+    def refuse():
+        raise cfg.ConfigError("disk is full")
+
+    monkeypatch.setattr(assistant, "mint_assistant_credential", refuse)
+    with started(config) as status:
+        assert status.session_id
+        assert assistant.authenticated_generation(stale) is None
+    assistant.stop()
+    assert assistant_history.credential_owner(stale) is None
+
+
 def test_a_revoked_credential_stops_authenticating(config, long_lived):
     cfg.ensure_secret(config)
     client = client_for(config)

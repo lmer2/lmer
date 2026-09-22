@@ -107,11 +107,12 @@ import {
   mdiUnfoldMoreHorizontal,
 } from '@mdi/js'
 import {
-  fetchSessionMessages, sendSessionInput, sessionUploadUrl, uploadSessionFile,
+  fetchAssistantHistory, fetchSessionMessages, sendSessionInput, sessionUploadUrl, uploadSessionFile,
 } from '../api.js'
 import { ago } from '../format.js'
 import { withoutOutboundCopies } from '../outbound.js'
 import { inView, layerOf } from '../conversation.js'
+import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
 // never open, and the fleet view must not pay for it on first paint.
@@ -137,6 +138,7 @@ const props = defineProps({
   // seconds and a watcher on it would restart a working view for no reason. Same
   // reasoning as Terminal.vue.
   sessionId: { type: String, required: true },
+  assistantHistory: { type: Boolean, default: false },
   // Whether the run is stopped waiting for an answer. A run-level fact the fleet
   // view already knows, and the one thing that changes what the composer is for.
   questionPending: { type: Boolean, default: false },
@@ -232,6 +234,10 @@ const draft = ref('')
 const sending = ref(false)
 const pending = ref([])
 const showInjected = ref(false)
+const historyGenerations = ref(new Map())
+let predecessorPoll = 0
+let historyConversation = null
+let earlierLoading = false
 
 // The next `since` to poll with. Server-issued: computing it from a message count
 // would skip or repeat the moment one record normalised to nothing.
@@ -485,7 +491,7 @@ const sessionByOrigin = computed(() => {
 })
 
 function uploadUrl(name, message) {
-  const owner = sessionByOrigin.value.get(message?.origin) || props.sessionId
+  const owner = message?.session || sessionByOrigin.value.get(message?.origin) || props.sessionId
   return sessionUploadUrl(owner, name)
 }
 
@@ -498,7 +504,8 @@ const presented = computed(() => {
   } else {
     shown = messages.value.filter((message) => inView(props.view, message))
   }
-  return withoutOutboundCopies(shown).map((message) => ({
+  const rows = props.assistantHistory ? historyWithoutOutboundCopies(shown) : withoutOutboundCopies(shown)
+  return rows.map((message) => ({
     ...message,
     // Only what you sent: these lines are put in a message by this pane, and an
     // agent quoting one back is quoting, not attaching.
@@ -521,8 +528,13 @@ const hiddenCount = computed(
 
 
 const canLoadEarlier = computed(
-  () => messages.value.length > 0 && messages.value[0].seq > 0,
+  () => props.assistantHistory
+    ? !!olderPage(messages.value, historyGenerations.value)
+    : messages.value.length > 0 && messages.value[0].seq > 0,
 )
+
+const historyHasGap = computed(() => props.assistantHistory
+  && historyGaps(messages.value, historyGenerations.value).some((gap) => gap.internal))
 
 // The three states the bottom of the view can be in. Named rather than inlined
 // because 'answer' is a pointer at another component, not a composer.
@@ -764,12 +776,13 @@ function settlePending() {
     const defused = words.startsWith('!') ? comparable(`. ${item.text}`) : null
     const own = said.find(
       (message) => message.seq >= item.since
-        && !consumed.has(message.seq)
+        && (!item.history || message.session === item.session)
+        && !consumed.has(item.history ? message.id : message.seq)
         && (comparable(message.text) === words
           || comparable(message.text) === defused),
     )
     if (own) {
-      consumed.add(own.seq)
+      consumed.add(item.history ? own.id : own.seq)
       release(item)
     }
     return !own
@@ -834,11 +847,73 @@ function absorb(page, mode = 'append') {
   if (follow) nextTick(stickToBottom)
 }
 
+function absorbHistory(page) {
+  const conversation = page.history?.conversation
+  if (historyConversation && conversation !== historyConversation) {
+    messages.value = []
+    historyGenerations.value = new Map()
+  }
+  historyConversation = conversation
+  messages.value = mergeHistory(messages.value, page)
+  const previous = historyGenerations.value.get(page.session)
+  historyGenerations.value = new Map(historyGenerations.value).set(page.session, {
+    ...page.history, cursor: Math.min(page.total, Math.max(previous?.cursor || 0, page.cursor)),
+  })
+  const sources = new Map(sessions.value.map((source) => [`${source.session}:${source.id}`, source]))
+  for (const source of page.sessions || []) sources.set(`${source.session}:${source.id}`, source)
+  sessions.value = [...sources.values()]
+  if (page.session === props.sessionId) {
+    cursor = historyGenerations.value.get(page.session).cursor
+    live.value = !!page.live
+    note.value = page.note || null
+  }
+  total.value = messages.value.length
+  settlePending()
+  if (following.value) nextTick(stickToBottom)
+}
+
+async function loadRecentHistory(mine) {
+  const page = await fetchAssistantHistory(props.sessionId, {
+    since: -INITIAL_TAIL, limit: INITIAL_TAIL, view: props.view,
+  })
+  if (stale(mine)) return
+  absorbHistory(page)
+  for (let count = 1; count < 8 && messages.value.length < INITIAL_TAIL; count += 1) {
+    const request = olderPage(messages.value, historyGenerations.value)
+    if (!request) break
+    const remaining = INITIAL_TAIL - messages.value.length
+    const previous = await fetchAssistantHistory(request.session, {
+      ...request, since: -remaining, limit: remaining, view: props.view,
+    })
+    if (stale(mine)) return
+    absorbHistory(previous)
+  }
+}
+
 async function poll() {
   if (polling) return
   const mine = generation
   polling = true
   try {
+    if (props.assistantHistory) {
+      const page = await fetchAssistantHistory(props.sessionId, {
+        since: Math.max(0, cursor - PAGE), limit: 500, view: props.view,
+      })
+      if (stale(mine)) return
+      absorbHistory(page)
+      const predecessors = [...historyGenerations.value].filter(([session]) => session !== props.sessionId)
+      if (predecessors.length) {
+        const [session, history] = predecessors[predecessorPoll % predecessors.length]
+        predecessorPoll += 1
+        const previous = await fetchAssistantHistory(session, {
+          since: Math.max(0, history.cursor - PAGE), limit: 500, view: props.view,
+        })
+        if (stale(mine)) return
+        absorbHistory(previous)
+      }
+      problem.value = null
+      return
+    }
     if (props.view !== 'session') {
       await refreshConversation(mine)
       return
@@ -885,7 +960,7 @@ async function start() {
   const mine = generation
   phase.value = 'loading'
   problem.value = null
-  messages.value = []
+  if (!props.assistantHistory) messages.value = []
   // Cleared here as well as in `send`'s `finally`, which is guarded by
   // `stale(mine)`: a send in flight when the view switches session leaves that
   // guard true forever, and the composer is `:disabled="sending"` — so the box
@@ -897,14 +972,8 @@ async function start() {
   // A different session is a different upload store, so which names came back
   // 404 says nothing about this one's.
   missingUploads.value = new Set()
-  // Deliberately NOT reset, and this is the whole of the rule: what belongs to
-  // the *conversation* is dropped here, while what belongs to the *operator* —
-  // the draft and the staged attachments — survives a switch, because a person
-  // who composed something and then went to look at another run has not
-  // discarded it. What that costs is one thing, and `send` pays it: an upload
-  // memo is keyed to the session it was made in, so a staged file that crosses a
-  // switch is uploaded again to the session it is actually sent to rather than
-  // named at a path only the previous one has (!272 review round 2).
+  // Keep the operator's draft and attachments through rotation. `send` uploads
+  // staged files to their eventual target session before referring to them.
   following.value = true
   cursor = 0
   // With the numbering they were recorded against: the turns of the session this
@@ -912,6 +981,11 @@ async function start() {
   // the reset would hold a new bubble against a turn that is not its own.
   consumed.clear()
   try {
+    if (props.assistantHistory) {
+      await loadRecentHistory(mine)
+      if (!stale(mine)) phase.value = 'ready'
+      return
+    }
     const page = await fetchSessionMessages(props.sessionId, {
       since: -INITIAL_TAIL,
       limit: INITIAL_TAIL,
@@ -932,6 +1006,21 @@ async function loadEarlier() {
   // on its own still counts as at the bottom of a short list.
   following.value = false
   const mine = generation
+  if (props.assistantHistory) {
+    if (earlierLoading) return
+    const request = olderPage(messages.value, historyGenerations.value)
+    if (!request) return
+    earlierLoading = true
+    try {
+      const page = await fetchAssistantHistory(request.session, { ...request, limit: PAGE, view: props.view })
+      if (!stale(mine)) absorbHistory(page)
+    } catch (exc) {
+      if (!stale(mine)) problem.value = exc.message
+    } finally {
+      earlierLoading = false
+    }
+    return
+  }
   const first = messages.value.length ? messages.value[0].seq : 0
   const since = Math.max(0, first - PAGE)
   try {
@@ -1045,6 +1134,8 @@ async function send() {
       text,
       at: Date.now(),
       since,
+      session: target,
+      history: props.assistantHistory,
       submitConfirmed: reply?.submit_confirmed === true,
       // Carried so the bubble shows what was attached rather than only the path
       // line, in the seconds before the transcript catches up. The previews are
@@ -1161,6 +1252,13 @@ onBeforeUnmount(() => {
 // rather than appending blindly.
 watch(() => props.sessionId, () => start())
 
+watch(() => props.view, () => {
+  if (!props.assistantHistory) return
+  messages.value = []
+  historyGenerations.value = new Map()
+  start()
+})
+
 // Following the end has to survive the renderer arriving after the turns do.
 // `absorb` scrolls to the end of a pane whose bodies are still empty, and that is
 // not the end once the words land; the ResizeObserver above does not catch it
@@ -1184,7 +1282,7 @@ watch(rendererLoaded, () => {
         <span
           v-else-if="total"
           class="text-body-small text-medium-emphasis"
-        >{{ total }} messages<template v-if="spansSessions"> across {{ sessions.length }} sessions</template></span>
+        >{{ total }} messages<template v-if="assistantHistory"> loaded</template><template v-else-if="spansSessions"> across {{ sessions.length }} sessions</template></span>
         <!-- The conversation view says what it leaves out and where the switch
              is; the transcript view says why the muted rows look the way they do. -->
         <span
@@ -1230,6 +1328,9 @@ watch(rendererLoaded, () => {
           @click="loadEarlier"
         >earlier messages</v-btn>
       </div>
+      <v-alert v-if="historyHasGap" type="info" density="compact" class="mb-3">
+        Some messages between the displayed exchanges are not loaded. Use earlier messages to fill the gap.
+      </v-alert>
 
       <div ref="scroller" class="chat" @scroll="onScroll">
         <details v-if="wrappers.length" class="wrapper-details text-body-small">
@@ -1246,10 +1347,11 @@ watch(rendererLoaded, () => {
           v-for="message in visible"
           :key="message.id ?? message.seq"
           class="turn"
-          :class="[`turn-${message.role}`, `ground-${ground(message)}`, { 'turn-transcript': muted(message) }]"
+          :class="[`turn-${message.role}`, `ground-${ground(message)}`, { 'turn-transcript': muted(message), 'turn-rotation': message.comms_kind === 'rotation' }]"
         >
           <div class="d-flex align-center ga-2 text-body-small text-medium-emphasis">
             <span>{{ speaker(message) }}</span>
+            <span v-if="assistantHistory && message.generation != null">· generation {{ message.generation }}</span>
             <span v-if="message.kind !== 'said'">· internal</span>
             <!-- The harness's own turn, in the view that draws them (issue 488):
                  said so in the header as well as by the muting, because a
@@ -1624,6 +1726,10 @@ watch(rendererLoaded, () => {
 </template>
 
 <style scoped>
+.turn-rotation {
+  border-block: 1px solid rgba(var(--v-theme-on-surface), 0.25);
+  padding-block: 1rem;
+}
 /* A conversation is a column of turns, not a table: the only layout decisions
    here are the gap between them and which side a turn leans to.
    And a bound, because a transcript has hundreds of turns and this view no
