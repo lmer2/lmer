@@ -1820,7 +1820,7 @@ def test_the_env_file_lands_in_an_owner_only_directory(config, monkeypatch):
     directory = assistant.env_file_path().parent
     directory.chmod(0o755)
 
-    path, _reach = assistant._prepare_environment(config)
+    path, _reach, _credential = assistant._prepare_environment(config)
     assert path is not None, "the env file did not write at all"
     mode = stat.S_IMODE(directory.stat().st_mode)
     assert mode == 0o700, f"the state dir is mode {mode:o}"

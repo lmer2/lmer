@@ -406,14 +406,17 @@ def readable_store(session_id: str, entry: Optional[dict]) -> Path:
     has been reaped — the normal end state of a clean exit — still serves what it
     was sent, from the directory its id names.
 
-    What does not survive is uber lmer's: its store is the host's, named by no
-    session, so once an incarnation's entry is gone there is nothing that says
-    which files were handed to *it*. The pane degrades to the path line the turn
-    already carries.
+    Assistant generations retain their original association with the host's
+    assistant store after their registry entries have been removed.
     """
     pointer = (entry or {}).get("uploads")
     if isinstance(pointer, dict) and pointer.get("path"):
         return mounted_store(session_id, entry)
+    from . import assistant_history
+
+    archived = assistant_history.generation(session_id)
+    if archived and archived["uploads"]:
+        return assistant_upload_dir()
     directory = session_upload_dir(session_id)
     if directory.is_dir():
         return directory

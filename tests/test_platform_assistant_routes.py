@@ -54,6 +54,7 @@ SECRET = "test-secret-value"
 #: from the app — so a route added later without an entry in ``GET /api`` fails
 #: there rather than being silently unreachable for the assistant.
 ASSISTANT_ROUTES = (
+    ("GET", "/api/assistant/history/{session_id}"),
     ("GET", "/api/assistant"),
     ("POST", "/api/assistant/start"),
     ("POST", "/api/assistant/stop"),

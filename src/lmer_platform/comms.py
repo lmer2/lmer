@@ -664,6 +664,15 @@ class CommsHub:
             # Before the journal/ack: a transient registry write failure must
             # leave this lifecycle fact eligible for the subscriber's retry.
             teardown.record_request(session_id, message)
+            from . import assistant_history
+
+            archived = assistant_history.generation(session_id)
+            if kind == "assistant" and archived is None:
+                from . import assistant
+
+                archived = assistant.history_for(session_id)
+            if kind == "assistant" or archived:
+                assistant_history.retain(session_id, message)
             event = self.journal.append(session_id, message, run=run, session_kind=kind)
         except StoreError as exc:
             logger.warning("platform_comms_journal_failed session=%s error=%s", session_id, exc)

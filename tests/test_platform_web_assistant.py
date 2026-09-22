@@ -480,7 +480,7 @@ def test_the_two_destructive_verbs_are_confirmed_in_the_apps_own_pattern():
 def test_the_confirmations_say_what_is_lost_and_claim_nothing_more():
     """The copy is the whole safety feature here, so it is checked as one.
 
-    What a rotation costs is the conversation window and *only* that: standing orders
+    A rotation ends model context while the visible archive remains. Standing orders
     are never consumed and a rotation carries them forward, and the handover note
     travels untouched when none is sent (``assistant.start``/``stop`` edit state with
     ``dataclasses.replace``, and ``_handoff_update`` keeps the recorded note when the
@@ -499,7 +499,8 @@ def test_the_confirmations_say_what_is_lost_and_claim_nothing_more():
     words = _words(DRAWER)
     for phrase in (
         "Restart uber lmer?",
-        "the conversation window is lost",
+        "its current context is lost",
+        "Your conversation history remains visible",
         "Standing orders survive",
         "the handover note already on record",
     ):
@@ -509,7 +510,7 @@ def test_the_confirmations_say_what_is_lost_and_claim_nothing_more():
         )
     for phrase in (
         "Stop uber lmer?",
-        "nothing in this drawer brings one back",
+        "This ends the incarnation and its current context",
         "A daemon that is supervising puts a fresh one up on its own",
         "none comes back until you start one here",
     ):
@@ -580,9 +581,9 @@ def test_the_conversation_follows_the_incarnation_a_restart_created():
         "a lifecycle reply is discarded, so the chat keeps reading the session the "
         "restart replaced until the next poll"
     )
-    assert 'const sessionId = computed(() => (running.value ? status.value.session_id' in text, (
+    assert 'status.value.session_id || status.value.history_session' in text, (
         "the conversation's session no longer derives from the status the reply "
-        "replaced"
+        "replaced, with retained history available when stopped"
     )
     assert "watch(() => props.sessionId, () => start())" in _read(CHAT), (
         "the shared chat no longer restarts when it is pointed at another session, "

@@ -326,6 +326,12 @@ export function fetchSessionMessages(sessionId, { since = 0, limit } = {}) {
   return request(`api/sessions/${encodeURIComponent(sessionId)}/messages?${query}`)
 }
 
+export function fetchAssistantHistory(sessionId, { since = -40, before, limit = 40, view = 'conversation' } = {}) {
+  const query = new URLSearchParams({ since: String(since), limit: String(limit), view })
+  if (before) query.set('before', before)
+  return request(`api/assistant/history/${encodeURIComponent(sessionId)}?${query}`)
+}
+
 // The chat view's write half, and pointedly a different route from the read half:
 // this types into the live session's control plane, while what comes back arrives
 // through the transcript whenever the harness writes it. `appendNewline` is the

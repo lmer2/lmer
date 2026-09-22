@@ -474,10 +474,15 @@ def _handoff_reply(state) -> dict:
     carries the one distinction a starting assistant has to be able to make —
     see :data:`_NO_HANDOFF_NOTE`.
     """
+    from . import assistant_history
+
+    latest = assistant_history.latest()
+    previous = assistant_history.reference(latest["previous_session"]) if latest else None
     return {
         "handoff": state.handoff,
         "handoff_at": state.handoff_at,
         "generation": state.generation,
+        "previous_session": previous,
         "limit": assistant.MAX_HANDOFF_CHARS,
         "note": None if state.handoff else _NO_HANDOFF_NOTE,
     }
@@ -1664,6 +1669,7 @@ class Caller:
     #: forged by naming another channel in the body.
     name: Optional[str] = None
     channel: Optional[str] = None
+    session_id: Optional[str] = None
 
     @property
     def is_assistant(self) -> bool:
@@ -1843,10 +1849,12 @@ def create_app(
             if minted and secrets_mod.compare_digest(
                 offered, minted.encode("utf-8")
             ):
-                # Which incarnation it is is deliberately not read: that cost an
-                # `assistant.read_state()` per request — file, handoff re-scrub and
-                # up to MAX_PENDING notes — for a field nothing consumed.
-                return Caller(CALLER_ASSISTANT)
+                try:
+                    owner = assistant.authenticated_generation(minted)
+                except StoreError as exc:
+                    logger.warning("assistant_identity_unavailable error=%s", exc)
+                    owner = None
+                return Caller(CALLER_ASSISTANT, session_id=owner["session"] if owner else None)
             # Connector credentials (#407): compared one by one so timing tells
             # nothing about which one matched; the set is small by construction.
             for credential, identity in active_connectors().items():
@@ -2084,6 +2092,11 @@ def create_app(
             "                               null one with a note means nobody left\n"
             "                               you anything, which is not the same as\n"
             "                               this route being absent\n"
+            "                               previous_session names the prior transcript;\n"
+            "                               read it only when relevant context is missing\n"
+            "  GET  /api/assistant/history/{session_id}  retained generation pages\n"
+            "                               since/before, limit 1-500, view=conversation|transcript;\n"
+            "                               history.previous_session links earlier generations\n"
             "  POST /api/assistant/handoff  write it {handoff} — what an assistant\n"
             "                               tells its successor before a rotation\n"
             "  GET  /api/assistant/instructions   the operator's standing orders.\n"
@@ -3023,12 +3036,15 @@ def create_app(
         result.update(receipt("post", result["posted"].get("ref")))
         if caller.is_assistant:
             try:
+                if not caller.session_id:
+                    raise StoreError("authenticated assistant generation is unavailable")
                 text = body.get("text") or ""
                 if private:
                     text = f"🔒 direct reply sent — {len(text)} characters, body not recorded"
                 assistant_conversation.record(
                     text, kind="reply",
                     thread=result["thread"]["permalink"],
+                    session_id=caller.session_id,
                 )
                 result["pane_recorded"] = True
             except StoreError as exc:
@@ -3870,6 +3886,26 @@ def create_app(
         shape however it arrived at it.
         """
         return assistant.status().to_dict()
+
+    @app.get("/api/assistant/history/{session_id}", dependencies=guard)
+    def assistant_history_page(
+        session_id: str,
+        since: int = -40,
+        before: Optional[str] = Query(default=None, max_length=2048),
+        limit: int = Query(default=40, ge=1, le=transcripts.MAX_MESSAGE_LIMIT),
+        view: str = Query(default="conversation", pattern="^(conversation|transcript)$"),
+    ) -> dict:
+        """One bounded generation page, with an explicit link to its predecessor."""
+        from . import assistant_history
+
+        try:
+            if assistant.history_for(session_id) is None:
+                raise HTTPException(status_code=404, detail="This assistant generation is not recorded.")
+            return assistant_history.page(session_id, since=since, before=before, limit=limit, view=view)
+        except assistant_history.HistoryError as exc:
+            raise HTTPException(status_code=409 if before is not None else 404, detail=str(exc)) from exc
+        except StoreError as exc:
+            raise HTTPException(status_code=503, detail=f"Assistant history is unavailable: {exc}") from exc
 
     @app.post("/api/assistant/start", dependencies=guard)
     def assistant_start(body: Optional[dict] = None) -> dict:

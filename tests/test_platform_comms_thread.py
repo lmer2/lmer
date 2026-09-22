@@ -160,9 +160,11 @@ class TestPosting:
 class TestAssistantConversation:
     @pytest.fixture(autouse=True)
     def assistant_pane(self, platform_root, tmp_path, monkeypatch):
-        from lmer_platform import comms, registry, transcripts
+        from lmer_platform import assistant, assistant_history, comms, registry, transcripts
         monkeypatch.setattr(transcripts, 'TRANSCRIPT_ROOT', str(tmp_path / 'transcripts'))
         monkeypatch.setattr(registry, 'read_session', lambda sid: {'id': sid, 'kind': 'assistant' if sid == 'assistant-1' else 'run'})
+        assistant._write_state(assistant.AssistantState(session_id='assistant-1', generation=1))
+        assistant_history.register('assistant-1', number=1, started_at=None)
         hub = comms.CommsHub()
         monkeypatch.setattr(comms, '_HUB', hub)
         self.hub = hub
@@ -252,3 +254,14 @@ class TestAssistantConversation:
         assert result.json()['pane_recorded'] is False
         assert result.json()[KEY]['id'] == result.json()['posted']['ref']
         assert len(slack.posted) == 1
+
+    def test_an_unknown_credential_owner_does_not_assign_a_reply_to_the_current_generation(self, client, slack):
+        from lmer_platform import assistant_history, transcripts
+        assistant_history.register('assistant-1', number=1, started_at=None)
+        assistant_history.bind_credential('assistant-1', None)
+        result = client.post('/api/comms/thread', headers=bearer(cfg.mint_assistant_credential()),
+                             json={'permalink': SLACK_LINK, 'text': 'sent once, owner unknown'})
+        assert result.status_code == 200
+        assert result.json()['pane_recorded'] is False
+        assert len(slack.posted) == 1
+        assert transcripts.read_messages('assistant-1').messages == ()
