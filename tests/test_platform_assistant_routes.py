@@ -23,8 +23,8 @@ What is worth pinning here:
 - **A read stays a read.** ``ensure_running`` sits in the same module as
   ``status``, and a UI polls the status route; wiring the idempotent starter to a
   GET would make opening a page cost a session slot.
-- **The refusals keep their own status** (409 for a second assistant, 429 at the
-  cap, 503 for a host that cannot see the taskdef), because that is the whole
+- **The refusals keep their own status** (409 for a second assistant, 429 for a
+  full inbox, 503 for a host that cannot see the taskdef), because that is the whole
   reason the code rides on the exception.
 
 Sessions are started for real against the stub standing in for ``lmer`` that
@@ -459,21 +459,13 @@ def test_a_refused_start_does_not_rewrite_the_live_ones_environment(
         )
 
 
-def test_a_start_at_capacity_is_a_429_with_the_numbers(platform_root, fake_lmer):
-    """The assistant counts against the global cap like any other container, so the
-    refusal has to say what to free — "I cannot open the chat" needs a reason."""
+def test_a_start_at_capacity_uses_the_reserved_slot(platform_root, fake_lmer, long_lived):
     config = cfg.load({"lmer_bin": str(fake_lmer), "max_concurrent_sessions": 1})
     registry.register("s-worker", kind="worker", pid=os.getpid())
 
-    response = client_for(config).post(
-        "/api/assistant/start", headers=bearer_header()
-    )
-
-    assert response.status_code == 429
-    detail = response.json()["detail"]
-    assert "1/1" in detail
-    assert "max_concurrent_sessions (1)" in detail
-    assert assistant.status().running is False
+    with running(client_for(config)) as status:
+        assert status["running"] is True
+        assert registry.is_live(registry.read_session("s-worker"))
 
 
 def test_a_host_that_cannot_see_the_taskdef_is_a_503(client, tmp_path, monkeypatch):
