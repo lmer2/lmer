@@ -2458,28 +2458,7 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
 
 
 def _live_worker_count() -> int:
-    """How many *worker* sessions are up — what ``max_concurrent_sessions`` bounds.
-
-    The orchestrating assistant is excluded, which is the whole of the operator's
-    decision that it "gets its own slot" (T75): the platform starts one for itself
-    at boot (:class:`lmer_platform.assistant.Supervisor`), so counting it would
-    silently turn a host configured for four sessions into a host that runs three
-    workers and a chat window. The cap is about how much *work* this host can bear;
-    the assistant is the thing that routes the work, and it is one container
-    whether the cap is set to 1 or 40.
-
-    The exclusion is by ``kind`` and therefore runs in both directions, which is
-    what keeps it one rule rather than two: a worker spawn does not see the
-    assistant in the count, and an assistant spawn does not see a previous
-    incarnation whose entry is still live. What stops a *second* assistant is
-    :func:`lmer_platform.assistant.start`, on the strength of the registry (D11),
-    and that is where the refusal belongs — a cap on workers rejecting an
-    assistant would be the same setting meaning two things.
-
-    Read through :data:`lmer_platform.registry.ASSISTANT_KIND` rather than a
-    literal, and from there rather than from :mod:`lmer_platform.assistant`: this
-    module is what spawns the assistant, so importing it would be a cycle.
-    """
+    """Count live workers, including legacy entries without a recorded kind."""
     return sum(
         1 for entry in registry.list_sessions(live_only=True)
         if entry.get("kind") != registry.ASSISTANT_KIND
@@ -3034,11 +3013,9 @@ def spawn_session(
 ) -> SpawnResult:
     """Start a session, register it, and track its run.
 
-    Raises :class:`CapacityError` when the configured concurrency cap is already
-    met — enforced here rather than in the caller so every spawn path (the API, the
-    assistant's own start) is bounded by the same check. The queue that makes
-    waiting graceful is still unbuilt; until then a spawn over cap is simply
-    refused with the numbers in the message.
+    Raises :class:`CapacityError` when a worker launch would exceed the configured
+    worker cap. Enforced here for every worker entry point, including answer and
+    resume; assistant launches use reserved capacity beside that cap.
 
     Raises :class:`SlotOccupied` — or a bare :class:`SpawnError` for a slot that
     is unknown or unusable — when ``request.slot`` names a service slot this
@@ -3079,12 +3056,13 @@ def _spawn_session(
     if kind not in registry.SESSION_KINDS:
         raise SpawnError(f"invalid session kind {kind!r}")
 
-    live = _live_worker_count()
-    if live >= config.max_concurrent_sessions:
-        raise CapacityError(
-            f"concurrency cap reached: {live}/{config.max_concurrent_sessions} "
-            "worker sessions already running"
-        )
+    if kind == registry.WORKER_KIND:
+        live = _live_worker_count()
+        if live >= config.max_concurrent_sessions:
+            raise CapacityError(
+                f"concurrency cap reached: {live}/{config.max_concurrent_sessions} "
+                "worker sessions already running"
+            )
 
     # After the cap, so a host that is simply full says so rather than blaming
     # the slot.

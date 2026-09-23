@@ -320,45 +320,10 @@ the manual route is the only place that fact is known.
 
 Caps: it holds its own slot (T75)
 ----------------------------------
-``max_concurrent_sessions`` counts **workers**. The assistant is excluded from it
-by :func:`lmer_platform.spawn._live_worker_count`, which is where the reservation
-had to land — worker spawns go through the same function, so a slot reserved
-anywhere else would not be reserved from them.
-
-That is a decision, not a convenience, and the earlier one is worth keeping in
-view: this module used to argue that the assistant should count "like any other
-container, because a cap you can exceed by one is not a cap". What made that
-wrong was the daemon starting the assistant at boot (T63). From then on the slot
-was spent from boot for the life of the daemon, so a host configured for four
-sessions ran *three* workers and a chat window, and the setting no longer meant
-what it says. The cap is about how much work a host can bear; the assistant is
-what routes that work, and it is one container whether the number is 1 or 40.
-So the number now means what an operator reads it to mean, and the one container
-they never asked for is not deducted from it.
-
-What did **not** change: a second assistant is still refused, and still by
-:func:`start` on the strength of the registry (D11), never by capacity. That
-matters both ways round — a worker cap rejecting an assistant would be one
-setting meaning two things, and the exclusion in the counting means a stale
-incarnation's entry cannot make its own replacement fail either.
-
-What remains true, and is why :class:`AssistantCapacityError` is still reachable:
-this is a reservation, not an exemption. Workers that already fill the cap are
-still holding every slot there is, so an assistant *start* against a full host is
-refused with the numbers and the setting to raise. The daemon starts the assistant
-before it serves anything, so in practice it is first; the refusal exists for the
-manual start on a host that came up busy.
-
-``max_concurrent_assistant_spawns`` is **gone** (T75). Per spec §6.4/§8.2 it
-bounded the sessions the assistant *initiates*, which is a different question from
-how many this host runs — and it was never enforced, only loaded, validated and
-served under ``GET /api/state``. Enforcing it is not possible today: there is one
-shared secret for the whole API and no way to attribute a spawn to the assistant
-rather than to the operator's browser, so the only cap it could have implemented
-would refuse the operator and blame the chat window. It is deleted rather than
-served, with the argument and the conditions for its return recorded in
-:mod:`lmer_platform.config`, because a setting an operator can lower and nothing
-reads is worse than an absent one: it reads as a control.
+``max_concurrent_sessions`` bounds workers only. Assistant start and rotation
+remain available when that pool is full; :func:`start` enforces the separate
+one-live-assistant rule through the registry. See docs/PLATFORM-QUICKSTART.md,
+"Reserved assistant capacity", for the launch paths and continuity guarantees.
 """
 
 from __future__ import annotations
@@ -535,11 +500,7 @@ SUPERVISE_POLL_SECONDS = 30.0
 RESPAWN_BACKOFF_SECONDS = 5.0
 RESPAWN_BACKOFF_CAP_SECONDS = 300.0
 
-#: Consecutive failures before the supervisor stops trying and says so. Bounded
-#: rather than infinite because every attempt is a clone and an image pull (§8.1
-#: promises a respawn, not an unbounded one), and not *one* because the common
-#: failure — the concurrency cap, a taskdef that is not installed yet — is one an
-#: operator clears while the daemon is up.
+#: Bound repeated image pulls while allowing transient launch failures to recover.
 MAX_RESPAWN_ATTEMPTS = 5
 
 #: How long an incarnation has to live before it counts as having worked. Under
@@ -587,11 +548,7 @@ class AssistantAlreadyRunning(AssistantError):
 
 
 class AssistantCapacityError(AssistantError):
-    """No room under ``max_concurrent_sessions``.
-
-    429, matching what ``POST /api/sessions`` already answers for a worker over
-    cap, so a client has one rule for "the host is full" rather than two.
-    """
+    """The assistant inbox is full; retry after it is drained (HTTP 429)."""
 
     status = 429
 
@@ -1765,14 +1722,8 @@ def start(
             except AssistantThreadHeld as exc:
                 raise _refuse(exc, "thread_held")
 
-        # After the refusals this module raises and before the spawn, so a second
-        # start against a live assistant cannot rewrite the file the live one was
-        # already given — the reachability answer can change under it (an
-        # operator rebinding the platform), and the file would then disagree with
-        # what the running session actually read. A *capacity* refusal comes from
-        # the spawn below and does rewrite it, which costs nothing: the content is
-        # derived rather than accumulated, and the secret in it already sits
-        # beside it in the same directory with the same mode.
+        # A refused duplicate must not rewrite the incumbent's environment or
+        # credential, even if the host's reachability settings have changed.
         _remember_generation(state)
         env_file, reach, credential = _prepare_environment(config)
 
@@ -1848,27 +1799,14 @@ def start(
                 ))
                 published = True
 
-        try:
-            result = spawn.spawn_session(
-                config,
-                request,
-                kind=KIND,
-                publish_registration=publish_registration,
-                # Settled above, where the layer each thread came from is still
-                # known: explicit refuses, standing defers (issue #413).
-                refuse_held_targets=False,
-            )
-        except spawn.CapacityError as exc:
-            raise _refuse(
-                AssistantCapacityError(
-                    f"{exc} — the assistant holds its own slot beside "
-                    "max_concurrent_sessions "
-                    f"({config.max_concurrent_sessions}), which counts workers, but "
-                    "it cannot take a slot that is already occupied. Free a worker "
-                    "slot and start it again"
-                ),
-                "cap_reached",
-            ) from exc
+        result = spawn.spawn_session(
+            config,
+            request,
+            kind=KIND,
+            publish_registration=publish_registration,
+            # Explicit threads refuse above; occupied standing threads defer.
+            refuse_held_targets=False,
+        )
 
         if not published:
             raise AssistantError(

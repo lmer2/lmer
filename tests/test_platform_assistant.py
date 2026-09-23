@@ -1312,27 +1312,16 @@ def test_an_installed_host_defers_to_the_container(config, long_lived, monkeypat
         assert status.running is True
 
 
-def test_a_host_whose_workers_fill_the_cap_refuses_the_assistant(
-    platform_root, fake_lmer
+def test_a_host_whose_workers_fill_the_cap_starts_the_assistant(
+    platform_root, fake_lmer, long_lived
 ):
-    """The assistant's slot is reserved, not conjured (T75).
-
-    ``max_concurrent_sessions`` counts workers and the assistant is not one of
-    them — but workers already holding every slot are holding the one it wanted
-    too, so the start is refused with the numbers and the setting to raise. The
-    daemon starts the assistant before it serves anything, so in practice it is
-    first; this refusal is for the manual start on a host that came up busy.
-    """
     config = cfg.load({"lmer_bin": str(fake_lmer), "max_concurrent_sessions": 1})
     registry.register("s-worker", kind="worker", pid=os.getpid())
 
-    with pytest.raises(assistant.AssistantCapacityError) as caught:
-        assistant.start(config)
-    assert caught.value.status == 429
-    assert "max_concurrent_sessions (1)" in str(caught.value)
-    assert "1/1" in str(caught.value), "the numbers belong in the refusal"
-    assert "Free a worker slot" in str(caught.value), "name what to free"
-    assert events_of("assistant_start_refused")[-1]["data"]["reason"] == "cap_reached"
+    with started(config) as status:
+        assert status.running is True
+        assert spawn._live_worker_count() == 1
+        assert events_of("assistant_start_refused") == []
 
 
 def test_a_live_assistant_leaves_every_worker_slot_free(platform_root, fake_lmer,
@@ -1356,12 +1345,18 @@ def test_a_live_assistant_leaves_every_worker_slot_free(platform_root, fake_lmer
             kill(worker.pid)
 
 
-def test_a_capacity_refusal_leaves_the_state_untouched(platform_root, fake_lmer):
+def test_start_at_capacity_carries_the_existing_handoff_and_pending(
+    platform_root, fake_lmer, long_lived
+):
     config = cfg.load({"lmer_bin": str(fake_lmer), "max_concurrent_sessions": 1})
     registry.register("s-worker", kind="worker", pid=os.getpid())
-    with pytest.raises(assistant.AssistantCapacityError):
-        assistant.start(config)
-    assert assistant.read_state().generation == 0
+    assistant.set_handoff("The worker is waiting on review")
+    assistant.notify("A question opened")
+    pending = assistant.read_state().pending
+    with started(config) as status:
+        assert status.generation == 1
+        assert status.handoff == "The worker is waiting on review"
+        assert assistant.read_state().pending == pending
 
 
 def test_a_dead_worker_does_not_block_the_assistant(platform_root, fake_lmer,
