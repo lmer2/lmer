@@ -83,6 +83,7 @@ from . import registry
 from .store import (
     StoreError, mutating, read_json, snapshot_path, utc_now_iso, write_json,
 )
+from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.runs")
 
@@ -299,7 +300,10 @@ def track(
     # here is a run that never appears in the fleet view while its container is
     # running, and that `resume` and `answer` then refuse as `run_not_tracked`.
     # Every route that gets here is a sync def in Starlette's threadpool.
-    with mutating(_index_path()):
+    with projects.operation(), mutating(_index_path()):
+        if projects.enabled():
+            home = projects.run_home(key)
+            projects.bind_run(key, project_context.current() or (home or {}).get("project_id"))
         runs = load_index()
         existing = runs.get(key) if isinstance(runs.get(key), dict) else {}
         now = utc_now_iso()

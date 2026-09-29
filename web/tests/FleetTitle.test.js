@@ -1,11 +1,12 @@
 import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import App from '../src/App.vue'
-import { fetchRunRelations, fetchState } from '../src/api.js'
+import { fetchProjects, fetchRunRelations, fetchState } from '../src/api.js'
 import { fleetTitle } from '../src/fleetTitle.js'
 import { mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({
+  fetchProjects: vi.fn(),
   fetchState: vi.fn(), forgetRun: vi.fn(), prune: vi.fn(), rescan: vi.fn(),
   // The shell reads relations for the map when the payload carries none.
   fetchRunRelations: vi.fn().mockResolvedValue({ run: {}, relations: [] }),
@@ -15,6 +16,7 @@ const state = (extra = {}) => ({ runs: [], attention: [], totals: { runs: 0, liv
 
 beforeEach(() => {
   vi.clearAllMocks()
+  fetchProjects.mockResolvedValue({ projects: [{ id: 'general', name: 'General', color: 'Blue', assistant: { lifecycle: 'stopped' } }] })
   fetchRunRelations.mockResolvedValue({ run: {}, relations: [] })
   window.localStorage.clear()
   window.location.hash = ''

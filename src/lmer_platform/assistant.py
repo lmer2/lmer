@@ -222,12 +222,9 @@ Nothing consumes it, a rotation carries it forward, and a stop-and-start does to
 :func:`dataclasses.replace` rather than rebuilding it, and pinning that is what
 the tests do from both ends.
 
-The write path is **chat**, not a settings screen (operator request, 2026-07-28:
-"I want to be able to do that via the chat, not some ux config thing"). The
-operator states a rule in the conversation, the assistant confirms the wording
-back and posts the whole updated document; the UI shows it read-only so there is
-one writer of the document's prose and it is the thing the operator is talking to.
-The taskdef owns both halves of that, since both are behaviour rather than state.
+The operator can edit the scoped document in Project settings or state a rule
+in chat for the assistant to confirm and store. Both use the same bounded,
+scrubbed whole-document write path.
 
 Two consequences worth stating, because they are what makes this safe to serve:
 
@@ -328,6 +325,8 @@ one-live-assistant rule through the registry. See docs/PLATFORM-QUICKSTART.md,
 
 from __future__ import annotations
 
+from .projects import serialized
+
 import json
 import logging
 import os
@@ -370,10 +369,11 @@ from .store import (
     append_event,
     ensure_state_dir,
     read_json,
-    snapshot_path,
     utc_now_iso,
     write_json,
 )
+from .project_context import assistant_dir
+from . import projects, project_context
 
 logger = logging.getLogger("lmer_platform.assistant")
 
@@ -738,7 +738,7 @@ class AssistantState:
             instructions_at=_opt_str(payload.get("instructions_at")),
             stopped_at=_opt_str(payload.get("stopped_at")),
             stop_reason=_opt_str(payload.get("stop_reason")),
-            pending=pending[-MAX_PENDING:],
+            pending=pending if projects.enabled() else pending[-MAX_PENDING:],
             pending_since=_opt_str(payload.get("pending_since")),
             pending_seq=pending_seq,
             nudged_at=_opt_str(payload.get("nudged_at")),
@@ -863,12 +863,12 @@ def _age_seconds(started_at: Optional[str]) -> Optional[float]:
 
 def state_path() -> Path:
     """Where the pointer and rotation bookkeeping live."""
-    return snapshot_path(STATE_FILE)
+    return assistant_dir() / STATE_FILE
 
 
 def env_file_path() -> Path:
     """Where the assistant's ``.env`` lives — see :func:`_prepare_environment`."""
-    return snapshot_path(ENV_FILE)
+    return assistant_dir() / ENV_FILE
 
 
 def read_state() -> AssistantState:
@@ -880,7 +880,7 @@ def read_state() -> AssistantState:
     generation 0.
     """
     try:
-        stored = read_json(state_path())
+        stored = projects.assistant_state() if projects.enabled() else read_json(state_path())
     except StoreError as exc:
         logger.error(
             "platform_assistant_state_unreadable error=%s — starting from empty", exc
@@ -901,7 +901,10 @@ def _write_state(state: AssistantState) -> bool:
     handoff, not the assistant.
     """
     try:
-        write_json(state_path(), state.to_dict())
+        if projects.enabled():
+            projects.save_assistant_state(state.to_dict())
+        else:
+            write_json(state_path(), state.to_dict())
     except StoreError as exc:
         logger.error(
             "platform_assistant_state_unwritable error=%s — the registry entry "
@@ -1063,11 +1066,14 @@ def _refuse_held_explicit_threads(
 
 def _stored_threads() -> list:
     """The assistant's stored launch list, as it is in ``config.json``."""
+    if projects.enabled():
+        return list(projects.get(project_context.current() or projects.GENERAL)["settings"].get("threads") or [])
     stored = assistant_settings().get("threads")
     raw = getattr(stored, "stored", None)
     return list(raw) if isinstance(raw, list) else []
 
 
+@serialized
 def note_thread_change(session_id: object, permalink: object, *, connected: bool) -> bool:
     """Keep the standing ``threads`` setting in step with a live connect (#412).
 
@@ -1104,7 +1110,12 @@ def note_thread_change(session_id: object, permalink: object, *, connected: bool
         # between a too-long list and a config.json that silently launches with
         # no threads at all is this check.
         validate_thread_targets(current)
-        update_stored({"assistant_threads": current})
+        if projects.enabled():
+            workspace_id = project_context.current() or projects.GENERAL
+            settings = projects.get(workspace_id)["settings"]
+            projects.update(workspace_id, {"settings": {**settings, "threads": current}})
+        else:
+            update_stored({"assistant_threads": current})
     except (ConfigError, ValueError) as exc:
         logger.warning(
             "platform_assistant_threads_unwritable connected=%s error=%s", connected, exc,
@@ -1122,9 +1133,11 @@ def _live_assistant() -> Optional[dict]:
     next; otherwise the oldest live one is the incumbent. More than one is
     logged, because it means something upstream let two starts through.
     """
+    workspace_id = project_context.current() or projects.GENERAL
     live = [
         entry for entry in registry.list_sessions(live_only=True)
         if entry.get("kind") == KIND
+        and (not projects.enabled() or projects.session_home(entry["id"]) == workspace_id)
     ]
     if not live:
         return None
@@ -1459,7 +1472,12 @@ def _launch_settings(overrides: Optional[dict]) -> tuple:
     for key, setting in assistant_settings().items():
         values[key] = setting.value
         sources[key] = setting.source
-    for key, value in (overrides or {}).items():
+    project_overrides = {}
+    if projects.enabled():
+        project_overrides = projects.get(project_context.current() or projects.GENERAL)["settings"]
+        if project_context.current() not in (None, projects.GENERAL):
+            values["threads"], sources["threads"] = [], "project"
+    for key, value in {**project_overrides, **(overrides or {})}.items():
         if key not in ASSISTANT_SETTING_KEYS:
             raise AssistantError(
                 f"unknown assistant setting {key!r}: expected one of "
@@ -1518,6 +1536,8 @@ def _assistant_credential(config: PlatformConfig) -> Optional[str]:
     try:
         return mint_assistant_credential()
     except ConfigError as exc:
+        if projects.enabled():
+            raise AssistantError(f"Could not mint a project-scoped assistant credential: {exc}") from exc
         logger.error(
             "platform_assistant_credential_unmintable error=%s — falling back to "
             "the shared secret, so this incarnation's calls cannot be told from "
@@ -1605,6 +1625,9 @@ def _prepare_environment(config: PlatformConfig) -> tuple:
     at all, which the taskdef reads as "say you cannot reach the platform".
     """
     values, reach = _assistant_environment(config)
+    if project_context.current():
+        values["LMER_WORKSPACE_ID"] = project_context.current()
+        values["LMER_WORKSPACE_NAME"] = projects.get(project_context.current())["name"]
     path = env_file_path()
     body = "".join(_dotenv_line(name, value) for name, value in values.items())
     try:
@@ -1665,6 +1688,7 @@ def authenticated_generation(credential: str) -> dict | None:
         return assistant_history.credential_owner(credential)
 
 
+@serialized
 def start(
     config: PlatformConfig,
     *,
@@ -1737,6 +1761,7 @@ def start(
         # this produces is echoed over HTTP and written to events.jsonl, and the
         # only thing in it is the name of a 0600 file.
         request = spawn.SpawnRequest(
+            workspace_id=(project_context.current() or projects.GENERAL) if projects.enabled() else None,
             taskdef=TASKDEF,
             target=TARGET,
             targets=launch["threads"],
@@ -1840,6 +1865,7 @@ def start(
         return status()
 
 
+@serialized
 def stop(
     *, reason: str = "operator", handoff: Optional[str] = None
 ) -> bool:
@@ -1933,6 +1959,7 @@ def stop(
         return gone
 
 
+@serialized
 def rotate(
     config: PlatformConfig,
     *,
@@ -2458,6 +2485,7 @@ def resume_supervision() -> bool:
     return supervisor.resume()
 
 
+@serialized
 def set_handoff(text: str) -> AssistantState:
     """Record the compact summary the next incarnation should be told (§8.3).
 
@@ -2477,6 +2505,7 @@ def set_handoff(text: str) -> AssistantState:
         return read_state()
 
 
+@serialized
 def set_instructions(text: str) -> AssistantState:
     """Record the operator's standing orders, replacing the whole document (T87).
 
@@ -2521,7 +2550,18 @@ def set_instructions(text: str) -> AssistantState:
         return read_state()
 
 
+@serialized
 def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bool:
+    if projects.enabled():
+        destination = projects.destination(data)
+        if not destination:
+            raise AssistantError("Assistant notification has no project destination.")
+        with project_context.bound(destination):
+            return _notify_bound(note, kind=kind, data=data)
+    return _notify_bound(note, kind=kind, data=data)
+
+
+def _notify_bound(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bool:
     """Spool a compact digest of a material event. Returns whether one is live.
 
     The seam §8.3 asks for, and the whole of it: the daemon detects and calls
@@ -2562,6 +2602,8 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
         )
         pending = list(state.pending) + [entry]
         dropped = max(0, len(pending) - MAX_PENDING)
+        if projects.enabled():
+            dropped = 0
         if dropped:
             discard = next((i for i, item in enumerate(pending)
                             if item.kind != "conversation_request"), len(pending) - 1)
@@ -2597,6 +2639,7 @@ def notify(note: str, *, kind: str = "event", data: Optional[dict] = None) -> bo
         return _live_assistant() is not None
 
 
+@serialized
 def notify_conversation(identity: str, data: dict) -> bool:
     """Atomically accept one request and its permanent, content-free replay key."""
     with _LOCK:
@@ -2695,6 +2738,7 @@ def _oldest_at(pending: tuple) -> Optional[str]:
     return min(stamps)
 
 
+@serialized
 def take_pending() -> list:
     """Drain the spooled digests, oldest first, and clear them.
 
@@ -2709,8 +2753,12 @@ def take_pending() -> list:
     empty either way, and a mark left behind by a take that raced the last digest
     out would suppress the next accumulation's first nudge for a window.
     """
+    from . import project_requests
+
     with _LOCK:
         state = read_state()
+        if projects.enabled():
+            return project_requests.drain(state)
         if not state.pending:
             if state.nudged_at is not None or state.pending_since is not None:
                 _write_state(replace(state, nudged_at=None, pending_since=None))

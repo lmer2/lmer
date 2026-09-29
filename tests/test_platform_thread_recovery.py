@@ -102,7 +102,7 @@ def test_saved_receipt_recovers_and_starts_without_operator(rig, monkeypatch):
     assert not rig.notices
 
 
-def test_unknown_outcome_stays_parked_with_one_digest_and_log(rig, monkeypatch, caplog):
+def test_unknown_outcome_stays_parked_with_health_log_and_no_digest(rig, monkeypatch, caplog):
     pending(rig, monkeypatch, "unknown")
     checkpoint = checkpoint_path(rig.key, rig.supervisor.log.session)
     before = (marker_path(rig.key).read_bytes(), checkpoint.read_bytes())
@@ -113,9 +113,9 @@ def test_unknown_outcome_stays_parked_with_one_digest_and_log(rig, monkeypatch, 
     assert not rig.threads._runner.started
     assert before == (marker_path(rig.key).read_bytes(), checkpoint.read_bytes())
     assert caplog.text.count("platform_thread_connector_unavailable") == 1
-    assert len(rig.notices) == 1
+    assert not rig.notices
     command = f"lmer-ctl threads recover s-1 {rig.record['id']} inspect"
-    assert command in rig.notices[0][0]
+    assert command in caplog.text
     view = rig.threads.listing("s-1")[0]
     assert view["attention"] == "recovery-required"
     assert command in view["detail"]
@@ -336,7 +336,7 @@ def test_review_connector_credentials_cannot_recover(rig, monkeypatch, action):
     assert not rig.threads._runner.started
 
 
-def test_review_notifier_failure_keeps_attention_and_reconciliation(rig, monkeypatch, caplog):
+def test_health_recovery_never_calls_notifier_and_keeps_attention(rig, monkeypatch, caplog):
     pending(rig, monkeypatch, "unknown")
     port = int(rig.supervisor.endpoint.url.rsplit(":", 1)[1])
     live_session("s-2", port=port)
@@ -354,10 +354,10 @@ def test_review_notifier_failure_keeps_attention_and_reconciliation(rig, monkeyp
         for _ in range(2):
             rig.now[0] += 60
             rig.threads.reconcile()
-    assert len(calls) == 1
+    assert not calls
     assert rig.threads.listing("s-1")[0]["attention"] == "recovery-required"
     assert rig.threads.listing("s-2")[0]["running"]
-    assert caplog.text.count("platform_thread_recovery_notify_failed") == 1
+    assert caplog.text.count("platform_thread_recovery_required") == 1
     assert marker_path(rig.key).exists()
 
 

@@ -280,6 +280,8 @@ from .config import active_assistant_credential, active_secret
 from .provenance import PLATFORM_PREFIX
 from .session_io import SessionNotFound
 from .store import logs_dir
+from . import projects
+from .config import active_assistant_credentials
 
 logger = logging.getLogger("lmer_platform.transcripts")
 
@@ -855,6 +857,7 @@ class Message:
     #: were addressed to a thread this session is not connected to — without this
     #: the pane shows them as a message to whoever is reading it.
     thread: Optional[str] = None
+    peer: Optional[dict] = None
 
     @property
     def empty(self) -> bool:
@@ -882,6 +885,7 @@ class Message:
             "comms_kind": self.comms_kind,
             "fidelity": self.fidelity,
             "thread": self.thread,
+            **({"peer": self.peer} if self.peer else {}),
         }
 
 
@@ -1211,6 +1215,10 @@ def _scrub(text: str) -> str:
     for known in (_platform_secret(), _assistant_credential()):
         if known:
             text = text.replace(known, _REDACTED)
+    if projects.enabled():
+        for known in active_assistant_credentials():
+            if len(known) >= 8:
+                text = text.replace(known, _REDACTED)
     for pattern, replacement in _CREDENTIAL_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
@@ -2750,6 +2758,8 @@ def _comms_turns(events: list, session_id: str) -> tuple:
         else:
             role = "assistant"
         label = None if kind == "message" and inbound else kind
+        if channel == "peer-ul":
+            label = "peer UL message"
         if kind == "digest":
             label = f"digest: {meta.get('digest_kind', 'event')}"
         if kind == "answer" and meta.get("late"):
@@ -2772,6 +2782,7 @@ def _comms_turns(events: list, session_id: str) -> tuple:
                 source=dict(source) if source else None, comms_kind=label,
                 fidelity=meta.get("fidelity") if isinstance(meta.get("fidelity"), str) else None,
                 thread=_thread_link(meta.get("thread")),
+                peer=_scrub_decoded(meta["peer"]) if channel == "peer-ul" and isinstance(meta.get("peer"), dict) else None,
             ))
         if role == "assistant" and spoken:
             # The record's own words, not the rendered ``text``: a ``close``

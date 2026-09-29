@@ -1441,17 +1441,17 @@ class TicketStore:
         self.ttl = TICKET_TTL_SECONDS if ttl is None else ttl
         self._capacity = capacity
         self._lock = threading.Lock()
-        self._issued: dict[str, tuple[str, float]] = {}
+        self._issued: dict[str, tuple[str, float, dict]] = {}
 
     @staticmethod
     def _digest(raw: str) -> str:
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     def _sweep(self, now: float) -> None:
-        for digest in [d for d, (_, exp) in self._issued.items() if exp <= now]:
+        for digest in [d for d, (_, exp, _) in self._issued.items() if exp <= now]:
             del self._issued[digest]
 
-    def mint(self, session_id: str) -> str:
+    def mint(self, session_id: str, *, binding: Optional[dict] = None) -> str:
         """Issue a ticket for *session_id*.
 
         Swept on the way in rather than on a timer: the only moment the store can
@@ -1469,7 +1469,7 @@ class TicketStore:
                     "platform_tty_ticket_evicted capacity=%d — a client is "
                     "minting tickets it never redeems", self._capacity,
                 )
-            self._issued[self._digest(raw)] = (session_id, now + self.ttl)
+            self._issued[self._digest(raw)] = (session_id, now + self.ttl, dict(binding or {}))
         return raw
 
     def redeem(self, raw: str, session_id: str) -> bool:
@@ -1480,13 +1480,17 @@ class TicketStore:
         those answers differ exactly by information about sessions it has not
         proved it may see.
         """
+        return self.consume(raw, session_id) is not None
+
+    def consume(self, raw: str, session_id: str) -> Optional[dict]:
+        """Consume a valid ticket and return its captured authority."""
         if not raw:
-            return False
+            return None
         now = time.monotonic()
         with self._lock:
             self._sweep(now)
             issued = self._issued.pop(self._digest(raw), None)
-        return issued is not None and issued[0] == session_id
+        return issued[2] if issued is not None and issued[0] == session_id else None
 
     def live_count(self) -> int:
         """Unredeemed, unexpired tickets — for tests and for a health readout."""

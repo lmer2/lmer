@@ -5,11 +5,14 @@ import hashlib
 import json
 import logging
 import os
+import re
+from html.parser import HTMLParser
+from urllib.parse import unquote, urlsplit
 
 from lmer_cli import dm_access, dm_parents, thread_access
 from lmer_cli.assistant_mentions import Settings
 from lmer_cli.threads import ThreadError, parse_thread
-from matrix_chat.connector import resolve_thread_root
+from matrix_chat.connector import resolve_thread_root, strip_reply_fallback
 from matrix_chat.client import MatrixError
 from matrix_chat.listener import is_assistant_mention
 from matrix_chat.permalink import matrix_to_link
@@ -17,10 +20,62 @@ from slack_chat.permalink import slack_thread_link
 from slack_chat.client import SlackError
 from slack_chat.registry import is_thread_connected
 
-from . import assistant, connectors
+from . import assistant, connectors, projects
+from . import project_requests
 
 logger = logging.getLogger(__name__)
 MAX_TEXT = 8000
+
+
+class _MentionLabels(HTMLParser):
+    def __init__(self, user_id):
+        super().__init__()
+        self.user_id = user_id
+        self.labels = []
+        self.label = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            try:
+                link = urlsplit(dict(attrs).get("href") or "")
+            except ValueError:
+                return
+            if link.hostname == "matrix.to" and unquote(link.fragment).split("?")[0].lstrip("/") == self.user_id:
+                self.label = ""
+
+    def handle_data(self, data):
+        if self.label is not None:
+            self.label += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.label is not None:
+            self.labels.append(self.label)
+            self.label = None
+
+
+def _request_text(transport, event, env, reader):
+    if transport == "slack":
+        text = str(event.get("text") or "")
+        prefix = re.match(r"^\s*<@([A-Z0-9]+)>[:,]?(?:\s+|$)", text)
+        if prefix:
+            try:
+                bot_user_id = reader.auth_test()
+            except SlackError as exc:
+                raise ThreadError("could not verify the Slack bot identity", status=502) from exc
+            if prefix[1] == bot_user_id:
+                return text[prefix.end():]
+        return text
+    content = event["content"]
+    text = strip_reply_fallback(str(content.get("body") or "")).lstrip()
+    user_id = thread_access.matrix_account(env).user_id
+    labels = _MentionLabels(user_id)
+    labels.feed(str(content.get("formatted_body") or ""))
+    for label in sorted({user_id, user_id.split(":")[0], *labels.labels}, key=len, reverse=True):
+        if label:
+            match = re.match(re.escape(label) + r"[:,]?(?:\s+|$)", text)
+            if match:
+                return text[match.end():]
+    return text
 
 
 def _required(value: object, name: str) -> str:
@@ -43,12 +98,9 @@ def _slack_allowed(client, sender: str, env) -> bool:
     entries = dm_access.allowed_recipients(sender, env)
     if dm_access.permits(sender, entries=entries):
         return True
-    if not entries:
+    if all(dm_access.slack_user_id(entry) for entry in entries):
         return False
-    try:
-        reply = client._request("GET", "users.info", params={"user": sender})
-    except SlackError:
-        return False
+    reply = client._request("GET", "users.info", params={"user": sender})
     member = reply.get("user") or {}
     return member.get("id") == sender and dm_access.permits(
         sender, spellings=(member.get("name"),), entries=entries,
@@ -130,12 +182,12 @@ def _receive(body: dict, settings: Settings, *, env=None, client=None) -> dict:
     except (SlackError, MatrixError) as exc:
         raise ThreadError(f"could not prepare the {transport} request: {exc}", status=502) from exc
     sender, event_id, root, permalink, parent, reader = prepared
-    if _held(transport, conversation, root, permalink):
+    if not projects.enabled() and _held(transport, conversation, root, permalink):
         return {"status": "connected"}
     identity = hashlib.sha256(json.dumps(
         [transport, conversation, event_id], separators=(",", ":"),
     ).encode()).hexdigest()
-    if identity in assistant.read_state().conversation_seen:
+    if not projects.enabled() and identity in assistant.read_state().conversation_seen:
         return {"status": "duplicate"}
     try:
         backlog = reader.history_before(conversation, event_id, settings.backlog) if not parent and root == event_id else []
@@ -155,6 +207,12 @@ def _receive(body: dict, settings: Settings, *, env=None, client=None) -> dict:
             "there under the operator's run-start policy. Do not broadcast its contents."
         ),
     }
+    if projects.enabled():
+        if not parent:
+            message = payload["message"]
+            message["original_text"] = message["text"]
+            message["text"] = _request_text(transport, event, environ, reader)[:MAX_TEXT]
+        return project_requests.admit(identity, payload, reader)
     # A connection may have been established while history was being fetched.
     if _held(transport, conversation, root, permalink):
         return {"status": "connected"}

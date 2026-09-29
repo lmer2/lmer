@@ -272,6 +272,14 @@ def rig(tmp_path):
 
 
 class TestConnector:
+    def test_peer_ul_records_never_post_but_worker_messages_still_do(self, rig):
+        record = {"id": "sess-1/peer", "kind": "message", "text": "Private native coordination",
+                  "source": {"channel": "peer-ul", "author": "Example Alpha"}, "meta": {}}
+        rig.connector._post_outbound(record, {})
+        assert rig.matrix.sent == []
+        rig.connector._post_outbound({**record, "id": "sess-1/worker", "source": {"channel": "uber-lmer"}}, {})
+        assert len(rig.matrix.sent) == 1
+
     @pytest.mark.parametrize("with_replies", [False, True])
     def test_default_attach_and_restart_exclude_lifecycle_notices(self, rig, monkeypatch, with_replies):
         from dataclasses import replace

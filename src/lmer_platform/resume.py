@@ -160,6 +160,7 @@ argv in :mod:`lmer_platform.spawn`.
 """
 
 from __future__ import annotations
+from .projects import run_operation, resume_selection
 
 import logging
 from dataclasses import dataclass, replace
@@ -365,6 +366,10 @@ class ResumeRequest:
     repo_url: Optional[str] = None
     direction: Optional[str] = None
     session_id: Optional[str] = None
+    workspace_id: Optional[str] = None
+    home_revision: Optional[int] = None
+    confirm_project: bool = False
+    slot: Optional[str] = None
 
     def validate(self) -> "ResumeRequest":
         """Return a normalised copy, or raise :class:`ResumeError`.
@@ -1055,6 +1060,7 @@ def _landing_session_id(
     return record_session_id(landing_ref)
 
 
+@run_operation
 def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
     """Continue a tracked run by starting its next session.
 
@@ -1095,6 +1101,7 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
     result = spawn_session(
         config,
         SpawnRequest(
+            **resume_selection(request.key, request.slot),
             taskdef=taskdef,
             target=target,
             repo_url=repo_url,

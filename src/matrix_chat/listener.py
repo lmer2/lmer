@@ -38,6 +38,7 @@ from slack_chat.sessions import SessionManager, preset_ack_parts
 from .client import MatrixAccount, MatrixClient, MatrixError
 from .connector import ACCESS_TOKEN_ENV, HOMESERVER_ENV, USER_ID_ENV, resolve_thread_root
 from .permalink import matrix_to_link
+from lmer_platform import projects, ingress_store
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,9 @@ class Listener:
         self.sessions = sessions
         self._matrix = matrix
         self._next_batch: Optional[str] = None
+        self._cursor_key = f"listener\n{config.homeserver}\n{config.user_id}"
+        if config.mentions.enabled:
+            self._next_batch = ingress_store.cursor(self._cursor_key)["since"]
         self._lock = asyncio.Lock()
 
     @property
@@ -121,9 +125,7 @@ class Listener:
         """One sync; returns the ``(room_id, event)`` pairs worth acting on."""
         body = self.matrix.sync(since=self._next_batch, filter_body=self._filter(), timeout_ms=timeout_ms)
         first = self._next_batch is None
-        self._next_batch = body.get("next_batch") or self._next_batch
-        if first:
-            return []  # the initial sync is history, not a request
+        cursor = body.get("next_batch") or self._next_batch
         found = []
         for room_id, room in ((body.get("rooms") or {}).get("join") or {}).items():
             for event in ((room.get("timeline") or {}).get("events") or []):
@@ -144,17 +146,24 @@ class Listener:
                         room_id, sender, ALLOWED_USERS_ENV,
                     )
                     continue
-                found.append((room_id, event))
+                if not first:
+                    found.append((room_id, event))
+        if self.config.mentions.enabled:
+            if not isinstance(cursor, str) or not cursor:
+                raise MatrixError("The Matrix listener received no sync cursor")
+            ingress_store.matrix_batch(self._cursor_key, cursor, self.config.rooms, found)
+        self._next_batch = cursor
         return found
 
     async def handle(self, room_id: str, event: dict) -> None:
         root = resolve_thread_root(event)
         permalink = matrix_to_link(room_id, root)
         async with self._lock:
-            if self.sessions.touch(room_id, root):
-                return
-            if is_thread_connected(room_id, root, kind="matrix"):
-                return
+            project_mention = (self.config.mentions.enabled and projects.enabled()
+                               and is_assistant_mention(event, self.config.account.user_id))
+            if not project_mention:
+                if self.sessions.touch(room_id, root) or is_thread_connected(room_id, root, kind="matrix"):
+                    return
             if self.config.mentions.enabled:
                 try:
                     await asyncio.to_thread(assistant_mentions.forward, "matrix", room_id, event)

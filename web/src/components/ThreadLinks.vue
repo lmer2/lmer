@@ -29,6 +29,7 @@ const TRANSPORTS = [
 ]
 
 const props = defineProps({
+  workspaceId: { type: String, default: undefined },
   sessionId: { type: String, default: null },
   threads: { type: Array, default: () => [] },
   live: { type: Boolean, default: false },
@@ -212,7 +213,7 @@ async function remember() {
   busy.value = true
   problem.value = null
   try {
-    await addSessionReference(props.sessionId, permalink.value.trim(), referenceTitle.value.trim())
+    await addSessionReference(props.sessionId, permalink.value.trim(), referenceTitle.value.trim(), props.workspaceId)
     dialog.value = false
     emit('changed')
   } catch (error) {
@@ -226,7 +227,7 @@ async function forget(reference) {
   busy.value = true
   failure.value = null
   try {
-    await removeSessionReference(props.sessionId, reference.id)
+    await removeSessionReference(props.sessionId, reference.id, props.workspaceId)
     emit('changed')
   } catch (error) {
     failure.value = error.message
@@ -251,9 +252,9 @@ async function connect() {
   try {
     let result
     if (opening.value) {
-      result = await openSessionThread(props.sessionId, permalink.value.trim(), rootTitle.value.trim())
+      result = await openSessionThread(props.sessionId, permalink.value.trim(), rootTitle.value.trim(), props.workspaceId)
     } else {
-      result = await connectSessionThread(props.sessionId, permalink.value.trim())
+      result = await connectSessionThread(props.sessionId, permalink.value.trim(), props.workspaceId)
     }
     if (mine !== generation) return
     operations.value = operations.value.map((item) => item.thread.id === operation.thread.id
@@ -280,7 +281,7 @@ async function disconnect(thread) {
   const mine = generation
   operations.value = [...operations.value, { action: 'disconnect', thread, accepted: false }]
   try {
-    await disconnectSessionThread(props.sessionId, thread.id)
+    await disconnectSessionThread(props.sessionId, thread.id, props.workspaceId)
     if (mine !== generation) return
     operations.value = operations.value.map((item) => item.thread.id === thread.id
       ? { ...item, accepted: true } : item)

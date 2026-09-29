@@ -511,6 +511,8 @@ def test_to_dict_is_the_row_the_payload_carries(
         "name": "webapp",
         "preset": "webapp_dev",
         "description": "Web app",
+        "applicable_projects": [],
+        "needs_project_assignment": True,
         "etag": row.definition.etag,
         "service": "webapp-web",
         "service_group": None,

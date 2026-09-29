@@ -13,7 +13,7 @@ import pytest
 import yaml
 from fastapi.testclient import TestClient
 
-from lmer_platform import api
+from lmer_platform import api, connectors
 from lmer_platform import config as cfg
 from lmer_platform import registry, store
 from tests.conftest import strip_lmer_env
@@ -24,6 +24,7 @@ from tests.conftest import strip_lmer_env
 # established, and a second copy would drift from the one the search is
 # described by.
 from tests.test_platform_addrun import blind_the_host, plant_taskdefs
+from starlette.datastructures import State
 
 SECRET = "test-secret-value"
 
@@ -588,8 +589,9 @@ def test_adopting_a_candidate_cannot_double_a_run_the_platform_spawned(
     assert tracked[0].source == "spawned"
 
 
-def test_adopt_then_forget_over_the_api(config, platform_root):
+def test_adopt_then_forget_over_the_api(config, platform_root, monkeypatch):
     """Needs the real state builder, so the tracked count actually reflects it."""
+    monkeypatch.setattr(connectors, "_CONNECTORS", None)
     real_client = TestClient(api.create_app(config, SECRET, state_builder=api.build_state))
     body = {"host": "gitlab.example.com", "project": "agents/global", "slug": "adopted-run"}
 
@@ -925,6 +927,7 @@ class _StubSocket:
     """
 
     def __init__(self, session_id, ticket, failure=None):
+        self.state = State()
         self.path_params = {"session_id": session_id}
         self.query_params = {"ticket": ticket}
         self.failure = failure
@@ -1175,6 +1178,7 @@ def test_build_state_carries_a_row_per_declared_slot(platform_root, slot_host):
         # The version an editor sends back as If-Match (#256); pinned in
         # tests/test_platform_slots_api.py rather than spelled out here.
         "etag": payload["slots"][0]["etag"],
+        "applicable_projects": [], "needs_project_assignment": True,
         "service": "webapp-web", "service_group": None, "members": [],
         "state": "free", "reason": None,
         "occupant": None, "occupants": [], "service_occupants": [],

@@ -85,6 +85,7 @@ to withhold it.
 """
 
 from __future__ import annotations
+from .projects import run_operation, resume_selection
 
 import logging
 from dataclasses import dataclass, replace
@@ -173,6 +174,10 @@ class AnswerRequest:
     project: str
     slug: str
     answer: str
+    workspace_id: Optional[str] = None
+    home_revision: Optional[int] = None
+    confirm_project: bool = False
+    slot: Optional[str] = None
 
     def validate(self) -> "AnswerRequest":
         """Return a normalised copy, or raise :class:`AnswerError`.
@@ -535,6 +540,7 @@ def _identity_repo_url(request: AnswerRequest) -> str:
     return f"https://{request.host}/{request.project}"
 
 
+@run_operation
 def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     """Answer a question-blocked run by respawning it with the answer attached.
 
@@ -561,6 +567,7 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
     result = spawn_session(
         config,
         SpawnRequest(
+            **resume_selection(request.key, request.slot),
             taskdef=taskdef,
             target=target,
             # Recorded only if the run actually has one — an adopted run that has

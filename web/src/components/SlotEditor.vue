@@ -27,6 +27,7 @@ import { createSlot, fetchSpawnOptions, removeSlot, updateSlot } from '../api.js
 import { slotMeta, toneColor } from '../format.js'
 
 const props = defineProps({
+  projects: { type: Array, default: () => [] },
   modelValue: { type: Boolean, default: false },
   // The row being edited, or null to declare a new slot. The row is where the
   // etag comes from, which is why the editor takes the whole thing rather than
@@ -52,6 +53,7 @@ const editing = computed(() => !!opened.value)
 const name = ref('')
 const preset = ref(null)
 const description = ref('')
+const applicableProjects = ref([])
 const presets = ref([])
 const problem = ref(null)
 // The row the daemon says this would be. Null until a preview lands, and
@@ -97,6 +99,7 @@ function reset() {
   name.value = opened.value?.name || ''
   preset.value = opened.value?.preset || null
   description.value = opened.value?.description || ''
+  applicableProjects.value = [...(opened.value?.applicable_projects || [])]
 }
 
 // The row moved under the dialog — another operator saved, or the file was
@@ -141,6 +144,7 @@ function changes() {
       name: typed(name.value),
       preset: typed(preset.value),
       description: typed(description.value),
+      applicable_projects: [...applicableProjects.value],
     }
   }
   const patch = {}
@@ -149,6 +153,9 @@ function changes() {
   }
   if (typed(description.value) !== (opened.value.description || '')) {
     patch.description = typed(description.value)
+  }
+  if (JSON.stringify(applicableProjects.value) !== JSON.stringify(opened.value.applicable_projects || [])) {
+    patch.applicable_projects = [...applicableProjects.value]
   }
   return patch
 }
@@ -165,6 +172,7 @@ async function refreshPreview() {
       ? await updateSlot(opened.value.name, {
         preset: typed(preset.value),
         description: typed(description.value),
+      applicable_projects: [...applicableProjects.value],
       }, { etag: opened.value.etag, dryRun: true })
       : await createSlot(changes(), { dryRun: true })
     if (stale(mine)) return
@@ -186,7 +194,7 @@ function schedulePreview() {
   previewTimer = setTimeout(refreshPreview, PREVIEW_DELAY_MS)
 }
 
-watch([name, preset, description], schedulePreview)
+watch([name, preset, description, applicableProjects], schedulePreview)
 
 watch(open, (isOpen) => {
   if (!isOpen) return
@@ -281,7 +289,10 @@ const presetHint = computed(() => {
           refused. Changes apply to the next poll; nothing restarts.
         </p>
 
-        <v-alert v-if="problem" type="warning" density="compact" class="mb-3">
+        <v-select v-model="applicableProjects" :items="projects.filter(project => !project.archived)"
+        item-title="name" item-value="id" label="Applicable projects" multiple chips clearable
+        hint="Empty means no project can use this slot. Existing occupants keep their services." persistent-hint class="mb-3" />
+      <v-alert v-if="problem" type="warning" density="compact" class="mb-3">
           {{ problem }}
         </v-alert>
 

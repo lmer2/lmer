@@ -239,16 +239,13 @@ def test_both_credentials_open_the_api_and_are_told_apart(config, long_lived):
 
 
 def _guard_of(app):
-    """The app's ``require_secret``, reachable for a direct call.
-
-    Read off a route's dependant rather than re-derived, so the thing under test
-    is the function the served routes actually gate on.
-    """
+    """Read the authenticator used by the served route's binding dependency."""
     for route in app.routes:
         for dependency in getattr(route, "dependencies", ()):
             call = dependency.dependency
             if getattr(call, "__name__", "") == "require_secret":
-                return call
+                guard = next(item for item in route.dependant.dependencies if item.call is call)
+                return next(item.call for item in guard.dependencies if item.call.__name__ == "authenticate")
     raise AssertionError("no require_secret dependency on any route")
 
 

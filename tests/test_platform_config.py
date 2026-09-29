@@ -1549,6 +1549,7 @@ def test_integer_settings_warn_under_their_own_log_keys(platform_root):
     keys = {rule.log_key for rule in cfg.INT_SETTINGS.values()}
     assert len(keys) == len(cfg.INT_SETTINGS)
     assert set(cfg.INT_SETTINGS) == {
+        "max_live_assistants", "max_concurrent_sessions",
         "chat_keep_last", "checkin_window_seconds", "nudge_after_seconds",
         "nudge_pending_threshold",
         "terminal_confirm_seconds",

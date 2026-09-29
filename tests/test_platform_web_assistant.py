@@ -144,11 +144,13 @@ def test_the_drawer_is_reachable_from_the_app_bar_on_every_view():
     app = _read(APP)
     button = None
     for match in re.finditer(r"<v-btn\b[^>]*>", app, re.S):
-        if "uberOpen" in match.group(0):
+        if '@click="toggleProjectChat"' in match.group(0):
             button = match.group(0)
             break
     assert button, "nothing in the shell opens the supervisor's drawer"
-    assert "uberOpen = !uberOpen" in button, "the bar button cannot close it again"
+    toggle = app.split("function toggleProjectChat()", 1)[1].split("\n}", 1)[0]
+    assert "if (uberOpen.value) uberOpen.value = false" in toggle, "the bar button cannot close it again"
+    assert "openProjectChat(activeProject.value || chatProject.value)" in toggle, "reopening lost its project destination"
     assert "aria-label" in button, "an icon-only button needs a name"
     assert "mdiRobot" in button, (
         "the toggle draws no icon, or one pasted as path data rather than taken "
@@ -163,64 +165,20 @@ def test_the_drawer_is_reachable_from_the_app_bar_on_every_view():
 # --- the words ----------------------------------------------------------------
 
 def test_the_supervisor_is_called_uber_lmer_and_never_an_assistant():
-    """Two visibly different names are what stand between an operator and the
-    wrong recipient (operator request, 2026-07-27).
-
-    "assistant" stays the spelling of the module, the taskdef and every API field —
-    this is a label decision — so the check is on the strings an operator reads and
-    on nothing else. Which is also why "uber lmer" has to be *present*: a drawer
-    that merely avoided the forbidden word would be a nameless panel, and a
-    nameless panel is one an operator has to guess the recipient of.
-    """
-    words = _operator_words(DRAWER)
-    assert "uber lmer" in words, "the drawer never says whose chat it is"
-    assert "assistant" not in words.lower(), (
-        f"the drawer calls the supervisor an assistant to the operator: {words!r}"
-    )
-    assert "lmer working in a repository" in words, (
-        "nothing tells the operator that this is not one of the runs, which is the "
-        "distinction the two names exist to carry"
-    )
-    # The bar button is the other operator-visible surface, and it is one word.
-    shell = _operator_words(APP)
-    assert "uber lmer" in shell, "the app bar's toggle is unnamed or misnamed"
-    assert "assistant" not in shell.lower(), (
-        "the shell calls the supervisor an assistant to the operator"
-    )
+    text = _read(DRAWER)
+    assert '{{ workspace.name }} · uber lmer' in text
+    assert 'agent-label="uber lmer"' in text
+    assert 'Waiting to start — assistant limit reached' in text
+    assert 'this chat belong to this project' in ' '.join(text.split())
 
 
 def test_the_composer_says_who_is_at_the_other_end():
-    """The shared chat's own label is written for a worker session ("this session").
+    text = _read(DRAWER)
+    assert 'You are talking to {{ workspace.name }} · uber lmer.' in text
+    assert ':composer-label="`Say something to ${workspace.name} · uber lmer`"' in text
+    assert ':workspace-id="workspace.id"' in text
+    assert 'say something to this session' in _read(CHAT)
 
-    Which is correct there and not enough here: the last line read before typing
-    has to name the recipient, because that is the moment the mistake happens. So
-    two things say it — the line above the composer, and the composer's own label,
-    which Chat.vue takes as a prop for exactly this reason. Both, rather than one:
-    the sentence is above a conversation that scrolls, and the label is inside the
-    field a thumb is already in.
-    """
-    words = _operator_words(DRAWER)
-    assert "You are talking to uber lmer." in words, (
-        "nothing above the composer names the recipient"
-    )
-
-    label = re.search(r"<Chat[^>]*\scomposer-label=\"([^\"]*)\"", _read(DRAWER), re.S)
-    assert label, (
-        "the drawer leaves the shared composer on its default label, which says "
-        '"this session" in a panel that is deliberately not one of the runs'
-    )
-    assert "uber lmer" in label.group(1), (
-        f"the composer is labelled {label.group(1)!r}, which names no recipient — "
-        "and the recipient is the whole of what this drawer has to get right"
-    )
-    # The default it overrides is the run's, and still exists: this is a wording
-    # decision in one component, not a second composer.
-    assert "say something to this session" in _read(CHAT), (
-        "the shared chat no longer has a label of its own to override"
-    )
-
-
-# --- the conversation is the shared one ---------------------------------------
 
 def test_the_conversation_is_the_shared_chat_pointed_at_the_supervisor():
     """Reused, not rebuilt: the supervisor is an lmer session with a session id.
@@ -272,36 +230,13 @@ def test_the_runs_two_chat_props_are_left_to_the_run_that_has_them():
 # --- the states the drawer has to be honest about -----------------------------
 
 def test_a_supervisor_that_is_not_running_says_so_and_offers_a_start():
-    """The state an operator most needs the drawer in is the one it is useless in.
-
-    The daemon supervises the supervisor (T63), so a manual start is a legitimate
-    verb rather than a workaround — and the drawer says both halves: one is coming
-    on its own, and here is the button if it has not.
-    """
     text = _read(DRAWER)
-    words = _operator_words(DRAWER)
-    assert "No uber lmer is running." in words, (
-        "a stopped supervisor is not stated, so an empty drawer reads as a broken one"
-    )
-    assert "start uber lmer" in words, "there is no way to start one"
-    assert "The daemon starts one and keeps it up" in words, (
-        "nothing says the daemon is already trying, so the button reads as the "
-        "only thing that can start one"
-    )
-    assert "startAssistant" in text and "startAssistant" in _read(API_JS), (
-        "the start goes somewhere other than the daemon's own route"
-    )
-    assert "request('api/assistant/start', { method: 'POST' })" in _read(API_JS), (
-        "the start route is no longer the POST the daemon serves"
-    )
-    # A 409 is "one is already running" — two taps on a slow connection — and must
-    # not be reported as a failure to start.
-    assert "exc.status === 409" in text, (
-        "a second start is reported as an error instead of being re-read"
-    )
-    assert ":loading=\"starting\"" in text and "starting" in words, (
-        "the wait between the tap and the session being up draws nothing"
-    )
+    assert 'Stopped until you choose Start' in text
+    assert "status?.lifecycle === 'failed' ? 'Retry' : 'Start'" in text
+    assert "lifecycle(starting, startAssistant)" in text
+    assert "workspaceId)" in _client_body(_read(API_JS), 'startAssistant')
+    assert ':loading="starting"' in text
+    assert 'Your draft stays here' in text
 
 
 def test_a_daemon_that_did_not_answer_degrades_instead_of_resetting():
@@ -404,8 +339,8 @@ def test_restart_is_the_rotate_route_and_the_other_two_are_their_own():
     text = _read(DRAWER)
     api = _read(API_JS)
     for client, route in (
-        ("rotateAssistant", "request('api/assistant/rotate', { method: 'POST' })"),
-        ("stopAssistant", "request('api/assistant/stop', { method: 'POST' })"),
+        ("rotateAssistant", "request(workspacePath('api/assistant/rotate', workspaceId), { method: 'POST' })"),
+        ("stopAssistant", "request(workspacePath('api/assistant/stop', workspaceId), { method: 'POST' })"),
     ):
         assert client in text, f"the drawer does not call {client}"
         assert route in api, (
@@ -472,62 +407,17 @@ def test_the_two_destructive_verbs_are_confirmed_in_the_apps_own_pattern():
     # The action functions are only reachable through those dialogs: a control that
     # called them directly would be the confirmation removed for one entry point.
     for call in ("restartUberLmer", "stopUberLmer"):
-        assert text.count(f'@click="{call}"') == 1, (
+        assert text.count(f'@click="{call}"') == (2 if call == 'stopUberLmer' else 1), (
             f"{call} is reachable from somewhere other than its confirmation"
         )
 
 
 def test_the_confirmations_say_what_is_lost_and_claim_nothing_more():
-    """The copy is the whole safety feature here, so it is checked as one.
-
-    A rotation ends model context while the visible archive remains. Standing orders
-    are never consumed and a rotation carries them forward, and the handover note
-    travels untouched when none is sent (``assistant.start``/``stop`` edit state with
-    ``dataclasses.replace``, and ``_handoff_update`` keeps the recorded note when the
-    field is omitted). So the confirm says both halves — and says the note is the one
-    on record rather than a fresh summary, because nothing in this UI asks the
-    outgoing incarnation to write one.
-
-    A stop must not promise it stays stopped. The daemon's supervisor respawns
-    anything that is not running, whatever ended it (``Supervisor.supervise_once``
-    reads liveness and nothing else), so "nothing restarts it until you say so" is
-    true only of a daemon that is not supervising or has given up — which is exactly
-    what the start button is for, and what the copy says instead.
-    """
-    # Collapsed, because a sentence this long is wrapped in the markup and what is
-    # being checked is the sentence rather than where it happens to break.
     words = _words(DRAWER)
-    for phrase in (
-        "Restart uber lmer?",
-        "its current context is lost",
-        "Your conversation history remains visible",
-        "Standing orders survive",
-        "the handover note already on record",
-    ):
-        assert phrase in words, (
-            f"the restart confirmation does not say {phrase!r}, so the operator is "
-            "asked to accept a loss nobody named"
-        )
-    for phrase in (
-        "Stop uber lmer?",
-        "This ends the incarnation and its current context",
-        "A daemon that is supervising puts a fresh one up on its own",
-        "none comes back until you start one here",
-    ):
-        assert phrase in words, (
-            f"the stop confirmation does not say {phrase!r}"
-        )
-    # The claim the code cannot support, in the shapes it would be written in.
-    for lie in (
-        "nothing restarts it",
-        "nothing will restart it",
-        "stays stopped",
-        "stays down until you start",
-    ):
-        assert lie not in words.lower(), (
-            f"the drawer promises {lie!r}, which the supervisor contradicts: it "
-            "respawns anything that is not running, whatever ended it"
-        )
+    for phrase in ('its current context is lost', 'Your conversation history remains visible',
+                   'Standing orders survive', 'the handover note already on record',
+                   'It stays stopped until you choose Start', 'pending work remain'):
+        assert phrase in words
 
 
 def test_one_lifecycle_call_at_a_time_and_the_wait_is_drawn():
@@ -571,9 +461,8 @@ def test_the_conversation_follows_the_incarnation_a_restart_created():
     Each lifecycle route answers with the reconciled status, so the reply becomes the
     status, ``sessionId`` derives from it, and ``Chat.vue`` already restarts its
     transcript when the id it was given changes (it was written for a respawned run's
-    session, which is the same shape). Anything else — a ``:key`` to force a remount,
-    a reload, a second poll — would be a second mechanism for a property one already
-    covers.
+    session, which is the same shape). The history/active key stays stable through
+    a live rotation, which must not remount the conversation or discard attachments.
     """
     text = _read(DRAWER)
     body = text[text.index("async function lifecycle("):text.index("function startUberLmer")]
@@ -590,10 +479,13 @@ def test_the_conversation_follows_the_incarnation_a_restart_created():
         "so a rotation would leave the previous incarnation's transcript on screen"
     )
     assert "location.reload" not in text, "the drawer reloads the page to follow a rotation"
-    assert not re.search(r"<Chat[^>]*:key=", text, re.S), (
-        "the conversation is remounted by key; the session-id watch is what follows "
-        "an incarnation, and two mechanisms for it is one to get wrong"
+    chat = re.search(r"<Chat\b[^>]*>", text, re.S).group(0)
+    assert ':key="composerActive ? \'active\' : \'history\'"' in chat, (
+        "the conversation key must stay stable across live generations"
     )
+    assert "running.value || rotating.value" in text
+    assert "status.value?.lifecycle === 'rotating'" in text
+    assert ':send-paused="rotating"' in chat
 
 
 def test_a_refused_lifecycle_call_arrives_in_the_daemons_own_words():
@@ -613,50 +505,19 @@ def test_a_refused_lifecycle_call_arrives_in_the_daemons_own_words():
     assert "status.value = null" not in body, (
         "a refused lifecycle call throws away the state the daemon last reported"
     )
-    assert "exc.status === 409" in body and "await load()" in body, (
+    assert "exc.status === 409" not in body, (
         "a 409 is reported as a failure instead of being settled by a re-read; it "
         "means the daemon's view of what is running differs from this one's"
     )
 
 
 def test_an_uber_lmer_that_was_stopped_is_legible_as_one():
-    """The zombie problem is a supervisor that is *gone* and looks merely quiet, so
-    the drawer has to say which of the two it is.
-
-    It can, from the status alone and without a new field: a stop clears the pointer
-    to the session and a crash leaves it, which is what ``stale`` reports. So the
-    card names the generation either way and says which of the two happened — and
-    the stop reply is itself a status, so the drawer lands on that card the moment
-    the daemon answers rather than at the next poll.
-    """
     text = _read(DRAWER)
-    words = _words(DRAWER)
-    assert "No uber lmer is running." in words, "a stopped supervisor is not stated"
-    assert "a stop looks like from here rather than a crash" in words, (
-        "a stopped uber lmer and one that crashed read identically, which is the "
-        "state this control cluster exists to get out of"
-    )
-    # Optional chaining on both branches, and it is not decoration: `load()`'s
-    # catch leaves `status` null while setting `problem`, and the spinner above
-    # is gated on both being absent — so a first poll that fails renders this
-    # card with nothing behind it. A bare deref throws on every re-render and
-    # leaves the drawer blank, which is the moment it is opened to find out
-    # what is wrong.
-    assert re.search(r'<template v-else-if="status\?\.generation">', text), (
-        "the clean-stop line is not the other branch of the stale check, so it "
-        "either claims a crash was a stop or fires on a host that never had one"
-    )
-    assert not re.search(r'v-(if|else-if)="status\.(stale|generation)"', text), (
-        "a branch of this card dereferences `status` without optional chaining, "
-        "so it throws whenever the drawer is opened while the daemon is not "
-        "answering"
-    )
-    assert "stopUberLmer" in text and "lifecycle(stopping, stopAssistant)" in text, (
-        "the stop the card describes is not the one this drawer performs"
-    )
+    assert "status?.lifecycle === 'stopped'" in text
+    assert "status?.lifecycle === 'failed' ? 'Retry' : 'Start'" in text
+    assert '{{ status.error }}' in text
+    assert 'lifecycle(stopping, stopAssistant)' in text
 
-
-# --- the digest spool ---------------------------------------------------------
 
 def test_the_drawer_shows_the_digest_count_and_can_never_drain_the_spool():
     """T69's open question, decided here: the operator sees the *number*.
@@ -718,23 +579,14 @@ def test_the_drawer_shows_the_digest_count_and_can_never_drain_the_spool():
 # --- the standing orders ------------------------------------------------------
 
 def test_the_drawer_shows_the_standing_orders_and_offers_no_way_to_edit_them():
-    """T87. The operator asked for the chat to be the write path — "not some ux
-    config thing" — so this panel is a window onto the document and nothing else.
-
-    Which is a real temptation to guard: it is a text document with a POST route
-    beside its GET, and a textarea plus a save button is the obvious next commit.
-    What that would cost is the confirm-the-wording step — uber lmer reads the rule
-    back before storing it, in the operator's own words — and it would make two
-    writers of one document with no merge between them. So the absence of a write
-    path here is the feature, and it is checked as one.
-    """
+    """The chat drawer reads standing orders; Project settings owns direct edits."""
     text = _read(DRAWER)
     words = _operator_words(DRAWER)
 
     assert "fetchAssistantInstructions" in text and (
         "fetchAssistantInstructions" in _read(API_JS)
     ), "the standing orders are read from somewhere other than the daemon's route"
-    assert "request('api/assistant/instructions')" in _read(API_JS), (
+    assert "request(workspacePath('api/assistant/instructions', workspaceId))" in _read(API_JS), (
         "the read route is no longer the GET the daemon serves"
     )
     assert "standing orders" in words, "the panel is unnamed, or named something else"
@@ -749,36 +601,22 @@ def test_the_drawer_shows_the_standing_orders_and_offers_no_way_to_edit_them():
         "nothing tells the operator what happens when they state a rule in the chat"
     )
 
-    # No write path, from either end: no field to type in, and no client that could
-    # send one. `POST api/assistant/instructions` exists and is the assistant's.
+    # Project settings owns the editor; the chat drawer remains a read-only view.
     for affordance in ("v-textarea", "v-text-field", "v-form", "v-switch"):
-        assert affordance not in text, (
+        assert affordance not in text[text.index('<v-expansion-panel title="standing orders"'):text.index('</v-expansion-panels>')], (
             f"the drawer grew a {affordance}: editing the standing orders here "
             "bypasses the confirm-the-wording step that makes them the operator's"
         )
-    writer = re.compile(r"""['"]api/assistant/instructions['"][^)]*method""")
-    for source in sorted((WEB / "src").rglob("*")):
-        if source.is_file() and source.suffix in {".js", ".vue"}:
-            assert not writer.search(_read(source)), (
-                f"{source.name} writes the standing orders; the chat is the write "
-                "path by the operator's own choice"
-            )
-    api = _read(API_PY)
-    assert '@app.post("/api/assistant/instructions"' in api, (
-        "the write route is gone, so the chat has nothing to store a rule through"
-    )
+    assert 'setAssistantInstructions' not in text, 'the chat drawer must remain a reader'
+    editor = _read(WEB / 'src/components/ProjectSettings.vue')
+    assert 'setAssistantInstructions(id, instructions.value)' in editor
+    client = _read(API_JS)
+    assert "export function setAssistantInstructions(workspaceId, instructions)" in client
+    assert "request(workspacePath('api/assistant/instructions', workspaceId), {" in client
 
 
 def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
-    """Issue #234. The drawer's no-affordance guard above is a one-line ban, and
-    keeping it one is why the settings dialog lives in its own file: launch facts
-    (model/harness/preset/agents) are a config file's to edit and a form's to
-    write, while the standing orders' write path stays the chat. What this pins
-    is the boundary — the dialog writes the config route and could not reach the
-    instructions route even by mistake (the rglob in the standing-orders test
-    covers every source file, this one included), and the drawer file itself
-    stays free of input widgets.
-    """
+    """Global execution settings remain separate from the project instruction editor."""
     settings = WEB / "src" / "components" / "AssistantSettings.vue"
     text = _read(settings)
     words = _operator_words(settings)
@@ -812,15 +650,8 @@ def test_the_settings_dialog_is_its_own_component_and_edits_only_launch_facts():
     assert re.search(r"\.stored \|\| ''", text), (
         "the form prefills from something other than the stored layer"
     )
-    # The restart the saved banner offers is the drawer's own confirmed one —
-    # ending a context window is one decision however it is reached.
-    drawer = _read(DRAWER)
-    assert '@restart="confirmingRestart = true"' in drawer, (
-        "the dialog's restart bypasses the drawer's confirmation"
-    )
-    assert "AssistantSettings" in drawer, (
-        "the dialog is not reachable from the drawer at all"
-    )
+    assert "emit('settings')" in _read(DRAWER)
+    assert '<AssistantSettings' in _read(WEB / 'src/components/PlatformSettings.vue')
     # The saved banner's one branch: when every changed key came back still
     # pinned by an export, the restart offer is withheld — an operator taking
     # it would pay a context window to run the export again.

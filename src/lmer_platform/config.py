@@ -114,6 +114,8 @@ from .store import (
     StoreError, ensure_state_dir, read_json, platform_dir, snapshot_path,
     write_json,
 )
+from .project_context import assistant_dir
+from . import project_context
 
 logger = logging.getLogger("lmer_platform.config")
 
@@ -414,6 +416,14 @@ class _IntSettingRule:
 #: which raises: a daemon bound where nobody expects it beats one that will not
 #: start.
 INT_SETTINGS = {
+    "max_concurrent_sessions": _IntSettingRule(
+        default=DEFAULT_MAX_CONCURRENT_SESSIONS, minimum=1, floor_reason="at least one worker must be allowed",
+        log_key="platform_worker_cap_invalid", unit="workers", singular_unit="worker",
+    ),
+    "max_live_assistants": _IntSettingRule(
+        default=4, minimum=1, floor_reason="at least one assistant must be allowed",
+        log_key="platform_assistant_cap_invalid", unit="assistants", singular_unit="assistant",
+    ),
     "terminal_confirm_seconds": _IntSettingRule(
         default=DEFAULT_TERMINAL_CONFIRM_SECONDS,
         minimum=1,
@@ -592,6 +602,7 @@ class PlatformConfig:
     #: assistant is not one of them — see
     #: :func:`lmer_platform.spawn._live_worker_count`.
     max_concurrent_sessions: int = DEFAULT_MAX_CONCURRENT_SESSIONS
+    max_live_assistants: int = 4
     # ``max_concurrent_assistant_spawns`` lived here, between the two caps it is
     # not. Retired by T75 rather than left standing: see the module docstring for
     # why an unattributable cap cannot be enforced, and what would have to become
@@ -741,6 +752,7 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
     for name in (
         "work_repo_pull_interval",
         "max_concurrent_sessions",
+        "max_live_assistants",
         "max_followup_rounds",
         "stuck_teardown_seconds",
     ):
@@ -2069,7 +2081,7 @@ _ASSISTANT_CREDENTIAL_MEMO: tuple = (None, None)
 
 def assistant_credential_path() -> Path:
     """Where the running assistant's minted credential lives."""
-    return platform_dir() / ASSISTANT_CREDENTIAL_FILENAME
+    return assistant_dir() / ASSISTANT_CREDENTIAL_FILENAME
 
 
 def mint_assistant_credential() -> str:
@@ -2137,6 +2149,21 @@ def active_assistant_credential() -> Optional[str]:
     _warn_if_permissive(path)
     _ASSISTANT_CREDENTIAL_MEMO = (key, credential)
     return credential
+
+
+def active_assistant_credentials() -> set[str]:
+    credentials = set()
+    with project_context.bound(None):
+        credential = active_assistant_credential()
+        if credential:
+            credentials.add(credential)
+    root = platform_dir() / "projects"
+    for path in root.glob(f"*/{ASSISTANT_CREDENTIAL_FILENAME}"):
+        with project_context.bound(path.parent.name):
+            credential = active_assistant_credential()
+            if credential:
+                credentials.add(credential)
+    return credentials
 
 
 def revoke_assistant_credential() -> bool:

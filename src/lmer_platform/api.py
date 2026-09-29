@@ -192,6 +192,7 @@ from .workrepo import (
     resolve_run_dir,
     run_dirs,
 )
+from . import projects, project_context as project_scope, project_requests, project_threads
 
 logger = logging.getLogger("lmer_platform.api")
 
@@ -346,7 +347,7 @@ def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
         "base_url": config.base_url,
         "work_repo_url": mirror.get("url"),
         "work_repo_pull_interval": config.work_repo_pull_interval,
-        "max_concurrent_sessions": config.max_concurrent_sessions,
+        "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions) if projects.enabled() else config.max_concurrent_sessions,
         "max_followup_rounds": config.max_followup_rounds,
         "autonomous_default": config.autonomous_default,
         "park_idle_side": config.park_idle_side,
@@ -604,6 +605,11 @@ def _assistant_config_reply(extra: Optional[dict] = None) -> dict:
         },
         "note": _CONFIG_SCOPE_NOTE,
     }
+    if projects.enabled() and project_scope.current():
+        overrides = projects.get(project_scope.current())["settings"]
+        for key, value in assistant._launch_settings(None)[0].items():
+            if key in payload["settings"]:
+                payload["settings"][key].update(value=value, source="project" if key in overrides else payload["settings"][key]["source"])
     payload.update(extra or {})
     return payload
 
@@ -621,7 +627,7 @@ def _body_launch_settings(payload: dict) -> Optional[dict]:
     module's refusal (400, naming the field) instead of arriving as ``None``
     and reading as "leave it alone".
     """
-    named = {key: value for key, value in payload.items() if key != "handoff"}
+    named = {key: value for key, value in payload.items() if key not in ("handoff", "workspace_id")}
     return named or None
 
 
@@ -869,7 +875,9 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     mirror = pull(config, force=force_pull).to_dict()
     # Ports are reported by the child after the spawn returned, so folding them in
     # happens on the read path (see spawn.absorb_ports).
-    sessions = absorb_ports(list_sessions(live_only=False))
+    with assistant._PUBLICATION_LOCK:
+        sessions = projects.inventory_sessions(list_sessions(live_only=False))
+    sessions = absorb_ports(sessions)
     tracked = list_tracked()
     refs = [
         ref
@@ -1784,6 +1792,9 @@ def create_app(
         FileResponse, JSONResponse, PlainTextResponse, StreamingResponse,
     )
     from starlette.websockets import WebSocketDisconnect
+    from starlette.requests import Request
+
+    from . import peers, project_api
 
     if not secret:
         raise ValueError("refusing to serve without a shared secret")
@@ -1791,6 +1802,11 @@ def create_app(
     builder = state_builder or build_state
     app = FastAPI(title="lmer platform", version=str(SCHEMA_VERSION),
                   lifespan=ingress.lifespan if ingress else None)
+    app.router.route_class = project_api.WorkspaceRoute
+
+    @app.exception_handler(projects.ProjectError)
+    async def project_error(_request, exc):
+        return JSONResponse(status_code=exc.status, content={"detail": {"code": exc.code, "message": str(exc)}})
     mention_settings = ingress.settings if ingress else MentionSettings.from_env()
     ingress_status = ingress or Ingress(mention_settings)
 
@@ -1812,7 +1828,7 @@ def create_app(
     # exactly one app in exactly one process (see session_io on why that matters).
     tickets = session_io.TicketStore()
 
-    def require_secret(
+    def authenticate(
         authorization: Optional[str] = Header(default=None)
     ) -> Caller:
         """Authenticate, and say who called (issue #244).
@@ -1845,6 +1861,14 @@ def create_app(
             offered = presented.encode("utf-8")
             if secrets_mod.compare_digest(offered, secret.encode("utf-8")):
                 return Caller(CALLER_OPERATOR)
+            if projects.enabled():
+                for project in projects.listing(archived=False):
+                    with project_scope.bound(project["id"]):
+                        minted = active_assistant_credential()
+                        if minted and secrets_mod.compare_digest(offered, minted.encode("utf-8")):
+                            owner = assistant.authenticated_generation(minted)
+                            if owner:
+                                return Caller(CALLER_ASSISTANT, session_id=owner["session"])
             minted = active_assistant_credential()
             if minted and secrets_mod.compare_digest(
                 offered, minted.encode("utf-8")
@@ -1873,6 +1897,18 @@ def create_app(
             headers={"WWW-Authenticate": f'Basic realm="{REALM}"'},
         )
 
+    async def require_secret(request: Request, caller: Caller = Depends(authenticate)):
+        body = {}
+        if "application/json" in request.headers.get("content-type", ""):
+            try:
+                value = await request.json()
+                body = value if isinstance(value, dict) else {}
+            except ValueError:
+                pass
+        with project_api.bind(request, caller, body):
+            yield caller
+
+    require_secret.__annotations__["request"] = Request
     guard = [Depends(require_secret)]
 
     def _unreadable_config(exc: StoreError) -> HTTPException:
@@ -2108,6 +2144,22 @@ def create_app(
             "                               writes after the operator states a\n"
             "                               standing preference in chat. Re-read\n"
             "                               first; this is not a patch\n"
+            "  GET  /api/projects          list named workspaces and assistant lifecycle\n"
+            "  GET  /api/assistant/peers    peer UL names, live session/generation and thread links\n"
+            "  GET  /api/assistant/peers/{peer_id}/instructions  explicit purpose, offset, limit (max 4000)\n"
+            "  GET  /api/assistant/peers/receipts/{ref}  this project's retained peer-send receipt\n"
+            "  POST /api/sessions/{id}/comms  peer UL message: {kind:message,text,ref,generation?}; no controls\n"
+            "  POST /api/projects          create {name}, queue its assistant\n"
+            "  PATCH /api/projects/{workspace_id}  change name, color, repositories, settings\n"
+            "  POST /api/projects/{workspace_id}/archive  archive eligible project\n"
+            "  POST /api/projects/{workspace_id}/restore  restore stopped\n"
+            "  GET|POST /api/settings      fleet assistant capacity\n"
+            "  POST /api/runs/move         inactive run: workspace_id, destination_id, home_revision\n"
+            "  GET  /api/project-context   explicit source_workspace_id excerpt\n"
+            "  POST /api/project-relay     explicit destination_id and text, with provenance\n"
+            "  GET  /api/assistant/requests  durable conversation requests and delivery state\n"
+            "  POST /api/assistant/requests/{request_id}/reply  reply to recorded source once\n"
+            "  POST /api/assistant/requests/{request_id}/park  operator parks uncertainty without resending\n"
             "  POST /api/assistant/requests  admit a host listener mention or DM reply\n"
             "  POST /api/assistant/pending  take the digests the daemon spooled and\n"
             "                               clear them. DESTRUCTIVE, hence not a\n"
@@ -2119,6 +2171,87 @@ def create_app(
             "The fleet view is scoped to runs this orchestrator spawned or\n"
             "adopted — never the whole shared work repo.\n"
         )
+
+    @app.get("/api/projects", dependencies=guard)
+    def project_list(caller: Caller = Depends(require_secret)) -> dict:
+        rows = projects.listing()
+        if caller.is_assistant:
+            rows = [row for row in rows if row["id"] == project_scope.current()]
+        return {"projects": [{**project_api.public_project(row), "assistant": projects.status(row["id"])}
+                             for row in rows], "colors": projects.COLORS, "max_live_assistants": projects.limit()}
+
+    @app.get("/api/assistant/peers", dependencies=guard)
+    def peer_list(caller: Caller = Depends(require_secret)) -> dict:
+        return peers.directory(caller)
+
+    @app.get("/api/assistant/peers/{peer_id}/instructions", dependencies=guard)
+    def peer_instructions(peer_id: str, purpose: str = Query(min_length=1, max_length=500),
+                          offset: int = Query(default=0, ge=0, le=4000),
+                          limit: int = Query(default=2000, ge=1, le=4000),
+                          caller: Caller = Depends(require_secret)) -> dict:
+        return peers.instructions(caller, peer_id, purpose, offset, limit)
+
+    @app.get("/api/assistant/peers/receipts/{ref}", dependencies=guard)
+    def peer_receipt(ref: str, caller: Caller = Depends(require_secret)) -> dict:
+        return peers.receipt(caller, ref)
+
+    @app.post("/api/projects", dependencies=guard, status_code=201)
+    def project_create(body: dict) -> dict:
+        row = projects.create(body.get("name"))
+        projects.reconcile(config)
+        return {**project_api.public_project(projects.get(row["id"])), "assistant": projects.status(row["id"])}
+
+    @app.patch("/api/projects/{workspace_id}", dependencies=guard)
+    def project_update(workspace_id: str, body: dict) -> dict:
+        return project_api.public_project(projects.update(workspace_id, body))
+
+    @app.post("/api/projects/{workspace_id}/archive", dependencies=guard)
+    def project_archive(workspace_id: str) -> dict:
+        return project_api.public_project(projects.archive(workspace_id, builder(config)))
+
+    @app.post("/api/projects/{workspace_id}/restore", dependencies=guard)
+    def project_restore(workspace_id: str) -> dict:
+        return project_api.public_project(projects.restore(workspace_id))
+
+    @app.post("/api/runs/move", dependencies=guard)
+    def move_run(body: dict) -> dict:
+        key = run_key(body.get("host") or "", body.get("project") or "", body.get("slug") or "")
+        return projects.move(key, body.get("destination_id"), expected_project=project_scope.current(),
+                             expected_revision=body.get("home_revision"))
+
+    @app.get("/api/project-context", dependencies=guard)
+    def project_context(source_workspace_id: str) -> dict:
+        source = projects.get(source_workspace_id)
+        payload = project_api.annotate(builder(config), workspace_id=source_workspace_id)
+        fields = {"host", "project", "slug", "title", "label", "state", "status", "phase", "attention"}
+        return {"source": {"id": source["id"], "name": source["name"]},
+                "runs": [{key: value for key, value in row.items() if key in fields}
+                         for row in payload.get("runs", [])]}
+
+    @app.post("/api/project-relay", dependencies=guard)
+    def project_relay(body: dict) -> dict:
+        source = projects.get(project_scope.current(), active=True)
+        destination = projects.get(body.get("destination_id"), active=True)
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 16384:
+            raise projects.ProjectError("Relay text must contain 1–16384 characters.")
+        with project_scope.bound(destination["id"]):
+            assistant.notify(f"Explicit relay from {source['name']}: {text.strip()}", kind="project_relay",
+                             data={"workspace_id": destination["id"], "source_workspace_id": source["id"],
+                                   "source_name": source["name"]})
+        return {"source_workspace_id": source["id"], "destination_id": destination["id"], "queued": True}
+
+    @app.get("/api/settings", dependencies=guard)
+    def platform_settings() -> dict:
+        with project_scope.bound(None):
+            return {**_assistant_config_reply(), "max_live_assistants": projects.limit(),
+                    "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions)}
+
+    @app.post("/api/settings", dependencies=guard)
+    def set_platform_settings(body: dict) -> dict:
+        with project_scope.bound(None):
+            set_assistant_config(body)
+            return platform_settings()
 
     @app.get("/api/health", dependencies=guard)
     def health() -> dict:
@@ -2143,12 +2276,14 @@ def create_app(
 
     @app.get("/api/state", dependencies=guard)
     def state() -> dict:
-        return builder(config)
+        payload = builder(config)
+        return project_api.annotate(payload, workspace_id=project_scope.current()) if projects.enabled() else payload
 
     @app.post("/api/rescan", dependencies=guard)
     def rescan() -> dict:
         """Re-read from ground truth, skipping the pull throttle."""
-        return builder(config, force_pull=True)
+        payload = builder(config, force_pull=True)
+        return project_api.annotate(payload, workspace_id=project_scope.current()) if projects.enabled() else payload
 
     @app.get("/api/spawn-options", dependencies=guard)
     def spawn_options(
@@ -2191,8 +2326,10 @@ def create_app(
         ``title`` that was refused is reported the same way and for the same
         reason — the session is already running by the time it is written.
         """
+        project_requests.preflight()
         try:
             request = SpawnRequest(
+                workspace_id=project_scope.current(),
                 taskdef=body.get("taskdef") or "",
                 target=body.get("target") or "",
                 targets=body.get("targets"),
@@ -2670,10 +2807,17 @@ def create_app(
         """Post one record on a session's bus, stamped with the caller's channel.
 
         The operator's credential posts as ``platform`` (with ``author`` from the
-        body when given), the assistant's as ``uber-lmer``, a connector's as the
-        channel bound to it. ``command`` is accepted from the operator and the
-        assistant only.
+        body when given), a project UL's as ``uber-lmer`` to workers or
+        ``peer-ul`` to an explicit peer, and a connector's as its bound channel.
+        Peer ULs receive messages only.
         """
+        if project_api.capture().get("peer"):
+            project_requests.preflight()
+            return peers.send(caller, session_id, body, _require_hub())
+        if (caller.source_channel == "peer-ul" or "generation" in body
+                or isinstance(body.get("meta"), dict) and "peer" in body["meta"]
+                or isinstance(body.get("source"), dict) and body["source"].get("channel") == "peer-ul"):
+            raise HTTPException(status_code=403, detail="Peer provenance is assigned only to authenticated cross-project UL messages.")
         try:
             session_io.require_session(session_id)
         except SessionIOError as exc:
@@ -2798,6 +2942,8 @@ def create_app(
         """
         hub = _require_hub()
         events, cursor = hub.feed(since, timeout=timeout, session=session, limit=limit)
+        if projects.enabled() and project_scope.current():
+            events = [event for event in events if projects.session_home(event.session) == project_scope.current()]
         return {"events": [event.to_dict() for event in events], "cursor": cursor}
 
     @app.post("/api/comms/ack", dependencies=guard)
@@ -2823,7 +2969,10 @@ def create_app(
     @app.get("/api/comms/questions", dependencies=guard)
     def comms_questions(open: bool = Query(default=False)) -> dict:
         hub = _require_hub()
-        return {"questions": hub.questions(open_only=open)}
+        questions = hub.questions(open_only=open)
+        if projects.enabled() and project_scope.current():
+            questions = [question for question in questions if projects.session_home(question["session"]) == project_scope.current()]
+        return {"questions": questions}
 
     # --- chat-thread connections (issue #412) --------------------------------
     #
@@ -3018,9 +3167,22 @@ def create_app(
         from lmer_cli.routing_receipts import receipt
 
         try:
+            binding = project_api.capture()
+            if binding.get("request_id"):
+                request = project_requests.get(binding["request_id"])
+                target = thread_access.parse_thread(body.get("permalink"))
+                source = thread_access.parse_thread(request["payload"]["permalink"])
+                if target != source:
+                    raise projects.ProjectError("Reply in the request's original source thread.", status=409)
+                result = project_requests.reply(request["id"], body.get("text"), workspace_id=project_scope.current(),
+                                                session_id=caller.session_id)
+                return {**result, "thread": thread_access._thread_summary(source),
+                        **receipt("post", result["posted"].get("ref"))}
             ref, client = None, None
             private = False
             if caller.is_assistant:
+                if projects.enabled():
+                    project_threads.authorize(body.get("permalink"), project_scope.current())
                 ref, client, _ = thread_access.resolve_thread(body.get("permalink"))
                 private = assistant_conversation.private_thread(ref, client)
             result = thread_access.post_thread(
@@ -3242,7 +3404,7 @@ def create_app(
         _note_check(caller, session_id=session_id)
         return {
             "session": session_id,
-            "ticket": tickets.mint(session_id),
+            "ticket": tickets.mint(session_id, binding=project_api.capture()),
             "expires_in": tickets.ttl,
         }
 
@@ -3269,8 +3431,9 @@ def create_app(
         """Push the backlog and then every new byte, until the session ends."""
         try:
             async for chunk in session_io.follow_log(session_id, offset=offset):
+                await asyncio.to_thread(project_api.invoke_captured, websocket.state.project_binding, lambda: None)
                 await websocket.send_json({"type": "data", **chunk.to_dict()})
-        except SessionIOError as exc:
+        except (SessionIOError, projects.ProjectError) as exc:
             await send_status(websocket, "log_failed", str(exc))
             return
         await send_status(
@@ -3291,12 +3454,14 @@ def create_app(
                 return
             try:
                 await asyncio.to_thread(
+                    project_api.invoke_captured, websocket.state.project_binding,
                     session_io.send_input,
                     session_id,
                     data,
                     append_newline=bool(frame.get("append_newline")),
+                    mutation=True,
                 )
-            except SessionIOError as exc:
+            except (SessionIOError, projects.ProjectError) as exc:
                 await send_status(websocket, "input_failed", str(exc))
             return
 
@@ -3311,7 +3476,8 @@ def create_app(
                 return
             try:
                 report = await asyncio.to_thread(
-                    session_io.apply_resize, session_id, rows, cols
+                    project_api.invoke_captured, websocket.state.project_binding,
+                    session_io.apply_resize, session_id, rows, cols, mutation=True
                 )
             except ControlPlaneError as exc:
                 # Not the same as a refused resize, and collapsing the two cost an
@@ -3324,7 +3490,7 @@ def create_app(
                 # cleared, on a session that was about to be perfectly fine.
                 await send_status(websocket, "resize_deferred", str(exc))
                 return
-            except SessionIOError as exc:
+            except (SessionIOError, projects.ProjectError) as exc:
                 await send_status(websocket, "resize_failed", str(exc))
                 return
             if not report.applied:
@@ -3401,16 +3567,18 @@ def create_app(
         offset = _query_int(
             websocket.query_params, "offset", -session_io.DEFAULT_TAIL_BYTES
         )
-        if not tickets.redeem(ticket, session_id):
+        binding = tickets.consume(ticket, session_id)
+        if binding is None:
             logger.warning("platform_tty_ticket_rejected session=%s", session_id)
             await websocket.close(
                 code=WS_POLICY_VIOLATION,
                 reason="invalid, expired or already-used ticket",
             )
             return
+        websocket.state.project_binding = binding
         try:
-            live = await asyncio.to_thread(_session_preamble, session_id)
-        except SessionIOError as exc:
+            live = await asyncio.to_thread(project_api.invoke_captured, binding, _session_preamble, session_id)
+        except (SessionIOError, projects.ProjectError) as exc:
             await websocket.close(
                 code=WS_POLICY_VIOLATION, reason=str(exc)[:_WS_REASON_LIMIT]
             )
@@ -3747,6 +3915,8 @@ def create_app(
         """
         try:
             request = AnswerRequest(
+                workspace_id=project_scope.current(), home_revision=body.get("home_revision"),
+                confirm_project=body.get("confirm_project") is True, slot=body.get("slot"),
                 host=body.get("host") or "",
                 project=body.get("project") or "",
                 slug=body.get("slug") or "",
@@ -3812,6 +3982,8 @@ def create_app(
         """
         try:
             request = ResumeRequest(
+                workspace_id=project_scope.current(), home_revision=body.get("home_revision"),
+                confirm_project=body.get("confirm_project") is True, slot=body.get("slot"),
                 host=body.get("host") or "",
                 project=body.get("project") or "",
                 slug=body.get("slug") or "",
@@ -3885,6 +4057,8 @@ def create_app(
         The same body start, stop and rotate answer with, so a client renders one
         shape however it arrived at it.
         """
+        if projects.enabled():
+            return projects.status(project_scope.current())
         return assistant.status().to_dict()
 
     @app.get("/api/assistant/history/{session_id}", dependencies=guard)
@@ -3945,6 +4119,16 @@ def create_app(
         through to it (:func:`lmer_platform.assistant._launch_settings`).
         """
         payload = body or {}
+        if projects.enabled():
+            settings = _body_launch_settings(payload)
+            if settings:
+                project = projects.get(project_scope.current())
+                projects.update(project["id"], {"settings": {**project["settings"], **settings}})
+            if payload.get("handoff") is not None:
+                assistant.set_handoff(payload["handoff"])
+            projects.request_start(project_scope.current())
+            projects.reconcile(config)
+            return projects.status(project_scope.current())
         try:
             started = assistant.start(
                 config,
@@ -3985,6 +4169,10 @@ def create_app(
         # caller mistake and gets the module's refusal, instead of being quietly
         # recorded as an operator stop.
         reason = payload.get("reason", "operator")
+        if projects.enabled():
+            if payload.get("handoff") is not None:
+                assistant.set_handoff(payload["handoff"])
+            return projects.stop(project_scope.current())
         try:
             stopped = assistant.stop(reason=reason, handoff=payload.get("handoff"))
         except AssistantError as exc:
@@ -4016,6 +4204,9 @@ def create_app(
         """
         payload = body or {}
         try:
+            if projects.enabled():
+                return projects.rotate(project_scope.current(), config, handoff=payload.get("handoff"),
+                                       settings=_body_launch_settings(payload))
             rotated = assistant.rotate(
                 config,
                 handoff=payload.get("handoff"),
@@ -4085,24 +4276,10 @@ def create_app(
 
     @app.post("/api/assistant/instructions", dependencies=guard)
     def set_assistant_instructions(body: dict) -> dict:
-        """Replace the standing-orders document. The chat is the write path (T87).
+        """Replace the scoped document and return its bounded, scrubbed value.
 
-        Written by the assistant, in the operator's words, after it has confirmed
-        the wording back to them — the operator asked for exactly that instead of a
-        settings screen, so the UI shows this read-only and the conversation is the
-        only thing that edits it. Which makes the text agent-authored and therefore
-        untrusted twice over: it is scrubbed and bounded in
-        :func:`lmer_platform.assistant.set_instructions`, and the ``limit`` in the
-        reply is the number that will actually refuse it.
-
-        Whole-document, not a patch, and the reply is what was stored: an assistant
-        composing a rewrite has to re-read first, and being handed back the result
-        is what lets it check that the rule it just promised the operator is the one
-        in the file.
-
-        Recorded whether or not an assistant is running, like the handoff — a
-        preference stated to an incarnation that then dies is still the operator's
-        preference.
+        The operator can edit project settings or direct the assistant in chat.
+        Instructions persist even when the assistant is stopped.
         """
         try:
             # Uncoerced, as with the handoff: a non-string keeps the module's own
@@ -4121,6 +4298,24 @@ def create_app(
             return mention_routing.receive(body, mention_settings)
         except (ThreadError, AssistantError) as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @app.get("/api/assistant/requests", dependencies=guard)
+    def conversation_requests() -> dict:
+        return {"requests": project_requests.listing(project_scope.current())}
+
+    @app.post("/api/assistant/requests/{request_id}/reply", dependencies=guard)
+    def conversation_reply(request_id: str, body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        try:
+            return project_requests.reply(request_id, body.get("text"), workspace_id=project_scope.current(),
+                                          session_id=caller.session_id)
+        except ThreadError as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+
+    @app.post("/api/assistant/requests/{request_id}/park", dependencies=guard)
+    def conversation_park(request_id: str, body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(status_code=403, detail="only an operator may park an uncertain reply")
+        return project_requests.park(request_id, body.get("reason"), workspace_id=project_scope.current())
 
     @app.post("/api/assistant/pending", dependencies=guard)
     def assistant_pending() -> dict:
@@ -4204,6 +4399,12 @@ def create_app(
         one call away when the operator wants the new settings live. The integer
         settings need neither — the daemon's next tick reads them.
         """
+        if projects.enabled() and project_scope.current():
+            project = projects.get(project_scope.current())
+            settings = {**project["settings"], **{key: value for key, value in body.items()
+                                                 if key != "workspace_id"}}
+            projects.update(project["id"], {"settings": settings})
+            return _assistant_config_reply({"changed": sorted(settings)})
         accepted = (
             sorted(ASSISTANT_SETTING_KEYS) + list(_INT_SETTING_KEYS) + list(_BOOL_SETTING_KEYS)
         )
@@ -4362,6 +4563,8 @@ def create_app(
             description = _slot_text(body, "description")
             if description:
                 entry["description"] = description
+            if "applicable_projects" in body:
+                entry["applicable_projects"] = projects.validate_assignments(body["applicable_projects"])
         except SlotWriteRefused as exc:
             raise _slot_refusal(exc) from exc
 
@@ -4451,6 +4654,8 @@ def create_app(
             _matched_etag(entries, name, if_match)
             index, _definition = _slot_at(entries, name)
             edited = dict(entries[index])
+            if "applicable_projects" in body:
+                edited["applicable_projects"] = projects.validate_assignments(body["applicable_projects"])
             if preset is not None:
                 edited["preset"] = preset
             if "description" in body:

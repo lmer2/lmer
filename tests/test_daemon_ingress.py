@@ -18,6 +18,7 @@ from tests.test_assistant_mentions import (
     AUTH, ROOM, SECRET,
     body, isolated, matrix_event, remember, slack_event, transports,
 )
+from lmer_platform import daemon, project_requests
 
 
 def manager(monkeypatch, *, matrix=False):
@@ -582,8 +583,7 @@ def test_slack_ingress_timeouts_and_no_rate_limit_sleep():
 
 
 @pytest.mark.parametrize("log_level", ["info", "trace"])
-def test_daemon_run_alone_receives_mentions(monkeypatch, log_level, fake_socket):
-    from lmer_platform import daemon
+def test_daemon_run_alone_receives_mentions(monkeypatch, log_level, fake_socket, transports):
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-test")
     for key in ("LMER_MATRIX_HOMESERVER", "LMER_MATRIX_USER_ID", "LMER_MATRIX_ACCESS_TOKEN"):
         monkeypatch.delenv(key)
@@ -602,7 +602,14 @@ def test_daemon_run_alone_receives_mentions(monkeypatch, log_level, fake_socket)
     def serve(app, **kwargs):
         with TestClient(app) as client:
             client.portal.call(until, lambda: seen[0].snapshot()["slack"]["up"])
-            client.portal.call(fake_socket[0][0].emit, slack_event())
+            event = slack_event()
+            client.portal.call(fake_socket[0][0].emit, event)
+            request = project_requests.listing()[0]
+            assert request["state"] == "queued" and request["project_id"] == "general"
+            assert len(transports["slack"].posts) == 1
+            assert len(assistant.read_state().pending) == 1
+            assert assistant.read_state().pending[0].data["workspace_id"] == "general"
+            client.portal.call(fake_socket[0][0].emit, event)
             assert len(assistant.read_state().pending) == 1
             secret = cfg.read_secret(cfg.load())
             result = client.get("/api/health", headers={"Authorization": f"Bearer {secret}"})

@@ -1,8 +1,6 @@
 <script setup>
-// Lifecycle controls and retained history share this drawer; sends still target
-// only the current generation. Transcript visibility is a host preference.
 
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   mdiRobot,
   mdiClose,
@@ -12,7 +10,6 @@ import {
   mdiRestart,
   mdiStopCircleOutline,
 } from '@mdi/js'
-import AssistantSettings from './AssistantSettings.vue'
 import ThreadLinks from './ThreadLinks.vue'
 import Chat from './Chat.vue'
 import {
@@ -23,67 +20,43 @@ import {
   stopAssistant,
 } from '../api.js'
 import { ago } from '../format.js'
+import { projectColor, readDraft, storeDraft } from '../projects.js'
 import { chatShowTranscript, refreshChatSettings } from '../operatorChat.js'
 import StatusStrip from './StatusStrip.vue'
 
 const props = defineProps({
+  workspace: { type: Object, required: true },
   now: { type: Number, default: () => Date.now() },
 })
 
-const emit = defineEmits(['close'])
-
-// The fleet view's cadence rather than the transcript's: this read answers "is
-// there one at all", and the conversation inside does its own faster poll.
+const emit = defineEmits(['close', 'settings'])
 const POLL_MS = 10000
 
+const draftKey = `assistant:${props.workspace.id}`
+const waitingDraft = ref(readDraft(draftKey).text)
+watch(waitingDraft, text => storeDraft(draftKey, text, []))
 const status = ref(null)
 const problem = ref(null)
 const starting = ref(false)
 const restarting = ref(false)
 const stopping = ref(false)
-
-// One confirmation per destructive verb rather than one flag holding which verb is
-// pending: the copy differs in what it says is lost, so the two dialogs are two
-// pieces of prose, and `v-model` on a boolean is the shape the rest of the app
-// confirms things with (RunDetail's exit, Terminal's Ctrl-C).
 const confirmingRestart = ref(false)
 const confirmingStop = ref(false)
-
-// The standing-orders panel: the reply, its own failure, and which panel is open.
-// Kept apart from `problem` on purpose — a failed read of the orders must not make
-// the drawer report the supervisor as unreachable, and vice versa.
 const orders = ref(null)
 const ordersProblem = ref(null)
 const ordersLoading = ref(false)
 const ordersOpen = ref(undefined)
 
-// The settings dialog (issue 234) lives in its own component, and the split is
-// what keeps this file's guard a guard: the drawer is pinned to carry no input
-// affordance at all — the tempting one being a standing-orders textarea, a second
-// writer of a chat-written document (T87) — while launch facts
-// (model/harness/preset/agents) are a config file's to edit and a form's to
-// write. This file owns only the open flag and the restart the dialog offers,
-// which routes through the same confirmation as the header's: ending a context
-// window is the same decision however it is reached.
-const settingsOpen = ref(false)
-
 let timer = null
 let disposed = false
-// Bumped by every request that replaces the state, so a slow reply cannot land
-// after the drawer has moved on — the same guard Chat.vue and AskChannel.vue use.
 let generation = 0
 
 const running = computed(() => !!status.value?.running)
+const rotating = computed(() => status.value?.lifecycle === 'rotating')
+const composerActive = computed(() => running.value || rotating.value)
+watch(running, active => { if (!active) waitingDraft.value = readDraft(draftKey).text })
 const sessionId = computed(() => status.value ? status.value.session_id || status.value.history_session : null)
-
-// One lifecycle call at a time, and the whole cluster goes with it: the three verbs
-// contradict each other, and a stop landing behind a restart would leave nothing
-// running while the drawer showed the incarnation the restart had just brought up.
 const busy = computed(() => starting.value || restarting.value || stopping.value)
-
-// How many digests the daemon has spooled for uber lmer. A count, never the notes
-// themselves: draining that queue is the supervisor's own destructive read and an
-// operator peeking must not consume it — api.js has the whole reasoning.
 const queued = computed(() => status.value?.pending || 0)
 
 function stale(mine) {
@@ -92,28 +65,17 @@ function stale(mine) {
 
 async function load() {
   const mine = generation
-  // The pane's view is a platform-side setting (issue 488): re-read on the
-  // same tick as the status, so a switch flipped in another browser reaches
-  // this one within a poll rather than at its next page load.
   refreshChatSettings()
   try {
-    const reply = await fetchAssistant()
+    const reply = await fetchAssistant(props.workspace.id)
     if (stale(mine)) return
     status.value = reply
     problem.value = null
   } catch (exc) {
     if (stale(mine)) return
-    // What the daemon last said stays on screen. A drawer that emptied itself
-    // because one poll was refused would read as "there is no uber lmer", which
-    // is the one thing it must not say wrongly — and it would offer a start
-    // button for a session that is running.
     problem.value = exc.message
   }
 }
-
-// Re-read on every expand rather than once: uber lmer rewrites this document from
-// the chat, so the answer from the last time the panel was open may already be the
-// old rules — which is the one thing a read-only view of a document must not show.
 function onOrdersToggle(value) {
   if (value !== undefined) loadOrders()
 }
@@ -123,26 +85,17 @@ async function loadOrders() {
   const mine = generation
   ordersLoading.value = true
   try {
-    const reply = await fetchAssistantInstructions()
+    const reply = await fetchAssistantInstructions(props.workspace.id)
     if (stale(mine)) return
     orders.value = reply
     ordersProblem.value = null
   } catch (exc) {
     if (stale(mine)) return
-    // Same degradation as the status read: whatever was last fetched stays, so a
-    // refused poll does not read as "the operator has told it nothing".
     ordersProblem.value = exc.message
   } finally {
     if (!stale(mine)) ordersLoading.value = false
   }
 }
-
-// One shape for all three lifecycle verbs, because they differ in nothing this
-// function does: the route answers with the reconciled status, so the reply *is* the
-// new state — which is what lets the conversation open on a start, and follow a
-// rotation to the incarnation that replaced the one it was reading, without waiting
-// for the next poll. The generation bump is the same guard the reads use: a status
-// poll already in flight must not land on top of a reply that superseded it.
 async function lifecycle(flag, call) {
   if (busy.value) return
   generation += 1
@@ -150,25 +103,11 @@ async function lifecycle(flag, call) {
   flag.value = true
   problem.value = null
   try {
-    const reply = await call()
+    const reply = await call(props.workspace.id)
     if (stale(mine)) return
     status.value = reply
   } catch (exc) {
     if (stale(mine)) return
-    // A 409 is "one is already running" and is not worth reporting as a failure:
-    // two taps on a slow connection are exactly how it happens. Re-read instead,
-    // which is what the route asks a client to do. Only `start` answers it today —
-    // `rotate` starts one deliberately and `stop` refuses nothing — and it is
-    // handled here rather than in one caller because what it means is "the daemon's
-    // view of what is running differs from ours", which a re-read settles whichever
-    // verb heard it.
-    if (exc.status === 409) {
-      await load()
-      return
-    }
-    // The daemon's own sentence, and nothing is thrown away to show it: a refused
-    // restart leaves the incarnation that is still up on screen, with the
-    // conversation and any half-typed message in it untouched.
     problem.value = exc.message
   } finally {
     if (!stale(mine)) flag.value = false
@@ -178,10 +117,6 @@ async function lifecycle(flag, call) {
 function startUberLmer() {
   return lifecycle(starting, startAssistant)
 }
-
-// The primary control, and the one that fixes the state it was asked for: a wedged
-// incarnation is replaced rather than merely ended, in one call, so there is no gap
-// for a start to land in and nothing to remember to do afterwards.
 function restartUberLmer() {
   confirmingRestart.value = false
   return lifecycle(restarting, rotateAssistant)
@@ -205,24 +140,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <!-- The accent bar is the identity, and it is the theme's `primary` rather than
-       a colour of this component's: one place owns the palette (main.js). -->
-  <v-toolbar color="primary" density="comfortable">
+  <v-toolbar :color="projectColor(workspace.color)" density="comfortable" class="assistant-header">
     <v-icon :icon="mdiRobot" class="ms-4 me-1" />
-    <v-toolbar-title class="text-title-medium">uber lmer</v-toolbar-title>
-
-    <!-- The lifecycle cluster, beside the close button because both act on the
-         panel's subject rather than on anything in the conversation — and drawn only
-         once the daemon has answered, since a control for a state nobody has read
-         yet is a guess. Restart carries a word as well as an icon: it is the verb
-         that gets tapped in a hurry, and the overflow beside it is two icon-only
-         buttons away from being ambiguous already. -->
+    <v-toolbar-title class="text-title-medium project-chat-title">{{ workspace.name }} · uber lmer</v-toolbar-title>
     <template v-if="status || problem">
-      <!-- Uber lmer's own threads. The same control as a run row's, and the same
-           three calls: connecting here also moves the standing `threads` launch
-           setting, so a thread attached from this header survives a rotation. -->
       <ThreadLinks
         :session-id="sessionId"
+        :workspace-id="workspace.id"
         :threads="status?.threads"
         :live="running"
         @changed="load"
@@ -239,9 +163,6 @@ onBeforeUnmount(() => {
 
       <v-menu>
         <template #activator="{ props: overflow }">
-          <!-- The spinner for a stop belongs here, on what was tapped: the entry
-               that started it lives in a menu that is closed by the time the daemon
-               answers, and a v-list-item has nowhere to put one. -->
           <v-btn
             v-bind="overflow"
             :icon="mdiDotsVertical"
@@ -251,18 +172,11 @@ onBeforeUnmount(() => {
             aria-label="more uber lmer controls"
           />
         </template>
-        <!-- Stop and start are never both here: one of them is always the verb the
-             daemon would refuse, and offering it would be offering a 409. -->
         <v-list density="compact">
-          <!-- Settings sit in the overflow rather than beside restart: the header
-               already carries a worded verb plus two icon buttons, and issue 194's
-               lesson was that this toolbar is read on a phone. Offered with no
-               uber lmer running too — what is being configured is the NEXT one,
-               which is exactly the state a start button is next to. -->
           <v-list-item
             :prepend-icon="mdiCogOutline"
-            title="uber lmer settings"
-            @click="settingsOpen = true"
+            title="Project settings"
+            @click="emit('settings')"
           />
           <v-list-item
             v-if="running"
@@ -271,7 +185,7 @@ onBeforeUnmount(() => {
             @click="confirmingStop = true"
           />
           <v-list-item
-            v-else
+            v-else-if="status?.lifecycle !== 'waiting'"
             :prepend-icon="mdiPlayCircleOutline"
             title="start uber lmer"
             @click="startUberLmer"
@@ -287,12 +201,6 @@ onBeforeUnmount(() => {
       @click="emit('close')"
     />
   </v-toolbar>
-
-  <!-- Confirmed because each of these ends a context window, and the copy is
-       specific about which one and about what outlives it: "are you sure" would put
-       the operator's finger on the same tap with nothing new to decide with. Same
-       shape as the app's other two confirmations (RunDetail's exit, Terminal's
-       Ctrl-C) — a dialog with the sentence in it, cancel first, the verb second. -->
   <v-dialog v-model="confirmingRestart" max-width="480">
     <v-card>
       <v-card-text class="text-body-medium">
@@ -310,25 +218,12 @@ onBeforeUnmount(() => {
     </v-card>
   </v-dialog>
 
-  <!-- The settings dialog (issue 234) — its own component, so this file stays
-       free of input affordances; see AssistantSettings.vue for everything it
-       promises. Its restart lands in the same confirmation as the header's. -->
-  <AssistantSettings
-    v-model="settingsOpen"
-    :running="running"
-    :running-settings="status?.settings || null"
-    @restart="confirmingRestart = true"
-  />
-
   <v-dialog v-model="confirmingStop" max-width="480">
     <v-card>
       <v-card-text class="text-body-medium">
         Stop uber lmer? This ends the incarnation and its current context.
-        Your conversation history remains visible. A daemon that is
-        supervising puts a fresh one up on its own within moments; if it has given up
-        on starting one, or nothing is supervising, none comes back until you start
-        one here. Restart is the one to reach for if what you want is a working
-        uber lmer.
+        Your conversation history and pending work remain in {{ workspace.name }}.
+        It stays stopped until you choose Start.
       </v-card-text>
       <v-card-actions>
         <v-spacer />
@@ -340,39 +235,24 @@ onBeforeUnmount(() => {
 
   <div class="pa-3">
     <p class="text-body-small text-medium-emphasis mb-3">
-      The session that supervises this fleet: ask it what is happening, or tell it
-      to start, follow up or wind down a run. It is not one of the runs — nothing
-      typed here reaches an lmer working in a repository.
+      The assistant for {{ workspace.name }}. Requests, instructions and history in
+      this chat belong to this project.
     </p>
-
-    <!-- The daemon not answering is its own state, and it degrades rather than
-         resets: the alert says so and whatever it last reported stays below. -->
     <v-alert v-if="problem" type="warning" density="compact" class="mb-3">
       {{ problem }}
       <template v-if="status"> — showing what the daemon last reported.</template>
     </v-alert>
-
-    <!-- The first read, and only the first: a later one that fails leaves the
-         answer it had rather than replacing it with a spinner. -->
     <div v-if="!status && !problem" class="text-body-small text-medium-emphasis">
       <v-progress-circular indeterminate size="12" width="2" class="me-2" />
       asking the daemon…
     </div>
 
     <template v-else>
-      <!-- Something is waiting for uber lmer, said as a number and nothing more.
-           Which matters most in the second case: with none running, nobody is
-           reading the queue at all, and that is what the start button is for. -->
       <v-alert v-if="queued" type="info" density="compact" class="mb-3">
         {{ queued }} {{ queued === 1 ? 'digest' : 'digests' }} waiting for uber lmer
         <template v-if="running">— read on its next check.</template>
         <template v-else>— nothing is reading them while none is running.</template>
       </v-alert>
-
-      <!-- What the operator has told uber lmer to always do. Read-only, and the
-           panel says so: the chat is the write path, by their own choice. Collapsed
-           by default and fetched on expand — the conversation is what the drawer is
-           for, and this is a reference. -->
       <v-expansion-panels
         v-model="ordersOpen"
         class="mb-3"
@@ -380,8 +260,6 @@ onBeforeUnmount(() => {
       >
         <v-expansion-panel title="standing orders">
           <v-expansion-panel-text>
-            <!-- Its own failure line, not the drawer's: a refused read here says
-                 nothing about whether uber lmer is running. -->
             <v-alert
               v-if="ordersProblem"
               type="warning"
@@ -400,10 +278,6 @@ onBeforeUnmount(() => {
             </div>
 
             <template v-else-if="orders">
-              <!-- Verbatim, with its own line breaks: this is a short list of
-                   rules the operator dictated, and running it into one paragraph
-                   would make a rule they wrote unrecognisable. Not rendered as
-                   markdown — the renderer belongs to the conversation. -->
               <p v-if="orders.instructions" class="text-body-small orders">
                 {{ orders.instructions }}
               </p>
@@ -435,16 +309,7 @@ onBeforeUnmount(() => {
             started {{ ago(status.started_at, now) }}
           </span>
         </div>
-
-        <!-- uber lmer's own status line (issue 248), at the run drawer's
-             density: what is left of this incarnation's context is what decides
-             whether to keep talking or restart. -->
         <StatusStrip :status="status.statusline" :now="now" class="mb-3" />
-
-        <!-- A lifecycle call in flight, said where the incarnation it is about is
-             described: the cluster's spinner says something is happening and this
-             says what, which matters most for the restart — the conversation below
-             is still the old one until the daemon answers. -->
         <p v-if="restarting" class="text-body-small text-medium-emphasis mb-2">
           restarting — the conversation below is still the incarnation being
           replaced, until the daemon answers with the new one.
@@ -452,67 +317,37 @@ onBeforeUnmount(() => {
         <p v-else-if="stopping" class="text-body-small text-medium-emphasis mb-2">
           stopping — the daemon answers once the session is gone.
         </p>
-
-        <!-- Above the composer, on purpose: the whole conversation below is with
-             uber lmer and not with any run, and this is the last line read before
-             typing. -->
-        <p class="text-body-small mb-2">You are talking to uber lmer.</p>
-
-        <!-- Two names passed down, and the same reason for both: the shared
-             chat's defaults are a worker's, and "this session" or "lmer" in a
-             drawer that is deliberately not one of the runs is the one wording
-             the whole panel exists to avoid. The label is the last line read
-             before a message goes; the title is on every turn above it. -->
+        <p class="text-body-small mb-2">You are talking to {{ workspace.name }} · uber lmer.</p>
       </template>
 
-      <v-card v-else>
+      <p v-else-if="rotating" class="text-body-small mb-3">Restarting {{ workspace.name }} · uber lmer. Your draft and attachments stay here; sending resumes when it is ready.</p>
+      <v-card v-else class="mb-3">
         <v-card-text>
-          <p class="text-body-medium mb-2">No uber lmer is running.</p>
-          <p class="text-body-small text-medium-emphasis mb-3">
-            The daemon starts one and keeps it up, so this usually resolves itself
-            within a poll or two; starting one here is the way past a start that
-            has not happened.
-            <!-- Optional chaining throughout, because `status` is legitimately
-                 null here: `load()`'s catch leaves it null and sets `problem`, and
-                 the spinner above is gated on *both* being absent — so a first
-                 poll that fails renders this card with nothing behind it. That is
-                 the path an operator is on when the daemon is restarting or
-                 answering 401, i.e. exactly when the drawer was opened to find
-                 out what is wrong; a bare deref throws on every re-render and
-                 leaves the subtree blank until a reload. -->
-            <template v-if="status?.stale">
-              The one on record (generation {{ status.generation }}) is gone — its
-              session is still named in the daemon's state, which is how the crash
-              stays visible.
-            </template>
-            <!-- The other way to arrive here, and worth telling apart: a stop clears
-                 the pointer, a crash leaves it, so `stale` is what distinguishes an
-                 uber lmer somebody ended from one that died. -->
-            <template v-else-if="status?.generation">
-              Generation {{ status.generation }} left no session behind, which is what
-              a stop looks like from here rather than a crash.
-            </template>
-          </p>
-          <p v-if="starting" class="text-body-small text-medium-emphasis mb-3">
-            starting — the daemon answers once the session is up, which takes a
-            moment.
-          </p>
-          <v-btn
-            :prepend-icon="mdiPlayCircleOutline"
-            :loading="starting"
-            :disabled="busy"
-            color="primary"
-            @click="startUberLmer"
-          >start uber lmer</v-btn>
+          <p class="text-body-medium mb-2">{{ workspace.name }} · {{ status?.lifecycle || 'Unavailable' }}</p>
+          <p v-if="status?.queue_position" class="mb-2">Waiting to start — assistant limit reached · queue position {{ status.queue_position }}</p>
+          <v-alert v-if="status?.error" type="warning" class="mb-2">{{ status.error }}</v-alert>
+          <p v-if="status?.lifecycle === 'stopped'" class="mb-2">Stopped until you choose Start. Pending work is retained.</p>
+          <v-btn v-if="status?.lifecycle === 'waiting'" :loading="stopping" :disabled="busy" @click="stopUberLmer">Cancel start</v-btn>
+          <v-btn v-else :prepend-icon="mdiPlayCircleOutline" :loading="starting" :disabled="busy || !status"
+            color="primary" @click="startUberLmer">{{ status?.lifecycle === 'failed' ? 'Retry' : 'Start' }}</v-btn>
         </v-card-text>
       </v-card>
+      <div v-if="!composerActive" class="mt-3">
+        <v-textarea v-model="waitingDraft" :label="`Draft for ${workspace.name} · uber lmer`" />
+        <p class="text-body-small">Sending becomes available when this project's assistant is ready. Your draft stays here.</p>
+      </div>
       <Chat
         v-if="sessionId"
+        :key="composerActive ? 'active' : 'history'"
         assistant-history
+        :read-only="!composerActive"
+        :send-paused="rotating"
         :session-id="sessionId"
+        :workspace-id="workspace.id"
         :now="now"
         :view="chatShowTranscript ? 'transcript' : 'conversation'"
-        composer-label="say something to uber lmer"
+        :composer-label="`Say something to ${workspace.name} · uber lmer`"
+        :conversation-key="composerActive ? draftKey : `${draftKey}:history`"
         agent-label="uber lmer"
       />
     </template>
@@ -520,10 +355,11 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-/* Standing orders are dictated prose with newlines in them — a rule per line is how
-   the operator said it, and how uber lmer stores it. Collapsing that would run three
-   rules into one sentence. `anywhere` for the same reason the channel view has it: a
-   preset name or a path must not scroll a phone sideways. */
+.project-chat-title { white-space: normal; overflow-wrap: anywhere; min-width: 180px; flex: 1 1 220px; }
+.project-chat-title :deep(.v-toolbar-title__placeholder) { white-space: normal; overflow: visible; text-overflow: clip; }
+.assistant-header { height: auto; min-height: 64px; }
+.assistant-header :deep(.v-toolbar__content) { height: auto !important; min-height: 64px; flex-wrap: wrap; }
+
 .orders {
   white-space: pre-wrap;
   overflow-wrap: anywhere;

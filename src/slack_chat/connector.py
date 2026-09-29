@@ -31,6 +31,7 @@ from lmer_cli.util import get_bool_env
 
 from .client import CONNECTION_NOTICE_BLOCK_PREFIX, SlackClient, SlackError
 from .permalink import slack_thread_link
+from lmer_cli.assistant_mentions import route_connected_mention
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,7 @@ def render_outbound(
     same code and must skip matrix's records, not Slack's.
     """
     source = record.get("source") or {}
-    if source.get("channel") == own_channel or record.get("kind") == "note":
+    if source.get("channel") in (own_channel, "peer-ul") or record.get("kind") == "note":
         return None
     kind = record.get("kind")
     text = str(record.get("text") or "")
@@ -539,6 +540,13 @@ class SlackConnector(ConnectorLifecycle):
 
     def _post_inbound(self, message, poster=None):
         ts = message.get("ts")
+        if poster is None and self._is_human(message):
+            routed = {**message, "thread_ts": self.config.thread_ts}
+            if route_connected_mention(CHANNEL, self.config.channel, routed, bot_id=self._bot_user_id):
+                with self._state.lock:
+                    self._accept_inbound(ts)
+                    self._state.save()
+                return {}
         def prepare():
             body, attachments = self._inbound_body(message)
             text = _with_references(body, attachments)

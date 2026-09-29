@@ -9,6 +9,7 @@ import shutil
 import tempfile
 
 from . import registry, store
+from .project_context import assistant_dir
 
 CONTAINER_DIR = '/home/developer/.codex'
 SEED_ENV = 'LMER_CODEX_CONFIG_SEED'
@@ -24,6 +25,8 @@ def prepare(host: str | None, project: str | None, slug: str, kind: str, session
     else:
         scope = 'untracked-' + hashlib.sha256(session_id.encode()).hexdigest()
     directory = store.platform_dir() / 'codex-config' / scope
+    if kind == registry.ASSISTANT_KIND:
+        directory = assistant_dir() / 'codex-config' / scope
     store.ensure_state_dir(directory)
     target = directory / 'config.toml'
     seed = os.environ.get(SEED_ENV, '').strip()

@@ -1186,6 +1186,7 @@ def _view_from_session(
     """
     run = entry.get("run") or {}
     task = entry.get("task") or {}
+    assistant_session = entry.get("kind") == assistant.KIND and _session_key(entry) is None
     live = bool(entry.get("live"))
     wound_down = (
         not live and _was_wound_down(entry) and not _observed_bad_exit(entry)
@@ -1212,9 +1213,9 @@ def _view_from_session(
     return RunView(
         host=run.get("host") or "—",
         project=run.get("project") or "—",
-        slug=run.get("slug") or entry.get("id") or "—",
+        slug=(entry.get("id") if assistant_session else run.get("slug")) or entry.get("id") or "—",
         state=state,
-        name=run.get("name"),
+        name=run.get("name") or (run.get("slug") if assistant_session else None),
         title=title,
         taskdef=task.get("taskdef"),
         target=task.get("target"),

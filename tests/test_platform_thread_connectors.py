@@ -1023,6 +1023,7 @@ class TestDisconnectNotices:
         assert disconnect_notices == [("s-1", {
             "kind": "message", "channel": "platform",
             "text": "thread disconnected: " + connected["label"],
+            "meta": {"notification_class": "connector_health"},
         })]
         with pytest.raises(connectors.ThreadError):
             threads.disconnect("s-1", connected["id"])

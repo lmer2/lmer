@@ -12,7 +12,7 @@ from lmer_cli.assistant_mentions import Settings
 from matrix_chat.client import MatrixAccount, MatrixClient, MatrixError
 from slack_chat.client import SlackClient
 
-from . import mention_routing
+from . import ingress_store, mention_routing
 from .store import utc_now_iso
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ class Ingress:
         self._stopping = False
         self._matrix_since = None
         self._matrix_synced_rooms = set()
+        self._replay_locks = {name: asyncio.Lock() for name in ("slack", "matrix")}
         self._states = {}
         for transport, required in (
             ("slack", ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN")),
@@ -113,7 +114,7 @@ class Ingress:
         finally:
             self._update(transport, up=False, state="stopped")
 
-    async def _receive(self, transport: str, conversation: str, event: dict, client=None):
+    async def _receive(self, transport: str, conversation: str, event: dict, client=None, *, durable=False):
         self._update(transport, last_event_at=utc_now_iso())
         if self._stopping:
             mention_routing.drop(transport, conversation, event, "stopping")
@@ -127,6 +128,20 @@ class Ingress:
         except Exception as exc:
             # receive logs the event's refusal once; retain its reason in health.
             self._update(transport, last_error=mention_routing.error_reason(exc))
+            if durable:
+                raise
+
+    async def _replay(self, transport, client):
+        async with self._replay_locks[transport]:
+            for row in await _blocking(ingress_store.pending, transport):
+                if self._stopping:
+                    return
+                try:
+                    await self._receive(transport, row["conversation"], row["event"], client, durable=True)
+                except Exception as exc:
+                    await _blocking(ingress_store.failed, row["id"], mention_routing.error_reason(exc))
+                else:
+                    await _blocking(ingress_store.finish, row["id"])
 
     async def _slack_event(self, socket, request):
         from slack_sdk.socket_mode.response import SocketModeResponse
@@ -138,17 +153,13 @@ class Ingress:
         conversation = event.get("channel") if isinstance(event, dict) else None
         self._update("slack", last_event_at=utc_now_iso())
         try:
+            retained = await _blocking(ingress_store.slack_event, request)
             await socket.send_socket_mode_response(SocketModeResponse(envelope_id=request.envelope_id))
-            if request.type != "events_api" or not isinstance(event, dict):
-                mention_routing.drop("slack", conversation, event, "unsupported_event")
-                return
-            if event.get("type") != "app_mention" and not (
-                event.get("type") == "message" and event.get("channel_type") == "im"
-            ):
+            if not retained:
                 mention_routing.drop("slack", conversation, event, "unsupported_event")
                 return
             reader = SlackClient(self.env["SLACK_BOT_TOKEN"], timeout=IO_TIMEOUT, retries=0)
-            await self._receive("slack", conversation, event, reader)
+            await self._replay("slack", reader)
         except Exception as exc:
             reason = mention_routing.error_reason(exc)
             mention_routing.drop("slack", conversation, event, reason)
@@ -209,6 +220,7 @@ class Ingress:
         sdk_logger.propagate = False
         sdk_logger.addHandler(errors)
         async with aiohttp.ClientSession() as session:
+            reader = SlackClient(self.env["SLACK_BOT_TOKEN"], timeout=IO_TIMEOUT, retries=0)
             web = AsyncWebClient(token=self.env["SLACK_BOT_TOKEN"], session=session,
                                  timeout=IO_TIMEOUT, logger=sdk_logger)
             socket = ReportingSocket(app_token=self.env["SLACK_APP_TOKEN"], web_client=web,
@@ -222,6 +234,7 @@ class Ingress:
                 except TimeoutError:
                     raise IngressError(errors.reason or "TimeoutError") from None
                 while True:
+                    await self._replay("slack", reader)
                     up = await socket.is_connected()
                     was_up = self.snapshot()["slack"]["up"]
                     self._update("slack", up=up, state="up" if up else "reconnecting")
@@ -230,6 +243,7 @@ class Ingress:
                     await asyncio.sleep(1)
             finally:
                 await socket.close()
+                reader.session.close()
 
     async def _matrix(self):
         account = MatrixAccount(
@@ -239,7 +253,11 @@ class Ingress:
         )
         reader = MatrixClient(account, timeout=IO_TIMEOUT)
         rooms = {room.strip() for room in self.env.get("LMER_MATRIX_ROOMS", "").split(",") if room.strip()}
+        account_key = f"{account.homeserver}\n{account.user_id}"
         try:
+            saved = await _blocking(ingress_store.cursor, account_key)
+            self._matrix_since = saved["since"]
+            self._matrix_synced_rooms = set(saved["rooms"])
             if await _blocking(reader.whoami) != account.user_id:
                 raise IngressError("matrix_account_mismatch")
             joined = {}
@@ -251,6 +269,7 @@ class Ingress:
             }
             sync_filter = {"room": room_filter, "presence": {"types": []}, "account_data": {"types": []}}
             while True:
+                await self._replay("matrix", reader)
                 if rooms - joined.keys() and time.monotonic() >= retry_at:
                     for room in sorted(rooms - joined.keys()):
                         try:
@@ -275,9 +294,7 @@ class Ingress:
                 cursor = body.get("next_batch")
                 if not isinstance(cursor, str) or not cursor:
                     raise IngressError("matrix_missing_sync_cursor")
-                self._matrix_since = cursor
-                self._matrix_synced_rooms.update(selected)
-                self._update("matrix", up=True, state="up")
+                events = []
                 for room_id, room in ((body.get("rooms") or {}).get("join") or {}).items():
                     timeline = room.get("timeline") or {}
                     if timeline.get("limited"):
@@ -290,6 +307,12 @@ class Ingress:
                         elif rooms and room_id not in selected:
                             mention_routing.drop("matrix", room_id, event, "room_not_selected")
                         else:
-                            await self._receive("matrix", room_id, event, reader)
+                            events.append((room_id, event))
+                synced_rooms = self._matrix_synced_rooms | set(selected)
+                await _blocking(ingress_store.matrix_batch, account_key, cursor, synced_rooms, events)
+                self._matrix_since = cursor
+                self._matrix_synced_rooms = synced_rooms
+                self._update("matrix", up=True, state="up")
+                await self._replay("matrix", reader)
         finally:
             reader._session.close()

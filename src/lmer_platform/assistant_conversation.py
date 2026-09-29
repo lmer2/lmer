@@ -7,6 +7,7 @@ import logging
 
 from . import comms
 from .store import utc_now_iso
+from .project_context import assistant_dir
 
 logger = logging.getLogger(__name__)
 _LOCK = threading.RLock()
@@ -16,7 +17,7 @@ DIGEST_KINDS = frozenset({"question", "live_question", "crashed", "complete"})
 
 def _journal() -> comms.Journal:
     global _JOURNAL
-    path = (comms.comms_dir() / "assistant-conversation.jsonl").resolve()
+    path = (assistant_dir() / "comms" / "assistant-conversation.jsonl").resolve()
     with _LOCK:
         if _JOURNAL is None or _JOURNAL.path != path:
             _JOURNAL = comms.Journal(path)

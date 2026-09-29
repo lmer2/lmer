@@ -35,7 +35,7 @@ it('shows disconnecting before the request finishes and holds it until the next 
   const wrapper = mountPane(ThreadLinks, { sessionId: 's-1', live: true, threads: [thread] })
   await openMenu(wrapper)
   await clickText('.v-list-item', 'Disconnect Design thread')
-  expect(disconnectSessionThread).toHaveBeenCalledWith('s-1', thread.id)
+  expect(disconnectSessionThread).toHaveBeenCalledWith('s-1', thread.id, undefined)
   expect(document.body.textContent).toContain('disconnecting…')
   expect(document.querySelector('[data-thread-action]').getAttribute('aria-disabled')).toBe('true')
   document.querySelector('[data-thread-action]').click()
@@ -129,7 +129,7 @@ it('allows a reference save while an accepted connect awaits fleet confirmation'
   await nextTick()
   await clickText('button', 'save')
   await flushPromises()
-  expect(addSessionReference).toHaveBeenCalledWith('s-1', thread.permalink, '')
+  expect(addSessionReference).toHaveBeenCalledWith('s-1', thread.permalink, '', undefined)
   expect(document.body.textContent).toContain('connecting…')
 })
 

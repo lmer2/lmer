@@ -1,5 +1,8 @@
 # Platform quickstart
 
+For named workspaces, project-bound routing, capacity and General migration, see
+[Projects](PROJECTS.md).
+
 Get the lmer platform — the web control plane for a fleet of lmer sessions,
 with its supervising assistant ("uber lmer") — running on a host in a few
 minutes. The full reference for a container deploy is
