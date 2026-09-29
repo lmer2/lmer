@@ -40,6 +40,7 @@ import { applyChatSettings } from '../operatorChat.js'
 const props = defineProps({
   modelValue: { type: Boolean, default: false },
   running: { type: Boolean, default: false },
+  allowRestart: { type: Boolean, default: true },
   // What the running incarnation was launched with (the status's `settings`),
   // for the current-vs-next line — a pending change with nothing naming the
   // difference reads as either a no-op or a lie.
@@ -553,7 +554,7 @@ onBeforeUnmount(() => {
           </v-alert>
           <v-alert v-else-if="saved" type="success" density="compact">
             Saved. It applies when a fresh uber lmer starts — restart to apply it
-            now, or let the change wait for the next incarnation.
+            from the project chat, or let the change wait for the next incarnation.
             <p v-if="savedDisplay">Operator chat display applies now.</p>
             <p v-if="savedTick">Reminder settings apply on the daemon's next check.</p>
             <p v-if="savedTickShadowed">
@@ -561,7 +562,7 @@ onBeforeUnmount(() => {
               environment variable — it is saved, but the daemon goes on reading
               the export.
             </p>
-            <template #append>
+            <template v-if="allowRestart" #append>
               <v-btn
                 size="small"
                 variant="tonal"

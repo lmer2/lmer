@@ -112,6 +112,7 @@ import {
 import { ago } from '../format.js'
 import { withoutOutboundCopies } from '../outbound.js'
 import { inView, layerOf } from '../conversation.js'
+import { readDraft, storeDraft } from '../projects.js'
 import { mergeHistory, olderPage, historyGaps, historyWithoutOutboundCopies } from '../assistantHistory.js'
 // The optional sketch phase (issue 246, slice 2). Its own chunk, like the
 // renderer and the terminal: it is a canvas and three tools that most sends
@@ -134,11 +135,15 @@ const Markdown = defineAsyncComponent(async () => {
 })
 
 const props = defineProps({
+  workspaceId: { type: String, default: undefined },
+  conversationKey: { type: String, default: null },
   // The id, not the session object: the fleet poll replaces that object every ten
   // seconds and a watcher on it would restart a working view for no reason. Same
   // reasoning as Terminal.vue.
   sessionId: { type: String, required: true },
   assistantHistory: { type: Boolean, default: false },
+  readOnly: { type: Boolean, default: false },
+  sendPaused: { type: Boolean, default: false },
   // Whether the run is stopped waiting for an answer. A run-level fact the fleet
   // view already knows, and the one thing that changes what the composer is for.
   questionPending: { type: Boolean, default: false },
@@ -230,7 +235,9 @@ const note = ref(null)
 const live = ref(false)
 const phase = ref('loading')
 const problem = ref(null)
-const draft = ref('')
+const draftKey = props.conversationKey || `session:${props.workspaceId}:${props.sessionId}`
+const draft = ref(readDraft(draftKey).text)
+watch(draft, text => storeDraft(draftKey, text, []))
 const sending = ref(false)
 const pending = ref([])
 const showInjected = ref(false)
@@ -539,6 +546,8 @@ const historyHasGap = computed(() => props.assistantHistory
 // The three states the bottom of the view can be in. Named rather than inlined
 // because 'answer' is a pointer at another component, not a composer.
 const composerMode = computed(() => {
+  if (props.readOnly) return 'closed'
+  if (props.sendPaused) return 'send'
   if (props.questionPending) return 'answer'
   return live.value ? 'send' : 'closed'
 })
@@ -1037,6 +1046,7 @@ async function loadEarlier() {
 }
 
 async function send() {
+  if (props.readOnly || props.sendPaused) return
   const typed = draft.value.trim()
   // A snapshot of the ids, not a handle on the array. `attachments.value` is
   // replaced (never mutated) by `unstage` and `stage`, so capturing the array
@@ -1060,6 +1070,7 @@ async function send() {
   // fact; the `stale(mine)` guards below are what stop this send from *typing*
   // at a session the operator has left.
   const target = props.sessionId
+  const workspaceId = props.workspaceId
   // Where the transcript ended when the message went, read BEFORE the round trip.
   // The poll keeps running while the POST is in flight and the harness writes the
   // turn down as soon as the TUI takes the submit, so a poll can absorb this very
@@ -1097,7 +1108,7 @@ async function send() {
       // *this* session has been sent.
       if (item.stored?.session !== target) {
         const reply = await uploadSessionFile(target, {
-          name: item.name, data: await base64Of(item.file),
+          name: item.name, data: await base64Of(item.file), workspaceId,
         })
         // The daemon's own wording, kept verbatim beside the session it belongs
         // to — `target`, the same value the call above used. It composes the line
@@ -1113,7 +1124,7 @@ async function send() {
     // is not touched here, and what the harness's TUI would otherwise do with it
     // (run a leading `!` as a shell command, issue 254) is decided by the supervisor,
     // which is the only end that knows which harness is on the other side.
-    const reply = await sendSessionInput(target, text, { sanitize: true })
+    const reply = await sendSessionInput(target, text, { sanitize: true, workspaceId })
     if (stale(mine)) return
     // Held until the transcript catches up. The send has already succeeded, so
     // this bubble is not a maybe — it is "delivered, not yet written down".
@@ -1711,7 +1722,7 @@ watch(rendererLoaded, () => {
             <v-btn
               :prepend-icon="mdiSend"
               :loading="sending"
-              :disabled="!draft.trim() && !attachments.length"
+              :disabled="sendPaused || (!draft.trim() && !attachments.length)"
               color="primary"
               variant="tonal"
               size="large"

@@ -123,12 +123,10 @@ An unknown outcome, incompatible state or exhausted retry allowance stays
 parked. Inspection uses durable operation evidence; matching text somewhere in
 the remote thread is not proof of delivery. A connector's unavailability is
 logged when its reason changes, and a successful start resets that comparison.
-On entering recovery-required, the daemon spools one `thread_recovery_required`
-digest for the assistant, including the affected session, thread and inspect
-command. Repeated reconciliation does not repeat that digest. A daemon restart
-re-evaluates the state and can report a still-parked connection again.
-If spooling the digest fails, the attention state remains visible, reconciliation
-continues, and the notification failure is logged once for that transition.
+Recovery-required remains operator-visible health. Under #512 it does not spool
+an unsolicited assistant digest or wake the assistant, including after restart
+or while the condition persists. Explicitly requested operations still return
+their actual failures to the caller; safe reconciliation continues normally.
 
 Thread listings expose `attention: "recovery-required"` while parked, otherwise
 `null`. The shared thread controls show a warning badge and the recovery detail

@@ -266,6 +266,14 @@ class TestRendering:
 
 
 class TestOutbound:
+    def test_peer_ul_records_never_post_but_worker_messages_still_do(self, rig):
+        record = {"id": "sess-1/peer", "kind": "message", "text": "Private native coordination",
+                  "source": {"channel": "peer-ul", "author": "Example Alpha"}, "meta": {}}
+        rig.connector._send_record(record)
+        assert rig.slack.posted == []
+        rig.connector._send_record({**record, "id": "sess-1/worker", "source": {"channel": "uber-lmer"}})
+        assert len(rig.slack.posted) == 1
+
     def test_agent_records_reach_the_thread_and_the_cursor_is_acked(self, rig):
         rig.connector.start()
         rig.agent("note", "working on it")

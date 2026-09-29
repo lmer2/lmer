@@ -1,5 +1,8 @@
 # Summon the assistant from Slack or Matrix
 
+For named workspaces, project-bound routing, capacity and General migration, see
+[Projects](PROJECTS.md).
+
 The platform daemon routes bot mentions to the existing Uber Lmer assistant.
 The assistant reads the request, answers in that conversation, or starts a worker
 under the operator's existing run-start policy. Receiving a mention does not
@@ -113,11 +116,13 @@ Conversation requests are protected from ordinary digest eviction. A full inbox
 refuses new requests with HTTP 429, leaving their identities eligible for retry.
 An unavailable transport or failed history read is visible in daemon health and
 logs; there is no fallback worker spawn. A failed delivery is not marked accepted.
-Transport delivery is not a durable outbox: after a logged failure, retry by
-mentioning the bot again once the cause is resolved. An initial Matrix sync is
-treated as history, as in the legacy listener; reconnects in the same daemon keep
-the sync cursor. A limited Matrix timeline is logged as `limited_sync` because
-the homeserver may have omitted events.
+Daemon ingress durably retains raw events before Slack acknowledgement and
+commits Matrix events with the sync cursor. Failed admission replays through the
+same deduplicated route after errors or daemon restart. Initial Matrix sync is
+treated as history; a persisted cursor prevents a new baseline after restart.
+A limited Matrix timeline is logged as `limited_sync` because the homeserver
+may have omitted events. This inbox does not retry an uncertain outgoing post:
+inspect those request receipts and the source thread before requesting new work.
 
 Slack context uses `conversations.history` with an exclusive `latest` bound.
 Matrix uses the trigger's `/context` backwards token and `/messages?dir=b`,

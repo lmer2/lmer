@@ -297,7 +297,7 @@ def test_runs_on_a_fresh_orchestrator_explains_the_scope(platform_root, capsys):
 
 
 def test_adopt_then_runs_then_forget(platform_root, capsys):
-    assert daemon.main(["adopt", "gitlab.example.com/agents/global/develop-issue-141"]) == 0
+    assert daemon.main(["--workspace-id", "general", "adopt", "gitlab.example.com/agents/global/develop-issue-141"]) == 0
     # The key, which is what was typed and what the index holds. Not
     # `…/runs/<slug>`: these verbs touch no directory, and for a named run that
     # path is one nobody can open (T96).
@@ -319,7 +319,7 @@ def test_adopt_then_runs_then_forget(platform_root, capsys):
 
 
 def test_adopt_warns_when_the_run_is_not_in_the_mirror(platform_root, capsys):
-    daemon.main(["adopt", "gitlab.example.com/agents/global/nowhere"])
+    daemon.main(["--workspace-id", "general", "adopt", "gitlab.example.com/agents/global/nowhere"])
     assert "no such run dir is in the mirror" in capsys.readouterr().err
 
 

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from typing import Optional
 
@@ -81,6 +82,7 @@ from .workrepo import (
     resolve_run_dir,
     run_dirs,
 )
+from . import projects, assistant, detect, project_context
 
 logger = logging.getLogger("lmer_platform.daemon")
 
@@ -93,6 +95,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Run and inspect the lmer orchestrator platform.",
     )
     sub = parser.add_subparsers(dest="command")
+    parser.add_argument("--workspace-id", default=os.environ.get("LMER_WORKSPACE_ID"),
+                        help="Named project identity for new work (distinct from repository).")
 
     def add_bind_flags(target: argparse.ArgumentParser) -> None:
         target.add_argument(
@@ -183,6 +187,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "resume", help="Continue a tracked run by starting its next session"
     )
     resume_cmd.add_argument("run", help="<host>/<project>/<slug>")
+    resume_cmd.add_argument("--slot")
+    resume_cmd.add_argument("--home-revision", type=int)
+    resume_cmd.add_argument("--confirm-project", action="store_true")
     resume_cmd.add_argument(
         "--taskdef",
         help="Run this taskdef against the run's target instead of the one it "
@@ -321,6 +328,11 @@ def _supervise_assistant(config) -> Supervisor:
     :func:`lmer_platform.assistant.register_supervisor` for why that is
     process-wide state rather than an argument to the app.
     """
+    if projects.enabled():
+        supervisor = projects.Supervisor(config)
+        print(supervisor.first_start(), flush=True)
+        supervisor.start()
+        return supervisor
     supervisor = Supervisor(config)
     print(supervisor.first_start().notice, flush=True)
     supervisor.start()
@@ -398,6 +410,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     notice = startup_notice(reattach_all())
     if notice:
         print(notice, flush=True)
+
+    projects.migrate()
 
     # After the re-attach and before the server, in that order for both halves:
     # a surviving assistant has to be re-attached first or this would see it as
@@ -495,7 +509,6 @@ def _subscribe_to_comms() -> CommsHub:
 
 def _assistant_consumer(hub: CommsHub):
     """Record milestones and spool worker and human records to the assistant."""
-    from . import assistant, detect
     from .store import append_event
 
     def consume(event) -> None:
@@ -503,6 +516,8 @@ def _assistant_consumer(hub: CommsHub):
         source = message.get("source") or {}
         meta = message.get("meta") or {}
         own = source.get("channel") == "uber-lmer" or meta.get("session_origin") is True
+        if meta.get("notification_class") == "connector_health":
+            return
         if message.get("kind") == "milestone":
             run = event.run or {}
             identity = None
@@ -520,7 +535,7 @@ def _assistant_consumer(hub: CommsHub):
                 slug=identity[2] if identity else None,
             )
             append_event(detect.SESSION_SIGNALLED, note=event.session, data=signal.event_data())
-            if not own:
+            if not own and not projects.enabled():
                 assistant.notify(signal.digest, kind=detect.SIGNAL_DIGEST_KIND, data=signal.data())
             try:
                 # Share the ask-directory mark to avoid duplicate history on recovery.
@@ -728,6 +743,8 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         repo_url=args.repo_url,
         direction=args.direction,
         session_id=args.session_id,
+        slot=getattr(args, "slot", None), home_revision=getattr(args, "home_revision", None),
+        confirm_project=getattr(args, "confirm_project", False),
     )
     try:
         result = resume_run(config, request)
@@ -822,7 +839,13 @@ def main(argv: Optional[list] = None) -> int:
         command = "run"
 
     try:
-        return _COMMANDS[command](args)
+        if command in ("spawn", "adopt", "resume"):
+            projects.migrate()
+        with project_context.bound(args.workspace_id):
+            return _COMMANDS[command](args)
+    except projects.ProjectError as exc:
+        print(f"lmer platform: {exc}", file=sys.stderr)
+        return 2
     except (ConfigError, StoreError) as exc:
         print(f"lmer platform: {exc}", file=sys.stderr)
         return 2

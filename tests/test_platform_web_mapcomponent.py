@@ -167,13 +167,15 @@ def test_the_bar_control_carries_the_orchestrators_state_and_what_it_needs():
         "can disagree with the map about what a state looks like"
     )
     markup = _read(APP)
-    button = re.search(r'<v-btn\s*\n\s*:icon="mdiRobot"(.*?)/>', markup, re.S)
+    button = re.search(r'<v-btn\b[^>]*:icon="mdiRobot"[^>]*/>', markup, re.S)
     assert button, "the uber lmer bar control is no longer recognisable"
-    assert ':color="orchestratorTone"' in button.group(1), (
+    assert ':aria-label="orchestratorHint"' in button.group(0)
+    assert ':color="orchestratorTone"' in button.group(0), (
         "the bar control is not painted from the orchestrator's state"
     )
-    assert ':title="orchestratorHint"' in button.group(1), (
-        "the bar control says nothing on hover about what the orchestrator is doing"
+    tooltip = next(block for block in re.findall(r"<v-tooltip\b.*?</v-tooltip>", markup, re.S) if button.group(0) in block)
+    assert ':text="orchestratorHint"' in tooltip and 'open-on-focus' in tooltip, (
+        "the bar control says nothing on hover/focus about what the orchestrator is doing"
     )
 
 

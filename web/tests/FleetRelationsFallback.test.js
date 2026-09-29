@@ -12,11 +12,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import App from '../src/App.vue'
-import { fetchRunRelations, fetchState } from '../src/api.js'
+import { fetchProjects, fetchRunRelations, fetchState } from '../src/api.js'
 import { mountPane } from './mount.js'
 
 vi.mock('../src/api.js', () => ({
   fetchState: vi.fn(),
+  fetchProjects: vi.fn().mockResolvedValue({ projects: [{ id: 'general', name: 'General', color: 'Blue', assistant: { lifecycle: 'stopped' } }] }),
   fetchRunRelations: vi.fn(),
   forgetRun: vi.fn(),
   prune: vi.fn(),
@@ -24,7 +25,7 @@ vi.mock('../src/api.js', () => ({
 }))
 
 const run = (slug, extra = {}) => ({
-  host: 'gitlab.example.com', project: 'acme/widget', slug, label: slug,
+  host: 'gitlab.example.com', project: 'acme/widget', slug, label: slug, workspace_id: 'general',
   state: 'running', live: true, ...extra,
 })
 
@@ -37,6 +38,8 @@ const reply = (subject, others) => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  fetchProjects.mockResolvedValue({ projects: [{ id: 'general', name: 'General', color: 'Blue', assistant: { lifecycle: 'stopped' } }] })
+  window.history.replaceState({}, '', '/?workspace=general')
   window.matchMedia = vi.fn().mockImplementation((query) => ({
     matches: false, media: query, addEventListener() {}, removeEventListener() {},
   }))

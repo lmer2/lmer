@@ -346,18 +346,13 @@ class TestTheThreeCallSites:
 
         assert by_component == [by_daemon(case) for case in cases]
 
-    def test_the_client_sends_the_permalink_and_nothing_else(self):
-        """The transport is read out of the link. A body field naming it would be
-        a second source for one fact, and the two could disagree."""
+    def test_thread_payloads_bind_project_without_a_second_transport_source(self):
+        """Project ownership is explicit; the link alone determines transport."""
         text = API.read_text(encoding="utf-8")
-        assert "JSON.stringify({ permalink })" in text
-        # And opening one is the same route with the other half of the choice:
-        # a channel to make a thread in, and the root's first line (#429).
-        assert "JSON.stringify({ channel, title })" in text
+        assert "JSON.stringify({ permalink, workspace_id: workspaceId })" in text
+        assert "JSON.stringify({ channel, title, workspace_id: workspaceId })" in text
         assert "encodeURIComponent(threadId)" in text
-        # A reference carries a title beside the link, and nothing else: what
-        # kind of thread it is comes out of the link there too.
-        assert "JSON.stringify({ permalink, title })" in text
+        assert "JSON.stringify({ permalink, title, workspace_id: workspaceId })" in text
         assert "encodeURIComponent(referenceId)" in text
         # And there is no client for the GET: the icons render from the fleet
         # payload and the assistant status, so nothing would read one.

@@ -153,7 +153,8 @@ class ConnectorLifecycle:
 
     def _transition_note(self, text):
         with contextlib.suppress(Exception):
-            self.bus.post("note", text, source={"channel": self._lease.key.transport})
+            self.bus.post("note", text, source={"channel": self._lease.key.transport},
+                          meta={"notification_class": "connector_health"})
         if self._notify is not None:
             with contextlib.suppress(Exception):
                 self._notify(text)

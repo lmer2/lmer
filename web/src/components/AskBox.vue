@@ -42,6 +42,7 @@ import { ago } from '../format.js'
 const Markdown = defineAsyncComponent(() => import('./Markdown.vue'))
 
 const props = defineProps({
+  workspaceId: { type: String, default: undefined },
   sessionId: { type: String, required: true },
   // One entry from the ask channel: { id, text, options, at, answered, answer }.
   question: { type: Object, required: true },
@@ -70,7 +71,7 @@ async function send(text) {
   busy.value = true
   error.value = null
   try {
-    await answerSessionQuestion(props.sessionId, props.question.id, reply)
+    await answerSessionQuestion(props.sessionId, props.question.id, reply, props.workspaceId)
     sent.value = true
     // On success only — including when a tapped option went out while something
     // else was half-typed. The question is answered: `sent` disables the box and

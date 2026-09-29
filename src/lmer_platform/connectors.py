@@ -266,10 +266,15 @@ class ThreadConnectors:
             if key in self._disconnected:
                 return
             self._disconnected.add(key)
+        entry = registry.read_session(session_id)
+        if entry and entry.get("kind") == "assistant":
+            logger.info("assistant_thread_disconnected session=%s thread=%s", session_id, record["id"])
+            return
         try:
             comms.ensure_hub().post(
                 session_id, kind="message", channel="platform",
                 text=f"thread disconnected: {record['label']}",
+                meta={"notification_class": "connector_health"},
             )
         except (comms.CommsError, session_io.SessionIOError) as exc:
             logger.warning(
@@ -648,8 +653,6 @@ class ThreadConnectors:
         return False
 
     def _park_recovery(self, key, reason):
-        from . import assistant
-
         command = f"lmer-ctl threads recover {key[0]} {key[1]} inspect"
         detail = f"recovery required: {reason}; use {command}"
         with self._lock:
@@ -658,12 +661,8 @@ class ThreadConnectors:
             if key in self._recovery:
                 return
             self._recovery.add(key)
-        try:
-            assistant.notify(detail, kind="thread_recovery_required",
-                             data={"session": key[0], "thread": key[1], "command": command})
-        except Exception as exc:
-            logger.warning("platform_thread_recovery_notify_failed session=%s thread=%s error=%s",
-                           *key, scrub_credentials(str(exc)))
+        logger.warning("platform_thread_recovery_required session=%s thread=%s detail=%s",
+                       *key, scrub_credentials(detail))
 
     # -- reading ---------------------------------------------------------------
 

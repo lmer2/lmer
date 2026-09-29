@@ -8,7 +8,7 @@ import os
 import sqlite3
 import uuid
 
-from . import registry, store
+from . import registry, store, project_context, projects
 from .store import StoreError
 
 
@@ -18,9 +18,15 @@ ROTATION_TEXT = (
 )
 
 
+def _history_dir(session_id=None):
+    owner = projects.session_home(session_id) if session_id else None
+    with project_context.bound(owner or project_context.current()):
+        return project_context.assistant_dir()
+
+
 @contextmanager
-def _database():
-    directory = store.platform_dir()
+def _database(session_id=None):
+    directory = _history_dir(session_id)
     path = directory / "assistant-history.sqlite3"
     try:
         store.ensure_state_dir(directory)
@@ -60,15 +66,16 @@ def _database():
 
 def generation(session_id: str | None) -> dict | None:
     """Return durable membership, without inventing links from run identities."""
-    if not session_id or not (store.platform_dir() / "assistant-history.sqlite3").is_file():
+    if not session_id or not (_history_dir(session_id) / "assistant-history.sqlite3").is_file():
         return None
     try:
         registry.session_path(session_id)
     except registry.RegistryError:
         return None
-    with _database() as db:
+    with _database(session_id) as db:
         row = db.execute("SELECT * FROM generations WHERE session = ?", (session_id,)).fetchone()
     return dict(row) if row else None
+
 
 
 def register(session_id: str, *, number: int, started_at: str | None,
@@ -102,7 +109,7 @@ def register(session_id: str, *, number: int, started_at: str | None,
 
 def latest() -> dict | None:
     """Return the last explicitly published generation, including stopped ones."""
-    if not (store.platform_dir() / "assistant-history.sqlite3").is_file():
+    if not (_history_dir() / "assistant-history.sqlite3").is_file():
         return None
     with _database() as db:
         row = db.execute(
@@ -115,13 +122,14 @@ def latest() -> dict | None:
 def bind_credential(session_id: str, credential: str | None) -> None:
     """Record a generation's immutable identity, including an unattributed launch."""
     fingerprint = hashlib.sha256(credential.encode()).hexdigest() if credential else None
-    with _database() as db:
+    with _database(session_id) as db:
         db.execute("INSERT OR IGNORE INTO credentials VALUES (?, ?)", (session_id, fingerprint))
+
 
 
 def credential_owner(credential: str) -> dict | None:
     """Resolve the credential captured at authentication, even after rotation."""
-    if not (store.platform_dir() / "assistant-history.sqlite3").is_file():
+    if not (_history_dir() / "assistant-history.sqlite3").is_file():
         return None
     fingerprint = hashlib.sha256(credential.encode()).hexdigest()
     with _database() as db:
@@ -174,11 +182,12 @@ def retain(session_id: str, message: dict) -> None:
     if not isinstance(identifier, str) or not identifier:
         raise StoreError("assistant communication has no stable message id")
     payload = json.dumps(_scrub_decoded(message), ensure_ascii=False)
-    with _database() as db:
+    with _database(session_id) as db:
         db.execute(
             "INSERT OR IGNORE INTO records (session, message_id, payload) VALUES (?, ?, ?)",
             (session_id, identifier, payload),
         )
+
 
 
 def events(session_id: str) -> list:
@@ -186,9 +195,9 @@ def events(session_id: str) -> list:
     from .comms import FleetEvent
     from .transcripts import MAX_MESSAGES_PER_SOURCE
 
-    if not (store.platform_dir() / "assistant-history.sqlite3").is_file():
+    if not (_history_dir(session_id) / "assistant-history.sqlite3").is_file():
         return []
-    with _database() as db:
+    with _database(session_id) as db:
         rows = db.execute(
             "SELECT position, payload FROM records WHERE session = ? ORDER BY position LIMIT ?",
             (session_id, MAX_MESSAGES_PER_SOURCE),
@@ -196,13 +205,14 @@ def events(session_id: str) -> list:
     return [FleetEvent(row["position"], session_id, json.loads(row["payload"])) for row in rows]
 
 
+
 def transcript_limit_note(session_id: str) -> str | None:
     """Explain the optional normalizer's ceiling, with a paged recovery route."""
     from .transcripts import MAX_MESSAGES_PER_SOURCE
 
-    if not (store.platform_dir() / "assistant-history.sqlite3").is_file():
+    if not (_history_dir(session_id) / "assistant-history.sqlite3").is_file():
         return None
-    with _database() as db:
+    with _database(session_id) as db:
         more = db.execute(
             "SELECT 1 FROM records WHERE session = ? ORDER BY position LIMIT 1 OFFSET ?",
             (session_id, MAX_MESSAGES_PER_SOURCE),
@@ -212,6 +222,7 @@ def transcript_limit_note(session_id: str) -> str | None:
                 "Later public messages remain available in bounded pages at "
                 f"/api/assistant/history/{session_id}?view=conversation.")
     return None
+
 
 
 def reference(session_id: str | None) -> dict | None:
@@ -229,6 +240,7 @@ def reference(session_id: str | None) -> dict | None:
     }
 
 
+
 class HistoryError(ValueError):
     """The requested generation or page anchor is unavailable."""
 
@@ -240,13 +252,14 @@ def _notice(session_id: str, item: dict, kind: str, text: str):
                    via="comms", comms_kind=kind, id=f"history:{session_id}:{kind}")
 
 
+
 def _conversation_page(session_id: str, prefix: list, *, since: int,
                        before: str | None, limit: int) -> tuple:
     from .comms import FleetEvent
     from .transcripts import _comms_turns
 
     offset = len(prefix)
-    with _database() as db:
+    with _database(session_id) as db:
         count = db.execute("SELECT count(*) FROM records WHERE session = ?", (session_id,)).fetchone()[0]
         total = count + offset
         end = total
@@ -281,6 +294,7 @@ def _conversation_page(session_id: str, prefix: list, *, since: int,
                 turn.id = f"{session_id}:history:{turn.id}"
             selected.extend(turns)
     return selected, start, stop, total
+
 
 
 def page(session_id: str, *, since: int = -40, before: str | None = None,
