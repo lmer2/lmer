@@ -242,6 +242,19 @@ for memory, work logs, and napkin repositories.
 
 ---
 
+### [SCHEMA-GUIDE.md](./SCHEMA-GUIDE.md)
+**The lmer schema, for the operator**
+
+A reading guide to SCHEMA.md, plus the two things it deliberately leaves out — how to migrate and how to check:
+- What the schema is in one page: the problem, form detection, the manifest and registry, short names and the compat symlink, session dirs, the two memory scopes
+- Per path: who writes it, who reads it, whether that reader dual-reads the legacy name, and the one command that exercises it
+- A step-by-step migration for an existing repo, with the validator findings to expect after each step and the two areas to leave alone
+- A test checklist of commands with their real output
+
+**Best for**: Planning a migration, or finding out which command would notice if you got a step wrong.
+
+---
+
 ### [SCHEMA.md](./SCHEMA.md)
 **The lmer schema (version 1)**
 
@@ -393,7 +406,7 @@ One-time, operator-performed production configuration receipts for the lmer rele
 - **Cutting a release?** Start with [RELEASE-FLOW.md](./RELEASE-FLOW.md) for the release flow, then [RELEASE-ADOPTION.md](./RELEASE-ADOPTION.md) and [RELEASE-PROD-SETUP.md](./RELEASE-PROD-SETUP.md) for adoption and operator setup
 - **Talking to a session from Slack, matrix or the chat pane?** See [COMMS.md](./COMMS.md)
 - **Announcing runs that want a human into a Matrix room?** See [MATRIX-CHAT.md](./MATRIX-CHAT.md)
-- **Migrating a work repo to the schema?** See [SCHEMA.md](./SCHEMA.md) for the normative layout, then check the tree with `lmer-schema validate`
+- **Migrating a work repo to the schema?** Start with [SCHEMA-GUIDE.md](./SCHEMA-GUIDE.md) for the plan and the checks, and read [SCHEMA.md](./SCHEMA.md) for the normative layout
 - **Need to troubleshoot?** All documents include troubleshooting sections
 
 ---

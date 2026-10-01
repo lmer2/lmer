@@ -112,7 +112,7 @@ from typing import Iterator, Optional
 import yaml
 from lmer_cli import runref
 
-from work_repo import run_state
+from work_repo import run_state, session_record
 
 # Private helpers reused deliberately rather than reimplemented: credential
 # lookup and credential scrubbing must have exactly one definition each.
@@ -124,7 +124,12 @@ from lmer_cli.tokens import _inject_gitlab_token_if_available
 # owns what a registry entry means and `urls.normalize` is the one remote
 # normalizer (D21).
 from lmer_schema.manifest import ManifestError
-from lmer_schema.registry import load_registry
+from lmer_schema.registry import (
+    RegistryError,
+    _bucket_identity,
+    bucket_path,
+    load_registry,
+)
 from lmer_schema.urls import normalize
 
 from .config import PlatformConfig
@@ -177,7 +182,9 @@ _RESLUGGED_INDEX_LOCK = threading.Lock()
 #: ``registry``, ``urls``), and a fleet read path has no business importing the
 #: check registry to sort two directory names. Both quote ``docs/SCHEMA.md``;
 #: keep them in step there.
-_SESSION_DIR_RE = re.compile(r"\d{8}-\d{6}-\d+-\d+(?:--[^/]+)?")
+_SESSION_DIR_RE = re.compile(
+    rf"{run_state.SESSION_ID_RE.pattern}(?:--[^/]+)?"
+)
 #: Characters that stop a slug from being usable as half of a directory-name glob
 #: pattern — path separators and the wildcards — see :func:`_renamed_run_dir`.
 _NOT_IN_A_DIR_NAME = ("/", "\\", "*", "?", "[")
@@ -888,6 +895,15 @@ def _newest_session(group: Path) -> Path | None:
         session for session in sessions if _SESSION_DIR_RE.fullmatch(session.name)
     ]
     if in_form:
+        if any(
+            session_record.UID_RE.fullmatch(
+                run_state.session_id_of(session.name)
+            )
+            for session in in_form
+        ):
+            chosen = max(in_form, key=session_record.sort_key)
+        else:
+            chosen = in_form[-1]
         if len(in_form) != len(sessions):
             _announce_once(
                 f"session-not-in-form:{group}",
@@ -900,9 +916,9 @@ def _newest_session(group: Path) -> Path | None:
                 ", ".join(
                     session.name for session in sessions if session not in in_form
                 ),
-                in_form[-1].name,
+                chosen.name,
             )
-        return in_form[-1]
+        return chosen
     newest = max(sessions, key=lambda session: (_mtime(session), session.name))
     _announce_once(
         f"session-undated:{group}",
@@ -1012,6 +1028,7 @@ class _RegistryIdentities:
         self._root = root
         self._identities: Optional[dict] = None
         self._names: Optional[dict] = None
+        self._schema = 1
 
     def get(self, name: str) -> Optional[tuple]:
         self._read()
@@ -1049,21 +1066,29 @@ class _RegistryIdentities:
 
         A list, and no tiebreak: ``build_registry`` refuses one remote claimed by
         two entries (it names both projects), so a lookup URL matches at most one
-        entry and the ordinary answer here is one name or none. Two names can
-        only meet in one identity when their remotes differ solely by PORT, which
-        the registry keeps as distinct keys while a host DIRECTORY cannot express
-        it (:func:`_identity_from_repo` drops the port). Both are then offered,
-        in name order so the attempt order is deterministic, and the first that
-        actually holds the record answers — guessing between two projects nothing
-        can separate is not an improvement on trying both.
+        entry and the ordinary answer here is one name or none. Under schema 1,
+        two names can only meet in one identity when their remotes differ solely
+        by PORT: the registry keeps distinct keys while the legacy host DIRECTORY
+        cannot express the port (:func:`_identity_from_repo` drops it). Both are
+        then offered, in name order so the attempt order is deterministic, and
+        the first that actually holds the record answers — guessing between two
+        projects nothing can separate is not an improvement on trying both.
+        Schema 2 retains endpoint ports and exact path case in that identity, so
+        those remotes remain distinct here.
         """
         self._read()
         return self._names.get(identity, [])
 
+    @property
+    def schema(self) -> int:
+        """The root schema used to encode identities and bucket paths."""
+        self._read()
+        return self._schema
+
     def _read(self) -> None:
         """Both maps, from one registry read, at most once per instance."""
         if self._identities is None:
-            self._identities, self._names = self._load()
+            self._identities, self._names, self._schema = self._load()
 
     def _load(self) -> tuple:
         try:
@@ -1077,23 +1102,23 @@ class _RegistryIdentities:
                 "belongs to, so those runs are not listed until it parses",
                 self._root, exc,
             )
-            return {}, {}
+            return {}, {}, 1
         except OSError as exc:  # pragma: no cover - load_manifest wraps these
             logger.warning("platform_mirror_manifest_unreadable error=%s", exc)
-            return {}, {}
+            return {}, {}, 1
         if registry is None:
-            return {}, {}
+            return {}, {}, 1
         identities: dict = {}
         names: dict = {}
         for name, project in registry.projects.items():
-            identity = _identity_from_repo(project.repo)
+            identity = _identity_from_repo(project.repo, schema=registry.schema)
             if identity is not None:
                 identities[name] = identity
             # The union, primary first, exactly as `entry_keys` builds the
             # registry's own index — a repoless entry (D19) declares no remote
             # and so answers to no identity here, only to its name.
             for remote in (project.repo, *project.remotes):
-                bound = _identity_from_repo(remote)
+                bound = _identity_from_repo(remote, schema=registry.schema)
                 if bound is None:
                     continue
                 found = names.setdefault(bound, [])
@@ -1101,25 +1126,22 @@ class _RegistryIdentities:
                     found.append(name)
         return identities, {
             bound: sorted(found) for bound, found in names.items()
-        }
+        }, registry.schema
 
 
-def _identity_from_repo(repo: Optional[str]) -> Optional[tuple]:
+def _identity_from_repo(repo: Optional[str], schema: int = 1) -> Optional[tuple]:
     """``(host, project)`` for a remote URL, or ``None`` when it has no host.
 
-    ``normalize`` is the ONE remote normalizer (D21, via ``lmer_schema.urls``);
-    the port is then dropped from the host because a host DIRECTORY never carries
-    one — the port participates in registry keys only, and every
-    ``{host}/{project}`` path lmer has ever written came from
-    ``urlparse(...).hostname`` (``lmer_schema.registry.bucket_path`` states the
-    same rule for bucket paths). That rule is not taken from ``bucket_path``
-    itself because this is an IDENTITY, not a bucket: a dotless host is a real
-    run key (``localhost`` is a real ``LMER_REPO_HOST``) where it is not a bucket
-    the schema supports.
+    ``normalize`` is the ONE remote normalizer (D21, via ``lmer_schema.urls``).
+    Schema 1 then drops the port for compatibility with its host directory.
+    Schema 2 retains the full endpoint and original path case. This is an
+    IDENTITY rather than a bucket address; the schema registry owns the
+    separate ``%3A`` filesystem encoding.
     """
     spelling = normalize(repo)
     host, _, project = spelling.partition("/")
-    host = host.partition(":")[0]
+    if schema < 2:
+        host = host.partition(":")[0]
     if not host or not project:
         return None
     return host, project
@@ -1216,7 +1238,9 @@ def primary_remote_identity(
     config: Optional[PlatformConfig], repo_url: Optional[str], registry=_UNREAD
 ) -> Optional[tuple]:
     """``(host, project)`` of the registered project *repo_url* reaches, keyed on
-    that project's PRIMARY remote — or ``None`` when nothing here can say.
+    that project's PRIMARY remote. For an unregistered schema-2 repository,
+    returns its own lossless endpoint identity; ``None`` means no readable
+    schema can identify it.
 
     The fold that keeps one run directory answering to ONE identity key, and the
     other half of :meth:`_RegistryIdentities.names_for`. A project with
@@ -1267,7 +1291,14 @@ def primary_remote_identity(
         # container's placement makes — a second matching rule here would fold
         # runs into a project the record never lands in.
         project = registry.lookup(repo_url)
-        return None if project is None else _identity_from_repo(project.repo)
+        if project is None:
+            # Schema 2 makes the endpoint itself lossless even while the
+            # repository remains visibly unnamed in its fallback bucket.
+            return (
+                _identity_from_repo(repo_url, schema=registry.schema)
+                if registry.schema >= 2 else None
+            )
+        return _identity_from_repo(project.repo, schema=registry.schema)
     except ManifestError as exc:
         _announce_once(
             f"fold-manifest-unusable:{config.mirror_path}",
@@ -1297,7 +1328,10 @@ def _identity_from_state(state: Optional[dict]) -> Optional[tuple]:
     """
     if not isinstance(state, dict):
         return None
-    identity = _identity_from_repo(state.get("repo"))
+    schema = state.get("schema", 1)
+    identity = _identity_from_repo(
+        state.get("repo"), schema=schema if type(schema) is int else 1,
+    )
     if identity is not None:
         return identity
     host, project = state.get("host"), state.get("project")
@@ -1329,7 +1363,7 @@ def _project_identity(parts, identities: _RegistryIdentities, state_hint):
     if not parts:
         return None
     if len(parts) >= 2:
-        return parts[0], "/".join(parts[1:])
+        return _bucket_identity(parts, schema=identities.schema)
     name = parts[0]
     identity = identities.get(name) or _identity_from_state(state_hint())
     if identity is None:
@@ -1374,7 +1408,22 @@ def _project_dirs(
     (:func:`_checked_dir`), so a short name that should never have passed the
     registry's charset rule cannot aim a lookup out of the mirror.
     """
-    yield root / host / project
+    # An unported endpoint uses the historical path under every schema. Offer
+    # it before the lazy registry read so legacy and ordinary bucket lookups
+    # keep their one-stat fast path.
+    if ":" not in host:
+        yield root / host / project
+    if identities.schema >= 2:
+        try:
+            bucket = bucket_path(
+                root, f"{host}/{project}", schema=identities.schema,
+            )
+        except RegistryError:
+            bucket = None
+        if bucket is not None and ":" in host:
+            yield bucket
+    elif ":" in host:
+        yield root / host / project
     for name in identities.names_for((host, project)):
         yield root / name
 

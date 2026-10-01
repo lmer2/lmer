@@ -19,9 +19,9 @@ project-shaped dir, §1):
 Identity and the union
 ======================
 Every URL comparison goes through ``lmer_schema.urls`` (D21): ``lookup_key``
-is the case-folded comparison key, ``normalize`` the canonical spelling. This
-module dissects no URL of its own — ``tests/test_lmer_schema_registry.py``
-guards that on the module source.
+applies the root schema's comparison contract and ``normalize`` supplies the
+canonical spelling. This module dissects no URL of its own —
+``tests/test_lmer_schema_registry.py`` guards that on the module source.
 
 An entry contributes ``entry_keys(repo, remotes)`` to the union, primary
 first. **A repoless entry contributes NO keys**: it lives in
@@ -81,18 +81,12 @@ entry wins here; the split tree is the validator's ERROR, not a resolution
 ambiguity. ``tests/test_lmer_schema_resolve.py`` asserts the precedence
 directly rather than leaving it emergent.
 
-The bucket path derives from the canonical SPELLING (``normalize``), not
-the comparison key: legacy lmer wrote ``{host}/{project}`` with the host
-lowered and the path case as written, and a case-sensitive file system must
-find that tree again. The host segment is the HOSTNAME WITHOUT PORT,
-exactly as ``lmer_cli.container.clone_and_exec._parse_host_project`` derives
-``LMER_REPO_HOST`` (``urlparse(...).hostname``, which drops the port): that
-function's answer is what every ``{host}/{project}`` path on disk was built
-from, so a bucket that kept the port would name a directory nothing ever
-wrote — and hand a caller that MUST write (D9) the second half of a split
-tree. A non-default port still makes a distinct registry KEY (§4: a
-different port can be a different repo); it just never reaches a directory
-name. The §1 markers decide whether a candidate is a bucket at all:
+The bucket path derives from the canonical SPELLING (``normalize``), not the
+comparison key. Schema 1 keeps the historical ``{hostname}/{path}`` address.
+Schema 2 preserves path case and encodes a non-default endpoint port in the
+host directory as ``%3A<port>``. A real legacy portless bucket makes a
+schema-2 fallback ambiguous and is refused; a registered short-name project
+remains authoritative. The §1 markers decide whether a candidate is a bucket:
 
 - the host must be a **dotted** name (``is_host_bucket_name``): a dotless
   host is unsupported as a bucket at v1 — register the project — and a
@@ -148,7 +142,9 @@ __all__ = [
 SHORT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
 
 #: The schema areas whose direct presence makes a dir project-shaped (§1).
-SCHEMA_AREAS = ("_runs", "_plans", "_agents", "_info", "_specs", "_taskdef")
+SCHEMA_AREAS = (
+    "_runs", "_plans", "_agents", "_info", "_specs", "_taskdef", "_claims",
+)
 
 #: The legacy areas that do the same (§1, §9).
 LEGACY_AREAS = ("runs", "specs", "info", "memory")
@@ -212,6 +208,7 @@ class Registry:
     path: Path
     projects: Dict[str, Project]
     index: Dict[str, str]
+    schema: int = 1
 
     def __contains__(self, name) -> bool:
         return name in self.projects
@@ -231,7 +228,7 @@ class Registry:
     def lookup(self, url) -> Optional[Project]:
         """The project *url* belongs to, by normalized lookup across the
         union (D8), or ``None``. An empty URL never matches."""
-        key = lookup_key(url)
+        key = lookup_key(url, schema=self.schema)
         if not key:
             return None
         name = self.index.get(key)
@@ -258,7 +255,7 @@ def build_registry(manifest: Manifest) -> Registry:
     projects: Dict[str, Project] = {}
     index: Dict[str, str] = {}
     for name, entry in manifest.projects.items():
-        project = _parse_entry(path, name, entry)
+        project = _parse_entry(path, name, entry, schema=manifest.schema)
         for key in project.keys:
             owner = index.get(key)
             if owner is not None:
@@ -271,10 +268,12 @@ def build_registry(manifest: Manifest) -> Registry:
                 )
             index[key] = name
         projects[name] = project
-    return Registry(path=path, projects=projects, index=index)
+    return Registry(
+        path=path, schema=manifest.schema, projects=projects, index=index,
+    )
 
 
-def _parse_entry(path, name, entry: Dict[str, Any]) -> Project:
+def _parse_entry(path, name, entry: Dict[str, Any], *, schema: int = 1) -> Project:
     """One ``projects:`` entry -> a :class:`Project`.
 
     The key charset and the ``repo:``/``remotes:`` TYPES are checked by
@@ -296,7 +295,7 @@ def _parse_entry(path, name, entry: Dict[str, Any]) -> Project:
 
     repo = entry.get("repo")
     if repo is not None:
-        repo = _check_remote(path, f"{where}.repo:", repo)
+        repo = _check_remote(path, f"{where}.repo:", repo, schema=schema)
 
     raw_remotes = entry.get("remotes")
     if raw_remotes is not None and repo is None:
@@ -315,7 +314,7 @@ def _parse_entry(path, name, entry: Dict[str, Any]) -> Project:
                 f"{type(raw_remotes).__name__}",
             )
         remotes = tuple(
-            _check_remote(path, f"{where}.remotes:[{i}]", value)
+            _check_remote(path, f"{where}.remotes:[{i}]", value, schema=schema)
             for i, value in enumerate(raw_remotes)
         )
 
@@ -327,17 +326,17 @@ def _parse_entry(path, name, entry: Dict[str, Any]) -> Project:
             f"{type(description).__name__}",
         )
 
-    _check_entry_collisions(path, where, repo, remotes)
+    _check_entry_collisions(path, where, repo, remotes, schema=schema)
     return Project(
         name=name,
         repo=repo,
         remotes=remotes,
         description=description,
-        keys=entry_keys(repo, remotes),
+        keys=entry_keys(repo, remotes, schema=schema),
     )
 
 
-def _check_remote(path, where, value) -> str:
+def _check_remote(path, where, value, *, schema: int = 1) -> str:
     """One ``repo:``/``remotes:`` value: a non-empty string, credential-free,
     normalizing to a real ``host/path`` key — HOST included, which is the
     check that catches ``repo: origin`` (a remote NAME normalizes to a
@@ -356,7 +355,7 @@ def _check_remote(path, where, value) -> str:
             f"({scrub_credentials(value)}); the manifest never holds secrets — "
             "write the remote without userinfo and let lmer supply auth.",
         )
-    key = lookup_key(value)
+    key = lookup_key(value, schema=schema)
     if not key or "/" not in key:
         raise RegistryError(
             path,
@@ -368,12 +367,12 @@ def _check_remote(path, where, value) -> str:
     return value
 
 
-def _check_entry_collisions(path, where, repo, remotes) -> None:
+def _check_entry_collisions(path, where, repo, remotes, *, schema: int = 1) -> None:
     """§4 registry corners: two values in ONE entry folding to one key."""
-    primary = lookup_key(repo) if repo is not None else None
+    primary = lookup_key(repo, schema=schema) if repo is not None else None
     seen: Dict[str, str] = {}
     for value in remotes:
-        key = lookup_key(value)
+        key = lookup_key(value, schema=schema)
         if key == primary:
             raise RegistryError(
                 path,
@@ -422,27 +421,96 @@ def is_project_shaped(path) -> bool:
     return any((path / marker).is_dir() for marker in PROJECT_MARKERS)
 
 
-def bucket_path(root, spelling) -> Optional[Path]:
-    """Where the host bucket for the canonical *spelling* (``host/path``,
-    from :func:`lmer_schema.urls.normalize`) lives under *root*, or ``None``
-    when no bucket can hold it: no host or path, a dotless host, or a path
-    with empty/``.``/``..`` components.
+def _bucket_host_segment(host: str, schema: int = 1) -> str:
+    """Filesystem spelling for a normalized endpoint host."""
+    if schema < 2:
+        return host.partition(":")[0]
+    hostname, separator, port = host.rpartition(":")
+    if separator and hostname and port.isdigit():
+        return f"{hostname}%3A{port}"
+    return host
 
-    The host segment drops any port, matching the ``{host}/{project}`` paths
-    lmer already writes (module docstring). Depth is not a criterion at any
-    length. Says nothing about existence.
-    """
+
+def _bucket_identity(parts, schema: int = 1) -> tuple[str, str]:
+    """Remote identity encoded by bucket path *parts*."""
+    host = parts[0]
+    if schema >= 2:
+        hostname, separator, port = host.rpartition("%3A")
+        if separator and hostname and port.isdigit():
+            host = f"{hostname}:{port}"
+    return host, "/".join(parts[1:])
+
+
+def _reject_filesystem_alias(root: Path, parts: list[str]) -> None:
+    """Refuse an existing path reached through a differently spelled alias."""
+    parent = root
+    for part in parts:
+        candidate = parent / part
+        if not candidate.exists():
+            return
+        try:
+            exact = any(child.name == part for child in parent.iterdir())
+        except OSError as exc:
+            raise RegistryError(
+                root,
+                f"bucket placement is ambiguous: cannot inspect {parent} "
+                "for exact filesystem spelling",
+            ) from exc
+        if not exact:
+            raise RegistryError(
+                root,
+                f"bucket placement is ambiguous: {candidate} aliases an existing "
+                "filesystem entry with different case",
+            )
+        parent = candidate
+
+
+def _bucket_address(root, spelling, schema: int = 1) -> Optional[Path]:
+    """Derive a bucket address without consulting existing filesystem state."""
     if not spelling or "/" not in spelling:
         return None
     host, _, path = spelling.partition("/")
-    # `urlparse(...).hostname` semantics: the directory is the bare host.
-    host = host.partition(":")[0]
-    if not is_host_bucket_name(host):
+    hostname = host.partition(":")[0]
+    if not is_host_bucket_name(hostname):
         return None
     parts = path.split("/")
     if any(part in ("", ".", "..") for part in parts):
         return None
-    return Path(root).joinpath(host, *parts)
+    root = Path(root)
+    bucket_host = _bucket_host_segment(host, schema=schema)
+    address_parts = [bucket_host, *parts]
+    return root.joinpath(*address_parts)
+
+
+def bucket_path(root, spelling, schema: int = 1) -> Optional[Path]:
+    """Filesystem address for the canonical remote *spelling*.
+
+    Schema 1 retains its hostname-only address. Schema 2 encodes a
+    non-default port as ``%3A<port>`` and preserves path case. This derivation
+    is read-only; :func:`resolve_project_dir` checks write ambiguity when the
+    registry does not claim the remote.
+    """
+    return _bucket_address(root, spelling, schema=schema)
+
+
+def _check_bucket_ambiguity(root: Path, spelling: str, schema: int) -> None:
+    """Refuse a schema-2 fallback whose endpoint has no unique disk address."""
+    if schema < 2:
+        return
+    host, _, path = spelling.partition("/")
+    hostname = host.partition(":")[0]
+    bucket_host = _bucket_host_segment(host, schema=schema)
+    parts = path.split("/")
+    address_parts = [bucket_host, *parts]
+    _reject_filesystem_alias(root, address_parts)
+    if bucket_host != hostname:
+        legacy = root.joinpath(hostname, *parts)
+        if not legacy.is_symlink() and is_project_shaped(legacy):
+            raise RegistryError(
+                root,
+                f"bucket placement is ambiguous: legacy path {legacy} drops "
+                f"the endpoint port from {host}",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +540,7 @@ class Resolution:
         return self.how != MISS
 
 
-def resolve_project_dir(root, url, registry=_LOAD) -> Resolution:
+def resolve_project_dir(root, url, registry=_LOAD, schema: Optional[int] = None) -> Resolution:
     """Resolve the project dir for *url* in the plexus rooted at *root*.
 
     Registry first, bucket second (D9). *registry* defaults to the tree's
@@ -483,12 +551,17 @@ def resolve_project_dir(root, url, registry=_LOAD) -> Resolution:
     root = Path(root)
     if registry is _LOAD:
         registry = load_registry(root)
-    key = lookup_key(url)
-    bucket = bucket_path(root, normalize(url))
+    if schema is None:
+        schema = registry.schema if registry is not None else 1
+    key = lookup_key(url, schema=schema)
+    spelling = normalize(url)
 
     if registry is not None:
         project = registry.lookup(url)
         if project is not None:
+            # The registry is authoritative. A stale real bucket is a layout
+            # finding, not grounds to redirect or refuse the registered tree.
+            bucket = _bucket_address(root, spelling, schema=schema)
             return Resolution(
                 how=REGISTRY_HIT,
                 path=project.dir(root),
@@ -496,6 +569,9 @@ def resolve_project_dir(root, url, registry=_LOAD) -> Resolution:
                 key=key,
                 bucket_path=bucket,
             )
+    bucket = bucket_path(root, spelling, schema=schema)
+    if bucket is not None:
+        _check_bucket_ambiguity(root, spelling, schema)
     if bucket is not None and is_project_shaped(bucket):
         return Resolution(
             how=BUCKET_HIT, path=bucket, project=None, key=key, bucket_path=bucket

@@ -135,6 +135,12 @@ class TestLookupKey:
         assert urls.lookup_key(f"https://{HOST}/{MIXED_CASE_PATH}") == urls.lookup_key(CANONICAL)
         assert urls.normalize(f"https://{HOST}/{MIXED_CASE_PATH}") != CANONICAL
 
+    def test_schema_2_preserves_path_case_in_the_identity_key(self):
+        upper = f"https://{HOST}/{MIXED_CASE_PATH}"
+
+        assert urls.lookup_key(upper, schema=2) == f"{HOST}/{MIXED_CASE_PATH}"
+        assert urls.lookup_key(upper, schema=2) != urls.lookup_key(CANONICAL, schema=2)
+
     def test_non_default_port_stays_a_different_key(self):
         assert urls.lookup_key(PORTED) == PORTED_KEY
         assert urls.lookup_key(PORTED) != urls.lookup_key(CANONICAL)
@@ -178,6 +184,14 @@ class TestEntryKeys:
     def test_path_case_variants_fold_to_one_key(self):
         keys = urls.entry_keys(f"https://{HOST}/{MIXED_CASE_PATH}", [f"git@{HOST}:{PATH}"])
         assert keys == (CANONICAL,)
+
+    def test_schema_2_keeps_path_case_variants_as_distinct_keys(self):
+        upper = f"https://{HOST}/{MIXED_CASE_PATH}"
+
+        assert urls.entry_keys(upper, [CANONICAL], schema=2) == (
+            f"{HOST}/{MIXED_CASE_PATH}",
+            CANONICAL,
+        )
 
     def test_userless_and_user_qualified_scp_forms_fold_to_one_key(self):
         keys = urls.entry_keys(SPELLINGS["scp"], [SPELLINGS["scp-userless"]])

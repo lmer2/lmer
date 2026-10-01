@@ -14,8 +14,10 @@ async function request(path, options = {}) {
   if (!response.ok) {
     let detail = `HTTP ${response.status}`
     let code = null
+    let errorBody = null
     try {
       const body = await response.json()
+      errorBody = body
       // Most routes answer with `detail` as a sentence. The resume route answers
       // with {code, message}, because two of its refusals are requests for one
       // more field rather than failures — a caller that had to match on the
@@ -36,6 +38,8 @@ async function request(path, options = {}) {
     // Null for every route that answers with a sentence, so a caller branching on
     // a code needs no knowledge of which routes can produce one.
     error.code = code
+    error.source = errorBody?.detail?.source || null
+    error.decisions = errorBody?.detail?.decisions || []
     throw error
   }
   return response.json()
@@ -157,11 +161,15 @@ function runRef({ host, project, slug }) {
 // into — the daemon starts a fresh session carrying the answer. Nothing is
 // recorded when this resolves (the reply is a 202); the answer lands in the run's
 // state a moment later, which the next fleet poll picks up.
-export function answerRun({ host, project, slug }, answer) {
+export function answerRun(
+  { host, project, slug }, answer, { allowUnsignedSource } = {},
+) {
+  const body = { host, project, slug, answer }
+  if (allowUnsignedSource) body.allow_unsigned_source = allowUnsignedSource
   return request('api/runs/answer', {
     method: 'POST',
     headers: jsonHeaders,
-    body: JSON.stringify({ host, project, slug, answer }),
+    body: JSON.stringify(body),
   })
 }
 
@@ -177,12 +185,15 @@ export function answerRun({ host, project, slug }, answer) {
 // happened. `repoUrl` and `direction` are what the daemon's two "one more field"
 // refusals ask for — see the `code` on a rejected request.
 export function resumeRun(
-  { host, project, slug }, { taskdef, repoUrl, direction } = {},
+  { host, project, slug }, {
+    taskdef, repoUrl, direction, allowUnsignedSource,
+  } = {},
 ) {
   const body = { host, project, slug }
   if (taskdef?.trim()) body.taskdef = taskdef.trim()
   if (repoUrl?.trim()) body.repo_url = repoUrl.trim()
   if (direction?.trim()) body.direction = direction.trim()
+  if (allowUnsignedSource) body.allow_unsigned_source = allowUnsignedSource
   return request('api/runs/resume', {
     method: 'POST',
     headers: jsonHeaders,

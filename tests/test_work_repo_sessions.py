@@ -678,7 +678,7 @@ class TestResumeChainsTheLineage:
         rdir, _ = run_state.ensure_run()
         state = run_state.load_state(rdir)
         assert run_state.session_lineage(state) == (SID_A,)
-        assert state["schema"] == run_state.SCHEMA_VERSION == 1
+        assert state["schema"] == 1  # the existing schema-1 tree keeps its write format
         assert state["owner"] is None
 
     def test_a_resume_appends_the_new_harness_id(self, monkeypatch, tmp_path):

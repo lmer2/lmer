@@ -27,8 +27,12 @@ FAMILY = (
     "tests/test_connector_review_boundaries.py",
     "tests/test_lmer_cli_slack_target.py",
     "tests/test_matrix_chat.py",
+    "tests/test_schema_v2_git_transactions.py",
+    "tests/test_schema_v2_mutation_transactions.py",
     "tests/test_slack_connector.py",
     "tests/test_supervisor_teardown.py",
+    "tests/test_work_repo_run_state.py",
+    "tests/test_work_repo_transactions.py",
 )
 
 #: Also covers modules that spawn processes without constructing ChildHarness.

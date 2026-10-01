@@ -10,6 +10,7 @@ import yaml
 
 from .run_state import _backup_bad_state, run_dir
 from .utils import redact_secrets, _collect_secret_values
+from .transactions import mutation_transaction, work_mutation
 
 
 class Logger(ABC):
@@ -38,7 +39,10 @@ class YamlFileLogger(Logger):
             log_file: Path to the log YAML file
         """
         self.log_file = log_file
-        self.log_file.parent.mkdir(parents=True, exist_ok=True)
+        # Locked on the log file's own checkout, not the process environment:
+        # `self` is the first argument here, so the decorator cannot see it.
+        with work_mutation(self.log_file):
+            self.log_file.parent.mkdir(parents=True, exist_ok=True)
 
     def _read_entries(self) -> list:
         """The entries already in the log, or raise rather than lose them.
@@ -104,6 +108,10 @@ class YamlFileLogger(Logger):
             message: The log message
             metadata: Optional metadata dictionary
         """
+        with work_mutation(self.log_file):
+            self._log_locked(message, metadata)
+
+    def _log_locked(self, message: str, metadata: Optional[dict]) -> None:
         # Collect secrets once and reuse for all redaction calls
         secret_values = _collect_secret_values()
 
@@ -170,6 +178,7 @@ class YamlFileLogger(Logger):
             raise
 
 
+@mutation_transaction
 def get_logger(log_file: Optional[Path] = None) -> Logger:
     """
     Get a logger instance based on configuration.

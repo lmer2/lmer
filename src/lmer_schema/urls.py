@@ -17,16 +17,16 @@ reimplementation here would be a security regression, not a refactor: the next
 credential-boundary fix there would silently not apply here.
 ``tests/test_lmer_schema_urls.py`` guards this on the module source.
 
-Two functions, two questions:
+Three functions, two schema contracts:
 
 - ``normalize(url)`` is the canonical SPELLING — what the tool writer emits into
   ``_plexus.yaml`` and what a "non-canonical spelling" WARN compares against.
   It is ``normalize_repo_url`` verbatim: host lowered, path case preserved as
   written.
-- ``lookup_key(url)`` is the COMPARISON key: the spelling folded to lower case,
-  because §4 compares paths case-insensitively (GitHub and GitLab both route
-  paths that way). That fold is the one thing this module adds, and it is a
-  case fold, not a parse. ``entry_keys`` is ``lookup_key`` over an entry.
+- ``lookup_key(url, schema=1)`` is the COMPARISON key. Schema 1 folds the
+  spelling to lower case for compatibility. Schema 2 retains path case as
+  repository identity; the shared normalizer already lowercases the host.
+  ``entry_keys`` applies the same versioned key to an entry's full union.
 
 Re-export decision — ``repo_url_host`` and ``scrub_credentials`` are NOT
 re-exported; callers that need them import from ``lmer_cli.container.sources``
@@ -59,21 +59,25 @@ def normalize(url) -> str:
     return normalize_repo_url(url)
 
 
-def lookup_key(url) -> str:
-    """Comparison key of a remote: ``normalize`` folded to lower case.
+def lookup_key(url, schema: int = 1) -> str:
+    """Comparison key of a remote under the requested root schema.
 
-    §4 preserves path case in the spelling but COMPARES case-insensitively;
-    the host is already lowered by the normalizer, so the fold only ever
-    changes the path. Every §4 spelling of one repo yields one key here, and
-    a non-default port keeps the key distinct (``host:port/path``).
+    Schema 1 folds the normalized spelling to preserve its historical
+    comparison. Schema 2 keeps path case. Both retain non-default ports.
     """
-    return normalize(url).lower()
+    spelling = normalize(url)
+    return spelling if schema >= 2 else spelling.lower()
 
 
-def entry_keys(repo: Optional[str], remotes: Optional[Iterable[str]] = None) -> Tuple[str, ...]:
+def entry_keys(
+    repo: Optional[str],
+    remotes: Optional[Iterable[str]] = None,
+    schema: int = 1,
+) -> Tuple[str, ...]:
     """The lookup keys one registry entry answers to: ``repo:`` first, then
     its ``remotes:`` in declared order, each normalized, without duplicates.
 
+    *schema* selects the same comparison contract as :func:`lookup_key`.
     Empty values contribute nothing, so a repoless project (D19) is ``()`` and
     a single-remote project is a 1-tuple. Only normalizes: two values that
     fold to the same key are collapsed here, and REJECTING that (``repo:``
@@ -84,7 +88,7 @@ def entry_keys(repo: Optional[str], remotes: Optional[Iterable[str]] = None) -> 
     """
     keys = []
     for value in (repo, *(remotes or ())):
-        key = lookup_key(value)
+        key = lookup_key(value, schema=schema)
         if key and key not in keys:
             keys.append(key)
     return tuple(keys)

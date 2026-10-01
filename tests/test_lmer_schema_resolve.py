@@ -22,6 +22,8 @@ never auto-named (D9). These tests, against the shared fixture trees, pin:
   raises rather than demoting to bucket-only (D20).
 """
 
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -77,7 +79,7 @@ def test_project_markers_are_the_spec_list():
     # §1 / SCHEMA.md "Project-shaped directory": any schema area or any
     # legacy area, directly inside. Exactly these, no path-depth rule.
     assert set(PROJECT_MARKERS) == {
-        "_runs", "_plans", "_agents", "_info", "_specs", "_taskdef",
+        "_runs", "_plans", "_agents", "_info", "_specs", "_taskdef", "_claims",
         "runs", "specs", "info", "memory",
     }
 
@@ -432,6 +434,124 @@ class TestPortedRemoteBucket:
         assert bucket_path(tmp_path, normalize(url)) == tmp_path.joinpath(
             host, *project.split("/")
         )
+
+
+class TestSchema2BucketIdentity:
+    def test_non_default_ports_have_distinct_filesystem_addresses(self, tmp_path):
+        first = resolve_project_dir(
+            tmp_path,
+            "ssh://git@git.example.org:2222/Acme/Widgets.git",
+            registry=None,
+            schema=2,
+        )
+        second = resolve_project_dir(
+            tmp_path,
+            "ssh://git@git.example.org:2200/Acme/Widgets.git",
+            registry=None,
+            schema=2,
+        )
+
+        assert first.bucket_path == tmp_path / "git.example.org%3A2222" / "Acme" / "Widgets"
+        assert second.bucket_path == tmp_path / "git.example.org%3A2200" / "Acme" / "Widgets"
+        assert first.bucket_path != second.bucket_path
+
+    def test_path_case_variants_have_distinct_real_temp_tree_addresses(self, tmp_path):
+        upper = resolve_project_dir(
+            tmp_path, "https://git.example.org/Acme/Widgets.git",
+            registry=None, schema=2,
+        )
+        lower = resolve_project_dir(
+            tmp_path, "https://git.example.org/acme/widgets.git",
+            registry=None, schema=2,
+        )
+        _make_project_shaped(upper.bucket_path)
+        _make_project_shaped(lower.bucket_path)
+
+        assert upper.bucket_path != lower.bucket_path
+        assert resolve_project_dir(
+            tmp_path, "https://git.example.org/Acme/Widgets.git",
+            registry=None, schema=2,
+        ).path == upper.bucket_path
+        assert resolve_project_dir(
+            tmp_path, "https://git.example.org/acme/widgets.git",
+            registry=None, schema=2,
+        ).path == lower.bucket_path
+
+    def test_existing_schema_1_bucket_makes_ported_schema_2_placement_ambiguous(
+            self, tmp_path):
+        _make_project_shaped(tmp_path / "git.example.org" / "Acme" / "Widgets")
+
+        with pytest.raises(RegistryError, match="ambiguous"):
+            resolve_project_dir(
+                tmp_path,
+                "ssh://git@git.example.org:2222/Acme/Widgets.git",
+                registry=None,
+                schema=2,
+            )
+
+    def test_registered_project_is_authoritative_over_legacy_bucket(self, tmp_path):
+        (tmp_path / "_plexus.yaml").write_text(
+            yaml.safe_dump({
+                "schema": 2,
+                "name": "test",
+                "projects": {
+                    "widgets": {
+                        "repo": "ssh://git@git.example.org:2222/Acme/Widgets.git",
+                    },
+                },
+            }),
+            encoding="utf-8",
+        )
+        _make_project_shaped(tmp_path / "widgets")
+        _make_project_shaped(tmp_path / "git.example.org" / "Acme" / "Widgets")
+
+        result = resolve_project_dir(
+            tmp_path, "ssh://git@git.example.org:2222/Acme/Widgets.git",
+        )
+
+        assert result.how == REGISTRY_HIT
+        assert result.path == tmp_path / "widgets"
+        assert result.bucket_path == (
+            tmp_path / "git.example.org%3A2222" / "Acme" / "Widgets"
+        )
+
+    def test_schema_1_compatibility_symlink_is_not_an_ambiguous_real_bucket(
+            self, tmp_path):
+        target = _make_project_shaped(tmp_path / "widgets")
+        legacy = tmp_path / "git.example.org" / "Acme" / "Widgets"
+        legacy.parent.mkdir(parents=True)
+        legacy.symlink_to(target)
+
+        result = resolve_project_dir(
+            tmp_path,
+            "ssh://git@git.example.org:2222/Acme/Widgets.git",
+            registry=None,
+            schema=2,
+        )
+
+        assert result.how == MISS
+        assert result.bucket_path == (
+            tmp_path / "git.example.org%3A2222" / "Acme" / "Widgets"
+        )
+
+    def test_uninspectable_parent_fails_closed(self, tmp_path, monkeypatch):
+        (tmp_path / "git.example.org").mkdir()
+        real_iterdir = Path.iterdir
+
+        def refuse_root_inspection(path):
+            if path == tmp_path:
+                raise PermissionError("test denies directory inspection")
+            return real_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", refuse_root_inspection)
+
+        with pytest.raises(RegistryError, match="cannot inspect"):
+            resolve_project_dir(
+                tmp_path,
+                "https://git.example.org/Acme/Widgets.git",
+                registry=None,
+                schema=2,
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -52,6 +52,7 @@ const draft = ref('')
 const busy = ref(false)
 const error = ref(null)
 const startedSession = ref(null)
+const unsignedSource = ref(null)
 
 const note = computed(() => props.run.attention?.note || '')
 const questionRecorded = computed(
@@ -66,14 +67,19 @@ const canSend = computed(
   () => !handedOff.value && !!draft.value.trim() && !busy.value,
 )
 
-async function submit() {
+async function submitWithDecision(allowUnsignedSource = null) {
   if (!canSend.value) return
   busy.value = true
   error.value = null
   try {
-    const result = await answerRun(props.run, draft.value.trim())
+    const result = await answerRun(
+      props.run,
+      draft.value.trim(),
+      allowUnsignedSource ? { allowUnsignedSource } : {},
+    )
     startedSession.value = result.session?.session_id || 'a new session'
     draft.value = ''
+    unsignedSource.value = null
     emit('answered')
   } catch (exc) {
     // Loud, and in the server's own words: every refusal names both the reason and
@@ -84,9 +90,24 @@ async function submit() {
     // so a failed respawn means the answer exists nowhere but this box; clearing it
     // would be the one way for an operator to actually lose what they typed.
     error.value = exc.message
+    unsignedSource.value = exc.code === 'unsigned_session' ? exc.source : null
   } finally {
     busy.value = false
   }
+}
+
+function submit() {
+  return submitWithDecision()
+}
+
+function continueUnsignedSource() {
+  const uid = unsignedSource.value?.uid
+  if (uid) return submitWithDecision(uid)
+}
+
+function cancelUnsignedSource() {
+  error.value = null
+  unsignedSource.value = null
 }
 </script>
 
@@ -123,8 +144,21 @@ async function submit() {
         before you answer.
       </v-alert>
 
-      <v-alert v-if="error" type="error" density="compact" class="mt-3">
+      <v-alert
+        v-if="error"
+        :type="unsignedSource ? 'warning' : 'error'"
+        density="compact"
+        class="mt-3"
+      >
         {{ error }}
+        <div v-if="unsignedSource?.uid" class="d-flex flex-wrap ga-2 mt-3">
+          <v-btn color="warning" variant="tonal" @click="continueUnsignedSource">
+            continue fresh
+          </v-btn>
+          <v-btn variant="text" @click="cancelUnsignedSource">
+            cancel and wait
+          </v-btn>
+        </div>
       </v-alert>
 
       <v-alert v-if="startedSession" type="success" density="compact" class="mt-3">

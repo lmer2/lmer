@@ -606,7 +606,8 @@ class TestClaimStatus:
         # warning, never a failure.
         state = run_state.seed_state("release-main", "release", "main")
         state["schema"] = run_state.SCHEMA_VERSION + 1
-        run_state.write_state(run_env, state)
+        run_env.mkdir(parents=True, exist_ok=True)
+        (run_env / "state.yaml").write_text(yaml.safe_dump(state))
         assert _main(["release", "claim-status"]) == 0
         assert "schema" in capsys.readouterr().err
 

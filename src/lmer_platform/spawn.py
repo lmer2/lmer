@@ -159,7 +159,7 @@ from lmer_cli.supervisor import (
 )
 from lmer_cli.service import ServiceError
 from lmer_cli.user_harnesses import CONTAINER_HARNESSES_DIR
-from work_repo import run_state
+from work_repo import run_state, session_record
 
 from . import (
     ask, codex_config, memory, meta, registry, runs, slots, statusline, uploads, workrepo,
@@ -227,6 +227,8 @@ ANSWER_FLAG = "--answer"
 #: to verbs that check before they spawn — and emitted from a typed field for
 #: the same reason: which record a session lands in is not caller text.
 SESSION_FLAG = "--session"
+SOURCE_SESSION_FLAG = "--source-session"
+SOURCE_ACK_FLAG = "--allow-unsigned-source"
 
 #: The flag ``lmer`` selects a named startup preset with, spelled by
 #: :func:`_build_command` from :attr:`SpawnRequest.preset`. The name is resolved
@@ -334,6 +336,8 @@ _RESERVED_ARGS = (
     # A raw POST /api/sessions must not be able to do from argv what those verbs
     # will not do from a request body.
     SESSION_FLAG,
+    SOURCE_SESSION_FLAG,
+    SOURCE_ACK_FLAG,
     # The next four are reserved for a different reason from the rest, and it
     # is not that they are dangerous to a session: the platform *emits* all
     # four, from typed fields, and writes what it emitted into the registry
@@ -657,6 +661,17 @@ class SpawnRequest:
     #: The two namespaces both get called a session and neither is derived from
     #: the other (:mod:`lmer_platform.resume`'s module docstring).
     session_id: Optional[str] = None
+    #: Read-only context for a schema-2 launch. Unlike ``session_id``, this never
+    #: chooses the record the new execution writes; the container mints that UID
+    #: after it has detected schema 2.
+    source_session_id: Optional[str] = None
+    #: An explicit decision to continue from a source that has no final
+    #: ``session_end``. The value is the selected source UID itself, never a
+    #: boolean force switch, so a retry cannot authorize a different record.
+    allow_unsigned_source: Optional[str] = None
+    #: Extensible launch metadata sent as JSON. Unknown fields survive and secret
+    #: values are scrubbed before the child process can record them.
+    session_metadata: Optional[dict] = None
     identity_repo_url: Optional[str] = None
     no_repo: bool = False
     #: What this orchestrator files the run under, one line
@@ -738,6 +753,26 @@ class SpawnRequest:
                 )
             _reject_option_value("session_id", self.session_id)
             _reject_unsafe_session_id(self.session_id)
+        if self.source_session_id is not None:
+            if (
+                not isinstance(self.source_session_id, str)
+                or not self.source_session_id.strip()
+            ):
+                raise SpawnError(
+                    "source_session_id must be non-empty text, got "
+                    f"{self.source_session_id!r}"
+                )
+            _reject_unsafe_session_id(self.source_session_id)
+        if self.allow_unsigned_source is not None:
+            if self.allow_unsigned_source != self.source_session_id:
+                raise SpawnError(
+                    "allow_unsigned_source must exactly match the selected "
+                    "source_session_id"
+                )
+        if self.session_metadata is not None and not isinstance(
+            self.session_metadata, dict
+        ):
+            raise SpawnError("session_metadata must be a JSON object")
         # The flag *arguments* the platform emits. Absent is the normal case
         # and says nothing; present and unusable is refused here rather than
         # discovered by the child, which can only report it by exiting 2 — after
@@ -782,6 +817,22 @@ class SpawnRequest:
                 "has no repository (spec D17) or belongs to one, so say which"
             )
         return self
+
+
+def _session_metadata(request: SpawnRequest) -> dict:
+    """Compose platform metadata through the shared session-record policy."""
+    effort = os.environ.get("LMER_REASONING_EFFORT") or None
+    return session_record.compose_launch_metadata(
+        request.session_metadata,
+        harness=request.harness,
+        model=request.model,
+        effort=effort,
+        config={
+            "preset": request.preset,
+            "agents": request.agents,
+            "slot": request.slot,
+        },
+    )
 
 
 @dataclass
@@ -2451,6 +2502,10 @@ def _build_command(config: PlatformConfig, request: SpawnRequest) -> list:
         cmd += ["--ports", str(request.ports)]
     if request.session_id:
         cmd += [f"{SESSION_FLAG}={request.session_id}"]
+    if request.source_session_id:
+        cmd += [f"{SOURCE_SESSION_FLAG}={request.source_session_id}"]
+    if request.allow_unsigned_source:
+        cmd += [f"{SOURCE_ACK_FLAG}={request.allow_unsigned_source}"]
     if request.answer:
         cmd += [f"{ANSWER_FLAG}={request.answer}"]
     cmd += [str(arg) for arg in request.extra_args]
@@ -3140,6 +3195,11 @@ def _spawn_session(
         "LMER_FASTAPI_PORT": str(control_port),
         "LMER_FASTAPI_TOKEN": control_token,
         "LMER_SESSION_KIND": kind,
+        session_record.SOURCE_ENV: request.source_session_id or "",
+        session_record.SOURCE_ACK_ENV: request.allow_unsigned_source or "",
+        session_record.METADATA_ENV: json.dumps(
+            _session_metadata(request), ensure_ascii=False, separators=(",", ":")
+        ),
         "LMER_PLATFORM_TERMINAL_CONFIRM_SECONDS": str(
             terminal_settings()["confirm_seconds"].value
         ),

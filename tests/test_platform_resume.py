@@ -100,7 +100,10 @@ def resume_recording_lmer(tmp_path):
         "           'prompt': ns.prompt, 'answer': ns.answer, 'rest': rest,\n"
         # getattr rather than ns.session so a suite run against a CLI without the
         # flag reports the missing *flag* rather than dying inside the stub.
-        "           'session': getattr(ns, 'session', None)}\n"
+        "           'session': getattr(ns, 'session', None),\n"
+        "           'source_session': os.environ.get('LMER_SOURCE_SESSION_ID'),\n"
+        "           'allow_unsigned': os.environ.get('LMER_ALLOW_UNSIGNED_SOURCE'),\n"
+        "           'metadata': json.loads(os.environ.get('LMER_SESSION_METADATA', '{}'))}\n"
         f"open({str(dump)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n"
         # Staying alive is how a test keeps the session's registry entry around; a
         # clean exit reaps it, which would race any assertion about a live one.
@@ -144,6 +147,7 @@ def plant_run(
     status="in-progress",
     recorded_slug=...,
     session_id=None,
+    schema=1,
     extra="",
 ):
     """Write one run dir into the mirror the way a pushed run appears there.
@@ -167,7 +171,7 @@ def plant_run(
     else:
         path = config.mirror_path / host / project / "_runs" / slug / session_id
     path.mkdir(parents=True, exist_ok=True)
-    lines = ["schema: 1", f"status: {json.dumps(status)}"]
+    lines = [f"schema: {schema}", f"status: {json.dumps(status)}"]
     recorded = slug if recorded_slug is ... else recorded_slug
     for name, value in (
         ("slug", recorded), ("taskdef", taskdef), ("target", target),
@@ -219,6 +223,34 @@ def child_payload(dump, timeout=10.0):
         "the resuming session never started"
     )
     return json.loads(dump.read_text(encoding="utf-8"))
+
+
+def plant_schema_two_source(config, *, signed_out=False):
+    """One opaque schema-2 source record with launch provenance."""
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        "schema: 2\nname: example-plexus\nprojects: {}\n", encoding="utf-8"
+    )
+    source = plant_run(
+        config, session_id="a" * 32, schema=2, stop_reason="yield",
+        extra=(
+            "session:\n"
+            "  uid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "  operator: alice\n"
+            "  hostname: build.example\n"
+            "  started_at: 2026-09-17T12:00:00Z"
+        ),
+    )
+    events = [
+        {"ts": "2026-09-17T12:00:00Z", "type": "session_start"},
+        {"ts": "2026-09-17T12:05:00Z", "type": "phase_set"},
+    ]
+    if signed_out:
+        events.append({"ts": "2026-09-17T12:06:00Z", "type": "session_end"})
+    (source / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+    )
+    return source
 
 
 def snapshot_tree(root):
@@ -1578,6 +1610,63 @@ def test_an_existing_sibling_in_schema_form_is_addressed_by_its_session(config):
 def session_flag_for(session_dir=SESSION_ID):
     """The one argv token that says which launch the session writes in."""
     return f"{spawn.SESSION_FLAG}={session_dir}"
+
+
+def test_schema_two_unsigned_source_refusal_carries_launch_provenance(config):
+    plant_schema_two_source(config)
+    track_run()
+
+    with pytest.raises(resume_mod.UnsignedSessionSource) as caught:
+        resume_mod.resume_run(config, request_for(session_id="a" * 32))
+
+    refusal = caught.value.to_dict()
+    assert refusal == {
+        "code": "unsigned_session",
+        "message": str(caught.value),
+        "source": {
+            "uid": "a" * 32,
+            "operator": "alice",
+            "hostname": "build.example",
+            "started_at": "2026-09-17T12:00:00Z",
+            "last_activity": "2026-09-17T12:05:00Z",
+        },
+        "decisions": ["continue_fresh", "cancel"],
+    }
+    assert registry.list_sessions(live_only=False) == []
+
+
+def test_schema_two_confirmation_starts_fresh_with_read_only_source(
+    config, resume_recording_lmer
+):
+    _script, dump = resume_recording_lmer
+    source = plant_schema_two_source(config)
+    track_run()
+    before = snapshot_tree(source)
+
+    resume_mod.resume_run(config, request_for(
+        session_id="a" * 32, allow_unsigned_source="a" * 32,
+    ))
+
+    payload = child_payload(dump)
+    assert payload["session"] is None
+    assert payload["source_session"] == "a" * 32
+    assert payload["allow_unsigned"] == "a" * 32
+    assert payload["metadata"]["operator"]
+    assert payload["metadata"]["hostname"]
+    assert snapshot_tree(source) == before
+
+
+def test_schema_two_signed_source_needs_no_confirmation(config, resume_recording_lmer):
+    _script, dump = resume_recording_lmer
+    plant_schema_two_source(config, signed_out=True)
+    track_run()
+
+    resume_mod.resume_run(config, request_for(session_id="a" * 32))
+
+    payload = child_payload(dump)
+    assert payload["source_session"] == "a" * 32
+    assert payload["allow_unsigned"] in (None, "")
+    assert payload["session"] is None
 
 
 def test_a_continue_lands_in_the_record_it_checked(config, resume_recording_lmer):

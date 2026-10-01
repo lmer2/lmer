@@ -163,10 +163,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 from work_repo import run_state
+from work_repo import session_record
+from lmer_schema.manifest import ManifestError, load_manifest
 
 from . import runs
 # Deliberate reuse of two private helpers rather than two second copies of
@@ -220,7 +223,8 @@ logger = logging.getLogger("lmer_platform.resume")
 
 __all__ = [
     "ResumeError", "RunNotTracked", "NotResumable", "RunIsLive", "QuestionOpen",
-    "SessionNotFound", "RepoUrlRequired", "DirectionRequired", "DIRECTION_FLAG",
+    "SessionNotFound", "RepoUrlRequired", "DirectionRequired",
+    "UnsignedSessionSource", "DIRECTION_FLAG",
     "MAX_DIRECTION_CHARS", "ResumeRequest", "ResumeResult", "resume_run",
 ]
 
@@ -309,6 +313,23 @@ class NotResumable(ResumeError):
     code = "not_resumable"
 
 
+class UnsignedSessionSource(NotResumable):
+    """The selected source has no final sign-out and needs an operator decision."""
+
+    code = "unsigned_session"
+
+    def __init__(self, message: str, source: dict):
+        super().__init__(message)
+        self.source = source
+
+    def to_dict(self) -> dict:
+        return {
+            **super().to_dict(),
+            "source": self.source,
+            "decisions": ["continue_fresh", "cancel"],
+        }
+
+
 class RunIsLive(NotResumable):
     """A session is already working the run a resume would land on."""
 
@@ -365,6 +386,7 @@ class ResumeRequest:
     repo_url: Optional[str] = None
     direction: Optional[str] = None
     session_id: Optional[str] = None
+    allow_unsigned_source: Optional[str] = None
 
     def validate(self) -> "ResumeRequest":
         """Return a normalised copy, or raise :class:`ResumeError`.
@@ -392,6 +414,7 @@ class ResumeRequest:
             repo_url=_clean_text("repo_url", self.repo_url),
             direction=_clean_direction(self.direction),
             session_id=_clean_session_id(self.session_id),
+            allow_unsigned_source=_clean_session_id(self.allow_unsigned_source),
             **fields,
         )
 
@@ -1055,6 +1078,76 @@ def _landing_session_id(
     return record_session_id(landing_ref)
 
 
+def _schema_two(config: PlatformConfig) -> bool:
+    """Whether the mirror uses fresh execution records."""
+    try:
+        manifest = load_manifest(config.mirror_path)
+    except ManifestError as exc:
+        raise NotResumable(
+            f"the host mirror manifest cannot be read ({exc}); refusing to "
+            "guess whether the selected session is a source or a writer"
+        ) from exc
+    return manifest is not None and manifest.schema >= 2
+
+
+def _source_provenance(ref: RunDirRef, state: dict, source_uid: str) -> tuple[dict, bool]:
+    """Return visible launch facts and whether the source signed out."""
+    events = run_state.read_events(ref.path, last_n=0)
+    metadata = state.get("session") if isinstance(state.get("session"), dict) else {}
+    def stamp(value) -> str:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return str(value)
+
+    provenance = {
+        "uid": source_uid,
+        "operator": metadata.get("operator", "?"),
+        "hostname": metadata.get("hostname", "?"),
+        "started_at": stamp(metadata.get("started_at", state.get("created", "?"))),
+        "last_activity": stamp(
+            events[-1].get("ts", "?") if events else state.get("updated", "?")
+        ),
+    }
+    return provenance, session_record.signed_out(events)
+
+
+def _schema_two_source(
+    config: PlatformConfig, request: ResumeRequest, ref: RunDirRef, state: dict
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate and return ``(source UID, exact unsigned acknowledgement)``."""
+    if not _schema_two(config):
+        return None, None
+    source_uid = record_session_id(ref)
+    if not source_uid:
+        raise NotResumable(
+            f"{ref.rel_path} is not an execution record, so it cannot be selected "
+            "as schema-2 read-only context"
+        )
+    if (
+        request.allow_unsigned_source is not None
+        and request.allow_unsigned_source != source_uid
+    ):
+        raise ResumeError(
+            "allow_unsigned_source must exactly match the selected source UID "
+            f"{source_uid}"
+        )
+    provenance, signed_out = _source_provenance(ref, state, source_uid)
+    if not signed_out and request.allow_unsigned_source != source_uid:
+        raise UnsignedSessionSource(
+            f"source session {source_uid} has no recorded final session_end "
+            f"(operator={provenance['operator']}, host={provenance['hostname']}, "
+            f"started={provenance['started_at']}, "
+            f"last_activity={provenance['last_activity']}). Choose cancel/wait, "
+            "inspect the prior session separately, or explicitly continue fresh; "
+            "the source will remain read-only and will not be signed out or rewritten.",
+            provenance,
+        )
+    acknowledgement = source_uid if not signed_out else None
+    return source_uid, acknowledgement
+
+
 def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
     """Continue a tracked run by starting its next session.
 
@@ -1073,6 +1166,9 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
     tracked = _require_tracked(request)
     ref = _require_run_dir(config, request)
     state = _load_state(ref)
+    source_session_id, unsigned_source_ack = _schema_two_source(
+        config, request, ref, state
+    )
     taskdef, target = _resume_inputs(state, tracked, ref, request)
     started_slug, continued = _landing_slug(taskdef, target, state, ref, request)
 
@@ -1102,7 +1198,12 @@ def resume_run(config: PlatformConfig, request: ResumeRequest) -> ResumeResult:
             # lands in the launch the operator asked to continue rather than in a
             # fresh one beside it — and nothing for an override, which lands in
             # another group entirely. See :func:`_landing_session_id`.
-            session_id=_landing_session_id(landing_ref, continued),
+            session_id=(
+                None if source_session_id is not None
+                else _landing_session_id(landing_ref, continued)
+            ),
+            source_session_id=source_session_id,
+            allow_unsigned_source=unsigned_source_ack,
             extra_args=_direction_args(request.direction),
         ),
     )

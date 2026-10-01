@@ -1500,10 +1500,10 @@ FIXTURE_REPO = "ssh://git@gitlab.example.com:2222/acme/widgets.git"
 FIXTURE_IDENTITY = ("gitlab.example.com", "acme/widgets")
 
 
-def _plant_manifest(config, projects, *, name="example-plexus"):
+def _plant_manifest(config, projects, *, name="example-plexus", schema=1):
     """A ``_plexus.yaml`` at the mirror root — the registry IS the identity (D8)."""
     (config.mirror_path / "_plexus.yaml").write_text(
-        yaml.safe_dump({"schema": 1, "name": name, "projects": projects}),
+        yaml.safe_dump({"schema": schema, "name": name, "projects": projects}),
         encoding="utf-8",
     )
     return config.mirror_path / "_plexus.yaml"
@@ -1558,6 +1558,68 @@ def test_run_dirs_take_a_flat_project_identity_from_the_registry(config):
     assert ref.project == "acme/widgets"
     assert "widgets/" not in f"{ref.host}/{ref.project}", (
         "the short name is the address, not the identity"
+    )
+
+
+def test_schema_2_inventory_preserves_full_endpoint_and_path_case(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {
+        "upper": {"repo": "ssh://git@gitlab.example.com:2222/Acme/Widgets.git"},
+        "lower": {"repo": "ssh://git@gitlab.example.com:2200/acme/widgets.git"},
+    }, schema=2)
+    _plant_session_run(config, "upper", "develop-upper", SESSION_ID)
+    _plant_session_run(config, "lower", "develop-lower", SESSION_ID)
+
+    refs = {ref.slug: (ref.host, ref.project) for ref in workrepo.run_dirs(config)}
+
+    assert refs["develop-upper"] == ("gitlab.example.com:2222", "Acme/Widgets")
+    assert refs["develop-lower"] == ("gitlab.example.com:2200", "acme/widgets")
+
+
+def test_schema_2_source_selection_distinguishes_port_and_path_case(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {
+        "upper": {"repo": "ssh://git@gitlab.example.com:2222/Acme/Widgets.git"},
+        "lower": {"repo": "ssh://git@gitlab.example.com:2200/acme/widgets.git"},
+    }, schema=2)
+    upper = _plant_session_run(config, "upper", "develop-2", SESSION_ID)
+    lower = _plant_session_run(config, "lower", "develop-2", SESSION_ID)
+
+    upper_ref = workrepo.resolve_run_dir(
+        config, "gitlab.example.com:2222", "Acme/Widgets", "develop-2"
+    )
+    lower_ref = workrepo.resolve_run_dir(
+        config, "gitlab.example.com:2200", "acme/widgets", "develop-2"
+    )
+
+    assert upper_ref is not None and upper_ref.path == upper
+    assert lower_ref is not None and lower_ref.path == lower
+
+
+def test_schema_2_unregistered_remote_identity_keeps_port_and_case(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {}, schema=2)
+
+    assert workrepo.primary_remote_identity(
+        config, "ssh://git@git.example.com:2222/Acme/Widgets.git"
+    ) == ("git.example.com:2222", "Acme/Widgets")
+
+
+def test_schema_2_inventory_decodes_unregistered_port_bucket(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {}, schema=2)
+    planted = _plant_session_run(
+        config,
+        "git.example.com%3A2222/Acme/Widgets",
+        "develop-ported",
+        SESSION_ID,
+    )
+
+    ref = _by_slug(config)["develop-ported"]
+
+    assert ref.path == planted
+    assert (ref.host, ref.project) == (
+        "git.example.com:2222", "Acme/Widgets",
     )
 
 
@@ -2373,6 +2435,76 @@ def test_run_dirs_prefer_any_session_id_to_the_newest_thing_on_disk(config):
     os.utime(copy, (2_000_000, 2_000_000))
 
     assert [ref.path for ref in _schema_form_refs(config)] == [session]
+
+
+def test_run_dirs_order_opaque_uids_by_recorded_start_time(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}}, schema=2)
+    group = config.mirror_path / "widgets" / "_runs" / "develop-2"
+    lexically_later = _plant_session_run(
+        config, "widgets", "develop-2", "f" * 32,
+        extra={"schema": 2, "session": {"started_at": "2026-01-01T00:00:00+00:00"}},
+    )
+    chronologically_later = _plant_session_run(
+        config, "widgets", "develop-2", "0" * 32,
+        extra={"schema": 2, "session": {"started_at": "2026-02-01T00:00:00+00:00"}},
+    )
+    os.utime(lexically_later, (3_000_000, 3_000_000))
+    os.utime(chronologically_later, (1_000_000, 1_000_000))
+
+    assert workrepo._newest_session(group) == chronologically_later
+
+
+def test_opaque_uid_sorting_falls_back_from_bad_started_at_to_state_created(config):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}}, schema=2)
+    group = config.mirror_path / "widgets" / "_runs" / "develop-2"
+    created_later = _plant_session_run(
+        config, "widgets", "develop-2", "f" * 32,
+        extra={
+            "schema": 2,
+            "created": "2026-03-01T00:00:00+00:00",
+            "session": {"started_at": "not-a-timestamp"},
+        },
+    )
+    mtime_later = _plant_session_run(
+        config, "widgets", "develop-2", "0" * 32,
+        extra={
+            "schema": 2,
+            "created": "2026-02-01T00:00:00+00:00",
+            "session": {},
+        },
+    )
+    os.utime(created_later, (1_000_000, 1_000_000))
+    os.utime(mtime_later, (3_000_000, 3_000_000))
+
+    assert workrepo._newest_session(group) == created_later
+
+
+def test_opaque_uid_sorting_treats_a_disappearing_record_as_oldest(
+        config, monkeypatch):
+    workrepo.ensure_clone(config)
+    _plant_manifest(config, {"widgets": {"repo": FIXTURE_REPO}}, schema=2)
+    group = config.mirror_path / "widgets" / "_runs" / "develop-2"
+    present = _plant_session_run(
+        config, "widgets", "develop-2", "0" * 32,
+        extra={"schema": 2, "session": {"started_at": "2026-02-01T00:00:00+00:00"}},
+    )
+    disappearing = _plant_session_run(
+        config, "widgets", "develop-2", "f" * 32,
+        extra={"schema": 2, "session": {"started_at": "2026-03-01T00:00:00+00:00"}},
+    )
+    real_sort_key = workrepo.session_record.sort_key
+
+    def vanish_before_sort(path):
+        if path == disappearing and path.exists():
+            (path / "state.yaml").unlink()
+            path.rmdir()
+        return real_sort_key(path)
+
+    monkeypatch.setattr(workrepo.session_record, "sort_key", vanish_before_sort)
+
+    assert workrepo._newest_session(group) == present
 
 
 def test_run_dirs_never_write_into_the_mirror(config):

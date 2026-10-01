@@ -183,6 +183,9 @@ class TestRunStateFragment:
         assert bullet, "the blocking-question contract bullet went missing"
         assert 'lmer ... --answer "<text>"' in bullet.group(0)
         assert 'work answer "<text>"' in bullet.group(0)
+        # A human's route is the platform; the bare shell verb is schema-1 only.
+        assert "POST /api/runs/answer" in bullet.group(0)
+        assert "schema-1" in bullet.group(0)
         assert "FRESH session" in bullet.group(0)
         assert "never revive" in bullet.group(0)
 

@@ -64,8 +64,12 @@ SHUTDOWN = stretch(60.0)
 DRAIN = stretch(60.0)
 #: An in-process thread finishing, or an event the test posted being picked up.
 JOIN = stretch(90.0)
-#: A recovery-CLI subprocess run to completion.
+#: A CLI subprocess run to completion: a recovery CLI, or a `work` verb in a
+#: scratch clone (a release claim fetches, commits, pushes and re-fetches).
 CLI = stretch(90.0)
+#: A Git hook or child parked at a barrier until the test releases it; must
+#: outlive every wait the test performs before the release.
+BARRIER = outlast(SETTLE)
 #: Interleaving probe in test_connector_ingestion.py.
 SCRIPT = stretch(360.0)
 #: The contained orphan probe can perform three SETTLE waits in sequence.

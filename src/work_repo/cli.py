@@ -27,6 +27,9 @@ from .git_ops import (
     commit_napkin_if_subdir,
     commit_work_changes,
     commit_work_path,
+    fetch_publication_head,
+    publish_overlay_commit,
+    published_file,
     push_napkin_if_separate,
     report_uncommitted_work_items,
     run_dir_push_status,
@@ -36,6 +39,10 @@ from .git_ops import (
 )
 from . import goals, plan_index, release_run, run_state, specs_index, write_journal
 from .memory import memory_write_rel_paths, persist_memory, restore_memory
+from .transactions import (
+    checkout_lock, inherited_transaction, mutation_transaction, queue_paths,
+    work_mutation, work_transaction,
+)
 from .utils import (
     MANIFEST_PROBLEM,
     redact_secrets,
@@ -241,6 +248,12 @@ Examples:
         "-m",
         help="Commit message (defaults to auto-generated)",
     )
+    for action in ("forget", "revive"):
+        retirement_parser = memory_subparsers.add_parser(
+            action, help=f"Explicitly {action} a scoped schema-2 memory"
+        )
+        retirement_parser.add_argument("scoped_path", help="Work-repo-relative memory path")
+        retirement_parser.add_argument("--message", "-m", help="Commit message")
 
     # setup-workspace command
     setup_ws_parser = subparsers.add_parser(
@@ -656,6 +669,7 @@ def render_truncated_log(log_file: Path, max_lines: int = 50) -> int:
     return 0
 
 
+@work_transaction
 def cmd_log(message: str | None, metadata: list[str]) -> int:
     """
     Execute log command.
@@ -717,6 +731,8 @@ def cmd_log(message: str | None, metadata: list[str]) -> int:
         # logging — the entry still lands at the resolved run path.
         try:
             run_state.ensure_run()
+        except run_state.RunStateError:
+            raise  # ownership/version refusals are a write boundary
         except Exception:
             pass
 
@@ -739,10 +755,11 @@ def _sync_masterplan_links() -> list[str]:
     now present at the run-dir root ([] when there is nothing to sync).
     """
     try:
-        rdir = run_state.run_dir()
-        if rdir is None or not rdir.is_dir():
-            return []
-        return run_state.sync_masterplan_artifacts(rdir)
+        with work_mutation():
+            rdir = run_state.run_dir()
+            if rdir is None or not rdir.is_dir():
+                return []
+            return run_state.sync_masterplan_artifacts(rdir)
     except Exception as exc:
         print(f"⚠️  masterplan artifact sync skipped: {exc}")
         return []
@@ -783,6 +800,7 @@ def cmd_commit(message: str | None) -> int:
     return rc
 
 
+@work_transaction
 def cmd_report(file_path: str) -> int:
     """
     Execute report command.
@@ -818,6 +836,8 @@ def cmd_report(file_path: str) -> int:
         # dir. Fail-soft: a state-layer problem must not lose the report.
         try:
             rdir, _ = run_state.ensure_run()
+        except run_state.RunStateError:
+            raise  # never place output in a record this writer cannot own
         except Exception:
             pass
 
@@ -863,6 +883,7 @@ def _goal_file() -> Path:
     return Path(GOAL_FILE_DIR or "/tmp") / f"lmer_work_goal.{stem}.txt"
 
 
+@work_transaction
 def cmd_goal(
     description: str | None,
     estimate_sessions: int | None = None,
@@ -954,7 +975,9 @@ def cmd_goal(
         return 1
 
 
-def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser) -> int:
+@work_transaction
+def cmd_memory(action: str | None, message: str | None, parser: argparse.ArgumentParser,
+               scoped_path: str | None = None) -> int:
     """
     Execute memory command.
 
@@ -970,6 +993,28 @@ def cmd_memory(action: str | None, message: str | None, parser: argparse.Argumen
         return restore_memory()
     elif action == "persist":
         return persist_memory(message)
+    elif action in ("forget", "revive"):
+        from .memory import (
+            MemoryRetirementError, forget_memory, revive_memory, memory_retirement_paths,
+        )
+        from . import write_journal
+
+        try:
+            operation = forget_memory if action == "forget" else revive_memory
+            rels = memory_retirement_paths(scoped_path)
+            write_journal.record_write_intent(f"memory {action}", rels)
+            pending = queue_paths(_work_repo_root(), rels)
+            try:
+                rels = operation(scoped_path)
+            except (MemoryRetirementError, OSError):
+                if pending is not None:
+                    pending.unlink(missing_ok=True)
+                raise
+            write_journal.record_write_intent(f"memory {action}", rels)
+            return commit_work_path(rels, message or f"memory: {action} {scoped_path}")
+        except (MemoryRetirementError, OSError) as exc:
+            print(f"Memory {action} refused: {exc}", file=sys.stderr)
+            return 1
     else:
         parser.print_help()
         return 1
@@ -1091,6 +1136,7 @@ def cmd_setup_workspace(target: str, task: str, sync_deps: bool) -> int:
     return 0
 
 
+@mutation_transaction
 def _require_run() -> tuple[Path, dict] | tuple[None, None]:
     """Resolve (and if needed create) the current run for mutations.
 
@@ -1204,6 +1250,7 @@ def _redact_json_values(obj):
     return obj
 
 
+@work_transaction
 def cmd_state(args) -> int:
     """Execute state / state set commands."""
     if args.action != "set":
@@ -1328,6 +1375,7 @@ def cmd_state(args) -> int:
     return 0
 
 
+@work_transaction
 def cmd_answer(text: str) -> int:
     """Execute answer command (issue #98 — resume-on-answer).
 
@@ -1397,8 +1445,15 @@ def cmd_verify(name: str, command: list[str]) -> int:
     do around `gate-check`. The marker never defers THIS process (see
     `gate_lock.active_gate`'s self-exclusion), so the receipt still lands.
     """
-    with gate_lock.hold_gate_lock(f"work verify {name.strip() or 'verify'}"):
-        return _run_verify(name, command)
+    # Only setup and receipt mutation acquire the checkout lock. Holding it
+    # while the external command runs would make that command's work helpers
+    # look like nested Git-hook writers and refuse valid writes.
+    try:
+        with gate_lock.hold_gate_lock(f"work verify {name.strip() or 'verify'}"):
+            return _run_verify(name, command)
+    except OSError as exc:
+        print(f"❌ Verify setup refused: {exc}", file=sys.stderr)
+        return 1
 
 
 def _run_verify(name: str, command: list[str]) -> int:
@@ -1494,6 +1549,7 @@ def _run_verify(name: str, command: list[str]) -> int:
     return exit_code
 
 
+@work_transaction
 def cmd_event(args) -> int:
     """Execute event command."""
     data = None
@@ -1617,6 +1673,7 @@ def _name_conflict(rdir: Path, name: str, slug: str | None = None) -> str | None
     return None
 
 
+@work_transaction
 def cmd_name(value: str | None) -> int:
     """Execute name command (spec §1 `work name`).
 
@@ -1665,6 +1722,7 @@ def cmd_name(value: str | None) -> int:
     return 0
 
 
+@work_transaction
 def cmd_ledger(args) -> int:
     """Execute ledger / ledger set commands (issue #89).
 
@@ -1887,6 +1945,7 @@ def _cmd_goals_check() -> int:
     return 0
 
 
+@work_transaction
 def _cmd_goals_freeze(note: str | None) -> int:
     """`work goals freeze`: the spec-approval gate (spec D2 + decision 1).
 
@@ -1953,6 +2012,7 @@ def _cmd_goals_freeze(note: str | None) -> int:
     return 0
 
 
+@work_transaction
 def _cmd_goals_amend(note: str | None) -> int:
     """`work goals amend`: explicit post-freeze change (spec D2). Validates
     the edited goals.md against the last agreed set with the
@@ -2003,6 +2063,7 @@ def _cmd_goals_amend(note: str | None) -> int:
     return 0
 
 
+@work_transaction
 def _cmd_goals_assess(verdict_flags: list[str], note: str | None) -> int:
     """`work goals assess`: the finish gate (spec D2 + D3, nudge-don't-block).
 
@@ -2115,6 +2176,7 @@ def _cmd_goals_assess(verdict_flags: list[str], note: str | None) -> int:
     return 0
 
 
+@work_transaction
 def cmd_goals(args) -> int:
     """Execute goals verbs (issue #91 — frozen goal-sets)."""
     if args.verdict and args.goals_action != "assess":
@@ -2341,7 +2403,10 @@ def cmd_sessions(running_only: bool = False, as_json: bool = False) -> int:
     if running_only:
         rows = [
             row for row in rows
-            if row["status"] == "in-progress" and row["orphaned"] is False
+            if row["status"] == "in-progress" and (
+                row.get("signed_out") is False if "signed_out" in row
+                else row["orphaned"] is False
+            )
         ]
     if as_json:
         payload = [_session_json_entry(row) for row in rows]
@@ -2499,6 +2564,7 @@ def _materialize_artifact(source: Path, dest: Path, rdir: Path) -> str | None:
     return linked
 
 
+@work_transaction
 def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) -> int:
     """Execute artifact command (spec §4.3 `work artifact`, §6 `--sync`)."""
     if sync:
@@ -2592,6 +2658,7 @@ def cmd_artifact(name: str | None, file_path: str | None, sync: bool = False) ->
     return 0
 
 
+@work_transaction
 def cmd_specs_index(rebuild: bool) -> int:
     """Execute specs-index command (issue #101 — central specs directory).
 
@@ -2624,6 +2691,7 @@ def cmd_specs_index(rebuild: bool) -> int:
     return 0
 
 
+@work_transaction
 def cmd_seed(args) -> int:
     """Execute seed command (issue #87 D3 — out-of-session run creation).
 
@@ -2705,7 +2773,11 @@ def _cas_stage_rels(extra_rels: list[str] | None = None) -> list[str]:
     its address. The specs-index file rides along for the same reason it
     does at session end: a dirty tracked file anywhere in the staged set
     would make ``pull --rebase`` refuse."""
-    rels = run_state.run_rel_path_candidates()
+    if run_state.is_process_record():
+        own = run_state.run_dir()
+        rels = [own.relative_to(_work_repo_root()).as_posix()] if own else []
+    else:
+        rels = run_state.run_rel_path_candidates()
     for extra in extra_rels or []:
         if extra not in rels:
             rels.append(extra)
@@ -2730,11 +2802,13 @@ def _sync_remote_head() -> tuple[bool, str]:
     remote head is the normal integration path; the §7 invariant (a CLAIM
     commit is never rebased onto an unchecked head) is preserved because
     the rebase runs only while no claim commit exists locally (the
-    lost-race path drops ours before looping back). The snapshot also makes
-    the lost-race ``reset --hard`` genuinely safe: every pre-existing file
-    — tracked or previously untracked (e.g. an uncommitted retro.md) — is
-    committed BEFORE the pre-claim head is captured, so dropping the claim
-    commit can never destroy anything the verb did not itself write.
+    lost-race path drops ours before looping back).
+
+    Schema 1 only. Every schema-2 claim transition — claim, unclaim, the
+    session-end release and abort — publishes an object built in a
+    temporary index instead (_shared_release_claim, _shared_release_abort),
+    because this rebase refuses outright on a shared checkout whenever any
+    sibling session has an uncommitted tracked file.
     """
     repo = _work_repo_root()
     ok, detail = _commit_claim_write(
@@ -2783,7 +2857,12 @@ def _commit_claim_write(
         # Content already committed (e.g. a same-second refresh) — the CAS
         # push still arbitrates below; nothing to commit is not a failure.
         return True, ""
-    rc, output = run_git_command(["commit", "-m", message], repo, check=False)
+    command = ["commit", "-m", message]
+    if run_state.is_process_record():
+        # Preserve unrelated staged edits as staged edits; a release snapshot
+        # is not permission to include someone else's index in our commit.
+        command += ["--only", "--", *rels]
+    rc, output = run_git_command(command, repo, check=False)
     if rc != 0:
         return False, f"git commit failed: {output}"
     return True, ""
@@ -2795,13 +2874,36 @@ def _drop_claim_commit(pre_head: str) -> None:
     The invariant: a claim commit is NEVER rebased onto a remote head that
     has not been re-checked for a foreign claim — so the loop discards the
     commit and rebuilds the claim from the re-fetched head each attempt.
-    ``reset --hard`` is safe exactly here: _sync_remote_head snapshot-
-    committed every pre-existing change (tracked AND untracked) before
-    ``pre_head`` was captured, so the dropped commit carries only what this
-    verb itself just wrote.
+    Schema 1 does this with a hard reset after snapshotting the run's files.
+
+    The schema-2 branch below is retained for a record-claim rollback on a
+    schema-2 tree; no schema-2 RELEASE transition reaches it any more, since
+    none of them creates a local claim commit to drop.
     """
     if pre_head:
-        run_git_command(["reset", "--hard", pre_head], _work_repo_root(), check=False)
+        repo = _work_repo_root()
+        if run_state.is_process_record():
+            from . import release_claims
+
+            # Only HEAD and this transaction's claim are rolled back. Hooks
+            # or helper commands may have written other files while Git ran.
+            rc, detail = run_git_command(["reset", "--soft", pre_head], repo, check=False)
+            if rc:
+                raise OSError(f"claim HEAD rollback failed: {detail}")
+            rel = release_claims.claim_rel_path()
+            rc, tracked = run_git_command(["ls-tree", "--name-only", pre_head, "--", rel], repo, check=False)
+            if rc:
+                raise OSError(f"claim rollback inspection failed: {tracked}")
+            if tracked.strip():
+                rc, detail = run_git_command(["restore", f"--source={pre_head}", "--staged", "--worktree", "--", rel], repo, check=False)
+            else:
+                rc, detail = run_git_command(["rm", "--cached", "--ignore-unmatch", "--", rel], repo, check=False)
+                if rc == 0:
+                    (repo / rel).unlink(missing_ok=True)
+            if rc:
+                raise OSError(f"claim file rollback failed: {detail}")
+        else:
+            run_git_command(["reset", "--hard", pre_head], repo, check=False)
 
 
 def _cas_commit_and_push(
@@ -2826,6 +2928,9 @@ def _cas_commit_and_push(
     pre_head = _git_head()
     ok, detail = _commit_claim_write(message, extra_rels)
     if not ok:
+        # A failed commit can still leave a staged claim. It must not ride
+        # along in a later ordinary commit and bypass arbitration.
+        _drop_claim_commit(pre_head)
         return CLAIM_PUSH_ERROR, detail
     outcome, detail = claim_push_once(_work_repo_root())
     if outcome != CLAIM_PUSH_WON:
@@ -2962,6 +3067,126 @@ def _roll_over_terminal_release(
     return fresh_rdir, fresh_state, moved_names
 
 
+def _shared_release_claim(
+    *, release: bool = False, force: bool = False, as_json: bool = False
+) -> int:
+    """Arbitrate schema-2 executions on one shared project resource.
+
+    The arbitration never touches the live checkout: the claim commit is
+    assembled in a temporary index seeded from the freshly fetched remote head
+    and pushed as an object. A work-repo checkout is shared — spawn-harness
+    children run beside their parent against one /work — so nothing here may
+    stash, rebase, reset or write it: a sibling session's uncommitted record
+    must not be able to leave the worktree because another session claimed a
+    release. There is correspondingly nothing to roll back on a lost race.
+    """
+    root = _work_repo_root()
+    if inherited_transaction(root):
+        return _claim_fail_closed("invoking Git transaction still owns this checkout", as_json)
+    try:
+        with checkout_lock(root):
+            result = _shared_release_claim_locked(release=release, force=force, as_json=as_json)
+        if isinstance(result, dict):
+            action = "unclaim" if release else "claim"
+            if as_json:
+                print(json.dumps({"result": "won", "action": action, **result}))
+            else:
+                print(f"Release {action} published for session {run_state.current_session_id()}")
+            return 0
+        return result
+    except (OSError, run_state.RunStateError, ValueError) as exc:
+        return _claim_fail_closed(str(exc), as_json)
+
+
+def _published_release_claim(expected_holder):
+    """Read the holder from a freshly fetched published tree, not our write."""
+    from . import release_claims
+    from .git_ops import _publication_destination
+
+    root = _work_repo_root()
+    destination = _publication_destination(root, "work repo")
+    if destination is None:
+        raise run_state.RunStateError("cannot resolve published claim destination")
+    remote, ref = destination
+    rc, output = run_git_command(["fetch", "--no-tags", remote, ref], root, check=False)
+    if rc:
+        raise run_state.RunStateError(f"cannot verify published claim: {output}")
+    rc, output = run_git_command(["show", f"FETCH_HEAD:{release_claims.claim_rel_path()}"], root, check=False)
+    if rc:
+        raise run_state.RunStateError(f"cannot read published claim: {output}")
+    claim = yaml.safe_load(output)
+    if not isinstance(claim, dict) or claim.get("schema") != 1 or claim.get("holder") != expected_holder:
+        raise run_state.RunStateError("published release holder differs from the requested transition")
+    return claim
+
+
+def _published_claim_at(root, commit: str, claim_rel: str) -> dict:
+    """The claim document a published head holds; unclaimed when absent."""
+    from . import release_claims
+
+    present, text = published_file(root, commit, claim_rel)
+    if not present:
+        return dict(release_claims.UNCLAIMED)
+    return release_claims.parse_claim(text, f"{commit}:{claim_rel}")
+
+
+def _shared_release_claim_locked(*, release=False, force=False, as_json=False):
+    """One claim transaction under the checkout lock: evaluate the PUBLISHED
+    claim, build the transition on top of it, and arbitrate with one push.
+
+    Each attempt re-reads the claim from the head it just fetched, so a lost
+    race re-evaluates a foreign claim before retrying — the §7 invariant that
+    a claim is never stacked onto an unchecked head. What the attempt builds
+    is an object graph, not checkout state, so the retry needs no rollback.
+    """
+    from . import release_claims
+
+    root = _work_repo_root()
+    session = run_state.current_session_id()
+    action = "unclaim" if release else "claim"
+    claim_rel = release_claims.claim_rel_path()
+    for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
+        try:
+            rdir, state = _require_run()
+            if rdir is None:
+                return 1
+            if not release and state.get("status") != "in-progress":
+                raise run_state.RunStateError(
+                    "this execution has finished; start a fresh session"
+                )
+            # Commit-first, as every other verb: what this publishes is the
+            # record the local branch already holds, so the next ordinary
+            # `pull --rebase` drops this snapshot as applied rather than
+            # merging two spellings of one session's own files.
+            ok, detail = _commit_claim_write(
+                f"run-state: local snapshot before release {action}"
+            )
+            if not ok:
+                return _claim_fail_closed(detail, as_json)
+            ok, base = fetch_publication_head(root, "work repo")
+            if not ok:
+                return _claim_fail_closed(base, as_json)
+            claim = release_claims.next_claim(
+                _published_claim_at(root, base, claim_rel),
+                session, release=release, force=force,
+            )
+        except (run_state.RunStateError, OSError) as exc:
+            return _claim_fail_closed(str(exc), as_json)
+        outcome, detail, _commit = publish_overlay_commit(
+            root,
+            base=base,
+            message=f"run-state: {state['slug']} release {action}",
+            blobs={claim_rel: release_claims.serialize_claim(claim)},
+            subtrees={rdir.relative_to(root).as_posix(): "HEAD"},
+        )
+        if outcome == CLAIM_PUSH_WON:
+            return _published_release_claim(None if release else session)
+        if outcome != CLAIM_PUSH_LOST_RACE:
+            return _claim_fail_closed(f"{action} push failed: {detail}", as_json)
+    return _claim_fail_closed("release claim push attempts exhausted", as_json)
+
+
+@work_transaction
 def cmd_release_claim(as_json: bool = False) -> int:
     """Execute `work release claim` (RUN-STATE.md §7 — frozen verb table).
 
@@ -2971,6 +3196,10 @@ def cmd_release_claim(as_json: bool = False) -> int:
     (git_ops.claim_push_once — never the rebase-retry path). A
     non-fast-forward rejection re-fetches and re-evaluates, bounded to
     RELEASE_CLAIM_ATTEMPTS.
+
+    On a schema-2 tree the shared claim takes over (_shared_release_claim):
+    the same CAS, the same bound, but published as an object built in a
+    temporary index so the shared checkout is never touched.
 
     A resolved run that is already FINISHED is not refused: it is the
     previous release, parked on the address this one derives, so it is
@@ -2986,6 +3215,8 @@ def cmd_release_claim(as_json: bool = False) -> int:
     written), or the claim could not be established (remote unreachable /
     attempts exhausted): fail closed, never proceed unlocked.
     """
+    if run_state.is_process_record():
+        return _shared_release_claim(as_json=as_json)
     if run_state.run_dir() is None:
         print(no_run_context_error(), file=sys.stderr)
         return 1
@@ -3120,6 +3351,31 @@ def cmd_release_claim(as_json: bool = False) -> int:
     )
 
 
+def _last_published_claim():
+    """The claim as of the last fetch, read from the upstream tracking ref.
+
+    The shared claim lives on the remote; the claim verb publishes it as an
+    object and deliberately never writes the checkout, so the worktree copy
+    is only as fresh as the last `pull`. This reads what the last fetch
+    brought down — no network, and current as of this session's own claim.
+    Returns None when there is no upstream ref or no claim recorded in it.
+    """
+    from . import release_claims
+
+    root = _work_repo_root()
+    rc, head = run_git_command(
+        ["rev-parse", "--verify", "--quiet", "@{upstream}"], root, check=False
+    )
+    if rc != 0 or not head.strip():
+        return None
+    try:
+        rel = release_claims.claim_rel_path()
+        present, text = published_file(root, head.strip(), rel)
+        return release_claims.parse_claim(text, f"@{{upstream}}:{rel}") if present else dict(release_claims.UNCLAIMED)
+    except (run_state.RunStateError, OSError):
+        return None
+
+
 def cmd_release_claim_status(as_json: bool = False) -> int:
     """Execute `work release claim-status` (§7 frozen verb table).
 
@@ -3128,6 +3384,20 @@ def cmd_release_claim_status(as_json: bool = False) -> int:
     convention, like `work ledger`); a broken state layer degrades to a
     warning, never a failure.
     """
+    if run_state.is_process_record():
+        from . import release_claims
+
+        try:
+            claim = _last_published_claim() or release_claims.read_claim()
+            holder = claim.get("holder")
+            verdict = ("unclaimed" if not holder else "ours"
+                       if holder == run_state.current_session_id() else "foreign")
+            payload = {**claim, "verdict": verdict}
+            print(json.dumps(payload) if as_json else
+                  f"Release claim: {verdict} (holder: {holder})")
+        except (run_state.RunStateError, OSError) as exc:
+            print(f"Release claim unreadable: {exc}", file=sys.stderr)
+        return 0
     rdir = run_state.run_dir()
     if rdir is None:
         if as_json:
@@ -3169,6 +3439,7 @@ def cmd_release_claim_status(as_json: bool = False) -> int:
     return 0
 
 
+@work_transaction
 def cmd_release_unclaim(force: bool = False) -> int:
     """Execute `work release unclaim` (§7 frozen verb table).
 
@@ -3178,6 +3449,8 @@ def cmd_release_unclaim(force: bool = False) -> int:
     stranded-claim cleanup. No claim recorded is an idempotent no-op
     success. Mutating-verb rules: no run context is an error (exit 1).
     """
+    if run_state.is_process_record():
+        return _shared_release_claim(release=True, force=force)
     if run_state.run_dir() is None:
         print(no_run_context_error(), file=sys.stderr)
         return 1
@@ -3223,6 +3496,144 @@ def cmd_release_unclaim(force: bool = False) -> int:
     )
 
 
+def _shared_release_abort(*, reason: str | None, force: bool) -> int:
+    """`work release abort` on a schema-2 tree (§7).
+
+    The terminal record writes keep their documented crash-safe order and
+    their exact semantics — `release_run.record_abort` marks the release
+    record terminal first, then `run_state.abort_run` flips status, stop
+    reason and claim in one atomic state write. What changes is only how the
+    transition reaches the remote: the same object publication claim and
+    unclaim take, instead of `pull --rebase` on a shared checkout. That
+    rebase refused outright whenever a sibling session had an uncommitted
+    tracked file — a `work log` away, and the resting state of a shared
+    checkout — so an abort could not complete until every sibling had
+    committed.
+
+    The refusal checks read the PUBLISHED claim rather than the checkout's
+    copy of it, for the reason session end does: the claim verbs no longer
+    write that copy. Already-aborted records retry publication without
+    rewriting history; success verifies the cleared claim and the complete
+    execution record together on a freshly fetched head.
+    """
+    from . import release_claims
+
+    root = _work_repo_root()
+    if inherited_transaction(root):
+        return _claim_fail_closed("invoking Git transaction still owns this checkout")
+    session = run_state.current_session_id()
+    claim_rel = release_claims.claim_rel_path()
+    rdir = run_state.run_dir()
+    try:
+        state = run_state.load_state(rdir)
+    except (run_state.RunStateError, OSError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 1
+    if state is None:
+        print("❌ No release run recorded — nothing to abort", file=sys.stderr)
+        return 1
+    already_aborted = (
+        state.get("status") != "in-progress"
+        and state.get("stop_reason") == "aborted"
+    )
+    if state.get("status") != "in-progress" and not already_aborted:
+        # Checked BEFORE record_abort so a refused abort never marks the
+        # release record terminal.
+        print(f"❌ run '{state.get('slug')}' is already "
+              f"{state.get('status')} (stop_reason: "
+              f"{state.get('stop_reason')}) — nothing to abort", file=sys.stderr)
+        return 1
+    ok, base = fetch_publication_head(root, "work repo")
+    if not ok:
+        return _claim_fail_closed(base)
+    try:
+        published = _published_claim_at(root, base, claim_rel)
+        release_claims.available(published, session, force=force)
+    except (run_state.RunStateError, OSError) as exc:
+        return _claim_fail_closed(str(exc))
+    holder = published.get("holder")
+    if run_state.is_claimed_by_other(state, session) and not force:
+        status = run_state.claim_status(state, session)
+        return _report_claim_lost(
+            run_state.claim_pointer(rdir, state, session),
+            False,
+            f"run '{state.get('slug')}' is claimed by session "
+            f"{status['holder']} ({int(status['age_minutes'])} min ago) — "
+            f"refusing to abort a release another session is driving "
+            f"(pass --force if that session is known dead)",
+        )
+    if not already_aborted:
+        try:
+            release_run.record_abort(rdir, reason=reason)
+            state = run_state.abort_run(
+                rdir, state, reason=reason, session=session, force=force)
+        except (run_state.RunStateError, run_state.ClaimRefusedError, OSError) as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 1
+    # A previous attempt may have saved these terminal writes but failed to
+    # publish them. Retry publication without rewriting the original reason
+    # or events, and recheck the remote holder even for an already-aborted run.
+    last_detail = "no push attempted"
+    for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
+        ok, detail = _commit_claim_write(
+            "run-state: local snapshot before release abort"
+        )
+        if not ok:
+            return _claim_fail_closed(detail)
+        ok, base = fetch_publication_head(root, "work repo")
+        if not ok:
+            return _claim_fail_closed(base)
+        try:
+            claim = release_claims.next_claim(
+                _published_claim_at(root, base, claim_rel),
+                session, release=True, force=force,
+            )
+        except (run_state.RunStateError, OSError) as exc:
+            return _claim_fail_closed(str(exc))
+        outcome, detail, _commit = publish_overlay_commit(
+            root,
+            base=base,
+            message=f"run-state: {state['slug']} release abort",
+            blobs={claim_rel: release_claims.serialize_claim(claim)},
+            subtrees={rdir.relative_to(root).as_posix(): "HEAD"},
+        )
+        if outcome == CLAIM_PUSH_WON:
+            try:
+                _published_release_claim(None)
+                # Check the record on the SAME freshly fetched head as the
+                # claim. A cleared claim alone does not prove the abort's
+                # state, reason and events reached the remote.
+                rc, detail = run_git_command(
+                    ["diff", "--quiet", "--no-ext-diff", "HEAD", "FETCH_HEAD",
+                     "--", rdir.relative_to(root).as_posix()],
+                    root, check=False,
+                )
+                if rc:
+                    raise run_state.RunStateError(
+                        "published abort record differs from the local snapshot"
+                        + (f": {detail}" if detail else "")
+                    )
+            except (run_state.RunStateError, OSError) as exc:
+                return _claim_fail_closed(str(exc))
+            cleared = f" (claim cleared: session {holder})" if holder else ""
+            print(f"✅ Release run aborted: {state.get('slug')}{cleared}")
+            # Precise about WHERE the next release goes: this run keeps its
+            # address until the next `work release claim` rolls it aside —
+            # the abort is a terminal write and nothing else.
+            print("   Bump commit stays on prep-release; the next "
+                  "`work release claim` rolls this run aside and starts the "
+                  "next release run.")
+            return 0
+        if outcome != CLAIM_PUSH_LOST_RACE:
+            return _claim_fail_closed(f"abort push failed: {detail}")
+        last_detail = detail
+    return _claim_fail_closed(
+        f"push attempts exhausted after {RELEASE_CLAIM_ATTEMPTS} "
+        f"non-fast-forward rejections: {last_detail}"
+    )
+
+
+@work_transaction
 def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
     """Execute `work release abort [--reason] [--force]` (release-flow spec §7: the
     abandoned release — bump merged, human declines the release MR).
@@ -3258,6 +3669,8 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
     if run_state.run_dir() is None:
         print(no_run_context_error(), file=sys.stderr)
         return 1
+    if run_state.is_process_record():
+        return _shared_release_abort(reason=reason, force=force)
     last_detail = "no push attempted"
     for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
         ok, detail = _sync_remote_head()
@@ -3287,6 +3700,16 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
         claim = state.get("claim")
         holder = claim.get("session_id") if isinstance(claim, dict) else None
         session = run_state.current_session_id()
+        extra_rels = None
+        if run_state.is_process_record():
+            from . import release_claims
+
+            try:
+                shared = release_claims.require_available(session, force=force)
+                holder = shared.get("holder")
+                extra_rels = [release_claims.claim_rel_path()]
+            except (run_state.RunStateError, OSError) as exc:
+                return _claim_fail_closed(str(exc))
         # Evaluated BEFORE record_abort: a refused abort must leave the
         # release record untouched.
         if run_state.is_claimed_by_other(state, session) and not force:
@@ -3303,11 +3726,13 @@ def cmd_release_abort(reason: str | None = None, force: bool = False) -> int:
             release_run.record_abort(rdir, reason=reason)
             state = run_state.abort_run(
                 rdir, state, reason=reason, session=session, force=force)
+            if extra_rels:
+                release_claims.change_claim(session, release=True, force=force)
         except (run_state.RunStateError, run_state.ClaimRefusedError, OSError) as exc:
             print(f"❌ {exc}", file=sys.stderr)
             return 1
         outcome, detail = _cas_commit_and_push(
-            f"run-state: {state['slug']} release abort"
+            f"run-state: {state['slug']} release abort", extra_rels
         )
         if outcome == CLAIM_PUSH_WON:
             cleared = f" (claim cleared: session {holder})" if holder else ""
@@ -3373,6 +3798,7 @@ def _ensure_release_slug(
     return run_state.reslug_run(rdir, state, target)
 
 
+@work_transaction
 def cmd_release_record(args) -> int:
     """Execute `work release record <field>` (§7 frozen verb table —
     release-flow spec §3).
@@ -3487,7 +3913,10 @@ def _answer_marker_path(answer: str) -> Path:
     container's lifetime — exactly the env var's — so "applied once in this
     container" is the right scope.
     """
-    digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()[:16]
+    # A schema-2 execution may reuse a container but never its predecessor's
+    # identity. The same answer can legitimately answer both fresh records.
+    scope = f"{run_state.current_session_id()}:" if run_state.is_process_record() else ""
+    digest = hashlib.sha256((scope + answer).encode("utf-8")).hexdigest()[:16]
     return Path(ANSWER_MARKER_DIR or "/tmp") / f".lmer-answer-applied-{digest}"
 
 
@@ -3525,6 +3954,7 @@ def _apply_pushed_answer(rdir: Path, state: dict) -> tuple[dict, dict | None]:
     return state, answered
 
 
+@work_transaction
 def cmd_session_start(session: str | None = None) -> int:
     """Seed-if-absent, claim, log, and print the resume brief. Hook-facing:
     ALWAYS exits 0 — a broken state layer must never break session start.
@@ -3538,6 +3968,14 @@ def cmd_session_start(session: str | None = None) -> int:
     forwarded into the container and kept in step with the directory. A
     legacy tree keeps one shared run dir per target and chains nothing.
     """
+    from .utils import SchemaContextError
+
+    try:
+        if run_state.is_process_record():
+            return _start_process_record(session)
+    except SchemaContextError as exc:
+        print(f"No run context: {exc} — run state skipped")
+        return 0
     try:
         session = _launch_session(session)
         rdir = run_state.run_dir(session=session)
@@ -3647,6 +4085,31 @@ def cmd_session_start(session: str | None = None) -> int:
     return 0
 
 
+def _start_process_record(source_session: str | None = None) -> int:
+    """Schema-2 hook: seed our record and print read-only predecessor context."""
+    try:
+        rdir, state = run_state.ensure_run(session=source_session)
+        state, answered = _apply_pushed_answer(rdir, state)
+        context = state.get("context") or {}
+        if context:
+            decision = run_state.decide(
+                state, run_state.read_events(rdir, last_n=25), run_state.current_session_id()
+            )
+            print(f"Context from session {context['source_session_uid']} (read-only):")
+            print(run_state.format_brief(decision, answered=answered))
+        starts = [e for e in run_state.read_events(rdir, last_n=0) if e.get("type") == "session_start"]
+        if not starts:
+            run_state.append_event(rdir, "session_start", data={"session": state["session"]})
+        state["owner"] = {"session_id": run_state.current_session_id(), "claimed_at": run_state.utc_now_iso()}
+        run_state.write_state(rdir, state)
+        print(f"Session {state['session']['uid']} owns {rdir}")
+        return 0
+    except (run_state.RunStateError, ValueError) as exc:
+        print(f"Session start refused: {exc}", file=sys.stderr)
+        return 2
+
+
+@work_transaction
 def _release_claim_at_session_end(rdir) -> None:
     """Release a release claim THIS session holds, at clean session end (§7).
 
@@ -3661,6 +4124,9 @@ def _release_claim_at_session_end(rdir) -> None:
     backstop.
     """
     session = run_state.current_session_id()
+    if run_state.is_process_record():
+        _shared_release_claim(release=True)
+        return
     for _attempt in range(RELEASE_CLAIM_ATTEMPTS):
         ok, detail = _sync_remote_head()
         if not ok:
@@ -3690,9 +4156,10 @@ def _release_claim_at_session_end(rdir) -> None:
           "leaving the claim to the stale threshold")
 
 
+@work_transaction(failure_result=0)
 def cmd_session_end() -> int:
     """Record session end, release a claim we hold, and push the run dir.
-    Hook-facing: ALWAYS exits 0."""
+    Hook-facing: ALWAYS exits 0; transaction refusal warns before any write."""
     rdir = run_state.run_dir()
     if rdir is None:
         return 0
@@ -3715,10 +4182,25 @@ def cmd_session_end() -> int:
         run_state.write_state(rdir, state)
         # The single-flight release claim (§7) is a separate lock from
         # `owner` and must be released through the CAS path, not a plain
-        # state write — check on the LOCAL view first so non-release
-        # sessions never pay the git round-trips.
-        if (run_state.claim_status(state, run_state.current_session_id())
-                ["verdict"] == run_state.CLAIM_OURS):
+        # state write — decided without a network round trip, so non-release
+        # sessions pay nothing for it.
+        if run_state.is_process_record():
+            from . import release_claims
+
+            # From the PUBLISHED claim, not the checkout's copy: the claim
+            # verb publishes an object and deliberately leaves that copy
+            # alone, so it is absent or stale unless something has pulled
+            # since. Reading it here made a holder skip its own release and
+            # strand the claim — and schema 2 has no age expiry to clear one
+            # (`available`), so only `unclaim --force` could. The upstream
+            # tracking ref was updated by this session's own claim, and
+            # reading it costs no network.
+            claim = _last_published_claim() or release_claims.read_claim()
+            held = claim.get("holder") == run_state.current_session_id()
+        else:
+            held = (run_state.claim_status(state, run_state.current_session_id())
+                    ["verdict"] == run_state.CLAIM_OURS)
+        if held:
             _release_claim_at_session_end(rdir)
         rels = run_state.run_rel_path_candidates()
         # Masterplan-sync (and freeze-rename) specs-index entries ride along —
@@ -3775,7 +4257,12 @@ def _write_intent_rel_paths(args) -> list[str] | None:
     if command == "release":
         action = getattr(args, "release_action", None)
         if action in ("claim", "unclaim", "abort", "record"):
-            return run_candidates()
+            rels = run_candidates()
+            if run_state.is_process_record():
+                from . import release_claims
+
+                rels.append(release_claims.claim_rel_path())
+            return rels
         return None
     if command in ("state", "ledger"):
         return run_candidates() if getattr(args, "action", None) == "set" else None
@@ -3801,6 +4288,10 @@ def _write_intent_rel_paths(args) -> list[str] | None:
         except Exception:
             return []
     if command == "memory":
+        if getattr(args, "memory_action", None) in ("forget", "revive"):
+            from .memory import memory_retirement_paths
+
+            return memory_retirement_paths(args.scoped_path)
         if getattr(args, "memory_action", None) != "persist":
             return None
         # The writer owns the shape: memory has one scope in a legacy tree and
@@ -3835,6 +4326,20 @@ def _journal_write_intent(args) -> None:
         pass
 
 
+#: A schema-2 record belongs to a launch, so a shell with no session UID cannot
+#: record an answer; this is where the human's answer goes instead.
+_ANSWER_ROUTE_HINT = (
+    "   A schema-2 record must belong to a launch, so a bare shell cannot record "
+    "an answer.\n"
+    "   Answer through the platform instead: the run's answer card in the UI, or "
+    "POST /api/runs/answer\n"
+    "   (`lmer-ctl runs answer KEY TEXT`); either starts a session that carries "
+    "the answer.\n"
+    "   From a host shell, `lmer ... --session <asking UID> --answer \"<text>\"` "
+    "does the same."
+)
+
+
 def main() -> int:
     """Main entry point for work CLI.
 
@@ -3856,6 +4361,25 @@ def main() -> int:
         parser.print_help()
         return 1
 
+    # Record-writing helpers inherit their execution's UID. Without one,
+    # a read resolver may choose the latest record, but a writer must refuse.
+    if args.command not in ("memory", "specs-index"):
+        from .utils import SchemaContextError
+
+        try:
+            if run_state.is_process_record() and _write_intent_rel_paths(args) is not None:
+                from .session_record import current_metadata
+
+                current_metadata()
+        except SchemaContextError:
+            # Existing dispatch reports the manifest cause, retaining each
+            # read-only/hook verb's documented exit behavior.
+            pass
+        except ValueError as exc:
+            print(f"Session write refused: {exc}", file=sys.stderr)
+            if args.command == "answer":
+                print(_ANSWER_ROUTE_HINT, file=sys.stderr)
+            return 2
     _journal_write_intent(args)
     try:
         return _dispatch(args, parser)
@@ -3876,7 +4400,8 @@ def _dispatch(args, parser) -> int:
     elif args.command == "goal":
         return cmd_goal(args.description, args.estimate_sessions, args.estimate_time)
     elif args.command == "memory":
-        return cmd_memory(args.memory_action, getattr(args, "message", None), parser)
+        return cmd_memory(args.memory_action, getattr(args, "message", None), parser,
+                          getattr(args, "scoped_path", None))
     elif args.command == "setup-workspace":
         return cmd_setup_workspace(args.target, args.task, not args.no_sync)
     elif args.command == "state":

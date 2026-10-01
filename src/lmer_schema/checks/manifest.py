@@ -294,7 +294,9 @@ def _report_broken(report, path, exc) -> None:
         finding = schema_finding(raw.get("schema"))
         if finding is not None:
             report.add(finding[0], _MANIFEST_PATH, finding[1])
-            diagnosed = True
+            # An older supported version is a warning, not the reason this
+            # document failed to parse. Keep the underlying error visible.
+            diagnosed = finding[0] != "manifest.schema-older"
         name = raw.get("name")
         if not isinstance(name, str) or not name:
             report.add(

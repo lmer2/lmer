@@ -223,7 +223,7 @@ LEGACY_LAYOUT = "legacy"
 
 #: The ``LMER_SESSION_ID`` form (``libexec/harness-common.sh``: UTC
 #: ``%Y%m%d-%H%M%S`` + pid + random), as SCHEMA.md states it.
-SESSION_ID_RE = re.compile(r"\d{8}-\d{6}-\d+-\d+")
+SESSION_ID_RE = re.compile(r"(?:\d{8}-\d{6}-\d+-\d+|[0-9a-f]{32})")
 
 #: A session DIRECTORY: the id, plus the ``--<name>`` suffix the freeze
 #: rename appends once a session is named. The name half is deliberately
@@ -363,6 +363,18 @@ _DETAIL_LIMIT = 120
 # table and are consumed, not re-registered — registering twice raises).
 # ---------------------------------------------------------------------------
 
+register(
+    "record.session-metadata",
+    Severity.ERROR,
+    tier=Tier.MACHINE,
+    summary="schema-2 session metadata must be a mapping with the record's UID",
+)
+register(
+    "record.release-claim",
+    Severity.ERROR,
+    tier=Tier.MACHINE,
+    summary="schema-2 shared release claim cannot be safely interpreted",
+)
 register(
     "record.grouping-level-entry",
     Severity.WARN,
@@ -521,7 +533,8 @@ def _is_legacy_target(path: Path) -> bool:
     return any((path / marker).exists() for marker in LEGACY_TARGET_MARKERS)
 
 
-def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECONDS) -> None:
+def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECONDS,
+                 manifest=..., projects=None) -> None:
     """Run every record-area check over the plexus at *root* into *report*.
 
     *now* is the instant staleness is measured against (default: UTC now),
@@ -532,6 +545,24 @@ def check_record(root, report: Report, *, now=None, stale_after=STALE_AFTER_SECO
     """
     root = Path(root)
     now = _utc(now) if now is not None else datetime.now(timezone.utc)
+    from lmer_schema.manifest import ManifestError, load_manifest
+    from lmer_schema.checks.walk import project_dirs
+    from work_repo.release_claims import read_claim
+    from work_repo.run_state import RunStateError
+
+    if manifest is ...:
+        try:
+            manifest = load_manifest(root)
+        except ManifestError:
+            manifest = None  # the manifest stage already reports the exact cause
+    if manifest is not None and manifest.schema >= 2:
+        for project in project_dirs(root) if projects is None else projects:
+            path = Path(project) / "_claims" / "release.yaml"
+            try:
+                read_claim(path)
+            except RunStateError:
+                report.add("record.release-claim", _rel(root, path),
+                           "invalid shared release claim; arbitration must refuse")
     for area, layout in iter_run_areas(root):
         if layout == SESSION_LAYOUT:
             _check_session_area(root, area, report, now=now, stale_after=stale_after)
@@ -657,6 +688,13 @@ def _check_state(root, rdir, path, report, *, layout, now, stale_after) -> None:
     if data is None:
         return
     _check_schema_int(root, path, report, data, required=False)
+    if data.get("schema") == 2:
+        metadata = data.get("session")
+        uid = metadata.get("uid") if isinstance(metadata, dict) else None
+        if (not isinstance(uid, str) or re.fullmatch(r"[0-9a-f]{32}", uid) is None
+                or uid != rdir.name.split("--", 1)[0]):
+            report.add("record.session-metadata", _rel(root, path),
+                       "`session` must be a mapping with an opaque `uid` matching its directory")
     status = data.get("status")
     if status is not None and status not in RUN_STATUSES:
         report.add(

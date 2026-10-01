@@ -79,7 +79,7 @@ LATE_NOW = FIXED_NOW + timedelta(days=90)
 #: for the host bucket the fixture carries on purpose (D9 — an unnamed repo's
 #: work, awaiting adoption, which never blocks). Anything else appearing here
 #: is a new statement about the form and belongs in a review, not in a diff.
-CLEAN_FINDINGS = (("tree.host-bucket", "INFO"),)
+CLEAN_FINDINGS = (("manifest.schema-older", "WARN"), ("tree.host-bucket", "INFO"))
 
 #: One defect per check family: the family, the code it must produce and the
 #: repo-relative path it must be reported against. The tests below inject them
@@ -175,13 +175,13 @@ class TestGreenEndToEnd:
         assert document["counts"]["error"] == 0
         assert [f for f in document["findings"] if f["severity"] == "ERROR"] == []
 
-    def test_it_is_not_warned_about_either(self, capsys, schema_plexus):
+    def test_only_the_older_schema_is_warned_about(self, capsys, schema_plexus):
         # Warnings never block (D14), so a WARN would not move the exit code —
-        # which is exactly why it has to be asserted separately. A conformant
-        # tree earns none: every remaining finding is informational.
+        # which is exactly why it has to be asserted separately. The schema-1
+        # fixture earns only the explicit newer-version availability warning.
         _code, document = _cli_json(capsys, schema_plexus)
-        assert document["counts"]["warn"] == 0
-        assert {f["severity"] for f in document["findings"]} <= {"INFO"}
+        assert document["counts"]["warn"] == 1
+        assert {f["code"] for f in document["findings"] if f["severity"] == "WARN"} == {"manifest.schema-older"}
 
     def test_the_text_report_says_conformant(self, capsys, schema_plexus):
         code = cli.main(["validate", str(schema_plexus.root)])

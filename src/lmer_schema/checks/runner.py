@@ -304,7 +304,8 @@ def _check_agents(context: Context) -> None:
     form its contents are checked at and ``check_agents`` reads it, so the
     bucket tier arrives with the list (module docstring)."""
     agents_checks.check_agents(
-        context.root, context.report, project_dirs=context.project_dirs
+        context.root, context.report, project_dirs=context.project_dirs,
+        manifest=context.manifest,
     )
 
 
@@ -319,6 +320,8 @@ def _check_record(context: Context) -> None:
         context.tiered(),
         now=context.now,
         stale_after=context.stale_after,
+        manifest=context.manifest,
+        projects=context.project_dirs,
     )
 
 

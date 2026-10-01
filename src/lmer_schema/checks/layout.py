@@ -135,10 +135,10 @@ INSTANCE_AREAS = ("_agents", "_knowledge", "_napkin", "_taskdef")
 
 #: Schema areas that live inside a PROJECT (§2) — also the legal first
 #: components of a project ``_archive/`` mirror path.
-PROJECT_AREAS = ("_agents", "_info", "_plans", "_runs", "_specs", "_taskdef")
+PROJECT_AREAS = ("_agents", "_info", "_plans", "_runs", "_specs", "_taskdef", "_claims")
 
 #: `_`-prefixed names the schema defines at the instance root (D6).
-RESERVED_INSTANCE_NAMES = INSTANCE_AREAS + (ARCHIVE_DIR, MANIFEST_NAME)
+RESERVED_INSTANCE_NAMES = INSTANCE_AREAS + (ARCHIVE_DIR, MANIFEST_NAME, "_memory_retirements.json")
 
 #: `_`-prefixed names the schema defines inside a project (D6).
 RESERVED_PROJECT_NAMES = PROJECT_AREAS + (ARCHIVE_DIR,)
@@ -412,7 +412,7 @@ def _check_bucket_collisions(root, report, registry):
         for spelling in (project.repo, *project.remotes):
             if not spelling:
                 continue
-            path = bucket_path(root, normalize(spelling))
+            path = bucket_path(root, normalize(spelling), schema=registry.schema)
             # Two spellings of one remote (a ported one and its unported
             # twin) name ONE directory — the port lives in the key only.
             if path is None or path in seen:

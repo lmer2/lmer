@@ -17,18 +17,19 @@ import hashlib
 import json
 import os
 import secrets
-import time
 import shlex
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 import re
 from typing import Iterable, Mapping
 from dotenv import dotenv_values
+from work_repo import session_record
 
 from . import resolve
 from .clone_cache import (
@@ -632,7 +633,9 @@ def parse_args(
     parser.add_argument("--manual-start", dest="manual_start", action="store_true", help="Do not auto-inject /start into claude on launch")
     parser.add_argument("--prompt", dest="prompt", help="Follow-up prompt injected immediately after the auto-/start (e.g. --prompt='research X online first'). Ignored under --manual-start since nothing is auto-injected then.")
     parser.add_argument("--answer", dest="answer", help="Answer to the run's recorded open question, exported to the container as LMER_ANSWER. The fresh session applies it at session start (question_answered event, question stop cleared) and its resume brief leads with the question+answer pair. This flag is the only supported source: a host/.env LMER_ANSWER is deliberately NOT read, so a stale value can never silently auto-answer a future question-stop.")
-    parser.add_argument("--session", dest="session", help="Session id of the run record this launch continues, exported to the container as LMER_SESSION_ID. In a schema-form work repo that variable decides which record everything in the container writes in (<project>/_runs/<slug>/<session-id>[--<name>]/, spec D22), so a resume that names one lands IN the record the operator asked to continue instead of opening a fresh one beside it. This flag is the only supported source: an LMER_SESSION_ID in the host environment is deliberately NOT read (see the env dict), because every lmer container exports one.")
+    parser.add_argument("--session", dest="session", help="Session id selected for continuation. The host marks it as a source candidate: schema 2 reads it through LMER_SOURCE_SESSION_ID and mints a fresh writer UID, while schema 1 keeps the established LMER_SESSION_ID behavior. This flag is the only supported source; an inherited host LMER_SESSION_ID is never read.")
+    parser.add_argument("--source-session", help="Read-only schema-2 predecessor UID, passed explicitly by the platform. The new execution always gets its own UID.")
+    parser.add_argument("--allow-unsigned-source", dest="allow_unsigned_source", metavar="SESSION_UID", help="Explicitly continue fresh when the selected schema-2 source has no final session_end. Must exactly equal --session, so the decision authorizes only that source; omit it to cancel/wait after a refusal.")
     parser.add_argument("--no-supervisor", dest="no_supervisor", action="store_true", help="Bypass lmer-supervisor and exec the harness directly (debug aid for rendering issues)")
     parser.add_argument("--harness", dest="harness", help=f"Agent harness to run in the container (default: claude, or LMER_HARNESS; when neither is set, LMER_LLM_NAME can imply one, e.g. gpt-* selects codex). Known: {', '.join(sorted(known_harnesses()))} (incl. any user-installed harnesses from ~/.lmer/harnesses; see docs/HARNESSES.md)")
     parser.add_argument("--model", dest="model", help="Model the harness runs, exported to the container as LMER_LLM_NAME (env: LMER_LLM_NAME; the flag wins over it, and over a preset's env). Forwarded verbatim to the harness's own --model flag by the runner scripts — lmer never validates it, the harness rejects what it does not know. Also implies the harness when neither --harness nor LMER_HARNESS is set (e.g. --model gpt-5.5 selects codex).")
@@ -1422,6 +1425,32 @@ def _session_id_refusal(session: str) -> str | None:
     return None
 
 
+def _continuation_env(ns: argparse.Namespace) -> dict[str, str | None]:
+    """Environment handshake for schema-aware direct CLI continuation."""
+    selected = ns.session if ns.session else None
+    return {
+        "LMER_SESSION_ID": selected,
+        "LMER_SESSION_IS_SOURCE": "1" if selected else None,
+        "LMER_SOURCE_SESSION_ID": ns.source_session or None,
+        "LMER_ALLOW_UNSIGNED_SOURCE": (
+            ns.allow_unsigned_source if ns.allow_unsigned_source else None
+        ),
+    }
+
+
+def _launch_session_metadata(
+    *, harness: str, model: str | None, effort: str | None, config: dict
+) -> dict:
+    """Compose host metadata through the shared session-record policy."""
+    return session_record.compose_launch_metadata(
+        session_record.provided_metadata(),
+        harness=harness,
+        model=model,
+        effort=effort,
+        config=config,
+    )
+
+
 def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
     """Validate mutually exclusive / dependent options on a parsed namespace.
 
@@ -1494,6 +1523,25 @@ def _validate_parsed_args(ns: argparse.Namespace) -> int | None:
                 "(<project>/_runs/<slug>/<session-id>), never a path or a "
                 "pattern — copy one from `work sessions` or from the fleet "
                 "view's row for the run."
+            )
+            return 2
+    if ns.source_session is not None:
+        if ns.session:
+            error("--session and --source-session are mutually exclusive")
+            return 2
+        refusal = _session_id_refusal(ns.source_session)
+        if refusal is not None:
+            error(f"--source-session is not a usable session id: {refusal}")
+            return 2
+    if ns.allow_unsigned_source is not None:
+        selected_source = ns.source_session or ns.session
+        if not selected_source:
+            error("--allow-unsigned-source requires --session or --source-session")
+            return 2
+        if ns.allow_unsigned_source != selected_source:
+            error(
+                "--allow-unsigned-source must exactly match --session or --source-session; use the "
+                "source UID shown in the unsigned-session refusal"
             )
             return 2
     return None
@@ -2905,6 +2953,23 @@ def main(argv: list[str] | None = None) -> int:
         container_taskdef_dir = f"/Agents/global/taskdef/{task_id}" if task_id else None
         container_task_instructions = f"/Agents/global/taskdef/{task_id}/instructions.txt" if task_id else None
 
+    try:
+        launch_metadata = _launch_session_metadata(
+            harness=harness.name,
+            model=session_model,
+            effort=os.environ.get("LMER_REASONING_EFFORT"),
+            config={
+                "preset": os.environ.get("LMER_SESSION_PRESET"),
+                "agents": list(resolved_agents or {}),
+                "taskdef": task_id if not ns.no_task else None,
+                "service": service_start_name if service_mode else None,
+                "service_group": ns.service_group if service_mode else None,
+            },
+        )
+    except ValueError as exc:
+        error(f"❌ {exc}")
+        return 2
+
     # When a shared taskdef repo is configured it is cloned to /taskdef inside
     # the container; append it AFTER any external taskdef mounts so it lands
     # between the work-repo taskdefs and the lmer built-in (taskdef_search_dirs
@@ -2943,6 +3008,9 @@ def main(argv: list[str] | None = None) -> int:
         "LMER_GITLAB_TOKEN_HOST": os.environ.get("LMER_GITLAB_TOKEN_HOST"),
         "LMER_LLM_NAME": os.environ.get("LMER_LLM_NAME"),
         "LMER_SESSION_PRESET": os.environ.get("LMER_SESSION_PRESET"),
+        session_record.METADATA_ENV: json.dumps(
+            launch_metadata, ensure_ascii=False, separators=(",", ":")
+        ),
         # No human attached (cron/scheduled launches): the AGENTS.md gates
         # report instead of asking when this is set. Never inferred from the
         # launch shape — only an explicit host value crosses over, while
@@ -3156,7 +3224,7 @@ def main(argv: list[str] | None = None) -> int:
         # because clone_and_exec.mint_session_id mints with setdefault: an
         # empty string is a value it would NOT replace, and the launch would
         # run with no usable id and open no record at all.
-        "LMER_SESSION_ID": ns.session if ns.session else None,
+        **_continuation_env(ns),
         "LMER_DISABLE_SUPERVISOR": "1" if ns.no_supervisor else None,
         # Forward the initial auto-/start delay so a host-set value reaches
         # the supervisor running inside the container.

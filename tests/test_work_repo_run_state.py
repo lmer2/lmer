@@ -12,6 +12,7 @@ import yaml
 
 from work_repo import run_state
 from tests.conftest import strip_lmer_env
+from tests.timing_budgets import JOIN, QUIET
 
 
 @pytest.fixture(autouse=True)
@@ -113,7 +114,7 @@ class TestSessionId:
 class TestStateIO:
     def test_seed_shape(self, run_env):
         state = run_state.seed_state("develop-issue-123", "develop", "https://x/-/issues/123")
-        assert state["schema"] == run_state.SCHEMA_VERSION
+        assert state["schema"] == 1  # legacy records retain their format
         assert state["slug"] == "develop-issue-123"
         assert state["name"] is None
         assert state["taskdef"] == "develop"
@@ -244,7 +245,7 @@ ATOMIC_ROWS = 100
 
 #: The two writers, with the file each publishes and the schema it accepts.
 ATOMIC_WRITERS = {
-    "state": (run_state.write_state, run_state.STATE_FILE, run_state.SCHEMA_VERSION),
+    "state": (run_state.write_state, run_state.STATE_FILE, 1),
     "ledger": (
         run_state.write_ledger,
         run_state.LEDGER_FILE,
@@ -314,8 +315,17 @@ def test_a_second_writer_cannot_hole_what_the_first_publishes(
     is held with its truncation done and its fd open across the first's rename,
     which is the interleaving in question, rather than trusting a one-CPU
     scheduler to produce it.
+
+    The checkout lock (``work_repo.transactions``) now serializes callers of the
+    decorated writer, so two locked writers can no longer interleave at all.
+    What this test proves is the layer beneath it: the atomic publish that is
+    the only defence where the lock does not reach — a tree that is no
+    checkout, a host process with no work repo, a writer from another process
+    that never took the lock. So it drives the writer beneath the transaction
+    boundary. The lock's own guarantee is the next test's.
     """
     write, filename, schema = ATOMIC_WRITERS[which]
+    write = write.__wrapped__
     rdir = tmp_path / "r"
     first_is_mid_file = threading.Event()
     second_holds_its_temp = threading.Event()
@@ -335,7 +345,7 @@ def test_a_second_writer_cannot_hole_what_the_first_publishes(
         payloads[name] = data
         if name == "second":
             # Nothing to lose until the other writer has bytes on disk.
-            first_is_mid_file.wait(timeout=60)
+            first_is_mid_file.wait(timeout=JOIN)
         half = len(data) // 2
         with real_open(self, "w", encoding=encoding) as fh:
             # The truncation is here: with a shared temp name, this is what lands
@@ -346,11 +356,11 @@ def test_a_second_writer_cannot_hole_what_the_first_publishes(
             if name == "first":
                 flushed.append(self.stat().st_size)
                 first_is_mid_file.set()
-                second_holds_its_temp.wait(timeout=60)
+                second_holds_its_temp.wait(timeout=JOIN)
             else:
                 second_holds_its_temp.set()
                 # Hold the fd open across the other writer's rename.
-                published.wait(timeout=60)
+                published.wait(timeout=JOIN)
             fh.write(data[half:])
 
     monkeypatch.setattr(Path, "write_text", gated_write_text)
@@ -370,7 +380,7 @@ def test_a_second_writer_cannot_hole_what_the_first_publishes(
     second = threading.Thread(target=run, args=("second",), name="second")
     first.start()
     second.start()
-    first.join(timeout=120)
+    first.join(timeout=JOIN)
 
     assert not first.is_alive(), "the first writer never published"
     assert not errors, errors
@@ -379,7 +389,7 @@ def test_a_second_writer_cannot_hole_what_the_first_publishes(
     # in, with the other writer's fd still open on a file that has been renamed.
     mid_race = (rdir / filename).read_bytes()
     published.set()
-    second.join(timeout=120)
+    second.join(timeout=JOIN)
 
     assert flushed and flushed[0] > 0, (
         "the first writer had nothing on disk yet, so this proved nothing"
@@ -400,6 +410,60 @@ def test_a_second_writer_cannot_hole_what_the_first_publishes(
     # The writers' own verdict last of all — a raise here is the symptom of the
     # tear above, and reading it first would hide what was published.
     assert not errors, errors
+
+
+@pytest.mark.parametrize("which", sorted(ATOMIC_WRITERS))
+def test_the_checkout_lock_holds_the_second_writer_until_the_first_publishes(
+    which, run_env, tmp_path, monkeypatch
+):
+    """Above the atomic writer sits the checkout lock: on a tree inside the
+    configured checkout (``run_env`` points it at ``tmp_path``) a second
+    writer does not even open its temp until the first has published. The
+    first is held mid-file, with bytes on disk, while the second is asked to
+    write; the second's only chance to run is after the first's rename.
+    """
+    write, filename, schema = ATOMIC_WRITERS[which]
+    rdir = tmp_path / "r"
+    first_is_mid_file = threading.Event()
+    release_first = threading.Event()
+    reached_write, errors = [], []
+    real_write_text = Path.write_text
+
+    def gated_write_text(self, data, encoding=None, errors=None, newline=None):
+        name = threading.current_thread().name
+        reached_write.append(name)
+        if name == "first":
+            first_is_mid_file.set()
+            release_first.wait(timeout=JOIN)
+        return real_write_text(self, data, encoding=encoding)
+
+    monkeypatch.setattr(Path, "write_text", gated_write_text)
+
+    def run(name):
+        try:
+            write(rdir, _bulky_payload(name, schema, ATOMIC_ROWS // 4))
+        except BaseException as exc:  # pragma: no cover - a failure prints why
+            errors.append(exc)
+
+    first = threading.Thread(target=run, args=("first",), name="first")
+    second = threading.Thread(target=run, args=("second",), name="second")
+    first.start()
+    assert first_is_mid_file.wait(timeout=JOIN), "the first writer never got going"
+    second.start()
+    # An absence window: the second writer must not reach its write while the
+    # first holds the checkout.
+    second.join(timeout=QUIET)
+    assert reached_write == ["first"], reached_write
+    assert second.is_alive(), "the second writer finished while the first held the lock"
+    release_first.set()
+    first.join(timeout=JOIN)
+    second.join(timeout=JOIN)
+    assert not first.is_alive() and not second.is_alive()
+    assert not errors, errors
+    assert reached_write == ["first", "second"]
+    rows = yaml.safe_load((rdir / filename).read_bytes())["tasks"]
+    assert {row["owner"] for row in rows.values()} == {"second"}
+    assert list(rdir.glob(".*.tmp")) == [], "a temp outlived the handover"
 
 
 class TestEvents:
