@@ -107,6 +107,46 @@ gate-push --tag v1.2.3                  # refs/tags/v1.2.3 -> origin
 gate-push --tag v1.2.3 --remote github  # same tag -> the GitHub mirror remote
 ```
 
+**Publishing an authorized rebased branch**:
+First obtain explicit human operator permission for the specific history
+rewrite. Only then set the approval variable for that command and use an
+explicit lease through the gate:
+```bash
+LMER_FORCE_PUSH_EXPLICITLY_APPROVED_BY_USER=1 gate-push --force-with-lease refs/heads/feature/example OLD_OID --remote origin
+```
+Before rebasing, use `gate-push --inspect-lease refs/heads/feature/example
+--remote origin` to inspect the push transport/host/port and its current commit.
+Keep that full, nonzero lowercase commit ID as `OLD_OID`; do not print raw
+remote URLs, which may contain credentials. Inspection omits URL userinfo,
+path, query and fragment, withholds captured Git failure output, and disables
+Git's inherited trace/diagnostic sinks throughout inspection, including
+configuration-backed Trace2 targets. It does not grant push authorization.
+The source is the clean, checked-out
+branch's committed HEAD; the destination must be covered by the normal
+allowlist. Generic task/development authorization and repository/ref allowlisting
+alone are insufficient. Existing explicit human approval for the same scoped
+rewrite need not be requested again; no direct `git push` exception is needed.
+
+`LMER_FORCE_PUSH_EXPLICITLY_APPROVED_BY_USER` must be exactly `1`: unset, empty,
+whitespace and all other values refuse before gates, source pinning or transport.
+This is a workflow checkpoint, not independent authentication of human consent.
+Keep it command-scoped; never export it for the session, add it to defaults,
+presets, taskdefs or persistent `.env` files, or automatically enable it after
+refusal. Obtain explicit operator permission first, then set it only for the
+approved command. Ordinary pushes and read-only inspection do not require it.
+
+Git receives that exact lease with the real push. A stale expectation refuses
+the update without an automatic refresh, retry, or unconditional force.
+Leased mode supports one fully qualified branch on one push URL, and refuses
+tags, deletions, wildcard/compound refspecs, mirror remotes and advertised
+symbolic destination branches. It cannot be combined with `--tag` or `--ref`.
+The selected remote's custom service selectors (`receivepack`, `uploadpack`,
+`vcs`, `serverOption`), custom URL helpers, `GIT_OVERRIDE_VIRTUAL_HOST` and
+`GIT_NAMESPACE` are unsupported for leased pushes and inspection. Required credential helpers,
+hooks, proxies and SSH programs retain their existing trust boundary.
+See [gate-push usage and guarantees](../docs/GATE-PUSH.md) for source locking,
+Git compatibility, credential routing and receipt semantics.
+
 **Pre-push Checklist**:
 1. Use `gate-push` command
 2. Gate will verify the remote URL AND the target ref against
