@@ -13,6 +13,11 @@ from . import assistant_conversation
 
 CHOICE = re.compile(r"\bproject\s+([a-f0-9]{64})\s+([a-z0-9][a-z0-9-]{0,63})\s*$")
 _ACTION = ContextVar("request_action", default=None)
+OWNERSHIP_CHANGED = (
+    "The request's thread ownership changed. Take pending to release it safely, "
+    "or use the operator's Release blocked request control. Keep completed action receipts; "
+    "ask for a new request in the source thread instead of repeating completed work."
+)
 
 
 def preflight():
@@ -24,8 +29,11 @@ def preflight():
 
 
 def effect():
+    from . import project_api
+
     action = _ACTION.get()
     if action is not None:
+        project_api.recheck()
         with projects.database() as db:
             db.execute("UPDATE request_actions SET state='sending' WHERE id=?", (action["id"],))
         action["effect"] = True
@@ -77,8 +85,15 @@ def listing(workspace_id=None):
             row["parking"] = dict(parked) if parked else None
             row["actions"] = [dict(action) for action in db.execute(
                 "SELECT method,path,state,error FROM request_actions WHERE request_id=? ORDER BY rowid", (row["id"],))]
-    return [{key: value for key, value in row.items() if key not in ("payload", "ownership", "reply")}
-            for row in rows if workspace_id is None or row["project_id"] == workspace_id]
+    result = []
+    for row in rows:
+        if workspace_id is not None and row["project_id"] != workspace_id:
+            continue
+        row["recovery"] = recovery(row)
+        if row["recovery"]:
+            row["error"] = row["recovery"]["reason"]
+        result.append({key: value for key, value in row.items() if key not in ("payload", "ownership", "reply")})
+    return result
 
 
 def _current(row):
@@ -109,10 +124,99 @@ def authorize(identity, workspace_id):
     if row["project_id"] != workspace_id:
         raise projects.ProjectError("This request belongs to another project.", code="project_changed", status=409)
     if row["state"] in ("choice", "invalid", "choice_reply") or row["ownership"] != _current(row):
-        raise projects.ProjectError("The request's thread ownership changed. Ask for a new request in its source thread.",
+        with projects.database() as db:
+            db.execute("UPDATE requests SET error=? WHERE id=?", (OWNERSHIP_CHANGED, identity))
+        raise projects.ProjectError(OWNERSHIP_CHANGED,
                                    code="request_ownership_changed", status=409)
     projects.get(workspace_id, active=True)
     return row
+
+
+def _uncertain(row):
+    if row["state"] in ("reply_sending", "reply_uncertain") or row["prompt_state"] in ("sending", "uncertain"):
+        return True
+    with projects.database() as db:
+        return db.execute("SELECT 1 FROM request_actions WHERE request_id=? AND state IN ('sending','uncertain')",
+                          (row["id"],)).fetchone() is not None
+
+
+def recovery(row):
+    """Describe safe recovery without claiming that any reply or action happened."""
+    if row["state"] not in ("queued", "delivered", "invalid"):
+        return None
+    if row["state"] != "invalid" and row["ownership"] == _current(row):
+        return None
+    uncertain = _uncertain(row)
+    with projects.database() as db:
+        bound = db.execute("SELECT 1 FROM request_context WHERE request_id=?", (row["id"],)).fetchone()
+    released = row["state"] == "invalid" and not bound
+    return {"code": "request_ownership_changed", "reason": row["error"] or OWNERSHIP_CHANGED,
+            "release_allowed": not uncertain and not released, "released": released,
+            "instruction": ("Request released; no reply sent. Completed action receipts are retained." if released else
+                            "Inspect the uncertain send or action outcome before recovery. It will not be repeated automatically."
+                            if uncertain else "Take pending or release this blocked request. No action or reply will be replayed.")}
+
+
+def _release(row, reason):
+    with projects.database() as db:
+        db.execute("UPDATE requests SET state='invalid',error=? WHERE id=?", (reason, row["id"]))
+        db.execute("DELETE FROM request_context WHERE project_id=? AND request_id=?", (row["project_id"], row["id"]))
+        raw = db.execute("SELECT assistant_state FROM projects WHERE id=?", (row["project_id"],)).fetchone()
+        state = assistant.AssistantState.from_dict(json.loads(raw[0]))
+        retained = tuple(note for note in state.pending if not (
+            note.kind == "conversation_request" and (note.data or {}).get("request_id") == row["id"]))
+        state = replace(state, pending=retained, pending_since=retained[0].at if retained else None)
+        db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(state.to_dict()), row["project_id"]))
+
+
+def release(identity, reason, *, workspace_id):
+    """Operator recovery for a known invalid request, preserving every receipt."""
+    if not isinstance(reason, str) or not reason.strip() or len(reason) > 2000:
+        raise projects.ProjectError("Release needs a reason of 1–2000 characters.")
+    with projects.operation():
+        row = get(identity)
+        if row["project_id"] != workspace_id:
+            raise projects.ProjectError("This request belongs to another project.", code="project_changed", status=409)
+        decision = recovery(row)
+        if decision and decision["released"]:
+            return {"request_id": identity, "workspace_id": workspace_id, "state": "invalid", "released": True}
+        if not decision or not decision["release_allowed"]:
+            raise projects.ProjectError("Only a blocked request with no uncertain effects can be released.", status=409)
+        _release(row, decision["reason"])
+        store.append_event("request_released", data={"request_id": identity, "workspace_id": workspace_id,
+                                                    "reason": scrub_credentials(reason.strip()), "by": "operator"})
+    return {"request_id": identity, "workspace_id": workspace_id, "state": "invalid", "released": True}
+
+
+def attach_spawned(component, session_id, targets):
+    """Capture only the source ownership added by this request's actual spawn."""
+    action = _ACTION.get()
+    row = action["row"] if action and action["path"] == "/api/sessions" and action["method"] == "POST" else None
+    before = _current(row) if row else None
+    owner = project_threads.session_owner(session_id) if row else None
+    records = component.adopt_launch_targets(session_id, targets, by="operator")
+    if (not row or before != row["ownership"] or not owner or owner["project_id"] != row["project_id"]
+            or not any(project_threads.key(record["permalink"]) == project_threads.key(row["payload"]["permalink"])
+                       for record in records)):
+        return records
+    if any(item["owner"] == owner["owner"] for item in before):
+        return records
+    expected = sorted(before + [owner], key=lambda item: item["owner"])
+    if _current(row) == expected:
+        action["attachment"] = {"session_id": session_id, "before": before, "after": expected, "owner": owner}
+    return records
+
+
+def _completed_attachment(action):
+    attachment = action.get("attachment")
+    row = action["row"]
+    if not attachment or project_threads.session_owner(attachment["session_id"]) != attachment["owner"]:
+        return None
+    state = projects.get(row["project_id"])["assistant_state"]
+    if (state.get("session_id") != row["generation"] or _current(row) != attachment["after"]
+            or get(row["id"])["ownership"] != attachment["before"]):
+        return None
+    return attachment
 
 
 def _queue(db, row, project_id, ownership):
@@ -121,7 +225,8 @@ def _queue(db, row, project_id, ownership):
         f"[{payload['source']['channel']} · {payload['sender']}] Handle this request only in project {project_id}. "
         f"Use lmer-ctl --request-id {row['id']} for actions. Reply with "
         f"lmer-ctl requests reply {row['id']} TEXT; its destination is the original thread. "
-        "A changed ownership refusal requires a fresh request; do not redirect or repeat the action."
+        "On an ownership refusal, take pending to release safely before unrelated work or handoff/rotation. "
+        "Do not redirect or repeat a completed action; request fresh instructions in the source thread."
     )
     payload["instruction"] += " Your credential is bound to this request until it is answered and you take pending again."
     payload["actions"] = [dict(action) for action in db.execute(
@@ -255,7 +360,8 @@ def _pending_notice(row, client):
         _notice(row, (row["error"] or reason) +
                 "\nChoose a project for this request. Mention the bot in this thread with:\n"
                 f"project {row['id']} PROJECT_ID\n{options}", client)
-    elif row["state"] == "invalid" and row["error"]:
+    elif (row["state"] == "invalid" and row["error"] and row["generation"] is None
+          and row["ownership"] == _current(row)):
         _notice(row, row["error"], client)
     elif row["state"] == "queued":
         status = projects.status(row["project_id"])
@@ -313,7 +419,7 @@ def action(binding, perform):
         db.execute("DELETE FROM request_actions WHERE id=?", (identity,))
         db.execute("INSERT INTO request_actions (id,request_id,method,path,state) VALUES (?,?,?,?,'sending')",
                    (identity, row["id"], binding["method"], binding["path"]))
-    outcome = {"id": identity, "effect": None}
+    outcome = {"id": identity, "effect": None, "row": row, "method": binding["method"], "path": binding["path"]}
     token = _ACTION.set(outcome)
     try:
         result = perform()
@@ -326,8 +432,13 @@ def action(binding, perform):
         raise
     finally:
         _ACTION.reset(token)
+    attachment = _completed_attachment(outcome)
+    if attachment:
+        receipt["ownership_transition"] = attachment
     with projects.database() as db:
         db.execute("UPDATE request_actions SET state='complete',result=? WHERE id=?", (json.dumps(receipt), identity))
+        if attachment:
+            db.execute("UPDATE requests SET ownership=?,error=NULL WHERE id=?", (json.dumps(attachment["after"]), row["id"]))
     return result
 
 
@@ -340,11 +451,21 @@ def _accepted(identity, selected, permalink):
 def drain(state):
     project_id = scope.current()
     current = active(project_id)
-    if current and get(current)["state"] in ("replied", "invalid"):
+    unavailable = None
+    row = get(current) if current else None
+    if row and row["state"] in ("queued", "delivered", "invalid"):
+        decision = recovery(row)
+        if decision and decision["release_allowed"]:
+            _release(row, decision["reason"])
+            unavailable = row["id"]
+            current = None
+    if current and row["state"] == "replied":
         with projects.database() as db:
             db.execute("DELETE FROM request_context WHERE project_id=?", (project_id,))
         current = None
     decisions, notes = [], []
+    if unavailable:
+        notes.append(_unavailable(row, decision["reason"]))
     retained = []
     for note in state.pending:
         identity = (note.data or {}).get("request_id") if note.kind == "conversation_request" else None
@@ -352,6 +473,11 @@ def drain(state):
             notes.append(note.to_dict())
             continue
         row = get(identity)
+        if identity == unavailable:
+            continue
+        if unavailable:
+            retained.append(note)
+            continue
         if current and identity != current:
             retained.append(note)
             continue
@@ -360,9 +486,13 @@ def drain(state):
         try:
             authorize(identity, project_id)
         except projects.ProjectError as exc:
+            if _uncertain(row):
+                retained.append(note)
+                continue
             decisions.append(("invalid", str(exc), identity))
-            notes.append({"at": note.at, "kind": "request_unavailable", "note": str(exc),
-                          "data": {"request_id": identity, "permalink": row["payload"]["permalink"], "workspace_id": project_id}})
+            notes.append(_unavailable(row, str(exc)))
+            if current == identity:
+                current = None
         else:
             current = identity
             decisions.append(("delivered", None, identity))
@@ -373,12 +503,25 @@ def drain(state):
                        (status, error, state.session_id, identity))
         if current:
             db.execute("INSERT OR REPLACE INTO request_context VALUES (?,?)", (project_id, current))
+        else:
+            db.execute("DELETE FROM request_context WHERE project_id=?", (project_id,))
         cleared = replace(state, pending=tuple(retained), pending_since=retained[0].at if retained else None, nudged_at=None)
         db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(cleared.to_dict()), project_id))
     return notes
 
 
+def _unavailable(row, reason):
+    with projects.database() as db:
+        receipts = [dict(action) for action in db.execute(
+            "SELECT method,path,state,result,error FROM request_actions WHERE request_id=?", (row["id"],))]
+    return {"at": store.utc_now_iso(), "kind": "request_unavailable", "note": reason,
+            "data": {"request_id": row["id"], "permalink": row["payload"]["permalink"], "workspace_id": row["project_id"],
+                     "actions": receipts, "reply_sent": False, "released": True}}
+
+
 def reply(identity, text, *, workspace_id, session_id):
+    from . import project_api
+
     if not isinstance(text, str) or not text.strip() or len(text) > 20000:
         raise projects.ProjectError("A reply needs 1–20000 characters.")
     with projects.operation():
@@ -389,6 +532,8 @@ def reply(identity, text, *, workspace_id, session_id):
             raise projects.ProjectError("This request is not awaiting a reply, or a previous reply outcome is unknown.", status=409)
         target, client, _ = thread_access.resolve_thread(row["payload"]["permalink"])
         private = assistant_conversation.private_thread(target, client)
+        project_api.recheck()
+        authorize(identity, workspace_id)
         with projects.database() as db:
             db.execute("UPDATE requests SET state='reply_sending' WHERE id=?", (identity,))
         try:

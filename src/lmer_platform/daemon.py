@@ -425,7 +425,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # the first tick baselines against, so its start is never itself an event.
     detector = _watch_for_attention(config)
     hub = _subscribe_to_comms()
-    threads = _run_thread_connectors()
+    threads = _run_thread_connectors(config)
     services = _serve_thread_requests()
 
     app = create_app(config, secret, ingress=ingress)
@@ -465,7 +465,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_thread_connectors() -> ThreadConnectors:
+def _run_thread_connectors(config=None) -> ThreadConnectors:
     """Start the chat-thread connectors: one process per (session, thread), and
     the loop that keeps that set equal to the recorded connections (issue #412).
 
@@ -473,7 +473,7 @@ def _run_thread_connectors() -> ThreadConnectors:
     and started here because a daemon restart with connections recorded has to
     reattach them — which is the same first pass as any other tick.
     """
-    threads = ThreadConnectors()
+    threads = ThreadConnectors(platform_config=config)
     threads.start()
     register_connectors(threads)
     return threads

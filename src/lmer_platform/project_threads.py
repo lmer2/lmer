@@ -11,18 +11,28 @@ def key(permalink):
     return json.dumps([ref.channel, *ref.registry_key()], separators=(",", ":"))
 
 
+def session_owner(session_id):
+    """The ownership record an attachment to this session contributes."""
+    project_id = projects.session_home(session_id)
+    if not project_id:
+        return None
+    parts = runs.run_for_session(session_id)
+    run_key = runs.run_key(*parts) if parts else None
+    home = projects.run_home(run_key) if run_key else None
+    return {"owner": f"run:{run_key}" if run_key else f"project:{project_id}",
+            "project_id": home["project_id"] if home else project_id, "run_key": run_key,
+            "revision": home["revision"] if home else None}
+
+
 def remember(session_id, permalink):
     if not projects.enabled():
         return
-    project_id = projects.session_home(session_id)
-    if not project_id:
+    owner = session_owner(session_id)
+    if not owner:
         return
-    parts = runs.run_for_session(session_id)
-    run_key = runs.run_key(*parts) if parts else None
-    owner = f"run:{run_key}" if run_key else f"project:{project_id}"
     with projects.database() as db:
         db.execute("INSERT OR REPLACE INTO thread_owners VALUES (?,?,?,?)",
-                   (key(permalink), owner, project_id, run_key))
+                   (key(permalink), owner["owner"], owner["project_id"], owner["run_key"]))
 
 
 def observe_connectors():

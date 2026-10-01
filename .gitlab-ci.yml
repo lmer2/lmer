@@ -41,6 +41,7 @@ pre-commit:
 
 pytest:
   stage: test
+  timeout: 2h
   image: python:3.12  # Full image includes git
   variables:
     # Arm the strict mode of tests/conftest.py's require_node_toolchain: with

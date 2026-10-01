@@ -2160,6 +2160,7 @@ def create_app(
             "  GET  /api/assistant/requests  durable conversation requests and delivery state\n"
             "  POST /api/assistant/requests/{request_id}/reply  reply to recorded source once\n"
             "  POST /api/assistant/requests/{request_id}/park  operator parks uncertainty without resending\n"
+            "  POST /api/assistant/requests/{request_id}/release  operator releases a blocked request with known effects\n"
             "  POST /api/assistant/requests  admit a host listener mention or DM reply\n"
             "  POST /api/assistant/pending  take the digests the daemon spooled and\n"
             "                               clear them. DESTRUCTIVE, hence not a\n"
@@ -2814,6 +2815,7 @@ def create_app(
         if project_api.capture().get("peer"):
             project_requests.preflight()
             return peers.send(caller, session_id, body, _require_hub())
+        project_requests.preflight()
         if (caller.source_channel == "peer-ul" or "generation" in body
                 or isinstance(body.get("meta"), dict) and "peer" in body["meta"]
                 or isinstance(body.get("source"), dict) and body["source"].get("channel") == "peer-ul"):
@@ -2840,6 +2842,7 @@ def create_app(
         attachments = body.get("attachments") or []
         if not isinstance(options, list) or not isinstance(attachments, list):
             raise HTTPException(status_code=400, detail="options and attachments must be lists")
+        project_requests.effect()
         try:
             result = hub.post(
                 session_id,
@@ -4316,6 +4319,13 @@ def create_app(
         if caller.kind != CALLER_OPERATOR:
             raise HTTPException(status_code=403, detail="only an operator may park an uncertain reply")
         return project_requests.park(request_id, body.get("reason"), workspace_id=project_scope.current())
+
+    @app.post("/api/assistant/requests/{request_id}/release", dependencies=guard)
+    def conversation_release(request_id: str, body: dict, caller: Caller = Depends(require_secret)) -> dict:
+        """Release a known blocked request without sending or repeating work."""
+        if caller.kind != CALLER_OPERATOR:
+            raise HTTPException(status_code=403, detail="only an operator may release a blocked request")
+        return project_requests.release(request_id, body.get("reason"), workspace_id=project_scope.current())
 
     @app.post("/api/assistant/pending", dependencies=guard)
     def assistant_pending() -> dict:

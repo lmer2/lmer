@@ -155,6 +155,7 @@ The existing forge `project` parameter continues to mean the repository path.
 | `POST /api/project-relay` | Operator-only destination and supplied text, with source provenance |
 | `GET /api/assistant/requests` | Retained conversation requests and delivery errors |
 | `POST /api/assistant/requests/{request_id}/reply` | Reply to that request's fixed source thread |
+| `POST /api/assistant/requests/{request_id}/release` | Operator-only `{reason}` releases a blocked request only when all effect outcomes are known |
 | `POST /api/assistant/requests/{request_id}/park` | Operator-only `{reason}` releases independent work without resolving or replaying an uncertain reply |
 
 Existing assistant lifecycle, history, instructions and pending routes use the
@@ -339,6 +340,45 @@ explicit spelling is useful for visibility but does not confer the binding:
 lmer-ctl --request-id REQUEST_ID spawn develop 'issue-123' --repo-url https://forge.example/org/repo
 lmer-ctl requests reply REQUEST_ID 'Result for this conversation'
 ```
+
+When an authorized request spawns a same-project worker with its original source
+thread attached, the completed spawn receipt records the exact ownership
+transition caused by that attachment. The updated snapshot and completed receipt
+are saved together. The assistant can then brief that worker and reply to the
+original source. This exception requires the original snapshot, the newly
+registered worker's actual owner and revision, and the current assistant
+generation. Independent attachments, conflicting owners, moves and changed
+revisions still refuse the request. Execution rechecks run before launch, brief
+and source reply; a worker's own verdict does not count as the assistant reply.
+
+An ownership refusal before effect leaves the request's delivery and completed
+action receipts intact, with a concrete error. **Take pending** rechecks even an
+already delivered request with no queued note. When no effect is uncertain, that
+single take releases the invalid request and returns `request_unavailable` with
+its original identity, retained action receipts and `reply_sent: false`. It does
+not deliver another request in the same take. An explicit request ID is retained
+and must match the active request; project and generation checks still apply.
+Independent work, handoff and
+explicitly authorized lifecycle recovery can then proceed without restarting
+the assistant. Take pending again to handle the next request. Never repeat a
+completed spawn to recover a blocked request.
+
+Platform settings lists blocked requests, including older delivered records
+whose stored error is empty and whose only action is a completed spawn. It
+refreshes with platform state and **Refresh requests**, shows the reason and
+retained receipts, and offers **Release blocked request** when safe. The operator
+must supply a reason; the API rechecks eligibility at execution. The equivalent
+command is:
+
+```sh
+lmer-ctl --workspace-id ID requests release REQUEST_ID 'Retain the existing worker and allow independent work'
+```
+
+Release is idempotent and preserves the request, source binding and receipts. It
+sends nothing, detaches nothing and grants no access to another project. A fresh
+source-thread request can authorize new work. Uncertain action or reply outcomes
+cannot use this release path; inspect them without blind retries. Existing
+operator parking for uncertain replies remains separate, as described below.
 
 Action receipts identify request, method, route and payload, excluding redundant
 workspace/request identity fields. Existing receipts using those fields remain

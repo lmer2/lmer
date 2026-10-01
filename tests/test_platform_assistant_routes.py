@@ -71,6 +71,7 @@ ASSISTANT_ROUTES = (
     ("GET", "/api/assistant/requests"),
     ("POST", "/api/assistant/requests/{request_id}/reply"),
     ("POST", "/api/assistant/requests/{request_id}/park"),
+    ("POST", "/api/assistant/requests/{request_id}/release"),
     ("GET", "/api/assistant/config"),
     ("POST", "/api/assistant/config"),
 )

@@ -32,7 +32,7 @@ from typing import Callable, Optional
 from ask_channel import bus
 
 from lmer_cli import thread_access
-from lmer_cli.connector_delivery import RecoveryRequired, marker_path
+from lmer_cli.connector_delivery import RecoveryRequired, checkpoint_path, marker_path
 from lmer_cli.connector_lifecycle import EXIT_RECOVERY
 from lmer_cli.connector_ownership import Lease, OwnershipError, ThreadKey
 from lmer_cli.connector_process import OwnedProcess, reclaim_orphan, spawn_child, spawn_owned
@@ -44,7 +44,7 @@ from slack_chat.client import SlackError
 from slack_chat.connector import ATTACH_FROM_NOW_ENV, ATTACH_SINCE_ENV
 from matrix_chat.client import MatrixError
 
-from . import registry, session_io, uploads
+from . import config, registry, session_io, uploads
 from .comms import comms_dir
 from .store import (
     StoreError, ensure_state_dir, logs_dir, mutating, read_json, utc_now_iso,
@@ -132,6 +132,7 @@ class ThreadConnectors:
         matrix_client: Optional[Callable] = None,
         slack_client: Optional[Callable] = None,
         environ: Optional[dict] = None,
+        platform_config: Optional[config.PlatformConfig] = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.path = path if path is not None else threads_path()
@@ -139,6 +140,7 @@ class ThreadConnectors:
         self._matrix_client = matrix_client if matrix_client is not None else _matrix_client
         self._slack_client = slack_client if slack_client is not None else _slack_client
         self._environ = os.environ if environ is None else environ
+        self._platform_config = platform_config
         self._clock = clock
         self._lock = threading.RLock()
         self._sessions: dict = {}
@@ -681,6 +683,20 @@ class ThreadConnectors:
             view["last_exit"] = self._exits.get(key)
             view["detail"] = self._detail.get(key)
             view["attention"] = "recovery-required" if key in self._recovery else None
+            if process is not None:
+                try:
+                    owner = process.lease.validate()
+                    session = owner.get("session")
+                    saved = read_json(checkpoint_path(process.lease.key, session)) if session else None
+                    health = ((saved or {}).get("transport") or {}).get("_delivery_health", {})
+                    view["delivery_health"] = health
+                    failed = [f"{direction}: {item['failures']} failures ({item['error']})"
+                              for direction, item in health.items() if item.get("failures")]
+                    if failed and not view["attention"]:
+                        view["attention"] = "delivery-retrying"
+                        view["detail"] = "Delivery retrying; " + "; ".join(failed)
+                except (OSError, ValueError, TypeError, KeyError, StoreError, OwnershipError):
+                    logger.debug("platform_thread_delivery_health_unavailable session=%s thread=%s", *key)
         return view
 
     # -- the loop --------------------------------------------------------------
@@ -917,6 +933,12 @@ class ThreadConnectors:
 
     def _environment(self, endpoint, session_id: str, record: dict) -> dict:
         env = dict(self._environ)
+        if self._platform_config is not None:
+            # These are host clients of this daemon, whose CLI overrides are
+            # absent from saved config. Container URLs and control tokens differ.
+            env[config.ENV_BIND_ADDRESS] = self._platform_config.bind_address
+            env[config.ENV_BIND_PORT] = str(self._platform_config.bind_port)
+            env[config.ENV_SECRET_FILE] = str(self._platform_config.secret_path)
         for name in _THREAD_CONTEXT_ENV:
             env.pop(name, None)
         # Which kind of attachment this is, told to the one process that has to

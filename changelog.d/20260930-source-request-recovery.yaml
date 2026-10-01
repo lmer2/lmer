@@ -1,0 +1,3 @@
+fixed:
+- "Connected-thread mentions use the effective daemon endpoint, including CLI bind/port overrides; delivery retry status survives connector restart (#528)."
+- "Authorized source-thread worker launches retain safe request briefing and replies; blocked requests expose receipt-preserving pending/operator recovery and refreshed UI status (#530)."

@@ -50,7 +50,7 @@ def _run(data):
 
 def receipted(path):
     return path not in ("/api/assistant/pending", "/api/assistant/requests", "/api/comms/thread") and not (
-        path.startswith("/api/assistant/requests/") and path.endswith(("/reply", "/park")))
+        path.startswith("/api/assistant/requests/") and path.endswith(("/reply", "/park", "/release")))
 
 
 @contextmanager
@@ -60,9 +60,9 @@ def bind(request, caller, body):
         return
     query = dict(request.query_params)
     path = request.url.path
-    parking = path.startswith("/api/assistant/requests/") and path.endswith("/park")
+    parking = path.startswith("/api/assistant/requests/") and path.endswith(("/park", "/release"))
     if caller.kind != "operator" and parking:
-        raise projects.ProjectError("Only an operator may park an uncertain reply.", status=403)
+        raise projects.ProjectError("Only an operator may release or park a conversation request.", status=403)
     if caller.kind != "operator" and path in ("/api/project-context", "/api/project-relay"):
         raise projects.ProjectError("Only an operator may explicitly share context between projects.", status=403)
     candidates = [value for value in (
@@ -158,7 +158,13 @@ def recheck():
             if current and binding["path"].endswith("/tty-ticket"):
                 raise projects.ProjectError("Use request-bound HTTP input while handling a conversation request.", status=409)
     if binding["request_id"] and not binding.get("parking"):
-        project_requests.authorize(binding["request_id"], workspace_id)
+        if binding["path"] == "/api/assistant/pending":
+            row = project_requests.get(binding["request_id"])
+            current = project_requests.active(workspace_id)
+            if row["project_id"] != workspace_id or current and current != row["id"]:
+                raise projects.ProjectError("Take pending for the active request in its recorded project.", status=409)
+        else:
+            project_requests.authorize(binding["request_id"], workspace_id)
     if binding.get("peer"):
         peers.identify(binding["session"])
     elif binding["session"] and projects.session_home(binding["session"]) != workspace_id:

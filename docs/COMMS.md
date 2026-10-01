@@ -986,6 +986,22 @@ inbox. Existing connected threads keep their normal delivery. See
 [assistant mention routing](ASSISTANT-MENTIONS.md) for configuration, context,
 replay protection and explicit replies to the originating conversation.
 
+Daemon-owned connectors inherit the daemon's resolved host bind address, port
+and secret-file location, including `lmer platform run --bind ... --port ...`
+overrides. Connected-thread mentions therefore reach the same platform that
+owns the connector without duplicating configuration. Wildcard listeners use a
+loopback client address; IPv6 client addresses are bracketed. The platform host
+endpoint remains separate from the session's supervisor URL/control token and
+from container-facing platform URLs.
+
+A running connector process can still have failed delivery. Thread status shows
+`delivery-retrying`, the failing direction, unresolved failure count and error
+class from its durable checkpoint. Recovery clears that status after a successful
+iteration. The existing consecutive-failure limit can restart a persistently
+failing connector; its checkpoint retains cursors and pending delivery identity.
+Routine retry/recovery notes retain `connector_health` metadata and do not wake
+project assistants (#512).
+
 **Limits stated plainly.** The matrix connector speaks the client-server API
 as a bot account and handles plaintext rooms; an end-to-end encrypted room is
 refused at connect time with its own name, and an encrypted event in a plain
