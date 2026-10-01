@@ -8,12 +8,15 @@ import os
 import subprocess
 import argparse
 import time
+from contextlib import ExitStack
 
 # Add src directory to path for container compatibility
 src_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 sys.path.insert(0, src_dir)
 
 from lmer_cli.gates import GateSystem, Colors, receipt_argv
+from lmer_cli.push_lease import PushLease, LeaseError
+from lmer_cli.push_transport import inspect_expectation
 # Same import gates.py uses: `--remote` may itself be a tokenized clone URL
 # (push-by-URL), and printing it raw puts a live credential on stdout (#281).
 from lmer_cli.container.clone_and_exec import _scrub_credentials
@@ -35,7 +38,7 @@ except ImportError:  # lock wiring must never break a gate, like receipts
 
 
 def gate_push(verbose: bool = False, tag: str = None, ref: str = None,
-              remote: str = "origin"):
+              remote: str = "origin", force_with_lease=None):
     """Run gate checks and push if passed.
 
     `tag` maps to ref refs/tags/<tag>; `ref` is any explicit refspec; with
@@ -50,19 +53,9 @@ def gate_push(verbose: bool = False, tag: str = None, ref: str = None,
     """
     started = time.monotonic()
 
-    target_ref = f"refs/tags/{tag}" if tag else ref
-
     gate = GateSystem(verbose=verbose)
-    # gate.run_push_gate carries the extended allow-list authorization
-    # (repo|refpattern grammar); the module-level push_gate() wrapper has
-    # no ref/remote parameters, so it is bypassed here.
-    if gate.run_push_gate(ref=target_ref, remote=remote):
-        print(f"\n{Colors.GREEN}You may proceed with push.{Colors.NC}")
-        result = 0
-    else:
-        print(f"\n{Colors.RED}Push blocked. Fix issues first.{Colors.NC}")
-        result = 1
-    outcome = "pass" if result == 0 else "fail"
+    outcome = "fail"
+    source = None
 
     def emit(exit_code):
         # Receipt assembly AND append are fail-soft: no receipt problem may
@@ -75,6 +68,7 @@ def gate_push(verbose: bool = False, tag: str = None, ref: str = None,
                 duration_s=time.monotonic() - started,
                 summary=gate.receipt_summary(),
                 argv=receipt_argv(),
+                **({"commit_sha": source.oid} if source else {}),
                 # What the tests check actually covered, as data (#269): a
                 # narrowed or cache-served run is a pass with exit code 0
                 # exactly like a full one, and a push is the reader that
@@ -84,9 +78,68 @@ def gate_push(verbose: bool = False, tag: str = None, ref: str = None,
         except Exception:
             pass
 
-    if result != 0:
-        emit(result)
-        return result
+    with ExitStack() as locks:
+        try:
+            target_ref = f"refs/tags/{tag}" if tag else ref
+            if force_with_lease is not None:
+                if os.environ.get("LMER_FORCE_PUSH_EXPLICITLY_APPROVED_BY_USER") != "1":
+                    raise LeaseError(
+                        "Force push blocked. Obtain explicit operator permission first; "
+                        "only then set LMER_FORCE_PUSH_EXPLICITLY_APPROVED_BY_USER=1 "
+                        "for this command.")
+                if tag is not None or ref is not None:
+                    raise LeaseError("A lease cannot be combined with --tag or --ref")
+                if len(force_with_lease) != 2:
+                    raise LeaseError("A lease requires one destination and one expected OID")
+                lease = PushLease(*force_with_lease)
+                source = locks.enter_context(lease.pin_source(remote))
+                target_ref = source.refspec
+
+            if not gate.run_push_gate(ref=target_ref, remote=remote):
+                print(f"\n{Colors.RED}Push blocked. Fix issues first.{Colors.NC}")
+                emit(1)
+                return 1
+
+            outcome = "pass"
+            print(f"\n{Colors.GREEN}You may proceed with push.{Colors.NC}")
+            if source:
+                argv, env = locks.enter_context(source.push_command(
+                    gate.authorized_push_urls, gate.push_by_url))
+                print(f"{Colors.CYAN}Pushing leased ref: {source.refspec} -> "
+                      f"{_scrub_credentials(remote)}{Colors.NC}")
+                result = subprocess.run(argv, check=False, env=env)
+            else:
+                result = ordinary_push(target_ref, remote)
+
+            if result.returncode == 0:
+                print(f"{Colors.GREEN}✅ Push successful!{Colors.NC}")
+            else:
+                print(f"{Colors.RED}❌ Push failed{Colors.NC}")
+            emit(result.returncode)
+            return result.returncode
+        except (LeaseError, OSError, subprocess.SubprocessError) as exc:
+            print(f"{Colors.RED}❌ Push refused: {_scrub_credentials(str(exc))}{Colors.NC}")
+            emit(1)
+            return 1
+
+
+def inspect_lease(remote, destination):
+    """Read the expectation without rendering credential-bearing URLs."""
+    try:
+        endpoint, oid = inspect_expectation(remote, destination)
+        print(f"Push endpoint: {endpoint}")
+        print(f"{oid} {destination}")
+        return 0
+    except LeaseError as exc:
+        print(f"Inspection refused: {exc}")
+        return 1
+    except (OSError, subprocess.SubprocessError):
+        print("Inspection refused: operation could not complete; diagnostic output withheld")
+        return 1
+
+
+def ordinary_push(target_ref, remote):
+    """Preserve the existing explicit-ref and current-branch push commands."""
 
     if target_ref is not None:
         # Explicit ref (tag or refspec): push it verbatim, no upstream
@@ -109,8 +162,7 @@ def gate_push(verbose: bool = False, tag: str = None, ref: str = None,
 
         if not branch:
             print(f"{Colors.RED}❌ Could not determine current branch{Colors.NC}")
-            emit(1)
-            return 1
+            return subprocess.CompletedProcess(["git", "push"], 1)
 
         print(f"{Colors.CYAN}Pushing branch: {branch}{Colors.NC}")
         result = subprocess.run(
@@ -118,17 +170,22 @@ def gate_push(verbose: bool = False, tag: str = None, ref: str = None,
             check=False
         )
 
-    if result.returncode == 0:
-        print(f"{Colors.GREEN}✅ Push successful!{Colors.NC}")
-    else:
-        print(f"{Colors.RED}❌ Push failed{Colors.NC}")
-
-    emit(result.returncode)
-    return result.returncode
+    return result
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Gate push - enforces all rules before push")
+class Once(argparse.Action):
+    """Do not silently replace an explicit target with a later occurrence."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is not None:
+            parser.error(f"{option_string} may only be supplied once")
+        setattr(namespace, self.dest, values)
+
+
+def parse_args(argv=None):
+    """Parse one unambiguous push target; Git options are never forwarded."""
+    parser = argparse.ArgumentParser(
+        description="Gate push - enforces all rules before push", allow_abbrev=False)
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     target = parser.add_mutually_exclusive_group()
     target.add_argument('--tag', metavar='NAME',
@@ -139,14 +196,37 @@ if __name__ == "__main__":
                              'refs/tags/...) or <src>:<dst> with a fully '
                              'qualified dst; force (+), deletion (:<dst>) and '
                              'glob refspecs are refused')
-    parser.add_argument('--remote', metavar='NAME', default='origin',
+    target.add_argument('--inspect-lease', metavar='DEST', action=Once,
+                        help='Read the current commit of one push branch; prints a '
+                             'transport/host/port label and OID, withholding URL '
+                             'userinfo/path/query/fragment and Git error output; '
+                             'Git tracing disabled; no push or gates')
+    target.add_argument('--force-with-lease', nargs=2, action=Once,
+                        metavar=('DEST', 'OLD_OID'),
+                        help='Push the clean current branch with an explicit lease: '
+                             'DEST must be refs/heads/<branch>, OLD_OID a full '
+                             'nonzero lowercase commit OID. Obtain explicit operator '
+                             'permission first; only then set '
+                             'LMER_FORCE_PUSH_EXPLICITLY_APPROVED_BY_USER=1 for '
+                             'this command (exactly "1"). Requires destination '
+                             'authorization; no automatic refresh or retry')
+    parser.add_argument('--remote', metavar='NAME', action=Once,
                         help='Remote to push to (default: origin)')
+    args = parser.parse_args(argv)
+    if args.remote is None:
+        args.remote = 'origin'
+    return args
 
-    args = parser.parse_args()
 
+if __name__ == "__main__":
+    args = parse_args()
     # Held across the whole command — checks, push AND receipt (issue #201).
     # Wrapped here rather than inside gate_push() so no early return can leave
     # the window uncovered.
     with hold_gate_lock("gate-push"):
-        rc = gate_push(args.verbose, tag=args.tag, ref=args.ref, remote=args.remote)
+        if args.inspect_lease is not None:
+            rc = inspect_lease(args.remote, args.inspect_lease)
+        else:
+            rc = gate_push(args.verbose, tag=args.tag, ref=args.ref, remote=args.remote,
+                           force_with_lease=args.force_with_lease)
     sys.exit(rc)
