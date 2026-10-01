@@ -37,6 +37,7 @@ class ConnectorLifecycle:
         self._pending_inbound = {}
         self._replayed = False
         self._direction_failures = {}
+        self._delivery_health = {}
         self._activity_seq = None
         self._receipt_pending = {}
         self._receipts = ReceiptReactions(self)
@@ -51,7 +52,7 @@ class ConnectorLifecycle:
 
     def _snapshot(self):
         fields = ["_bus_cursor", "_answered_freely", "_announced", "_questions",
-                  "_pending_inbound", "_replayed", "_receipt_pending", *self._transport_fields]
+                  "_pending_inbound", "_replayed", "_receipt_pending", "_delivery_health", *self._transport_fields]
         return {
             **{field: sorted(getattr(self, field)) if isinstance(getattr(self, field), set)
                else copy.deepcopy(getattr(self, field)) for field in fields},
@@ -175,6 +176,7 @@ class ConnectorLifecycle:
                 count = self._direction_failures.get(direction, 0) + 1
                 self._direction_failures[direction] = count
                 self.failures = max(self._direction_failures.values())
+                self._record_delivery_health(direction, exc)
                 if count == 1:
                     self._transition_note(f"{direction} connector delivery is retrying after an error")
                 if count >= FAILURE_LIMIT:
@@ -182,11 +184,27 @@ class ConnectorLifecycle:
                     return
                 self._backoff()
                 continue
-            if self._direction_failures.get(direction):
+            if self._direction_failures.get(direction) or self._delivery_health.get(direction, {}).get("failures"):
                 self._transition_note(f"{direction} connector delivery recovered")
+                self._record_delivery_health(direction)
             self._direction_failures[direction] = 0
             self.failures = max(self._direction_failures.values(), default=0)
             self._stop.wait(interval)
+
+    def _record_delivery_health(self, direction, error=None):
+        if self._state is None or self._state.session is None:
+            return
+        try:
+            with self._state.lock:
+                previous = self._delivery_health.get(direction, {})
+                self._delivery_health[direction] = {
+                    "failures": previous.get("failures", 0) + 1 if error else 0,
+                    "error": type(error).__name__ if error else None,
+                    "at": time.time(),
+                }
+                self._state.save()
+        except (OSError, RecoveryRequired, IdentityUnavailable):
+            logger.exception("connector_health_checkpoint_failed direction=%s", direction)
 
     def _backoff(self):
         self._stop.wait(min(30.0, 0.5 * 2 ** min(self.failures, 6)))

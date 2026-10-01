@@ -3086,7 +3086,7 @@ def _spawn_session(
     publish_registration: Optional[Callable[[Callable[[], None], str, int], None]],
     refuse_held_targets: bool,
 ) -> SpawnResult:
-    from . import project_requests
+    from . import project_requests, project_threads
 
     request = request.validate()
     if kind not in registry.SESSION_KINDS:
@@ -3095,6 +3095,9 @@ def _spawn_session(
     if projects.enabled():
         try:
             projects.get(workspace_id, active=True)
+            if request.targets:
+                for target in request.targets:
+                    project_threads.authorize(target, workspace_id)
             if kind == registry.ASSISTANT_KIND:
                 projects.require_admission(workspace_id)
         except projects.ProjectError as exc:
@@ -3217,6 +3220,8 @@ def _spawn_session(
         # credential does not get left lying around.
         with _suppress_oserror():
             token_file.unlink()
+        if isinstance(exc, projects.ProjectError):
+            raise
         raise SpawnError(f"cannot start {command[0]} ({exc})")
     finally:
         if launch_pipe:
@@ -3333,9 +3338,7 @@ def _spawn_session(
 
         component = thread_connectors.get_connectors()
         if component is not None:
-            component.adopt_launch_targets(
-                session_id, request.targets, by="operator",
-            )
+            project_requests.attach_spawned(component, session_id, request.targets)
 
     # Track the run so it appears in this orchestrator's fleet view (D25). Only
     # possible with a full identity; a session whose repo URL could not be parsed

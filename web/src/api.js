@@ -97,6 +97,12 @@ export function parkConversationRequest(identity, workspaceId, reason) {
   })
 }
 
+export function releaseConversationRequest(identity, workspaceId, reason) {
+  return request(`api/assistant/requests/${encodeURIComponent(identity)}/release`, {
+    method: 'POST', headers: jsonHeaders, body: JSON.stringify({ workspace_id: workspaceId, reason }),
+  })
+}
+
 export function fetchHealth() {
   return request('api/health')
 }

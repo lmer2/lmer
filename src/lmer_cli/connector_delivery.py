@@ -100,7 +100,7 @@ class DeliveryState:
                 if (saved.get("version") != 1 or saved.get("session") != session
                         or saved.get("thread") != self.key.parts
                         or not isinstance(saved.get("transport"), dict)
-                        or not (set(self.snapshot()) - {"_receipt_pending"}).issubset(saved["transport"])
+                        or not (set(self.snapshot()) - {"_receipt_pending", "_delivery_health"}).issubset(saved["transport"])
                         or type(saved["transport"].get("_bus_cursor")) is not int
                         or saved["transport"]["_bus_cursor"] < 0):
                     raise RecoveryRequired("incompatible connector checkpoint; state preserved")

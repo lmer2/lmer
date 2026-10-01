@@ -1,6 +1,6 @@
 <script setup>
-import { computed, nextTick, onMounted, ref } from 'vue'
-import { archiveProject, fetchPlatformSettings, setPlatformSettings, fetchConversationRequests, parkConversationRequest } from '../api.js'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { archiveProject, fetchPlatformSettings, setPlatformSettings, fetchConversationRequests, parkConversationRequest, releaseConversationRequest } from '../api.js'
 import AssistantSettings from './AssistantSettings.vue'
 import IngressStatus from './IngressStatus.vue'
 import SlotEditor from './SlotEditor.vue'
@@ -23,14 +23,29 @@ const requests = ref([])
 const parking = ref(null)
 const parkingReason = ref('')
 const parkingBusy = ref(false)
+const releasing = ref(null)
+const releaseReason = ref('')
+const releaseBusy = ref(false)
+const requestsBusy = ref(false)
+const requestsError = ref(null)
+
+async function refreshRequests() {
+  if (requestsBusy.value) return
+  requestsBusy.value = true
+  try {
+    const pending = await fetchConversationRequests()
+    requests.value = pending.requests.filter(row => row.state === 'choice' || row.error || row.recovery || row.prompt_state === 'sending'
+      || ['reply_sending', 'reply_uncertain'].includes(row.state) || actionProblems(row))
+    requestsError.value = null
+  } catch (exc) { requestsError.value = exc.message } finally { requestsBusy.value = false }
+}
+watch(() => props.state, refreshRequests)
 
 onMounted(async () => {
   try {
-    const [settings, pending] = await Promise.all([fetchPlatformSettings(), fetchConversationRequests()])
+    const [settings] = await Promise.all([fetchPlatformSettings(), refreshRequests()])
     cap.value = settings.max_live_assistants
     workerCap.value = settings.max_concurrent_sessions
-    requests.value = pending.requests.filter(row => row.state === 'choice' || row.error || row.prompt_state === 'sending'
-      || ['reply_sending', 'reply_uncertain'].includes(row.state) || actionProblems(row))
   } catch (exc) { error.value = exc.message }
   if (props.focusSection === 'slots') {
     await nextTick()
@@ -62,6 +77,17 @@ async function park() {
     parking.value = null
     error.value = null
   } catch (exc) { error.value = exc.message } finally { parkingBusy.value = false }
+}
+function confirmRelease(request) { releasing.value = request; releaseReason.value = ''; error.value = null }
+async function release() {
+  const target = releasing.value
+  releaseBusy.value = true
+  try {
+    await releaseConversationRequest(target.id, target.project_id, releaseReason.value)
+    releasing.value = null
+    await refreshRequests()
+    emit('changed')
+  } catch (exc) { error.value = exc.message } finally { releaseBusy.value = false }
 }
 </script>
 
@@ -100,10 +126,17 @@ async function park() {
     <v-chip :color="projectColor(project.color)" variant="flat">{{ project.name }}</v-chip>
     <template #append><v-btn :color="projectColor(project.color)" variant="flat" @click="restore(project)">Restore stopped</v-btn></template>
   </v-list-item></v-list>
-  <h2 v-if="requests.length" class="text-title-medium mt-4">Conversation requests needing attention</h2>
+  <div class="d-flex align-center mt-4"><h2 class="text-title-medium">Conversation requests needing attention</h2>
+    <v-spacer /><v-btn :loading="requestsBusy" @click="refreshRequests">Refresh requests</v-btn></div>
+  <v-alert v-if="requestsError" type="error">{{ requestsError }}</v-alert>
   <v-list><v-list-item v-for="request in requests" :key="request.id" :title="`${request.transport}: ${request.state}`"
-    :subtitle="request.error || actionProblems(request) || `Project choice pending in ${request.conversation}, thread ${request.root}`">
+    :subtitle="request.recovery?.reason || request.error || actionProblems(request) || `Project choice pending in ${request.conversation}, thread ${request.root}`">
     <p>{{ projectName(request) }} · {{ request.conversation }} · {{ request.root }}</p>
+    <p v-if="request.recovery">{{ request.recovery.instruction }}</p>
+    <p v-for="action in (request.actions || []).filter(row => row.state === 'complete')" :key="`${action.method}:${action.path}`">
+      {{ action.method }} {{ action.path }}: complete — receipt retained
+    </p>
+    <v-btn v-if="request.recovery?.release_allowed" @click="confirmRelease(request)">Release blocked request</v-btn>
     <p v-if="request.parking">Parked by {{ request.parking.by }} at {{ request.parking.at }}: {{ request.parking.reason }}. Delivery remains unknown; archive stays blocked.</p>
     <v-btn v-else-if="['reply_sending', 'reply_uncertain'].includes(request.state)" @click="confirmParking(request)">Park uncertain reply</v-btn>
   </v-list-item></v-list>
@@ -118,6 +151,21 @@ async function park() {
       <v-card-actions>
         <v-btn :disabled="parkingBusy" @click="parking = null">Cancel</v-btn>
         <v-btn :loading="parkingBusy" :disabled="!parkingReason.trim()" @click="park">Park and allow independent work</v-btn>
+      </v-card-actions>
+    </v-card>
+  </v-dialog>
+  <v-dialog :model-value="!!releasing" :persistent="releaseBusy" max-width="560" @update:model-value="value => { if (!value) releasing = null }">
+    <v-card v-if="releasing" :title="`Release blocked request for ${projectName(releasing)}`">
+      <v-card-text>
+        <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+        <p>{{ releasing.transport }} · {{ releasing.conversation }} · {{ releasing.root }}</p>
+        <p>{{ releasing.recovery.reason }}</p>
+        <p>No reply will be sent and no completed action will be repeated. Keep the existing worker and ask for a fresh request in the source thread.</p>
+        <v-textarea v-model="releaseReason" label="Reason for release" maxlength="2000" :disabled="releaseBusy" />
+      </v-card-text>
+      <v-card-actions>
+        <v-btn :disabled="releaseBusy" @click="releasing = null">Cancel</v-btn>
+        <v-btn :loading="releaseBusy" :disabled="!releaseReason.trim()" @click="release">Release and allow independent work</v-btn>
       </v-card-actions>
     </v-card>
   </v-dialog>

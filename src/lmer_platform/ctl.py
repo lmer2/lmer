@@ -743,6 +743,11 @@ def create_parser() -> argparse.ArgumentParser:
     requests_park.add_argument("reason")
     requests_park.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/park",
                                                      body={"reason": _text(args.reason)}))
+    requests_release = requests_sub.add_parser("release", help="Operator-only: release a blocked request with no uncertain effects.")
+    requests_release.add_argument("identity")
+    requests_release.add_argument("reason")
+    requests_release.set_defaults(call=lambda args: Call("POST", f"/api/assistant/requests/{args.identity}/release",
+                                                        body={"reason": _text(args.reason)}))
 
     status = sub.add_parser(
         "status",
