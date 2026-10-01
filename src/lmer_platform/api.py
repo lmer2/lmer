@@ -2186,6 +2186,9 @@ def create_app(
                 agents=body.get("agents"),
                 harness=body.get("harness"),
                 model=body.get("model"),
+                session_metadata=body.get("session_metadata"),
+                source_session_id=body.get("source_session_id"),
+                allow_unsigned_source=body.get("allow_unsigned_source"),
                 # Not a launch flag like the four above it: the slot resolves
                 # against ``config.slots`` and supplies the preset, which is why
                 # naming both is refused rather than ordered (issue #245).
@@ -3683,10 +3686,15 @@ def create_app(
                 # Not coerced: a non-string answer keeps its own refusal message
                 # rather than being reported as an empty one.
                 answer=body.get("answer") or "",
+                allow_unsigned_source=body.get("allow_unsigned_source"),
             )
             result = answer_run(config, request)
         except AnswerError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except ResumeError as exc:
+            # Schema-2 answers continue from the record that asked, so the same
+            # source-bound unsigned decision as resume can be required here.
+            raise HTTPException(status_code=exc.status, detail=exc.to_dict()) from exc
         # The same 409 ``NotAnswerable`` gives this route for a run that is already
         # running, for the residual case the answer path's own check cannot see: the
         # spawn's invariant matches the identity it is about to register, so it
@@ -3752,6 +3760,10 @@ def create_app(
                 # path segment and imposes no grammar beyond that, because the
                 # ``--<name>`` half of a session dir has none (docs/SCHEMA.md).
                 session_id=body.get("session_id"),
+                # The selected source UID itself, never a boolean force flag.
+                # Resume validates it against the record it resolved before a
+                # child process is started.
+                allow_unsigned_source=body.get("allow_unsigned_source"),
             )
             result = resume_run(config, request)
         except ResumeError as exc:

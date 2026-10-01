@@ -5,6 +5,8 @@ import os
 import re
 import subprocess
 import sys
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlsplit
@@ -31,6 +33,10 @@ from lmer_cli import gate_lock
 from .run_state import append_event, run_dir, run_rel_path_candidates
 from .specs_index import specs_rel_path
 from .utils import no_run_context_error, task_target_dir, work_repo_layout
+from .transactions import (
+    checkout_lock, checkout_metadata_dir, inherited_transaction, pending_paths,
+    published_paths, queue_paths,
+)
 
 PUSH_RETRIES = 3
 
@@ -84,7 +90,9 @@ _FORGE_PATH_PREFIX = {
 DEFAULT_WEB_BRANCH = "main"
 
 
-def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int, str]:
+def run_git_command(
+    cmd: list[str], cwd: Path, check: bool = True, extra_env: Optional[dict] = None
+) -> tuple[int, str]:
     """
     Run a git command and return exit code and output.
 
@@ -92,6 +100,9 @@ def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int,
         cmd: Git command and arguments
         cwd: Working directory for the command
         check: If True, raise exception on non-zero exit
+        extra_env: Environment overlay — ``GIT_INDEX_FILE`` for the
+            publication index, which is how a tree is assembled without
+            touching the checkout's own index.
 
     Returns:
         Tuple of (exit_code, output)
@@ -107,7 +118,7 @@ def run_git_command(cmd: list[str], cwd: Path, check: bool = True) -> tuple[int,
             capture_output=True,
             text=True,
             check=check,
-            env={**os.environ, "LC_ALL": "C"},
+            env={**os.environ, "LC_ALL": "C", **(extra_env or {})},
         )
         if result.returncode == 0:
             return result.returncode, result.stdout
@@ -654,10 +665,40 @@ def _verify_published(
     return 0
 
 
-def commit_work_path(
+def commit_work_path(target_path, commit_message=None, allow_during_gate=False) -> int:
+    """Serialize publication and replay complete deferred transition paths.
+
+    Includes deferred transitions from other sessions in this checkout: their
+    shared retirement marker can only be published with all its archive/live
+    changes. Ordinary pre-stage refusals do not enroll unrelated paths for
+    later retries; explicit transitions and actual deferrals retain their
+    requests until verified publication.
+    """
+    root = Path(os.environ.get("LMER_WORK_REPO_PATH", "/work"))
+    if not root.exists():
+        print(f"❌ Work repository not found at {root}", file=sys.stderr)
+        return 1
+    paths = [target_path] if isinstance(target_path, str) else list(target_path)
+    try:
+        if inherited_transaction(root):
+            queue_paths(root, paths)
+            _queue_deferral(_current_run_dir(), {"gate": "invoking Git transaction"}, paths)
+            print("⏸️  Work-repo commit deferred until the invoking Git transaction finishes")
+            return 0
+        with checkout_lock(root):
+            entries, deferred_paths = pending_paths(root)
+            paths.extend(path for path in deferred_paths if path not in paths)
+            return _commit_work_path_locked(paths, commit_message, allow_during_gate, entries)
+    except (OSError, ValueError) as exc:
+        print(f"❌ Work-repo commit transaction failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def _commit_work_path_locked(
     target_path,
     commit_message: Optional[str] = None,
     allow_during_gate: bool = False,
+    pending_entries=(),
 ) -> int:
     """
     Sync one or more paths in the work repo: add -> commit -> rebase -> push.
@@ -733,13 +774,14 @@ def commit_work_path(
                 return _git_failure("pending commit check", "work repo", rc, pending)
             if not pending.strip():
                 return 0
+        queue_paths(work_repo_path, all_paths)
         _report_deferral(marker, paths)
         _queue_deferral(_current_run_dir(), marker, paths)
         return 0
 
     if not paths:
         print("No existing paths to commit in work repository")
-        return _push_pending_commits(work_repo_path, "work repo")
+        return published_paths(pending_entries, _push_pending_commits(work_repo_path, "work repo"))
 
     # Parked deferrals land as events now, so this commit carries the trace of
     # the commits it is standing in for.
@@ -756,7 +798,7 @@ def commit_work_path(
         return rc
     if not status_output.strip():
         print("No new file changes to commit in work repository")
-        return _push_pending_commits(work_repo_path, "work repo")
+        return published_paths(pending_entries, _push_pending_commits(work_repo_path, "work repo"))
 
     # 2. Commit
     if commit_message is None:
@@ -773,7 +815,185 @@ def commit_work_path(
     rc = _push_with_rebase_retries(work_repo_path, "work repo")
     if rc == 0:
         print("✅ Successfully committed and pushed changes to work repository")
-    return rc
+    return published_paths(pending_entries, rc)
+
+
+# ---------------------------------------------------------------------------
+# Publishing without touching the live checkout (§7)
+# ---------------------------------------------------------------------------
+#
+# A claim used to be published the way an ordinary commit is: rebase the local
+# branch onto the fetched head, write the claim into the worktree, commit,
+# push. A dirty tracked file makes `pull --rebase` refuse outright, so the
+# transaction stashed the checkout first — and a work-repo checkout is SHARED
+# (spawn-harness children run beside their parent against one /work), so that
+# stash captured every sibling session's uncommitted record, and a restore
+# that could not put them back left them nowhere but the stash.
+#
+# What follows publishes a commit without reading or writing the live index,
+# HEAD or worktree: the tree is assembled in a temporary index seeded from the
+# fetched remote head, the commit is created as an object with `commit-tree`,
+# and that object is pushed. So a claim cannot capture, move or lose anything
+# of anyone else's, whatever happens to it, and a lost race has nothing to
+# roll back. The arbitration is unchanged: one plain push, and the server's
+# non-fast-forward rejection is the answer.
+
+
+def _git_raw(
+    repo_path: Path, args: list[str], *, stdin: Optional[bytes] = None,
+    extra_env: Optional[dict] = None,
+) -> tuple[int, bytes]:
+    """``git`` with byte-exact input and output — content must round-trip."""
+    result = subprocess.run(
+        ["git", *args], cwd=str(repo_path), input=stdin, capture_output=True,
+        env={**os.environ, "LC_ALL": "C", **(extra_env or {})},
+    )
+    if result.returncode == 0:
+        return 0, result.stdout
+    return result.returncode, result.stdout + result.stderr
+
+
+def fetch_publication_head(repo_path: Path, label: str) -> tuple[bool, str]:
+    """Fetch the remote head a transaction arbitrates against, and name it.
+
+    ``(True, sha)``, or ``(False, detail)``. An unreachable remote fails here,
+    before anything is built or pushed, so a dead remote can never be mistaken
+    for a lost race — a release fails closed, it does not proceed unlocked.
+    """
+    destination = _publication_destination(repo_path, label)
+    if destination is None:
+        return False, "the current branch has no remote branch upstream configured"
+    remote, ref = destination
+    rc, output = run_git_command(["fetch", "--no-tags", remote, ref], repo_path, check=False)
+    if rc != 0:
+        return False, f"git fetch failed: {_scrub_credentials(output)}"
+    rc, output = run_git_command(
+        ["rev-parse", "--verify", "--quiet", "FETCH_HEAD^{commit}"], repo_path, check=False
+    )
+    if rc != 0 or not output.strip():
+        return False, f"cannot resolve the fetched head: {output}"
+    return True, output.strip()
+
+
+def published_file(repo_path: Path, commit: str, rel: str) -> tuple[bool, str]:
+    """One file's text at *commit*: ``(True, text)``, or ``(False, "")`` when
+    the path does not exist there. Reads the object store, never the worktree."""
+    rc, _ = run_git_command(["cat-file", "-e", f"{commit}:{rel}"], repo_path, check=False)
+    if rc != 0:
+        return False, ""
+    rc, output = run_git_command(["show", f"{commit}:{rel}"], repo_path, check=False)
+    if rc != 0:
+        raise OSError(f"cannot read {rel} at {commit}: {output}")
+    return True, output
+
+
+@contextmanager
+def _publication_index(repo_path: Path):
+    """A private index file, outside every commit path set, removed after use.
+
+    It lives beside the checkout's own bookkeeping (never in the worktree, so
+    no `work commit` can stage it), and `GIT_INDEX_FILE` points the plumbing
+    at it — the checkout's index is neither read nor written.
+    """
+    directory = checkout_metadata_dir(repo_path)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"lmer-publish-index.{os.getpid()}.{uuid.uuid4().hex}"
+    try:
+        yield {"GIT_INDEX_FILE": str(path)}
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _replace_subtree(
+    repo_path: Path, env: dict, rel: str, source: str
+) -> Optional[str]:
+    """Put *source*'s copy of the directory *rel* into the publication index.
+
+    A tree-to-tree copy: file modes, symlinks and binary content cross over
+    exactly as Git recorded them, with no blob rewritten and no worktree read.
+    Returns a failure detail, or None on success.
+    """
+    rc, listed = run_git_command(["ls-files", "-z", "--", rel], repo_path, check=False, extra_env=env)
+    if rc != 0:
+        return f"cannot inspect {rel}: {listed}"
+    existing = [entry for entry in listed.split("\0") if entry]
+    if existing:
+        # --force-remove, not `git rm`: the entry goes whatever the worktree
+        # holds, because the worktree is not this transaction's business.
+        rc, output = run_git_command(
+            ["update-index", "--force-remove", "--", *existing],
+            repo_path, check=False, extra_env=env,
+        )
+        if rc != 0:
+            return f"cannot replace {rel}: {output}"
+    rc, _ = run_git_command(["cat-file", "-e", f"{source}:{rel}"], repo_path, check=False)
+    if rc != 0:
+        return None  # nothing recorded there yet; the removal stands
+    rc, output = run_git_command(
+        ["read-tree", f"--prefix={rel}/", f"{source}:{rel}"],
+        repo_path, check=False, extra_env=env,
+    )
+    return None if rc == 0 else f"cannot copy {rel}: {output}"
+
+
+def publish_overlay_commit(
+    repo_path: Path, *, base: str, message: str,
+    blobs: Optional[dict] = None, subtrees: Optional[dict] = None,
+    label: str = "work repo",
+) -> tuple[str, str, str]:
+    """Build a commit on *base* carrying the overlay, and push it once.
+
+    *blobs* maps a work-repo-relative path to its complete new text.
+    *subtrees* maps a work-repo-relative DIRECTORY to a commit whose copy of
+    that directory replaces it — this session's own record, taken from the
+    snapshot it just committed, so what is published is exactly what the local
+    branch already holds and the next ordinary rebase drops as applied.
+
+    Returns ``(outcome, detail, commit)`` in the vocabulary of
+    :func:`claim_push_once`. On any outcome the checkout is exactly as it was.
+    """
+    destination = _publication_destination(repo_path, label)
+    if destination is None:
+        return CLAIM_PUSH_ERROR, "no upstream publication destination", ""
+    remote, ref = destination
+    with _publication_index(repo_path) as env:
+        rc, output = run_git_command(["read-tree", base], repo_path, check=False, extra_env=env)
+        if rc != 0:
+            return CLAIM_PUSH_ERROR, f"cannot seed the publication index: {output}", ""
+        for rel, source in (subtrees or {}).items():
+            detail = _replace_subtree(repo_path, env, rel, source)
+            if detail:
+                return CLAIM_PUSH_ERROR, detail, ""
+        for rel, text in (blobs or {}).items():
+            rc, written = _git_raw(
+                repo_path, ["hash-object", "-w", "--stdin", "--path", rel],
+                stdin=text.encode("utf-8"),
+            )
+            if rc != 0:
+                return CLAIM_PUSH_ERROR, f"cannot write {rel}: {written.decode(errors='replace')}", ""
+            rc, output = run_git_command(
+                ["update-index", "--add", "--cacheinfo",
+                 f"100644,{written.decode().strip()},{rel}"],
+                repo_path, check=False, extra_env=env,
+            )
+            if rc != 0:
+                return CLAIM_PUSH_ERROR, f"cannot stage {rel}: {output}", ""
+        rc, tree = run_git_command(["write-tree"], repo_path, check=False, extra_env=env)
+        if rc != 0:
+            return CLAIM_PUSH_ERROR, f"cannot write the publication tree: {tree}", ""
+    rc, commit = run_git_command(
+        ["commit-tree", tree.strip(), "-p", base, "-m", message], repo_path, check=False
+    )
+    if rc != 0:
+        return CLAIM_PUSH_ERROR, f"cannot create the publication commit: {commit}", ""
+    commit = commit.strip()
+    rc, output = run_git_command(["push", remote, f"{commit}:{ref}"], repo_path, check=False)
+    if rc == 0:
+        return CLAIM_PUSH_WON, output, commit
+    if any(marker in output.lower() for marker in _NON_FAST_FORWARD_MARKERS):
+        return CLAIM_PUSH_LOST_RACE, output, commit
+    print(f"❌ git push failed ({label}): {_scrub_credentials(output)}", file=sys.stderr)
+    return CLAIM_PUSH_ERROR, output, commit
 
 
 def _stash_head(repo_path: Path, label: str) -> tuple[int, str]:

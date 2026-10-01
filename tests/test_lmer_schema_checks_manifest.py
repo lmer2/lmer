@@ -135,7 +135,7 @@ class TestPresence:
         manifest = check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
         assert report.exit_code == EXIT_CLEAN
         assert manifest is not None
         assert manifest.name == pf.INSTANCE_NAME
@@ -367,7 +367,7 @@ class TestUnknownKeys:
         check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
 
     def test_an_unknown_housekeeping_policy_key_warns(self, schema_plexus):
         doc = _doc()
@@ -462,7 +462,7 @@ class TestSourcesSameHost:
         check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
 
         doc["sources"]["napkin"] = {"repo": "elsewhere.example.net/a/napkin"}
         _rewrite(schema_plexus, doc)
@@ -470,7 +470,7 @@ class TestSourcesSameHost:
         check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == ["manifest.sources-cross-host"]
+        assert _codes(report) == ["manifest.sources-cross-host", "manifest.schema-older"]
 
     def test_without_a_plexus_repo_url_the_host_check_is_skipped(self, schema_plexus):
         doc = _doc()
@@ -478,7 +478,7 @@ class TestSourcesSameHost:
         _rewrite(schema_plexus, doc)
         report = _report()
         check_manifest(schema_plexus.root, report)
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
 
     def test_a_credential_in_a_declaration_is_an_error_and_never_echoed(self, schema_plexus):
         host = _sources_host(schema_plexus)
@@ -518,7 +518,7 @@ class TestSourcesSameHost:
         check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == ["manifest.sources-reserved"]
+        assert _codes(report) == ["manifest.schema-older", "manifest.sources-reserved"]
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +570,7 @@ class TestHousekeeping:
         check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
 
     @pytest.mark.parametrize("value", [365, "365 days", "d", True, "365D"])
     def test_a_malformed_duration_is_a_shape_error(self, schema_plexus, value):
@@ -592,7 +592,7 @@ class TestHousekeeping:
         check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
 
 
 # ---------------------------------------------------------------------------
@@ -611,7 +611,7 @@ class TestLayering:
         check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
 
     def test_a_duplicate_remote_is_not_this_modules_finding(self, schema_plexus):
         doc = _doc()
@@ -624,7 +624,7 @@ class TestLayering:
         check_manifest(
             schema_plexus.root, report, plexus_repo_url=schema_plexus.primary_repo
         )
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
 
     def test_a_bad_short_name_stops_the_loader_and_reads_as_unusable(self, schema_plexus):
         # The loader owns the §1 charset (fail-closed), so a bad key never

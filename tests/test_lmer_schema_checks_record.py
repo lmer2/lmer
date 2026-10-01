@@ -104,6 +104,8 @@ RECORD_CODES = {
     "record.seed-dir-leftover",
     "record.session-dir-without-state",
     "record.session-id-malformed",
+    "record.session-metadata",
+    "record.release-claim",
     "record.session-stale",
     "record.state-enum",
     "record.state-schema",

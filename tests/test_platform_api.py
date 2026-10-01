@@ -786,6 +786,46 @@ def test_the_answer_does_not_come_back_in_the_reply(client, answered):
     assert "command" not in response.text
 
 
+def test_answer_confirmation_is_passed_as_the_exact_source_uid(client, answered):
+    source_uid = "a" * 32
+    response = client.post(
+        "/api/runs/answer",
+        headers=bearer_header(),
+        json={**ANSWER_BODY, "allow_unsigned_source": source_uid},
+    )
+    assert response.status_code == 202
+    assert answered.calls[0].allow_unsigned_source == source_uid
+
+
+def test_answer_unsigned_refusal_keeps_structured_provenance(
+    client, platform_root, monkeypatch
+):
+    from lmer_platform import resume as resume_mod
+
+    source = {
+        "uid": "a" * 32,
+        "operator": "alice",
+        "hostname": "build.example",
+        "started_at": "2026-09-17T12:00:00Z",
+        "last_activity": "2026-09-17T12:05:00Z",
+    }
+
+    def refuse(config, request):
+        raise resume_mod.UnsignedSessionSource("source has no sign-out", source)
+
+    monkeypatch.setattr(api, "answer_run", refuse)
+    response = client.post(
+        "/api/runs/answer", headers=bearer_header(), json=ANSWER_BODY
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "unsigned_session",
+        "message": "source has no sign-out",
+        "source": source,
+        "decisions": ["continue_fresh", "cancel"],
+    }
+
+
 def test_answer_refusals_keep_their_status(client, platform_root, monkeypatch):
     from lmer_platform import answer as answer_mod
 

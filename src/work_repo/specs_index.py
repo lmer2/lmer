@@ -47,7 +47,8 @@ exactly `spec`, starts with `spec` + separator, or ends with separator +
 `spec-auth.md`, `foo-spec.md`, `masterplan-spec.md` qualify; `plan.md`,
 `spec.py` (not Markdown), `specifics.md`, `inspect.md` do not.
 
-Every write path here is fail-soft by contract: the index is a
+Every write path here is fail-soft after acquiring the checkout transaction:
+an inherited Git hook is refused before lookup or mutation. The index is a
 convenience view over the run area, and no index problem may ever fail the
 artifact registration (or sync) that triggered it. `rebuild()` is the
 backfill path for runs that predate the index; it asks the run-state
@@ -65,6 +66,7 @@ from pathlib import Path
 from typing import Optional
 
 from .utils import _work_repo_base, project_area, work_repo_root
+from .transactions import mutation_transaction
 
 __all__ = [
     "SPECS_DIR", "SCHEMA_SPECS_DIR", "is_spec_artifact", "specs_dir",
@@ -225,6 +227,7 @@ def _entry_name(label: str, basename: str, when: Optional[datetime]) -> str:
     return f"{when.strftime(_DATE_PREFIX)}-{_safe_label(label)}--{basename}"
 
 
+@mutation_transaction
 def upsert_spec_link(
     spec_path: Path,
     label: str,
@@ -310,6 +313,7 @@ def upsert_spec_link(
         return None
 
 
+@mutation_transaction
 def repoint_run_dir_entries(
     old_name: str, new_name: str, new_label: str
 ) -> None:
@@ -460,6 +464,7 @@ def _registration_when(rdir: Path, name: str, canonical: Path) -> Optional[datet
         return None
 
 
+@mutation_transaction
 def rebuild() -> list[Path]:
     """Rebuild the whole index from the run area (backfill path, `work
     specs-index --rebuild`): drop every existing symlink entry, then re-index

@@ -81,7 +81,7 @@ int → tools read and write, validator WARN).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -92,7 +92,7 @@ MANIFEST_NAME = "_plexus.yaml"
 
 #: Schema versions this loader understands. A present manifest declaring
 #: anything else fails loud (see the module docstring).
-SUPPORTED_SCHEMAS = (1,)
+SUPPORTED_SCHEMAS = (1, 2)
 
 #: The newest supported schema — the int a tool writes into a new manifest.
 CURRENT_SCHEMA = max(SUPPORTED_SCHEMAS)
@@ -185,6 +185,9 @@ class Manifest:
     sources: Dict[str, Dict[str, Any]]
     housekeeping: Dict[str, Dict[str, Any]]
     warnings: Tuple[str, ...]
+    # Writers retain the full document; understanding a subset never grants
+    # permission to discard an extension owned by another compatible writer.
+    document: Dict[str, Any] = field(default_factory=dict)
 
 
 def source_entry_keys(name) -> Tuple[str, ...]:
@@ -282,6 +285,7 @@ def parse_manifest(text, path=None) -> Manifest:
         sources=sections["sources"],
         housekeeping=sections["housekeeping"],
         warnings=tuple(warnings),
+        document=data,
     )
 
 

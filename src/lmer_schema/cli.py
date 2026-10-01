@@ -8,13 +8,16 @@ logic, opens no file of the tree and decides no severity — a rule that is
 easy to keep because the report already carries everything the two outputs
 need (the form, the ordered findings, the counts, the exit code).
 
-Two commands, two outputs
-=========================
+Commands and outputs
+====================
 ``validate <path>`` renders the report, as **text** for a human or as one
 **JSON document** for a machine (``--json``); ``--list-checks`` prints the
 registered check codes with their severities and tiers — the machine-readable
 inventory docs/SCHEMA.md's strictness table is reconciled against, in text or
-JSON. Nothing else: the adoption/migration verbs are ``work``'s (spec §9).
+JSON. ``migrate <path>`` previews an explicit schema-1 to schema-2 cutover,
+or applies that reviewed local change with ``--apply``. Its preconditions
+and filesystem changes live in :mod:`lmer_schema.migration`; it never commits
+or pushes. Legacy layout adoption remains separate.
 
 The exit taxonomy
 =================
@@ -128,6 +131,7 @@ from typing import Dict, List, Optional, Sequence
 from lmer_schema.checks.findings import (
     CHECKS,
     EXIT_CLEAN,
+    EXIT_ERRORS,
     EXIT_UNUSABLE,
     Form,
     Report,
@@ -207,14 +211,15 @@ def build_parser() -> _ArgumentParser:
         # argparse's generated line would show the subcommand as required.
         usage=(
             f"{PROG} validate PATH [--json] [--plexus-repo-url URL] "
-            f"[--stale-after DAYS]\n       {PROG} --list-checks [--json]"
+            f"[--stale-after DAYS]\n       {PROG} migrate PATH [--apply] [--json]"
+            f"\n       {PROG} --list-checks [--json]"
         ),
         description=(
-            "Validate a plexus — an lmer schema tree — against docs/SCHEMA.md. "
+            "Validate a plexus or preview a schema-version migration. "
             "Exit 0 clean (warnings never block), 1 errors, 2 unusable input."
         ),
         epilog=(
-            "Text output is an ordered fix-list; --json prints one document "
+            "Validation text is an ordered fix-list; --json prints one document "
             "(schema, tool, form, exit_code, unusable, counts, findings) whose "
             "every path is repo-relative. Run it as `python -m lmer_schema.cli` "
             "when the console script is not on PATH yet."
@@ -231,9 +236,15 @@ def build_parser() -> _ArgumentParser:
         action="store_true",
         help="emit one JSON document on stdout instead of text",
     )
-    # metavar="" so the one command is listed once: argparse otherwise prints
+    # metavar="" so each command is listed once: argparse otherwise prints
     # the choice line AND the choice's own help line under it.
     subparsers = parser.add_subparsers(dest="command", title="commands", metavar="")
+    migration_parser = subparsers.add_parser(
+        "migrate", help="preview a schema-1 to schema-2 cutover"
+    )
+    migration_parser.add_argument("path", help="plexus root")
+    migration_parser.add_argument("--apply", action="store_true", help="apply a clear preview")
+    migration_parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     validate_parser = subparsers.add_parser(
         "validate",
         prog=f"{PROG} validate",
@@ -300,6 +311,27 @@ def _dispatch(parser: _ArgumentParser, args) -> int:
         return _cmd_list_checks(args)
     if args.command is None:
         parser.error("a command is required (try `validate PATH`, or --list-checks)")
+    if args.command == "migrate":
+        from .manifest import ManifestError
+        from .migration import migrate
+
+        try:
+            result = migrate(Path(args.path), apply=args.apply)
+        except (ManifestError, OSError) as exc:
+            print(f"Migration refused: {exc}", file=sys.stderr)
+            return EXIT_UNUSABLE
+        if args.json:
+            print(json.dumps(result, indent=2))
+        else:
+            print(result["diff"] or "Already schema 2; no changes.")
+            print("Directory moves: none; historical records remain unchanged.")
+            for blocker in result["blockers"]:
+                print(f"Blocked: {blocker}")
+            if result["applied"]:
+                print("Schema 2 applied locally.")
+            elif result["diff"] and not result["blockers"]:
+                print("Preview only. Re-run with --apply after reviewing and stopping old writers.")
+        return EXIT_ERRORS if result["blockers"] else EXIT_CLEAN
     return _cmd_validate(args)
 
 

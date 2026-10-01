@@ -1265,7 +1265,8 @@ class TestSessionStart:
         state = run_state.seed_state("develop-issue-123", "develop", "t")
         state["schema"] = run_state.SCHEMA_VERSION + 1
         state["name"] = "kept-by-refusal"
-        run_state.write_state(run_env, state)
+        run_env.mkdir(parents=True, exist_ok=True)
+        (run_env / "state.yaml").write_text(yaml.safe_dump(state))
         assert _main(["session-start"]) == 0  # still fail-soft for the hook
         out = capsys.readouterr().out
         assert "read-only refusal" in out

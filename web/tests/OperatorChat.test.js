@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from 'vitest'
 import { flushPromises } from '@vue/test-utils'
 import RunDetail from '../src/components/RunDetail.vue'
 import AskHistory from '../src/components/AskHistory.vue'
-import { fetchAssistantConfig, fetchSessionAsk } from '../src/api.js'
+import { fetchAssistantConfig, fetchSessionAsk, resumeRun } from '../src/api.js'
 import { applyChatSettings, retainedEntries } from '../src/operatorChat.js'
 import { mountPane, deferred } from './mount.js'
 
@@ -130,4 +130,73 @@ it('marks a new answer to a previously viewed question unread', async () => {
   await vi.advanceTimersByTimeAsync(5000)
   await flushPromises()
   expect(tab.find('[aria-label="Unread messages"]').exists()).toBe(true)
+})
+
+it('binds fresh continuation approval to the refused source UID', async () => {
+  window.localStorage.setItem('lmer.run.tab', 'overview')
+  const refusal = Object.assign(new Error(
+    'source has no final sign-out (operator=alice, host=build.example)',
+  ), {
+    code: 'unsigned_session',
+    source: { uid: 'a'.repeat(32), operator: 'alice', hostname: 'build.example' },
+  })
+  resumeRun.mockRejectedValueOnce(refusal).mockResolvedValueOnce({
+    session: { session_id: 's-new' }, note: 'fresh continuation started',
+  })
+  const wrapper = mountPane(RunDetail, { run: {
+    host: 'gitlab.example.com', project: 'acme/widget', slug: 'develop-1',
+    taskdef: 'develop', state: 'yielded', live: false, questions: [],
+  } }, { global: { stubs: {
+    Chat: true, Terminal: true, RelatedRuns: true, RunMeta: true, ThreadLinks: true,
+  } } })
+  await flushPromises()
+
+  const continueButton = wrapper.findAll('button').find(
+    (button) => button.text().includes('continue this run'),
+  )
+  await continueButton.trigger('click')
+  await flushPromises()
+  expect(wrapper.text()).toContain('source has no final sign-out')
+
+  const freshButton = wrapper.findAll('button').find(
+    (button) => button.text().includes('continue fresh'),
+  )
+  await freshButton.trigger('click')
+  await flushPromises()
+  expect(resumeRun).toHaveBeenLastCalledWith(expect.any(Object), expect.objectContaining({
+    allowUnsignedSource: 'a'.repeat(32),
+  }))
+})
+
+it('cancels an unsigned continuation without losing direction or retrying', async () => {
+  window.localStorage.setItem('lmer.run.tab', 'overview')
+  const refusal = Object.assign(new Error('source has no final sign-out'), {
+    code: 'unsigned_session', source: { uid: 'a'.repeat(32) },
+  })
+  resumeRun.mockRejectedValueOnce(refusal)
+  const wrapper = mountPane(RunDetail, { run: {
+    host: 'gitlab.example.com', project: 'acme/widget', slug: 'develop-1',
+    taskdef: 'develop', state: 'yielded', live: false, questions: [],
+  } }, { global: { stubs: {
+    Chat: true, Terminal: true, RelatedRuns: true, RunMeta: true, ThreadLinks: true,
+  } } })
+  await flushPromises()
+
+  const direction = wrapper.get('textarea')
+  await direction.setValue('Wait for the prior execution')
+  const continueButton = wrapper.findAll('button').find(
+    (button) => button.text().includes('continue this run'),
+  )
+  await continueButton.trigger('click')
+  await flushPromises()
+
+  const cancelButton = wrapper.findAll('button').find(
+    (button) => button.text().includes('cancel and wait'),
+  )
+  await cancelButton.trigger('click')
+  await flushPromises()
+
+  expect(resumeRun).toHaveBeenCalledTimes(1)
+  expect(direction.element.value).toBe('Wait for the prior execution')
+  expect(wrapper.text()).not.toContain('source has no final sign-out')
 })

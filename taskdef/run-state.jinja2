@@ -78,10 +78,12 @@ the work, not optional bookkeeping:
   text too — `work state set --stop-reason=question --question "<the question>"`
   — then `work commit`, then END the session immediately. Never idle in-session
   waiting for an answer: the next session's resume brief surfaces the recorded
-  question first. Answers arrive via a FRESH session — the human relaunches
-  with `lmer ... --answer "<text>"` (or records `work answer "<text>"`) and
-  that session resumes seeded with the question+answer pair; never revive
-  the asking session.
+  question first. Answers arrive via a FRESH session — the human answers
+  through the platform (the run's answer card, `POST /api/runs/answer`) or
+  relaunches with `lmer ... --answer "<text>"`, and that session resumes
+  seeded with the question+answer pair; never revive the asking session.
+  (A bare shell `work answer "<text>"` records an answer only on a schema-1
+  work repo; on schema 2 a record must belong to a launch, so it is refused.)
 - At a phasic phase-end yield: `work state set --stop-reason=yield`
 - On completion: `work state set --status=complete --stop-reason=complete`
 - Only for a genuine unrecoverable failure: `work state set --stop-reason=critical_error --critical-error '{"summary": "...", "detail": "..."}'`

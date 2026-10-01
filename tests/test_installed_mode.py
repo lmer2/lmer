@@ -5,6 +5,9 @@ These tests verify that the CLI works correctly when installed via
 `uv tool install` where no local repository checkout exists.
 """
 
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -12,7 +15,7 @@ from unittest.mock import patch
 from lmer_cli.cli import _discover_tasks
 from lmer_cli.container_home import ensure_container_home
 from lmer_cli.mounts import build_global_mount, build_lmer_docs_mount
-from lmer_cli.runtime import InstallMode, lmer_state_dir, repo_root_path
+from lmer_cli.runtime import InstallMode, repo_root_path
 
 
 class TestInstalledModeRepoRoot:
@@ -162,7 +165,23 @@ class TestInstalledModeEnvFileLoading:
             content = env_file.read_text()
             assert "TEST_VAR=hello" in content
 
-    def test_state_dir_is_consistent(self):
-        """lmer_state_dir should always return the same path"""
-        assert lmer_state_dir() == lmer_state_dir()
-        assert lmer_state_dir() == Path.home() / ".lmer"
+    def test_state_dir_is_consistent(self, tmp_path):
+        """The import-time home stays stable even if HOME later changes."""
+        result = subprocess.run(
+            [sys.executable, "-c", (
+                "import os\n"
+                "from lmer_cli.runtime import lmer_state_dir\n"
+                "initial = lmer_state_dir()\n"
+                "os.environ['HOME'] += '/changed'\n"
+                "assert lmer_state_dir() == initial\n"
+                "print(initial)\n"
+            )],
+            env={
+                "HOME": str(tmp_path),
+                "PATH": os.defpath,
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            capture_output=True, text=True, check=True,
+        )
+        assert result.stdout.strip() == str(tmp_path / ".lmer")

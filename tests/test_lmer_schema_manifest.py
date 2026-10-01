@@ -79,11 +79,10 @@ def test_manifest_name_matches_the_fixture_and_spec():
     assert MANIFEST_NAME == pf.MANIFEST_NAME
 
 
-def test_supported_schemas_is_exactly_one():
-    """v1 understands schema 1 and nothing else; ``CURRENT_SCHEMA`` is what a
-    tool writes (the newest it understands)."""
-    assert SUPPORTED_SCHEMAS == (1,)
-    assert CURRENT_SCHEMA == 1
+def test_supported_schemas_include_legacy_and_process_records():
+    """Both tree contracts remain readable; new manifests select schema 2."""
+    assert SUPPORTED_SCHEMAS == (1, 2)
+    assert CURRENT_SCHEMA == 2
     assert CURRENT_SCHEMA == max(SUPPORTED_SCHEMAS)
 
 

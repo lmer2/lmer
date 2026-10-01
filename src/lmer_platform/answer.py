@@ -173,6 +173,7 @@ class AnswerRequest:
     project: str
     slug: str
     answer: str
+    allow_unsigned_source: Optional[str] = None
 
     def validate(self) -> "AnswerRequest":
         """Return a normalised copy, or raise :class:`AnswerError`.
@@ -210,7 +211,19 @@ class AnswerRequest:
                 "limit — it is passed to the session as one command-line argument, "
                 "and a longer one fails the spawn itself"
             )
-        return replace(self, answer=answer, **fields)
+        acknowledgement = self.allow_unsigned_source
+        if acknowledgement is not None:
+            if not isinstance(acknowledgement, str):
+                raise AnswerError(
+                    "allow_unsigned_source must be a source UID string"
+                )
+            acknowledgement = acknowledgement.strip() or None
+        return replace(
+            self,
+            answer=answer,
+            allow_unsigned_source=acknowledgement,
+            **fields,
+        )
 
     @property
     def key(self) -> str:
@@ -558,6 +571,15 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
         # not look at the identity the new session would take.
         _refuse_if_live(request, recorded_slug)
 
+    # Imported here to keep answer/resume's existing helper dependency acyclic.
+    # The schema-2 rule is shared: a prior launch is read-only context and an
+    # unsigned source needs a decision bound to that exact UID.
+    from .resume import _schema_two_source
+
+    source_session_id, unsigned_source_ack = _schema_two_source(
+        config, request, ref, state
+    )
+
     result = spawn_session(
         config,
         SpawnRequest(
@@ -589,7 +611,11 @@ def answer_run(config: PlatformConfig, request: AnswerRequest) -> AnswerResult:
             # stays as the fallback it describes itself as — it reroutes a launch
             # carrying ``LMER_ANSWER`` to the record that asked, which is what
             # covers launchers that carry only the answer and nothing else.
-            session_id=record_session_id(ref),
+            session_id=(
+                None if source_session_id is not None else record_session_id(ref)
+            ),
+            source_session_id=source_session_id,
+            allow_unsigned_source=unsigned_source_ack,
         ),
     )
 

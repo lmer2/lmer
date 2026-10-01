@@ -330,7 +330,10 @@ class TestEntrypointBlock:
         assert not (tmp_path / ".lmer-gnupg").exists()
 
     def test_socket_present_provisions_the_redirect(self, tmp_path, agent_socket):
-        proc = _run_block(tmp_path, sock=agent_socket)
+        path = TestRedirectFollowsGpgconfSocketdir._fake_gpgconf(
+            tmp_path / "bin", tmp_path / ".lmer-gnupg"
+        )
+        proc = _run_block(tmp_path, sock=agent_socket, path=path)
         assert proc.returncode == 0, proc.stderr
         gnupg = tmp_path / ".lmer-gnupg"
         assert gnupg.is_dir()
@@ -367,7 +370,10 @@ class TestEntrypointBlock:
         assert not (tmp_path / ".lmer-gnupg" / "pubring.kbx").exists()
 
     def test_missing_keyring_warns_without_failing(self, tmp_path, agent_socket):
-        proc = _run_block(tmp_path, sock=agent_socket, pubring=tmp_path / "absent.kbx")
+        path = TestRedirectFollowsGpgconfSocketdir._fake_gpgconf(
+            tmp_path / "bin", tmp_path / ".lmer-gnupg"
+        )
+        proc = _run_block(tmp_path, sock=agent_socket, pubring=tmp_path / "absent.kbx", path=path)
         assert proc.returncode == 0, proc.stderr
         assert "keyring" in proc.stdout
         assert (tmp_path / ".lmer-gnupg" / "S.gpg-agent").exists(), (

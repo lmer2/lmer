@@ -302,6 +302,48 @@ def test_a_resume_naming_a_session_carries_it_through(client, resumed):
     assert resumed.calls[0].session_id == SESSION_ID
 
 
+def test_unsigned_confirmation_is_passed_as_the_exact_source_uid(client, resumed):
+    response = client.post(
+        "/api/runs/resume",
+        headers=bearer_header(),
+        json={
+            **RESUME_BODY,
+            "session_id": SESSION_ID,
+            "allow_unsigned_source": SESSION_ID,
+        },
+    )
+
+    assert response.status_code == 202
+    assert resumed.calls[0].allow_unsigned_source == SESSION_ID
+
+
+def test_unsigned_refusal_keeps_structured_provenance(client, monkeypatch):
+    source = {
+        "uid": "a" * 32,
+        "operator": "alice",
+        "hostname": "build.example",
+        "started_at": "2026-09-17T12:00:00Z",
+        "last_activity": "2026-09-17T12:05:00Z",
+    }
+    refuse_with(
+        monkeypatch,
+        api,
+        resume_mod.UnsignedSessionSource("source has no final sign-out", source),
+    )
+
+    response = client.post(
+        "/api/runs/resume", headers=bearer_header(), json=RESUME_BODY
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "unsigned_session",
+        "message": "source has no final sign-out",
+        "source": source,
+        "decisions": ["continue_fresh", "cancel"],
+    }
+
+
 def test_a_resume_without_a_session_id_says_nothing_about_one(client, resumed):
     """Absent means "the record the run resolves to", not "no launch at all".
 

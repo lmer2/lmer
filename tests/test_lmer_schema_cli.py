@@ -338,10 +338,11 @@ class TestJsonDocument:
         assert isinstance(doc["unusable"], str) and doc["unusable"]
         assert [f["code"] for f in doc["findings"]] == ["runner.no-such-path"]
 
-    def test_a_clean_tree_is_an_empty_finding_list(self, capsys, schema_plexus):
+    def test_schema_one_has_only_the_upgrade_warning(self, capsys, schema_plexus):
         _code, doc, _err = _json(capsys, "validate", str(schema_plexus.root), "--json")
         assert doc["unusable"] is None
-        assert doc["counts"]["error"] == doc["counts"]["warn"] == 0
+        assert doc["counts"]["error"] == 0
+        assert [f["code"] for f in doc["findings"] if f["severity"] == "WARN"] == ["manifest.schema-older"]
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +412,8 @@ class TestTextOutput:
         # "Clean" is about severity, not silence: the fixture's host bucket is
         # listed (informational) and the tree is conformant all the same.
         _code, out, _err = _run(capsys, "validate", str(schema_plexus.root))
-        assert {severity for _n, severity, _c, _p in _entries(out)} <= {"INFO"}
+        assert [(severity, code) for _n, severity, code, _p in _entries(out)
+                if severity != "INFO"] == [("WARN", "manifest.schema-older")]
         assert "conformant" in out.lower()
         assert "not conformant" not in out.lower()
 
@@ -503,19 +505,16 @@ class TestListChecks:
         assert "ERROR" in row
         assert "WARN" in row
 
-    def test_an_unreachable_code_is_flagged_not_advertised(self, capsys):
-        # At schema 1 `SUPPORTED_SCHEMAS == (1,)`: nothing older is supported,
-        # so `manifest.schema-older` cannot fire (an older int is unsupported
-        # input, exit 2). The inventory must not promise that WARN.
-        assert not any(value < CURRENT_SCHEMA for value in SUPPORTED_SCHEMAS)
+    def test_older_schema_warning_is_reachable(self, capsys):
+        assert any(value < CURRENT_SCHEMA for value in SUPPORTED_SCHEMAS)
         _code, out, _err = _run(capsys, "--list-checks")
         row = next(line for line in out.splitlines() if line.startswith("manifest.schema-older"))
-        assert "unreachable" in row
+        assert "unreachable" not in row
 
     def test_reachable_codes_are_not_flagged(self, capsys):
         _code, out, _err = _run(capsys, "--list-checks")
         flagged = [line for line in out.splitlines() if "unreachable" in line]
-        assert [line.split()[0] for line in flagged] == ["manifest.schema-older"]
+        assert flagged == []
 
     def test_the_json_inventory_is_the_registry_document(self, capsys):
         code, doc, _err = _json(capsys, "--list-checks", "--json")
@@ -531,11 +530,10 @@ class TestListChecks:
             assert entry["legacy"] == registered.legacy.value
             assert entry["tier"] == registered.tier.value
 
-    def test_the_json_inventory_marks_the_unreachable_code(self, capsys):
+    def test_the_json_inventory_has_no_unreachable_codes(self, capsys):
         _code, doc, _err = _json(capsys, "--list-checks", "--json")
         unreachable = {e["code"]: e["unreachable"] for e in doc["checks"] if e["unreachable"]}
-        assert set(unreachable) == {"manifest.schema-older"}
-        assert str(CURRENT_SCHEMA) in unreachable["manifest.schema-older"]
+        assert unreachable == {}
 
 
 # ---------------------------------------------------------------------------
@@ -818,3 +816,77 @@ class TestTheCodeTableMatchesTheDocument:
             f"{sorted(filled)}, but the tier-sensitive codes (D14) are "
             f"{sorted(sensitive)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# `migrate`: the verb the cutover docs prescribe running before `--apply`
+# ---------------------------------------------------------------------------
+
+
+def _schema_one_tree(tmp_path, *, in_progress):
+    """A schema-1 tree with one record; ``in_progress`` makes it a blocker
+    (no recorded sign-out, so the cutover must refuse)."""
+    root = tmp_path / "plexus"
+    record = root / "widgets" / "_runs" / "chat" / "20260917-120000-1-7"
+    record.mkdir(parents=True)
+    (root / "_plexus.yaml").write_text(
+        "schema: 1\nname: example\nprojects:\n  widgets:\n"
+        "    repo: git.example.test/acme/widgets\n",
+        encoding="utf-8",
+    )
+    status = "in-progress" if in_progress else "complete"
+    (record / "state.yaml").write_text(f"schema: 1\nstatus: {status}\n", encoding="utf-8")
+    return root
+
+
+def _tree_bytes(root):
+    return {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+
+class TestMigrate:
+    """The CLI wrapper around ``lmer_schema.migration.migrate``: the library
+    is covered by ``tests/test_schema_v2_migration.py``; what these pin is the
+    verb's exit code and output on each outcome — a blocked preview crashing
+    with a ``NameError`` shipped green because nothing drove the verb here."""
+
+    @pytest.mark.parametrize("extra", [(), ("--json",), ("--apply",)], ids=["text", "json", "apply"])
+    def test_a_blocked_preview_reports_the_blocker_and_exits_errors(self, capsys, tmp_path, extra):
+        root = _schema_one_tree(tmp_path, in_progress=True)
+        before = _tree_bytes(root)
+        code, out, err = _run(capsys, "migrate", str(root), *extra)
+        assert code == EXIT_ERRORS
+        assert "Traceback" not in err and "NameError" not in err
+        if "--json" in extra:
+            doc = json.loads(out)
+            assert doc["applied"] is False
+            assert any("sign-out" in blocker for blocker in doc["blockers"])
+        else:
+            assert "Blocked:" in out and "sign-out" in out
+            assert "Schema 2 applied" not in out
+        assert _tree_bytes(root) == before, "a blocked preview must write nothing"
+
+    def test_an_unblocked_preview_is_clean_and_writes_nothing(self, capsys, tmp_path):
+        root = _schema_one_tree(tmp_path, in_progress=False)
+        before = _tree_bytes(root)
+        code, out, _err = _run(capsys, "migrate", str(root))
+        assert code == EXIT_CLEAN
+        assert "+schema: 2" in out and "Preview only" in out
+        assert _tree_bytes(root) == before
+
+    def test_apply_changes_only_the_version_and_reports_clean(self, capsys, tmp_path):
+        root = _schema_one_tree(tmp_path, in_progress=False)
+        before = _tree_bytes(root)
+        code, out, _err = _run(capsys, "migrate", str(root), "--apply")
+        assert code == EXIT_CLEAN
+        assert "Schema 2 applied locally." in out
+        after = _tree_bytes(root)
+        manifest = Path("_plexus.yaml")
+        assert after[manifest] == before[manifest].replace(b"schema: 1", b"schema: 2")
+        assert {k: v for k, v in after.items() if k != manifest} == {
+            k: v for k, v in before.items() if k != manifest
+        }
+
+    def test_a_tree_without_a_manifest_is_unusable_input(self, capsys, tmp_path):
+        code, _out, err = _run(capsys, "migrate", str(tmp_path))
+        assert code == EXIT_UNUSABLE
+        assert "Migration refused" in err

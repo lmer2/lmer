@@ -303,8 +303,9 @@ class TestTheBundleIsFlatInSchemaForm:
         _nested_bundle(rdir, "mp-a", "plan.md")
         _launch(monkeypatch, root, session=pf.SESSION_IDS[0])
 
-        assert run_state.sync_masterplan_artifacts(rdir) == ["spec.md"]
-        assert _links(rdir) == {"spec.md": "masterplan/spec.md"}
+        # A manifest that cannot establish writer ownership refuses mutation.
+        assert run_state.sync_masterplan_artifacts(rdir) == []
+        assert _links(rdir) == {}
 
     def test_a_symlink_failure_is_still_fail_soft(
         self, monkeypatch, schema_plexus, capsys

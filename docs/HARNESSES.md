@@ -299,6 +299,16 @@ about progress), and when a child dies its `--output` file gets a
 `[spawn-harness] child FAILED` footer carrying the exit reason and the
 stderr tail, so a failed agent's output explains itself.
 
+In a [schema-2 work repository](./SCHEMA-V2.md), every child is an independent
+execution with a fresh UID and its own record. The startup trampoline becomes
+the harness process with `exec`, so recorded PID/start/hostname describe the
+actual child. Its metadata records the resolved child harness/model/effort,
+configuration and parent provenance while preserving extension fields. The
+supervisor signs the child out after reaping it. Inherited continuation source,
+answer and acknowledgement are cleared; explicit child overlays can choose
+their own continuation. Lifecycle diagnostics go to stderr and cannot make an
+empty harness response look usable. Schema-1 child behavior is unchanged.
+
 The mirrored exit code outranks the footer: once the child has run, a footer
 `spawn-harness` cannot write — a full or read-only filesystem — warns on stderr
 (`cannot append the failure footer to <path>`) and leaves the code alone, rather
@@ -369,7 +379,7 @@ wrapper would hang indefinitely while the heartbeat reported a healthy run.
 |---|---|---|---|
 | Invocation | `claude -p` | `codex exec` | `pi -p` |
 | Permission posture | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--no-approve` (pi never prompts) |
-| Statelessness | `--no-session-persistence` | `--ephemeral` | `--no-session` |
+| Harness transcript persistence | `--no-session-persistence` | `--ephemeral` | `--no-session` |
 | Model / effort | `--model` / `--effort` (accepts `max`) | `--model` / `-c model_reasoning_effort=` (`max`→`xhigh`) | `--model` / `--thinking` (`max`→`xhigh`, matching the interactive runner) |
 | Prompt safety | `--` before the prompt | `--` before the prompt | no `--` support — a prompt starting with `-` is rejected |
 

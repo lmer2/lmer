@@ -775,7 +775,7 @@ def _unreadable_manifest_tree(monkeypatch, tmp_path, body, *, context=True):
 
 
 #: The document itself is unusable — nothing resolves (MANIFEST_PROBLEM).
-_UNUSABLE_MANIFEST = "schema: 2\nname: example\nprojects: {}\n"
+_UNUSABLE_MANIFEST = "schema: 3\nname: example\nprojects: {}\n"
 #: The document parsed; only its identity layer breaks a rule. The base
 #: still resolves — to the {host}/{project} host bucket (REGISTRY_PROBLEM).
 _BROKEN_REGISTRY = (

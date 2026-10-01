@@ -1693,6 +1693,56 @@ def test_child_env_carries_the_port_and_token_the_platform_chose(
         os.kill(result.pid, 9)
 
 
+def test_schema_two_source_confirmation_and_metadata_reach_the_child(
+    platform_root, env_dumping_lmer, monkeypatch
+):
+    """A continuation reads one UID but never assigns that UID to its writer."""
+    script, dump = env_dumping_lmer
+    config = cfg.load({"lmer_bin": str(script)})
+    source_uid = "a" * 32
+    monkeypatch.setenv("FAKE_LMER_SLEEP", "30")
+
+    result = spawn.spawn_session(config, request_for(
+        source_session_id=source_uid,
+        allow_unsigned_source=source_uid,
+        session_metadata={
+            "operator": "host-user",
+            "hostname": "host.example",
+            "model": "predecessor-model",
+            "effort": "predecessor-effort",
+            "config": {"future": {"enabled": True}, "api_token": "secret"},
+            "extension": [1, 2],
+        },
+        model="current-model",
+    ))
+    try:
+        assert wait_for(lambda: dump.is_file() and dump.stat().st_size)
+        child = env_from_dump(dump)
+        metadata = json.loads(child["LMER_SESSION_METADATA"])
+        assert child["LMER_SOURCE_SESSION_ID"] == source_uid
+        assert child["LMER_ALLOW_UNSIGNED_SOURCE"] == source_uid
+        assert child.get("LMER_SESSION_ID") in (None, "")
+        assert metadata["operator"] == "host-user"
+        assert metadata["hostname"] == "host.example"
+        assert metadata["model"] == "current-model"
+        assert metadata["effort"] is None
+        assert metadata["config"]["future"] == {"enabled": True}
+        assert metadata["config"]["api_token"] == "***REDACTED***"
+        assert metadata["extension"] == [1, 2]
+        assert metadata["launcher"]["pid"] == os.getpid()
+    finally:
+        os.kill(result.pid, 9)
+
+
+def test_unsigned_source_confirmation_must_equal_the_selected_source(config):
+    with pytest.raises(spawn.SpawnError, match="must exactly match"):
+        spawn.spawn_session(config, request_for(
+            source_session_id="a" * 32,
+            allow_unsigned_source="b" * 32,
+        ))
+    assert registry.list_sessions(live_only=False) == []
+
+
 def test_a_no_repo_session_is_told_so_in_its_environment(
     platform_root, env_dumping_lmer, monkeypatch
 ):
@@ -3221,19 +3271,32 @@ def test_the_ask_mount_satisfies_lmer_s_own_validator(config):
     assert specs[0].mode == "rw", "the session writes its questions into it"
 
 
-def test_the_platform_mounts_do_not_collide(config):
-    """All of them handed to the real validator together, which rejects a clash.
+@pytest.mark.parametrize("kind", [registry.WORKER_KIND, registry.ASSISTANT_KIND])
+def test_the_platform_mounts_do_not_collide(config, monkeypatch, kind):
+    """Validate the actual launch mounts before the child can retire them.
 
     Two mounts at one destination is the container runtime aborting the launch,
-    and ``parse_dir_mount_specs`` is the check that catches it first — so they go
-    through it as a set rather than being eyeballed here.
+    so check the whole set with the real parser and reject its deduplication.
+    The immediately exiting stub can remove its status directory before spawn
+    returns: validating host paths after that races legitimate cleanup.
     """
-    result = spawn.spawn_session(config, request_for())
-    specs = parse_dir_mount_specs(mount_specs_in(result.command), "")
-    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS)
-    assert sorted(spec.container for spec in specs) == sorted(
-        PLATFORM_MOUNT_DESTINATIONS
-    )
+    real_popen = spawn.subprocess.Popen
+    specs = []
+
+    def validate_then_launch(command, **kwargs):
+        specs.extend(parse_dir_mount_specs(mount_specs_in(command), ""))
+        return real_popen(command, **kwargs)
+
+    with monkeypatch.context() as launch_patch:
+        launch_patch.setattr(spawn.subprocess, "Popen", validate_then_launch)
+        result = spawn.spawn_session(config, request_for(), kind=kind)
+    assert spawn.wait_for_exit_recorded(result.session_id)
+
+    expected = set(PLATFORM_MOUNT_DESTINATIONS)
+    if kind == registry.ASSISTANT_KIND:
+        expected.add(memory.CONTAINER_STAGED_DIR)
+    assert len(specs) == len(mount_specs_in(result.command)) == len(expected)
+    assert {spec.container for spec in specs} == expected
     assert all(spec.mode == "rw" for spec in specs)
 
 
@@ -4191,18 +4254,6 @@ def test_an_oversized_memory_store_is_reported_when_the_assistant_starts(
         for record in caplog.records
     )
     assert (store_dir / "huge.md").is_file()
-
-
-def test_the_assistants_mounts_do_not_collide(config):
-    """The memory destination sits inside the staging area while the transcript
-    mount sits at claude's projects dir — different subtrees, but only the real
-    validator settles whether the whole set is acceptable to a runtime."""
-    result = spawn.spawn_session(
-        config, request_for(), kind=registry.ASSISTANT_KIND
-    )
-    specs = parse_dir_mount_specs(mount_specs_in(result.command), "")
-    assert len(specs) == len(PLATFORM_MOUNT_DESTINATIONS) + 1
-    assert memory.CONTAINER_STAGED_DIR in [spec.container for spec in specs]
 
 
 def test_a_drop_in_cannot_claim_the_memory_store_path(

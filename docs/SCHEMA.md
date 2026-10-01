@@ -1,4 +1,9 @@
-# The lmer schema (version 1)
+# The lmer schema (versions 1 and 2)
+
+Schema 2 is current. [Schema 2](./SCHEMA-V2.md) defines its changed writer,
+identity, session and retirement contracts. The layout and schema-1 behavior
+below remain the baseline; explicit schema-2 rules take precedence for a
+`schema: 2` tree. Existing schema-1 trees retain their original semantics.
 
 The lmer schema is the normative layout of everything lmer reads and writes
 outside the code repositories it works on: run records, specifications, plans,
@@ -820,6 +825,7 @@ Rows of [Agent surface](#agent-surface-both-scopes); the scope rules are
 | `agents.unknown-harness` | WARN | | machine | a first-level name under `_agents/` that is neither a known harness nor the reserved `memory`/`mirrors` |
 | `agents.reserved-harness-name` | ERROR | | machine | the reserved `_agents/` name `memory` or `mirrors` used as something else — a harness configuration dir, or not a directory at all |
 | `agents.memory-frontmatter` | ERROR | | machine | a memory file whose YAML frontmatter is missing, malformed or short of `name`, `description` or `metadata.type` |
+| `agents.memory-retirement` | ERROR | | machine | schema-2 retirement state cannot be safely interpreted; no memory mutation is permitted |
 | `agents.memory-type-unknown` | ERROR | | machine | a memory whose `metadata.type` is outside the four-value vocabulary |
 | `agents.memory-scope-mismatch` | WARN | INFO | machine | a memory whose `metadata.type` does not select the scope it lives in; recall unions both scopes, so nothing is lost |
 | `agents.memory-unknown-file` | WARN | | machine | a file in a memory directory that is not a memory or its index |
@@ -839,6 +845,8 @@ tier: a corrupt state file is broken in every form.
 | `record.state-unparseable` | ERROR | | machine | a state file (`state.yaml`, `ledger.yaml`, `plan.index.json`) that does not parse |
 | `record.state-schema` | ERROR | | machine | a state file whose `schema:` is not an integer (a bool is not one) |
 | `record.state-enum` | ERROR | | machine | a state file enum (run status, task status) outside its RUN-STATE.md range |
+| `record.session-metadata` | ERROR | | machine | a schema-2 session dictionary is absent or its opaque UID does not match the record directory |
+| `record.release-claim` | ERROR | | machine | a schema-2 shared release claim cannot be safely interpreted; arbitration must refuse |
 | `record.events-line-unparseable` | ERROR | | machine | an `events.jsonl` line that is not one JSON object |
 | `record.grouping-level-entry` | WARN | | machine | a file or a non-session directory at a `_runs/<slug>/` grouping level, where nothing is written |
 | `record.session-dir-without-state` | WARN | | machine | a session directory with no `state.yaml`: a session SHOULD carry one |

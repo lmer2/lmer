@@ -1,5 +1,21 @@
 # Run D.M.C. — Durable Run State
 
+**Version scope:** The existing lifecycle and claim descriptions below define
+legacy/schema-1 behavior. Schema 2 uses [one execution per record](./SCHEMA-V2.md):
+fresh opaque UIDs, a freeform `session` dictionary, read-only predecessor
+context, explicit unsigned-source decisions, and a shared project release claim.
+New schema-2 records have `state.yaml` schema 2; historical records stay unchanged.
+Helper processes inherit their execution's UID. A new execution never appends
+itself to an older record's `sessions` lineage or writes a predecessor's answer.
+
+Schema-2 continuation copies goal/phase/question and ledger/release checkpoints
+into the new record during atomic seeding. Its `context` retains the source
+state, recent events, source path and checkpoint hashes. Ownership, claim,
+creation time and terminal status start afresh. `work sessions --json` includes
+the freeform session metadata and an explicit `signed_out` boolean; `orphaned`
+is unknown rather than inferred from age. `--running` includes unsigned
+in-progress records, which may still require operator investigation.
+
 **D**urable, **M**achine-readable, **C**rash-proof state for every lmer
 session — not just orchestrated multi-phase runs. It replaces prose
 archaeology ("read the worklog, guess what happened") with a small state
@@ -211,7 +227,11 @@ renders it FIRST, before the run header, as a
 
 **Answering (issue #98):** the answer arrives in a FRESH session — the
 asking session already ended (that is the #97 contract). Two delivery
-paths, one mechanism: `work answer "<text>"` in-container, or
+paths, one mechanism: `work answer "<text>"` in-container (from a session
+that has its launch's UID; on a schema-2 tree a bare shell without one is
+refused, and a human answers through the platform's answer route instead —
+the run's answer card or `POST /api/runs/answer`, which starts a session
+carrying the answer), or
 `lmer ... --answer "<text>"` on the host, which exports `LMER_ANSWER`
 (flag-only — a host-exported or `.env` value is never forwarded; answers
 are one-shot data, not standing configuration) so `work session-start`
@@ -664,7 +684,7 @@ engagement seeds a fresh run.
 |---|---|
 | `work state` | Print current run state (read-only). |
 | `work state set --phase=… --stop-reason=… --status=… [--critical-error=<json>] [--question "<text>"]` | The only mutation path. Constrained fields; atomic write; bumps `updated`; appends a corresponding event. Re-submitting the same `--phase` value with no other flags short-circuits with `State unchanged` and does not write; the other flags always write (see below). |
-| `work answer "<text>"` | Record the human's answer to the run's recorded open question (§2): appends `question_answered` (`{question, answer}`, both secret-redacted), clears `open_question` and `stop_reason` (`status` untouched — a completed run stays complete), pushes the run dir. Errors (exit 1) without run context or when no open question is recorded; never auto-seeds. The same logic is applied automatically by `work session-start` when `LMER_ANSWER` is set (the host CLI's `--answer` flag). |
+| `work answer "<text>"` | Record an answer to the run's recorded open question (§2) from inside a session. On a schema-2 tree the verb needs the launch's session UID: a bare shell is refused (exit 2) with a message naming the human's route — the platform's answer card or `POST /api/runs/answer`, which starts a session carrying the answer. It appends `question_answered` (`{question, answer}`, both secret-redacted), clears `open_question` and `stop_reason` (`status` untouched — a completed run stays complete), pushes the run dir. Errors (exit 1) without run context or when no open question is recorded; never auto-seeds. The same logic is applied automatically by `work session-start` when `LMER_ANSWER` is set (the host CLI's `--answer` flag). |
 | `work event <type> [--note "…"] [--data <json>]` | Append one event line. Auto-seeds the run if it doesn't exist yet. |
 | `work verify <name> -- <command …>` | Run the command (stderr merged into stdout), stream its output through, mirror its exit code, and append a `verify` receipt event (§2): `{name, argv, exit_code, duration_s, summary_line, output_tail_sha256}`. The `--` separator is required (a forgotten name must not silently become the command). A signal-killed command mirrors the shell convention `128+N` (receipt and observed exit code agree); a command that cannot start exits 127. Mutating-verb rules: without run context this errors *before* running the command. A receipt-append failure after the command ran is reported loudly on stderr but the exit code still mirrors the command. |
 | `work resume [--json] [--session <id>]` | Pure decide function: reads state + events (+ ledger), prints a resume brief — slug, status, phase, stop_reason, goal, an `Estimate: ~3 sessions / 4h — used: 2 sessions` line when an estimate is recorded (§2), a one-line ledger summary when a ledger exists (`Ledger: 4/7 done, in-flight: T3a, last commit 4a1f9c2`), last ~5 events, artifacts, owner-claim warning if applicable. For release runs the brief additionally carries a `Release:` block — derived leg + next step, recorded SHAs/tag, receipt set, and the claim verdict (§7) — so a relaunched session resumes at exactly one next action; non-release briefs are byte-identical to before. `--json` for hooks/machines and carries the full ledger. Never exits non-zero — an unreadable or missing run (or ledger) degrades to a message, not a failure. |
@@ -854,6 +874,22 @@ invariant; dropping on `error` too matters because a leftover claim commit
 would later be silently rebase-pushed onto an un-re-checked head by the
 next ordinary verb. Same-file racers on the state.yaml both CAS through
 this path, so the git server arbitrates.
+
+**On a schema-2 work repo** every release transition — claim, unclaim, the
+session-end release and `release abort` — takes the same CAS and the same
+invariant against the shared `_claims/` document (SCHEMA-V2.md), but assembles
+its commit **without moving the checkout** (abort still writes its own two
+terminal record files, in their documented order): it commits this execution's own
+record locally, fetches the upstream head, builds the claim commit in a
+temporary index seeded from that head (`commit-tree`), and pushes that object.
+There is no `pull --rebase`, so no stash is needed to get a clean tree, and no
+claim commit exists locally, so no rollback is needed on a lost or failed
+attempt. That matters because a schema-2 checkout is shared by every session
+in its container: a transaction that moved the checkout's state could take a
+sibling session's uncommitted record with it. The new claim is evaluated
+against the fetched publication rather than the checkout's copy of it, so
+`work release claim-status` reads the upstream tracking ref (the last fetch)
+and falls back to the checkout copy only when there is no upstream.
 
 ### Lock object and scope
 

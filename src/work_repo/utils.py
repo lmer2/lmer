@@ -16,8 +16,31 @@ import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
+
+if TYPE_CHECKING:
+    from lmer_schema.manifest import Manifest
+
+
+class SchemaContextError(ValueError):
+    """The work tree declares a schema this writer cannot safely use."""
+
+
+def load_work_manifest(root: Optional[Path] = None) -> Optional["Manifest"]:
+    """Shared version boundary for work-repo writers and metadata readers."""
+    root = root if root is not None else work_repo_root()
+    path = root / "_plexus.yaml"
+    if not (path.exists() or path.is_symlink()):
+        return None
+    try:
+        from lmer_schema.manifest import ManifestError, load_manifest
+    except ImportError as exc:
+        raise SchemaContextError("schema support is unavailable for this work tree") from exc
+    try:
+        return load_manifest(root)
+    except ManifestError as exc:
+        raise SchemaContextError(str(exc)) from exc
 
 # Minimum length for an env var value to be considered a secret worth redacting.
 # Very short values (e.g., "yes", "dev", "true") stored in secret-named env vars
@@ -55,6 +78,39 @@ _SECRET_VALUE_PREFIX_RE = re.compile(
     r"|xox[bp]-[A-Za-z0-9-]{10,}"  # Slack bot / user token
     r"|xapp-[A-Za-z0-9-]{10,}"  # Slack app-level token
     r")"
+)
+
+# NOTHING in either pattern may depend on what PRECEDES a prefix. Where a token
+# can start is not enumerable: it follows an ANSI colour code (whose final `m`
+# is a word character), a JSON-escaped newline (a literal `n`), a hyphen or an
+# underscore in a slug, a letter, a digit, a percent-escape. A left boundary
+# was tried to stop `lmer-task-worker-…` being recorded as
+# `lmer-ta***REDACTED***`, and it let real tokens through every one of those,
+# here and at every `redact_secrets` call site. A miss publishes a credential
+# to a shared repository; an over-redaction costs a readable hostname. False
+# positives may be reduced only by constraining what FOLLOWS a prefix (body
+# length and alphabet per provider), and only with proof that no real token is
+# excluded.
+#
+# Token SHAPES, for data that arrives from outside this process (the session
+# metadata envelope: platform `session_metadata`, a hand-set env value). The
+# prefix list above is tuned for prose — logs and reports — where a {20,} tail
+# keeps a sentence mentioning "glpat-" readable. Metadata is a record in a
+# shared repository, and a token there need not be one this process holds, so
+# the floor is the shape itself: a known prefix with any plausible tail, AWS
+# key ids, and PEM blocks holding a private key (through their END line when present).
+_TOKEN_SHAPE_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    r"(?:.*?-----END [A-Z0-9 ]*PRIVATE KEY-----|.*)"  # PEM private key
+    r"|glpat-[A-Za-z0-9_\-.]{8,}"  # GitLab personal access token
+    r"|gl(?:rt|dt)-[A-Za-z0-9_\-.]{8,}"  # GitLab runner / deploy token
+    r"|github_pat_[A-Za-z0-9_]{8,}"  # GitHub fine-grained PAT
+    r"|gh[pousr]_[A-Za-z0-9]{8,}"  # GitHub classic PAT / OAuth / app tokens
+    r"|(?:AKIA|ASIA)[0-9A-Z]{16}(?![0-9A-Z])"  # AWS access key id: exactly 20, judged by what follows
+    r"|xox[abprs]-[A-Za-z0-9-]{8,}"  # Slack app / bot / user tokens
+    r"|xapp-[A-Za-z0-9-]{8,}"  # Slack app-level token
+    r"|sk-[A-Za-z0-9_\-.]{20,}",  # LLM API key
+    re.DOTALL,
 )
 
 # Backstop for credentials embedded in URLs (https://oauth2:<token>@host/path).
@@ -137,6 +193,16 @@ def redact_secrets(text: str, secret_values: Optional[list[str]] = None) -> str:
         )
 
     return redacted
+
+
+def redact_token_shapes(text: str) -> str:
+    """Replace token-shaped substrings, whether or not this process holds them.
+
+    The complement of :func:`redact_secrets` for data supplied from outside:
+    that function knows the values in this process's environment; this one
+    knows what a credential looks like (:data:`_TOKEN_SHAPE_RE`).
+    """
+    return _TOKEN_SHAPE_RE.sub(_REDACTED, text) if text else text
 
 
 def is_secret_env_name(name: str) -> bool:
@@ -435,7 +501,7 @@ def _schema_layout(root, repo_host, repo_project, legacy_base):
         # without it (or with it half-installed) degrades instead of dying on
         # a module-level import in a hook path.
         from lmer_schema.form import Form, detect_form
-        from lmer_schema.manifest import ManifestError, manifest_path
+        from lmer_schema.manifest import ManifestError, load_manifest, manifest_path
         from lmer_schema.registry import (
             RegistryError,
             load_registry,
@@ -450,6 +516,7 @@ def _schema_layout(root, repo_host, repo_project, legacy_base):
     manifest = manifest_path(root)
     registry, problem = None, None
     try:
+        manifest_schema = load_manifest(root).schema
         registry = load_registry(root)
     except RegistryError as exc:
         # The identity layer only: the document parsed, so the tree, its form
@@ -476,7 +543,12 @@ def _schema_layout(root, repo_host, repo_project, legacy_base):
 
     base, project = legacy_base, None
     if url:
-        resolution = resolve_project_dir(root, url, registry=registry)
+        try:
+            resolution = resolve_project_dir(
+                root, url, registry=registry, schema=manifest_schema
+            )
+        except RegistryError as exc:
+            return _unusable(root, manifest, str(exc))
         if resolution.path is not None:
             base, project = resolution.path, resolution.project
         elif resolution.bucket_path is not None:

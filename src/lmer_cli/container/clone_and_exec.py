@@ -1779,7 +1779,7 @@ def _resolve_work_repo_placement(
         # known to be present, so a legacy tree never imports the core, and an
         # lmer built without it degrades instead of dying at container start.
         from lmer_schema.form import Form, detect_form
-        from lmer_schema.manifest import ManifestError
+        from lmer_schema.manifest import ManifestError, load_manifest
         from lmer_schema.registry import (
             RegistryError,
             load_registry,
@@ -1802,6 +1802,7 @@ def _resolve_work_repo_placement(
 
     registry, problem = None, None
     try:
+        manifest_schema = load_manifest(root).schema
         registry = load_registry(root)
     except RegistryError as exc:
         problem = str(exc)
@@ -1820,7 +1821,10 @@ def _resolve_work_repo_placement(
 
     base = legacy_base
     if url:
-        resolution = resolve_project_dir(root, url, registry=registry)
+        try:
+            resolution = resolve_project_dir(root, url, registry=registry, schema=manifest_schema)
+        except RegistryError as exc:
+            return WorkRepoPlacement(schema=True, base=None, problem=str(exc))
         if resolution.path is not None:
             base = resolution.path
         elif resolution.bucket_path is not None:
@@ -2664,7 +2668,7 @@ def run_state_session_end() -> None:
         print(f"⚠️  run-state session-end failed (continuing): {e}", file=sys.stderr)
 
 
-def mint_session_id() -> None:
+def mint_session_id(*, fresh: bool = False) -> None:
     """Ensure LMER_SESSION_ID exists BEFORE the runner spawns.
 
     The id used to be minted only inside claude-runner.sh — a child — so it
@@ -2675,6 +2679,11 @@ def mint_session_id() -> None:
     preserves an inherited value) gives runner, hooks, and backstop one id.
     A host-injected id is preserved the same way (setdefault).
     """
+    if fresh:
+        from work_repo.session_record import start_launch
+
+        start_launch()
+        return
     os.environ.setdefault(
         "LMER_SESSION_ID",
         f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
@@ -2864,6 +2873,24 @@ def main(argv: list[str] | None = None) -> int:
         # probes without reconstructing a credential-bearing URL.
         os.environ["LMER_WORK_REPO_CREDENTIAL_FILE"] = str(work_credential.path)
 
+    # The freshly cloned manifest owns the writer contract. A schema-2
+    # process never inherits the UID of a preceding execution.
+    process_records = False
+    manifest = work_repo_path / PLEXUS_MANIFEST_NAME
+    if manifest.exists() or manifest.is_symlink():
+        try:
+            from work_repo.session_record import schema_version
+
+            process_records = schema_version(work_repo_path) >= 2
+            if process_records:
+                inherited_source = os.environ.pop("LMER_SESSION_ID", None)
+                if inherited_source and os.environ.get("LMER_SESSION_IS_SOURCE") == "1":
+                    os.environ.setdefault("LMER_SOURCE_SESSION_ID", inherited_source)
+                mint_session_id(fresh=True)
+        except Exception as exc:
+            print(f"Session start refused: {_scrub_credentials(str(exc))}", file=sys.stderr)
+            return 2
+
     # Canonical source resolution (sources.yaml, issue #105): runs here —
     # after the work-repo clone (the declaration is now present and fresh)
     # and before every aux clone below. Propagates declared sources
@@ -2897,6 +2924,16 @@ def main(argv: list[str] | None = None) -> int:
     repo_project = os.environ.get("LMER_REPO_PROJECT")
     task_type = os.environ.get("LMER_TASK")
     task_target = os.environ.get("LMER_TASK_TARGET")
+    if process_records:
+        from work_repo import run_state
+
+        try:
+            # Check the source before creating a destination or starting the
+            # harness: hooks are fail-soft and cannot enforce this decision.
+            run_state._source_context(run_state.derive_slug(), os.environ.get("LMER_SOURCE_SESSION_ID"))
+        except run_state.RunStateError as exc:
+            print(f"Session start refused: {exc}", file=sys.stderr)
+            return 2
     try:
         ensure_work_repo_directory(work_repo_path, repo_host, repo_project, task_type, task_target)
     except OSError as e:

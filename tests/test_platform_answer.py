@@ -86,7 +86,9 @@ def answer_recording_lmer(tmp_path):
         "           'target': ns.target, 'rest': rest,\n"
         # getattr rather than ns.session so a suite run against a CLI without the
         # flag reports the missing *flag* rather than dying inside the stub.
-        "           'session': getattr(ns, 'session', None)}\n"
+        "           'session': getattr(ns, 'session', None),\n"
+        "           'source_session': os.environ.get('LMER_SOURCE_SESSION_ID'),\n"
+        "           'allow_unsigned': os.environ.get('LMER_ALLOW_UNSIGNED_SOURCE')}\n"
         f"open({str(dump)!r}, 'w', encoding='utf-8').write(json.dumps(payload))\n"
         # Staying alive is how a test keeps the session's registry entry around; a
         # clean exit reaps it, which would race any assertion about a live one.
@@ -130,6 +132,7 @@ def plant_run(
     status="in-progress",
     recorded_slug=...,
     session_id=None,
+    schema=1,
     extra="",
 ):
     """Write one run dir into the mirror the way a pushed run appears there.
@@ -149,7 +152,7 @@ def plant_run(
     else:
         path = config.mirror_path / host / project / "_runs" / slug / session_id
     path.mkdir(parents=True, exist_ok=True)
-    lines = ["schema: 1", f"status: {status}"]
+    lines = [f"schema: {schema}", f"status: {status}"]
     recorded = slug if recorded_slug is ... else recorded_slug
     if recorded is not None:
         lines.append(f"slug: {recorded}")
@@ -186,12 +189,13 @@ def waiting_run(config):
     return track_run()
 
 
-def request_for(slug=None, answer="yes — start empty."):
+def request_for(slug=None, answer="yes — start empty.", **fields):
     return answer_mod.AnswerRequest(
         host=HOST,
         project=PROJECT,
         slug=slug if slug is not None else run_state.derive_slug(TASKDEF, TARGET),
         answer=answer,
+        **fields,
     )
 
 
@@ -433,6 +437,55 @@ def test_answering_a_renamed_run_dir_still_targets_the_recorded_slug(config):
 #: sort into start order), not a container session id.
 SESSION_ID = "20260824-165230-2-31245"
 LATER_SESSION_ID = "20260825-090000-2-31300"
+
+
+def plant_schema_two_question(config, *, signed_out=False):
+    config.mirror_path.mkdir(parents=True, exist_ok=True)
+    (config.mirror_path / "_plexus.yaml").write_text(
+        "schema: 2\nname: example-plexus\nprojects: {}\n", encoding="utf-8"
+    )
+    source = plant_run(
+        config, session_id="a" * 32, schema=2,
+        extra=(
+            "session:\n"
+            "  uid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "  operator: alice\n"
+            "  hostname: build.example\n"
+            "  started_at: 2026-09-17T12:00:00Z"
+        ),
+    )
+    events = [{"ts": "2026-09-17T12:00:00Z", "type": "session_start"}]
+    if signed_out:
+        events.append({"ts": "2026-09-17T12:01:00Z", "type": "session_end"})
+    (source / "events.jsonl").write_text(
+        "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+    )
+    return source
+
+
+def test_schema_two_answer_uses_fresh_record_with_question_source(
+    config, answer_recording_lmer
+):
+    _script, dump = answer_recording_lmer
+    source = plant_schema_two_question(config, signed_out=True)
+    track_run()
+    before = snapshot_tree(source)
+
+    answer_mod.answer_run(config, request_for())
+
+    payload = child_payload(dump)
+    assert payload["session"] is None
+    assert payload["source_session"] == "a" * 32
+    assert snapshot_tree(source) == before
+
+
+def test_schema_two_answer_requires_source_bound_confirmation(config):
+    plant_schema_two_question(config)
+    track_run()
+
+    with pytest.raises(resume_mod.UnsignedSessionSource):
+        answer_mod.answer_run(config, request_for())
+    assert registry.list_sessions(live_only=False) == []
 
 
 def test_the_answer_lands_in_the_record_that_asked(config, answer_recording_lmer):

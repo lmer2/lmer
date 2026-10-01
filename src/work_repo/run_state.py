@@ -118,6 +118,7 @@ from typing import Optional
 import yaml
 
 from . import specs_index
+from .transactions import mutation_transaction, work_transaction
 from .utils import (
     project_area,
     redact_secrets,
@@ -126,7 +127,7 @@ from .utils import (
     work_repo_root,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STATE_FILE = "state.yaml"
 # Pre-rename runs wrote this name; read-fallback + rename-on-write migration.
 LEGACY_STATE_FILE = "state.yml"
@@ -148,7 +149,7 @@ ARCHIVE_DIR = "archive"
 # timestamp-first, so a directory listing of one group is start order
 # (docs/SCHEMA.md, "Sessions and runs"). SESSION_DIR_RE adds the `--<name>`
 # suffix the freeze rename appends; the two spellings are ONE session.
-SESSION_ID_RE = re.compile(r"\d{8}-\d{6}-\d+-\d+")
+SESSION_ID_RE = re.compile(r"(?:\d{8}-\d{6}-\d+-\d+|[0-9a-f]{32})")
 SESSION_DIR_RE = re.compile(rf"{SESSION_ID_RE.pattern}(?:--.+)?")
 # The append-only lineage of harness ids that have written in a session dir
 # (D22 resume). Optional and additive: a record without it is a record from
@@ -282,6 +283,13 @@ def is_session_form() -> bool:
     any base handed in and meet an unmigrated record wherever it lies.
     """
     return work_repo_layout().is_schema
+
+
+def is_process_record() -> bool:
+    """Schema 2 binds each record to exactly one execution UID."""
+    from .session_record import schema_version
+
+    return schema_version() >= 2
 
 
 def _usable_session_id(session: Optional[str]) -> bool:
@@ -421,6 +429,7 @@ def _chain_session(state: dict, session_id: str) -> bool:
     return True
 
 
+@mutation_transaction
 def attach_session(
     rdir: Path, state: dict, session_id: Optional[str] = None
 ) -> bool:
@@ -531,8 +540,12 @@ def _newest_record(records: list[Path]) -> Optional[Path]:
     """
     if not records:
         return None
+    from .session_record import UID_RE, sort_key
+
     in_form = [rdir for rdir in records if SESSION_DIR_RE.fullmatch(rdir.name)]
     if in_form:
+        if any(UID_RE.fullmatch(session_id_of(path.name)) for path in in_form):
+            return max(in_form, key=sort_key)
         return max(in_form, key=lambda rdir: rdir.name)
     return max(records, key=lambda rdir: (_mtime(rdir), rdir.name))
 
@@ -894,6 +907,8 @@ def _session_dir(group: Path, session: Optional[str] = None) -> Path:
         return _named_session(group, session) or group / session
     launch = launch_session_id()
     if launch:
+        if is_process_record():
+            return _named_session(group, launch) or group / launch
         return (
             _named_session(group, launch)
             or _lineage_session(group, launch)
@@ -940,6 +955,17 @@ def _record_address(
     legacy run dir, or a tree adopted before its runs were migrated, is
     written where it lies and never given a session dir nested inside it.
     """
+    if is_process_record():
+        uid = session or launch_session_id()
+        if uid:
+            if not _usable_session_id(uid):
+                raise RunStateError("session must be a UID, not a path or pattern")
+            matches = [path for path in iter_record_dirs(base)
+                       if session_id_of(path.name) == session_id_of(uid)]
+            if len(matches) > 1:
+                raise RunStateError(f"session UID {uid} has more than one record")
+            if matches:
+                return matches[0]
     found = resolve_run_dir(slug, base) or _unreadable_state_candidate(base, slug)
     if found is None:
         return _creation_address(base, slug, session)
@@ -1056,8 +1082,8 @@ def run_rel_path_candidates(slug: Optional[str] = None) -> list[str]:
 def seed_state(slug: str, taskdef: str, target: str) -> dict:
     """Fresh state for a new run (spec §4.1). taskdef/target are immutable."""
     now = utc_now_iso()
-    return {
-        "schema": SCHEMA_VERSION,
+    state = {
+        "schema": 2 if is_process_record() else 1,
         "slug": slug,
         "name": None,
         "taskdef": taskdef,
@@ -1075,8 +1101,14 @@ def seed_state(slug: str, taskdef: str, target: str) -> dict:
         "created": now,
         "updated": now,
     }
+    if is_process_record():
+        from .session_record import current_metadata
+
+        state["session"] = current_metadata()
+    return state
 
 
+@mutation_transaction
 def seed_run_dir(
     slug: str,
     taskdef: str,
@@ -1084,6 +1116,7 @@ def seed_run_dir(
     note: Optional[str] = None,
     adopt_existing: bool = True,
     session: Optional[str] = None,
+    context: Optional[dict] = None,
 ) -> tuple[Path, dict]:
     """Create a run dir via the tmp-dir-then-rename lifecycle (issue #87 D2).
 
@@ -1125,12 +1158,27 @@ def seed_run_dir(
     )
     os.chmod(tmp, 0o755)  # mkdtemp defaults to 0700; match mkdir-created runs
     state = seed_state(slug, taskdef, target)
+    if context is not None:
+        from copy import deepcopy
+
+        state["context"] = context
+        state["session"]["source_session_uid"] = context["source_session_uid"]
+        if context["unsigned_source_acknowledged"]:
+            state["session"]["unsigned_source_acknowledged"] = context["source_session_uid"]
+        for key in ("goal", "estimate", "phase", "open_question"):
+            if key in context["state"]:
+                state[key] = deepcopy(context["state"][key])
+        if context["state"].get("stop_reason") == "question":
+            state["stop_reason"] = "question"
     if is_session_form():
         # The chain starts with the launch that opened the record, so a
         # resumed dir reads as the lineage it is. A synthesized id names a
         # process, not a session anyone can resume, and is left out.
         _chain_session(state, launch_session_id() or "")
     write_state(tmp, state)
+    if context is not None:
+        for name, checkpoint in context.get("checkpoints", {}).items():
+            (tmp / name).write_text(yaml.safe_dump(checkpoint["data"], sort_keys=False))
     append_event(tmp, "run_seeded", note=note)
     # Whose directory the group is, recorded BEFORE the mutation — the same
     # question, and the same answer, as the re-slug path below. `mkdir` with
@@ -1182,6 +1230,121 @@ def _seed_session_label() -> str:
     return _session_dir_id() if is_session_form() else current_session_id()
 
 
+def _source_context(slug: str, source_uid: str | None) -> dict | None:
+    """Read a prior record without any corrupt-file recovery or other writes."""
+    if not source_uid:
+        return None
+    from .session_record import SOURCE_ACK_ENV, signed_out
+
+    if not _usable_session_id(source_uid):
+        raise RunStateError("source session must be a session UID, not a path")
+    if source_uid == current_session_id():
+        raise RunStateError("a new session cannot reuse its context source's UID")
+    source = run_dir(slug, session=source_uid)
+    if source is None or _state_path(source) is None:
+        raise RunStateError(f"source session {source_uid} does not exist")
+    try:
+        raw = _state_path(source).read_bytes()
+        state = yaml.safe_load(raw)
+    except (OSError, yaml.YAMLError) as exc:
+        raise RunStateError(f"source session {source_uid} cannot be read") from exc
+    if not isinstance(state, dict) or state.get("schema", 1) > SCHEMA_VERSION:
+        raise RunStateError(f"source session {source_uid} has an unsupported record")
+    events = read_events(source, last_n=0)
+    acknowledged = os.environ.get(SOURCE_ACK_ENV) == source_uid
+    if not signed_out(events) and not acknowledged:
+        metadata = state.get("session") or {}
+        raise RunStateError(
+            f"source session {source_uid} has no recorded sign-out "
+            f"(operator={metadata.get('operator', '?')}, host={metadata.get('hostname', '?')}, "
+            f"started={metadata.get('started_at', state.get('created', '?'))}, "
+            f"last_activity={events[-1].get('ts', '?') if events else state.get('updated', '?')}). "
+            "Choose cancel/wait, inspect the prior session, or explicitly start fresh."
+        )
+    import hashlib
+
+    checkpoints = {}
+    for name in (LEDGER_FILE, "release.yaml"):
+        path = source / name
+        if not path.exists():
+            continue
+        try:
+            content = path.read_bytes()
+            data = yaml.safe_load(content)
+        except (OSError, yaml.YAMLError) as exc:
+            raise RunStateError(f"source checkpoint {name} cannot be read") from exc
+        if (not isinstance(data, dict) or type(data.get("schema")) is not int
+                or data["schema"] != 1):
+            raise RunStateError(f"source checkpoint {name} has an unsupported format")
+        checkpoints[name] = {"data": data, "sha256": hashlib.sha256(content).hexdigest()}
+    return {
+        "source_session_uid": source_uid,
+        "source_path": source.relative_to(work_repo_root()).as_posix(),
+        "state_sha256": hashlib.sha256(raw).hexdigest(),
+        "state": state,
+        "events": events[-25:],
+        "checkpoints": checkpoints,
+        "unsigned_source_acknowledged": acknowledged and not signed_out(events),
+    }
+
+
+def _ensure_process_record(slug, taskdef, target, source_uid):
+    """Create or load only this launch's record; a prior record is context."""
+    from .session_record import SOURCE_ENV, current_metadata
+
+    try:
+        current_metadata()
+    except ValueError as exc:
+        raise RunStateError(str(exc)) from exc
+    slug = slug or derive_slug()
+    rdir = run_dir(slug)
+    if rdir is None:
+        raise RunStateError("no run context")
+    if _state_path(rdir) is not None:
+        state = load_state(rdir)
+        _require_record_writer(rdir, state)
+        return rdir, state
+    context = _source_context(slug, source_uid or os.environ.get(SOURCE_ENV))
+    return seed_run_dir(
+        slug, taskdef or os.environ.get("LMER_TASK", "default"),
+        target if target is not None else os.environ.get("LMER_TASK_TARGET", ""),
+        adopt_existing=False,
+        context=context,
+    )
+
+
+def _require_record_writer(rdir: Path, state: dict | None = None) -> None:
+    """Refuse writes to another execution's record before touching files."""
+    process_records = is_process_record()
+    path = _state_path(rdir)
+    persisted = None
+    if path is not None:
+        try:
+            persisted = yaml.safe_load(path.read_text())
+        except (OSError, yaml.YAMLError) as exc:
+            if not process_records:
+                return  # legacy corrupt-state recovery remains unchanged
+            raise RunStateError("cannot establish record ownership") from exc
+    # Inspect disk even when the caller supplies an older in-memory state.
+    # Otherwise a stale helper could overwrite a newer document version.
+    for candidate in (persisted, state):
+        if isinstance(candidate, dict):
+            version = candidate.get("schema", 1)
+            if isinstance(version, int) and version > SCHEMA_VERSION:
+                raise RunStateError("record uses a newer schema; upgrade lmer before writing")
+    if state is None:
+        state = persisted
+    state = state or {}
+    if state.get("schema", 1) < 2 and not process_records:
+        return
+    metadata = state.get("session") or {}
+    owner = metadata.get("uid") or session_id_of(rdir.name)
+    address_matches = session_id_of(rdir.name) == owner or rdir.name.startswith(f"{TMP_DIR_PREFIX}{owner}-")
+    if owner != launch_session_id() or not address_matches:
+        raise RunStateError("a session may write only its own record; use prior sessions as context")
+
+
+@mutation_transaction
 def ensure_run(
     slug: Optional[str] = None,
     taskdef: Optional[str] = None,
@@ -1206,6 +1369,8 @@ def ensure_run(
     slug and strand the renamed dir. Only load_state's read-only refusal
     (schema newer than this kernel) propagates.
     """
+    if is_process_record():
+        return _ensure_process_record(slug, taskdef, target, session)
     slug = slug or derive_slug()
     rdir = run_dir(slug, session)
     if rdir is None:
@@ -1293,10 +1458,20 @@ def list_sessions(
                     "created": state.get("created"),
                     "updated": state.get("updated"),
                     "owner": state.get("owner"),
-                    "orphaned": _is_orphaned(state, now, stale_after_minutes),
+                    "orphaned": (None if state.get("schema") == 2 else
+                                 _is_orphaned(state, now, stale_after_minutes)),
                 }
             )
+            if state.get("schema") == 2:
+                from .session_record import signed_out
+
+                row["session"] = state.get("session")
+                row["signed_out"] = signed_out(read_events(rdir, last_n=0))
         rows.append(row)
+    if any("session" in row for row in rows):
+        from .session_record import sort_key
+
+        rows.sort(key=lambda row: (str(row["slug"] or ""), sort_key(row["path"])))
     return rows
 
 
@@ -1325,6 +1500,7 @@ def is_planning_phase(phase: Optional[str]) -> bool:
     return lowered.startswith(PLANNING_PHASE_PREFIXES)
 
 
+@mutation_transaction
 def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     """Pre-execution freeze gate (issue #87 D2): the run's identity is final.
 
@@ -1349,6 +1525,7 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     the caller stages the pre-rename path so the old path's deletion lands in
     the same commit (:func:`run_rel_for_dir_name`).
     """
+    _require_record_writer(rdir)
     state["frozen"] = utc_now_iso()
     name = state.get("name")
     slug = state.get("slug") or rdir.name
@@ -1393,6 +1570,7 @@ def freeze_run_dir(rdir: Path, state: dict) -> tuple[Path, Optional[str]]:
     return rdir, old_rel
 
 
+@mutation_transaction
 def reslug_run(
     rdir: Path, state: dict, new_slug: str
 ) -> tuple[Path, dict, Optional[str]]:
@@ -1438,6 +1616,7 @@ def reslug_run(
     name when a rename happened, else None) — the caller stages the previous
     path so the old path's deletion lands in the same commit.
     """
+    _require_record_writer(rdir)
     old_slug = state.get("slug")
     if not new_slug or new_slug == old_slug:
         return rdir, state, None
@@ -1555,6 +1734,7 @@ def reslug_run(
     return rdir, state, old_dir_name
 
 
+@mutation_transaction
 def _backup_bad_state(path: Path, reason: str) -> "RunStateError":
     """Move an unusable state file aside and return the error to raise.
 
@@ -1562,6 +1742,8 @@ def _backup_bad_state(path: Path, reason: str) -> "RunStateError":
     preserved as <name>.bad-<utc-compact> for post-mortem, named after
     whichever file was actually read (state.yaml or legacy state.yml).
     """
+    if is_process_record():
+        return RunStateError(f"{reason} — left untouched at {path}")
     stamp = utc_now_iso().replace(":", "").replace("-", "")
     backup = path.with_name(f"{path.name}.bad-{stamp}")
     path.rename(backup)
@@ -1578,6 +1760,7 @@ def _state_path(rdir: Path) -> Optional[Path]:
     return None
 
 
+@mutation_transaction
 def _load_yaml_mapping(path: Path, label: str, supported_version: int) -> dict:
     """Shared parse/validate preamble for the schema'd single-writer YAML
     files (state.yaml, ledger.yaml): parse → mapping check → schema
@@ -1600,6 +1783,7 @@ def _load_yaml_mapping(path: Path, label: str, supported_version: int) -> dict:
     return data
 
 
+@mutation_transaction
 def load_state(rdir: Path) -> Optional[dict]:
     """Read state.yaml (falling back to legacy state.yml). None if absent.
     RunStateError if corrupt (backed up first) or if `schema` is newer than
@@ -1610,6 +1794,7 @@ def load_state(rdir: Path) -> Optional[dict]:
     return _load_yaml_mapping(path, "state", SCHEMA_VERSION)
 
 
+@mutation_transaction
 def write_state(rdir: Path, state: dict) -> None:
     """Atomic tmp+rename write. The ONLY writer of state.yaml (spec §3.4).
 
@@ -1620,6 +1805,7 @@ def write_state(rdir: Path, state: dict) -> None:
     hole. Single-writer discipline is a contract on the destination, not a
     guarantee that only one process is executing this function.
     """
+    _require_record_writer(rdir, state)
     rdir.mkdir(parents=True, exist_ok=True)
     state = dict(state)
     state["updated"] = utc_now_iso()
@@ -1635,6 +1821,7 @@ def write_state(rdir: Path, state: dict) -> None:
         legacy.rename(rdir / f"{LEGACY_STATE_FILE}.migrated")
 
 
+@mutation_transaction
 def append_event(
     rdir: Path,
     event_type: str,
@@ -1642,6 +1829,7 @@ def append_event(
     data: Optional[dict] = None,
 ) -> None:
     """Append one JSON line to events.jsonl (append-only, spec §4.2)."""
+    _require_record_writer(rdir)
     rdir.mkdir(parents=True, exist_ok=True)
     event = {"ts": utc_now_iso(), "session": current_session_id(), "type": event_type}
     if note is not None:
@@ -1672,6 +1860,7 @@ def read_events(rdir: Path, last_n: int = 5) -> list[dict]:
     return events[-last_n:] if last_n else events
 
 
+@mutation_transaction
 def load_ledger(rdir: Path) -> Optional[dict]:
     """Read ledger.yaml. None if absent. Same safety contract as state.yaml
     (the shared preamble): corrupt files are backed up first (RunStateError),
@@ -1689,16 +1878,46 @@ def load_ledger(rdir: Path) -> Optional[dict]:
     return ledger
 
 
+def require_document_version(path: Path, proposed: dict, supported: int) -> None:
+    """Check disk and proposed machine-owned versions without modifying either.
+
+    A supported in-memory snapshot is not permission to overwrite a document
+    another writer has upgraded since it was read. Descriptive extensions are
+    deliberately outside this small version envelope.
+    """
+    candidates = [proposed]
+    if path.exists():
+        try:
+            candidates.append(yaml.safe_load(path.read_text(encoding="utf-8")))
+        except (OSError, yaml.YAMLError) as exc:
+            raise RunStateError(f"cannot validate {path.name}: {exc}") from exc
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise RunStateError(f"{path.name} must be a mapping")
+        version = candidate.get("schema", 0)
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise RunStateError(f"{path.name} schema must be an integer")
+        if version > supported:
+            raise RunStateError(
+                f"{path.name} schema {version} is newer than supported "
+                f"{supported} — read-only refusal"
+            )
+
+
+@mutation_transaction
 def write_ledger(rdir: Path, ledger: dict) -> None:
     """Atomic tmp+rename write. The ONLY writer of ledger.yaml (issue #89:
     single-writer contract, same as state.yaml) — including its temp naming,
     which carries pid and thread id for the reason :func:`write_state` gives."""
+    _require_record_writer(rdir)
+    require_document_version(rdir / LEDGER_FILE, ledger, LEDGER_SCHEMA_VERSION)
     rdir.mkdir(parents=True, exist_ok=True)
     tmp = rdir / f".{LEDGER_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
     tmp.write_text(yaml.safe_dump(ledger, sort_keys=False), encoding="utf-8")
     tmp.replace(rdir / LEDGER_FILE)
 
 
+@mutation_transaction
 def set_ledger_task(
     rdir: Path,
     task_id: str,
@@ -1820,6 +2039,7 @@ def format_ledger(ledger: Optional[dict]) -> str:
     return "\n".join(lines)
 
 
+@mutation_transaction
 def answer_question(rdir: Path, state: dict, answer: str) -> dict:
     """Apply a human's answer to the run's open question (issue #98).
 
@@ -1987,6 +2207,7 @@ def claim_pointer(
     )
 
 
+@mutation_transaction
 def claim_run(
     rdir: Path,
     state: dict,
@@ -2048,6 +2269,7 @@ def claim_run(
     return state
 
 
+@mutation_transaction
 def unclaim_run(
     rdir: Path,
     state: dict,
@@ -2086,6 +2308,7 @@ def unclaim_run(
     return state
 
 
+@mutation_transaction
 def abort_run(
     rdir: Path,
     state: dict,
@@ -2494,6 +2717,7 @@ def _masterplan_bundle_artifacts(rdir: Path) -> list[tuple[Path, str, str]]:
     return found
 
 
+@mutation_transaction
 def sync_masterplan_artifacts(rdir: Path) -> list[str]:
     """Surface masterplan bundle artifacts at the record root (spec §6).
 
@@ -2527,6 +2751,7 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
     linked: list[str] = []
     spec_files: list[tuple[Path, str]] = []  # (bundle file, record-root link name)
     try:
+        _require_record_writer(rdir)
         for bundle_file, link_name, target in _masterplan_bundle_artifacts(rdir):
             if specs_index.is_spec_artifact(bundle_file.name):
                 spec_files.append((bundle_file, link_name))
@@ -2587,6 +2812,7 @@ def sync_masterplan_artifacts(rdir: Path) -> list[str]:
     return linked
 
 
+@work_transaction(failure_result=None)
 def emit_gate_event(
     gate: str,
     outcome: str,

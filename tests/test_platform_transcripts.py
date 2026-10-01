@@ -2285,6 +2285,7 @@ def test_a_writer_held_mid_file_cannot_have_its_temp_truncated(
     # `flushed` assertion below fails the test if there was nothing on disk yet.
     hold_after = (BULKY_RECORDS * 3) // 4
     real_open, real_scrub_decoded = os.open, transcripts._scrub_decoded
+    real_fdopen = os.fdopen
     first_is_mid_file = threading.Event()
     second_holds_its_temp = threading.Event()
     published = threading.Event()
@@ -2323,6 +2324,10 @@ def test_a_writer_held_mid_file_cannot_have_its_temp_truncated(
             nested.discard(ident)
 
     monkeypatch.setattr(transcripts.os, "open", gated_open)
+    # Pin the test's buffering assumption: Python versions choose different
+    # defaults. The scenario needs bytes flushed before the forced handoff.
+    monkeypatch.setattr(transcripts.os, "fdopen", lambda fd, mode, **kwargs:
+                        real_fdopen(fd, mode, buffering=8192, **kwargs))
     monkeypatch.setattr(transcripts, "_scrub_decoded", gated_scrub_decoded)
     results, errors = {}, []
 

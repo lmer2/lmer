@@ -225,7 +225,7 @@ class TestFixtureTrees:
     def test_schema_tree_is_clean(self, schema_plexus):
         report = _validate(schema_plexus)
         assert report.errors == ()
-        assert report.warnings == ()
+        assert [f.code for f in report.warnings] == ["manifest.schema-older"]
         assert report.exit_code == 0
         assert report.unusable is None
 
@@ -808,7 +808,7 @@ class TestRunChecks:
         assert context.manifest is not None
         assert context.registry is not None
         assert context.project_dirs is None  # the layout stage never ran
-        assert _codes(report) == []
+        assert _codes(report) == ["manifest.schema-older"]
 
     def test_the_context_carries_the_stages_output(self, schema_plexus):
         report = Report(Form.SCHEMA)

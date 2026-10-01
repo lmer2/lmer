@@ -218,6 +218,26 @@ class TestStateSetRedaction:
         assert SAMPLE not in _committed_text(run_env)
 
 
+class TestNoLeftContextLetsATokenReachTheSharedRepo:
+    """The reviewer's end-to-end probe: three ordinary commands whose text puts
+    a token after a JSON-escaped newline, an ANSI colour code and a slug
+    hyphen. Zero occurrences in log.yaml / state.yaml / events.jsonl."""
+
+    TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def test_log_and_phase_never_carry_the_token(self, run_env):
+        token = self.TOKEN
+        with patch("work_repo.cli.commit_work_path", return_value=0):
+            assert _main(["log", f"gate output captured as JSON: error:\\n{token}"]) == 0
+            assert _main(["log", f"coloured cli output: Token: \x1b[1m{token}\x1b[0m"]) == 0
+            assert _main(["state", "set", f"--phase=execute-{token}"]) == 0
+        counts = {
+            name: (run_env / name).read_text(encoding="utf-8").count(token)
+            for name in ("log.yaml", run_state.STATE_FILE, run_state.EVENTS_FILE)
+        }
+        assert counts == {"log.yaml": 0, run_state.STATE_FILE: 0, run_state.EVENTS_FILE: 0}
+
+
 class TestCommitMessageRedaction:
     """B5 — `work commit -m` becomes a commit subject in the shared repo."""
 

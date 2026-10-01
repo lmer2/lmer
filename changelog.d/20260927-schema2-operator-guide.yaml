@@ -1,0 +1,2 @@
+added:
+- "operator guide separates legacy layout adoption from schema-2 cutover, with scratch-repository isolation, runtime rollout, publication and continuation checks"
