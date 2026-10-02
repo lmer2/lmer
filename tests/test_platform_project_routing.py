@@ -6,17 +6,19 @@ import os
 import signal
 import subprocess
 from threading import Event
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
-from lmer_platform import api, assistant, config, connectors, projects, runs, spawn
+from lmer_platform import api, assistant, config, connectors, projects, runs, spawn, store
 from lmer_platform import project_context as scope
 from tests.test_platform_projects import fleet  # noqa: F401
 from lmer_platform import registry, comms, transcripts, ctl, daemon, assistant_history, uploads
 from tests.test_platform_comms import BusPlane, live_session, agent_posts
 from tests.test_platform_ctl import Local
+from tests.conftest import strip_lmer_env
 
 
 @pytest.fixture
@@ -83,6 +85,160 @@ def test_move_transfers_pending_once_and_rejects_stale_actions(client):
         assert sum(row["note"] == "Waiting question" for row in pending) == 1
         assert any(row["kind"] == "run_moved" for row in pending)
         assert assistant.take_pending() == []
+
+
+def _track_unassigned(key, workspace_id):
+    """A tracked run with no home record, as an upgraded fleet can carry."""
+    with scope.bound(workspace_id):
+        runs.track(*key)
+    with projects.database() as db:
+        db.execute("DELETE FROM homes WHERE run_key=?", (runs.run_key(*key),))
+
+
+def test_unassigned_run_assignment_is_operator_only_and_revision_checked(client):
+    alpha, beta = [client.post("/api/projects", json={"name": name}).json() for name in ("Alpha", "Beta")]
+    key = ("forge.test", "repository", "orphan")
+    _track_unassigned(key, alpha["id"])
+    assert projects.run_home(runs.run_key(*key)) is None
+    data = {"host": key[0], "project": key[1], "slug": key[2]}
+    # A supplied source that disagrees with the destination is a stale tab, not
+    # evidence of ownership, and it is refused before anything is written.
+    conflict = client.post("/api/runs/move", json={**data, "workspace_id": beta["id"],
+                                                   "destination_id": alpha["id"]})
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "project_changed"
+    assert projects.run_home(runs.run_key(*key)) is None
+    assigned = client.post("/api/runs/move", json={**data, "workspace_id": None,
+                                                   "destination_id": alpha["id"]})
+    assert assigned.status_code == 200, assigned.text
+    home = projects.run_home(runs.run_key(*key))
+    assert home["project_id"] == alpha["id"] and home["revision"] == 1
+    stale = client.post("/api/runs/move", json={**data, "workspace_id": alpha["id"],
+                                                "home_revision": 99, "destination_id": beta["id"]})
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "project_changed"
+    assert projects.run_home(runs.run_key(*key))["project_id"] == alpha["id"]
+
+
+def test_assistants_cannot_assign_or_forget_unassigned_runs(client):
+    alpha, beta = [client.post("/api/projects", json={"name": name}).json() for name in ("Alpha", "Beta")]
+    key = ("forge.test", "repository", "assistant-target")
+    _track_unassigned(key, alpha["id"])
+    with scope.bound(alpha["id"]):
+        token = config.active_assistant_credential()
+    headers = {"Authorization": f"Bearer {token}"}
+    data = {"host": key[0], "project": key[1], "slug": key[2]}
+    moved = client.post("/api/runs/move", headers=headers,
+                        json={**data, "destination_id": beta["id"]})
+    assert moved.status_code == 409  # a different project is a scope conflict
+    own = client.post("/api/runs/move", headers=headers,
+                      json={**data, "destination_id": alpha["id"]})
+    assert own.status_code == 403  # even its own project: assignment is operator-only
+    assert projects.run_home(runs.run_key(*key)) is None
+    forgotten = client.post("/api/runs/forget", headers=headers, json=data)
+    assert forgotten.status_code == 403
+    assert runs.get_tracked(*key) is not None
+
+
+def test_unassigned_assignment_refuses_a_live_worker(client):
+    alpha = client.post("/api/projects", json={"name": "Alpha"}).json()
+    key = ("forge.test", "repository", "running")
+    _track_unassigned(key, alpha["id"])
+    registry.register("s-running", pid=os.getpid(), kind="worker",
+                      run={"host": key[0], "project": key[1], "slug": key[2]})
+    data = {"host": key[0], "project": key[1], "slug": key[2]}
+    refused = client.post("/api/runs/move", json={**data, "destination_id": alpha["id"]})
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["code"] == "run_active"
+    assert projects.run_home(runs.run_key(*key)) is None
+
+
+def test_move_out_of_an_archived_home_transfers_without_adopting(client):
+    alpha, beta = [client.post("/api/projects", json={"name": name}).json() for name in ("Alpha", "Beta")]
+    key = ("forge.test", "repository", "stranded")
+    with scope.bound(alpha["id"]):
+        runs.track(*key)
+    with projects.database() as db:
+        db.execute("UPDATE projects SET archived=1 WHERE id=?", (alpha["id"],))
+    data = {"host": key[0], "project": key[1], "slug": key[2]}
+    # The run keeps its recorded (archived) home; recovery is a transfer, so the
+    # assignment path that would invent ownership is never reached.
+    moved = client.post("/api/runs/move", json={**data, "workspace_id": alpha["id"],
+                                                "home_revision": 1, "destination_id": beta["id"]})
+    assert moved.status_code == 200, moved.text
+    home = projects.run_home(runs.run_key(*key))
+    assert home["project_id"] == beta["id"] and home["revision"] == 2
+
+
+def test_operator_forgets_unassigned_run_without_a_project(client):
+    alpha = client.post("/api/projects", json={"name": "Alpha"}).json()
+    key = ("forge.test", "repository", "forgotten")
+    _track_unassigned(key, alpha["id"])
+    assert any(row["slug"] == "forgotten" for row in client.get("/api/state").json()["runs"])
+    data = {"host": key[0], "project": key[1], "slug": key[2]}
+    result = client.post("/api/runs/forget", json=data)
+    assert result.status_code == 200, result.text
+    assert result.json() == {"forgotten": True}
+    assert runs.get_tracked(*key) is None
+    # The row is gone on the next read; only the tracked-index entry was removed.
+    assert all(row["slug"] != "forgotten" for row in client.get("/api/state").json()["runs"])
+
+
+def test_forget_excludes_a_retained_dead_session_from_the_real_fleet_view(tmp_path, monkeypatch):
+    """Forgetting a completed unassigned run removes its row even though the
+    run's dead registry entry is retained as evidence (review round 1, major)."""
+    strip_lmer_env(monkeypatch)
+    mirror = tmp_path / "mirror"
+    monkeypatch.setattr(store, "PLATFORM_DIR", str(tmp_path / "platform"))
+    monkeypatch.setattr(api, "pull", lambda *a, **kw: SimpleNamespace(
+        to_dict=lambda: {"present": True, "healthy": True, "path": str(mirror)}))
+    settings = config.load({"work_repo_mirror": str(mirror)})
+    secret = config.ensure_secret(settings)
+    projects.migrate()
+    alpha = projects.create("Alpha")
+    host, project, slug = "forge.test", "fixture/repository", "completed-retained"
+    key = runs.run_key(host, project, slug)
+    dead = "s-completed-retained"
+    with scope.bound(alpha["id"]):
+        runs.track(host, project, slug, session_id=dead)
+    # A clean-exit run: completed, no retained registry row. This is the positive
+    # control that already disappeared before the fix and must keep doing so.
+    clean_slug = "completed-clean"
+    clean_key = runs.run_key(host, project, clean_slug)
+    with scope.bound(alpha["id"]):
+        runs.track(host, project, clean_slug)
+    with projects.database() as db:
+        db.execute("DELETE FROM homes WHERE run_key IN (?,?)", (key, clean_key))
+    for name in (slug, clean_slug):
+        run_dir = mirror / host / project / "runs" / name
+        run_dir.mkdir(parents=True)
+        (run_dir / "state.yaml").write_text(
+            f"schema: 1\nslug: {name}\nstatus: complete\nstop_reason: complete\n")
+    run_dir = mirror / host / project / "runs" / slug
+    registry.register(dead, pid=99999999, run={"host": host, "project": project, "slug": slug})
+    # An unrelated unassigned legacy session must survive the same refresh.
+    registry.register("s-legacy-unassigned", pid=99999999,
+                      run={"host": None, "project": None, "slug": "legacy"})
+    app = api.create_app(settings, secret)
+    with TestClient(app, headers={"Authorization": f"Bearer {secret}"}) as client:
+        before = client.get("/api/state").json()["runs"]
+        row = next(entry for entry in before if entry["slug"] == slug)
+        assert row["state"] == "complete" and row["workspace_id"] is None
+        assert any(entry["slug"] == clean_slug for entry in before)
+        assert any(entry["slug"] == "legacy" for entry in before)
+        evidence = (run_dir / "state.yaml").read_bytes()
+        clean_forget = client.post("/api/runs/forget", json={"host": host, "project": project, "slug": clean_slug})
+        assert clean_forget.status_code == 200, clean_forget.text
+        forgotten = client.post("/api/runs/forget", json={"host": host, "project": project, "slug": slug})
+        assert forgotten.status_code == 200, forgotten.text
+        assert forgotten.json() == {"forgotten": True}
+        after = client.get("/api/state").json()["runs"]
+        assert all(entry["slug"] not in (slug, clean_slug) for entry in after)
+        assert any(entry["slug"] == "legacy" for entry in after)
+        # Evidence is retained, not deleted: the run dir and its dead entry survive.
+        assert (run_dir / "state.yaml").read_bytes() == evidence
+        assert registry.read_session(dead) is not None
+        assert key in runs.forgotten_keys()
 
 
 def test_run_move_waits_for_launch_and_then_refuses_live_worker(client, fleet, monkeypatch):

@@ -66,12 +66,16 @@ const selectedSlot = ref(null)
 async function transferRun() {
   if (!moveDestination.value) return
   busy.value = true
-  error.value = null
+  moveError.value = null
   try { await moveRun(props.run, moveDestination.value); emit('changed'); emit('close') }
-  catch (exc) { error.value = exc.message }
+  catch (exc) { moveError.value = exc.message }
   finally { busy.value = false }
 }
 const busy = ref(false)
+// The move control sits on the identity line and the forget control in the exit
+// tab, so one shared error ref would report a move failure at the bottom of a tab
+// nobody is looking at — the hidden refusal this fix exists to remove.
+const moveError = ref(null)
 const error = ref(null)
 
 // --- which view of a run this operator likes (T49) ---------------------------
@@ -570,13 +574,16 @@ async function forget() {
   <div>
     <div class="d-flex flex-wrap ga-2 align-center mb-3">
       <v-chip v-if="!run.workspace_id || run.workspace_id !== identifiedWorkspaceId"
-        class="run-project-identity" :color="projectColor(run.workspace_color)" variant="flat">{{ run.workspace_name || 'Unavailable project' }}</v-chip>
+        class="run-project-identity" :color="projectColor(run.workspace_color)" variant="flat">{{ run.workspace_id ? (run.workspace_name || 'Unavailable project') : 'Unassigned' }}</v-chip>
       <template v-if="!run.live && !run.orchestrator">
         <v-select v-model="moveDestination" :items="projects.filter(project => !project.archived && project.id !== run.workspace_id)"
           item-title="name" item-value="id" label="Move to project" hide-details density="compact" style="min-width: 180px" />
         <v-btn :disabled="!moveDestination || busy" @click="transferRun">Move run</v-btn>
       </template>
     </div>
+    <v-alert v-if="moveError" type="error" density="compact" class="mb-3">
+      {{ moveError }}
+    </v-alert>
     <!-- The run's identity, and the reason it is asking for you. Both sit above
          the tabs on purpose: which panel is showing is the operator's remembered
          choice now, so this view no longer decides what they land on — and

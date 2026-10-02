@@ -24,6 +24,18 @@ def test_unassigned_http_inventory_reaches_mounted_operator_views():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_unassigned_recovery_controls_run_in_the_mounted_detail_view():
+    node = node_binary()
+    if not node:
+        require_node_toolchain("Node is required for mounted recovery UI tests")
+    result = subprocess.run(
+        [node, "node_modules/vitest/vitest.mjs", "run", "tests/UnassignedRecovery.test.js"],
+        cwd=Path(__file__).resolve().parents[1] / "web", capture_output=True, text=True, timeout=120,
+        env={**os.environ, "PROJECT_TEST_PYTHON": sys.executable},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.fixture
 def legacy_platform(tmp_path, monkeypatch):
     strip_lmer_env(monkeypatch)

@@ -74,6 +74,9 @@ def bind(request, caller, body):
     if len(set(candidates)) > 1:
         raise projects.ProjectError("Conflicting project destinations.", status=409)
     explicit = candidates[0] if candidates else None
+    destination = body.get("destination_id") if path == "/api/runs/move" else None
+    if destination is not None and not isinstance(destination, str):
+        raise projects.ProjectError("Invalid project identity.")
     session = request.path_params.get("session_id")
     caller_home = projects.session_home(caller.session_id) if caller.kind == "assistant" else None
     peer = bool(caller_home and session and projects.session_home(session) != caller_home
@@ -95,16 +98,26 @@ def bind(request, caller, body):
         if owner and owner != home["project_id"]:
             raise projects.ProjectError("Conflicting session and run destinations.", status=409)
         owner = home["project_id"]
+    if not home and path == "/api/runs/move" and destination:
+        # An unowned run has no source project, so the destination the operator
+        # named is the only scope the request carries. A supplied source that
+        # disagrees is a stale tab or a guess, never ownership.
+        if explicit and explicit != destination:
+            raise projects.ProjectError("This run is not assigned to that project.",
+                                        code="project_changed", status=409)
+        explicit = destination
     chosen = explicit or owner or caller_home
     if owner and chosen != owner or caller_home and chosen != caller_home:
         raise projects.ProjectError("This action belongs to another project.", code="project_changed", status=409)
     if caller.kind == "assistant" and not caller_home:
         raise projects.ProjectError("This assistant generation is no longer authorized.", status=401)
+    if not home and path == "/api/runs/forget" and caller.kind != "operator":
+        raise projects.ProjectError("Only an operator may forget an unassigned run.", status=403)
     unbound = path in {
         "/api/assistant/requests", "/api/projects", "/api/settings", "/api/health",
         "/api/state", "/api/rescan", "/api", "/", "/api/assistant/config",
         "/api/comms/feed", "/api/comms/questions", "/api/comms/connectors", "/api/spawn-options",
-        "/api/prune",
+        "/api/prune", "/api/runs/forget",
         "/api/assistant/peers",
     } or path.startswith(("/assets/", "/api/slots"))
     operator_history_read = caller.kind == "operator" and request.method == "GET" and session and path in {
@@ -113,7 +126,12 @@ def bind(request, caller, body):
     if path.startswith("/api/") and not chosen and not unbound and not operator_history_read:
         raise projects.ProjectError("Choose a project for this request.", code="project_required")
     if chosen:
-        projects.get(chosen, active=request.method not in ("GET", "HEAD") and not path.endswith("/restore"))
+        # A move may name the run's own home as its source even when that project
+        # is archived: the destination is validated active by ``projects.move``,
+        # and this is how a run stranded in an archived project is recovered.
+        moving_out = path == "/api/runs/move" and home and chosen == home["project_id"]
+        projects.get(chosen, active=request.method not in ("GET", "HEAD")
+                     and not path.endswith("/restore") and not moving_out)
     if caller.kind != "operator" and (path.startswith("/api/projects") or path == "/api/settings"
                                        or path.startswith("/api/slots") or path in ("/api/runs/move", "/api/prune")) and request.method != "GET":
         raise projects.ProjectError("Only an operator may change platform or project settings.", status=403)
