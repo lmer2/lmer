@@ -47,6 +47,36 @@ lmer chat \
   --checkout ~/myapp
 ```
 
+## Unexpected checkout state
+
+Startup and the lightweight review-followup entry files share
+`service-checkout.jinja2`. The external `develop/followup.txt` and
+`followup/followup.txt` include it before applying review fixes, plus the shared
+commit guidance. Followup retains its existing review instructions and does not
+repeat full branch setup or the complete service environment guide. The
+companion taskdef patch remains unapplied until coordinated distribution.
+
+Before changing branches or files or starting validation, the agent inspects
+the supplied checkout's branch and changes against its task and recorded run
+context. Unexpected pre-existing changes, or a branch that appears to belong
+to another issue, require a stop: report the service/group, branch and
+unexpected state through `lmer-signal ask`, preserve the environment, and wait
+for the operator or orchestrator to resolve it. Often the supplied service
+environment has simply not been reset after a previous task.
+
+The agent must not work around this condition by creating or switching
+worktrees, switching branches, stashing, resetting, discarding, cleaning up or
+otherwise repairing the environment itself. This rule precedes the task's
+branch-setup instructions. The operator may explicitly authorize a specific
+remedy after seeing the blocker.
+
+This is an instruction for the agent's decision-making, not an automatic
+classification of Git status. Changes owned by the current run, known
+provisioned local instructions and ignored files are normal; they must not
+cause repeated stops. A clean, appropriate service checkout remains usable.
+The rule applies to service mode; test runners and non-service workflows are
+unchanged.
+
 ## How It Works
 
 ### Container Resolution

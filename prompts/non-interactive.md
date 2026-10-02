@@ -12,6 +12,8 @@ your work vanishes with no error surfaced.
   the taskdef instructions, `/gate-commit` — is still approval. Act on it.
   A headless run whose purpose is to produce committed work still commits,
   and still runs the gate's checks first.
+  Routine commits within authorized work need no separate generic confirmation;
+  explicit user holds and task-specific restrictions remain binding.
 - For an approval you would have to obtain *now*: do not ask for it, and do
   not perform the gated action either. Stop that line of work and state in
   your final output what you would have asked, why you stopped, and what you

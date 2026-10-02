@@ -92,8 +92,8 @@ def run_commit_gate():
 
     if all_passed:
         print("\n✅ All checks passed! Ready to commit.")
-        print("4️⃣  Waiting for explicit approval...")
-        print('   User should now type: "commit" or "please commit"')
+        print("4️⃣  Use gate-commit for routine commits within authorized work.")
+        print("   No extra generic confirmation; explicit user holds remain binding.")
     else:
         print("\n❌ COMMIT BLOCKED: Not all checks passed")
         print("   Fix the issues above and run 'rgrpc' again")
@@ -133,7 +133,7 @@ def main():
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - COMMIT GATE passed via rgrpc\n")
 
     print("\n✅ Hook completed. COMMIT GATE passed.")
-    print("⏳ Awaiting user approval to commit...\n")
+    print("Use gate-commit within authorized scope; respect explicit user holds.\n")
 
 
 if __name__ == "__main__":

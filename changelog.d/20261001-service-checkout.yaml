@@ -1,0 +1,2 @@
+fixed:
+  - Service-mode agents stop for unexpected checkout state and ask the operator instead of creating alternate worktrees (#531).

@@ -8,7 +8,7 @@
 - **ALWAYS** check that ALL tests pass before declaring anything complete
 - **ALWAYS** check git rules before commit
 - **NEVER** push to any repository without explicit permission (except allow list)
-- **NEVER** commit without explicit user approval or request
+- **ALWAYS** use required gates for routine commits within authorized work; respect explicit user holds
 - **NEVER** expose API keys, tokens, or secrets in code or logs
 
 ## 🤖 NON-INTERACTIVE SESSIONS - when there is nobody to ask
@@ -39,8 +39,9 @@ When a gate would stop you for approval you do not already have:
   report, not a prompt.
 
 Per-gate, in a non-interactive session:
-- **COMMIT GATE** — run `gate-check`, show its output, and commit under the approval
-  the launch already carries. Without such approval, stop at the checks and report.
+- **COMMIT GATE** — run `gate-check`, show its output, and use `gate-commit` for
+  routine commits within authorized work. No separate generic commit confirmation
+  is required. An explicit user hold or restriction still blocks the commit.
 - **CONTEXT SWITCH GATE** — state the switch (completed / new objective / files) in
   your output and proceed; do not stop for the confirmation step.
 - **ERROR GATE** — for the STOP cases, use the report format below with its
@@ -50,8 +51,13 @@ Per-gate, in a non-interactive session:
 Before EVERY commit, you MUST:
 1. Run gate check: `gate-check`
 2. Show gate check results to user
-3. Get explicit approval: "commit" / "please commit" / `/gate-commit` command
+3. Confirm the changes stay within authorized work and no explicit user hold applies
 4. Use gate commit: `gate-commit -m "message"`
+
+Routine commits within authorized work need no separate commit-confirmation stop.
+A user instruction such as "do not commit yet" remains binding. A local commit
+does not authorize new scope, push, history rewrite, merge, deploy, destructive
+operations, or another worker's lifecycle. Those boundaries remain separate.
 
 **IMPORTANT**: The `/gate-commit` command IS explicit approval to commit:
 - When user runs `/gate-commit`, generate appropriate message if none provided

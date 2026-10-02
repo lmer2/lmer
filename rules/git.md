@@ -25,19 +25,22 @@ The gate checks warn when a staged file that names a spec-class deliverable (any
 - **ALWAYS** run all tests before commit
 - **ALWAYS** run precommit before commit
 - **NEVER** push to any repository without explicit permission (except allow list)
-- **NEVER** commit without explicit user approval or request
+- **ALWAYS** use required gates for routine commits within authorized work; respect explicit user holds
 - **NEVER** add Claude attributions or signatures
 
 ## 🚨 Commit Rules - STOP AND CHECK
 - **MUST** use `gate-commit -m "message"` for all commits
 - **NEVER** use `git commit` directly
-- **NEVER** commit without explicit user approval (user must say "commit", "please commit", "pc", "rgrpc")
+- Routine commits within authorized work need no separate generic commit confirmation
+- An explicit user hold, such as "do not commit yet", remains binding
 - **BEFORE committing:**
   1. ✅ Run `gate-check` to verify all checks pass
   2. ✅ Show user the gate check results
   3. ✅ Summarize what changed
-  4. ✅ Get explicit user approval
-- **STOP**: Wait for user to review changes before committing
+  4. ✅ Confirm the changes stay within authorized work and no explicit user hold applies
+- Proceed through `gate-commit` when required checks pass; failing checks block
+- A commit does not authorize new scope, push, history rewrite, merge, deploy,
+  destructive operations, or another worker's lifecycle
 - Only add and commit files you created or modified
 - Never include Claude code attributions in commit messages
 - Never add or commit any Claude-specific files to git

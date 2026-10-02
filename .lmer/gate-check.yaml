@@ -35,6 +35,7 @@ tests:
     # must run them.
     - tests/test_browser_automation_wiring.py
     - tests/test_codex_usage.py
+    - tests/test_commit_guidance.py
     # Reads docs/GATE-FASTPATH.md and docs/LMER-CLI.md.
     - tests/test_timing_budgets.py
     - tests/test_consistency.py
@@ -67,6 +68,7 @@ tests:
     # `Path(__file__).resolve().parents[1]` — the same unmodelled idiom as its
     # sibling above, listed by hand for the same reason.
     - tests/test_platform_rotation.py
+    - tests/test_provision_documentation.py
     # Reads docs/LMER-CLI.md (the LMER_STATUS_DIR bullet) through
     # `Path(__file__).parent.parent`, an idiom the scanner does not model —
     # listed by hand, as the header above says such a test must be.
@@ -83,6 +85,7 @@ tests:
     - tests/test_platform_web_theme.py
     - tests/test_release_taskdef.py
     - tests/test_rules_structure.py
+    - tests/test_service_checkout_guidance.py
     - tests/test_run_state_wiring.py
     - tests/test_security.py
     - tests/test_self_dev_pythonpath.py
