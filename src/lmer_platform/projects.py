@@ -434,6 +434,54 @@ def destination(data):
     return session_home(data.get("session")) or data.get("workspace_id") or scope.current()
 
 
+def _live_worker(key):
+    """The live registry entry for *key*, or ``None``.
+
+    A run with a container behind it is never reassigned or moved: the worker
+    holds the old project's admission, and a move under it would split the
+    session from its home.
+    """
+    for entry in registry.list_sessions(live_only=True):
+        parts = runs.run_key_of_entry(entry)
+        if parts and runs.run_key(*parts) == key:
+            return entry
+    return None
+
+
+def _assign(key, destination_id):
+    """Give a genuinely unowned run a home in an explicitly chosen project.
+
+    Called only when ``homes`` has no row for *key*. A recorded home, even one
+    in an archived project, is a transfer (see :func:`move`), never an adoption:
+    this function must not be reachable for a run whose ownership is known.
+    The caller has validated *destination_id* active and holds the operation
+    lock. Ownership comes from the named destination alone.
+    """
+    from . import assistant
+
+    if _live_worker(key):
+        raise ProjectError("Stop the worker before assigning this run.", code="run_active", status=409)
+    with database() as db:
+        db.execute("INSERT INTO homes (run_key,project_id) VALUES (?,?)", (key, destination_id))
+        db.execute("UPDATE sessions SET project_id=? WHERE run_key=?", (destination_id, key))
+        db.execute("UPDATE event_queue SET project_id=? WHERE done=0 AND (session IN "
+                   "(SELECT session FROM sessions WHERE run_key=?) OR json_extract(payload,'$.data.run_key')=?)",
+                   (destination_id, key, key))
+        row = db.execute("SELECT assistant_state FROM projects WHERE id=?", (destination_id,)).fetchone()
+        state = assistant.AssistantState.from_dict(json.loads(row[0]))
+        notice = assistant.PendingNote(
+            at=store.utc_now_iso(), kind="run_assigned",
+            note=f"Run {key} was assigned to this project.",
+            data={"run_key": key, "workspace_id": destination_id, "home_revision": 1},
+        )
+        updated = replace(state, pending=(*state.pending, notice),
+                          pending_since=state.pending_since or notice.at,
+                          pending_seq=state.pending_seq + (not state.pending))
+        db.execute("UPDATE projects SET assistant_state=? WHERE id=?", (json.dumps(updated.to_dict()), destination_id))
+    logger.info("platform_run_assigned key=%s destination=%s", key, destination_id)
+    return run_home(key)
+
+
 def move(key, destination_id, *, expected_project, expected_revision=None):
     from . import assistant
 
@@ -441,13 +489,17 @@ def move(key, destination_id, *, expected_project, expected_revision=None):
         get(destination_id, active=True)
         home = check_home(key, expected_project, expected_revision)
         if not home:
-            raise ProjectError("This run has no recorded project.", status=404)
+            # An unowned run is assigned, not moved: there is no source to
+            # transfer from. ``expected_project`` is the destination because the
+            # request layer made the destination the request's only scope.
+            if expected_project != destination_id:
+                raise ProjectError("An unassigned run can only be assigned to the project named "
+                                   "as its destination.", status=409)
+            return _assign(key, destination_id)
         if home["project_id"] == destination_id:
             return home
-        for entry in registry.list_sessions(live_only=True):
-            parts = runs.run_key_of_entry(entry)
-            if parts and runs.run_key(*parts) == key:
-                raise ProjectError("Stop the worker before moving this run.", code="run_active", status=409)
+        if _live_worker(key):
+            raise ProjectError("Stop the worker before moving this run.", code="run_active", status=409)
         with database() as db:
             states = {}
             for project_id in (expected_project, destination_id):

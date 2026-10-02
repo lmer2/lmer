@@ -31,6 +31,15 @@ inspect its session; this returns to the operator-wide scope without assigning
 it to General or another project. Selected-project lists still contain only
 that project's rows. Registry records and history remain intact.
 
+An unassigned run — one with no recorded home — is recoverable from its run
+detail: the operator selects an active destination and chooses **Move run**,
+which assigns the run there (refused while a worker is live). Forgetting an
+unassigned run needs no project choice, but stays operator-only. A run whose
+recorded project is archived is **not** unassigned: moving it out is a transfer,
+not a new assignment. The identity chip reads **Unavailable project** only when
+a run names a workspace whose name cannot be resolved; an archived project keeps
+its name, so the chip shows it.
+
 The **Platform settings** cog in the global app header is available on desktop
 and phone views, separately from the selected project's **Project settings**.
 Platform settings contains shared worker capacity, assistant capacity, execution
@@ -129,6 +138,17 @@ An operator supplies `workspace_id` in JSON, the query string, or
 credentials bind the caller to its current project and incarnation. Known run
 and session actions resolve their recorded home and recheck it at execution.
 Unassigned new work fails with `project_required`; General must be selected.
+
+`POST /api/runs/move` is operator-only. For a run with a recorded home it
+transfers ownership to the active `destination_id`; for a run with no home it
+assigns the run to that destination at revision 1, refusing while a worker is
+live. A supplied `workspace_id` that disagrees with the destination is a
+conflict **only for that no-home assignment** — an existing-home transfer
+supplies its source workspace and a different destination by design, and is
+never treated as ownership inference. `POST /api/runs/forget` is unbound when
+the run has no home — no project choice is needed — but a project assistant is
+refused there; an assigned run keeps its existing rules.
+
 Operators can inspect retained unassigned sessions through
 `GET /api/sessions/{id}/messages`, `/log`, and `/ask` without selecting a project.
 These reads preserve unresolved ownership and use the existing history readers;
@@ -150,7 +170,8 @@ The existing forge `project` parameter continues to mean the repository path.
 | `POST /api/projects/{workspace_id}/archive` | Stop/archive an eligible project |
 | `POST /api/projects/{workspace_id}/restore` | Restore its identity/history, stopped |
 | `GET`, `POST /api/settings` | Platform defaults and shared capacity |
-| `POST /api/runs/move` | Run identity, source `workspace_id`, `destination_id`, `home_revision` |
+| `POST /api/runs/move` | Operator-only: assign an unassigned run, or transfer an owned run, to an active `destination_id`; `workspace_id`, `home_revision` |
+| `POST /api/runs/forget` | Stop tracking a run; unbound for an unassigned run, operator-only there |
 | `GET /api/project-context?source_workspace_id=ID` | Operator-only bounded fleet excerpt with source identity |
 | `POST /api/project-relay` | Operator-only destination and supplied text, with source provenance |
 | `GET /api/assistant/requests` | Retained conversation requests and delivery errors |
@@ -261,7 +282,12 @@ address or its successor.
 
 A move waits for the shared control boundary, then refuses any live worker. It
 changes only durable ownership and its revision: checkout, service, artifacts,
-run identity, transcript and question identities are unchanged. Undelivered
+run identity, transcript and question identities are unchanged. A run with no
+recorded home is **assigned**, not moved: the operator names an active
+destination and the run gains a home at revision 1, so no source project is
+read or inferred. A run whose recorded home is an archived project is still a
+transfer — never an adoption — and may be moved out to an active project.
+Undelivered
 run events/questions follow the run once. The destination gets a short
 run-specific move notice, not the source assistant's conversation. Delivered
 events retain provenance. Stale source requests fail. Resume/answer after a move

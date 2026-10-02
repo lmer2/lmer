@@ -150,7 +150,7 @@ from .registry import list_sessions, prune_dead, read_session
 from .relations import RelationError
 from .resume import ResumeError, ResumeRequest, resume_run
 from .runs import (
-    RunIndexError, forget, list_tracked, run_for_session, run_key, track,
+    RunIndexError, filter_forgotten, forget, list_tracked, run_for_session, run_key, track,
 )
 from .session_io import ControlPlaneError, SessionIOError
 # ``_repo_urls`` and ``derive_run_identity`` are the pair that predicts a run's
@@ -877,6 +877,9 @@ def build_state(config: PlatformConfig, *, force_pull: bool = False) -> dict:
     # happens on the read path (see spawn.absorb_ports).
     with assistant._PUBLICATION_LOCK:
         sessions = projects.inventory_sessions(list_sessions(live_only=False))
+    # A forgotten run's index entry is gone, but its retained registry sessions
+    # are evidence: leave them on disk and out of the fleet view (#527).
+    sessions = filter_forgotten(sessions)
     sessions = absorb_ports(sessions)
     tracked = list_tracked()
     refs = [
@@ -2154,7 +2157,8 @@ def create_app(
             "  POST /api/projects/{workspace_id}/archive  archive eligible project\n"
             "  POST /api/projects/{workspace_id}/restore  restore stopped\n"
             "  GET|POST /api/settings      fleet assistant capacity\n"
-            "  POST /api/runs/move         inactive run: workspace_id, destination_id, home_revision\n"
+            "  POST /api/runs/move         inactive run: assign/transfer to destination_id,\n"
+            "                               with workspace_id and home_revision\n"
             "  GET  /api/project-context   explicit source_workspace_id excerpt\n"
             "  POST /api/project-relay     explicit destination_id and text, with provenance\n"
             "  GET  /api/assistant/requests  durable conversation requests and delivery state\n"
