@@ -1,0 +1,2 @@
+fixed:
+  - Authorized routine commits no longer stop for blanket confirmation; required gates and explicit user holds remain binding (#532).

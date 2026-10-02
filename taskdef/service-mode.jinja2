@@ -11,6 +11,8 @@ A development environment is running with service `{{ LMER_SERVICE_NAME }}`.
 Your workspace at `/workspace` contains the project source code from the
 developer's local checkout on the host.
 
+{% include 'service-checkout.jinja2' %}
+
 {% if LMER_SERVICE_GROUP is defined and LMER_SERVICE_GROUP %}
 ### Choosing which service you target
 

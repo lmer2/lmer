@@ -10,6 +10,19 @@ import pytest
 
 from lmer_cli.container.clone_and_exec import provision_documentation
 from lmer_cli.gates import GateSystem, CheckStatus
+from tests.conftest import strip_lmer_env
+
+
+def test_fresh_provisioning_contains_current_commit_policy(tmp_path, monkeypatch):
+    strip_lmer_env(monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", str(workspace)], check=True, capture_output=True, timeout=30)
+    root = Path(__file__).resolve().parent.parent
+    provision_documentation(workspace, tmp_path / "work", root)
+    for relative in ("AGENTS.md", "rules/git.md", "rules/testing.md"):
+        assert (workspace / relative).read_bytes() == (root / relative).read_bytes()
+        assert "NEVER** commit without explicit user approval" not in (workspace / relative).read_text()
 
 
 class TestProvisionDocumentation:

@@ -11,8 +11,8 @@
 - [ ] All unit tests written (not shell scripts)
 - [ ] Ran `python -m pytest tests/ -x` - ALL PASS
 - [ ] Ran `pre-commit run --all-files` - ALL PASS
-- [ ] User has reviewed changes
-- [ ] User explicitly approved commit
+- [ ] Changes stay within authorized work
+- [ ] No explicit user hold or task-specific restriction blocks the commit
 
 **If ANY check fails: DO NOT COMMIT**
 
