@@ -994,6 +994,18 @@ loopback client address; IPv6 client addresses are bracketed. The platform host
 endpoint remains separate from the session's supervisor URL/control token and
 from container-facing platform URLs.
 
+The credential-file path is expanded and made absolute **in the daemon's
+working directory before export**. A relative `secret_file` (or
+`LMER_PLATFORM_SECRET_FILE`) therefore keeps naming that file when the connector
+child launches from its interpreter directory. Absolute paths, `~` paths and
+the default platform-state secret location remain supported. This is lexical
+absolutization: symlinks and `..` retain filesystem traversal semantics; it does
+not pin an inode or prevent a later file replacement. Exporting the path neither
+reads nor creates a credential. Missing or empty files still fail mention
+forwarding as unconfigured; unreadable paths still raise `ConfigError`. A child
+never substitutes a same-named file in its cwd, the default secret for a custom
+path, or its session control token.
+
 A running connector process can still have failed delivery. Thread status shows
 `delivery-retrying`, the failing direction, unresolved failure count and error
 class from its durable checkpoint. Recovery clears that status after a successful

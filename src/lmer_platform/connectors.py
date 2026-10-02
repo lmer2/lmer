@@ -938,7 +938,8 @@ class ThreadConnectors:
             # absent from saved config. Container URLs and control tokens differ.
             env[config.ENV_BIND_ADDRESS] = self._platform_config.bind_address
             env[config.ENV_BIND_PORT] = str(self._platform_config.bind_port)
-            env[config.ENV_SECRET_FILE] = str(self._platform_config.secret_path)
+            # The child launches from its interpreter directory, not the daemon cwd.
+            env[config.ENV_SECRET_FILE] = str(self._platform_config.secret_path.absolute())
         for name in _THREAD_CONTEXT_ENV:
             env.pop(name, None)
         # Which kind of attachment this is, told to the one process that has to
