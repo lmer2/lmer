@@ -1,6 +1,7 @@
 """Recovery uses real child exits, durable stores and recreated consumers."""
 from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
+import errno
 import os
 import signal
 import subprocess
@@ -223,6 +224,107 @@ def test_assistant_does_not_execute_before_ownership_is_published(fleet, tmp_pat
     assert projects.status(project["id"])["running"]
 
 
+def _process_running(proc):
+    try:
+        state = proc.read_text().rsplit(")", 1)[1].split()[0]
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return state != "Z"
+
+
+def _assert_child_exited_without_execution(pid, marker, *, timeout=5):
+    proc = Path(f"/proc/{pid}/stat")
+    deadline = time.monotonic() + timeout
+    try:
+        while _process_running(proc) and time.monotonic() < deadline:
+            time.sleep(.02)
+        assert not _process_running(proc)
+        assert not marker.exists()
+    finally:
+        if _process_running(proc):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize("read_index", [0, 1, 2], ids=["poll", "assertion", "cleanup"])
+@pytest.mark.parametrize("error", [errno.ENOENT, errno.ESRCH])
+def test_orphan_observation_accepts_process_disappearance(tmp_path, monkeypatch, read_index, error):
+    proc = Path("/proc/4242/stat")
+    read_text = Path.read_text
+    reads = []
+
+    def disappearing(path, *args, **kwargs):
+        if path != proc:
+            return read_text(path, *args, **kwargs)
+        reads.append(path)
+        if len(reads) - 1 == read_index:
+            raise OSError(error, os.strerror(error), str(path))
+        return "4242 (fixture) Z 1"
+
+    monkeypatch.setattr(Path, "read_text", disappearing)
+    _assert_child_exited_without_execution(4242, tmp_path / "not-executed")
+    assert reads == [proc] * 3
+
+
+@pytest.mark.parametrize("error", [PermissionError(errno.EACCES, "denied"), OSError(errno.EIO, "I/O error")])
+def test_orphan_observation_does_not_hide_other_read_errors(error):
+    def read_text():
+        raise error
+
+    with pytest.raises(type(error)) as raised:
+        _process_running(SimpleNamespace(read_text=read_text))
+    assert raised.value is error
+
+
+def test_orphan_observation_distinguishes_running_and_exited_child(tmp_path):
+    child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+                             stdin=subprocess.PIPE, start_new_session=True)
+    try:
+        assert _process_running(Path(f"/proc/{child.pid}/stat"))
+        child.stdin.close()
+        _assert_child_exited_without_execution(child.pid, tmp_path / "not-executed")
+        assert child.wait(timeout=5) == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def test_orphan_observation_fails_and_kills_a_surviving_child(tmp_path):
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], start_new_session=True)
+    try:
+        with pytest.raises(AssertionError):
+            _assert_child_exited_without_execution(child.pid, tmp_path / "not-executed", timeout=0)
+        assert child.wait(timeout=5) == -signal.SIGKILL
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def test_orphan_observation_still_refuses_an_executable_marker(tmp_path):
+    marker = tmp_path / "executed"
+    marker.touch()
+    with pytest.raises(AssertionError):
+        _assert_child_exited_without_execution(2 ** 30, marker)
+
+
+def test_orphan_cleanup_tolerates_process_disappearance_before_signal(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(Path, "read_text", lambda _path: "4242 (fixture) S 1")
+
+    def gone(pid, sig):
+        calls.append((pid, sig))
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    monkeypatch.setattr(os, "killpg", gone)
+    with pytest.raises(AssertionError):
+        _assert_child_exited_without_execution(4242, tmp_path / "not-executed", timeout=0)
+    assert calls == [(4242, signal.SIGKILL)]
+
+
 def test_parent_death_in_publication_gap_cannot_launch_an_orphan_assistant(fleet, tmp_path):
     root = tmp_path / "crash-platform"
     marker = tmp_path / "orphan-executed"
@@ -248,16 +350,7 @@ projects.reconcile(settings)
     result = subprocess.run([sys.executable, "-c", code, str(root), str(executable), str(pid_file)], timeout=20)
     assert result.returncode == 77
     pid = int(pid_file.read_text())
-    proc = Path(f"/proc/{pid}/stat")
-    deadline = time.monotonic() + 5
-    while proc.exists() and proc.read_text().split(")", 1)[1].strip()[0] != "Z" and time.monotonic() < deadline:
-        time.sleep(.02)
-    try:
-        assert not proc.exists() or proc.read_text().split(")", 1)[1].strip()[0] == "Z"
-        assert not marker.exists()
-    finally:
-        if proc.exists() and proc.read_text().split(")", 1)[1].strip()[0] != "Z":
-            os.killpg(pid, signal.SIGKILL)
+    _assert_child_exited_without_execution(pid, marker)
 
 
 def test_guarded_exec_failure_retains_actual_error_and_can_retry(fleet, tmp_path):
