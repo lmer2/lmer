@@ -33,8 +33,10 @@ const keyOf = (r) => `${r.host}/${r.project}/${r.slug}`
 // next tick — so every case here awaits one. Reading the DOM synchronously after
 // mount sees the frame before the layout exists, which looks exactly like a map
 // that draws nothing.
-async function mountMap(runs, relations = []) {
-  const wrapper = mountPane(FleetMap, { runs, relations })
+const GROUPS = [{ name: 'Team', patterns: ['team/', 'tools/team-'] }]
+
+async function mountMap(runs, relations = [], groups = []) {
+  const wrapper = mountPane(FleetMap, { runs, relations, groups })
   await nextTick()
   return wrapper
 }
@@ -222,25 +224,21 @@ const at = (host, project, slug, extra = {}) => ({
 describe('grouping and labels', () => {
 
   it('draws one group ring around projects a rule gathers across namespaces', async () => {
-    // The operator's own example, and the reason the rules are regexes rather
-    // than a namespace prefix: `syseng/fullctl-site` is a fullctl project living
-    // in someone else's namespace, and a first-path-segment rule would file it
-    // somewhere else entirely.
     const wrapper = await mountMap([
-      at('gitlab.example.com', 'fullctl/ixctl', 'a'),
-      at('gitlab.example.com', 'fullctl/peerctl', 'b'),
-      at('gitlab.example.com', 'syseng/fullctl-site', 'c'),
+      at('gitlab.example.com', 'team/widget', 'a'),
+      at('gitlab.example.com', 'team/service', 'b'),
+      at('gitlab.example.com', 'tools/team-site', 'c'),
       at('gitlab.example.com', 'acme/widget', 'd'),
-    ])
+    ], [], GROUPS)
     const groupLabels = wrapper.findAll('.fleet-map__group').map((t) => t.text())
-    expect(groupLabels).toEqual(['fullctl'])
+    expect(groupLabels).toEqual(['Team'])
     expect(wrapper.findAll('.fleet-map__group-ring')).toHaveLength(1)
 
     // The projects inside it stay visible and keep their own names.
     const clusterLabels = wrapper.findAll('.fleet-map__cluster').map((t) => t.text())
-    expect(clusterLabels).toContain('fullctl/ixctl')
-    expect(clusterLabels).toContain('fullctl/peerctl')
-    expect(clusterLabels).toContain('syseng/fullctl-site')
+    expect(clusterLabels).toContain('team/widget')
+    expect(clusterLabels).toContain('team/service')
+    expect(clusterLabels).toContain('tools/team-site')
     expect(clusterLabels).toContain('acme/widget')
     wrapper.unmount()
   })
@@ -257,7 +255,7 @@ describe('grouping and labels', () => {
   it('labels every cluster it draws, never a dash and never blank', async () => {
     const wrapper = await mountMap([
       run('a'),
-      at('gitlab.example.com', 'peeringdb/peeringdb', 'p'),
+      at('gitlab.example.com', 'catalog/data', 'p'),
       // A worker in its first seconds: no identity committed yet, so the daemon
       // sends dashes. It is a cluster like any other and has to be named.
       at('\u2014', '\u2014', 'brand-new'),
@@ -280,10 +278,10 @@ describe('grouping and labels', () => {
     const many = []
     for (let p = 0; p < 14; p += 1) {
       for (let n = 0; n < 2; n += 1) {
-        many.push(at('gitlab.example.com', `fullctl/p${p}`, `run-${p}-${n}`))
+        many.push(at('gitlab.example.com', `team/p${p}`, `run-${p}-${n}`))
       }
     }
-    const wrapper = await mountMap(many)
+    const wrapper = await mountMap(many, [], GROUPS)
     const labels = [
       ...wrapper.findAll('.fleet-map__cluster'),
       ...wrapper.findAll('.fleet-map__group'),
@@ -318,7 +316,7 @@ describe('grouping and labels', () => {
         many.push(at('gitlab.example.com', `proj${p}/x`, `run-${p}-${n}`, { title: `run ${p}-${n}` }))
       }
     }
-    const wrapper = await mountMap(many)
+    const wrapper = await mountMap(many, [], GROUPS)
     const nodes = wrapper.findAll('[role="button"]')
     // Hover whichever node the layout put highest.
     let top = null
@@ -343,10 +341,10 @@ describe('grouping and labels', () => {
     // labels landing on each other at a size somebody actually runs.
     const many = []
     for (let p = 0; p < 12; p += 1) {
-      many.push(at('gitlab.example.com', `fullctl/p${p}`, `run-${p}`))
+      many.push(at('gitlab.example.com', `team/p${p}`, `run-${p}`))
       many.push(at('gitlab.example.com', `other${p}/thing`, `o-${p}`))
     }
-    const wrapper = await mountMap(many)
+    const wrapper = await mountMap(many, [], GROUPS)
     const read = (sel, charWidth) => wrapper.findAll(sel).map((t) => ({
       text: t.text(),
       x: Number(t.attributes('x')),
@@ -543,4 +541,30 @@ describe('motion', () => {
     }
     wrapper.unmount()
   })
+})
+
+
+it('refreshes saved groups without changing runs and keeps identical polls settled', async () => {
+  window.matchMedia = vi.fn().mockImplementation((query) => ({
+    matches: query.includes('reduced-motion'), media: query, addEventListener() {}, removeEventListener() {},
+  }))
+  const rows = [at('forge.test', 'team/widget', 'a'), at('forge.test', 'tools/team-site', 'b'), run('c')]
+  const wrapper = await mountMap(rows)
+  const coordinates = () => wrapper.findAll('.fleet-map__core').map(node => [node.attributes('cx'), node.attributes('cy')])
+  const before = coordinates()
+  const buttons = wrapper.findAll('[role="button"]').map(node => node.element)
+  expect(wrapper.findAll('.fleet-map__group-ring')).toHaveLength(0)
+  await wrapper.setProps({ groups: GROUPS })
+  expect(wrapper.findAll('.fleet-map__group').map(node => node.text())).toEqual(['Team'])
+  expect(coordinates()).not.toEqual(before)
+  expect(wrapper.findAll('[role="button"]').map(node => node.element)).toEqual(buttons)
+  const grouped = coordinates()
+  await wrapper.setProps({ groups: JSON.parse(JSON.stringify(GROUPS)), runs: [...rows] })
+  expect(coordinates()).toEqual(grouped)
+  await wrapper.setProps({ groups: [{ ...GROUPS[0], name: 'Renamed' }] })
+  expect(wrapper.find('.fleet-map__group').text()).toBe('Renamed')
+  await wrapper.setProps({ groups: [] })
+  expect(wrapper.findAll('.fleet-map__group-ring')).toHaveLength(0)
+  expect(wrapper.findAll('.fleet-map__cluster')).toHaveLength(3)
+  wrapper.unmount()
 })

@@ -75,7 +75,7 @@ import secrets
 import stat
 import subprocess
 import threading
-from dataclasses import asdict, dataclass, fields, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlsplit
@@ -634,6 +634,8 @@ class PlatformConfig:
     #: conversation (issue #488). Off, the pane draws bus records only. A pane
     #: display setting like ``chat_keep_last``: no env var, read on config refresh.
     chat_show_transcript: bool = False
+    #: Visual graph groups; read fresh for UI requests, independent of run ownership.
+    fleet_groups: list[dict] = field(default_factory=list)
     #: Service slots this host declares (issue #245) — the raw ``config.json``
     #: entries, deliberately unparsed here. :mod:`lmer_platform.slots` turns
     #: them into definitions and skips a malformed one with a warning; parsing
@@ -814,7 +816,12 @@ def _validate(config: PlatformConfig) -> PlatformConfig:
         usable = _bool_setting_value(getattr(config, field_name), field=field_name)
         if usable is not getattr(config, field_name):
             config = replace(config, **{field_name: usable})
-    return config
+    try:
+        groups = validate_fleet_groups(config.fleet_groups)
+    except ConfigError as exc:
+        logger.warning("platform_config_unusable field=fleet_groups error=%s", exc)
+        groups = []
+    return replace(config, fleet_groups=groups)
 
 
 def _slots_value(value: object) -> tuple:
@@ -1530,6 +1537,49 @@ def assistant_settings() -> dict:
             continue
         resolved[key] = AssistantSetting(stored=stored_text)
     return resolved
+
+
+FLEET_GROUP_LIMITS = {"groups": 32, "name": 64, "patterns": 16, "pattern": 256}
+
+
+def validate_fleet_groups(value: Any) -> list[dict]:
+    """Validate and normalize an ordered list of literal repository-path matches."""
+    if not isinstance(value, list) or len(value) > FLEET_GROUP_LIMITS["groups"]:
+        raise ConfigError("fleet_groups must be a list of at most 32 groups.")
+
+    def text(raw: Any, limit: int, where: str) -> str:
+        if (not isinstance(raw, str) or len(raw) > limit or not raw.strip()
+                or any(ord(char) < 32 or ord(char) == 127 for char in raw)):
+            raise ConfigError(f"{where} must contain 1–{limit} characters without control characters.")
+        return raw.strip()
+
+    result, names = [], set()
+    for index, row in enumerate(value, 1):
+        where = f"Group {index}"
+        if not isinstance(row, dict) or set(row) != {"name", "patterns"}:
+            raise ConfigError(f"{where} must contain only name and patterns.")
+        name = text(row["name"], FLEET_GROUP_LIMITS["name"], f"{where} name")
+        if name.casefold() in names:
+            raise ConfigError(f"{where} name must be unique (case-insensitive).")
+        names.add(name.casefold())
+        patterns = row["patterns"]
+        if not isinstance(patterns, list) or not 1 <= len(patterns) <= FLEET_GROUP_LIMITS["patterns"]:
+            raise ConfigError(f"{where} must have 1–16 text entries.")
+        result.append({"name": name, "patterns": [
+            text(pattern, FLEET_GROUP_LIMITS["pattern"], f"{where}, entry {number}")
+            for number, pattern in enumerate(patterns, 1)
+        ]})
+    return result
+
+
+def fleet_group_settings() -> dict:
+    """Read current visual groups; report unusable stored input without blocking the UI."""
+    try:
+        stored = read_json(config_path()) or {}
+        groups = validate_fleet_groups(stored.get("fleet_groups", []))
+    except (ConfigError, StoreError) as exc:
+        return {"fleet_groups": [], "fleet_groups_problem": str(exc)}
+    return {"fleet_groups": groups, "fleet_groups_problem": None}
 
 
 def chat_settings() -> dict:

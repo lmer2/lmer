@@ -53,7 +53,7 @@
 - Added opt-in, task- and repository-scoped NVIDIA GPU passthrough for Docker and Podman session containers
 - Fleet view can be read as a constellation map: runs clustered by project, coloured by run state, with a line between runs you have related. Switch between the map and the list from the app bar; the choice is remembered, and the list stays the default.
 - The fleet payload now carries every relation in the fleet, so the map draws its edges without a request per run.
-- The map gathers related projects into one labelled group, by a list of regex rules rather than by a shared namespace prefix — so `fullctl/ixctl`, `fullctl/peerctl` and `syseng/fullctl-site` read as one `fullctl` region while staying three visible project clusters. A project no rule names is its own group and draws as it always did.
+- Configure visual graph groups in Platform settings using ordered, case-insensitive text matches; unconfigured repositories keep their own clusters.
 - Every cluster the map draws is named — a run with no project committed yet reads `unidentified` instead of a dash.
 - The map carries a legend for the tones it paints, the attention ring and the relation line, and a hovered star names the run, its state and its project.
 - uber lmer is not drawn on the map: it is the session supervising the runs rather than one of them. The app bar's robot control is painted from its state instead, and says on hover what it is doing or what it needs.

@@ -37,6 +37,7 @@ import {
 const props = defineProps({
   runs: { type: Array, default: () => [] },
   relations: { type: Array, default: () => [] },
+  groups: { type: Array, default: () => [] },
 })
 
 const emit = defineEmits(['open'])
@@ -203,7 +204,7 @@ const groupRings = computed(() => {
 })
 
 function build() {
-  clusters.value = seedPositions(groupRuns(props.runs), {
+  clusters.value = seedPositions(groupRuns(props.runs, props.groups), {
     width: VIEW_WIDTH, height: VIEW_HEIGHT,
   })
   const next = buildGraph(props.runs, props.relations)
@@ -281,11 +282,13 @@ function refresh() {
   }
   const next = reconcile(graph.value, props.runs, props.relations)
   graph.value = next
-  clusters.value = seedPositions(groupRuns(props.runs), {
+  const nextClusters = seedPositions(groupRuns(props.runs, props.groups), {
     width: VIEW_WIDTH, height: VIEW_HEIGHT,
   })
+  const regrouped = nextClusters.some((cluster, index) => cluster.group !== clusters.value[index]?.group)
+  clusters.value = nextClusters
   frame.value += 1
-  if (!next.changed) return
+  if (!next.changed && !regrouped) return
   // Only a change in the *shape* of the fleet is worth moving the map for. A
   // poll that changed nothing but a run's state must not re-heat: a node that
   // shifts under the cursor is a node the operator misses when they click.
@@ -311,7 +314,7 @@ function onVisibility() {
   }
 }
 
-watch(() => [props.runs, props.relations], refresh, { deep: false })
+watch(() => [props.runs, props.relations, props.groups], refresh, { deep: false })
 
 onMounted(() => {
   build()

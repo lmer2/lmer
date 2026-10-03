@@ -130,6 +130,7 @@ from .config import (
     checkin_settings,
     _slots_value,
     configured_repo_url,
+    fleet_group_settings,
     mutate_stored,
     nudge_settings,
     rotation_settings,
@@ -140,6 +141,7 @@ from .config import (
     validate_assistant_override,
     validate_bool_setting,
     validate_int_setting,
+    validate_fleet_groups,
     stored_slots_or_problem,
     with_stored_slots,
 )
@@ -351,6 +353,7 @@ def _config_summary(config: PlatformConfig, mirror: dict) -> dict:
         "max_followup_rounds": config.max_followup_rounds,
         "autonomous_default": config.autonomous_default,
         "park_idle_side": config.park_idle_side,
+        **fleet_group_settings(),
     }
 
 
@@ -2250,12 +2253,19 @@ def create_app(
     def platform_settings() -> dict:
         with project_scope.bound(None):
             return {**_assistant_config_reply(), "max_live_assistants": projects.limit(),
-                    "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions)}
+                    "max_concurrent_sessions": projects.worker_limit(config.max_concurrent_sessions),
+                    **fleet_group_settings()}
 
     @app.post("/api/settings", dependencies=guard)
     def set_platform_settings(body: dict) -> dict:
         with project_scope.bound(None):
-            set_assistant_config(body)
+            changes = {}
+            if "fleet_groups" in body:
+                try:
+                    changes["fleet_groups"] = validate_fleet_groups(body["fleet_groups"])
+                except ConfigError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+            _write_assistant_settings({key: value for key, value in body.items() if key != "fleet_groups"}, changes)
             return platform_settings()
 
     @app.get("/api/health", dependencies=guard)
@@ -4419,10 +4429,14 @@ def create_app(
                                                  if key != "workspace_id"}}
             projects.update(project["id"], {"settings": settings})
             return _assistant_config_reply({"changed": sorted(settings)})
+        return _write_assistant_settings(body)
+
+    def _write_assistant_settings(body: dict, changes: Optional[dict] = None) -> dict:
+        changes = dict(changes or {})
         accepted = (
             sorted(ASSISTANT_SETTING_KEYS) + list(_INT_SETTING_KEYS) + list(_BOOL_SETTING_KEYS)
         )
-        if not isinstance(body, dict) or not body:
+        if not isinstance(body, dict) or not (body or changes):
             raise HTTPException(
                 status_code=400,
                 detail=(
@@ -4430,7 +4444,6 @@ def create_app(
                     f"{', '.join(accepted)}"
                 ),
             )
-        changes: dict = {}
         for key, value in body.items():
             if key in _INT_SETTING_KEYS:
                 if value is None or (isinstance(value, str) and not value.strip()):

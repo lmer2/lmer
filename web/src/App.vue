@@ -1004,6 +1004,7 @@ onUnmounted(() => {
               v-if="fleetView === 'map'"
               :runs="mapRows"
               :relations="relations"
+              :groups="state?.config?.fleet_groups || []"
               @open="open"
             />
 
