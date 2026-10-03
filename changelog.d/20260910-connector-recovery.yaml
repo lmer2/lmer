@@ -1,5 +1,0 @@
-fixed:
-  - 'Keep Slack and Matrix connector delivery recoverable across worker exceptions, child replacement and module reloads, with exclusive ownership and explicit per-operation recovery (#449).'
-  - 'Preserve durable receipt ownership beyond echo-cache eviction and checkpoint failure, recover interrupted send-marker and retry transitions, and include finalization in the connector drain deadline (#449).'
-  - 'Avoid connector shutdown deadlocks when SIGTERM interrupts polling, and honor stop requests during reload finalization (#449).'
-  - 'Bind platform connector leases and orphan recovery to the supervisor session instead of the platform registry ID (#449).'

@@ -1,2 +1,0 @@
-fixed:
-- "Claude Code sessions no longer stop at the folder-trust or first-run onboarding dialog: lmer pre-trusts the container workspace at every session start"

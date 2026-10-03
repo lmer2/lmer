@@ -1,7 +1,0 @@
-added:
-- "Container memory and CPU limits can be set per taskdef and per repository, with LMER_DEVELOP_MEMORY and LMER_DEVELOP__AGENTS_GLOBAL__MEMORY style variables"
-- "--memory and --cpus set one launch's container limits, overriding the environment"
-- "LMER_PLATFORM_ASSISTANT_MEMORY and LMER_PLATFORM_ASSISTANT_CPUS give the platform's orchestrating assistant its own allocation"
-changed:
-- "A verbose launch now reports the container limits it resolved and which setting supplied each one"
-- "A containerized platform now forwards the container resource limits from the host, so they reach the sessions it spawns"

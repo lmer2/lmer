@@ -1,4 +1,0 @@
-added:
-- "`lmer-signal dm` sends one private message to a Slack or matrix user, gated by that transport's host-side allow list: `LMER_SLACK_DM_ALLOWED_USERS` or `LMER_MATRIX_ALLOWED_USERS`"
-changed:
-- "Breaking: inbound Slack DMs now require `LMER_SLACK_DM_ALLOWED_USERS`; unset or empty refuses everyone, as it does for outbound Slack DMs and both directions on matrix"

@@ -1,5 +1,0 @@
-changed:
-- "The uber lmer pane draws the conversation only by default; tool calls, watch events, hook re-prompts and unposted prose sit muted behind a settings switch."
-- "The reply-routing Stop hook checks the ending turn only: a posted turn passes whatever follows, and a turn that wrote nothing may end empty."
-added:
-- "`chat_show_transcript` on `GET`/`POST /api/assistant/config`: the platform-side switch for the uber lmer pane's working transcript, stored in config.json."
