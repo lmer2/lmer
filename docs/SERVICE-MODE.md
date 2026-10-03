@@ -233,16 +233,16 @@ lmer chat --service web --checkout ~/project/dev-env --match-uid ...
 
 ## Service groups: one session, a whole stack
 
-`--service` binds a session to one container. A stack that runs as a unit — the
-fullctl suite is 12+ containers, all up together — would need twelve sessions
-that way, one per service. `--service-group <compose-project>` attaches **one**
+`--service` binds a session to one container. A stack of twelve containers running
+as a unit would need twelve sessions that way, one per service.
+`--service-group <compose-project>` attaches **one**
 session to the whole project instead, and the agent moves its target around
 inside it:
 
 ```bash
 lmer chat \
-  --service-group fullctl \
-  --checkout ~/fullctl/dev-env
+  --service-group example-stack \
+  --checkout ~/example-stack/dev-env
 ```
 
 ### The group is discovered, not declared

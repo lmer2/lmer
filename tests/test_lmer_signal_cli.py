@@ -58,7 +58,7 @@ class Rig:
         self.client = bus.BusClient(endpoint, session=_Session(self.http))
         monkeypatch.setattr(signal_cli, "_client", lambda: self.client)
 
-    def answer(self, question_seq: int, text: str, *, channel="slack", author="vegu", ref="t1",
+    def answer(self, question_seq: int, text: str, *, channel="slack", author="tester", ref="t1",
                delay=0.0, when_waiting=False):
         """Post an answer from another thread.
 
@@ -212,7 +212,7 @@ class TestAsk:
         assert rc == 0
         captured = capsys.readouterr()
         assert captured.out == "prep-release\n"
-        assert "answered from slack · vegu" in captured.err
+        assert "answered from slack · tester" in captured.err
         question, answer = rig.records()
         # The CLI was waiting, so the supervisor handed it over instead of
         # typing it into the harness.
@@ -291,15 +291,15 @@ class TestList:
     def test_list_shows_every_record_with_its_source_and_state(self, rig, capsys):
         run(["note", "working"])
         run(["ask", "branch?", "--option", "main", "--no-wait"])
-        rig.log.append(kind="message", text="hi there", source=comms.Source("slack", author="vegu", ref="t9"))
+        rig.log.append(kind="message", text="hi there", source=comms.Source("slack", author="tester", ref="t9"))
         rig.answer(2, "main").join()
         assert run(["list"]) == 0
         out = capsys.readouterr().out
         assert "[000001] note from agent: working" in out
         assert "[000002] question from agent (answered): branch?" in out
         assert "    options: main" in out
-        assert "[000003] message from slack · vegu: hi there" in out
-        assert "[000004] answer from slack · vegu → #2: main" in out
+        assert "[000003] message from slack · tester: hi there" in out
+        assert "[000004] answer from slack · tester → #2: main" in out
 
     def test_list_open_only_and_since(self, rig, capsys):
         run(["ask", "a?", "--no-wait"])

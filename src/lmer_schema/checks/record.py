@@ -323,10 +323,9 @@ LEGACY_PROJECT_AREAS = frozenset({"info", "taskdef"})
 #: marker, so "holds a run area" is exactly what makes a directory a target
 #: AND exactly what makes it a project — and a project's name is a repo name,
 #: the same open set this module already refuses to prune ``{task_type}`` by.
-#: Including it pruned real, nested projects: on the live work repo
-#: ``syseng/infra/ansible-roles/{caddy,common,…}/runs/`` are six real run
-#: areas, and the moment ``syseng/infra`` gained one marker they silently left
-#: validation altogether (!271 review). Positive writer evidence cannot
+#: Including it pruned nested projects: for example,
+#: ``example/infra/roles/{web,common}/runs/`` would leave validation when
+#: ``example/infra`` gained one marker (!271 review). Positive writer evidence cannot
 #: collide that way: nothing but ``work log`` and ``work report`` puts these
 #: here.
 #:

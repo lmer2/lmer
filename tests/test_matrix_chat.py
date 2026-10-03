@@ -143,7 +143,7 @@ class FakeMatrix:
         self.media = {}
         self.counter = 0
         self.reactions = []
-        self.root = {"event_id": ROOT, "sender": "@vegu:example.org", "type": "m.room.message",
+        self.root = {"event_id": ROOT, "sender": "@tester:example.org", "type": "m.room.message",
                      "content": {"msgtype": "m.text", "body": "@lmer help me"}, "origin_server_ts": 1}
 
     def resolve_room(self, room):
@@ -205,7 +205,7 @@ class FakeMatrix:
             text, sender=BOT, live=live, **thread_posts.matrix_content(poster),
         )
 
-    def human_says(self, text, *, sender="@vegu:example.org", live=True, **content):
+    def human_says(self, text, *, sender="@tester:example.org", live=True, **content):
         self.counter += 1
         event = {
             "event_id": f"$h{self.counter}", "sender": sender, "type": "m.room.message",
@@ -375,11 +375,11 @@ class TestConnector:
 
     def test_events_outside_the_thread_and_the_bots_own_are_ignored(self, rig):
         rig.connector.replay()
-        rig.matrix.pending.append({"event_id": "$other", "sender": "@vegu:example.org", "type": "m.room.message",
+        rig.matrix.pending.append({"event_id": "$other", "sender": "@tester:example.org", "type": "m.room.message",
                                    "content": {"msgtype": "m.text", "body": "in another thread",
                                                "m.relates_to": {"rel_type": "m.thread", "event_id": "$elsewhere"}}})
         rig.matrix.human_says("from the bot", sender=BOT)
-        rig.matrix.pending.append({"event_id": "$enc", "sender": "@vegu:example.org", "type": "m.room.encrypted", "content": {}})
+        rig.matrix.pending.append({"event_id": "$enc", "sender": "@tester:example.org", "type": "m.room.encrypted", "content": {}})
         assert rig.connector.sync_once() == 0
 
     def test_agent_records_reach_the_thread_and_are_acked(self, rig):
@@ -577,7 +577,7 @@ class TestConfigAndTargets:
     def test_listener_denies_unlisted_senders_and_finds_mentions(self, monkeypatch):
         config = listener.ListenerConfig({
             "LMER_MATRIX_HOMESERVER": "https://hs", "LMER_MATRIX_USER_ID": BOT,
-            "LMER_MATRIX_ACCESS_TOKEN": "syt", "LMER_MATRIX_ALLOWED_USERS": "@vegu:example.org",
+            "LMER_MATRIX_ACCESS_TOKEN": "syt", "LMER_MATRIX_ALLOWED_USERS": "@tester:example.org",
         })
         fake = FakeMatrix()
 
@@ -586,11 +586,11 @@ class TestConfigAndTargets:
 
         watcher = listener.Listener(config, Sessions(), matrix=fake)
         assert watcher.sync_once() == []  # the initial sync is history
-        fake.pending.append({"event_id": "$m1", "sender": "@vegu:example.org", "type": "m.room.message",
+        fake.pending.append({"event_id": "$m1", "sender": "@tester:example.org", "type": "m.room.message",
                              "content": {"body": "@lmer start", "msgtype": "m.text"}})
         fake.pending.append({"event_id": "$m2", "sender": "@stranger:evil.org", "type": "m.room.message",
                              "content": {"body": "@lmer start", "msgtype": "m.text"}})
-        fake.pending.append({"event_id": "$m3", "sender": "@vegu:example.org", "type": "m.room.message",
+        fake.pending.append({"event_id": "$m3", "sender": "@tester:example.org", "type": "m.room.message",
                              "content": {"body": "no mention here", "msgtype": "m.text"}})
         found = watcher.sync_once()
         assert [(room, event["event_id"]) for room, event in found] == [(ROOM, "$m1")]
@@ -604,7 +604,7 @@ class TestConfigAndTargets:
         class Sessions:
             max_sessions = 5
 
-        for allowed in (None, "@vegu:example.org"):
+        for allowed in (None, "@tester:example.org"):
             config = listener.ListenerConfig({
                 **account, **({} if allowed is None else {"LMER_MATRIX_ALLOWED_USERS": allowed}),
             })
@@ -612,7 +612,7 @@ class TestConfigAndTargets:
             watcher = listener.Listener(config, Sessions(), matrix=fake)
             assert watcher.sync_once() == []
             fake.pending.append({
-                "event_id": "$m1", "sender": "@Vegu:example.org",
+                "event_id": "$m1", "sender": "@Tester:example.org",
                 "type": "m.room.message",
                 "content": {"body": "@lmer start", "msgtype": "m.text"},
             })
@@ -852,7 +852,7 @@ class TestPostsFromOtherRuns:
         rig.matrix.human_says("and one from me")
         assert rig.connector.sync_once() == 2
         authors = [record.source.author for record in rig.log.read_since(1)[0]]
-        assert authors == ["lmer chat-mr-288", "@vegu:example.org"]
+        assert authors == ["lmer chat-mr-288", "@tester:example.org"]
 
     def test_it_is_not_mirrored_straight_back_into_the_thread(self, rig):
         """A live inbound record is never mirrored back to its own channel."""

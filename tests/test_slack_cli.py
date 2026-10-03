@@ -1493,10 +1493,10 @@ class TestBusShims:
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
         monkeypatch.setenv("LMER_SLACK_CHANNEL", "C1")
         monkeypatch.setenv("LMER_SLACK_THREAD_TS", "1.2")
-        bus_rig.log.append(kind="message", text="hi", source=__import__("lmer_cli.comms", fromlist=["Source"]).Source("slack", author="vegu", ref="t1"))
+        bus_rig.log.append(kind="message", text="hi", source=__import__("lmer_cli.comms", fromlist=["Source"]).Source("slack", author="tester", ref="t1"))
         assert cli.main(["history"]) == 0
         captured = capsys.readouterr()
-        assert "message from slack · vegu: hi" in captured.out
+        assert "message from slack · tester: hi" in captured.out
         assert "deprecated" in captured.err
 
     @pytest.mark.parametrize("verb", ["watch", "poll"])

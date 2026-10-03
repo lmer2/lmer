@@ -137,7 +137,7 @@ class TestTheVerbs:
         assert code == 0, out.err
         thread = json.loads(out.out)["thread"]
         assert thread["permalink"] == (
-            "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900"
+            "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
         )
         assert slack.opened[0][0] == "#a-channel"
 
