@@ -1,4 +1,0 @@
-added:
-- "A run can be given a brand-new Slack or matrix thread: name a channel in its thread menu, with `lmer-ctl threads open`, or from inside the session with `lmer-signal thread open`, and the root message is posted and the run connected in one step"
-- "A session can connect and disconnect its own chat threads with `lmer-signal thread connect` / `disconnect`, without an operator at the control UI"
-- "Audit your Slack app before opening a thread: `lmer-signal thread open` (and the `open` route behind the UI prompt) refuses a bot token carrying `chat:write.public` by name, because that scope lets it post into channels nobody invited it to and suppresses the `not_in_channel` lmer relies on there. Remove the scope from the app's bot token scopes; the documented scope set needs no change. Connecting an existing thread is unaffected — it is guarded by Slack's own answer when the thread is read"

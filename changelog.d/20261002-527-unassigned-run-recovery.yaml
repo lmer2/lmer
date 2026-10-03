@@ -1,4 +1,0 @@
-added:
-- "Operators can assign a genuinely unowned inactive run to an active project, and can forget a completed unassigned run without inventing a project for it"
-fixed:
-- "An unassigned run is labelled **Unassigned** instead of **Unavailable project**, and its Move to project action now recovers it; move and forget errors appear beside the control that was used"

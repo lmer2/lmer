@@ -1,2 +1,0 @@
-fixed:
-  - Preset environment overrides host file defaults across session launches while preserving explicit exports and invocation controls, and resolved reasoning effort appears beside the model in platform run views.

@@ -1,2 +1,0 @@
-fixed:
-  - "Terminal dialog input stays out of connected chat threads; prompt mirroring waits for transcript confirmation within a configurable window."

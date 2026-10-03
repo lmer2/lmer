@@ -1,2 +1,0 @@
-fixed:
-- "Fixed uber lmer startup and rotation at full worker capacity while preserving the worker limit and existing assistant continuity."

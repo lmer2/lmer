@@ -1,2 +1,0 @@
-fixed:
-  - 'Thread connectors recover safe pending sends automatically and expose host recovery commands and actionable attention for parked sends (#482).'

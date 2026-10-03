@@ -1,2 +1,0 @@
-changed:
-- "A connector attaching to a thread with history replays the whole backlog as one message instead of one per message"

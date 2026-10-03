@@ -1,2 +1,0 @@
-fixed:
-  - Service review followups receive checkout inspection and authorized commit guidance without repeating branch setup (#531).

@@ -1,2 +1,0 @@
-added:
-  - "Projects can configure parallel test-runner overrides in the work repository, selected by resource requirements with an explicit normal-runner override."

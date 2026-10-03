@@ -1,2 +1,0 @@
-fixed:
-  - "Made memory and work publication reject unsafe Git state and unapplied autostashes, preserve unrelated edits and staging on refusal, and verify remote reachability."

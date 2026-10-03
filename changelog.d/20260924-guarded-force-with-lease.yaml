@@ -1,5 +1,0 @@
-added:
-- "Agents can publish authorized rebased branches through gate-push using explicit force-with-lease protection."
-- "Leased pushes require explicit human permission and a command-scoped approval value of exactly 1 before any gates, source pinning or transport."
-- "Lease inspection displays transport/host/port and a branch commit, omitting URL userinfo/path/query/fragment and captured Git failure output while disabling Git diagnostic trace sinks."
-- "Leased pushes refuse custom remote service selectors and unsupported URL helpers while retaining credential, proxy and SSH routing."
