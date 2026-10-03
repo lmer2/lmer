@@ -305,6 +305,30 @@ def _run_block(home: Path, sock=None, pubring=None, path=None):
     return proc
 
 
+def _fake_gpgconf(bin_dir: Path, socketdir: Path) -> str:
+    """A gpgconf on PATH reporting *socketdir*, as one under /run/user would."""
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "gpgconf"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "--list-dirs" ] && [ "$2" = "socketdir" ]; then\n'
+        f'    echo "{socketdir}"\n'
+        "    exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    fake.chmod(0o755)
+    return f"{bin_dir}:/usr/bin:/bin"
+
+
+@pytest.fixture(params=["home", "runtime"])
+def entrypoint_socketdir(request, tmp_path):
+    socketdir = tmp_path / ".lmer-gnupg"
+    if request.param == "runtime":
+        socketdir = tmp_path / "run" / "gnupg" / "d.hashed"
+    return socketdir, _fake_gpgconf(tmp_path / "bin", socketdir)
+
+
 class TestEntrypointBlock:
     """Inert unless the socket mount is present; never fatal."""
 
@@ -329,13 +353,15 @@ class TestEntrypointBlock:
         assert proc.returncode == 0, proc.stderr
         assert not (tmp_path / ".lmer-gnupg").exists()
 
-    def test_socket_present_provisions_the_redirect(self, tmp_path, agent_socket):
-        proc = _run_block(tmp_path, sock=agent_socket)
+    def test_socket_present_provisions_the_redirect(self, tmp_path, agent_socket, entrypoint_socketdir):
+        socketdir, path = entrypoint_socketdir
+        proc = _run_block(tmp_path, sock=agent_socket, path=path)
         assert proc.returncode == 0, proc.stderr
         gnupg = tmp_path / ".lmer-gnupg"
         assert gnupg.is_dir()
         assert stat.S_IMODE(gnupg.stat().st_mode) == 0o700
-        assert (gnupg / "S.gpg-agent").read_text() == f"%Assuan%\nsocket={agent_socket}\n"
+        assert stat.S_IMODE(socketdir.stat().st_mode) == 0o700
+        assert (socketdir / "S.gpg-agent").read_text() == f"%Assuan%\nsocket={agent_socket}\n"
         assert f"GNUPGHOME={gnupg}" in proc.stdout
 
     def test_the_home_is_deliberately_not_the_default_gnupg_dir(self, tmp_path, agent_socket):
@@ -366,13 +392,15 @@ class TestEntrypointBlock:
         assert (tmp_path / ".lmer-gnupg" / "pubring.gpg").exists()
         assert not (tmp_path / ".lmer-gnupg" / "pubring.kbx").exists()
 
-    def test_missing_keyring_warns_without_failing(self, tmp_path, agent_socket):
-        proc = _run_block(tmp_path, sock=agent_socket, pubring=tmp_path / "absent.kbx")
+    def test_missing_keyring_warns_without_failing(self, tmp_path, agent_socket, entrypoint_socketdir):
+        socketdir, path = entrypoint_socketdir
+        proc = _run_block(tmp_path, sock=agent_socket, pubring=tmp_path / "absent.kbx", path=path)
         assert proc.returncode == 0, proc.stderr
         assert "keyring" in proc.stdout
-        assert (tmp_path / ".lmer-gnupg" / "S.gpg-agent").exists(), (
+        assert (socketdir / "S.gpg-agent").exists(), (
             "A missing keyring must not cost the session the agent redirect"
         )
+        assert (socketdir / "S.gpg-agent").read_text() == f"%Assuan%\nsocket={agent_socket}\n"
 
     def test_unprovisionable_home_warns_without_failing(self, tmp_path, agent_socket):
         """The never-fatal promise, at the one step that can realistically fail.
@@ -407,25 +435,9 @@ class TestRedirectFollowsGpgconfSocketdir:
     says gpg will look.
     """
 
-    @staticmethod
-    def _fake_gpgconf(bin_dir: Path, socketdir: Path) -> str:
-        """A gpgconf on PATH reporting *socketdir*, as one under /run/user would."""
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        fake = bin_dir / "gpgconf"
-        fake.write_text(
-            "#!/bin/sh\n"
-            'if [ "$1" = "--list-dirs" ] && [ "$2" = "socketdir" ]; then\n'
-            f'    echo "{socketdir}"\n'
-            "    exit 0\n"
-            "fi\n"
-            "exit 1\n"
-        )
-        fake.chmod(0o755)
-        return f"{bin_dir}:/usr/bin:/bin"
-
     def test_redirect_is_written_into_the_reported_socketdir(self, tmp_path, agent_socket):
         socketdir = tmp_path / "run" / "gnupg" / "d.hashed"
-        path = self._fake_gpgconf(tmp_path / "bin", socketdir)
+        path = _fake_gpgconf(tmp_path / "bin", socketdir)
         home = tmp_path / "home"
         home.mkdir()
         proc = _run_block(home, sock=agent_socket, path=path)
@@ -441,7 +453,7 @@ class TestRedirectFollowsGpgconfSocketdir:
     def test_gnupghome_still_points_at_the_provisioned_home(self, tmp_path, agent_socket):
         """The socket dir moves; the home — which holds the keyring — does not."""
         socketdir = tmp_path / "run" / "gnupg" / "d.hashed"
-        path = self._fake_gpgconf(tmp_path / "bin", socketdir)
+        path = _fake_gpgconf(tmp_path / "bin", socketdir)
         home = tmp_path / "home"
         home.mkdir()
         pubring = tmp_path / "gpg-pubring.kbx"
@@ -452,7 +464,7 @@ class TestRedirectFollowsGpgconfSocketdir:
 
     def test_reported_socketdir_is_created_when_absent(self, tmp_path, agent_socket):
         socketdir = tmp_path / "run" / "gnupg" / "d.hashed"
-        path = self._fake_gpgconf(tmp_path / "bin", socketdir)
+        path = _fake_gpgconf(tmp_path / "bin", socketdir)
         home = tmp_path / "home"
         home.mkdir()
         assert not socketdir.exists()
