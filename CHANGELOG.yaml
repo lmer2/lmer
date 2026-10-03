@@ -124,11 +124,7 @@ unreleased:
     default.'
   - The fleet payload now carries every relation in the fleet, so the map draws its
     edges without a request per run.
-  - "The map gathers related projects into one labelled group, by a list of regex\
-    \ rules rather than by a shared namespace prefix \u2014 so `fullctl/ixctl`, `fullctl/peerctl`\
-    \ and `syseng/fullctl-site` read as one `fullctl` region while staying three visible\
-    \ project clusters. A project no rule names is its own group and draws as it always\
-    \ did."
+  - Configure visual graph groups in Platform settings using ordered, case-insensitive text matches; unconfigured repositories keep their own clusters.
   - "Every cluster the map draws is named \u2014 a run with no project committed yet\
     \ reads `unidentified` instead of a dash."
   - The map carries a legend for the tones it paints, the attention ring and the relation

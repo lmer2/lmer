@@ -12,6 +12,12 @@ const props = defineProps({ state: { type: Object, default: null }, loading: Boo
 const emit = defineEmits(['changed', 'open'])
 const cap = ref(4)
 const workerCap = ref(8)
+const fleetGroups = ref([])
+const groupsReady = ref(false)
+const groupsBusy = ref(false)
+const groupsError = ref(null)
+const groupsSaved = ref(false)
+let groupId = 0
 const defaultsOpen = ref(false)
 const slotOpen = ref(false)
 const slotName = ref(null)
@@ -46,6 +52,8 @@ onMounted(async () => {
     const [settings] = await Promise.all([fetchPlatformSettings(), refreshRequests()])
     cap.value = settings.max_live_assistants
     workerCap.value = settings.max_concurrent_sessions
+    readGroups(settings)
+    groupsReady.value = true
   } catch (exc) { error.value = exc.message }
   if (props.focusSection === 'slots') {
     await nextTick()
@@ -57,6 +65,35 @@ async function save() {
   busy.value = true
   try { await setPlatformSettings({ max_live_assistants: Number(cap.value), max_concurrent_sessions: Number(workerCap.value) }); emit('changed'); error.value = null }
   catch (exc) { error.value = exc.message } finally { busy.value = false }
+}
+function readGroups(settings) {
+  fleetGroups.value = (settings.fleet_groups || []).map(group => ({
+    id: ++groupId, name: group.name, text: group.patterns.join('\n'),
+  }))
+  groupsError.value = settings.fleet_groups_problem || null
+}
+function editGroups() { groupsError.value = null; groupsSaved.value = false }
+function addGroup() {
+  fleetGroups.value.push({ id: ++groupId, name: '', text: '' })
+  editGroups()
+}
+function removeGroup(index) { fleetGroups.value.splice(index, 1); editGroups() }
+function moveGroup(index, direction) {
+  const [group] = fleetGroups.value.splice(index, 1)
+  fleetGroups.value.splice(index + direction, 0, group)
+  editGroups()
+}
+async function saveGroups() {
+  groupsBusy.value = true
+  groupsSaved.value = false
+  try {
+    const settings = await setPlatformSettings({ fleet_groups: fleetGroups.value.map(group => ({
+      name: group.name, patterns: group.text.split('\n').map(text => text.trim()).filter(Boolean),
+    })) })
+    readGroups(settings)
+    groupsSaved.value = true
+    emit('changed')
+  } catch (exc) { groupsError.value = exc.message } finally { groupsBusy.value = false }
 }
 async function restore(project) {
   try { await archiveProject(project.id, true); emit('changed') } catch (exc) { error.value = exc.message }
@@ -111,6 +148,32 @@ async function release() {
     <v-card-actions class="flex-wrap"><v-btn :loading="busy" @click="save">Save limit</v-btn><v-btn @click="defaultsOpen = true">Execution and chat defaults</v-btn></v-card-actions>
   </v-card>
   <AssistantSettings v-model="defaultsOpen" :allow-restart="false" />
+  <v-card class="fleet-groups mb-4" title="Graph groups">
+    <v-card-text>
+      <p id="fleet-group-help" class="mb-3">Match case-insensitive text contained in the repository path, one entry per line.
+        Any entry matches; the first matching group wins. For example, <code>team/</code> or <code>tools/team-</code>.
+        All characters are literal. These groups only change the graph.</p>
+      <v-alert v-if="groupsError" type="error" class="mb-3" role="alert">{{ groupsError }}</v-alert>
+      <p v-if="groupsReady && !fleetGroups.length" class="mb-3">No graph groups. Repositories keep their own clusters.</p>
+      <div v-for="(group, index) in fleetGroups" :key="group.id" class="fleet-group-row">
+        <v-text-field v-model="group.name" :label="`Group ${index + 1} name`" maxlength="64"
+          :disabled="groupsBusy" @update:model-value="editGroups" />
+        <v-textarea v-model="group.text" :label="`Group ${index + 1} matching text`" rows="2" auto-grow
+          aria-describedby="fleet-group-help" :disabled="groupsBusy" @update:model-value="editGroups" />
+        <div class="fleet-group-actions">
+          <v-btn size="small" :aria-label="`Move group ${index + 1} up`" :disabled="groupsBusy || index === 0" @click="moveGroup(index, -1)">Up</v-btn>
+          <v-btn size="small" :aria-label="`Move group ${index + 1} down`" :disabled="groupsBusy || index === fleetGroups.length - 1" @click="moveGroup(index, 1)">Down</v-btn>
+          <v-btn size="small" :aria-label="`Remove group ${index + 1}`" :disabled="groupsBusy" @click="removeGroup(index)">Remove</v-btn>
+        </div>
+      </div>
+      <p class="text-medium-emphasis">Up to 32 groups, with 1–16 entries of up to 256 characters each. Remove all groups and save to clear.</p>
+      <p v-if="groupsSaved" role="status" class="mt-2">Graph groups saved.</p>
+    </v-card-text>
+    <v-card-actions class="flex-wrap">
+      <v-btn :disabled="!groupsReady || groupsBusy || fleetGroups.length >= 32" @click="addGroup">Add group</v-btn>
+      <v-btn :disabled="!groupsReady" :loading="groupsBusy" @click="saveGroups">Save groups</v-btn>
+    </v-card-actions>
+  </v-card>
   <IngressStatus :now="now" />
   <div class="d-flex align-center mt-4 mb-2"><h2 id="platform-service-slots" ref="slotSection" tabindex="-1" class="text-title-medium">Service slots</h2><v-spacer /><v-btn @click="edit(null)">Add slot</v-btn></div>
   <template v-if="!loading">
@@ -172,6 +235,9 @@ async function release() {
 </template>
 
 <style scoped>
+.fleet-group-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(160px, 2fr); gap: 0 16px; margin-bottom: 16px; }
+.fleet-group-actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+@media (max-width: 600px) { .fleet-group-row { grid-template-columns: minmax(0, 1fr); } }
 #platform-service-slots { scroll-margin-top: 80px; }
 .capacity-limits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .capacity-limits > div { display: flex; flex-direction: column; }
