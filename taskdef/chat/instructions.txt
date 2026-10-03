@@ -106,7 +106,7 @@ directions: the session's bus.
 
 - **Inbound arrives as ordinary turns.** Whatever a human writes in the thread
   is delivered into this session as a message tagged with where it came from —
-  `[slack · vegu] can you rebuild the indices?`, `[matrix · @alice:example.org]
+  `[slack · tester] can you rebuild the indices?`, `[matrix · @alice:example.org]
   …`. You do not watch, poll or read the thread yourself; there is nothing to
   monitor. A message that arrives while you are working is a redirect — fold it
   in.

@@ -867,7 +867,7 @@ LMER_MATRIX_ACCESS_TOKEN=syt_...
 LMER_MATRIX_AUTHENTICATED_MEDIA=1   # only once the homeserver requires auth for media; gates the agent's attachments
 ```
 
-The container gets `LMER_MATRIX_ROOM_ID` / `LMER_MATRIX_THREAD_EVENT` / `LMER_MATRIX_PERMALINK` and `LMER_CHAT_CHANNEL=matrix` as context; the connector child supervised by the host `lmer` process mirrors the thread onto the session bus in both directions, so a reply in the thread reaches the agent tagged `[matrix · @vegu:example.org]` and `lmer-signal post`/`ask` land in the thread. The connector speaks the client-server API and handles **plaintext rooms only**: an end-to-end encrypted room is refused at connect time by name. Files posted in the thread are downloaded into the session's upload store; the agent's `--attach` uploads only under `LMER_MATRIX_AUTHENTICATED_MEDIA=1`. Standalone: `lmer-matrix-connector --permalink <url>`.
+The container gets `LMER_MATRIX_ROOM_ID` / `LMER_MATRIX_THREAD_EVENT` / `LMER_MATRIX_PERMALINK` and `LMER_CHAT_CHANNEL=matrix` as context; the connector child supervised by the host `lmer` process mirrors the thread onto the session bus in both directions, so a reply in the thread reaches the agent tagged `[matrix · @tester:example.org]` and `lmer-signal post`/`ask` land in the thread. The connector speaks the client-server API and handles **plaintext rooms only**: an end-to-end encrypted room is refused at connect time by name. Files posted in the thread are downloaded into the session's upload store; the agent's `--attach` uploads only under `LMER_MATRIX_AUTHENTICATED_MEDIA=1`. Standalone: `lmer-matrix-connector --permalink <url>`.
 
 #### Spawning sessions automatically (`lmer-matrix-listener`)
 
@@ -879,7 +879,7 @@ The mirror of the Slack listener: a long-lived **host** process logged in as the
 
 ```bash
 # ~/.lmer/.env — beside the three account variables above
-LMER_MATRIX_ALLOWED_USERS=@vegu:example.org,@alice:example.org   # explicit MXIDs; empty means nobody
+LMER_MATRIX_ALLOWED_USERS=@tester:example.org,@alice:example.org   # explicit MXIDs; empty means nobody
 LMER_MATRIX_ROOMS=!roomid:example.org                            # optional; default: every joined room
 lmer-matrix-listener --log-level DEBUG
 ```

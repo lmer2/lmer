@@ -361,7 +361,7 @@ class TestRoutes:
         session = live_session(plane)
         resp = client.post(
             f"/api/sessions/{session}/comms",
-            json={"kind": "message", "text": "did this land?", "author": "vegu"}, headers=auth(),
+            json={"kind": "message", "text": "did this land?", "author": "tester"}, headers=auth(),
         )
         assert resp.status_code == 200
         events = [e for e in platform_store.read_events() if e.get("type") == "comms_post"]
@@ -409,13 +409,13 @@ class TestRoutes:
 
     def test_the_operator_posts_as_platform_and_the_agent_is_tagged(self, platform_root, client, plane):
         session = live_session(plane)
-        resp = client.post(f"/api/sessions/{session}/comms", json={"kind": "message", "text": "!206 was merged", "author": "vegu"}, headers=auth())
+        resp = client.post(f"/api/sessions/{session}/comms", json={"kind": "message", "text": "!206 was merged", "author": "tester"}, headers=auth())
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["accepted_as"] == "new"
-        assert body["message"]["source"] == {"channel": "platform", "author": "vegu"}
+        assert body["message"]["source"] == {"channel": "platform", "author": "tester"}
         assert body["relay"]["tagged"] is True
-        assert b"[platform \xc2\xb7 vegu] !206 was merged" in b"".join(plane.sink)
+        assert b"[platform \xc2\xb7 tester] !206 was merged" in b"".join(plane.sink)
         # Journaled at once, visible on the per-session read and the fleet feed.
         page = client.get(f"/api/sessions/{session}/comms", headers=auth()).json()
         assert [m["text"] for m in page["messages"]] == ["!206 was merged"] and page["cursor"] == 1
@@ -435,13 +435,13 @@ class TestRoutes:
         session = live_session(plane)
         credential = cfg.mint_connector_credential("slack-bridge", "slack")
         resp = client.post(f"/api/sessions/{session}/comms", json={
-            "kind": "message", "text": "hi", "author": "vegu", "ref": "1725.1",
+            "kind": "message", "text": "hi", "author": "tester", "ref": "1725.1",
             "source": {"channel": "matrix"},
         }, headers=bearer(credential))
         assert resp.status_code == 200, resp.text
-        assert resp.json()["message"]["source"] == {"channel": "slack", "author": "vegu", "ref": "1725.1"}
+        assert resp.json()["message"]["source"] == {"channel": "slack", "author": "tester", "ref": "1725.1"}
         # A retry with the same ref is the same record.
-        again = client.post(f"/api/sessions/{session}/comms", json={"kind": "message", "text": "hi", "author": "vegu", "ref": "1725.1"}, headers=bearer(credential))
+        again = client.post(f"/api/sessions/{session}/comms", json={"kind": "message", "text": "hi", "author": "tester", "ref": "1725.1"}, headers=bearer(credential))
         assert again.json()["accepted_as"] == "duplicate"
 
     def test_commands_come_from_the_operator_and_the_assistant_only(self, platform_root, client, plane):
@@ -627,7 +627,7 @@ class TestHub:
         hub.add_consumer(daemon._assistant_consumer(hub))
         hub.subscribe(session)
         agent_posts(plane, "milestone", "pushed MR !300")
-        plane.log.append(kind="message", text="hi there", source=bus.Source("slack", author="vegu", ref="t1"))
+        plane.log.append(kind="message", text="hi there", source=bus.Source("slack", author="tester", ref="t1"))
         agent_posts(plane, "note", "working on it")
         deadline = time.monotonic() + 5
         while hub.journal.cursor < 3 and time.monotonic() < deadline:
@@ -638,7 +638,7 @@ class TestHub:
         assert hub.flush_digests() == 1
         kind, note, data = spooled[1]
         assert kind == "session_comms" and data["count"] == 2
-        assert "[slack · vegu] message: hi there" in note and "[agent] note: working on it" in note
+        assert "[slack · tester] message: hi there" in note and "[agent] note: working on it" in note
         assert "gitlab.example.com/agents/global/develop-407" in note
 
     def test_a_milestone_the_hub_delivered_is_not_spooled_again_by_the_detector(

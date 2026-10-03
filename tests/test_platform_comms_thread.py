@@ -126,7 +126,7 @@ class TestPosting:
     def test_the_body_cannot_choose_who_the_thread_thinks_wrote_it(self, client, slack):
         client.post(
             "/api/comms/thread",
-            json={"permalink": SLACK_LINK, "text": "ship it", "author": "vegu", "label": "vegu"},
+            json={"permalink": SLACK_LINK, "text": "ship it", "author": "tester", "label": "tester"},
             headers=auth(),
         )
         assert slack.posted[0][2] == "[operator] ship it"

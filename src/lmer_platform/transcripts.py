@@ -2704,7 +2704,7 @@ def _comms_messages(session_id: str) -> tuple:
     harness turn that is the same communication as a record already in *turns*,
     which the harness wrote down for its own two reasons:
 
-    - inbound, the exact line the supervisor typed in (``[slack · vegu] …``),
+    - inbound, the exact line the supervisor typed in (``[slack · tester] …``),
       recorded as a ``user`` turn;
     - outbound, the reply the agent wrote as prose before posting it, recorded
       as an ``assistant`` turn.

@@ -233,7 +233,7 @@ class TestPostIntoAThread:
         assert record.kind == "message" and record.text == "the review is posted"
         # Where it went, on the record: the pane and the run's connected threads
         # read it from here.
-        assert record.meta["thread"].startswith("https://20c.slack.com/archives/C0123ABCDEF/")
+        assert record.meta["thread"].startswith("https://example.slack.com/archives/C0123ABCDEF/")
         assert "posted into" in out.err
         from lmer_cli.routing_receipts import delivered
         assert delivered('call', 'claude-test')
@@ -326,7 +326,7 @@ class _Connections:
         self.calls.append(("open", channel, text, poster))
         return {"thread": {
             "id": "slack:9f2c1d", "channel": "slack", "label": "20c · #a-channel",
-            "permalink": "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900",
+            "permalink": "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900",
         }}
 
     def connect(self, permalink):
@@ -348,7 +348,7 @@ class TestTheRunsOwnThreads:
         assert run(["thread", "open", "#a-channel", "watching the release"]) == 0
 
         out = capsys.readouterr()
-        assert out.out.strip() == "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900"
+        assert out.out.strip() == "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
         assert "opened a thread in 20c · #a-channel" in out.err
         # And the poster is the real one: this rig has a live supervisor, so the
         # servicer answers "which session am I serving" from its `/healthz` — the

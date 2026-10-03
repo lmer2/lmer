@@ -264,7 +264,7 @@ class TestOpeningAThread:
         record = created.json()["thread"]
         assert record["channel"] == "slack" and record["running"] is True
         assert record["permalink"] == (
-            "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900"
+            "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"
         )
         channel, root = _slack.opened[0]
         assert channel == "#a-channel"

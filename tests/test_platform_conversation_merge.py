@@ -751,7 +751,7 @@ def test_bus_records_are_the_conversation_with_their_sources(platform_root):
     plant_rows(session_id, [assistant_row("looking at the branch")])
     plant_record(session_id, 1, "note", "running the suite")
     plant_record(session_id, 2, "question", "which branch?", options=["main", "prep"])
-    plant_record(session_id, 3, "answer", "prep", channel="slack", author="vegu", ref="t1",
+    plant_record(session_id, 3, "answer", "prep", channel="slack", author="tester", ref="t1",
                  in_reply_to=f"{session_id}/000002", meta={"delivered": "pty"})
     plant_record(session_id, 4, "message", "thanks — go ahead", channel="matrix", author="@alice:x", ref="e1")
     plant_record(session_id, 5, "milestone", "pushed MR !300")
@@ -766,30 +766,30 @@ def test_bus_records_are_the_conversation_with_their_sources(platform_root):
         ("assistant", "pushed MR !300", "milestone", "agent"),
     ]
     answer = [m for m in page.messages if m.text == "prep"][0]
-    assert answer.source == {"channel": "slack", "author": "vegu", "ref": "t1"}
-    assert answer.to_dict()["source"]["author"] == "vegu"
+    assert answer.source == {"channel": "slack", "author": "tester", "ref": "t1"}
+    assert answer.to_dict()["source"]["author"] == "tester"
     assert answer.origin is None
 
 
 def test_the_harness_copy_of_a_relayed_record_is_hidden(platform_root):
-    """The supervisor typed ``[slack · vegu] hello there`` into the harness, which
+    """The supervisor typed ``[slack · tester] hello there`` into the harness, which
     wrote it down as a user turn. The bus record already says who said hello."""
     session_id = "s-bus-relay"
     plant_rows(session_id, [
-        user_row("[slack · vegu] hello there", at="2026-07-20T09:00:02.000Z"),
-        assistant_row("hi vegu", at="2026-07-20T09:00:03.000Z"),
-        user_row("[slack · vegu] hello   there", at="2026-07-20T09:00:04.000Z"),
+        user_row("[slack · tester] hello there", at="2026-07-20T09:00:02.000Z"),
+        assistant_row("hi tester", at="2026-07-20T09:00:03.000Z"),
+        user_row("[slack · tester] hello   there", at="2026-07-20T09:00:04.000Z"),
         user_row("an unrelated turn typed at the terminal", at="2026-07-20T09:00:05.000Z"),
     ])
-    plant_record(session_id, 1, "message", "hello there", channel="slack", author="vegu", ref="t1",
+    plant_record(session_id, 1, "message", "hello there", channel="slack", author="tester", ref="t1",
                  at="2026-07-20T09:00:01Z")
-    plant_record(session_id, 2, "message", "hello there", channel="slack", author="vegu", ref="t2",
+    plant_record(session_id, 2, "message", "hello there", channel="slack", author="tester", ref="t2",
                  at="2026-07-20T09:00:04Z")
     page = transcripts.read_messages(session_id, limit=100)
     harness_copies = [m for m in page.messages if m.via is None and m.text.startswith("[slack")]
     assert harness_copies == [], "the harness's copy of a relayed record is still shown"
     assert [(m.role, m.text) for m in page.messages if m.via is None] == [
-        ("assistant", "hi vegu"),
+        ("assistant", "hi tester"),
         ("user", "an unrelated turn typed at the terminal"),
     ]
     assert said(page).count(("user", "hello there")) == 2
@@ -799,7 +799,7 @@ def test_a_late_answer_is_labelled_and_a_command_is_the_platforms(platform_root)
     session_id = "s-bus-late"
     registry.register(session_id, pid=DEAD_PID, run=dict(RUN))
     plant_record(session_id, 1, "question", "branch?")
-    plant_record(session_id, 2, "answer", "prep", channel="slack", author="vegu", in_reply_to=f"{session_id}/000001")
+    plant_record(session_id, 2, "answer", "prep", channel="slack", author="tester", in_reply_to=f"{session_id}/000001")
     plant_record(session_id, 3, "answer", "main", channel="matrix", author="@a:x",
                  in_reply_to=f"{session_id}/000001", meta={"late": True, "answered_by": f"{session_id}/000002"})
     plant_record(session_id, 4, "command", "/followup", channel="uber-lmer")
@@ -880,7 +880,7 @@ def test_a_post_into_another_thread_says_so_all_the_way_to_the_view(platform_roo
     plant_log(session_id)
     plant_record(
         session_id, 1, "message", "the review is posted", channel="agent",
-        meta={"thread": "https://20c.slack.com/archives/C0123ABCDEF/p1712345678000900"},
+        meta={"thread": "https://example.slack.com/archives/C0123ABCDEF/p1712345678000900"},
     )
     client = TestClient(
         api.create_app(cfg.load(), SECRET, state_builder=lambda config, force_pull=False: {})

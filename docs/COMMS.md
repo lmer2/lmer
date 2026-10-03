@@ -78,7 +78,7 @@ line in the log and the same object on the wire.
   "seq": 42,
   "session": "20260904-153332-7-21957",
   "at": "2026-09-04T16:02:11.482Z",
-  "source": {"channel": "slack", "author": "vegu", "ref": "1725465731.001200"},
+  "source": {"channel": "slack", "author": "tester", "ref": "1725465731.001200"},
   "kind": "answer",
   "text": "prep-release",
   "in_reply_to": "20260904-153332-7-21957/000039",
@@ -205,7 +205,7 @@ that process runs — and may say who is speaking. The *session* token is minted
 by the supervisor for the harness it wraps and exported as
 `LMER_FASTAPI_TOKEN`; it may only ever speak as `agent`, and may not ack. They
 are different values on purpose: with one shared token any process inside the
-container could post as `[slack · vegu]`, and a source tag nobody can trust is
+container could post as `[slack · tester]`, and a source tag nobody can trust is
 not worth rendering. What crosses into the container is
 `LMER_FASTAPI_TOKEN_SHA256`, the control token's digest — the supervisor
 verifies against it and has no preimage to leak, and the container's own initial
@@ -381,7 +381,7 @@ Every accepted inbound record (any channel but `agent`) of kind `message`,
 one submitted turn, through the same locked submit path `/input` uses:
 
 ```
-[slack · vegu] which target branch?
+[slack · tester] which target branch?
 [uber lmer] the review is posted; fix the two majors and re-signal
 [matrix · @alice:example.org] (answer to #39 'target branch?') prep-release
 [matrix · @alice:example.org] (late answer to #39 'target branch?', already answered by 20260904-…/000040) main
@@ -652,11 +652,11 @@ does not prevent later lines in the same input chunk from being mirrored.
 agent       lmer-signal ask "target branch?" --option main --option prep-release
 supervisor  seq 39, kind question, open; fan-out
 channels    UI card · Slack: text + numbered options · matrix: the same in the thread
-vegu/Slack  replies "2"  → the connector posts answer, in_reply_to 39, ref <channel:thread_ts:ts>
+tester/Slack  replies "2"  → the connector posts answer, in_reply_to 39, ref <channel:thread_ts:ts>
 supervisor  first accepted answer wins, under one lock
             a CLI is waiting?  → its stdout: "prep-release", exit 0
-            none waiting?      → typed into the PTY: "[slack · vegu] (answer to #39 …) prep-release"
-            fan-out            → UI: answered by slack · vegu · matrix: "answered from slack by vegu"
+            none waiting?      → typed into the PTY: "[slack · tester] (answer to #39 …) prep-release"
+            fan-out            → UI: answered by slack · tester · matrix: "answered from slack by tester"
 alice/matrix "main", a minute later → accepted_as late; stored, fanned out, typed as a late message
 ```
 
@@ -1560,7 +1560,7 @@ N; matrix stops its forward relation fetch at N before sorting the fetched
 events. A bounded matrix read therefore does not guarantee the newest N
 messages of a longer thread. It prints
 messages as bus-style records — the same
-`[slack · vegu] …` tag the harness sees for an inbound message — and copies any
+`[slack · tester] …` tag the harness sees for an inbound message — and copies any
 files into the session's upload store, naming them with the `[lmer upload]`
 reference (#246). `post --thread` posts once, and records the post on the
 session's own bus as a `message` carrying `meta.thread`, so the run's connected
